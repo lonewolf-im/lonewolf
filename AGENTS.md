@@ -89,3 +89,11 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Log an error once at the layer that handles it. Lower layers must return contextual errors instead of logging duplicates.
 - Logging must not block an XMPP I/O task. Use bounded asynchronous output with an explicit overload policy.
 - Privacy rules apply at every level, including `debug` and `trace`.
+
+## 9. No C or C++ Application Dependencies Rule
+
+- Do not add application libraries implemented in C or C++. This restriction covers direct and transitive dependencies, including build and development dependencies.
+- Apply this rule to enabled Cargo features and target-specific dependencies for every supported platform. Bundling, vendoring, static linking, dynamic linking, or installing a library through the operating system does not exempt it.
+- Normal operating-system interfaces and platform runtime libraries are allowed. Rust bindings to these interfaces, such as `libc`, are allowed. This exception does not permit application libraries such as SQLite, OpenSSL, or RocksDB.
+- A Rust wrapper does not make a C or C++ backend compliant. Check cryptography providers and other native backends separately from their Rust APIs.
+- Before adding or updating a dependency or enabling a feature, inspect the resolved dependency and feature graph, relevant build scripts, and native linkage. Do not introduce a C or C++ application library through any of these paths.

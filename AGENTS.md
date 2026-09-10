@@ -77,3 +77,15 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Never add `Co-Authored-By:` trailers that name an AI tool or agent to commit messages. Human co-author trailers are permitted and must be preserved.
 - If your tooling automatically inserts such attribution into a draft commit message or PR body, remove it before committing or opening the PR. Review the final text of every commit message and PR description for these footers before submitting.
 - PR descriptions must contain only content relevant to the change, such as the summary, motivation, and testing notes.
+
+## 8. Logging and Tracing Rule
+
+- Use structured `tracing` events and spans. Keep each event message static and put context in named fields.
+- Use `error` for failed operations or broken invariants, `warn` for recoverable protocol or policy violations, `info` for low-volume lifecycle and security events, `debug` for routing and state decisions, and `trace` for high-volume protocol mechanics.
+- Never log raw XML stanzas, message bodies, presence text, roster or vCard content, SASL payloads, credentials, tokens, TLS key material, or other secrets.
+- Do not log full JIDs, IP addresses, XMPP stream IDs, or client-provided stanza IDs by default. Use log-specific correlation IDs. Pass necessary identifiers through one redaction or pseudonymization helper.
+- Log protocol metadata instead of payloads. Prefer fields such as `connection_id`, `direction`, `stream_phase`, `stanza_kind`, `namespace`, `outcome`, `latency_ms`, and `bytes`.
+- Treat every client-provided value as untrusted. Bound its length and sanitize control characters before logging it.
+- Log an error once at the layer that handles it. Lower layers must return contextual errors instead of logging duplicates.
+- Logging must not block an XMPP I/O task. Use bounded asynchronous output with an explicit overload policy.
+- Privacy rules apply at every level, including `debug` and `trace`.

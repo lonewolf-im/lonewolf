@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::alloc::Layout;
+use std::alloc::{Layout, alloc, dealloc};
 use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
@@ -19,7 +19,6 @@ pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024;
 ///     (chunk, chunk)
 /// }
 /// ```
-#[expect(dead_code, reason = "Method bodies are intentionally unimplemented.")]
 pub struct Chunk {
     pointer: NonNull<u8>,
     layout: Layout,
@@ -30,25 +29,25 @@ impl Chunk {
     /// The layout must describe the whole writable block and have a nonzero size.
     /// The pointer must satisfy the layout's alignment and remain valid until deallocation.
     /// The caller transfers sole ownership and must keep the originating allocator alive.
-    pub unsafe fn from_raw_parts(_pointer: NonNull<u8>, _layout: Layout) -> Self {
-        unimplemented!()
+    pub unsafe fn from_raw_parts(pointer: NonNull<u8>, layout: Layout) -> Self {
+        Self { pointer, layout }
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
-        unimplemented!()
+        self.pointer.as_ptr()
     }
 
     pub fn capacity(&self) -> usize {
-        unimplemented!()
+        self.layout.size()
     }
 
     /// Includes the full usable capacity and alignment to preserve for deallocation.
     pub fn layout(&self) -> Layout {
-        unimplemented!()
+        self.layout
     }
 
     pub fn into_raw_parts(self) -> (NonNull<u8>, Layout) {
-        unimplemented!()
+        (self.pointer, self.layout)
     }
 }
 
@@ -81,31 +80,39 @@ pub unsafe trait ChunkAllocator: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GlobalChunkAllocator;
 
-// Neither operation can expose or access memory because both diverge.
+// Global allocations are disjoint and remain valid across threads until freed.
 unsafe impl ChunkAllocator for GlobalChunkAllocator {
-    fn allocate(&self, _layout: Layout) -> Result<Chunk, AllocationError> {
-        unimplemented!()
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        if layout.size() == 0 {
+            return Err(AllocationError::UnsupportedLayout);
+        }
+
+        let pointer = NonNull::new(unsafe { alloc(layout) }).ok_or(AllocationError::Exhausted)?;
+        Ok(Chunk { pointer, layout })
     }
 
-    unsafe fn deallocate(&self, _chunk: Chunk) {
-        unimplemented!()
+    unsafe fn deallocate(&self, chunk: Chunk) {
+        let (pointer, layout) = chunk.into_raw_parts();
+        // The caller guarantees sole ownership and the original allocation layout.
+        unsafe { dealloc(pointer.as_ptr(), layout) };
     }
 }
 
-// Neither operation can expose or access memory because both diverge.
+// Shared ownership preserves the allocator and its allocation contracts.
 unsafe impl<A: ChunkAllocator + ?Sized> ChunkAllocator for Arc<A> {
-    fn allocate(&self, _layout: Layout) -> Result<Chunk, AllocationError> {
-        unimplemented!()
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        self.as_ref().allocate(layout)
     }
 
-    unsafe fn deallocate(&self, _chunk: Chunk) {
-        unimplemented!()
+    unsafe fn deallocate(&self, chunk: Chunk) {
+        unsafe { self.as_ref().deallocate(chunk) };
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AllocationError {
     UnsupportedLayout,
+    /// Global allocation failure can also indicate an unsupported size or alignment.
     Exhausted,
 }
 
@@ -292,8 +299,11 @@ impl<A: ChunkAllocator> Drop for SharedArena<A> {
 }
 
 impl fmt::Display for AllocationError {
-    fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        unimplemented!()
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedLayout => "unsupported allocation layout",
+            Self::Exhausted => "chunk allocation failed",
+        })
     }
 }
 

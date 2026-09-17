@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024;
-pub const MAX_BACKEND_CHUNK_SIZE: usize = 256 * 1024;
+pub const DEFAULT_HEAP_THRESHOLD: usize = 64 * 1024;
 
 /// Supplies both payload storage and ownership metadata.
 ///
@@ -65,9 +65,13 @@ pub enum HandleError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArenaPoolConfig {
-    /// Usable bytes per regular chunk. Must be a power of two no greater than 256 KiB.
-    /// Larger requests round up to a power of two. Capacities above 256 KiB use the global heap.
+    /// Usable bytes per regular chunk. Must be a power of two.
+    /// Larger requests round up to a power of two.
     pub chunk_size: NonZeroUsize,
+    /// Largest rounded chunk capacity retained in the backend.
+    /// Must be a power of two at least as large as the regular chunk size.
+    /// Larger chunks use the global heap and are released on recycle.
+    pub heap_threshold: NonZeroUsize,
     /// Maximum reserved bytes for one arena, including metadata and global heap chunks.
     pub max_arena_bytes: NonZeroUsize,
     /// Maximum reserved bytes for the pool, including idle arenas and shared metadata.
@@ -75,7 +79,8 @@ pub struct ArenaPoolConfig {
 }
 
 impl ArenaPoolConfig {
-    /// Uses 4 KiB regular chunks. Pool creation validates the limits.
+    /// Uses 4 KiB regular chunks and a 64 KiB heap threshold.
+    /// Pool creation validates the configuration.
     pub fn new(_max_arena_bytes: NonZeroUsize, _max_pool_bytes: NonZeroUsize) -> Self {
         unimplemented!()
     }
@@ -118,7 +123,7 @@ impl<T: ?Sized + 'static> Clone for Handle<T> {
 
 /// Leases keep the pool and backend alive after external pool handles are dropped.
 /// Backend chunks remain attached to their arenas until the pool and all leases are dropped.
-/// Chunks above 256 KiB use the global heap and are released on recycle.
+/// Chunks above the configured threshold use the global heap and are released on recycle.
 /// Other storage uses the configured backend.
 /// Backend exhaustion does not trigger heap fallback.
 /// Limits count requested bytes from both sources, including headers and alignment padding.
@@ -163,7 +168,7 @@ impl<A: ChunkAllocator> Drop for ArenaPool<A> {
 }
 
 /// Can move between threads, but cannot be shared between them.
-/// Dropping the lease retains chunks up to 256 KiB and releases larger chunks.
+/// Dropping the lease retains backend chunks and releases chunks above the heap threshold.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::Arena;
@@ -234,7 +239,7 @@ impl<A: ChunkAllocator> Drop for Arena<A> {
 }
 
 /// Allows concurrent reads. Borrowed views cannot outlive their owning shared handle.
-/// The final owner recycles the arena, retaining chunks up to 256 KiB and releasing larger chunks.
+/// The final owner recycles the arena, retaining backend chunks and releasing heap fallback chunks.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::{Handle, HandleError, SharedArena};

@@ -6,37 +6,99 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024;
-pub const DEFAULT_HEAP_THRESHOLD: usize = 64 * 1024;
+
+/// Owns an uninitialized block. Return it through its allocator; dropping it does not free it.
+///
+/// ```compile_fail
+/// use lonewolf_util::arena::Chunk;
+///
+/// fn duplicate(chunk: Chunk) -> (Chunk, Chunk) {
+///     (chunk, chunk)
+/// }
+/// ```
+#[expect(dead_code, reason = "Method bodies are intentionally unimplemented.")]
+pub struct Chunk {
+    pointer: NonNull<u8>,
+    layout: Layout,
+}
+
+impl Chunk {
+    /// # Safety
+    /// The layout must describe the whole writable block and have a nonzero size.
+    /// The pointer must satisfy the layout's alignment and remain valid until deallocation.
+    /// The caller transfers sole ownership and must keep the originating allocator alive.
+    pub unsafe fn from_raw_parts(_pointer: NonNull<u8>, _layout: Layout) -> Self {
+        unimplemented!()
+    }
+
+    pub fn as_ptr(&self) -> *mut u8 {
+        unimplemented!()
+    }
+
+    pub fn capacity(&self) -> usize {
+        unimplemented!()
+    }
+
+    /// Includes the full usable capacity and alignment to preserve for deallocation.
+    pub fn layout(&self) -> Layout {
+        unimplemented!()
+    }
+
+    pub fn into_raw_parts(self) -> (NonNull<u8>, Layout) {
+        unimplemented!()
+    }
+}
+
+// The descriptor gives no safe access to its memory.
+unsafe impl Send for Chunk {}
+unsafe impl Sync for Chunk {}
 
 /// Supplies both payload storage and ownership metadata.
 ///
 /// # Safety
-/// Successful allocations must be disjoint, writable, and valid for the requested layout.
-/// Their addresses must stay valid until released, even if the allocator moves.
+/// Successful allocations must be disjoint and writable for their full returned layouts.
+/// The returned layout must provide at least the requested size and alignment.
+/// Blocks must stay valid until returned while the allocator is alive.
+/// Moving the allocator must not invalidate its live blocks.
 /// Releasing one block must not invalidate any other live block.
+/// Allocation and deallocation must be valid on any thread.
 pub unsafe trait ChunkAllocator: Send + Sync + 'static {
     /// Returns uninitialized storage. Zero-sized layouts must return an error.
+    /// The allocator chooses any extra capacity. All returned bytes are usable by the caller.
     /// Exhaustion must return an error without waiting for memory to become available.
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocationError>;
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError>;
 
     /// # Safety
-    /// The pointer must identify a live block from this allocator with the same layout.
+    /// The chunk must be a live allocation from this allocator with its returned layout intact.
     /// No references or pending accesses to the block may remain.
-    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout);
+    unsafe fn deallocate(&self, chunk: Chunk);
 }
 
+/// Returns exactly the requested usable layout from the global heap, with no size-class rounding.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GlobalChunkAllocator;
 
 // Neither operation can expose or access memory because both diverge.
 unsafe impl ChunkAllocator for GlobalChunkAllocator {
-    fn allocate(&self, _layout: Layout) -> Result<NonNull<u8>, AllocationError> {
+    fn allocate(&self, _layout: Layout) -> Result<Chunk, AllocationError> {
         unimplemented!()
     }
 
-    unsafe fn deallocate(&self, _pointer: NonNull<u8>, _layout: Layout) {
+    unsafe fn deallocate(&self, _chunk: Chunk) {
+        unimplemented!()
+    }
+}
+
+// Neither operation can expose or access memory because both diverge.
+unsafe impl<A: ChunkAllocator + ?Sized> ChunkAllocator for Arc<A> {
+    fn allocate(&self, _layout: Layout) -> Result<Chunk, AllocationError> {
+        unimplemented!()
+    }
+
+    unsafe fn deallocate(&self, _chunk: Chunk) {
         unimplemented!()
     }
 }
@@ -52,7 +114,6 @@ pub enum ArenaError {
     InvalidConfiguration,
     CapacityOverflow,
     ArenaLimitExceeded,
-    PoolLimitExceeded,
     IdentityExhausted,
     Allocation(AllocationError),
 }
@@ -60,28 +121,21 @@ pub enum ArenaError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleError {
     WrongArena,
-    Expired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArenaPoolConfig {
-    /// Usable bytes per regular chunk. Must be a power of two.
-    /// Larger requests round up to a power of two.
+pub struct ArenaConfig {
+    /// Minimum bytes requested for data chunks. Larger values request enough contiguous space.
+    /// The arena does not round requests to size classes.
     pub chunk_size: NonZeroUsize,
-    /// Largest rounded chunk capacity retained in the backend.
-    /// Must be a power of two at least as large as the regular chunk size.
-    /// Larger chunks use the global heap and are released on recycle.
-    pub heap_threshold: NonZeroUsize,
-    /// Maximum reserved bytes for one arena, including metadata and global heap chunks.
-    pub max_arena_bytes: NonZeroUsize,
-    /// Maximum reserved bytes for the pool, including idle arenas and shared metadata.
-    pub max_pool_bytes: NonZeroUsize,
+    /// Maximum total returned capacity, including unused bytes and ownership metadata.
+    /// A chunk that exceeds the remaining budget is returned and the allocation fails.
+    pub max_reserved_bytes: NonZeroUsize,
 }
 
-impl ArenaPoolConfig {
-    /// Uses 4 KiB regular chunks and a 64 KiB heap threshold.
-    /// Pool creation validates the configuration.
-    pub fn new(_max_arena_bytes: NonZeroUsize, _max_pool_bytes: NonZeroUsize) -> Self {
+impl ArenaConfig {
+    /// Uses 4 KiB chunk requests. Arena creation validates the configuration.
+    pub fn new(_max_reserved_bytes: NonZeroUsize) -> Self {
         unimplemented!()
     }
 }
@@ -90,21 +144,13 @@ impl ArenaPoolConfig {
 pub struct ArenaStats {
     /// Bytes occupied by values, excluding alignment padding and metadata.
     pub used_bytes: usize,
-    /// Reserved bytes, including unused capacity, metadata, and global heap chunks.
+    /// Total returned capacity, including unused bytes and ownership metadata.
     pub reserved_bytes: usize,
     pub chunk_count: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArenaPoolStats {
-    /// Reserved bytes for active and idle arenas and the pool's own metadata.
-    pub reserved_bytes: usize,
-    pub arena_count: usize,
-    pub idle_arena_count: usize,
-}
-
-/// Does not retain storage. A handle stays valid through freezing, but not arena reuse.
-/// Handles cannot be used with another arena, even if their value types match.
+/// Does not retain storage. A handle stays valid through freezing.
+/// Handles cannot be used with another arena, even if the same memory is reused.
 pub struct Handle<T: ?Sized + 'static> {
     _value: PhantomData<fn(*mut T) -> *mut T>,
 }
@@ -121,54 +167,9 @@ impl<T: ?Sized + 'static> Clone for Handle<T> {
     }
 }
 
-/// Leases keep the pool and backend alive after external pool handles are dropped.
-/// Backend chunks remain attached to their arenas until the pool and all leases are dropped.
-/// Chunks above the configured threshold use the global heap and are released on recycle.
-/// Other storage uses the configured backend.
-/// Backend exhaustion does not trigger heap fallback.
-/// Limits count requested bytes from both sources, including headers and alignment padding.
-/// The underlying allocators' own overhead is not included.
-pub struct ArenaPool<A: ChunkAllocator = GlobalChunkAllocator> {
-    _allocator: PhantomData<A>,
-}
-
-impl ArenaPool<GlobalChunkAllocator> {
-    pub fn try_new(_config: ArenaPoolConfig) -> Result<Self, ArenaError> {
-        unimplemented!()
-    }
-}
-
-impl<A: ChunkAllocator> ArenaPool<A> {
-    pub fn try_new_in(_config: ArenaPoolConfig, _allocator: A) -> Result<Self, ArenaError> {
-        unimplemented!()
-    }
-
-    /// Reserves ownership metadata before returning. Does not wait for an idle arena.
-    /// Reuse starts a new identity so earlier handles cannot access the new lease.
-    pub fn try_acquire(&self) -> Result<Arena<A>, ArenaError> {
-        unimplemented!()
-    }
-
-    pub fn stats(&self) -> ArenaPoolStats {
-        unimplemented!()
-    }
-}
-
-impl<A: ChunkAllocator> Clone for ArenaPool<A> {
-    /// Shares the pool without allocating.
-    fn clone(&self) -> Self {
-        unimplemented!()
-    }
-}
-
-impl<A: ChunkAllocator> Drop for ArenaPool<A> {
-    fn drop(&mut self) {
-        unimplemented!()
-    }
-}
-
 /// Can move between threads, but cannot be shared between them.
-/// Dropping the lease retains backend chunks and releases chunks above the heap threshold.
+/// Keeps its allocator alive. All storage, including ownership metadata, uses that allocator.
+/// Dropping the arena returns every chunk to the allocator, which may cache or free it.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::Arena;
@@ -181,7 +182,19 @@ pub struct Arena<A: ChunkAllocator = GlobalChunkAllocator> {
     _exclusive: PhantomData<Cell<()>>,
 }
 
+impl Arena<GlobalChunkAllocator> {
+    pub fn try_new(_config: ArenaConfig) -> Result<Self, ArenaError> {
+        unimplemented!()
+    }
+}
+
 impl<A: ChunkAllocator> Arena<A> {
+    /// Reserves ownership metadata before returning so freezing needs no allocation.
+    /// Each arena gets a fresh identity, even when its allocator reuses memory.
+    pub fn try_new_in(_config: ArenaConfig, _allocator: A) -> Result<Self, ArenaError> {
+        unimplemented!()
+    }
+
     pub fn try_alloc<T: Copy + Send + Sync + 'static>(
         &mut self,
         _value: T,
@@ -239,7 +252,7 @@ impl<A: ChunkAllocator> Drop for Arena<A> {
 }
 
 /// Allows concurrent reads. Borrowed views cannot outlive their owning shared handle.
-/// The final owner recycles the arena, retaining backend chunks and releasing heap fallback chunks.
+/// The final owner returns every chunk before dropping the allocator.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::{Handle, HandleError, SharedArena};

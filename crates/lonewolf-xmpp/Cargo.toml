@@ -8,3 +8,6 @@ publish.workspace = true
 
 [dependencies]
 bumpalo.workspace = true
+icu_properties.workspace = true
+idna.workspace = true
+precis-profiles.workspace = true

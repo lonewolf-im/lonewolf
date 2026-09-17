@@ -4,8 +4,9 @@ use std::alloc::Layout;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crossbeam_queue::ArrayQueue;
 
 use crate::arena::{AllocationError, Chunk, ChunkAllocator, GlobalChunkAllocator};
 
@@ -82,12 +83,13 @@ impl std::error::Error for PoolError {
 pub struct PooledChunkAllocator {
     config: PoolConfig,
     storage: Chunk,
-    buckets: [Mutex<Bucket>; BUCKET_SIZES.len()],
+    buckets: [Bucket; BUCKET_SIZES.len()],
     heap_allocation_count: AtomicU64,
 }
 
 impl PooledChunkAllocator {
     /// Preallocates equal capacity per bucket, plus bookkeeping, from the global allocator.
+    /// Queue bookkeeping allocation failure uses the global allocation error handler.
     pub fn try_new(config: PoolConfig) -> Result<Self, PoolError> {
         let total_bytes = config.total_bytes.get();
         if total_bytes < MIN_POOL_SIZE || !total_bytes.is_power_of_two() {
@@ -96,21 +98,17 @@ impl PooledChunkAllocator {
         let layout = Layout::from_size_align(total_bytes, BUCKET_SIZES[BUCKET_SIZES.len() - 1])
             .map_err(|_| PoolError::InvalidConfiguration)?;
         let bucket_bytes = total_bytes / BUCKET_SIZES.len();
-        let mut buckets = std::array::from_fn(|_| {
-            Mutex::new(Bucket {
-                available: Vec::new(),
-                allocation_count: 0,
-            })
+        let buckets = std::array::from_fn(|index| {
+            let count = bucket_bytes / BUCKET_SIZES[index];
+            let available = ArrayQueue::new(count);
+            for slot in 0..count {
+                assert!(available.push(slot).is_ok());
+            }
+            Bucket {
+                available,
+                allocation_count: AtomicU64::new(0),
+            }
         });
-        for (bucket, chunk_bytes) in buckets.iter_mut().zip(BUCKET_SIZES) {
-            let bucket = bucket.get_mut().unwrap_or_else(|error| error.into_inner());
-            let count = bucket_bytes / chunk_bytes;
-            bucket
-                .available
-                .try_reserve_exact(count)
-                .map_err(|_| PoolError::Allocation(AllocationError::Exhausted))?;
-            bucket.available.extend((0..count).rev());
-        }
         let storage = GlobalChunkAllocator
             .allocate(layout)
             .map_err(PoolError::Allocation)?;
@@ -130,14 +128,12 @@ impl PooledChunkAllocator {
         let bucket_bytes = self.config.total_bytes.get() / BUCKET_SIZES.len();
         PoolStats {
             buckets: std::array::from_fn(|index| {
-                let bucket = self.buckets[index]
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let bucket = &self.buckets[index];
                 BucketStats {
                     chunk_bytes: BUCKET_SIZES[index],
                     total_chunks: bucket_bytes / BUCKET_SIZES[index],
                     available_chunks: bucket.available.len(),
-                    allocation_count: bucket.allocation_count,
+                    allocation_count: bucket.allocation_count.load(Ordering::Relaxed),
                 }
             }),
             heap_allocation_count: self.heap_allocation_count.load(Ordering::Relaxed),
@@ -145,7 +141,7 @@ impl PooledChunkAllocator {
     }
 }
 
-// Locked free lists give exclusive access to disjoint ranges in the retained allocation.
+// Each queued slot grants exclusive access to a disjoint range in the retained allocation.
 unsafe impl ChunkAllocator for PooledChunkAllocator {
     /// Tries buckets by increasing size. Pooled chunks are aligned to their full capacity.
     /// If no compatible chunk is available, uses the exact layout from the global allocator.
@@ -160,11 +156,9 @@ unsafe impl ChunkAllocator for PooledChunkAllocator {
             }
             let chunk_layout = Layout::from_size_align(chunk_bytes, chunk_bytes)
                 .map_err(|_| AllocationError::UnsupportedLayout)?;
-            let mut bucket = self.buckets[index]
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let bucket = &self.buckets[index];
             if let Some(slot) = bucket.available.pop() {
-                bucket.allocation_count = bucket.allocation_count.saturating_add(1);
+                increment_saturating(&bucket.allocation_count);
                 let offset = index * bucket_bytes + slot * chunk_bytes;
                 // Bucket boundaries and slot strides preserve the chunk's alignment.
                 return Ok(unsafe {
@@ -176,18 +170,7 @@ unsafe impl ChunkAllocator for PooledChunkAllocator {
             }
         }
         let chunk = GlobalChunkAllocator.allocate(layout)?;
-        let mut count = self.heap_allocation_count.load(Ordering::Relaxed);
-        while let Some(next) = count.checked_add(1) {
-            match self.heap_allocation_count.compare_exchange_weak(
-                count,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => count = current,
-            }
-        }
+        increment_saturating(&self.heap_allocation_count);
         Ok(chunk)
     }
 
@@ -209,11 +192,8 @@ unsafe impl ChunkAllocator for PooledChunkAllocator {
         let bucket_bytes = self.config.total_bytes.get() / BUCKET_SIZES.len();
         let index = offset / bucket_bytes;
         let slot = (offset % bucket_bytes) / BUCKET_SIZES[index];
-        let mut bucket = self.buckets[index]
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        // A returned slot vacated one entry, so the preallocated list cannot grow.
-        bucket.available.push(slot);
+        // Each outstanding chunk leaves one free entry for its return.
+        assert!(self.buckets[index].available.push(slot).is_ok());
     }
 }
 
@@ -225,6 +205,16 @@ impl Drop for PooledChunkAllocator {
 }
 
 struct Bucket {
-    available: Vec<usize>,
-    allocation_count: u64,
+    available: ArrayQueue<usize>,
+    allocation_count: AtomicU64,
+}
+
+fn increment_saturating(counter: &AtomicU64) {
+    let mut count = counter.load(Ordering::Relaxed);
+    while let Some(next) = count.checked_add(1) {
+        match counter.compare_exchange_weak(count, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(current) => count = current,
+        }
+    }
 }

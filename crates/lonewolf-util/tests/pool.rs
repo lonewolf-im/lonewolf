@@ -176,21 +176,21 @@ fn configured_capacity_scales_every_bucket() -> TestResult {
 }
 
 #[test]
-fn every_constructor_failure_releases_partial_allocations() -> TestResult {
+fn failed_storage_allocation_releases_queue_bookkeeping() -> TestResult {
     let (probe, trace) = traced(None, || PooledChunkAllocator::try_new(small_config()));
     drop(probe?);
-    for fail_at in 1..=trace.attempts {
-        let (result, trace) = traced(Some(fail_at), || {
-            PooledChunkAllocator::try_new(small_config())
-        });
-        assert!(matches!(
-            result,
-            Err(PoolError::Allocation(AllocationError::Exhausted))
-        ));
-        assert_eq!(trace.attempts, fail_at);
-        assert_eq!(trace.allocations, trace.deallocations);
-        assert_eq!(trace.allocated_bytes, trace.deallocated_bytes);
-    }
+    let fail_at = trace.attempts;
+    let (result, trace) = traced(Some(fail_at), || {
+        PooledChunkAllocator::try_new(small_config())
+    });
+    assert!(matches!(
+        result,
+        Err(PoolError::Allocation(AllocationError::Exhausted))
+    ));
+    assert_eq!(trace.attempts, fail_at);
+    assert!(trace.allocations > 0);
+    assert_eq!(trace.allocations, trace.deallocations);
+    assert_eq!(trace.allocated_bytes, trace.deallocated_bytes);
     Ok(())
 }
 
@@ -420,6 +420,42 @@ fn concurrent_allocations_can_return_on_another_thread() -> TestResult {
 }
 
 #[test]
+fn concurrent_returns_restore_every_slot_after_queue_wraparound() -> TestResult {
+    let pool = PooledChunkAllocator::try_new(small_config())?;
+    let barrier = Barrier::new(4);
+    thread::scope(|scope| {
+        for worker in 0..4 {
+            let pool = &pool;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                for round in 0..4 {
+                    let chunks = std::array::from_fn::<_, 64, _>(|slot| {
+                        let chunk = pool.allocate(Layout::new::<usize>()).expect("chunk");
+                        let value = round * 256 + worker * 64 + slot;
+                        unsafe { chunk.as_ptr().cast::<usize>().write(value) };
+                        chunk
+                    });
+                    barrier.wait();
+                    for (slot, chunk) in chunks.into_iter().enumerate() {
+                        let value = round * 256 + worker * 64 + slot;
+                        assert_eq!(unsafe { chunk.as_ptr().cast::<usize>().read() }, value);
+                        unsafe { pool.deallocate(chunk) };
+                    }
+                    barrier.wait();
+                }
+            });
+        }
+    });
+    let stats = pool.stats();
+    assert_eq!(stats.heap_allocation_count, 0);
+    assert_eq!(stats.buckets[0].allocation_count, 1024);
+    for bucket in stats.buckets {
+        assert_eq!(bucket.available_chunks, bucket.total_chunks);
+    }
+    Ok(())
+}
+
+#[test]
 fn arena_can_own_its_pool_inside_pooled_storage() -> TestResult {
     let (result, trace) = traced(None, || {
         let pool = PooledChunkAllocator::try_new(small_config())?;
@@ -480,11 +516,18 @@ fn live_views_survive_neighbor_reuse_and_old_handles_stay_invalid() -> TestResul
     let old_text = second.try_alloc_str("second")?;
     let old_address = second.get(old_text)?.as_ptr();
     drop(second);
-    let mut third = Arena::try_new_in(ArenaConfig::default(), pool)?;
-    let new_text = third.try_alloc_str("third")?;
-    assert_eq!(third.get(new_text)?.as_ptr(), old_address);
-    assert_eq!(third.get(old_text), Err(HandleError::WrongArena));
-    assert_eq!(view, "first");
-    assert_eq!(third.get(new_text)?, "third");
+    let mut reused = false;
+    for _ in 0..pool.stats().buckets[0].total_chunks {
+        let mut third = Arena::try_new_in(ArenaConfig::default(), pool.clone())?;
+        let new_text = third.try_alloc_str("third")?;
+        assert_eq!(third.get(old_text), Err(HandleError::WrongArena));
+        assert_eq!(view, "first");
+        assert_eq!(third.get(new_text)?, "third");
+        if third.get(new_text)?.as_ptr() == old_address {
+            reused = true;
+            break;
+        }
+    }
+    assert!(reused);
     Ok(())
 }

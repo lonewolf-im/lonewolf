@@ -40,16 +40,21 @@ fn report<A: ChunkAllocator>(name: &str, allocator: &Arc<A>, workers: usize) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool_bytes = std::env::var("LONEWOLF_BENCH_POOL_BYTES")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(MIN_POOL_SIZE);
     let global = Arc::new(GlobalChunkAllocator);
     let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
-        total_bytes: NonZeroUsize::new(MIN_POOL_SIZE).ok_or("pool size")?,
+        total_bytes: NonZeroUsize::new(pool_bytes).ok_or("pool size")?,
     })?);
     if !std::env::args().any(|argument| argument == "--bench") {
         sample(&global, 1, 1);
         sample(&pool, 1, 1);
         return Ok(());
     }
-    println!("pool_bytes={MIN_POOL_SIZE} payload_bytes=512 samples=5 arenas_per_worker=100000");
+    println!("pool_bytes={pool_bytes} payload_bytes=512 samples=5 arenas_per_worker=100000");
     for workers in [1, 4] {
         report("global", &global, workers);
         report("pool", &pool, workers);

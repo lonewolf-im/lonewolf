@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lonewolf", "crates/lonewolf-xmpp"]
+members = ["crates/lonewolf", "crates/lonewolf-util", "crates/lonewolf-xmpp"]
 resolver = "3"
 
 [workspace.package]

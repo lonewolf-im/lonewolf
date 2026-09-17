@@ -1,0 +1,10 @@
+[package]
+name = "lonewolf"
+description = "An XMPP server focused on performance and a low memory footprint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+lonewolf-xmpp.workspace = true

@@ -6,7 +6,6 @@ use std::hash::{Hash, Hasher};
 use std::net::Ipv6Addr;
 use std::num::NonZeroU16;
 
-use bumpalo::Bump;
 use icu_properties::props::{
     ChangesWhenNfkcCasefolded, GeneralCategory, HangulSyllableType, Script,
 };
@@ -14,6 +13,7 @@ use icu_properties::{CodePointMapData, CodePointSetData};
 use idna::uts46::{
     AsciiDenyList, ErrorPolicy, Hyphens, ProcessingSuccess, Uts46, verify_dns_length,
 };
+use lonewolf_util::arena::{Arena, ArenaError, ArenaRead, ChunkAllocator, Handle, HandleError};
 use precis_profiles::precis_core::profile::{PrecisFastInvocation, Rules};
 use precis_profiles::{OpaqueString, UsernameCaseMapped};
 
@@ -26,11 +26,33 @@ const MAX_INPUT_PART_LEN: usize = 16 * MAX_PART_LEN;
 
 /// Text is normalized under [RFC 7622]. Resourceparts remain case-sensitive.
 /// Storage uses the caller's arena. Unicode preparation can allocate temporary heap buffers.
+/// Handles do not retain storage. Compare and hash resolved views by their text.
 /// Localpart escaping is not automatic.
 ///
 /// [RFC 7622]: https://www.rfc-editor.org/rfc/rfc7622.html
-#[derive(Clone)]
-pub struct Jid<'arena> {
+#[derive(Clone, Copy)]
+pub struct Jid {
+    text: Handle<str>,
+    text_len: u16,
+    localpart_end: Option<NonZeroU16>,
+    resourcepart_start: Option<NonZeroU16>,
+}
+
+/// Borrows normalized text from the arena. It does not retain the arena.
+///
+/// ```compile_fail
+/// use lonewolf_util::arena::{Arena, ArenaConfig};
+/// use lonewolf_xmpp::jid::Jid;
+///
+/// let text = {
+///     let mut arena = Arena::try_new(ArenaConfig::default()).unwrap();
+///     let jid = Jid::parse_in("example.com", &mut arena).unwrap();
+///     jid.resolve(&arena).unwrap().as_str()
+/// };
+/// println!("{text}");
+/// ```
+#[derive(Clone, Copy)]
+pub struct JidRef<'arena> {
     text: &'arena str,
     localpart_end: Option<NonZeroU16>,
     resourcepart_start: Option<NonZeroU16>,
@@ -48,12 +70,16 @@ pub enum JidError {
     EmptyPart(JidPart),
     PartTooLong(JidPart),
     InvalidPart(JidPart),
-    /// Only arena allocation failures are reported.
-    AllocationFailed,
+    /// Temporary Unicode buffer allocation failures are not reported.
+    AllocationFailed(ArenaError),
+    AccessFailed(HandleError),
 }
 
-impl<'arena> Jid<'arena> {
-    pub fn parse_in(input: &str, arena: &'arena Bump) -> Result<Self, JidError> {
+impl Jid {
+    pub fn parse_in<A: ChunkAllocator>(
+        input: &str,
+        arena: &mut Arena<A>,
+    ) -> Result<Self, JidError> {
         let (bare, resourcepart) = input
             .split_once('/')
             .map_or((input, None), |(bare, resource)| (bare, Some(resource)));
@@ -63,11 +89,11 @@ impl<'arena> Jid<'arena> {
         Self::from_parts_in(localpart, domainpart, resourcepart, arena)
     }
 
-    pub fn from_parts_in(
+    pub fn from_parts_in<A: ChunkAllocator>(
         localpart: Option<&str>,
         domainpart: &str,
         resourcepart: Option<&str>,
-        arena: &'arena Bump,
+        arena: &mut Arena<A>,
     ) -> Result<Self, JidError> {
         let localpart = localpart.map(prepare_localpart).transpose()?;
         let mut ip_buffer = [0; MAX_PART_LEN];
@@ -83,51 +109,67 @@ impl<'arena> Jid<'arena> {
 
     /// Requires components validated and normalized by this library before storage.
     /// Skips Unicode preparation to reuse trusted stored values.
-    pub fn from_trusted_parts_in(
+    pub fn from_trusted_parts_in<A: ChunkAllocator>(
         localpart: Option<&str>,
         domainpart: &str,
         resourcepart: Option<&str>,
-        arena: &'arena Bump,
+        arena: &mut Arena<A>,
     ) -> Result<Self, JidError> {
-        if let Some(localpart) = localpart {
-            check_length(localpart, JidPart::Localpart)?;
-            if localpart.contains(['@', '/']) {
-                return Err(JidError::InvalidPart(JidPart::Localpart));
-            }
-        }
-        check_length(domainpart, JidPart::Domainpart)?;
-        if domainpart.contains(['@', '/']) {
-            return Err(JidError::InvalidPart(JidPart::Domainpart));
-        }
-        if let Some(resourcepart) = resourcepart {
-            check_length(resourcepart, JidPart::Resourcepart)?;
-        }
+        let mut buffer = [0; MAX_JID_LEN];
+        compose_parts(localpart, domainpart, resourcepart, &mut buffer)?.clone_in(arena)
+    }
 
-        let local_len = localpart.map_or(0, str::len);
-        let domain_start = localpart.map_or(0, |s| s.len() + 1);
-        let bare_len = domain_start + domainpart.len();
-        let total_len = bare_len + resourcepart.map_or(0, |s| s.len() + 1);
-        let bytes = arena
-            .try_alloc_slice_fill_copy(total_len, 0)
-            .map_err(|_| JidError::AllocationFailed)?;
-        if let Some(localpart) = localpart {
-            bytes[..local_len].copy_from_slice(localpart.as_bytes());
-            bytes[local_len] = b'@';
-        }
-        bytes[domain_start..bare_len].copy_from_slice(domainpart.as_bytes());
-        if let Some(resourcepart) = resourcepart {
-            bytes[bare_len] = b'/';
-            bytes[bare_len + 1..].copy_from_slice(resourcepart.as_bytes());
-        }
-        let text =
-            std::str::from_utf8(bytes).map_err(|_| JidError::InvalidPart(JidPart::Domainpart))?;
-        Ok(Self {
-            text,
-            localpart_end: NonZeroU16::new(local_len as u16),
-            resourcepart_start: resourcepart.and_then(|_| NonZeroU16::new((bare_len + 1) as u16)),
+    pub fn resolve<'arena>(
+        &self,
+        arena: &'arena impl ArenaRead,
+    ) -> Result<JidRef<'arena>, HandleError> {
+        let text = arena.get(self.text)?;
+        Ok(JidRef {
+            text: &text[..usize::from(self.text_len)],
+            localpart_end: self.localpart_end,
+            resourcepart_start: self.resourcepart_start,
         })
     }
 
+    pub fn is_bare(&self) -> bool {
+        self.resourcepart_start.is_none()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.resourcepart_start.is_some()
+    }
+
+    /// Reuses existing storage without allocation.
+    pub fn bare(&self) -> Self {
+        Self {
+            text_len: self
+                .resourcepart_start
+                .map_or(self.text_len, |start| start.get() - 1),
+            resourcepart_start: None,
+            ..*self
+        }
+    }
+
+    /// Requires the arena that owns the source text. Stores a new value in that arena.
+    pub fn with_resource_in<A: ChunkAllocator>(
+        &self,
+        resourcepart: &str,
+        arena: &mut Arena<A>,
+    ) -> Result<Self, JidError> {
+        let resourcepart = prepare_resourcepart(resourcepart)?;
+        let current = self.resolve(arena).map_err(JidError::AccessFailed)?;
+        let mut buffer = [0; MAX_JID_LEN];
+        compose_parts(
+            current.localpart(),
+            current.domainpart(),
+            Some(&resourcepart),
+            &mut buffer,
+        )?
+        .clone_in(arena)
+    }
+}
+
+impl<'arena> JidRef<'arena> {
     pub fn localpart(&self) -> Option<&'arena str> {
         self.localpart_end
             .map(|end| &self.text[..usize::from(end.get())])
@@ -166,11 +208,11 @@ impl<'arena> Jid<'arena> {
         }
     }
 
-    pub fn with_resource_in<'target>(
+    pub fn with_resource_in<A: ChunkAllocator>(
         &self,
         resourcepart: &str,
-        arena: &'target Bump,
-    ) -> Result<Jid<'target>, JidError> {
+        arena: &mut Arena<A>,
+    ) -> Result<Jid, JidError> {
         let resourcepart = prepare_resourcepart(resourcepart)?;
         Jid::from_trusted_parts_in(
             self.localpart(),
@@ -181,11 +223,12 @@ impl<'arena> Jid<'arena> {
     }
 
     /// Only arena allocation failure returns an error.
-    pub fn clone_in<'target>(&self, arena: &'target Bump) -> Result<Jid<'target>, JidError> {
+    pub fn clone_in<A: ChunkAllocator>(&self, arena: &mut Arena<A>) -> Result<Jid, JidError> {
         Ok(Jid {
             text: arena
                 .try_alloc_str(self.text)
-                .map_err(|_| JidError::AllocationFailed)?,
+                .map_err(JidError::AllocationFailed)?,
+            text_len: self.text.len() as u16,
             localpart_end: self.localpart_end,
             resourcepart_start: self.resourcepart_start,
         })
@@ -198,27 +241,34 @@ impl<'arena> Jid<'arena> {
 }
 
 /// Omit address text to prevent disclosure in logs.
-impl fmt::Debug for Jid<'_> {
+impl fmt::Debug for Jid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Jid").finish_non_exhaustive()
     }
 }
 
-impl fmt::Display for Jid<'_> {
+/// Omit address text to prevent disclosure in logs.
+impl fmt::Debug for JidRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("JidRef").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for JidRef<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.text)
     }
 }
 
-impl PartialEq for Jid<'_> {
+impl PartialEq for JidRef<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
     }
 }
 
-impl Eq for Jid<'_> {}
+impl Eq for JidRef<'_> {}
 
-impl Hash for Jid<'_> {
+impl Hash for JidRef<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.text.hash(state);
     }
@@ -230,7 +280,12 @@ impl fmt::Display for JidError {
             Self::EmptyPart(part) => (part, "must not be empty"),
             Self::PartTooLong(part) => (part, "exceeds the byte limit"),
             Self::InvalidPart(part) => (part, "is invalid"),
-            Self::AllocationFailed => return formatter.write_str("JID arena allocation failed"),
+            Self::AllocationFailed(error) => {
+                return write!(formatter, "JID arena allocation failed: {error}");
+            }
+            Self::AccessFailed(error) => {
+                return write!(formatter, "JID arena access failed: {error}");
+            }
         };
         let name = match part {
             JidPart::Localpart => "localpart",
@@ -241,7 +296,58 @@ impl fmt::Display for JidError {
     }
 }
 
-impl std::error::Error for JidError {}
+impl std::error::Error for JidError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocationFailed(error) => Some(error),
+            Self::AccessFailed(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn compose_parts<'buffer>(
+    localpart: Option<&str>,
+    domainpart: &str,
+    resourcepart: Option<&str>,
+    buffer: &'buffer mut [u8; MAX_JID_LEN],
+) -> Result<JidRef<'buffer>, JidError> {
+    if let Some(localpart) = localpart {
+        check_length(localpart, JidPart::Localpart)?;
+        if localpart.contains(['@', '/']) {
+            return Err(JidError::InvalidPart(JidPart::Localpart));
+        }
+    }
+    check_length(domainpart, JidPart::Domainpart)?;
+    if domainpart.contains(['@', '/']) {
+        return Err(JidError::InvalidPart(JidPart::Domainpart));
+    }
+    if let Some(resourcepart) = resourcepart {
+        check_length(resourcepart, JidPart::Resourcepart)?;
+    }
+
+    let local_len = localpart.map_or(0, str::len);
+    let domain_start = localpart.map_or(0, |s| s.len() + 1);
+    let bare_len = domain_start + domainpart.len();
+    let total_len = bare_len + resourcepart.map_or(0, |s| s.len() + 1);
+    let bytes = &mut buffer[..total_len];
+    if let Some(localpart) = localpart {
+        bytes[..local_len].copy_from_slice(localpart.as_bytes());
+        bytes[local_len] = b'@';
+    }
+    bytes[domain_start..bare_len].copy_from_slice(domainpart.as_bytes());
+    if let Some(resourcepart) = resourcepart {
+        bytes[bare_len] = b'/';
+        bytes[bare_len + 1..].copy_from_slice(resourcepart.as_bytes());
+    }
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| JidError::InvalidPart(JidPart::Domainpart))?;
+    Ok(JidRef {
+        text,
+        localpart_end: NonZeroU16::new(local_len as u16),
+        resourcepart_start: resourcepart.and_then(|_| NonZeroU16::new((bare_len + 1) as u16)),
+    })
+}
 
 fn check_length(text: &str, part: JidPart) -> Result<(), JidError> {
     if text.is_empty() {

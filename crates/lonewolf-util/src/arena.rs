@@ -186,6 +186,15 @@ impl<T: ?Sized + 'static> Clone for Handle<T> {
     }
 }
 
+/// Only arena owners can resolve handles. Returned views cannot outlive the owner borrow.
+pub trait ArenaRead: sealed::ArenaRead {
+    fn get<T: ?Sized + Send + Sync + 'static>(&self, handle: Handle<T>) -> Result<&T, HandleError>;
+}
+
+mod sealed {
+    pub trait ArenaRead {}
+}
+
 /// Can move between threads, but cannot be shared between them.
 /// Keeps its allocator alive. All storage, including ownership metadata, uses that allocator.
 /// Dropping the arena returns every chunk to the allocator, which may cache or free it.
@@ -361,6 +370,14 @@ impl<A: ChunkAllocator> Drop for Arena<A> {
     }
 }
 
+impl<A: ChunkAllocator> sealed::ArenaRead for Arena<A> {}
+
+impl<A: ChunkAllocator> ArenaRead for Arena<A> {
+    fn get<T: ?Sized + Send + Sync + 'static>(&self, handle: Handle<T>) -> Result<&T, HandleError> {
+        self.get(handle)
+    }
+}
+
 /// Allows concurrent reads. Borrowed views cannot outlive their owning shared handle.
 /// The final owner returns every chunk before dropping the allocator.
 ///
@@ -392,6 +409,14 @@ impl<A: ChunkAllocator> SharedArena<A> {
 
     pub fn stats(&self) -> ArenaStats {
         unsafe { self.inner.as_ref() }.stats
+    }
+}
+
+impl<A: ChunkAllocator> sealed::ArenaRead for SharedArena<A> {}
+
+impl<A: ChunkAllocator> ArenaRead for SharedArena<A> {
+    fn get<T: ?Sized + Send + Sync + 'static>(&self, handle: Handle<T>) -> Result<&T, HandleError> {
+        self.get(handle)
     }
 }
 

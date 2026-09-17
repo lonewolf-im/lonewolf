@@ -12,12 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bumpalo"
-version = "3.20.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
-
-[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,9 +147,9 @@ version = "0.1.0"
 name = "lonewolf-xmpp"
 version = "0.1.0"
 dependencies = [
- "bumpalo",
  "icu_properties",
  "idna",
+ "lonewolf-util",
  "precis-profiles",
 ]
 

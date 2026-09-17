@@ -97,3 +97,8 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Normal operating-system interfaces and platform runtime libraries are allowed. Rust bindings to these interfaces, such as `libc`, are allowed. This exception does not permit application libraries such as SQLite, OpenSSL, or RocksDB.
 - A Rust wrapper does not make a C or C++ backend compliant. Check cryptography providers and other native backends separately from their Rust APIs.
 - Before adding or updating a dependency or enabling a feature, inspect the resolved dependency and feature graph, relevant build scripts, and native linkage. Do not introduce a C or C++ application library through any of these paths.
+
+## 10. README Rule
+
+- Keep `README.md` limited to `XMPP server written in Rust`.
+- Do not modify `README.md` in future pull requests unless the user explicitly requests a README change.

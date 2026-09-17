@@ -1,6 +1,6 @@
 [package]
 name = "lonewolf"
-description = "An XMPP server focused on performance and a low memory footprint"
+description = "XMPP server written in Rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

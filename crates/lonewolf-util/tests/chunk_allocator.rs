@@ -2,12 +2,14 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use lonewolf_util::arena::{AllocationError, Chunk, ChunkAllocator, GlobalChunkAllocator};
+use lonewolf_util::arena::{
+    AllocationError, Arena, ArenaConfig, Chunk, ChunkAllocator, GlobalChunkAllocator,
+};
 
 #[derive(Clone, Copy, Default)]
 struct AllocationTrace {
@@ -216,5 +218,50 @@ fn shared_allocator_preserves_allocation_errors() -> Result<(), AllocationError>
 
     let chunk = allocator.allocate(Layout::new::<u64>())?;
     unsafe { allocator.deallocate(chunk) };
+    Ok(())
+}
+
+struct SystemChunkAllocator;
+
+// Direct system allocation bypasses the global allocation trace.
+unsafe impl ChunkAllocator for SystemChunkAllocator {
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        if layout.size() == 0 {
+            return Err(AllocationError::UnsupportedLayout);
+        }
+        let pointer =
+            NonNull::new(unsafe { System.alloc(layout) }).ok_or(AllocationError::Exhausted)?;
+        Ok(unsafe { Chunk::from_raw_parts(pointer, layout) })
+    }
+
+    unsafe fn deallocate(&self, chunk: Chunk) {
+        let (pointer, layout) = chunk.into_raw_parts();
+        unsafe { System.dealloc(pointer.as_ptr(), layout) };
+    }
+}
+
+#[test]
+fn arena_storage_uses_only_the_supplied_allocator() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ArenaConfig::default();
+    TRACE.set(AllocationTrace::default());
+
+    let mut arena = Arena::try_new_in(config, SystemChunkAllocator)?;
+    let text = arena.try_alloc_str("stanza")?;
+    let number = arena.try_alloc(42_u64)?;
+    let bytes = arena.try_alloc_slice_copy(&[1, 2, 3])?;
+    let large = arena.try_alloc_slice_fill(32 * 1024, 7_u8)?;
+    *arena.get_mut(number)? = 99;
+    let shared = arena.freeze();
+    let recipient = shared.clone();
+    drop(shared);
+    assert_eq!(recipient.get(text)?, "stanza");
+    assert_eq!(*recipient.get(number)?, 99);
+    assert_eq!(recipient.get(bytes)?, [1, 2, 3]);
+    assert_eq!(recipient.get(large)?.len(), 32 * 1024);
+    drop(recipient);
+
+    let trace = TRACE.get();
+    assert!(trace.allocated.is_none());
+    assert!(trace.deallocated.is_none());
     Ok(())
 }

@@ -100,5 +100,5 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 
 ## 10. README Rule
 
-- Keep `README.md` limited to `XMPP server written in Rust`.
+- Keep `README.md` limited to the `# Lonewolf` header and `XMPP server written in Rust` description.
 - Do not modify `README.md` in future pull requests unless the user explicitly requests a README change.

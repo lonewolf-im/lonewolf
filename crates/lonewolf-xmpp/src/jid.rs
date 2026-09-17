@@ -14,11 +14,9 @@ pub const MAX_JID_LEN: usize = 3 * MAX_PART_LEN + 2;
 
 /// Text is normalized under [RFC 7622]. Resourceparts remain case-sensitive.
 /// Storage uses the caller's arena. Unicode preparation can allocate temporary heap buffers.
-/// Optional parts must be nonempty when present. Localpart escaping is not automatic.
-/// Localpart and resourcepart character support follows the [PRECIS tables].
+/// Localpart escaping is not automatic.
 ///
 /// [RFC 7622]: https://www.rfc-editor.org/rfc/rfc7622.html
-/// [PRECIS tables]: precis_profiles::precis_core::UNICODE_VERSION
 #[derive(Clone)]
 pub struct Jid<'arena> {
     text: &'arena str,
@@ -38,12 +36,11 @@ pub enum JidError {
     EmptyPart(JidPart),
     PartTooLong(JidPart),
     InvalidPart(JidPart),
-    /// Covers arena allocation failures. Unicode libraries do not return allocation errors.
+    /// Only arena allocation failures are reported.
     AllocationFailed,
 }
 
 impl<'arena> Jid<'arena> {
-    /// Validates and normalizes the input before storing it in the arena.
     pub fn parse_in(input: &str, arena: &'arena Bump) -> Result<Self, JidError> {
         let (bare, resourcepart) = input
             .split_once('/')
@@ -54,7 +51,6 @@ impl<'arena> Jid<'arena> {
         Self::from_parts_in(localpart, domainpart, resourcepart, arena)
     }
 
-    /// Validates and normalizes each component before storing it in the arena.
     pub fn from_parts_in(
         localpart: Option<&str>,
         domainpart: &str,
@@ -74,7 +70,7 @@ impl<'arena> Jid<'arena> {
     }
 
     /// Requires components validated and normalized by this library before storage.
-    /// Checks presence, separators, and byte limits without Unicode preparation.
+    /// Skips Unicode preparation to reuse trusted stored values.
     pub fn from_trusted_parts_in(
         localpart: Option<&str>,
         domainpart: &str,
@@ -149,7 +145,7 @@ impl<'arena> Jid<'arena> {
         self.resourcepart_start.is_some()
     }
 
-    /// Borrows the existing text without allocating or validating again.
+    /// Reuses existing storage without allocation.
     pub fn bare(&self) -> Self {
         Self {
             text: &self.text[..self.bare_len()],
@@ -158,7 +154,6 @@ impl<'arena> Jid<'arena> {
         }
     }
 
-    /// Validates and normalizes the resource, then copies the complete JID into the arena.
     pub fn with_resource_in<'target>(
         &self,
         resourcepart: &str,
@@ -173,8 +168,7 @@ impl<'arena> Jid<'arena> {
         )
     }
 
-    /// Copies into the target arena without validating again.
-    /// Only allocation failure returns an error.
+    /// Only arena allocation failure returns an error.
     pub fn clone_in<'target>(&self, arena: &'target Bump) -> Result<Jid<'target>, JidError> {
         Ok(Jid {
             text: arena
@@ -191,7 +185,7 @@ impl<'arena> Jid<'arena> {
     }
 }
 
-/// Does not expose JID text.
+/// Omit address text to prevent disclosure in logs.
 impl fmt::Debug for Jid<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Jid").finish_non_exhaustive()

@@ -22,20 +22,16 @@ Whenever you modify, create, or delete Rust (`.rs`) files, you MUST follow this 
    - Re-run the `cargo clippy` command to verify the fix worked.
 4. **Completion:** Do not report that you are finished until `cargo fmt` has been run and `cargo clippy` returns a clean, zero-exit-code run with no warnings.
 
-## 3. No Slop Comments Rule
+## 3. Code Comments
 
-Apply this rule to every code comment and doc comment in the repository.
-
-- A comment is a last resort. Keep or add one only when it is 100% necessary to understand correctness, safety, an external constraint, or a non-obvious design choice.
-- First try to make the code clear through names, types, functions, and structure. If that works, do not write a comment.
-- Explain why the code exists or why the obvious approach is wrong. Never narrate what the next line does, restate a name or type, label a section, or describe routine control flow.
-- Use ASD-STE100 Simplified Technical English as the writing guide. Use short, direct sentences, common words, active voice, and one idea per sentence. Remove filler, history, speculation, jokes, and decorative wording.
-- Keep comments as short as possible. If more detail is essential, link to the relevant specification or architecture document.
-- Apply the same standard to public API documentation. Document only contracts, invariants, side effects, errors, or units that the signature does not make clear.
-- Do not include temporary or historical facts such as versions, dates, ticket status, what is new, or what the code did before. Put change history in commits and pull requests.
-- When modifying a file, remove or rewrite any comment that fails this rule, even if the comment predates the current change.
-- License headers and comments required by external tools or formats are exempt.
-- Do not use em dashes or ellipses in comments.
+- **Omit comments by default.** New code should carry no comments unless one of the exceptions below applies. Do not narrate what the code does — that is recoverable from the code itself. Never add a comment that restates the adjacent statement, labels an obvious block, or describes the change you just made.
+- **Exception 1 — non-obvious "why".** Add a comment when it explains *why* the code does something a certain way and that rationale is not obvious from reading it: a subtle correctness or performance reason, a non-obvious invariant or constraint, a workaround, or a reference to an external requirement.
+- **Exception 2 — the deliberate omission.** Add a comment when a casual reader would expect some action to happen here and it deliberately does not, so they don't "fix" it by adding it back. Explain why it was intentionally left out.
+- **Exception 3 — godoc on non-obvious functions.** For a new method or function whose behaviour isn't obvious or that carries important invariants, a brief godoc-style doc comment is fine. Keep it short and focused on the contract/invariants, not a line-by-line description.
+- **Keep comments self-contained.** Do not name specific symbols (functions, types, variables) or describe behaviour that lives far from the comment — those references silently go stale when the remote code changes. State the rationale in terms of the invariant or consequence itself, not by pointing at distant code that must be kept in sync.
+- **Tests get the same treatment, usually less.** Do not write a doc comment above a test function narrating the scenario, and do not annotate steps inside a test body ("bring the DB up", "simulate a newer binary", "now assert…"). A precise test name plus readable setup and assertion messages already convey intent; a step comment that restates the next line is noise. Keep a comment only for a genuine non-obvious "why" (Exceptions 1–2) — e.g. why the test forces an otherwise-invalid state.
+- **No decorative separators.** Never add divider/section comments (`// --- label ---`, `// === section ===`, trailing dashes). Group with blank lines or split the file instead.
+- **Test:** if a comment could be deleted without losing information not already in the code, delete it.
 
 ## 4. License Header Rule
 

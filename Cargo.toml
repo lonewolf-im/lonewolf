@@ -10,4 +10,7 @@ publish = false
 
 [workspace.dependencies]
 bumpalo = { version = "3.20.3", default-features = false }
+icu_properties = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
+idna = "1.1.0"
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }
+precis-profiles = { version = "0.2.0", default-features = false }

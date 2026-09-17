@@ -1,6 +1,7 @@
 # Lonewolf
 
 Lonewolf is a Rust XMPP server focused on performance and a low memory footprint.
+It targets Unix systems, with Linux and macOS covered by CI.
 
 The Rust 2024 workspace contains two crates:
 
@@ -46,8 +47,8 @@ bash scripts/check-license-headers.sh
 ```
 
 GitHub Actions runs these checks for pull requests, merge queues, pushes to `main`,
-manual runs, and every Monday. Clippy, tests, and release builds run on Linux,
-macOS, and Windows. Compiler and documentation warnings fail CI. The `CI` job
+manual runs, and every Monday. Clippy, tests, and release builds run on Linux and
+macOS. Compiler and documentation warnings fail CI. The `CI` job
 requires every validation job to pass and can be used as a required status check
 in branch protection.
 
@@ -60,7 +61,8 @@ cargo deny --workspace --all-features --locked check
 ```
 
 The policy checks security advisories, licenses, dependency sources, and common
-C/C++ backends across all target-specific, build, and development dependencies.
+C/C++ backends across target-specific, build, and development dependencies for
+the Linux and macOS targets listed in `deny.toml`.
 Duplicate versions produce warnings. Only the licenses listed in `deny.toml` and
 the default crates.io registry are allowed. The native backend denylist is not
 exhaustive: dependency and feature changes still require review of the resolved

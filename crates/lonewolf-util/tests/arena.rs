@@ -7,8 +7,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use lonewolf_util::arena::{
-    AllocationError, Arena, ArenaConfig, ArenaError, Chunk, ChunkAllocator, GlobalChunkAllocator,
-    Handle, HandleError, SharedArena,
+    AllocationError, Arena, ArenaConfig, ArenaError, Chunk, ChunkAllocator, ChunkAllocatorHandle,
+    GlobalChunkAllocator, Handle, HandleError, SharedArena,
 };
 
 fn assert_send<T: Send>() {}
@@ -116,6 +116,74 @@ impl Drop for TestAllocator {
         assert_eq!(self.0.live_bytes.load(Ordering::Relaxed), 0);
         self.0.drops.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+#[test]
+fn allocator_handle_clones_keep_one_parent_reference() {
+    let state = Arc::new(AllocatorState::default());
+    let allocator: Arc<dyn ChunkAllocator> = Arc::new(TestAllocator(state.clone()));
+    let first = ChunkAllocatorHandle::new(allocator.clone());
+    let second = ChunkAllocatorHandle::new(allocator.clone());
+    assert_send_sync_static::<ChunkAllocatorHandle<dyn ChunkAllocator>>();
+    assert_eq!(Arc::strong_count(&allocator), 3);
+    let copy = first.clone();
+    assert_eq!(Arc::strong_count(&allocator), 3);
+    drop(first);
+    drop(second);
+    assert_eq!(Arc::strong_count(&allocator), 2);
+    drop(allocator);
+    assert_eq!(state.drops.load(Ordering::Relaxed), 0);
+    drop(copy);
+    assert_eq!(state.drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn allocator_handles_keep_storage_alive_after_the_producer_exits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(AllocatorState::default());
+    let allocator: Arc<dyn ChunkAllocator> = Arc::new(TestAllocator(state.clone()));
+    let (shared, payload) = thread::spawn(move || {
+        let handle = ChunkAllocatorHandle::new(allocator);
+        let mut arena = Arena::try_new_in(config(256, 4096), handle.clone())?;
+        let payload = arena.try_alloc_slice_fill(512, 7_u8)?;
+        Ok::<_, ArenaError>((arena.freeze(), payload))
+    })
+    .join()
+    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+    assert_eq!(state.drops.load(Ordering::Relaxed), 0);
+    let barrier = Barrier::new(2);
+    thread::scope(|scope| {
+        for recipient in [shared.clone(), shared] {
+            let barrier = &barrier;
+            let state = &state;
+            scope.spawn(move || {
+                assert_eq!(recipient.get(payload), Ok([7_u8; 512].as_slice()));
+                assert_eq!(state.drops.load(Ordering::Relaxed), 0);
+                barrier.wait();
+            });
+        }
+    });
+    assert_eq!(state.live_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        state.allocations.load(Ordering::Relaxed),
+        state.deallocations.load(Ordering::Relaxed)
+    );
+    assert_eq!(state.drops.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn failed_arena_creation_releases_its_allocator_handle() {
+    let state = Arc::new(AllocatorState::default());
+    let allocator = Arc::new(TestAllocator(state.clone()));
+    let weak = Arc::downgrade(&allocator);
+    state.fail_next.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        Arena::try_new_in(config(256, 4096), ChunkAllocatorHandle::new(allocator)),
+        Err(ArenaError::Allocation(AllocationError::Exhausted))
+    ));
+    assert!(weak.upgrade().is_none());
+    assert_eq!(state.drops.load(Ordering::Relaxed), 1);
 }
 
 #[test]

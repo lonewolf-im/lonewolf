@@ -10,10 +10,17 @@ use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
+use crossbeam_utils::CachePadded;
+
 pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024;
 pub const DEFAULT_MAX_RESERVED_BYTES: usize = 8 * 1024 * 1024;
 
 static NEXT_ARENA_ID: AtomicUsize = AtomicUsize::new(1);
+const IDENTITY_BATCH_SIZE: usize = 1024;
+
+thread_local! {
+    static ARENA_IDS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
 
 /// Owns an uninitialized block. Return it through its allocator; dropping it does not free it.
 ///
@@ -114,6 +121,41 @@ unsafe impl<A: ChunkAllocator + ?Sized> ChunkAllocator for Arc<A> {
     }
 }
 
+/// Create one per long-lived producer to separate allocator reference counts.
+/// Clones share this handle's counter. Independent handles share only the allocator.
+pub struct ChunkAllocatorHandle<A: ChunkAllocator + ?Sized> {
+    // Alignment keeps the reference count apart from this read-only allocator pointer.
+    owner: Arc<CachePadded<Arc<A>>>,
+}
+
+impl<A: ChunkAllocator + ?Sized> ChunkAllocatorHandle<A> {
+    /// Allocates bookkeeping on the global heap. Failure uses the global allocation error handler.
+    pub fn new(allocator: Arc<A>) -> Self {
+        Self {
+            owner: Arc::new(CachePadded::new(allocator)),
+        }
+    }
+}
+
+impl<A: ChunkAllocator + ?Sized> Clone for ChunkAllocatorHandle<A> {
+    fn clone(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+        }
+    }
+}
+
+// Shared ownership keeps the backing allocator alive until all handles are dropped.
+unsafe impl<A: ChunkAllocator + ?Sized> ChunkAllocator for ChunkAllocatorHandle<A> {
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        self.owner.allocate(layout)
+    }
+
+    unsafe fn deallocate(&self, chunk: Chunk) {
+        unsafe { self.owner.deallocate(chunk) };
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AllocationError {
     UnsupportedLayout,
@@ -147,7 +189,6 @@ pub struct ArenaConfig {
 }
 
 impl Default for ArenaConfig {
-    /// Uses 4 KiB chunk requests and an 8 MiB budget, including metadata and unused capacity.
     fn default() -> Self {
         Self {
             chunk_size: const { NonZeroUsize::new(DEFAULT_CHUNK_SIZE).unwrap() },
@@ -234,7 +275,7 @@ impl<A: ChunkAllocator> Arena<A> {
             return Err(ArenaError::InvalidConfiguration);
         }
 
-        let identity = take_identity(&NEXT_ARENA_ID)?;
+        let identity = ARENA_IDS.with(|range| take_identity(&NEXT_ARENA_ID, range))?;
         let chunk = allocator.allocate(layout).map_err(ArenaError::Allocation)?;
         let capacity = chunk.capacity();
         if capacity > config.max_reserved_bytes.get() {
@@ -537,15 +578,26 @@ impl ChunkHeader {
     }
 }
 
-fn take_identity(counter: &AtomicUsize) -> Result<usize, ArenaError> {
-    let mut identity = counter.load(Ordering::Relaxed);
+fn take_identity(counter: &AtomicUsize, range: &Cell<(usize, usize)>) -> Result<usize, ArenaError> {
+    let (mut next, mut end) = range.get();
+    if next == end {
+        (next, end) = reserve_identities(counter)?;
+    }
+    range.set((next + 1, end));
+    Ok(next)
+}
+
+fn reserve_identities(counter: &AtomicUsize) -> Result<(usize, usize), ArenaError> {
+    let mut first = counter.load(Ordering::Relaxed);
     loop {
-        let next = identity
-            .checked_add(1)
-            .ok_or(ArenaError::IdentityExhausted)?;
-        match counter.compare_exchange_weak(identity, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Ok(identity),
-            Err(current) => identity = current,
+        if first == usize::MAX {
+            return Err(ArenaError::IdentityExhausted);
+        }
+        let end = first.saturating_add(IDENTITY_BATCH_SIZE);
+        // This counter reserves disjoint ranges. It does not publish arena storage.
+        match counter.compare_exchange_weak(first, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok((first, end)),
+            Err(current) => first = current,
         }
     }
 }
@@ -605,14 +657,65 @@ impl std::error::Error for HandleError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ArenaError, take_identity};
-    use std::sync::atomic::AtomicUsize;
+    use super::{ARENA_IDS, ArenaError, IDENTITY_BATCH_SIZE, NEXT_ARENA_ID, take_identity};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn exhausted_identities_never_wrap() {
-        let counter = AtomicUsize::new(usize::MAX - 1);
-        assert_eq!(take_identity(&counter), Ok(usize::MAX - 1));
-        assert_eq!(take_identity(&counter), Err(ArenaError::IdentityExhausted));
-        assert_eq!(take_identity(&counter), Err(ArenaError::IdentityExhausted));
+        let counter = AtomicUsize::new(usize::MAX - 3);
+        let range = Cell::new((0, 0));
+        for expected in usize::MAX - 3..usize::MAX {
+            assert_eq!(take_identity(&counter, &range), Ok(expected));
+        }
+        assert_eq!(
+            take_identity(&counter, &range),
+            Err(ArenaError::IdentityExhausted)
+        );
+        assert_eq!(
+            take_identity(&counter, &range),
+            Err(ArenaError::IdentityExhausted)
+        );
+    }
+
+    #[test]
+    fn identity_ranges_refill_without_reusing_abandoned_ids() -> Result<(), ArenaError> {
+        let counter = AtomicUsize::new(1);
+        let first = Cell::new((0, 0));
+        let second = Cell::new((0, 0));
+        assert_eq!(take_identity(&counter, &first)?, 1);
+        for expected in IDENTITY_BATCH_SIZE + 1..=3 * IDENTITY_BATCH_SIZE {
+            assert_eq!(take_identity(&counter, &second)?, expected);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 3 * IDENTITY_BATCH_SIZE + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_local_identities_stay_unique_across_refills_and_thread_exit() {
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            (0..2 * IDENTITY_BATCH_SIZE + 1)
+                                .map(|_| {
+                                    ARENA_IDS
+                                        .with(|range| take_identity(&NEXT_ARENA_ID, range))
+                                        .expect("identity")
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    ids.extend(worker.join().expect("worker"));
+                }
+            });
+        }
+        ids.sort_unstable();
+        assert!(ids[0] > 0);
+        assert!(ids.windows(2).all(|pair| pair[0] != pair[1]));
     }
 }

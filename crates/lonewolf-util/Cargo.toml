@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 crossbeam-queue.workspace = true
+crossbeam-utils.workspace = true
 
 [[bench]]
 name = "pool"

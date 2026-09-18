@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 crossbeam-queue = "0.3.12"
+crossbeam-utils = "0.8.21"
 icu_properties = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 idna = "1.1.0"
 lonewolf-util = { path = "crates/lonewolf-util" }

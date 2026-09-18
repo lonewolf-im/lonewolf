@@ -8,7 +8,7 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 
 use lonewolf_util::arena::{
-    AllocationError, Arena, ArenaConfig, Chunk, ChunkAllocator, HandleError,
+    AllocationError, Arena, ArenaConfig, Chunk, ChunkAllocator, ChunkAllocatorHandle, HandleError,
 };
 use lonewolf_util::pool::{
     DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError, PooledChunkAllocator,
@@ -101,6 +101,7 @@ fn traced<T>(fail_at: Option<usize>, operation: impl FnOnce() -> T) -> (T, Trace
 fn small_config() -> PoolConfig {
     PoolConfig {
         total_bytes: const { NonZeroUsize::new(MIN_POOL_SIZE).unwrap() },
+        ..PoolConfig::default()
     }
 }
 
@@ -142,6 +143,7 @@ fn invalid_configurations_do_not_allocate() -> TestResult {
     ] {
         let config = PoolConfig {
             total_bytes: NonZeroUsize::new(bytes).ok_or("nonzero size")?,
+            ..small_config()
         };
         let (result, trace) = traced(None, || PooledChunkAllocator::try_new(config));
         assert!(matches!(result, Err(PoolError::InvalidConfiguration)));
@@ -155,6 +157,7 @@ fn configured_capacity_scales_every_bucket() -> TestResult {
     for multiplier in [1, 2] {
         let config = PoolConfig {
             total_bytes: NonZeroUsize::new(multiplier * MIN_POOL_SIZE).ok_or("nonzero size")?,
+            ..small_config()
         };
         let pool = PooledChunkAllocator::try_new(config)?;
         assert_eq!(pool.config(), config);
@@ -170,6 +173,25 @@ fn configured_capacity_scales_every_bucket() -> TestResult {
                 bucket.chunk_bytes * bucket.total_chunks,
                 multiplier * 1024 * 1024
             );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn shard_counts_respect_requests_cpu_limits_and_bucket_capacity() -> TestResult {
+    let available = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+    assert_eq!(PoolConfig::default().shards_per_bucket, available);
+    for requested in [1, 3, 16, 24, usize::MAX] {
+        let pool = PooledChunkAllocator::try_new(PoolConfig {
+            shards_per_bucket: NonZeroUsize::new(requested).ok_or("nonzero shards")?,
+            ..small_config()
+        })?;
+        let effective = requested.min(available.get());
+        assert_eq!(pool.config().shards_per_bucket.get(), effective);
+        for bucket in pool.stats().buckets {
+            assert_eq!(bucket.shard_count, effective.min(bucket.total_chunks));
+            assert_eq!(bucket.available_chunks, bucket.total_chunks);
         }
     }
     Ok(())
@@ -352,11 +374,12 @@ fn failed_heap_fallback_preserves_pool_state_and_can_be_retried() -> TestResult 
 }
 
 #[test]
-fn arena_reuse_needs_no_heap_allocations_after_pool_creation() -> TestResult {
+fn arena_reuse_needs_no_heap_allocations_after_producer_setup() -> TestResult {
     let pool = Arc::new(PooledChunkAllocator::try_new(small_config())?);
+    let allocator = ChunkAllocatorHandle::new(pool.clone());
     let (result, trace) = traced(None, || {
         for _ in 0..32 {
-            let mut arena = Arena::try_new_in(ArenaConfig::default(), pool.clone())?;
+            let mut arena = Arena::try_new_in(ArenaConfig::default(), allocator.clone())?;
             let text = arena.try_alloc_str("example.com")?;
             let bytes = arena.try_alloc_slice_fill(5000, 7_u8)?;
             let shared = arena.freeze();
@@ -480,7 +503,7 @@ fn arena_can_own_its_pool_inside_pooled_storage() -> TestResult {
 fn frozen_arena_returns_chunks_after_the_last_recipient() -> TestResult {
     let pool = Arc::new(PooledChunkAllocator::try_new(small_config())?);
     let backend: Arc<dyn ChunkAllocator> = pool.clone();
-    let mut arena = Arena::try_new_in(ArenaConfig::default(), backend)?;
+    let mut arena = Arena::try_new_in(ArenaConfig::default(), ChunkAllocatorHandle::new(backend))?;
     let text = arena.try_alloc_str("example.com")?;
     let bytes = arena.try_alloc_slice_fill(5000, 9_u8)?;
     let frozen = arena.freeze();

@@ -102,6 +102,70 @@ pub struct ElementBuilder<'a, A: ChunkAllocator> {
     children: SliceBuilder<Node>,
 }
 
+pub(crate) struct ElementFrame {
+    name: Name,
+    attributes: AttributesBuilder,
+    children: SliceBuilder<Node>,
+}
+
+impl ElementFrame {
+    pub(super) fn new<A: ChunkAllocator>(
+        name: &str,
+        namespace: &str,
+        arena: &mut Arena<A>,
+    ) -> Result<Self, BuildError> {
+        Ok(Self {
+            name: Name::new(name, namespace, false, arena)?,
+            attributes: AttributesBuilder::new(),
+            children: SliceBuilder::new(),
+        })
+    }
+
+    pub(super) fn attribute<A: ChunkAllocator>(
+        &mut self,
+        name: &str,
+        namespace: &str,
+        value: &str,
+        arena: &mut Arena<A>,
+    ) -> Result<(), BuildError> {
+        if self.attributes.find(name, namespace, arena)?.is_some() {
+            return Err(BuildError::DuplicateAttribute);
+        }
+        self.attributes.set(name, namespace, value, arena)
+    }
+
+    pub(super) fn text<A: ChunkAllocator>(
+        &mut self,
+        text: &str,
+        arena: &mut Arena<A>,
+    ) -> Result<(), BuildError> {
+        xml::validate_text(text)?;
+        let text = arena.try_alloc_str(text)?;
+        self.children.push(Node::Text(text), arena)
+    }
+
+    pub(super) fn child<A: ChunkAllocator>(
+        &mut self,
+        element: Element,
+        arena: &mut Arena<A>,
+    ) -> Result<(), BuildError> {
+        self.children.push(Node::Element(element), arena)
+    }
+
+    pub(super) fn finish<A: ChunkAllocator>(
+        self,
+        arena: &mut Arena<A>,
+    ) -> Result<Element, BuildError> {
+        ElementBuilder {
+            arena,
+            name: self.name,
+            attributes: self.attributes,
+            children: self.children,
+        }
+        .build()
+    }
+}
+
 impl Element {
     pub fn builder_in<'a, A: ChunkAllocator>(
         name: &str,
@@ -422,7 +486,7 @@ impl AttributesBuilder {
         Ok(())
     }
 
-    fn find(
+    pub(super) fn find(
         &self,
         name: &str,
         namespace: &str,

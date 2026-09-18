@@ -7,7 +7,7 @@ use super::BuildError;
 pub(super) const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
-pub(super) fn validate_name(
+pub(crate) fn validate_name(
     name: &str,
     namespace: &str,
     attribute: bool,
@@ -35,7 +35,7 @@ fn name_start(ch: char) -> bool {
         | '\u{10000}'..='\u{effff}')
 }
 
-pub(super) fn validate_text(text: &str) -> Result<(), BuildError> {
+pub(crate) fn validate_text(text: &str) -> Result<(), BuildError> {
     if text.chars().all(|ch| {
         matches!(ch, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
     }) {

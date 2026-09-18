@@ -15,18 +15,26 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+base64 = "0.22.1"
 compio-io = { version = "0.10.1", default-features = false, features = ["compat"] }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 futures-executor = "0.3.34"
+getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
+hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
 icu_properties = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 idna = "1.1.0"
 lonewolf-auth = { path = "crates/lonewolf-auth" }
 lonewolf-util = { path = "crates/lonewolf-util" }
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 precis-profiles = { version = "0.2.0", default-features = false }
 quick-xml = { version = "0.41.0", default-features = false, features = ["async-tokio"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
+sha1 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+stringprep = "0.1.5"
 tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false, features = ["io-util"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["compat"] }
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }

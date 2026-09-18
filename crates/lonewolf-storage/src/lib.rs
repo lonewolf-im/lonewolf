@@ -6,3 +6,4 @@ mod error;
 mod redb;
 
 pub use error::{StorageError, StorageErrorKind};
+pub use redb::RedbDatabase;

@@ -15,7 +15,9 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+async-lock = "3.4.2"
 base64 = "0.22.1"
+blocking = "1.7.0"
 compio-io = { version = "0.10.1", default-features = false, features = ["compat"] }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"

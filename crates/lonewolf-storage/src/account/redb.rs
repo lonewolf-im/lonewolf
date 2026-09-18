@@ -11,7 +11,9 @@ use lonewolf_auth::scram::{
 };
 
 use crate::account::{Account, AccountError, AccountKey, AccountRepository, NewAccount};
-use crate::redb::{METADATA, begin_write, commit_error, open_database, storage_error};
+use crate::redb::{
+    METADATA, begin_write, commit_error, open_database, run_blocking, storage_error,
+};
 use crate::{StorageError, StorageErrorKind};
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
@@ -22,15 +24,19 @@ const SHA1: u8 = 1;
 const SHA256: u8 = 2;
 const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2);
 
+/// Account operations use a shared, bounded blocking pool.
+/// Dropping a request future does not stop an operation that has started.
 pub struct RedbAccountRepository {
     database: Arc<Database>,
 }
 
 impl RedbAccountRepository {
+    /// Opens the database and initializes its schema synchronously.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::from_database(Arc::new(open_database(path)?))
     }
 
+    /// Checks and initializes the schema synchronously.
     pub fn from_database(database: Arc<Database>) -> Result<Self, StorageError> {
         let transaction = begin_write(&database)?;
         let initialize;
@@ -72,33 +78,14 @@ impl RedbAccountRepository {
 
 impl AccountRepository for RedbAccountRepository {
     async fn create(&self, account: NewAccount) -> Result<(), AccountError> {
-        let record = encode_credentials(&account.credentials);
-        let transaction = begin_write(&self.database)?;
-        {
-            let mut table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-            if table
-                .get(account.key.as_str())
-                .map_err(storage_error)?
-                .is_some()
-            {
-                return Err(AccountError::AlreadyExists);
-            }
-            table
-                .insert(account.key.as_str(), record.as_slice())
-                .map_err(storage_error)?;
-        }
-        transaction.commit().map_err(commit_error)?;
-        Ok(())
+        let database = Arc::clone(&self.database);
+        run_blocking(move || create(&database, account)).await
     }
 
     async fn get(&self, key: &AccountKey) -> Result<Option<Account>, AccountError> {
-        let transaction = self.database.begin_read().map_err(storage_error)?;
-        let table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-        let Some(record) = table.get(key.as_str()).map_err(storage_error)? else {
-            return Ok(None);
-        };
-        decode_credentials(record.value())?;
-        Ok(Some(Account { key: key.clone() }))
+        let database = Arc::clone(&self.database);
+        let key = key.clone();
+        run_blocking(move || get(&database, key)).await
     }
 
     async fn get_scram(
@@ -106,16 +93,9 @@ impl AccountRepository for RedbAccountRepository {
         key: &AccountKey,
         hash: ScramHash,
     ) -> Result<Option<ScramVerifier>, AccountError> {
-        let transaction = self.database.begin_read().map_err(storage_error)?;
-        let table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-        let Some(record) = table.get(key.as_str()).map_err(storage_error)? else {
-            return Ok(None);
-        };
-        let credentials = decode_credentials(record.value())?;
-        Ok(match hash {
-            ScramHash::Sha1 => credentials.sha1.map(ScramVerifier::Sha1),
-            ScramHash::Sha256 => credentials.sha256.map(ScramVerifier::Sha256),
-        })
+        let database = Arc::clone(&self.database);
+        let key = key.clone();
+        run_blocking(move || get_scram(&database, &key, hash)).await
     }
 
     async fn replace_credentials(
@@ -123,23 +103,80 @@ impl AccountRepository for RedbAccountRepository {
         key: &AccountKey,
         credentials: ScramCredentials,
     ) -> Result<(), AccountError> {
-        let record = encode_credentials(&credentials);
-        let transaction = begin_write(&self.database)?;
-        {
-            let mut table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-            {
-                let Some(existing) = table.get(key.as_str()).map_err(storage_error)? else {
-                    return Err(AccountError::NotFound);
-                };
-                decode_credentials(existing.value())?;
-            }
-            table
-                .insert(key.as_str(), record.as_slice())
-                .map_err(storage_error)?;
-        }
-        transaction.commit().map_err(commit_error)?;
-        Ok(())
+        let database = Arc::clone(&self.database);
+        let key = key.clone();
+        run_blocking(move || replace_credentials(&database, &key, credentials)).await
     }
+}
+
+fn create(database: &Database, account: NewAccount) -> Result<(), AccountError> {
+    let record = encode_credentials(&account.credentials);
+    let transaction = begin_write(database)?;
+    {
+        let mut table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+        if table
+            .get(account.key.as_str())
+            .map_err(storage_error)?
+            .is_some()
+        {
+            return Err(AccountError::AlreadyExists);
+        }
+        table
+            .insert(account.key.as_str(), record.as_slice())
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(commit_error)?;
+    Ok(())
+}
+
+fn get(database: &Database, key: AccountKey) -> Result<Option<Account>, AccountError> {
+    let transaction = database.begin_read().map_err(storage_error)?;
+    let table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+    let Some(record) = table.get(key.as_str()).map_err(storage_error)? else {
+        return Ok(None);
+    };
+    decode_credentials(record.value())?;
+    Ok(Some(Account { key }))
+}
+
+fn get_scram(
+    database: &Database,
+    key: &AccountKey,
+    hash: ScramHash,
+) -> Result<Option<ScramVerifier>, AccountError> {
+    let transaction = database.begin_read().map_err(storage_error)?;
+    let table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+    let Some(record) = table.get(key.as_str()).map_err(storage_error)? else {
+        return Ok(None);
+    };
+    let credentials = decode_credentials(record.value())?;
+    Ok(match hash {
+        ScramHash::Sha1 => credentials.sha1.map(ScramVerifier::Sha1),
+        ScramHash::Sha256 => credentials.sha256.map(ScramVerifier::Sha256),
+    })
+}
+
+fn replace_credentials(
+    database: &Database,
+    key: &AccountKey,
+    credentials: ScramCredentials,
+) -> Result<(), AccountError> {
+    let record = encode_credentials(&credentials);
+    let transaction = begin_write(database)?;
+    {
+        let mut table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+        {
+            let Some(existing) = table.get(key.as_str()).map_err(storage_error)? else {
+                return Err(AccountError::NotFound);
+            };
+            decode_credentials(existing.value())?;
+        }
+        table
+            .insert(key.as_str(), record.as_slice())
+            .map_err(storage_error)?;
+    }
+    transaction.commit().map_err(commit_error)?;
+    Ok(())
 }
 
 struct EncodedCredentials {

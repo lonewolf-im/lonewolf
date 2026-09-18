@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::future::Future;
 use std::sync::{Arc, Barrier};
+use std::task::{Context, Waker};
 use std::thread;
+use std::time::Duration;
 
 use futures_executor::block_on;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
@@ -408,5 +411,111 @@ fn commit_failure_reports_unknown_outcome_and_recovers_a_complete_record() -> Te
         block_on(repository.get_scram(&account, ScramHash::Sha256))?,
         marker + 3,
     )?;
+    Ok(())
+}
+
+#[test]
+fn all_account_operations_do_database_io_off_the_callers_thread() -> TestResult {
+    let backend = ObservedBackend::default();
+    let database = Database::builder()
+        .set_cache_size(0)
+        .create_with_backend(backend.clone())?;
+    let repository = RedbAccountRepository::from_database(Arc::new(database))?;
+    let account = key("alice@example.com")?;
+    backend.take_threads()?;
+
+    block_on(repository.create(NewAccount {
+        key: account.clone(),
+        credentials: credentials(10),
+    }))?;
+    assert_worker_threads(&backend)?;
+    assert!(block_on(repository.get(&account))?.is_some());
+    assert_worker_threads(&backend)?;
+    assert_scram(
+        block_on(repository.get_scram(&account, ScramHash::Sha256))?,
+        13,
+    )?;
+    assert_worker_threads(&backend)?;
+    block_on(repository.replace_credentials(&account, credentials(20)))?;
+    assert_worker_threads(&backend)?;
+    Ok(())
+}
+
+#[test]
+fn reads_continue_while_a_write_waits_for_disk_sync() -> TestResult {
+    let backend = ObservedBackend::default();
+    let database = Database::builder()
+        .set_cache_size(1024 * 1024)
+        .create_with_backend(backend.clone())?;
+    let repository = RedbAccountRepository::from_database(Arc::new(database))?;
+    let existing = key("existing@example.com")?;
+    let new = key("new@example.com")?;
+    block_on(repository.create(NewAccount {
+        key: existing.clone(),
+        credentials: credentials(10),
+    }))?;
+    let (entered, release) = backend.block_next_sync()?;
+    let mut write = Box::pin(repository.create(NewAccount {
+        key: new.clone(),
+        credentials: credentials(20),
+    }));
+    assert!(
+        write
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    entered.recv_timeout(Duration::from_secs(5))?;
+
+    assert!(block_on(repository.get(&existing))?.is_some());
+    assert_scram(
+        block_on(repository.get_scram(&existing, ScramHash::Sha256))?,
+        13,
+    )?;
+    assert!(block_on(repository.get(&new))?.is_none());
+    release.send(())?;
+    block_on(write)?;
+    assert!(block_on(repository.get(&new))?.is_some());
+    Ok(())
+}
+
+#[test]
+fn cancelling_a_started_write_does_not_abort_its_commit() -> TestResult {
+    let backend = ObservedBackend::default();
+    let database = Database::builder()
+        .set_cache_size(1024 * 1024)
+        .create_with_backend(backend.clone())?;
+    let repository = RedbAccountRepository::from_database(Arc::new(database))?;
+    let account = key("alice@example.com")?;
+    let (entered, release) = backend.block_next_sync()?;
+    let mut write = Box::pin(repository.create(NewAccount {
+        key: account.clone(),
+        credentials: credentials(10),
+    }));
+    assert!(
+        write
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    entered.recv_timeout(Duration::from_secs(5))?;
+    drop(write);
+    release.send(())?;
+
+    block_on(repository.create(NewAccount {
+        key: key("next@example.com")?,
+        credentials: credentials(20),
+    }))?;
+    assert_scram(
+        block_on(repository.get_scram(&account, ScramHash::Sha256))?,
+        13,
+    )?;
+    Ok(())
+}
+
+fn assert_worker_threads(backend: &ObservedBackend) -> TestResult {
+    let threads = backend.take_threads()?;
+    assert!(!threads.is_empty());
+    assert!(threads.iter().all(|id| *id != thread::current().id()));
     Ok(())
 }

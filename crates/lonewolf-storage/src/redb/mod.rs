@@ -9,8 +9,10 @@ use ::redb::{Database, Durability, TableDefinition, WriteTransaction};
 
 use crate::StorageError;
 
+mod blocking;
 mod error;
 
+pub(crate) use blocking::run as run_blocking;
 pub(crate) use error::{commit_error, storage_error};
 
 pub(crate) const METADATA: TableDefinition<&str, u32> = TableDefinition::new("lonewolf_metadata");

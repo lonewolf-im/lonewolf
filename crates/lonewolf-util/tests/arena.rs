@@ -7,8 +7,8 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use lonewolf_util::arena::{
-    AllocationError, Arena, ArenaConfig, ArenaError, Chunk, ChunkAllocator, GlobalChunkAllocator,
-    Handle, HandleError, SharedArena,
+    AllocationError, Arena, ArenaConfig, ArenaError, Chunk, ChunkAllocator, ChunkAllocatorHandle,
+    GlobalChunkAllocator, Handle, HandleError, SharedArena,
 };
 
 fn assert_send<T: Send>() {}
@@ -119,6 +119,74 @@ impl Drop for TestAllocator {
 }
 
 #[test]
+fn allocator_handle_clones_keep_one_parent_reference() {
+    let state = Arc::new(AllocatorState::default());
+    let allocator: Arc<dyn ChunkAllocator> = Arc::new(TestAllocator(state.clone()));
+    let first = ChunkAllocatorHandle::new(allocator.clone());
+    let second = ChunkAllocatorHandle::new(allocator.clone());
+    assert_send_sync_static::<ChunkAllocatorHandle<dyn ChunkAllocator>>();
+    assert_eq!(Arc::strong_count(&allocator), 3);
+    let copy = first.clone();
+    assert_eq!(Arc::strong_count(&allocator), 3);
+    drop(first);
+    drop(second);
+    assert_eq!(Arc::strong_count(&allocator), 2);
+    drop(allocator);
+    assert_eq!(state.drops.load(Ordering::Relaxed), 0);
+    drop(copy);
+    assert_eq!(state.drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn allocator_handles_keep_storage_alive_after_the_producer_exits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(AllocatorState::default());
+    let allocator: Arc<dyn ChunkAllocator> = Arc::new(TestAllocator(state.clone()));
+    let (shared, payload) = thread::spawn(move || {
+        let handle = ChunkAllocatorHandle::new(allocator);
+        let mut arena = Arena::try_new_in(config(256, 4096), handle.clone())?;
+        let payload = arena.try_alloc_slice_fill(512, 7_u8)?;
+        Ok::<_, ArenaError>((arena.freeze(), payload))
+    })
+    .join()
+    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
+    assert_eq!(state.drops.load(Ordering::Relaxed), 0);
+    let barrier = Barrier::new(2);
+    thread::scope(|scope| {
+        for recipient in [shared.clone(), shared] {
+            let barrier = &barrier;
+            let state = &state;
+            scope.spawn(move || {
+                assert_eq!(recipient.get(payload), Ok([7_u8; 512].as_slice()));
+                assert_eq!(state.drops.load(Ordering::Relaxed), 0);
+                barrier.wait();
+            });
+        }
+    });
+    assert_eq!(state.live_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        state.allocations.load(Ordering::Relaxed),
+        state.deallocations.load(Ordering::Relaxed)
+    );
+    assert_eq!(state.drops.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn failed_arena_creation_releases_its_allocator_handle() {
+    let state = Arc::new(AllocatorState::default());
+    let allocator = Arc::new(TestAllocator(state.clone()));
+    let weak = Arc::downgrade(&allocator);
+    state.fail_next.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        Arena::try_new_in(config(256, 4096), ChunkAllocatorHandle::new(allocator)),
+        Err(ArenaError::Allocation(AllocationError::Exhausted))
+    ));
+    assert!(weak.upgrade().is_none());
+    assert_eq!(state.drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn values_slices_and_strings_survive_mutation_and_freezing()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut arena = Arena::try_new(ArenaConfig::default())?;
@@ -145,6 +213,43 @@ fn values_slices_and_strings_survive_mutation_and_freezing()
 }
 
 #[test]
+fn first_chunk_holds_a_small_stanza_with_a_single_chunk_budget()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(AllocatorState::default());
+    let mut arena = Arena::try_new_in(config(4096, 4096), TestAllocator(state.clone()))?;
+    assert_eq!(arena.stats().reserved_bytes, 4096);
+    assert_eq!(arena.stats().used_bytes, 0);
+    let text = arena.try_alloc_str("alice@example.com")?;
+    let bytes = arena.try_alloc_slice_fill(512, 7_u8)?;
+    assert_eq!(arena.stats().chunk_count, 1);
+    assert_eq!(state.requests.load(Ordering::Relaxed), 1);
+    assert_eq!(state.last_request.load(Ordering::Relaxed), 4096);
+    let shared = arena.freeze();
+    assert_eq!(shared.get(text)?, "alice@example.com");
+    assert_eq!(shared.get(bytes)?, [7; 512]);
+    drop(shared);
+    assert_eq!(state.live_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(state.deallocations.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn ownership_metadata_can_exceed_the_configured_chunk_size()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(AllocatorState::default());
+    let mut arena = Arena::try_new_in(config(1, 4096), TestAllocator(state.clone()))?;
+    assert!(arena.stats().reserved_bytes > 1);
+    assert_eq!(
+        arena.stats().reserved_bytes,
+        state.last_request.load(Ordering::Relaxed)
+    );
+    let value = arena.try_alloc(42_u64)?;
+    assert_eq!(arena.freeze().get(value)?, &42);
+    assert_eq!(state.live_bytes.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 fn growth_uses_fixed_requests_and_preserves_earlier_values()
 -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AllocatorState::default());
@@ -152,8 +257,13 @@ fn growth_uses_fixed_requests_and_preserves_earlier_values()
     let initial = arena.stats();
     let first = arena.try_alloc(1_u8)?;
     assert_eq!(state.last_request.load(Ordering::Relaxed), 4096);
-    assert_eq!(arena.stats().reserved_bytes, initial.reserved_bytes + 4096);
+    assert_eq!(arena.stats().reserved_bytes, initial.reserved_bytes);
     let second = arena.try_alloc(2_u64)?;
+    assert_eq!(state.requests.load(Ordering::Relaxed), 1);
+    let third = arena.try_alloc_slice_fill(2048, 3_u8)?;
+    let fourth = arena.try_alloc_slice_fill(2048, 4_u8)?;
+    assert_eq!(state.last_request.load(Ordering::Relaxed), 4096);
+    assert_eq!(arena.stats().reserved_bytes, initial.reserved_bytes + 4096);
     assert_eq!(state.requests.load(Ordering::Relaxed), 2);
 
     let large = arena.try_alloc_slice_fill(27 * 1024, 0xa5_u8)?;
@@ -161,8 +271,10 @@ fn growth_uses_fixed_requests_and_preserves_earlier_values()
     assert!(state.last_request.load(Ordering::Relaxed) < 28 * 1024);
     assert_eq!(*arena.get(first)?, 1);
     assert_eq!(*arena.get(second)?, 2);
+    assert_eq!(arena.get(third)?, [3; 2048]);
+    assert_eq!(arena.get(fourth)?, [4; 2048]);
     assert!(arena.get(large)?.iter().all(|value| *value == 0xa5));
-    assert_eq!(arena.stats().used_bytes, 1 + 8 + 27 * 1024);
+    assert_eq!(arena.stats().used_bytes, 1 + 8 + 4096 + 27 * 1024);
     assert_eq!(
         arena.stats().reserved_bytes,
         state.live_bytes.load(Ordering::Relaxed)
@@ -194,14 +306,19 @@ fn over_aligned_values_and_slices_remain_aligned() -> Result<(), Box<dyn std::er
 #[test]
 fn allocator_extra_capacity_is_usable_and_counted() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AllocatorState::default());
-    let mut arena = Arena::try_new_in(config(4096, 256 * 1024), TestAllocator(state.clone()))?;
+    let mut arena = Arena::try_new_in(config(256, 256 * 1024), TestAllocator(state.clone()))?;
     let initial = arena.stats();
     state.extra_bytes.store(1024, Ordering::Relaxed);
     arena.try_alloc(1_u8)?;
     let extra = arena.try_alloc_slice_fill(4300, 7_u8)?;
+    let tail = arena.try_alloc_slice_fill(1024, 9_u8)?;
     assert_eq!(state.requests.load(Ordering::Relaxed), 2);
-    assert_eq!(arena.stats().reserved_bytes, initial.reserved_bytes + 5120);
+    assert_eq!(
+        arena.stats().reserved_bytes,
+        initial.reserved_bytes + state.last_request.load(Ordering::Relaxed) + 1024
+    );
     assert_eq!(arena.get(extra)?.len(), 4300);
+    assert_eq!(arena.get(tail)?, [9; 1024]);
     Ok(())
 }
 
@@ -210,7 +327,8 @@ fn ownership_chunk_extra_capacity_is_usable() -> Result<(), Box<dyn std::error::
     let state = Arc::new(AllocatorState::default());
     state.extra_bytes.store(1024, Ordering::Relaxed);
     let mut arena = Arena::try_new_in(config(4096, 256 * 1024), TestAllocator(state.clone()))?;
-    let bytes = arena.try_alloc_slice_fill(1024, 7_u8)?;
+    let bytes = arena.try_alloc_slice_fill(4096, 7_u8)?;
+    assert_eq!(arena.stats().reserved_bytes, 5120);
     assert_eq!(arena.stats().chunk_count, 1);
     assert_eq!(state.requests.load(Ordering::Relaxed), 1);
     assert!(arena.get(bytes)?.iter().all(|value| *value == 7));
@@ -221,7 +339,7 @@ fn ownership_chunk_extra_capacity_is_usable() -> Result<(), Box<dyn std::error::
 fn spare_capacity_in_older_chunks_remains_usable() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AllocatorState::default());
     let mut arena = Arena::try_new_in(config(256, 4096), TestAllocator(state.clone()))?;
-    arena.try_alloc_slice_fill(100, 1_u8)?;
+    arena.try_alloc_slice_fill(64, 1_u8)?;
     arena.try_alloc_slice_fill(512, 2_u8)?;
     let requests = state.requests.load(Ordering::Relaxed);
     let value = arena.try_alloc_slice_fill(64, 3_u8)?;
@@ -332,15 +450,11 @@ fn failed_growth_preserves_values_and_allows_retry() -> Result<(), Box<dyn std::
 #[test]
 fn limit_includes_metadata_and_unused_capacity() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AllocatorState::default());
-    let probe = Arena::try_new_in(config(256, 4096), TestAllocator(state.clone()))?;
-    let metadata = probe.stats().reserved_bytes;
-    drop(probe);
-
-    let mut arena = Arena::try_new_in(config(256, metadata + 256), TestAllocator(state.clone()))?;
+    let mut arena = Arena::try_new_in(config(256, 256), TestAllocator(state.clone()))?;
     let value = arena.try_alloc_slice_fill(128, 1_u8)?;
     let before = arena.stats();
     let requests = state.requests.load(Ordering::Relaxed);
-    assert_eq!(before.reserved_bytes, metadata + 256);
+    assert_eq!(before.reserved_bytes, 256);
     assert!(matches!(
         arena.try_alloc_slice_fill(256, 1_u8),
         Err(ArenaError::ArenaLimitExceeded)
@@ -370,22 +484,24 @@ fn oversized_initial_chunk_is_returned() {
 fn oversized_growth_chunk_is_returned_without_changing_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AllocatorState::default());
-    let probe = Arena::try_new_in(config(256, 4096), TestAllocator(state.clone()))?;
-    let metadata = probe.stats().reserved_bytes;
-    drop(probe);
-
-    let mut arena = Arena::try_new_in(config(256, metadata + 384), TestAllocator(state.clone()))?;
+    let mut arena = Arena::try_new_in(config(256, 640), TestAllocator(state.clone()))?;
+    let first = arena.try_alloc_slice_fill(128, 1_u8)?;
     let before = arena.stats();
     state.extra_bytes.store(256, Ordering::Relaxed);
     assert!(matches!(
-        arena.try_alloc(1_u8),
+        arena.try_alloc_slice_fill(256, 3_u8),
         Err(ArenaError::ArenaLimitExceeded)
     ));
     assert_eq!(arena.stats(), before);
-    assert_eq!(state.live_bytes.load(Ordering::Relaxed), metadata);
-    assert_eq!(state.deallocations.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        state.live_bytes.load(Ordering::Relaxed),
+        before.reserved_bytes
+    );
+    assert_eq!(state.deallocations.load(Ordering::Relaxed), 1);
+    assert_eq!(arena.get(first)?, [1; 128]);
     state.extra_bytes.store(0, Ordering::Relaxed);
-    arena.try_alloc(2_u8)?;
+    let second = arena.try_alloc_slice_fill(256, 2_u8)?;
+    assert_eq!(arena.get(second)?, [2; 256]);
     Ok(())
 }
 

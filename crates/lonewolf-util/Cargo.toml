@@ -5,3 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+crossbeam-queue.workspace = true
+crossbeam-utils.workspace = true
+
+[[bench]]
+name = "pool"
+harness = false

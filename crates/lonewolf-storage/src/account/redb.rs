@@ -2,7 +2,6 @@
 
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::Arc;
 
 use ::redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use lonewolf_auth::scram::{
@@ -11,10 +10,8 @@ use lonewolf_auth::scram::{
 };
 
 use crate::account::{Account, AccountError, AccountKey, AccountRepository, NewAccount};
-use crate::redb::{
-    METADATA, begin_write, commit_error, open_database, run_blocking, storage_error,
-};
-use crate::{StorageError, StorageErrorKind};
+use crate::redb::{METADATA, begin_write, commit_error, storage_error};
+use crate::{RedbDatabase, StorageError, StorageErrorKind};
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
 const SCHEMA_KEY: &str = "accounts_schema";
@@ -27,18 +24,18 @@ const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2);
 /// Account operations use a shared, bounded blocking pool.
 /// Dropping a request future does not stop an operation that has started.
 pub struct RedbAccountRepository {
-    database: Arc<Database>,
+    database: RedbDatabase,
 }
 
 impl RedbAccountRepository {
     /// Opens the database and initializes its schema synchronously.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::from_database(Arc::new(open_database(path)?))
+        Self::from_database(RedbDatabase::open(path)?)
     }
 
     /// Checks and initializes the schema synchronously.
-    pub fn from_database(database: Arc<Database>) -> Result<Self, StorageError> {
-        let transaction = begin_write(&database)?;
+    pub fn from_database(database: RedbDatabase) -> Result<Self, StorageError> {
+        let transaction = begin_write(database.as_ref())?;
         let initialize;
         {
             let accounts_exist = transaction
@@ -78,14 +75,14 @@ impl RedbAccountRepository {
 
 impl AccountRepository for RedbAccountRepository {
     async fn create(&self, account: NewAccount) -> Result<(), AccountError> {
-        let database = Arc::clone(&self.database);
-        run_blocking(move || create(&database, account)).await
+        self.database
+            .write(move |database| create(database, account))
+            .await
     }
 
     async fn get(&self, key: &AccountKey) -> Result<Option<Account>, AccountError> {
-        let database = Arc::clone(&self.database);
         let key = key.clone();
-        run_blocking(move || get(&database, key)).await
+        self.database.read(move |database| get(database, key)).await
     }
 
     async fn get_scram(
@@ -93,9 +90,10 @@ impl AccountRepository for RedbAccountRepository {
         key: &AccountKey,
         hash: ScramHash,
     ) -> Result<Option<ScramVerifier>, AccountError> {
-        let database = Arc::clone(&self.database);
         let key = key.clone();
-        run_blocking(move || get_scram(&database, &key, hash)).await
+        self.database
+            .read(move |database| get_scram(database, &key, hash))
+            .await
     }
 
     async fn replace_credentials(
@@ -103,9 +101,10 @@ impl AccountRepository for RedbAccountRepository {
         key: &AccountKey,
         credentials: ScramCredentials,
     ) -> Result<(), AccountError> {
-        let database = Arc::clone(&self.database);
         let key = key.clone();
-        run_blocking(move || replace_credentials(&database, &key, credentials)).await
+        self.database
+            .write(move |database| replace_credentials(database, &key, credentials))
+            .await
     }
 }
 

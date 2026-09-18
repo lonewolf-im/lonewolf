@@ -9,8 +9,8 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use lonewolf_auth::scram::{ScramCredentials, ScramVerifier, ScramVerifierData};
-use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::{AccountError, AccountKey};
+use lonewolf_storage::{RedbDatabase, StorageErrorKind};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use redb::backends::InMemoryBackend;
@@ -63,11 +63,11 @@ pub fn assert_storage_error<T>(result: Result<T, AccountError>, expected: Storag
     }
 }
 
-pub fn database() -> Result<Arc<Database>, redb::DatabaseError> {
+pub fn database() -> Result<RedbDatabase, redb::DatabaseError> {
     Database::builder()
         .set_cache_size(1024 * 1024)
         .create_with_backend(InMemoryBackend::new())
-        .map(Arc::new)
+        .map(RedbDatabase::new)
 }
 
 pub fn insert_record(database: &Database, key: &AccountKey, bytes: &[u8]) -> TestResult {

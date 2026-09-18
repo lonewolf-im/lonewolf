@@ -2,7 +2,7 @@
 
 use async_lock::Semaphore;
 
-static CAPACITY: Semaphore = Semaphore::new(16);
+static CAPACITY: Semaphore = Semaphore::new(32);
 
 pub(crate) async fn run<T: Send + 'static>(operation: impl FnOnce() -> T + Send + 'static) -> T {
     run_with_capacity(&CAPACITY, operation).await

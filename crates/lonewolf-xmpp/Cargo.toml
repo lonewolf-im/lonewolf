@@ -7,7 +7,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+compio-io.workspace = true
 icu_properties.workspace = true
 idna.workspace = true
 lonewolf-util.workspace = true
 precis-profiles.workspace = true
+quick-xml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true

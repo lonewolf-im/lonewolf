@@ -7,8 +7,9 @@ use lonewolf_util::arena::{Arena, ArenaError, ArenaRead, ChunkAllocator, Handle,
 use crate::jid::{Jid, JidError, JidRef};
 
 mod element;
+pub(crate) mod incoming;
 mod storage;
-mod xml;
+pub(crate) mod xml;
 
 pub use element::{AttributeRef, Element, ElementBuilder, ElementRef, NodeRef};
 
@@ -143,6 +144,7 @@ pub enum BuildError {
     InvalidName,
     InvalidNamespace,
     InvalidText,
+    DuplicateAttribute,
     ReservedAttribute,
     EmptyId,
     MissingIqId,
@@ -320,7 +322,6 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         element::attributes(self.data.attributes, self.arena)
     }
 
-    /// Looks up an extension attribute by expanded name.
     pub fn attribute(&self, name: &str, namespace: &str) -> Result<Option<&'a str>, HandleError> {
         for value in self.attributes()? {
             let value = value?;
@@ -625,6 +626,7 @@ impl fmt::Display for BuildError {
             Self::InvalidName => formatter.write_str("invalid XML local name"),
             Self::InvalidNamespace => formatter.write_str("reserved XML namespace"),
             Self::InvalidText => formatter.write_str("invalid XML character"),
+            Self::DuplicateAttribute => formatter.write_str("duplicate XML attribute"),
             Self::ReservedAttribute => {
                 formatter.write_str("common stanza attribute requires its typed setter")
             }

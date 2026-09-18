@@ -307,6 +307,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lonewolf-auth"
+version = "0.1.0"
+
+[[package]]
+name = "lonewolf-storage"
+version = "0.1.0"
+dependencies = [
+ "lonewolf-auth",
+ "lonewolf-util",
+ "lonewolf-xmpp",
+]
+
+[[package]]
 name = "lonewolf-util"
 version = "0.1.0"
 dependencies = [

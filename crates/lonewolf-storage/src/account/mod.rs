@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod redb;
+
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

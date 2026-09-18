@@ -26,5 +26,7 @@ lonewolf-util = { path = "crates/lonewolf-util" }
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }
 precis-profiles = { version = "0.2.0", default-features = false }
 quick-xml = { version = "0.41.0", default-features = false, features = ["async-tokio"] }
+redb = { version = "4.3.0", default-features = false, features = ["std"] }
+tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false, features = ["io-util"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["compat"] }

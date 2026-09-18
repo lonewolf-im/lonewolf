@@ -7,6 +7,7 @@ use std::fmt;
 pub enum StorageErrorKind {
     Unavailable,
     CorruptData,
+    UnsupportedVersion,
     CommitUnknown,
     Other,
 }
@@ -48,6 +49,7 @@ impl fmt::Display for StorageError {
         formatter.write_str(match self.kind {
             StorageErrorKind::Unavailable => "storage unavailable",
             StorageErrorKind::CorruptData => "stored data is invalid",
+            StorageErrorKind::UnsupportedVersion => "stored data version is not supported",
             StorageErrorKind::CommitUnknown => "storage commit outcome is unknown",
             StorageErrorKind::Other => "storage operation failed",
         })

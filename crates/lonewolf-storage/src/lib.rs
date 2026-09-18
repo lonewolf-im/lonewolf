@@ -3,5 +3,6 @@
 pub mod account;
 
 mod error;
+mod redb;
 
 pub use error::{StorageError, StorageErrorKind};

@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/lonewolf", "crates/lonewolf-util", "crates/lonewolf-xmpp"]
+members = [
+    "crates/lonewolf",
+    "crates/lonewolf-auth",
+    "crates/lonewolf-storage",
+    "crates/lonewolf-util",
+    "crates/lonewolf-xmpp",
+]
 resolver = "3"
 
 [workspace.package]
@@ -15,6 +21,7 @@ crossbeam-utils = "0.8.21"
 futures-executor = "0.3.34"
 icu_properties = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 idna = "1.1.0"
+lonewolf-auth = { path = "crates/lonewolf-auth" }
 lonewolf-util = { path = "crates/lonewolf-util" }
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }
 precis-profiles = { version = "0.2.0", default-features = false }

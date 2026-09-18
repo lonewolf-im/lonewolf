@@ -1,0 +1,14 @@
+[package]
+name = "lonewolf-storage"
+description = "Storage repository contracts for Lonewolf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+lonewolf-auth.workspace = true
+lonewolf-xmpp.workspace = true
+
+[dev-dependencies]
+lonewolf-util.workspace = true

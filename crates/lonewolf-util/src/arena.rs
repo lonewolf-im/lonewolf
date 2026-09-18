@@ -179,7 +179,8 @@ pub enum HandleError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArenaConfig {
-    /// Minimum bytes requested for data chunks. Larger values request enough contiguous space.
+    /// Minimum bytes requested for each chunk, including the first.
+    /// Larger values request enough contiguous space.
     /// The arena does not round requests to size classes.
     /// Chunk metadata and alignment reduce the space available for values.
     pub chunk_size: NonZeroUsize,
@@ -261,19 +262,23 @@ impl Arena<GlobalChunkAllocator> {
 }
 
 impl<A: ChunkAllocator> Arena<A> {
-    /// Reserves ownership metadata before returning so freezing needs no allocation.
+    /// Reserves the first chunk before returning so freezing needs no allocation.
     /// Each arena gets a fresh identity, even when its allocator reuses memory.
     /// The chunk size must fit a layout. It and ownership metadata must each fit the budget.
     pub fn try_new_in(config: ArenaConfig, allocator: A) -> Result<Self, ArenaError> {
-        let (layout, header_offset) = Layout::new::<ArenaInner<A>>()
+        let (metadata_layout, header_offset) = Layout::new::<ArenaInner<A>>()
             .extend(Layout::new::<ChunkHeader>())
             .map_err(|_| ArenaError::InvalidConfiguration)?;
         if config.chunk_size > config.max_reserved_bytes
-            || layout.size() > config.max_reserved_bytes.get()
-            || Layout::from_size_align(config.chunk_size.get(), align_of::<ChunkHeader>()).is_err()
+            || metadata_layout.size() > config.max_reserved_bytes.get()
         {
             return Err(ArenaError::InvalidConfiguration);
         }
+        let layout = Layout::from_size_align(
+            config.chunk_size.get().max(metadata_layout.size()),
+            metadata_layout.align(),
+        )
+        .map_err(|_| ArenaError::InvalidConfiguration)?;
 
         let identity = ARENA_IDS.with(|range| take_identity(&NEXT_ARENA_ID, range))?;
         let chunk = allocator.allocate(layout).map_err(ArenaError::Allocation)?;
@@ -292,7 +297,7 @@ impl<A: ChunkAllocator> Arena<A> {
             head.as_ptr().write(ChunkHeader {
                 chunk,
                 next: None,
-                used: layout.size(),
+                used: metadata_layout.size(),
             });
             inner.as_ptr().write(ArenaInner {
                 allocator,

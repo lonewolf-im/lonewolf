@@ -617,6 +617,8 @@ fn propagates_arena_capacity_failures() -> TestResult {
         max_reserved_bytes: NonZeroUsize::new(4096).ok_or("limit")?,
         ..ArenaConfig::default()
     })?;
+    while full.try_alloc(0_u8).is_ok() {}
+    let before = full.stats();
     let error = JidError::AllocationFailed(ArenaError::ArenaLimitExceeded);
     assert_eq!(Jid::parse_in("example.com", &mut full).err(), Some(error));
     assert_eq!(
@@ -636,7 +638,7 @@ fn propagates_arena_capacity_failures() -> TestResult {
         view.with_resource_in("", &mut full).err(),
         Some(JidError::EmptyPart(JidPart::Resourcepart))
     );
-    assert_eq!(full.stats().used_bytes, 0);
+    assert_eq!(full.stats(), before);
     assert!(std::error::Error::source(&error).is_some());
     Ok(())
 }

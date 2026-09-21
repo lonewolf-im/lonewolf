@@ -7,6 +7,7 @@ use compio::runtime::Runtime;
 pub mod config;
 mod error;
 mod logging;
+mod panic;
 mod shutdown;
 
 use config::Config;
@@ -19,9 +20,12 @@ pub struct BuildInfo {
 }
 
 /// Runs on the calling thread until Ctrl+C or, on Unix, SIGTERM requests shutdown.
-/// Installs the global tracing subscriber and flushes logs before returning.
+/// Installs the global panic hook and tracing subscriber, and flushes logs before returning.
 pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError> {
+    panic::init(&build);
+
     let config = Config::load(config_path).map_err(RunError::Config)?;
+
     let _logging_guard = logging::init(config.logging.level).map_err(RunError::Logging)?;
     tracing::info!(
         version = build.version,

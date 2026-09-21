@@ -54,10 +54,6 @@ impl Config {
         if self.admin.socket_path.as_os_str().is_empty() {
             return Err("admin.socket_path must not be empty".into());
         }
-        #[cfg(not(unix))]
-        if self.admin.enabled {
-            return Err("the admin service requires Unix; set admin.enabled to false".into());
-        }
         if let Some(store) = &self.account.storage
             && !self.storage.stores.contains_key(store)
         {
@@ -85,7 +81,7 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            enabled: cfg!(unix),
+            enabled: true,
             socket_path: PathBuf::from("./run/lonewolf/admin.sock"),
         }
     }

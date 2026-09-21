@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(unix)]
-
 use std::error::Error;
 use std::fs;
 use std::future::Future;

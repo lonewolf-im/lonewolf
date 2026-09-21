@@ -304,7 +304,6 @@ fn opening_a_locked_database_reports_unavailable() -> TestResult {
     Ok(())
 }
 
-#[cfg(unix)]
 #[test]
 fn new_database_files_are_private_to_the_owner() -> TestResult {
     use std::os::unix::fs::PermissionsExt;

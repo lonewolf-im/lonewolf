@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(unix)]
+#[cfg(not(unix))]
+compile_error!("Lonewolf supports Unix targets only.");
+
 mod api;
-#[cfg(unix)]
 mod server;
 
-#[cfg(unix)]
 pub use server::Server;

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(not(unix))]
+compile_error!("Lonewolf supports Unix targets only.");
+
 use std::path::Path;
 
 use compio::runtime::Runtime;
@@ -21,7 +24,7 @@ pub struct BuildInfo {
     pub commit: &'static str,
 }
 
-/// Runs on the calling thread until Ctrl+C or, on Unix, SIGTERM requests shutdown.
+/// Runs on the calling thread until SIGINT or SIGTERM requests shutdown.
 /// Installs the global panic hook and tracing subscriber, and flushes logs before returning.
 /// Opens storage and the enabled admin listener before waiting for shutdown.
 pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError> {
@@ -47,13 +50,11 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
         let accounts = stores.accounts(account_store)?;
         let runtime = Runtime::new().map_err(RunError::Runtime)?;
         runtime.block_on(async {
-            #[cfg(unix)]
             if config.admin.enabled {
                 let server = lonewolf_admin::Server::bind(&config.admin.socket_path, accounts)
                     .map_err(RunError::Admin)?;
                 return server.run(shutdown::wait()).await.map_err(RunError::Admin);
             }
-            let _ = accounts;
             shutdown::wait().await.map_err(RunError::Signal)
         })?;
     }

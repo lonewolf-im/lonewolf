@@ -11,4 +11,5 @@ clap.workspace = true
 lonewolf-core.workspace = true
 
 [dev-dependencies]
+nix.workspace = true
 tempfile.workspace = true

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(not(unix))]
+compile_error!("Lonewolf supports Unix targets only.");
+
 use std::path::Path;
 
 use compio::runtime::Runtime;
@@ -21,9 +24,9 @@ pub struct BuildInfo {
     pub commit: &'static str,
 }
 
-/// Runs on the calling thread until Ctrl+C or, on Unix, SIGTERM requests shutdown.
+/// Runs on the calling thread until SIGINT or SIGTERM requests shutdown.
 /// Installs the global panic hook and tracing subscriber, and flushes logs before returning.
-/// Opens storage and initializes repository schemas.
+/// Opens storage and the enabled admin listener before waiting for shutdown.
 pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError> {
     panic::init(&build);
 
@@ -44,13 +47,16 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
             .storage
             .as_deref()
             .unwrap_or(&config.storage.default);
-        let _accounts = stores.accounts(account_store)?;
+        let accounts = stores.accounts(account_store)?;
         let runtime = Runtime::new().map_err(RunError::Runtime)?;
-        tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
-        runtime
-            .block_on(shutdown::wait())
-            .map_err(RunError::Signal)?;
-        tracing::info!("received stop signal... gracefully shutting down...");
+        runtime.block_on(async {
+            if config.admin.enabled {
+                let server = lonewolf_admin::Server::bind(&config.admin.socket_path, accounts)
+                    .map_err(RunError::Admin)?;
+                return server.run(shutdown::wait()).await.map_err(RunError::Admin);
+            }
+            shutdown::wait().await.map_err(RunError::Signal)
+        })?;
     }
 
     tracing::info!("heading back to the den");

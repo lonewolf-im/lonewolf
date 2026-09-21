@@ -1,7 +1,6 @@
 # Copy this file to lonewolf.toml and uncomment the sections and values you need.
 # Omitted settings use their defaults. Values below are defaults unless marked as examples.
 
-# ---------------------------------- Logging ----------------------------------
 # [logging]
 
 # Log events at this level and more severe levels. Applied at startup.
@@ -9,7 +8,6 @@
 # Use "off" to disable logs. The default is "info".
 # level = "info"
 
-# ---------------------------------- Storage ----------------------------------
 # [storage]
 
 # Default store for components that do not select a store.
@@ -31,19 +29,15 @@
 # The built-in primary store uses this path.
 # path = "./data/lonewolf.dat"
 
-# --------------------------------- Accounts ----------------------------------
 # [account]
 
 # Optional store override. Omit to inherit storage.default.
 # storage = "primary"
 
-# ------------------------------ Administration -------------------------------
 # [admin]
 
-# Enable the admin server. Set to false to disable it.
+# Enable the admin server. Default: true.
 # enabled = true
 
-# IP address and port for the admin listener.
-# The default permits connections from this machine only.
-# Use a numeric IP address. Put IPv6 addresses in brackets, as in "[::1]:8080".
-# listen_addr = "127.0.0.1:8080"
+# Admin Unix socket path. Relative paths use the working directory.
+# socket_path = "./run/lonewolf/admin.sock"

@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fs::DirBuilder;
-#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
 use lonewolf_storage::RedbDatabase;
@@ -48,7 +47,6 @@ impl<'config> StoreRegistry<'config> {
                         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                             let mut builder = DirBuilder::new();
                             builder.recursive(true);
-                            #[cfg(unix)]
                             builder.mode(0o700);
                             builder.create(parent).map_err(|source| {
                                 RunError::StorageDirectory {

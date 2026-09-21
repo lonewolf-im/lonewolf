@@ -8,17 +8,16 @@ publish.workspace = true
 
 [dependencies]
 compio.workspace = true
+futures-util.workspace = true
+lonewolf-admin.workspace = true
 lonewolf-storage.workspace = true
+nix.workspace = true
 serde.workspace = true
 time.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-futures-util.workspace = true
-nix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

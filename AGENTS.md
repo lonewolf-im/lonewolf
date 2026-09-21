@@ -101,4 +101,9 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Keep all section headers and value assignments commented out. The unchanged reference must load with built-in defaults.
 - Document each key's purpose, default, accepted values or format, and units where applicable. Use short operator-facing comments. These comments are required documentation for the reference file.
 - Show the default value for each key. If a key has no default, mark its example value and state when the key is required.
-- Keep the README and configuration-reference tests consistent with the reference file.
+- Keep configuration-reference tests consistent with the reference file.
+
+## 11. README Change Rule
+
+- Never change `README.md` unless the user explicitly requests changes to that file.
+- Do not infer permission from requests to change code or other documentation.

@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::NonZeroU32;
+use std::ops::Bound;
 use std::path::Path;
 
-use ::redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
-use futures_util::Stream;
+use ::redb::{Database, OwnedRange, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use futures_util::{Stream, stream};
 use lonewolf_auth::scram::{
     ScramCredentials, ScramHash, ScramSha1Verifier, ScramSha256Verifier, ScramVerifier,
     ScramVerifierData,
 };
+use lonewolf_util::arena::{Arena, ArenaConfig};
+use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
 
 use crate::account::{Account, AccountError, AccountKey, AccountRepository, NewAccount};
 use crate::redb::{METADATA, begin_write, commit_error, storage_error};
 use crate::{RedbDatabase, StorageError, StorageErrorKind};
-
-mod list;
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
 const SCHEMA_KEY: &str = "accounts_schema";
@@ -89,7 +90,7 @@ impl AccountRepository for RedbAccountRepository {
     }
 
     fn list(&self, after: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>> {
-        list::accounts(&self.database, after)
+        list(&self.database, after)
     }
 
     async fn delete(&self, key: &AccountKey) -> Result<(), AccountError> {
@@ -150,6 +151,83 @@ fn get(database: &Database, key: AccountKey) -> Result<Option<Account>, AccountE
     };
     decode_credentials(record.value())?;
     Ok(Some(Account { key }))
+}
+
+struct ListState {
+    after: Option<AccountKey>,
+    entries: Option<OwnedRange<&'static str, &'static [u8]>>,
+}
+
+fn list(
+    database: &RedbDatabase,
+    after: Option<AccountKey>,
+) -> impl Stream<Item = Result<Account, AccountError>> {
+    let state = ListState {
+        after,
+        entries: None,
+    };
+    stream::try_unfold(state, move |state| async move {
+        database
+            .read(move |database| {
+                let mut entries = match state.entries {
+                    Some(entries) => entries,
+                    None => open_range(database, state.after)?,
+                };
+                let Some(entry) = entries.next() else {
+                    return Ok(None);
+                };
+                let (key, record) = entry.map_err(storage_error)?;
+                decode_credentials(record.value())?;
+                let account = Account {
+                    key: decode_account_key(key.value())?,
+                };
+                Ok(Some((
+                    account,
+                    ListState {
+                        after: None,
+                        entries: Some(entries),
+                    },
+                )))
+            })
+            .await
+    })
+}
+
+fn open_range(
+    database: &Database,
+    after: Option<AccountKey>,
+) -> Result<OwnedRange<&'static str, &'static [u8]>, AccountError> {
+    let transaction = database.begin_read().map_err(storage_error)?;
+    let table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+    let start = after
+        .as_ref()
+        .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_str()));
+    table
+        .range_owned::<&str>((start, Bound::Unbounded))
+        .map_err(|error| storage_error(error).into())
+}
+
+fn decode_account_key(text: &str) -> Result<AccountKey, StorageError> {
+    if text.len() > MAX_PART_LEN * 2 + 1 {
+        return Err(StorageError::new(StorageErrorKind::CorruptData));
+    }
+    let mut arena = Arena::try_new(ArenaConfig::default())
+        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
+    let jid = Jid::parse_in(text, &mut arena).map_err(|error| {
+        let kind = match error {
+            JidError::AllocationFailed(_) | JidError::AccessFailed(_) => StorageErrorKind::Other,
+            _ => StorageErrorKind::CorruptData,
+        };
+        StorageError::with_source(kind, error)
+    })?;
+    let jid = jid
+        .resolve(&arena)
+        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
+    if jid.as_str() != text {
+        return Err(StorageError::new(StorageErrorKind::CorruptData));
+    }
+    AccountKey::try_from(jid)
+        .map_err(|error| StorageError::with_source(StorageErrorKind::CorruptData, error))
 }
 
 fn delete(database: &Database, key: &AccountKey) -> Result<(), AccountError> {

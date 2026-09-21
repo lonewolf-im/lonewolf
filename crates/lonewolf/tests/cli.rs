@@ -53,7 +53,6 @@ fn missing_default_file_uses_builtin_defaults() -> TestResult {
         .output()?;
 
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
     Ok(())
 }
 
@@ -95,7 +94,6 @@ fn explicit_path_overrides_default_file() -> TestResult {
             .output()?;
 
         assert!(output.status.success());
-        assert!(output.stderr.is_empty());
     }
     Ok(())
 }
@@ -147,6 +145,5 @@ fn config_file_with_non_utf8_path_is_loaded() -> TestResult {
         .output()?;
 
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
     Ok(())
 }

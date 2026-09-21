@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
+use std::pin::pin;
 use std::sync::Barrier;
 use std::task::{Context, Waker};
 use std::thread;
@@ -27,6 +28,66 @@ mod deletion;
 mod stream;
 
 use support::*;
+
+#[test]
+fn generic_repository_operations_can_cross_threads() -> TestResult {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    fn on_worker<F>(future: F) -> Result<F::Output, Box<dyn std::error::Error>>
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        thread::scope(|scope| {
+            scope
+                .spawn(move || block_on(future))
+                .join()
+                .map_err(|_| "repository worker panicked".into())
+        })
+    }
+
+    fn verify<R: AccountRepository>(repository: &R) -> TestResult {
+        assert_send_sync::<R>();
+        let alice = key("alice@example.com")?;
+        let bob = key("bob@example.com")?;
+        for account in [&alice, &bob] {
+            on_worker(repository.create(NewAccount {
+                key: account.clone(),
+                credentials: credentials(10),
+            }))??;
+        }
+        assert_eq!(
+            on_worker(repository.get(&alice))??
+                .ok_or("missing account")?
+                .key,
+            alice
+        );
+        on_worker(repository.replace_credentials(&alice, credentials(20)))??;
+        assert_scram(
+            on_worker(repository.get_scram(&alice, ScramHash::Sha256))??,
+            23,
+        )?;
+
+        let mut accounts = pin!(repository.list(None));
+        assert_eq!(
+            block_on(accounts.try_next())?.ok_or("missing account")?.key,
+            alice
+        );
+        on_worker(repository.delete(&bob))??;
+        assert_eq!(
+            on_worker(accounts.try_next())??
+                .ok_or("missing account")?
+                .key,
+            bob
+        );
+        assert!(on_worker(accounts.try_next())??.is_none());
+        assert!(on_worker(repository.get(&bob))??.is_none());
+        Ok(())
+    }
+
+    let repository = RedbAccountRepository::from_database(database()?)?;
+    verify(&repository)
+}
 
 #[test]
 fn accounts_and_all_verifier_fields_survive_reopening() -> TestResult {

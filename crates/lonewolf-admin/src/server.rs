@@ -26,7 +26,7 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Server<R> {
     listener: UnixListener,
-    _socket: SocketFile,
+    socket: SocketFile,
     api: Api<R>,
 }
 
@@ -62,7 +62,7 @@ impl<R: AccountRepository> Server<R> {
         fs::set_permissions(path, Permissions::from_mode(0o600))?;
         Ok(Self {
             listener: UnixListener::from_std(listener)?,
-            _socket: socket,
+            socket,
             api: Api::new(accounts),
         })
     }
@@ -72,7 +72,7 @@ impl<R: AccountRepository> Server<R> {
     pub async fn run(self, shutdown: impl Future<Output = io::Result<()>>) -> io::Result<()> {
         let mut shutdown = pin!(shutdown);
         let mut connections = FuturesUnordered::new();
-        tracing::info!("admin service started");
+        tracing::info!(socket_path = ?self.socket.path, "admin service started");
         let result = loop {
             let event = {
                 let progress = async {

@@ -9,9 +9,11 @@ mod error;
 mod logging;
 mod panic;
 mod shutdown;
+mod storage;
 
 use config::Config;
 pub use error::RunError;
+use storage::StoreRegistry;
 
 pub struct BuildInfo {
     pub version: &'static str,
@@ -21,6 +23,7 @@ pub struct BuildInfo {
 
 /// Runs on the calling thread until Ctrl+C or, on Unix, SIGTERM requests shutdown.
 /// Installs the global panic hook and tracing subscriber, and flushes logs before returning.
+/// Opens storage and initializes repository schemas.
 pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError> {
     panic::init(&build);
 
@@ -35,6 +38,8 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     );
 
     {
+        let mut stores = StoreRegistry::new(&config.storage);
+        let _accounts = stores.accounts()?;
         let runtime = Runtime::new().map_err(RunError::Runtime)?;
         tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
         runtime

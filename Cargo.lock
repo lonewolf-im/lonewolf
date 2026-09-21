@@ -781,6 +781,7 @@ version = "0.1.0"
 dependencies = [
  "compio",
  "futures-util",
+ "lonewolf-storage",
  "nix",
  "serde",
  "tempfile",

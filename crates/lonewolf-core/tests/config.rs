@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
-use lonewolf_core::config::{Config, ConfigError};
+use lonewolf_core::config::{Config, ConfigError, StoreConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -36,6 +36,8 @@ fn omitted_settings_use_defaults() -> TestResult {
         "[admin]",
         "logging = {}",
         "[logging]",
+        "storage = {}",
+        "[storage]",
     ] {
         let file = config_file(contents)?;
         assert_eq!(Config::load(Some(file.path()))?, Config::default());
@@ -71,6 +73,59 @@ fn explicit_admin_settings_override_defaults() -> TestResult {
 }
 
 #[test]
+fn named_stores_replace_builtins_and_select_the_default() -> TestResult {
+    let file = config_file(
+        r#"
+[storage]
+default = "accounts"
+
+[storage.stores.accounts]
+backend = "redb"
+path = "db/accounts.redb"
+
+[storage.stores.archive]
+backend = "redb"
+path = "db/archive.redb"
+"#,
+    )?;
+    let config = Config::load(Some(file.path()))?;
+
+    assert_eq!(config.storage.default, "accounts");
+    assert_eq!(config.storage.stores.len(), 2);
+    assert!(!config.storage.stores.contains_key("primary"));
+    assert!(matches!(
+        config.storage.stores.get("accounts"),
+        Some(StoreConfig::Redb { path }) if path == Path::new("db/accounts.redb")
+    ));
+    assert!(matches!(
+        config.storage.stores.get("archive"),
+        Some(StoreConfig::Redb { path }) if path == Path::new("db/archive.redb")
+    ));
+    Ok(())
+}
+
+#[test]
+fn invalid_storage_references_and_empty_values_are_rejected() -> TestResult {
+    for contents in [
+        "[storage]\ndefault = 'missing'",
+        "[storage]\nstores = {}",
+        "[storage.stores.archive]\nbackend = 'redb'\npath = 'archive.redb'",
+        "[storage]\ndefault = ''\n[storage.stores.'']\nbackend = 'redb'\npath = 'db.redb'",
+        "[storage.stores.primary]\nbackend = 'redb'\npath = ''",
+    ] {
+        let file = config_file(contents)?;
+        let error = Config::load(Some(file.path())).expect_err(contents);
+        assert!(matches!(error, ConfigError::Invalid { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(&file.path().display().to_string())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn invalid_configuration_is_rejected() -> TestResult {
     for contents in [
         "[admni]",
@@ -92,6 +147,13 @@ fn invalid_configuration_is_rejected() -> TestResult {
         "[logging]\nlevel = 'INFO'",
         "[logging]\nlevel = 3",
         "[logging]\nlevel = false",
+        "[storage]\ndefualt = 'primary'",
+        "[storage]\ndefault = 1",
+        "[storage.stores.primary]\nbackend = 'postgresql'\npath = 'db.redb'",
+        "[storage.stores.primary]\nbackend = 'redb'",
+        "[storage.stores.primary]\npath = 'db.redb'",
+        "[storage.stores.primary]\nbackend = 'redb'\npath = 'db.redb'\nunknown = true",
+        "[storage.stores.primary]\nbackend = 'redb'\npath = 1",
     ] {
         let file = config_file(contents)?;
         let error = Config::load(Some(file.path())).expect_err(contents);

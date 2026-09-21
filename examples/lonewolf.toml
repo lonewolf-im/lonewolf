@@ -8,6 +8,26 @@
 # Use "off" to disable logs. The default is "info".
 # level = "info"
 
+# [storage]
+
+# Default store for components that do not select a store.
+# Must name a store defined below. The default is "primary".
+# default = "primary"
+
+# Define each store once under storage.stores.<name>. Names must not be empty.
+# Omit all store definitions to use the primary store shown below.
+# Explicit store definitions replace the built-in store list.
+# Stores are opened only when used.
+# [storage.stores.primary]
+
+# Storage backend. Required for each explicit store. Only "redb" is supported.
+# backend = "redb"
+
+# Database file path. Required and nonempty for each explicit redb store.
+# Relative paths use the working directory. Missing parent directories are created.
+# The built-in primary store uses this path.
+# path = "./data/lonewolf.redb"
+
 # [admin]
 
 # Enable the admin server. Set to false to disable it.

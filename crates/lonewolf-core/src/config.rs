@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -16,6 +17,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 pub struct Config {
     pub admin: AdminConfig,
     pub logging: LoggingConfig,
+    pub storage: StorageConfig,
 }
 
 impl Config {
@@ -36,10 +38,18 @@ impl Config {
             }
         };
 
-        toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+        let config: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
             path: selected_path.to_path_buf(),
             source,
-        })
+        })?;
+        config
+            .storage
+            .validate()
+            .map_err(|reason| ConfigError::Invalid {
+                path: selected_path.to_path_buf(),
+                reason,
+            })?;
+        Ok(config)
     }
 }
 
@@ -77,6 +87,56 @@ pub enum LogLevel {
     Trace,
 }
 
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    pub default: String,
+    pub stores: BTreeMap<String, StoreConfig>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            default: "primary".into(),
+            stores: BTreeMap::from([(
+                "primary".into(),
+                StoreConfig::Redb {
+                    path: PathBuf::from("./data/lonewolf.redb"),
+                },
+            )]),
+        }
+    }
+}
+
+impl StorageConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !self.stores.contains_key(&self.default) {
+            return Err(format!(
+                "storage.default references unknown store {:?}",
+                self.default
+            ));
+        }
+        for (name, store) in &self.stores {
+            if name.is_empty() {
+                return Err("storage store names must not be empty".into());
+            }
+            match store {
+                StoreConfig::Redb { path } if path.as_os_str().is_empty() => {
+                    return Err(format!("path for store {name:?} must not be empty"));
+                }
+                StoreConfig::Redb { .. } => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
+pub enum StoreConfig {
+    Redb { path: PathBuf },
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     Read {
@@ -86,6 +146,10 @@ pub enum ConfigError {
     Parse {
         path: PathBuf,
         source: toml::de::Error,
+    },
+    Invalid {
+        path: PathBuf,
+        reason: String,
     },
 }
 
@@ -106,6 +170,11 @@ impl fmt::Display for ConfigError {
                     path.display()
                 )
             }
+            Self::Invalid { path, reason } => write!(
+                formatter,
+                "invalid configuration file '{}': {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -115,6 +184,7 @@ impl Error for ConfigError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
+            Self::Invalid { .. } => None,
         }
     }
 }

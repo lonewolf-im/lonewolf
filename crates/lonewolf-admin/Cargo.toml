@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-axum.workspace = true
+axum = { workspace = true, features = ["matched-path"] }
 compio = { workspace = true, features = ["net", "time"] }
 compio-io.workspace = true
 futures-util.workspace = true

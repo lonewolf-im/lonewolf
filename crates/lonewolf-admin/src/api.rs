@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
+use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Path, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode, Uri, request::Parts};
 use axum::middleware::{self, Next};
@@ -51,10 +51,11 @@ pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
         .with_state(Arc::new(Api::new(accounts)))
 }
 
-async fn log_request(request: Request, next: Next) -> Response {
+async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
     let started = Instant::now();
     let response = next.run(request).await;
     tracing::debug!(
+        route = route.as_ref().map_or("unmatched", MatchedPath::as_str),
         status = response.status().as_u16(),
         latency_ms = started.elapsed().as_millis(),
         "admin request completed"

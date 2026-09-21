@@ -1,6 +1,6 @@
 [package]
 name = "lonewolf"
-description = "An XMPP messaging server"
+description = "A modern and highly efficient XMPP server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

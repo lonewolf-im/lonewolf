@@ -1,3 +1,3 @@
 # Lonewolf
 
-An XMPP messaging server
+A modern and highly efficient XMPP server

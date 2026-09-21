@@ -396,8 +396,8 @@ impl From<AccountError> for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
     use futures_util::Stream;
@@ -407,8 +407,8 @@ mod tests {
     use super::*;
 
     struct Repository {
-        reads: Cell<usize>,
-        active: Cell<bool>,
+        reads: AtomicUsize,
+        active: AtomicBool,
         fail_at: Option<usize>,
     }
 
@@ -418,8 +418,7 @@ mod tests {
         type Item = Result<Account, AccountError>;
 
         fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            let index = self.0.reads.get();
-            self.0.reads.set(index + 1);
+            let index = self.0.reads.fetch_add(1, Ordering::Relaxed);
             let account = if self.0.fail_at == Some(index) {
                 Err(StorageError::with_source(
                     StorageErrorKind::CorruptData,
@@ -437,7 +436,7 @@ mod tests {
 
     impl Drop for Entries<'_> {
         fn drop(&mut self) {
-            self.0.active.set(false);
+            self.0.active.store(false, Ordering::Relaxed);
         }
     }
 
@@ -449,7 +448,7 @@ mod tests {
             unreachable!()
         }
         fn list(&self, _: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>> {
-            self.active.set(true);
+            self.active.store(true, Ordering::Relaxed);
             Entries(self)
         }
         async fn delete(&self, _: &AccountKey) -> Result<(), AccountError> {
@@ -476,16 +475,16 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         compio::runtime::Runtime::new()?.block_on(async {
             let api = Api::new(Repository {
-                reads: Cell::new(0),
-                active: Cell::new(false),
+                reads: AtomicUsize::new(0),
+                active: AtomicBool::new(false),
                 fail_at: Some(3),
             });
             let response = api
                 .list(Some("limit=2"))
                 .await
                 .map_err(|_| "listing failed")?;
-            assert_eq!(api.accounts.reads.get(), 3);
-            assert!(!api.accounts.active.get());
+            assert_eq!(api.accounts.reads.load(Ordering::Relaxed), 3);
+            assert!(!api.accounts.active.load(Ordering::Relaxed));
             let bytes = response.into_body().collect().await?.to_bytes();
             let body: serde_json::Value = serde_json::from_slice(&bytes)?;
             assert_eq!(body["next_cursor"], "user00001@example.org");
@@ -499,15 +498,15 @@ mod tests {
         compio::runtime::Runtime::new()?.block_on(async {
             for fail_at in [1, 2] {
                 let api = Api::new(Repository {
-                    reads: Cell::new(0),
-                    active: Cell::new(false),
+                    reads: AtomicUsize::new(0),
+                    active: AtomicBool::new(false),
                     fail_at: Some(fail_at),
                 });
                 let error = match api.list(Some("limit=2")).await {
                     Err(error) => error,
                     Ok(_) => return Err("listing should fail".into()),
                 };
-                assert!(!api.accounts.active.get());
+                assert!(!api.accounts.active.load(Ordering::Relaxed));
                 let response = error.response();
                 assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
                 let bytes = response.into_body().collect().await?.to_bytes();

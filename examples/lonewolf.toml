@@ -1,0 +1,12 @@
+# Copy this file to lonewolf.toml and uncomment the sections and values you need.
+# The values below are the defaults. Omitted settings use their defaults.
+
+# [admin]
+
+# Enable the admin server. Set to false to disable it.
+# enabled = true
+
+# IP address and port for the admin listener.
+# The default permits connections from this machine only.
+# Use a numeric IP address. Put IPv6 addresses in brackets, as in "[::1]:8080".
+# listen_addr = "127.0.0.1:8080"

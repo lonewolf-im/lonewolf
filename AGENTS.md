@@ -93,3 +93,12 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Normal operating-system interfaces and platform runtime libraries are allowed. Rust bindings to these interfaces, such as `libc`, are allowed. This exception does not permit application libraries such as SQLite, OpenSSL, or RocksDB.
 - A Rust wrapper does not make a C or C++ backend compliant. Check cryptography providers and other native backends separately from their Rust APIs.
 - Before adding or updating a dependency or enabling a feature, inspect the resolved dependency and feature graph, relevant build scripts, and native linkage. Do not introduce a C or C++ application library through any of these paths.
+
+## 10. Configuration Reference Rule
+
+- Keep `examples/lonewolf.toml` as the operator reference for every supported configuration key.
+- When adding, removing, or renaming a key, update this reference in the same change. Also update it when a key's type, default, accepted values, or behavior changes.
+- Keep all section headers and value assignments commented out. The unchanged reference must load with built-in defaults.
+- Document each key's purpose, default, accepted values or format, and units where applicable. Use short operator-facing comments. These comments are required documentation for the reference file.
+- Show the default value for each key. If a key has no default, mark its example value and state when the key is required.
+- Keep the README and configuration-reference tests consistent with the reference file.

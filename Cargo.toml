@@ -18,6 +18,7 @@ publish = false
 async-lock = "3.4.2"
 base64 = "0.22.1"
 blocking = "1.7.0"
+clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 compio-io = { version = "0.10.1", default-features = false, features = ["compat"] }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
@@ -33,10 +34,12 @@ pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 precis-profiles = { version = "0.2.0", default-features = false }
 quick-xml = { version = "0.41.0", default-features = false, features = ["async-tokio"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
 sha1 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
 sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
 stringprep = "0.1.5"
 tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false, features = ["io-util"] }
 tokio-util = { version = "0.7.19", default-features = false, features = ["compat"] }
+toml = { version = "1.1.6", default-features = false, features = ["parse", "serde", "std"] }
 zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }

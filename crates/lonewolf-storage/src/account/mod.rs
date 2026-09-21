@@ -33,30 +33,36 @@ pub enum AccountError {
     Storage(StorageError),
 }
 
-pub trait AccountRepository {
-    fn create(&self, account: NewAccount) -> impl Future<Output = Result<(), AccountError>>;
+pub trait AccountRepository: Send + Sync {
+    fn create(&self, account: NewAccount) -> impl Future<Output = Result<(), AccountError>> + Send;
 
-    fn get(&self, key: &AccountKey) -> impl Future<Output = Result<Option<Account>, AccountError>>;
+    fn get(
+        &self,
+        key: &AccountKey,
+    ) -> impl Future<Output = Result<Option<Account>, AccountError>> + Send;
 
     /// Reads one account on demand in ascending canonical key order after an exclusive cursor.
     /// The cursor need not exist. Holds one snapshot from the first read until end or drop.
     /// Yields the first error, then ends.
-    fn list(&self, after: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>>;
+    fn list(
+        &self,
+        after: Option<AccountKey>,
+    ) -> impl Stream<Item = Result<Account, AccountError>> + Send;
 
     /// Removes the account and all credentials atomically. Fails if the account is absent.
-    fn delete(&self, key: &AccountKey) -> impl Future<Output = Result<(), AccountError>>;
+    fn delete(&self, key: &AccountKey) -> impl Future<Output = Result<(), AccountError>> + Send;
 
     fn get_scram(
         &self,
         key: &AccountKey,
         hash: ScramHash,
-    ) -> impl Future<Output = Result<Option<ScramVerifier>, AccountError>>;
+    ) -> impl Future<Output = Result<Option<ScramVerifier>, AccountError>> + Send;
 
     fn replace_credentials(
         &self,
         key: &AccountKey,
         credentials: ScramCredentials,
-    ) -> impl Future<Output = Result<(), AccountError>>;
+    ) -> impl Future<Output = Result<(), AccountError>> + Send;
 }
 
 impl fmt::Display for AccountError {

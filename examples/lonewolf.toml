@@ -36,7 +36,7 @@
 
 # [admin]
 
-# Enable the admin server. Default: true. Set to false to disable it.
+# Enable the admin server. Default: true.
 # enabled = true
 
 # Unix socket path for the HTTP/JSON admin API. TCP is not supported.

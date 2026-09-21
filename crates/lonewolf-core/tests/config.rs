@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
-use lonewolf::config::{Config, ConfigError};
+use lonewolf_core::config::{Config, ConfigError};
 
 type TestResult = Result<(), Box<dyn Error>>;
 

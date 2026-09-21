@@ -38,10 +38,9 @@ pub trait AccountRepository {
 
     fn get(&self, key: &AccountKey) -> impl Future<Output = Result<Option<Account>, AccountError>>;
 
-    /// Yields accounts in ascending canonical-key order, strictly after the cursor.
-    /// The cursor need not exist. Reads one account on demand without prefetching.
-    /// Opens a snapshot on the first read and retains it until exhaustion, error, or drop.
-    /// Separate streams can observe concurrent changes. Yields the first error and then ends.
+    /// Reads one account on demand in ascending canonical key order after an exclusive cursor.
+    /// The cursor need not exist. Holds one snapshot from the first read until end or drop.
+    /// Yields the first error, then ends.
     fn list(&self, after: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>>;
 
     /// Removes the account and all credentials atomically. Fails if the account is absent.

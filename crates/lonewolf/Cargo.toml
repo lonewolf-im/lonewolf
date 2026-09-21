@@ -12,3 +12,6 @@ lonewolf-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+nix.workspace = true

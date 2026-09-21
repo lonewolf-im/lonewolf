@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lonewolf",
+    "crates/lonewolf-admin",
     "crates/lonewolf-auth",
     "crates/lonewolf-core",
     "crates/lonewolf-storage",
@@ -24,12 +25,17 @@ compio = { version = "0.19.2", default-features = false, features = ["runtime", 
 compio-io = { version = "0.10.1", default-features = false, features = ["compat"] }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
+futures-channel = "0.3.34"
 futures-executor = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
 hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
+http-body-util = { version = "0.1.4", default-features = false }
+hyper = { version = "1.11.0", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 icu_properties = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 idna = "1.1.0"
+lonewolf-admin = { path = "crates/lonewolf-admin" }
 lonewolf-auth = { path = "crates/lonewolf-auth" }
 lonewolf-core = { path = "crates/lonewolf-core" }
 lonewolf-storage = { path = "crates/lonewolf-storage" }
@@ -37,10 +43,12 @@ lonewolf-util = { path = "crates/lonewolf-util" }
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
+percent-encoding = "2.3.2"
 precis-profiles = { version = "0.2.0", default-features = false }
 quick-xml = { version = "0.41.0", default-features = false, features = ["async-tokio"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha1 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
 sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
 stringprep = "0.1.5"

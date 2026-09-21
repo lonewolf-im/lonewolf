@@ -3,10 +3,11 @@
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
-use lonewolf_core::config::{AccountConfig, Config, ConfigError, StoreConfig};
+#[cfg(unix)]
+use lonewolf_core::config::AccountConfig;
+use lonewolf_core::config::{Config, ConfigError, StoreConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -17,13 +18,13 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
 }
 
 #[test]
-fn admin_defaults_are_enabled_on_loopback() {
+fn admin_defaults_are_enabled_on_a_unix_socket() {
     let config = Config::default();
 
-    assert!(config.admin.enabled);
+    assert_eq!(config.admin.enabled, cfg!(unix));
     assert_eq!(
-        config.admin.listen_addr,
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))
+        config.admin.socket_path,
+        Path::new("./run/lonewolf/admin.sock")
     );
 }
 
@@ -53,24 +54,24 @@ fn partial_admin_settings_preserve_other_defaults() -> TestResult {
     let config = Config::load(Some(file.path()))?;
     assert!(!config.admin.enabled);
     assert_eq!(
-        config.admin.listen_addr,
-        Config::default().admin.listen_addr
+        config.admin.socket_path,
+        Config::default().admin.socket_path
     );
 
-    let file = config_file("[admin]\nlisten_addr = '[::1]:9090'\n")?;
+    let file = config_file("[admin]\nsocket_path = 'private/admin.sock'\n")?;
     let config = Config::load(Some(file.path()))?;
-    assert!(config.admin.enabled);
-    assert_eq!(config.admin.listen_addr, "[::1]:9090".parse()?);
+    assert_eq!(config.admin.enabled, cfg!(unix));
+    assert_eq!(config.admin.socket_path, Path::new("private/admin.sock"));
     Ok(())
 }
 
 #[test]
 fn explicit_admin_settings_override_defaults() -> TestResult {
-    let file = config_file("[admin]\nenabled = false\nlisten_addr = '127.0.0.2:9090'\n")?;
+    let file = config_file("[admin]\nenabled = false\nsocket_path = 'private/custom.sock'\n")?;
     let config = Config::load(Some(file.path()))?;
 
     assert!(!config.admin.enabled);
-    assert_eq!(config.admin.listen_addr, "127.0.0.2:9090".parse()?);
+    assert_eq!(config.admin.socket_path, Path::new("private/custom.sock"));
     Ok(())
 }
 
@@ -204,6 +205,7 @@ path = "db/accounts.redb"
 #[test]
 fn invalid_storage_references_and_empty_values_are_rejected() -> TestResult {
     for contents in [
+        "[admin]\nsocket_path = ''",
         "[account]\nstorage = 'missing'",
         "[account]\nstorage = ''",
         "[storage]\ndefault = 'missing'",
@@ -234,10 +236,8 @@ fn invalid_configuration_is_rejected() -> TestResult {
         "[admin]\nenabled = []",
         "[admin]\nenabled = maybe",
         "[admin]\nenabled = 'false'",
-        "[admin]\nlisten_addr = 'localhost:8080'",
-        "[admin]\nlisten_addr = '127.0.0.1'",
-        "[admin]\nlisten_addr = '127.0.0.1:65536'",
-        "[admin]\nlisten_addr = '999.0.0.1:8080'",
+        "[admin]\nsocket_path = 42",
+        "[admin]\nlisten_addr = '127.0.0.1:8080'",
         "[admin]\nenabled = true\nenabled = false",
         "[admin]\n[admin]",
         "admin = [",
@@ -323,6 +323,14 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     }
     assert!(!uncommented.is_empty());
     let file = config_file(&uncommented)?;
+    #[cfg(not(unix))]
+    {
+        assert!(matches!(
+            Config::load(Some(file.path())),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+    #[cfg(unix)]
     assert_eq!(
         Config::load(Some(file.path()))?,
         Config {

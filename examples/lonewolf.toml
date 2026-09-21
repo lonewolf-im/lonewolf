@@ -40,10 +40,14 @@
 # ------------------------------ Administration -------------------------------
 # [admin]
 
-# Enable the admin server. Set to false to disable it.
+# Enable the admin server. Default: true on Unix, false on other platforms.
+# Set to false to disable it. Enabling it on a non-Unix system is an error.
 # enabled = true
 
-# IP address and port for the admin listener.
-# The default permits connections from this machine only.
-# Use a numeric IP address. Put IPv6 addresses in brackets, as in "[::1]:8080".
-# listen_addr = "127.0.0.1:8080"
+# Unix socket path for the HTTP/JSON admin API. TCP is not supported.
+# Default: ./run/lonewolf/admin.sock. Relative paths use the working directory.
+# The parent directory must be private (0700) and owned by the server user.
+# Missing directories are created with mode 0700; the socket uses mode 0600.
+# Existing paths are rejected. Remove a stale socket only after stopping its server.
+# The socket is removed on graceful shutdown. Non-Unix systems must disable admin.
+# socket_path = "./run/lonewolf/admin.sock"

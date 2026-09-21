@@ -5,7 +5,6 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -52,6 +51,13 @@ impl Config {
 
     fn validate(&self) -> Result<(), String> {
         self.storage.validate()?;
+        if self.admin.socket_path.as_os_str().is_empty() {
+            return Err("admin.socket_path must not be empty".into());
+        }
+        #[cfg(not(unix))]
+        if self.admin.enabled {
+            return Err("the admin service requires Unix; set admin.enabled to false".into());
+        }
         if let Some(store) = &self.account.storage
             && !self.storage.stores.contains_key(store)
         {
@@ -73,14 +79,14 @@ pub struct AccountConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct AdminConfig {
     pub enabled: bool,
-    pub listen_addr: SocketAddr,
+    pub socket_path: PathBuf,
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
+            enabled: cfg!(unix),
+            socket_path: PathBuf::from("./run/lonewolf/admin.sock"),
         }
     }
 }

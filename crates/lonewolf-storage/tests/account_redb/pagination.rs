@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use futures_executor::block_on;
+use futures_util::{StreamExt, TryStreamExt};
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountPageSize, AccountRepository, NewAccount};
@@ -9,7 +10,7 @@ use redb::ReadableTable;
 use super::support::*;
 
 #[test]
-fn pages_follow_canonical_key_order_across_domains() -> TestResult {
+fn caller_pagination_follows_canonical_key_order_without_skipping_lookahead() -> TestResult {
     let repository = RedbAccountRepository::from_database(database()?)?;
     for input in [
         "bob@example.com",
@@ -23,39 +24,44 @@ fn pages_follow_canonical_key_order_across_domains() -> TestResult {
         }))?;
     }
     let size = AccountPageSize::new(2).ok_or("invalid page size")?;
-    let first = block_on(repository.list(None, size))?;
-    assert_eq!(first.accounts.len(), 2);
-    assert_eq!(first.accounts[0].key, key("alice@example.com")?);
-    assert_eq!(first.accounts[1].key, key("alice@example.org")?);
-    assert!(first.has_more);
+    let first = block_on(repository.list(None, size).take(3).try_collect::<Vec<_>>())?;
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[0].key, key("alice@example.com")?);
+    assert_eq!(first[1].key, key("alice@example.org")?);
+    assert_eq!(first[2].key, key("bob@example.com")?);
 
-    let second = block_on(repository.list(Some(&first.accounts[1].key), size))?;
-    assert_eq!(second.accounts.len(), 2);
-    assert_eq!(second.accounts[0].key, key("bob@example.com")?);
-    assert_eq!(second.accounts[1].key, key("é@bücher.example")?);
-    assert!(!second.has_more);
-    let end = block_on(repository.list(Some(&second.accounts[1].key), size))?;
-    assert!(end.accounts.is_empty());
-    assert!(!end.has_more);
+    let second = block_on(
+        repository
+            .list(Some(first[1].key.clone()), size)
+            .take(3)
+            .try_collect::<Vec<_>>(),
+    )?;
+    assert_eq!(second.len(), 2);
+    assert_eq!(second[0].key, first[2].key);
+    assert_eq!(second[1].key, key("é@bücher.example")?);
+    let end = block_on(
+        repository
+            .list(Some(second[1].key.clone()), size)
+            .try_collect::<Vec<_>>(),
+    )?;
+    assert!(end.is_empty());
     Ok(())
 }
 
 #[test]
-fn empty_and_partial_pages_do_not_claim_more_accounts() -> TestResult {
+fn listing_ends_after_empty_and_partial_batches() -> TestResult {
     let repository = RedbAccountRepository::from_database(database()?)?;
     let size = AccountPageSize::new(2).ok_or("invalid page size")?;
-    let empty = block_on(repository.list(None, size))?;
-    assert!(empty.accounts.is_empty());
-    assert!(!empty.has_more);
+    let empty = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
+    assert!(empty.is_empty());
 
     block_on(repository.create(NewAccount {
         key: key("alice@example.com")?,
         credentials: credentials(10),
     }))?;
-    let page = block_on(repository.list(None, size))?;
-    assert_eq!(page.accounts.len(), 1);
-    assert_eq!(page.accounts[0].key, key("alice@example.com")?);
-    assert!(!page.has_more);
+    let accounts = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].key, key("alice@example.com")?);
     Ok(())
 }
 
@@ -69,10 +75,9 @@ fn pagination_resumes_after_deleted_and_absent_keys() -> TestResult {
         }))?;
     }
     let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let first = block_on(repository.list(None, size))?;
-    assert_eq!(first.accounts.len(), 1);
-    assert!(first.has_more);
-    let cursor = &first.accounts[0].key;
+    let first = block_on(repository.list(None, size).take(1).try_collect::<Vec<_>>())?;
+    assert_eq!(first.len(), 1);
+    let cursor = &first[0].key;
     block_on(repository.delete(cursor))?;
     for input in ["aaron@example.com", "bob@example.com"] {
         block_on(repository.create(NewAccount {
@@ -80,21 +85,25 @@ fn pagination_resumes_after_deleted_and_absent_keys() -> TestResult {
             credentials: credentials(10),
         }))?;
     }
-    let second = block_on(repository.list(Some(cursor), size))?;
-    assert_eq!(second.accounts.len(), 1);
-    assert_eq!(second.accounts[0].key, key("bob@example.com")?);
-    assert!(second.has_more);
+    let second = block_on(
+        repository
+            .list(Some(cursor.clone()), size)
+            .try_collect::<Vec<_>>(),
+    )?;
+    assert_eq!(second.len(), 3);
+    assert_eq!(second[0].key, key("bob@example.com")?);
+    assert_eq!(second[1].key, key("carol@example.com")?);
+    assert_eq!(second[2].key, key("erin@example.com")?);
 
     let between = key("dan@example.com")?;
-    let page = block_on(repository.list(Some(&between), size))?;
-    assert_eq!(page.accounts.len(), 1);
-    assert_eq!(page.accounts[0].key, key("erin@example.com")?);
-    assert!(!page.has_more);
+    let accounts = block_on(repository.list(Some(between), size).try_collect::<Vec<_>>())?;
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].key, key("erin@example.com")?);
     Ok(())
 }
 
 #[test]
-fn listing_does_not_decode_records_beyond_the_requested_page() -> TestResult {
+fn stopping_listing_does_not_decode_records_in_later_batches() -> TestResult {
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     block_on(repository.create(NewAccount {
@@ -103,11 +112,14 @@ fn listing_does_not_decode_records_beyond_the_requested_page() -> TestResult {
     }))?;
     insert_record(database.as_ref(), &key("bob@example.com")?, &[2, 2])?;
     let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let first = block_on(repository.list(None, size))?;
-    assert_eq!(first.accounts.len(), 1);
-    assert!(first.has_more);
+    let first = block_on(repository.list(None, size).take(1).try_collect::<Vec<_>>())?;
+    assert_eq!(first.len(), 1);
     assert_storage_error(
-        block_on(repository.list(Some(&first.accounts[0].key), size)),
+        block_on(
+            repository
+                .list(Some(first[0].key.clone()), size)
+                .try_collect::<Vec<_>>(),
+        ),
         StorageErrorKind::UnsupportedVersion,
     );
     Ok(())
@@ -147,7 +159,7 @@ fn listing_rejects_invalid_or_noncanonical_stored_keys() -> TestResult {
         }
         transaction.commit()?;
         assert_storage_error(
-            block_on(repository.list(None, size)),
+            block_on(repository.list(None, size).try_collect::<Vec<_>>()),
             StorageErrorKind::CorruptData,
         );
         let transaction = database.as_ref().begin_write()?;
@@ -158,7 +170,7 @@ fn listing_rejects_invalid_or_noncanonical_stored_keys() -> TestResult {
 }
 
 #[test]
-fn maximum_size_pages_support_long_account_keys() -> TestResult {
+fn maximum_size_batches_support_long_account_keys() -> TestResult {
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     let source = key("source@example.com")?;
@@ -182,13 +194,17 @@ fn maximum_size_pages_support_long_account_keys() -> TestResult {
     }
     transaction.commit()?;
     let size = AccountPageSize::new(AccountPageSize::MAX).ok_or("invalid page size")?;
-    let first = block_on(repository.list(None, size))?;
-    assert_eq!(first.accounts.len(), AccountPageSize::MAX);
-    assert!(first.has_more);
-    assert_eq!(first.accounts[0].key.username().len(), 1023);
-    let cursor = &first.accounts.last().ok_or("empty page")?.key;
-    let second = block_on(repository.list(Some(cursor), size))?;
-    assert_eq!(second.accounts.len(), 1);
-    assert!(!second.has_more);
+    let accounts = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
+    assert_eq!(accounts.len(), AccountPageSize::MAX + 1);
+    assert!(
+        accounts
+            .iter()
+            .all(|account| account.key.username().len() == 1023)
+    );
+    assert!(
+        accounts
+            .windows(2)
+            .all(|pair| pair[0].key.as_str() < pair[1].key.as_str())
+    );
     Ok(())
 }

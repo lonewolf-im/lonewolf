@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use futures_executor::block_on;
+use futures_util::TryStreamExt;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountError, AccountPageSize, AccountRepository, NewAccount};
@@ -321,7 +322,7 @@ fn malformed_records_fail_operations_without_modifying_data() -> TestResult {
             StorageErrorKind::CorruptData,
         );
         assert_storage_error(
-            block_on(repository.list(None, size)),
+            block_on(repository.list(None, size).try_collect::<Vec<_>>()),
             StorageErrorKind::CorruptData,
         );
         assert_storage_error(
@@ -362,7 +363,7 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
         StorageErrorKind::UnsupportedVersion,
     );
     assert_storage_error(
-        block_on(repository.list(None, size)),
+        block_on(repository.list(None, size).try_collect::<Vec<_>>()),
         StorageErrorKind::UnsupportedVersion,
     );
     assert_storage_error(
@@ -478,9 +479,9 @@ fn all_account_operations_do_database_io_off_the_callers_thread() -> TestResult 
     block_on(repository.replace_credentials(&account, credentials(20)))?;
     assert_worker_threads(&backend)?;
     let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let page = block_on(repository.list(None, size))?;
-    assert_eq!(page.accounts.len(), 1);
-    assert_eq!(page.accounts[0].key, account);
+    let accounts = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].key, account);
     assert_worker_threads(&backend)?;
     block_on(repository.delete(&account))?;
     assert_worker_threads(&backend)?;

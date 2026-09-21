@@ -1,22 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::NonZeroU32;
-use std::ops::Bound;
 use std::path::Path;
 
 use ::redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use futures_util::Stream;
 use lonewolf_auth::scram::{
     ScramCredentials, ScramHash, ScramSha1Verifier, ScramSha256Verifier, ScramVerifier,
     ScramVerifierData,
 };
-use lonewolf_util::arena::{Arena, ArenaConfig};
-use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
 
 use crate::account::{
-    Account, AccountError, AccountKey, AccountPage, AccountPageSize, AccountRepository, NewAccount,
+    Account, AccountError, AccountKey, AccountPageSize, AccountRepository, NewAccount,
 };
 use crate::redb::{METADATA, begin_write, commit_error, storage_error};
 use crate::{RedbDatabase, StorageError, StorageErrorKind};
+
+mod list;
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
 const SCHEMA_KEY: &str = "accounts_schema";
@@ -90,15 +90,12 @@ impl AccountRepository for RedbAccountRepository {
         self.database.read(move |database| get(database, key)).await
     }
 
-    async fn list(
+    fn list(
         &self,
-        after: Option<&AccountKey>,
-        size: AccountPageSize,
-    ) -> Result<AccountPage, AccountError> {
-        let after = after.cloned();
-        self.database
-            .read(move |database| list(database, after, size))
-            .await
+        after: Option<AccountKey>,
+        batch_size: AccountPageSize,
+    ) -> impl Stream<Item = Result<Account, AccountError>> {
+        list::accounts(&self.database, after, batch_size)
     }
 
     async fn delete(&self, key: &AccountKey) -> Result<(), AccountError> {
@@ -159,54 +156,6 @@ fn get(database: &Database, key: AccountKey) -> Result<Option<Account>, AccountE
     };
     decode_credentials(record.value())?;
     Ok(Some(Account { key }))
-}
-
-fn list(
-    database: &Database,
-    after: Option<AccountKey>,
-    size: AccountPageSize,
-) -> Result<AccountPage, AccountError> {
-    let transaction = database.begin_read().map_err(storage_error)?;
-    let table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-    let start = after
-        .as_ref()
-        .map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_str()));
-    let mut entries = table
-        .range::<&str>((start, Bound::Unbounded))
-        .map_err(storage_error)?;
-    let mut accounts = Vec::with_capacity(size.get());
-    let mut arena = Arena::try_new(ArenaConfig::default())
-        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
-    for entry in entries.by_ref().take(size.get()) {
-        let (key, record) = entry.map_err(storage_error)?;
-        decode_credentials(record.value())?;
-        accounts.push(Account {
-            key: decode_account_key(key.value(), &mut arena)?,
-        });
-    }
-    let has_more = entries.next().transpose().map_err(storage_error)?.is_some();
-    Ok(AccountPage { accounts, has_more })
-}
-
-fn decode_account_key(text: &str, arena: &mut Arena) -> Result<AccountKey, StorageError> {
-    if text.len() > MAX_PART_LEN * 2 + 1 {
-        return Err(StorageError::new(StorageErrorKind::CorruptData));
-    }
-    let jid = Jid::parse_in(text, arena).map_err(|error| {
-        let kind = match error {
-            JidError::AllocationFailed(_) | JidError::AccessFailed(_) => StorageErrorKind::Other,
-            _ => StorageErrorKind::CorruptData,
-        };
-        StorageError::with_source(kind, error)
-    })?;
-    let jid = jid
-        .resolve(arena)
-        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
-    if jid.as_str() != text {
-        return Err(StorageError::new(StorageErrorKind::CorruptData));
-    }
-    AccountKey::try_from(jid)
-        .map_err(|error| StorageError::with_source(StorageErrorKind::CorruptData, error))
 }
 
 fn delete(database: &Database, key: &AccountKey) -> Result<(), AccountError> {

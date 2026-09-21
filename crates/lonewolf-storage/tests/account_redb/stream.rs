@@ -27,7 +27,7 @@ fn stream_reads_only_when_a_page_is_needed_and_stays_off_the_callers_thread() ->
     }
     backend.take_threads()?;
     let size = AccountPageSize::new(2).ok_or("invalid page size")?;
-    let mut accounts = pin!(repository.stream(None, size));
+    let mut accounts = pin!(repository.list(None, size));
     assert!(backend.take_threads()?.is_empty());
     assert_eq!(
         block_on(accounts.try_next())?.ok_or("missing account")?.key,
@@ -65,7 +65,7 @@ fn stream_releases_each_snapshot_and_continues_after_a_deleted_cursor() -> TestR
         }))?;
     }
     let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let mut accounts = pin!(repository.stream(Some(key("alice@example.com")?), size));
+    let mut accounts = pin!(repository.list(Some(key("alice@example.com")?), size));
     let first = block_on(accounts.try_next())?.ok_or("missing account")?;
     assert_eq!(first.key, key("bob@example.com")?);
     block_on(repository.delete(&first.key))?;
@@ -95,7 +95,7 @@ fn stream_yields_a_later_page_error_once_and_then_ends() -> TestResult {
     }))?;
     insert_record(database.as_ref(), &key("bob@example.com")?, &[2, 2])?;
     let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let mut accounts = pin!(repository.stream(None, size));
+    let mut accounts = pin!(repository.list(None, size));
     assert_eq!(
         block_on(accounts.try_next())?.ok_or("missing account")?.key,
         key("alice@example.com")?
@@ -123,7 +123,7 @@ fn dropping_a_partly_consumed_stream_does_not_read_another_page() -> TestResult 
     }
     let size = AccountPageSize::new(1).ok_or("invalid page size")?;
     {
-        let mut accounts = pin!(repository.stream(None, size));
+        let mut accounts = pin!(repository.list(None, size));
         assert!(block_on(accounts.try_next())?.is_some());
         backend.take_threads()?;
     }
@@ -135,7 +135,7 @@ fn dropping_a_partly_consumed_stream_does_not_read_another_page() -> TestResult 
 fn empty_stream_remains_exhausted() -> TestResult {
     let repository = RedbAccountRepository::from_database(database()?)?;
     let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let mut accounts = pin!(repository.stream(None, size));
+    let mut accounts = pin!(repository.list(None, size));
     assert!(block_on(accounts.try_next())?.is_none());
     assert!(block_on(accounts.try_next())?.is_none());
     Ok(())

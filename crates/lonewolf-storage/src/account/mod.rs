@@ -12,7 +12,6 @@ use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 use crate::StorageError;
 
 mod key;
-mod stream;
 
 pub use key::{AccountKey, AccountKeyError};
 
@@ -43,13 +42,6 @@ impl AccountPageSize {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct AccountPage {
-    pub accounts: Vec<Account>,
-    /// If true, continue after the last returned account key.
-    pub has_more: bool,
-}
-
 #[derive(Debug)]
 pub enum AccountError {
     AlreadyExists,
@@ -62,24 +54,15 @@ pub trait AccountRepository {
 
     fn get(&self, key: &AccountKey) -> impl Future<Output = Result<Option<Account>, AccountError>>;
 
-    /// Returns a snapshot in ascending canonical-key order, strictly after the cursor.
-    /// The cursor need not exist. Separate pages can observe concurrent changes.
+    /// Yields accounts in ascending canonical-key order, strictly after the cursor.
+    /// The cursor need not exist. Buffers at most one batch, fetched on demand.
+    /// Releases each snapshot before yielding. Batches can observe concurrent changes.
+    /// Yields the first error and then ends.
     fn list(
         &self,
-        after: Option<&AccountKey>,
-        size: AccountPageSize,
-    ) -> impl Future<Output = Result<AccountPage, AccountError>>;
-
-    /// Fetches one page on demand and releases its snapshot before yielding accounts.
-    /// Buffers at most one page. Each page can observe concurrent changes.
-    /// Stops after the first error.
-    fn stream(
-        &self,
         after: Option<AccountKey>,
-        size: AccountPageSize,
-    ) -> impl Stream<Item = Result<Account, AccountError>> {
-        stream::accounts(self, after, size)
-    }
+        batch_size: AccountPageSize,
+    ) -> impl Stream<Item = Result<Account, AccountError>>;
 
     /// Removes the account and all credentials atomically. Fails if the account is absent.
     fn delete(&self, key: &AccountKey) -> impl Future<Output = Result<(), AccountError>>;

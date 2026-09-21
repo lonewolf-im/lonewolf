@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::borrow::Cow;
-use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::pin::pin;
+use std::sync::Arc;
 use std::time::Instant;
 
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, FromRequestParts, Path, Request, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::{HeaderValue, StatusCode, Uri, request::Parts};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, put};
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
-use hyper::header::{CACHE_CONTROL, CONTENT_TYPE};
-use hyper::{Method, Request, Response, StatusCode};
+use http_body_util::BodyExt;
 use lonewolf_auth::scram::{
     ScramCredentials, ScramError, ScramHash, ScramIterations, ScramVerifier,
 };
@@ -27,104 +32,138 @@ const MAX_BODY: usize = 16 * 1024;
 const MAX_PAGE: usize = 100;
 const DEFAULT_PAGE: usize = 50;
 
-type HttpResponse = Response<Full<Bytes>>;
+pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
+    Router::new()
+        .route(
+            "/v1/accounts",
+            get(list_accounts::<R>).post(create_account::<R>),
+        )
+        .route(
+            "/v1/accounts/{jid}",
+            get(get_account::<R>).delete(delete_account::<R>),
+        )
+        .route("/v1/accounts/{jid}/password", put(change_password::<R>))
+        .fallback(|| async { ApiError::not_found() })
+        .method_not_allowed_fallback(|| async {
+            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
+        })
+        .layer(middleware::from_fn(log_request))
+        .with_state(Arc::new(Api::new(accounts)))
+}
 
-pub(crate) struct Api<R> {
+async fn log_request(request: Request, next: Next) -> Response {
+    let started = Instant::now();
+    let response = next.run(request).await;
+    tracing::debug!(
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis(),
+        "admin request completed"
+    );
+    response
+}
+
+async fn list_accounts<R: AccountRepository>(
+    State(api): State<Arc<Api<R>>>,
+    uri: Uri,
+) -> Result<Response, ApiError> {
+    api.list(uri.query()).await
+}
+
+async fn create_account<R: AccountRepository>(
+    State(api): State<Arc<Api<R>>>,
+    SensitiveJson(input): SensitiveJson<CreateAccount>,
+) -> Result<Response, ApiError> {
+    let key = account_key(&input.jid)?;
+    let response = json(StatusCode::CREATED, &AccountView { jid: key.as_str() })?;
+    let credentials = api.credentials(input.password).await?;
+    api.accounts.create(NewAccount { key, credentials }).await?;
+    Ok(response)
+}
+
+async fn get_account<R: AccountRepository>(
+    State(api): State<Arc<Api<R>>>,
+    AccountPath(key): AccountPath,
+) -> Result<Response, ApiError> {
+    let account = api
+        .accounts
+        .get(&key)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    json(
+        StatusCode::OK,
+        &AccountView {
+            jid: account.key.as_str(),
+        },
+    )
+}
+
+async fn delete_account<R: AccountRepository>(
+    State(api): State<Arc<Api<R>>>,
+    AccountPath(key): AccountPath,
+) -> Result<Response, ApiError> {
+    api.accounts.delete(&key).await?;
+    Ok(empty())
+}
+
+async fn change_password<R: AccountRepository>(
+    State(api): State<Arc<Api<R>>>,
+    AccountPath(key): AccountPath,
+    SensitiveJson(input): SensitiveJson<ChangePassword>,
+) -> Result<Response, ApiError> {
+    let credentials = api.credentials(input.password).await?;
+    api.accounts.replace_credentials(&key, credentials).await?;
+    Ok(empty())
+}
+
+struct AccountPath(AccountKey);
+
+impl<S: Send + Sync> FromRequestParts<S> for AccountPath {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if parts.uri.query().is_some() {
+            return Err(ApiError::bad_request());
+        }
+        validate_percent_encoding(parts.uri.path())?;
+        let Path(jid) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ApiError::bad_request())?;
+        account_key(&jid).map(Self)
+    }
+}
+
+struct SensitiveJson<T>(T);
+
+impl<S, T> FromRequest<S> for SensitiveJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, _: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = request.into_parts();
+        if parts.uri.query().is_some() {
+            return Err(ApiError::bad_request());
+        }
+        read_json(&parts.headers, body).await.map(Self)
+    }
+}
+
+struct Api<R> {
     accounts: R,
     passwords: BlockingExecutor,
 }
 
 impl<R: AccountRepository> Api<R> {
-    pub(crate) fn new(accounts: R) -> Self {
+    fn new(accounts: R) -> Self {
         Self {
             accounts,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
         }
     }
 
-    pub(crate) async fn handle(
-        &self,
-        request: Request<Incoming>,
-    ) -> Result<HttpResponse, Infallible> {
-        let started = Instant::now();
-        let response = match self.route(request).await {
-            Ok(response) => response,
-            Err(error) => error.response(),
-        };
-        tracing::debug!(
-            status = response.status().as_u16(),
-            latency_ms = started.elapsed().as_millis(),
-            "admin request completed"
-        );
-        Ok(response)
-    }
-
-    async fn route(&self, request: Request<Incoming>) -> Result<HttpResponse, ApiError> {
-        let (parts, body) = request.into_parts();
-        let path = parts.uri.path();
-        if path == "/v1/accounts" {
-            return match parts.method {
-                Method::GET => self.list(parts.uri.query()).await,
-                Method::POST if parts.uri.query().is_none() => {
-                    let input: CreateAccount = read_json(&parts.headers, body).await?;
-                    let key = account_key(&input.jid)?;
-                    let response = json(StatusCode::CREATED, &AccountView { jid: key.as_str() })?;
-                    let credentials = self.credentials(input.password).await?;
-                    self.accounts
-                        .create(NewAccount { key, credentials })
-                        .await?;
-                    Ok(response)
-                }
-                Method::POST => Err(ApiError::bad_request()),
-                _ => Err(ApiError::method_not_allowed("GET, POST")),
-            };
-        }
-        let Some(account_path) = path.strip_prefix("/v1/accounts/") else {
-            return Err(ApiError::not_found());
-        };
-        if parts.uri.query().is_some() {
-            return Err(ApiError::bad_request());
-        }
-        let (encoded_key, password) = match account_path.strip_suffix("/password") {
-            Some(key) => (key, true),
-            None => (account_path, false),
-        };
-        if encoded_key.is_empty() || encoded_key.contains('/') {
-            return Err(ApiError::not_found());
-        }
-        let key = account_key(&decode(encoded_key)?)?;
-        if password {
-            if parts.method != Method::PUT {
-                return Err(ApiError::method_not_allowed("PUT"));
-            }
-            let input: ChangePassword = read_json(&parts.headers, body).await?;
-            let credentials = self.credentials(input.password).await?;
-            self.accounts.replace_credentials(&key, credentials).await?;
-            return Ok(empty());
-        }
-        match parts.method {
-            Method::GET => {
-                let account = self
-                    .accounts
-                    .get(&key)
-                    .await?
-                    .ok_or_else(ApiError::not_found)?;
-                json(
-                    StatusCode::OK,
-                    &AccountView {
-                        jid: account.key.as_str(),
-                    },
-                )
-            }
-            Method::DELETE => {
-                self.accounts.delete(&key).await?;
-                Ok(empty())
-            }
-            _ => Err(ApiError::method_not_allowed("GET, DELETE")),
-        }
-    }
-
-    async fn list(&self, query: Option<&str>) -> Result<HttpResponse, ApiError> {
+    async fn list(&self, query: Option<&str>) -> Result<Response, ApiError> {
         let (after, limit) = list_parameters(query)?;
         let mut stream = pin!(self.accounts.list(after));
         let mut bytes = Vec::with_capacity(1024);
@@ -215,8 +254,8 @@ struct AccountView<'a> {
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(
-    headers: &hyper::HeaderMap,
-    mut body: Incoming,
+    headers: &axum::http::HeaderMap,
+    mut body: Body,
 ) -> Result<T, ApiError> {
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -263,7 +302,7 @@ fn account_key(text: &str) -> Result<AccountKey, ApiError> {
     AccountKey::try_from(jid).map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_jid"))
 }
 
-fn decode(value: &str) -> Result<Cow<'_, str>, ApiError> {
+fn validate_percent_encoding(value: &str) -> Result<(), ApiError> {
     for (i, byte) in value.bytes().enumerate() {
         if byte == b'%'
             && !value
@@ -274,6 +313,11 @@ fn decode(value: &str) -> Result<Cow<'_, str>, ApiError> {
             return Err(ApiError::bad_request());
         }
     }
+    Ok(())
+}
+
+fn decode(value: &str) -> Result<Cow<'_, str>, ApiError> {
+    validate_percent_encoding(value)?;
     percent_decode_str(value)
         .decode_utf8()
         .map_err(|_| ApiError::bad_request())
@@ -305,43 +349,36 @@ fn list_parameters(query: Option<&str>) -> Result<(Option<AccountKey>, usize), A
     Ok((after, limit.unwrap_or(DEFAULT_PAGE)))
 }
 
-fn json(status: StatusCode, value: &impl Serialize) -> Result<HttpResponse, ApiError> {
+fn json(status: StatusCode, value: &impl Serialize) -> Result<Response, ApiError> {
     serde_json::to_vec(value)
         .map(|bytes| response(status, bytes.into()))
         .map_err(|_| ApiError::internal())
 }
 
-fn response(status: StatusCode, body: Bytes) -> HttpResponse {
-    let mut response = Response::new(Full::new(body));
+fn response(status: StatusCode, body: Bytes) -> Response {
+    let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("application/json"),
-    );
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        hyper::header::HeaderValue::from_static("no-store"),
-    );
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
-fn empty() -> HttpResponse {
+fn empty() -> Response {
     response(StatusCode::NO_CONTENT, Bytes::new())
 }
 
 struct ApiError {
     status: StatusCode,
     code: &'static str,
-    allow: Option<&'static str>,
 }
 
 impl ApiError {
     fn new(status: StatusCode, code: &'static str) -> Self {
-        Self {
-            status,
-            code,
-            allow: None,
-        }
+        Self { status, code }
     }
     fn bad_request() -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request")
@@ -352,24 +389,14 @@ impl ApiError {
     fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
     }
-    fn method_not_allowed(allow: &'static str) -> Self {
-        Self {
-            allow: Some(allow),
-            ..Self::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
-        }
-    }
-    fn response(self) -> HttpResponse {
-        let mut response = response(
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        response(
             self.status,
             format!("{{\"error\":{{\"code\":\"{}\"}}}}", self.code).into(),
-        );
-        if let Some(allow) = self.allow {
-            response.headers_mut().insert(
-                hyper::header::ALLOW,
-                hyper::header::HeaderValue::from_static(allow),
-            );
-        }
-        response
+        )
     }
 }
 
@@ -507,7 +534,7 @@ mod tests {
                     Ok(_) => return Err("listing should fail".into()),
                 };
                 assert!(!api.accounts.active.load(Ordering::Relaxed));
-                let response = error.response();
+                let response = error.into_response();
                 assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
                 let bytes = response.into_body().collect().await?.to_bytes();
                 assert_eq!(&bytes[..], b"{\"error\":{\"code\":\"internal_error\"}}");

@@ -279,6 +279,8 @@ fn rejects_invalid_routes_keys_queries_and_json() -> TestResult {
             "/v1/accounts/a%40example.org%2Fresource",
             "/v1/accounts/a%40example.org?limit=1",
             "/v1/accounts/bad%",
+            "/v1/accounts/bad%GG%40example.org",
+            "/v1/accounts/%FF%40example.org",
         ] {
             assert_eq!(
                 request(&path, "GET", target, None).await?.status,
@@ -286,10 +288,6 @@ fn rejects_invalid_routes_keys_queries_and_json() -> TestResult {
                 "{target}"
             );
         }
-        assert_eq!(request(&path, "GET", "/unknown", None).await?.status, 404);
-        let reply = request(&path, "PATCH", "/v1/accounts", None).await?;
-        assert_eq!(reply.status, 405);
-        assert!(reply.headers.contains("allow: GET, POST"));
         for input in [
             json!({"jid":"example.org","password":"valid"}),
             json!({"jid":"a@example.org/resource","password":"valid"}),
@@ -315,6 +313,142 @@ fn rejects_invalid_routes_keys_queries_and_json() -> TestResult {
             415
         );
         assert_eq!(raw(&path, "POST /v1/accounts HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n{".into()).await?.status, 400);
+        Ok(())
+    })
+}
+
+#[test]
+fn route_fallbacks_return_json_and_advertise_allowed_methods() -> TestResult {
+    with_server(|path, _| async move {
+        for target in [
+            "/unknown",
+            "/v1/accounts/",
+            "/v1/accounts/a@example.org/resource",
+            "/v1/accounts/a@example.org/password/",
+        ] {
+            let reply = request(&path, "GET", target, None).await?;
+            assert_eq!(reply.status, 404, "{target}");
+            assert_eq!(reply.body, json!({"error":{"code":"not_found"}}));
+            assert!(reply.headers.contains("content-type: application/json"));
+            assert!(reply.headers.contains("cache-control: no-store"));
+        }
+        for (target, expected) in [
+            ("/v1/accounts", &["GET", "HEAD", "POST"][..]),
+            ("/v1/accounts/a@example.org", &["DELETE", "GET", "HEAD"][..]),
+            ("/v1/accounts/a@example.org/password", &["PUT"][..]),
+        ] {
+            let reply = request(&path, "PATCH", target, None).await?;
+            assert_eq!(reply.status, 405, "{target}");
+            assert_eq!(reply.body, json!({"error":{"code":"method_not_allowed"}}));
+            assert!(reply.headers.contains("content-type: application/json"));
+            assert!(reply.headers.contains("cache-control: no-store"));
+            let mut allowed: Vec<_> = reply
+                .headers
+                .lines()
+                .find_map(|line| line.strip_prefix("allow: "))
+                .ok_or("missing Allow header")?
+                .split(',')
+                .map(str::trim)
+                .collect();
+            allowed.sort_unstable();
+            assert_eq!(allowed, expected);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn head_routes_match_get_status_and_headers_without_a_body() -> TestResult {
+    with_server(|path, accounts| async move {
+        seed(&accounts, "alice@example.org").await?;
+        for target in [
+            "/v1/accounts?limit=1",
+            "/v1/accounts/alice%40example.org",
+            "/v1/accounts/missing%40example.org",
+            "/v1/accounts/bad%",
+        ] {
+            let get = request(&path, "GET", target, None).await?;
+            let head = request(&path, "HEAD", target, None).await?;
+            assert_eq!(head.status, get.status, "{target}");
+            assert_eq!(head.body, Value::Null);
+            assert!(head.headers.contains("content-type: application/json"));
+            assert!(head.headers.contains("cache-control: no-store"));
+            let content_length = get
+                .headers
+                .lines()
+                .find(|line| line.starts_with("content-length: "))
+                .ok_or("missing Content-Length header")?;
+            assert!(head.headers.lines().any(|line| line == content_length));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn account_paths_decode_once_and_preserve_plus_signs() -> TestResult {
+    with_server(|path, accounts| async move {
+        for (jid, encoded) in [
+            ("alice+tag@example.org", "alice+tag%40example.org"),
+            ("percent%name@example.org", "percent%25name%40example.org"),
+            ("literal%2f@example.org", "literal%252f%40example.org"),
+            ("alice@bücher.example", "alice%40b%C3%BCcher.example"),
+        ] {
+            seed(&accounts, jid).await?;
+            let reply = request(&path, "GET", &format!("/v1/accounts/{encoded}"), None).await?;
+            assert_eq!(reply.status, 200, "{encoded}");
+            assert_eq!(reply.body, json!({"jid":jid}));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn mutations_reject_query_parameters_before_changing_accounts() -> TestResult {
+    with_server(|path, accounts| async move {
+        let reply = request(
+            &path,
+            "POST",
+            "/v1/accounts?limit=1",
+            Some(json!({"jid":"alice@example.org","password":"valid"})),
+        )
+        .await?;
+        assert_eq!(reply.status, 400);
+        let key = key("alice@example.org")?;
+        assert!(accounts.get(&key).await?.is_none());
+
+        seed(&accounts, "alice@example.org").await?;
+        let Some(ScramVerifier::Sha256(before)) =
+            accounts.get_scram(&key, ScramHash::Sha256).await?
+        else {
+            return Err("missing credentials".into());
+        };
+        let reply = request(
+            &path,
+            "PUT",
+            "/v1/accounts/alice%40example.org/password?limit=1",
+            Some(json!({"password":"changed"})),
+        )
+        .await?;
+        assert_eq!(reply.status, 400);
+        let Some(ScramVerifier::Sha256(after)) =
+            accounts.get_scram(&key, ScramHash::Sha256).await?
+        else {
+            return Err("missing credentials".into());
+        };
+        assert_eq!(after.salt(), before.salt());
+        assert_eq!(after.iterations(), before.iterations());
+        assert_eq!(after.stored_key(), before.stored_key());
+        assert_eq!(after.server_key(), before.server_key());
+
+        let reply = request(
+            &path,
+            "DELETE",
+            "/v1/accounts/alice%40example.org?limit=1",
+            None,
+        )
+        .await?;
+        assert_eq!(reply.status, 400);
+        assert!(accounts.get(&key).await?.is_some());
         Ok(())
     })
 }

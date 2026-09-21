@@ -8,33 +8,34 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::time::Duration;
 
+use axum::Router;
 use compio::net::{UnixListener, UnixStream};
 use compio::time::timeout;
 use compio_io::compat::AsyncStream;
 use futures_util::future::{Either, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use hyper::server::conn::http1;
-use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use lonewolf_storage::account::AccountRepository;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::api::Api;
+use crate::api;
 
 const MAX_CONNECTIONS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct Server<R> {
+pub struct Server {
     listener: UnixListener,
     socket: SocketFile,
-    api: Api<R>,
+    router: Router,
 }
 
-impl<R: AccountRepository> Server<R> {
+impl Server {
     /// Requires a private parent directory owned by the current user.
     /// Creates missing directories with mode 0700 and the socket with mode 0600.
     /// Refuses existing paths, including stale sockets.
-    pub fn bind(path: &Path, accounts: R) -> io::Result<Self> {
+    pub fn bind(path: &Path, accounts: impl AccountRepository + 'static) -> io::Result<Self> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -63,7 +64,7 @@ impl<R: AccountRepository> Server<R> {
         Ok(Self {
             listener: UnixListener::from_std(listener)?,
             socket,
-            api: Api::new(accounts),
+            router: api::router(accounts),
         })
     }
 
@@ -96,7 +97,7 @@ impl<R: AccountRepository> Server<R> {
             match event {
                 Either::Left(result) => break result,
                 Either::Right(Ok(Some((stream, _)))) => {
-                    connections.push(serve_connection(stream, &self.api));
+                    connections.push(serve_connection(stream, self.router.clone()));
                 }
                 Either::Right(Ok(None)) => {}
                 Either::Right(Err(error)) => break Err(error),
@@ -109,14 +110,14 @@ impl<R: AccountRepository> Server<R> {
     }
 }
 
-async fn serve_connection<R: AccountRepository>(stream: UnixStream, api: &Api<R>) {
+async fn serve_connection(stream: UnixStream, router: Router) {
     let io = TokioIo::new(Box::pin(AsyncStream::with_limits(4096, 16384, stream)).compat());
     let mut builder = http1::Builder::new();
     builder
         .keep_alive(false)
         .max_buf_size(16384)
         .max_headers(32);
-    let connection = builder.serve_connection(io, service_fn(|request| api.handle(request)));
+    let connection = builder.serve_connection(io, TowerToHyperService::new(router));
     match timeout(CONNECTION_TIMEOUT, connection).await {
         Ok(Ok(())) => {}
         Ok(Err(_)) => tracing::debug!(outcome = "connection_failed", "admin connection closed"),

@@ -29,7 +29,14 @@ fn admin_defaults_are_enabled_on_loopback() {
 
 #[test]
 fn omitted_settings_use_defaults() -> TestResult {
-    for contents in ["", "# defaults\n", "admin = {}", "[admin]"] {
+    for contents in [
+        "",
+        "# defaults\n",
+        "admin = {}",
+        "[admin]",
+        "logging = {}",
+        "[logging]",
+    ] {
         let file = config_file(contents)?;
         assert_eq!(Config::load(Some(file.path()))?, Config::default());
     }
@@ -80,6 +87,11 @@ fn invalid_configuration_is_rejected() -> TestResult {
         "admin = [",
         "[[admin]]",
         "admin:\n  enabled: false",
+        "[logging]\nlevle = 'debug'",
+        "[logging]\nlevel = 'verbose'",
+        "[logging]\nlevel = 'INFO'",
+        "[logging]\nlevel = 3",
+        "[logging]\nlevel = false",
     ] {
         let file = config_file(contents)?;
         let error = Config::load(Some(file.path())).expect_err(contents);

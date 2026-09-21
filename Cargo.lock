@@ -529,8 +529,6 @@ dependencies = [
 name = "lonewolf-storage"
 version = "0.1.0"
 dependencies = [
- "async-lock",
- "blocking",
  "futures-executor",
  "lonewolf-auth",
  "lonewolf-util",
@@ -543,8 +541,11 @@ dependencies = [
 name = "lonewolf-util"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
+ "blocking",
  "crossbeam-queue",
  "crossbeam-utils",
+ "futures-executor",
 ]
 
 [[package]]

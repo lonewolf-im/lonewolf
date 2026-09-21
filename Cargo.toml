@@ -32,6 +32,7 @@ icu_properties = { version = "2.3.0", default-features = false, features = ["com
 idna = "1.1.0"
 lonewolf-auth = { path = "crates/lonewolf-auth" }
 lonewolf-core = { path = "crates/lonewolf-core" }
+lonewolf-storage = { path = "crates/lonewolf-storage" }
 lonewolf-util = { path = "crates/lonewolf-util" }
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }
 nix = { version = "0.31.3", default-features = false, features = ["signal"] }

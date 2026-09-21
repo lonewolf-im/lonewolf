@@ -3,6 +3,8 @@
 use std::error::Error;
 use std::{fmt, io};
 
+use lonewolf_storage::StorageError;
+
 use crate::config::ConfigError;
 
 #[derive(Debug)]
@@ -11,6 +13,10 @@ pub enum RunError {
     Config(ConfigError),
     Runtime(io::Error),
     Signal(io::Error),
+    UnknownStore(String),
+    StorageDirectory { store: String, source: io::Error },
+    Storage { store: String, source: StorageError },
+    Accounts { store: String, source: StorageError },
 }
 
 impl fmt::Display for RunError {
@@ -20,6 +26,18 @@ impl fmt::Display for RunError {
             Self::Config(source) => source.fmt(formatter),
             Self::Runtime(source) => write!(formatter, "cannot create root runtime: {source}"),
             Self::Signal(source) => write!(formatter, "cannot wait for shutdown signal: {source}"),
+            Self::UnknownStore(store) => write!(formatter, "unknown storage store {store:?}"),
+            Self::StorageDirectory { store, source } => write!(
+                formatter,
+                "cannot create parent directory for store {store:?}: {source}"
+            ),
+            Self::Storage { store, source } => {
+                write!(formatter, "cannot open store {store:?}: {source}")
+            }
+            Self::Accounts { store, source } => write!(
+                formatter,
+                "cannot initialize account repository in store {store:?}: {source}"
+            ),
         }
     }
 }
@@ -30,6 +48,9 @@ impl Error for RunError {
             Self::Logging(source) => Some(source.as_ref()),
             Self::Config(source) => Some(source),
             Self::Runtime(source) | Self::Signal(source) => Some(source),
+            Self::StorageDirectory { source, .. } => Some(source),
+            Self::Storage { source, .. } | Self::Accounts { source, .. } => Some(source),
+            Self::UnknownStore(_) => None,
         }
     }
 }

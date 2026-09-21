@@ -24,8 +24,7 @@ impl<'config> StoreRegistry<'config> {
         }
     }
 
-    pub(crate) fn accounts(&mut self) -> Result<RedbAccountRepository, RunError> {
-        let name = self.config.default.as_str();
+    pub(crate) fn accounts(&mut self, name: &str) -> Result<RedbAccountRepository, RunError> {
         let database = self.database(name)?;
         RedbAccountRepository::from_database(database.clone()).map_err(|source| {
             RunError::Accounts {
@@ -90,7 +89,7 @@ mod tests {
         let path = directory.path().join("data/accounts.redb");
         let unused_path = directory.path().join("unused/archive.redb");
         let config = StorageConfig {
-            default: "accounts".into(),
+            default: "archive".into(),
             stores: BTreeMap::from([
                 ("accounts".into(), StoreConfig::Redb { path: path.clone() }),
                 (
@@ -102,8 +101,8 @@ mod tests {
             ]),
         };
         let mut stores = StoreRegistry::new(&config);
-        let first = stores.accounts()?;
-        let second = stores.accounts()?;
+        let first = stores.accounts("accounts")?;
+        let second = stores.accounts("accounts")?;
 
         assert!(path.is_file());
         assert!(!unused_path.exists());
@@ -130,7 +129,7 @@ mod tests {
         let mut stores = StoreRegistry::new(&config);
 
         assert!(matches!(
-            stores.accounts(),
+            stores.accounts("accounts"),
             Err(RunError::Storage { store, .. }) if store == "accounts"
         ));
         assert_eq!(fs::read(path)?, contents);

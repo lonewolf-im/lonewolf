@@ -1,6 +1,7 @@
 # Copy this file to lonewolf.toml and uncomment the sections and values you need.
-# The values below are the defaults. Omitted settings use their defaults.
+# Omitted settings use their defaults. Values below are defaults unless marked as examples.
 
+# ---------------------------------- Logging ----------------------------------
 # [logging]
 
 # Log events at this level and more severe levels. Applied at startup.
@@ -8,6 +9,7 @@
 # Use "off" to disable logs. The default is "info".
 # level = "info"
 
+# ---------------------------------- Storage ----------------------------------
 # [storage]
 
 # Default store for components that do not select a store.
@@ -28,6 +30,13 @@
 # The built-in primary store uses this path.
 # path = "./data/lonewolf.redb"
 
+# --------------------------------- Accounts ----------------------------------
+# [account]
+
+# Optional store override. Omit to inherit storage.default.
+# storage = "primary"
+
+# ------------------------------ Administration -------------------------------
 # [admin]
 
 # Enable the admin server. Set to false to disable it.

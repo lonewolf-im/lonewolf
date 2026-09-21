@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 
-use lonewolf_core::config::{Config, ConfigError, StoreConfig};
+use lonewolf_core::config::{AccountConfig, Config, ConfigError, StoreConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -32,6 +32,8 @@ fn omitted_settings_use_defaults() -> TestResult {
     for contents in [
         "",
         "# defaults\n",
+        "account = {}",
+        "[account]",
         "admin = {}",
         "[admin]",
         "logging = {}",
@@ -91,6 +93,7 @@ path = "db/archive.redb"
     let config = Config::load(Some(file.path()))?;
 
     assert_eq!(config.storage.default, "accounts");
+    assert_eq!(config.account.storage, None);
     assert_eq!(config.storage.stores.len(), 2);
     assert!(!config.storage.stores.contains_key("primary"));
     assert!(matches!(
@@ -105,8 +108,33 @@ path = "db/archive.redb"
 }
 
 #[test]
+fn account_storage_can_select_a_nondefault_store() -> TestResult {
+    let file = config_file(
+        r#"
+[account]
+storage = "accounts"
+
+[storage.stores.primary]
+backend = "redb"
+path = "db/primary.redb"
+
+[storage.stores.accounts]
+backend = "redb"
+path = "db/accounts.redb"
+"#,
+    )?;
+    let config = Config::load(Some(file.path()))?;
+
+    assert_eq!(config.account.storage.as_deref(), Some("accounts"));
+    assert_eq!(config.storage.default, "primary");
+    Ok(())
+}
+
+#[test]
 fn invalid_storage_references_and_empty_values_are_rejected() -> TestResult {
     for contents in [
+        "[account]\nstorage = 'missing'",
+        "[account]\nstorage = ''",
         "[storage]\ndefault = 'missing'",
         "[storage]\nstores = {}",
         "[storage.stores.archive]\nbackend = 'redb'\npath = 'archive.redb'",
@@ -129,6 +157,8 @@ fn invalid_storage_references_and_empty_values_are_rejected() -> TestResult {
 fn invalid_configuration_is_rejected() -> TestResult {
     for contents in [
         "[admni]",
+        "[account]\nstroage = 'primary'",
+        "[account]\nstorage = 1",
         "[admin]\nenable = false",
         "[admin]\nenabled = []",
         "[admin]\nenabled = maybe",
@@ -201,7 +231,7 @@ fn unreadable_configuration_is_an_error() -> TestResult {
 }
 
 #[test]
-fn reference_configuration_matches_defaults() -> TestResult {
+fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
     let reference = fs::read_to_string(&path)?;
     assert!(
@@ -222,6 +252,14 @@ fn reference_configuration_matches_defaults() -> TestResult {
     }
     assert!(!uncommented.is_empty());
     let file = config_file(&uncommented)?;
-    assert_eq!(Config::load(Some(file.path()))?, Config::default());
+    assert_eq!(
+        Config::load(Some(file.path()))?,
+        Config {
+            account: AccountConfig {
+                storage: Some("primary".into()),
+            },
+            ..Config::default()
+        }
+    );
     Ok(())
 }

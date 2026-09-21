@@ -10,7 +10,7 @@ use futures_executor::block_on;
 use futures_util::TryStreamExt;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 use lonewolf_storage::account::redb::RedbAccountRepository;
-use lonewolf_storage::account::{AccountError, AccountPageSize, AccountRepository, NewAccount};
+use lonewolf_storage::account::{AccountError, AccountRepository, NewAccount};
 use lonewolf_storage::{RedbDatabase, StorageErrorKind};
 use redb::{Database, ReadableDatabase};
 
@@ -304,7 +304,6 @@ fn malformed_records_fail_operations_without_modifying_data() -> TestResult {
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     let account = key("alice@example.com")?;
-    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
     let mut zero_iterations = [0; 86];
     zero_iterations[..2].copy_from_slice(&[1, 2]);
     for bytes in [&[][..], &[1], &[1, 0], &[1, 4], &[1, 2], &zero_iterations] {
@@ -322,7 +321,7 @@ fn malformed_records_fail_operations_without_modifying_data() -> TestResult {
             StorageErrorKind::CorruptData,
         );
         assert_storage_error(
-            block_on(repository.list(None, size).try_collect::<Vec<_>>()),
+            block_on(repository.list(None).try_collect::<Vec<_>>()),
             StorageErrorKind::CorruptData,
         );
         assert_storage_error(
@@ -348,7 +347,6 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     let account = key("alice@example.com")?;
-    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
     insert_record(database.as_ref(), &account, &[2, 2])?;
     assert_storage_error(
         block_on(repository.get(&account)),
@@ -363,7 +361,7 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
         StorageErrorKind::UnsupportedVersion,
     );
     assert_storage_error(
-        block_on(repository.list(None, size).try_collect::<Vec<_>>()),
+        block_on(repository.list(None).try_collect::<Vec<_>>()),
         StorageErrorKind::UnsupportedVersion,
     );
     assert_storage_error(
@@ -478,8 +476,7 @@ fn all_account_operations_do_database_io_off_the_callers_thread() -> TestResult 
     assert_worker_threads(&backend)?;
     block_on(repository.replace_credentials(&account, credentials(20)))?;
     assert_worker_threads(&backend)?;
-    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let accounts = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
+    let accounts = block_on(repository.list(None).try_collect::<Vec<_>>())?;
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0].key, account);
     assert_worker_threads(&backend)?;

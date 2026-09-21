@@ -26,22 +26,6 @@ pub struct NewAccount {
     pub credentials: ScramCredentials,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AccountPageSize(usize);
-
-impl AccountPageSize {
-    pub const MAX: usize = 500;
-
-    /// Accepts account counts from 1 through 500.
-    pub fn new(size: usize) -> Option<Self> {
-        (1..=Self::MAX).contains(&size).then_some(Self(size))
-    }
-
-    pub fn get(self) -> usize {
-        self.0
-    }
-}
-
 #[derive(Debug)]
 pub enum AccountError {
     AlreadyExists,
@@ -55,14 +39,10 @@ pub trait AccountRepository {
     fn get(&self, key: &AccountKey) -> impl Future<Output = Result<Option<Account>, AccountError>>;
 
     /// Yields accounts in ascending canonical-key order, strictly after the cursor.
-    /// The cursor need not exist. Buffers at most one batch, fetched on demand.
-    /// Releases each snapshot before yielding. Batches can observe concurrent changes.
-    /// Yields the first error and then ends.
-    fn list(
-        &self,
-        after: Option<AccountKey>,
-        batch_size: AccountPageSize,
-    ) -> impl Stream<Item = Result<Account, AccountError>>;
+    /// The cursor need not exist. Reads one account on demand without prefetching.
+    /// Opens a snapshot on the first read and retains it until exhaustion, error, or drop.
+    /// Separate streams can observe concurrent changes. Yields the first error and then ends.
+    fn list(&self, after: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>>;
 
     /// Removes the account and all credentials atomically. Fails if the account is absent.
     fn delete(&self, key: &AccountKey) -> impl Future<Output = Result<(), AccountError>>;

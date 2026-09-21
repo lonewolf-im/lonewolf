@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::pin::pin;
+
 use futures_executor::block_on;
 use futures_util::{StreamExt, TryStreamExt};
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::redb::RedbAccountRepository;
-use lonewolf_storage::account::{AccountPageSize, AccountRepository, NewAccount};
+use lonewolf_storage::account::{AccountRepository, NewAccount};
 use redb::ReadableTable;
 
 use super::support::*;
@@ -23,8 +25,7 @@ fn caller_pagination_follows_canonical_key_order_without_skipping_lookahead() ->
             credentials: credentials(10),
         }))?;
     }
-    let size = AccountPageSize::new(2).ok_or("invalid page size")?;
-    let first = block_on(repository.list(None, size).take(3).try_collect::<Vec<_>>())?;
+    let first = block_on(repository.list(None).take(3).try_collect::<Vec<_>>())?;
     assert_eq!(first.len(), 3);
     assert_eq!(first[0].key, key("alice@example.com")?);
     assert_eq!(first[1].key, key("alice@example.org")?);
@@ -32,7 +33,7 @@ fn caller_pagination_follows_canonical_key_order_without_skipping_lookahead() ->
 
     let second = block_on(
         repository
-            .list(Some(first[1].key.clone()), size)
+            .list(Some(first[1].key.clone()))
             .take(3)
             .try_collect::<Vec<_>>(),
     )?;
@@ -41,7 +42,7 @@ fn caller_pagination_follows_canonical_key_order_without_skipping_lookahead() ->
     assert_eq!(second[1].key, key("é@bücher.example")?);
     let end = block_on(
         repository
-            .list(Some(second[1].key.clone()), size)
+            .list(Some(second[1].key.clone()))
             .try_collect::<Vec<_>>(),
     )?;
     assert!(end.is_empty());
@@ -49,17 +50,16 @@ fn caller_pagination_follows_canonical_key_order_without_skipping_lookahead() ->
 }
 
 #[test]
-fn listing_ends_after_empty_and_partial_batches() -> TestResult {
+fn listing_ends_for_empty_and_single_account_stores() -> TestResult {
     let repository = RedbAccountRepository::from_database(database()?)?;
-    let size = AccountPageSize::new(2).ok_or("invalid page size")?;
-    let empty = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
+    let empty = block_on(repository.list(None).try_collect::<Vec<_>>())?;
     assert!(empty.is_empty());
 
     block_on(repository.create(NewAccount {
         key: key("alice@example.com")?,
         credentials: credentials(10),
     }))?;
-    let accounts = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
+    let accounts = block_on(repository.list(None).try_collect::<Vec<_>>())?;
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0].key, key("alice@example.com")?);
     Ok(())
@@ -74,8 +74,7 @@ fn pagination_resumes_after_deleted_and_absent_keys() -> TestResult {
             credentials: credentials(10),
         }))?;
     }
-    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let first = block_on(repository.list(None, size).take(1).try_collect::<Vec<_>>())?;
+    let first = block_on(repository.list(None).take(1).try_collect::<Vec<_>>())?;
     assert_eq!(first.len(), 1);
     let cursor = &first[0].key;
     block_on(repository.delete(cursor))?;
@@ -87,7 +86,7 @@ fn pagination_resumes_after_deleted_and_absent_keys() -> TestResult {
     }
     let second = block_on(
         repository
-            .list(Some(cursor.clone()), size)
+            .list(Some(cursor.clone()))
             .try_collect::<Vec<_>>(),
     )?;
     assert_eq!(second.len(), 3);
@@ -96,14 +95,14 @@ fn pagination_resumes_after_deleted_and_absent_keys() -> TestResult {
     assert_eq!(second[2].key, key("erin@example.com")?);
 
     let between = key("dan@example.com")?;
-    let accounts = block_on(repository.list(Some(between), size).try_collect::<Vec<_>>())?;
+    let accounts = block_on(repository.list(Some(between)).try_collect::<Vec<_>>())?;
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0].key, key("erin@example.com")?);
     Ok(())
 }
 
 #[test]
-fn stopping_listing_does_not_decode_records_in_later_batches() -> TestResult {
+fn stopping_listing_does_not_decode_later_records() -> TestResult {
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     block_on(repository.create(NewAccount {
@@ -111,13 +110,12 @@ fn stopping_listing_does_not_decode_records_in_later_batches() -> TestResult {
         credentials: credentials(10),
     }))?;
     insert_record(database.as_ref(), &key("bob@example.com")?, &[2, 2])?;
-    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
-    let first = block_on(repository.list(None, size).take(1).try_collect::<Vec<_>>())?;
+    let first = block_on(repository.list(None).take(1).try_collect::<Vec<_>>())?;
     assert_eq!(first.len(), 1);
     assert_storage_error(
         block_on(
             repository
-                .list(Some(first[0].key.clone()), size)
+                .list(Some(first[0].key.clone()))
                 .try_collect::<Vec<_>>(),
         ),
         StorageErrorKind::UnsupportedVersion,
@@ -134,7 +132,6 @@ fn listing_rejects_invalid_or_noncanonical_stored_keys() -> TestResult {
         key: valid.clone(),
         credentials: credentials(10),
     }))?;
-    let size = AccountPageSize::new(2).ok_or("invalid page size")?;
     let long_key = format!("{}@example.com", "a".repeat(2048));
     for invalid in [
         "",
@@ -159,7 +156,7 @@ fn listing_rejects_invalid_or_noncanonical_stored_keys() -> TestResult {
         }
         transaction.commit()?;
         assert_storage_error(
-            block_on(repository.list(None, size).try_collect::<Vec<_>>()),
+            block_on(repository.list(None).try_collect::<Vec<_>>()),
             StorageErrorKind::CorruptData,
         );
         let transaction = database.as_ref().begin_write()?;
@@ -170,7 +167,7 @@ fn listing_rejects_invalid_or_noncanonical_stored_keys() -> TestResult {
 }
 
 #[test]
-fn maximum_size_batches_support_long_account_keys() -> TestResult {
+fn long_scans_do_not_accumulate_key_decoding_scratch_memory() -> TestResult {
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     let source = key("source@example.com")?;
@@ -187,24 +184,19 @@ fn maximum_size_batches_support_long_account_keys() -> TestResult {
             .value()
             .to_vec();
         let suffix = "a".repeat(1019);
-        for index in 0..=AccountPageSize::MAX {
+        for index in 0..10_000 {
             let account = key(&format!("{index:04}{suffix}@example.com"))?;
             table.insert(account.as_str(), record.as_slice())?;
         }
     }
     transaction.commit()?;
-    let size = AccountPageSize::new(AccountPageSize::MAX).ok_or("invalid page size")?;
-    let accounts = block_on(repository.list(None, size).try_collect::<Vec<_>>())?;
-    assert_eq!(accounts.len(), AccountPageSize::MAX + 1);
-    assert!(
-        accounts
-            .iter()
-            .all(|account| account.key.username().len() == 1023)
-    );
-    assert!(
-        accounts
-            .windows(2)
-            .all(|pair| pair[0].key.as_str() < pair[1].key.as_str())
-    );
+    let mut accounts = pin!(repository.list(None));
+    let mut count = 0;
+    while let Some(account) = block_on(accounts.try_next())? {
+        assert_eq!(account.key.username().len(), 1023);
+        assert_eq!(account.key.as_str()[..4].parse::<usize>()?, count);
+        count += 1;
+    }
+    assert_eq!(count, 10_000);
     Ok(())
 }

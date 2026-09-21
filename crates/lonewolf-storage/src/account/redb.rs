@@ -10,9 +10,7 @@ use lonewolf_auth::scram::{
     ScramVerifierData,
 };
 
-use crate::account::{
-    Account, AccountError, AccountKey, AccountPageSize, AccountRepository, NewAccount,
-};
+use crate::account::{Account, AccountError, AccountKey, AccountRepository, NewAccount};
 use crate::redb::{METADATA, begin_write, commit_error, storage_error};
 use crate::{RedbDatabase, StorageError, StorageErrorKind};
 
@@ -27,7 +25,7 @@ const SHA256: u8 = 2;
 const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2);
 
 /// Account operations use a shared, bounded blocking pool.
-/// Dropping a request future does not stop an operation that has started.
+/// Dropping a future or stream does not stop an operation that has started.
 pub struct RedbAccountRepository {
     database: RedbDatabase,
 }
@@ -90,12 +88,8 @@ impl AccountRepository for RedbAccountRepository {
         self.database.read(move |database| get(database, key)).await
     }
 
-    fn list(
-        &self,
-        after: Option<AccountKey>,
-        batch_size: AccountPageSize,
-    ) -> impl Stream<Item = Result<Account, AccountError>> {
-        list::accounts(&self.database, after, batch_size)
+    fn list(&self, after: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>> {
+        list::accounts(&self.database, after)
     }
 
     async fn delete(&self, key: &AccountKey) -> Result<(), AccountError> {

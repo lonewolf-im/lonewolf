@@ -2,6 +2,24 @@
 
 An XMPP messaging server
 
+## Startup logging
+
+On startup, Lonewolf writes an INFO event to stderr before loading configuration:
+
+```text
+INFO lonewolf: lonewolf is starting... version="0.1.0" branch="main" commit="abc1234"
+```
+
+Each event includes a timestamp. The version comes from the package manifest;
+the branch and short commit hash are embedded by `build.rs`. A detached checkout
+reports `branch="detached"`. Builds without Git metadata use `"unknown"` for the
+branch and commit. Git is not needed at runtime. `--help` and `--version` do not
+initialize logging.
+
+Logging uses a bounded queue of 1,024 lines and a background writer. If the queue
+fills, new lines are dropped to keep the calling thread from blocking. Queued
+logs are flushed on normal exit.
+
 ## Configuration
 
 The [configuration reference](examples/lonewolf.toml) documents every supported

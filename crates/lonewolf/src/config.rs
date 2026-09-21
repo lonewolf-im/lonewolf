@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.yaml";
+pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -18,7 +18,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// With no path, loads `lonewolf.yaml` or uses defaults if that file is absent.
+    /// With no path, loads `lonewolf.toml` or uses defaults if that file is absent.
     /// An explicit path must refer to a readable configuration file.
     pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
         let selected_path = path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG_PATH));
@@ -35,12 +35,10 @@ impl Config {
             }
         };
 
-        serde_saphyr::from_str::<Option<Self>>(&contents)
-            .map(Option::unwrap_or_default)
-            .map_err(|source| ConfigError::Parse {
-                path: selected_path.to_path_buf(),
-                source: Box::new(source),
-            })
+        toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: selected_path.to_path_buf(),
+            source,
+        })
     }
 }
 
@@ -68,7 +66,7 @@ pub enum ConfigError {
     },
     Parse {
         path: PathBuf,
-        source: Box<serde_saphyr::Error>,
+        source: toml::de::Error,
     },
 }
 
@@ -97,7 +95,7 @@ impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Read { source, .. } => Some(source),
-            Self::Parse { source, .. } => Some(source.as_ref()),
+            Self::Parse { source, .. } => Some(source),
         }
     }
 }

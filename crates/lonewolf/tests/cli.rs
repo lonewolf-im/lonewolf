@@ -21,6 +21,9 @@ fn help_and_version_succeed_without_loading_configuration() -> TestResult {
         assert!(stdout.contains("lonewolf"));
         if flag == "--help" {
             assert!(stdout.contains("--config <PATH>"));
+            assert!(stdout.contains("TOML configuration file"));
+            assert!(stdout.contains(DEFAULT_CONFIG_PATH));
+            assert!(stdout.starts_with("An XMPP messaging server\n"));
         }
         assert!(output.stderr.is_empty());
     }
@@ -59,7 +62,7 @@ fn default_file_is_loaded_and_invalid_settings_fail() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join(DEFAULT_CONFIG_PATH);
 
-    for (contents, success) in [("admin:\n  enabled: false", true), ("admni: {}", false)] {
+    for (contents, success) in [("[admin]\nenabled = false", true), ("[admni]", false)] {
         fs::write(&path, contents)?;
         let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
             .current_dir(directory.path())
@@ -79,16 +82,16 @@ fn default_file_is_loaded_and_invalid_settings_fail() -> TestResult {
 #[test]
 fn explicit_path_overrides_default_file() -> TestResult {
     let directory = tempfile::tempdir()?;
-    fs::write(directory.path().join(DEFAULT_CONFIG_PATH), "admni: {}")?;
+    fs::write(directory.path().join(DEFAULT_CONFIG_PATH), "[admni]")?;
     fs::write(
-        directory.path().join("custom.yaml"),
-        "admin:\n  enabled: false",
+        directory.path().join("custom.toml"),
+        "[admin]\nenabled = false",
     )?;
 
     for flag in ["-c", "--config"] {
         let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
             .current_dir(directory.path())
-            .args([flag, "custom.yaml"])
+            .args([flag, "custom.toml"])
             .output()?;
 
         assert!(output.status.success());
@@ -134,8 +137,8 @@ fn config_paths_do_not_require_utf8() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory
         .path()
-        .join(OsString::from_vec(b"config-\xff.yaml".to_vec()));
-    fs::write(&path, "admin:\n  enabled: false")?;
+        .join(OsString::from_vec(b"config-\xff.toml".to_vec()));
+    fs::write(&path, "[admin]\nenabled = false")?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
         .current_dir(directory.path())
         .arg("--config")

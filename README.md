@@ -1,26 +1,26 @@
 # Lonewolf
 
-XMPP server written in Rust
+An XMPP messaging server
 
 ## Configuration
 
-Run with a YAML configuration file:
+Run with a TOML configuration file:
 
 ```sh
-cargo run -p lonewolf -- --config lonewolf.example.yaml
+cargo run -p lonewolf -- --config lonewolf.example.toml
 ```
 
 `-c` is the short form of `--config`. With no argument, Lonewolf looks for
-`lonewolf.yaml` in the current directory and uses built-in defaults if that file
+`lonewolf.toml` in the current directory and uses built-in defaults if that file
 is absent. An explicit path must exist. Read errors and invalid configuration
 produce a diagnostic on stderr and a nonzero exit status.
 
 The default settings are:
 
-```yaml
-admin:
-  enabled: true
-  listen_addr: "127.0.0.1:8080"
+```toml
+[admin]
+enabled = true
+listen_addr = "127.0.0.1:8080"
 ```
 
 Omitted settings use their defaults. An empty file also uses defaults. Set

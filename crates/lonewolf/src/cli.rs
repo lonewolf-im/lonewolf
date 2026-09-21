@@ -11,8 +11,8 @@ pub struct Cli {
         short,
         long,
         value_name = "PATH",
-        help = "Path to the YAML configuration file",
-        long_help = "Path to the YAML configuration file. Defaults to ./lonewolf.yaml; uses built-in defaults if that file is absent. An explicit path must exist."
+        help = "Path to the TOML configuration file",
+        long_help = "Path to the TOML configuration file. Defaults to ./lonewolf.toml; uses built-in defaults if that file is absent. An explicit path must exist."
     )]
     pub config: Option<PathBuf>,
 }

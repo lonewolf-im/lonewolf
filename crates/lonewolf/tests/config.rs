@@ -29,7 +29,7 @@ fn admin_defaults_are_enabled_on_loopback() {
 
 #[test]
 fn omitted_settings_use_defaults() -> TestResult {
-    for contents in ["", "# defaults\n", "{}", "admin: {}"] {
+    for contents in ["", "# defaults\n", "admin = {}", "[admin]"] {
         let file = config_file(contents)?;
         assert_eq!(Config::load(Some(file.path()))?, Config::default());
     }
@@ -38,7 +38,7 @@ fn omitted_settings_use_defaults() -> TestResult {
 
 #[test]
 fn partial_admin_settings_preserve_other_defaults() -> TestResult {
-    let file = config_file("admin:\n  enabled: false\n")?;
+    let file = config_file("[admin]\nenabled = false\n")?;
     let config = Config::load(Some(file.path()))?;
     assert!(!config.admin.enabled);
     assert_eq!(
@@ -46,7 +46,7 @@ fn partial_admin_settings_preserve_other_defaults() -> TestResult {
         Config::default().admin.listen_addr
     );
 
-    let file = config_file("admin:\n  listen_addr: '[::1]:9090'\n")?;
+    let file = config_file("[admin]\nlisten_addr = '[::1]:9090'\n")?;
     let config = Config::load(Some(file.path()))?;
     assert!(config.admin.enabled);
     assert_eq!(config.admin.listen_addr, "[::1]:9090".parse()?);
@@ -55,7 +55,7 @@ fn partial_admin_settings_preserve_other_defaults() -> TestResult {
 
 #[test]
 fn explicit_admin_settings_override_defaults() -> TestResult {
-    let file = config_file("admin:\n  enabled: false\n  listen_addr: '127.0.0.2:9090'\n")?;
+    let file = config_file("[admin]\nenabled = false\nlisten_addr = '127.0.0.2:9090'\n")?;
     let config = Config::load(Some(file.path()))?;
 
     assert!(!config.admin.enabled);
@@ -66,19 +66,20 @@ fn explicit_admin_settings_override_defaults() -> TestResult {
 #[test]
 fn invalid_configuration_is_rejected() -> TestResult {
     for contents in [
-        "admni: {}",
-        "admin:\n  enable: false",
-        "admin:\n  enabled: []",
-        "admin:\n  enabled: maybe",
-        "admin:\n  listen_addr: 'localhost:8080'",
-        "admin:\n  listen_addr: '127.0.0.1'",
-        "admin:\n  listen_addr: '127.0.0.1:65536'",
-        "admin:\n  listen_addr: '999.0.0.1:8080'",
-        "admin:\n  enabled: true\n  enabled: false",
-        "admin: {}\nadmin: {}",
-        "admin: [",
-        "[admin]",
-        "{}\n---\nadmin:\n  enabled: false",
+        "[admni]",
+        "[admin]\nenable = false",
+        "[admin]\nenabled = []",
+        "[admin]\nenabled = maybe",
+        "[admin]\nenabled = 'false'",
+        "[admin]\nlisten_addr = 'localhost:8080'",
+        "[admin]\nlisten_addr = '127.0.0.1'",
+        "[admin]\nlisten_addr = '127.0.0.1:65536'",
+        "[admin]\nlisten_addr = '999.0.0.1:8080'",
+        "[admin]\nenabled = true\nenabled = false",
+        "[admin]\n[admin]",
+        "admin = [",
+        "[[admin]]",
+        "admin:\n  enabled: false",
     ] {
         let file = config_file(contents)?;
         let error = Config::load(Some(file.path())).expect_err(contents);
@@ -96,7 +97,7 @@ fn invalid_configuration_is_rejected() -> TestResult {
 #[test]
 fn explicit_missing_files_are_errors() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("missing.yaml");
+    let path = directory.path().join("missing.toml");
     let error = Config::load(Some(&path)).expect_err("explicit path must exist");
 
     assert!(error.source().is_some());
@@ -127,7 +128,7 @@ fn unreadable_configuration_is_an_error() -> TestResult {
 
 #[test]
 fn example_configuration_matches_defaults() -> TestResult {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lonewolf.example.yaml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lonewolf.example.toml");
     assert_eq!(Config::load(Some(&path))?, Config::default());
     Ok(())
 }

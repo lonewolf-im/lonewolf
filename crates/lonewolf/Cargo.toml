@@ -7,4 +7,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+clap.workspace = true
 lonewolf-xmpp.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

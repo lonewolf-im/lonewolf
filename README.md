@@ -4,10 +4,13 @@ An XMPP messaging server
 
 ## Configuration
 
-Run with a TOML configuration file:
+The [configuration reference](examples/lonewolf.toml) documents every supported
+setting and its default. All sections and values are commented out. Copy it to
+`lonewolf.toml` and uncomment the sections and values you want to change:
 
 ```sh
-cargo run -p lonewolf -- --config lonewolf.example.toml
+cp examples/lonewolf.toml lonewolf.toml
+cargo run -p lonewolf -- --config lonewolf.toml
 ```
 
 `-c` is the short form of `--config`. With no argument, Lonewolf looks for

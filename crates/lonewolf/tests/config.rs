@@ -127,8 +127,27 @@ fn unreadable_configuration_is_an_error() -> TestResult {
 }
 
 #[test]
-fn example_configuration_matches_defaults() -> TestResult {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lonewolf.example.toml");
+fn reference_configuration_matches_defaults() -> TestResult {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
+    let reference = fs::read_to_string(&path)?;
+    assert!(
+        reference
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
+    );
     assert_eq!(Config::load(Some(&path))?, Config::default());
+
+    let mut uncommented = String::with_capacity(reference.len());
+    for line in reference.lines() {
+        if let Some(setting) = line.strip_prefix("# ")
+            && (setting.starts_with('[') || setting.contains(" = "))
+        {
+            uncommented.push_str(setting);
+            uncommented.push('\n');
+        }
+    }
+    assert!(!uncommented.is_empty());
+    let file = config_file(&uncommented)?;
+    assert_eq!(Config::load(Some(file.path()))?, Config::default());
     Ok(())
 }

@@ -23,7 +23,7 @@ fn help_and_version_succeed_without_loading_configuration() -> TestResult {
             assert!(stdout.contains("--config <PATH>"));
             assert!(stdout.contains("TOML configuration file"));
             assert!(stdout.contains(DEFAULT_CONFIG_PATH));
-            assert!(stdout.starts_with("An XMPP messaging server\n"));
+            assert!(stdout.starts_with("A modern and highly efficient XMPP server\n"));
         }
         assert!(output.stderr.is_empty());
     }

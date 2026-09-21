@@ -5,12 +5,28 @@ use std::error::Error;
 use std::num::NonZeroU32;
 
 use lonewolf_auth::scram::{ScramCredentials, ScramSha1Verifier, ScramSha256Verifier};
-use lonewolf_storage::account::{Account, AccountError, AccountKey, AccountKeyError, NewAccount};
+use lonewolf_storage::account::{
+    Account, AccountError, AccountKey, AccountKeyError, AccountPageSize, NewAccount,
+};
 use lonewolf_storage::{StorageError, StorageErrorKind};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn account_pages_require_a_nonzero_bounded_size() -> TestResult {
+    for size in [1, 100, AccountPageSize::MAX] {
+        assert_eq!(
+            AccountPageSize::new(size).ok_or("invalid page size")?.get(),
+            size
+        );
+    }
+    for size in [0, AccountPageSize::MAX + 1, usize::MAX] {
+        assert!(AccountPageSize::new(size).is_none());
+    }
+    Ok(())
+}
 
 fn key(input: &str) -> Result<AccountKey, Box<dyn Error>> {
     let mut arena = Arena::try_new(ArenaConfig::default())?;

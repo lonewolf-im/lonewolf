@@ -9,12 +9,21 @@ use std::time::Duration;
 use futures_executor::block_on;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 use lonewolf_storage::account::redb::RedbAccountRepository;
-use lonewolf_storage::account::{AccountError, AccountRepository, NewAccount};
+use lonewolf_storage::account::{AccountError, AccountPageSize, AccountRepository, NewAccount};
 use lonewolf_storage::{RedbDatabase, StorageErrorKind};
 use redb::{Database, ReadableDatabase};
 
 #[path = "account_redb/support.rs"]
 mod support;
+
+#[path = "account_redb/pagination.rs"]
+mod pagination;
+
+#[path = "account_redb/deletion.rs"]
+mod deletion;
+
+#[path = "account_redb/stream.rs"]
+mod stream;
 
 use support::*;
 
@@ -290,10 +299,11 @@ fn incomplete_schema_is_rejected_without_recreating_tables() -> TestResult {
 }
 
 #[test]
-fn malformed_records_fail_reads_and_replacements_without_overwriting_data() -> TestResult {
+fn malformed_records_fail_operations_without_modifying_data() -> TestResult {
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     let account = key("alice@example.com")?;
+    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
     let mut zero_iterations = [0; 86];
     zero_iterations[..2].copy_from_slice(&[1, 2]);
     for bytes in [&[][..], &[1], &[1, 0], &[1, 4], &[1, 2], &zero_iterations] {
@@ -308,6 +318,14 @@ fn malformed_records_fail_reads_and_replacements_without_overwriting_data() -> T
         );
         assert_storage_error(
             block_on(repository.replace_credentials(&account, credentials(20))),
+            StorageErrorKind::CorruptData,
+        );
+        assert_storage_error(
+            block_on(repository.list(None, size)),
+            StorageErrorKind::CorruptData,
+        );
+        assert_storage_error(
+            block_on(repository.delete(&account)),
             StorageErrorKind::CorruptData,
         );
         assert_eq!(
@@ -329,6 +347,7 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
     let database = database()?;
     let repository = RedbAccountRepository::from_database(database.clone())?;
     let account = key("alice@example.com")?;
+    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
     insert_record(database.as_ref(), &account, &[2, 2])?;
     assert_storage_error(
         block_on(repository.get(&account)),
@@ -341,6 +360,24 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
     assert_storage_error(
         block_on(repository.replace_credentials(&account, credentials(20))),
         StorageErrorKind::UnsupportedVersion,
+    );
+    assert_storage_error(
+        block_on(repository.list(None, size)),
+        StorageErrorKind::UnsupportedVersion,
+    );
+    assert_storage_error(
+        block_on(repository.delete(&account)),
+        StorageErrorKind::UnsupportedVersion,
+    );
+    assert_eq!(
+        database
+            .as_ref()
+            .begin_read()?
+            .open_table(ACCOUNTS)?
+            .get(account.as_str())?
+            .ok_or("missing record")?
+            .value(),
+        &[2, 2]
     );
     Ok(())
 }
@@ -439,6 +476,13 @@ fn all_account_operations_do_database_io_off_the_callers_thread() -> TestResult 
     )?;
     assert_worker_threads(&backend)?;
     block_on(repository.replace_credentials(&account, credentials(20)))?;
+    assert_worker_threads(&backend)?;
+    let size = AccountPageSize::new(1).ok_or("invalid page size")?;
+    let page = block_on(repository.list(None, size))?;
+    assert_eq!(page.accounts.len(), 1);
+    assert_eq!(page.accounts[0].key, account);
+    assert_worker_threads(&backend)?;
+    block_on(repository.delete(&account))?;
     assert_worker_threads(&backend)?;
     Ok(())
 }

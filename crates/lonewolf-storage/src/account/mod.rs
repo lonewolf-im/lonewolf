@@ -6,11 +6,13 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 
+use futures_util::Stream;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 
 use crate::StorageError;
 
 mod key;
+mod stream;
 
 pub use key::{AccountKey, AccountKeyError};
 
@@ -25,6 +27,29 @@ pub struct NewAccount {
     pub credentials: ScramCredentials,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AccountPageSize(usize);
+
+impl AccountPageSize {
+    pub const MAX: usize = 500;
+
+    /// Accepts account counts from 1 through 500.
+    pub fn new(size: usize) -> Option<Self> {
+        (1..=Self::MAX).contains(&size).then_some(Self(size))
+    }
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct AccountPage {
+    pub accounts: Vec<Account>,
+    /// If true, continue after the last returned account key.
+    pub has_more: bool,
+}
+
 #[derive(Debug)]
 pub enum AccountError {
     AlreadyExists,
@@ -36,6 +61,28 @@ pub trait AccountRepository {
     fn create(&self, account: NewAccount) -> impl Future<Output = Result<(), AccountError>>;
 
     fn get(&self, key: &AccountKey) -> impl Future<Output = Result<Option<Account>, AccountError>>;
+
+    /// Returns a snapshot in ascending canonical-key order, strictly after the cursor.
+    /// The cursor need not exist. Separate pages can observe concurrent changes.
+    fn list(
+        &self,
+        after: Option<&AccountKey>,
+        size: AccountPageSize,
+    ) -> impl Future<Output = Result<AccountPage, AccountError>>;
+
+    /// Fetches one page on demand and releases its snapshot before yielding accounts.
+    /// Buffers at most one page. Each page can observe concurrent changes.
+    /// Stops after the first error.
+    fn stream(
+        &self,
+        after: Option<AccountKey>,
+        size: AccountPageSize,
+    ) -> impl Stream<Item = Result<Account, AccountError>> {
+        stream::accounts(self, after, size)
+    }
+
+    /// Removes the account and all credentials atomically. Fails if the account is absent.
+    fn delete(&self, key: &AccountKey) -> impl Future<Output = Result<(), AccountError>>;
 
     fn get_scram(
         &self,

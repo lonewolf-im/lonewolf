@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, Barrier};
+use std::future::Future;
+use std::sync::Barrier;
+use std::task::{Context, Waker};
 use std::thread;
+use std::time::Duration;
 
 use futures_executor::block_on;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
-use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountError, AccountRepository, NewAccount};
+use lonewolf_storage::{RedbDatabase, StorageErrorKind};
 use redb::{Database, ReadableDatabase};
 
 #[path = "account_redb/support.rs"]
@@ -206,7 +209,7 @@ fn concurrent_creation_has_one_winner_without_overwriting_credentials() -> TestR
 #[test]
 fn repositories_can_share_one_database() -> TestResult {
     let database = database()?;
-    let first = RedbAccountRepository::from_database(Arc::clone(&database))?;
+    let first = RedbAccountRepository::from_database(database.clone())?;
     let second = RedbAccountRepository::from_database(database)?;
     let account = key("alice@example.com")?;
     block_on(first.create(NewAccount {
@@ -245,16 +248,16 @@ fn new_database_files_are_private_to_the_owner() -> TestResult {
 #[test]
 fn incompatible_schema_is_rejected_without_modifying_it() -> TestResult {
     let database = database()?;
-    let transaction = database.begin_write()?;
+    let transaction = database.as_ref().begin_write()?;
     transaction.open_table(METADATA)?.insert(SCHEMA_KEY, 2)?;
     transaction.open_table(ACCOUNTS)?;
     transaction.commit()?;
 
-    match RedbAccountRepository::from_database(Arc::clone(&database)) {
+    match RedbAccountRepository::from_database(database.clone()) {
         Err(error) => assert_eq!(error.kind(), StorageErrorKind::UnsupportedVersion),
         Ok(_) => return Err("accepted incompatible schema".into()),
     }
-    let transaction = database.begin_read()?;
+    let transaction = database.as_ref().begin_read()?;
     assert_eq!(
         transaction
             .open_table(METADATA)?
@@ -270,18 +273,18 @@ fn incompatible_schema_is_rejected_without_modifying_it() -> TestResult {
 fn incomplete_schema_is_rejected_without_recreating_tables() -> TestResult {
     for accounts_exist in [false, true] {
         let database = database()?;
-        let transaction = database.begin_write()?;
+        let transaction = database.as_ref().begin_write()?;
         if accounts_exist {
             transaction.open_table(ACCOUNTS)?;
         } else {
             transaction.open_table(METADATA)?.insert(SCHEMA_KEY, 1)?;
         }
         transaction.commit()?;
-        match RedbAccountRepository::from_database(Arc::clone(&database)) {
+        match RedbAccountRepository::from_database(database.clone()) {
             Err(error) => assert_eq!(error.kind(), StorageErrorKind::CorruptData),
             Ok(_) => return Err("accepted incomplete schema".into()),
         }
-        assert_eq!(database.begin_read()?.list_tables()?.count(), 1);
+        assert_eq!(database.as_ref().begin_read()?.list_tables()?.count(), 1);
     }
     Ok(())
 }
@@ -289,12 +292,12 @@ fn incomplete_schema_is_rejected_without_recreating_tables() -> TestResult {
 #[test]
 fn malformed_records_fail_reads_and_replacements_without_overwriting_data() -> TestResult {
     let database = database()?;
-    let repository = RedbAccountRepository::from_database(Arc::clone(&database))?;
+    let repository = RedbAccountRepository::from_database(database.clone())?;
     let account = key("alice@example.com")?;
     let mut zero_iterations = [0; 86];
     zero_iterations[..2].copy_from_slice(&[1, 2]);
     for bytes in [&[][..], &[1], &[1, 0], &[1, 4], &[1, 2], &zero_iterations] {
-        insert_record(&database, &account, bytes)?;
+        insert_record(database.as_ref(), &account, bytes)?;
         assert_storage_error(
             block_on(repository.get(&account)),
             StorageErrorKind::CorruptData,
@@ -309,6 +312,7 @@ fn malformed_records_fail_reads_and_replacements_without_overwriting_data() -> T
         );
         assert_eq!(
             database
+                .as_ref()
                 .begin_read()?
                 .open_table(ACCOUNTS)?
                 .get(account.as_str())?
@@ -323,9 +327,9 @@ fn malformed_records_fail_reads_and_replacements_without_overwriting_data() -> T
 #[test]
 fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResult {
     let database = database()?;
-    let repository = RedbAccountRepository::from_database(Arc::clone(&database))?;
+    let repository = RedbAccountRepository::from_database(database.clone())?;
     let account = key("alice@example.com")?;
-    insert_record(&database, &account, &[2, 2])?;
+    insert_record(database.as_ref(), &account, &[2, 2])?;
     assert_storage_error(
         block_on(repository.get(&account)),
         StorageErrorKind::UnsupportedVersion,
@@ -344,13 +348,14 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
 #[test]
 fn truncated_and_extended_records_are_rejected_even_for_a_complete_first_hash() -> TestResult {
     let database = database()?;
-    let repository = RedbAccountRepository::from_database(Arc::clone(&database))?;
+    let repository = RedbAccountRepository::from_database(database.clone())?;
     let account = key("alice@example.com")?;
     block_on(repository.create(NewAccount {
         key: account.clone(),
         credentials: credentials(10),
     }))?;
     let mut bytes = database
+        .as_ref()
         .begin_read()?
         .open_table(ACCOUNTS)?
         .get(account.as_str())?
@@ -358,14 +363,14 @@ fn truncated_and_extended_records_are_rejected_even_for_a_complete_first_hash() 
         .value()
         .to_vec();
     for len in 0..bytes.len() {
-        insert_record(&database, &account, &bytes[..len])?;
+        insert_record(database.as_ref(), &account, &bytes[..len])?;
         assert_storage_error(
             block_on(repository.get_scram(&account, ScramHash::Sha1)),
             StorageErrorKind::CorruptData,
         );
     }
     bytes.push(0);
-    insert_record(&database, &account, &bytes)?;
+    insert_record(database.as_ref(), &account, &bytes)?;
     assert_storage_error(
         block_on(repository.get_scram(&account, ScramHash::Sha1)),
         StorageErrorKind::CorruptData,
@@ -381,7 +386,7 @@ fn commit_failure_reports_unknown_outcome_and_recovers_a_complete_record() -> Te
         let database = Database::builder()
             .set_cache_size(1024 * 1024)
             .create_with_backend(backend.clone())?;
-        let repository = RedbAccountRepository::from_database(Arc::new(database))?;
+        let repository = RedbAccountRepository::from_database(RedbDatabase::new(database))?;
         block_on(repository.create(NewAccount {
             key: account.clone(),
             credentials: credentials(10),
@@ -395,7 +400,7 @@ fn commit_failure_reports_unknown_outcome_and_recovers_a_complete_record() -> Te
     let database = Database::builder()
         .set_cache_size(1024 * 1024)
         .create_with_backend(backend)?;
-    let repository = RedbAccountRepository::from_database(Arc::new(database))?;
+    let repository = RedbAccountRepository::from_database(RedbDatabase::new(database))?;
     let Some(ScramVerifier::Sha1(value)) =
         block_on(repository.get_scram(&account, ScramHash::Sha1))?
     else {
@@ -408,5 +413,158 @@ fn commit_failure_reports_unknown_outcome_and_recovers_a_complete_record() -> Te
         block_on(repository.get_scram(&account, ScramHash::Sha256))?,
         marker + 3,
     )?;
+    Ok(())
+}
+
+#[test]
+fn all_account_operations_do_database_io_off_the_callers_thread() -> TestResult {
+    let backend = ObservedBackend::default();
+    let database = Database::builder()
+        .set_cache_size(0)
+        .create_with_backend(backend.clone())?;
+    let repository = RedbAccountRepository::from_database(RedbDatabase::new(database))?;
+    let account = key("alice@example.com")?;
+    backend.take_threads()?;
+
+    block_on(repository.create(NewAccount {
+        key: account.clone(),
+        credentials: credentials(10),
+    }))?;
+    assert_worker_threads(&backend)?;
+    assert!(block_on(repository.get(&account))?.is_some());
+    assert_worker_threads(&backend)?;
+    assert_scram(
+        block_on(repository.get_scram(&account, ScramHash::Sha256))?,
+        13,
+    )?;
+    assert_worker_threads(&backend)?;
+    block_on(repository.replace_credentials(&account, credentials(20)))?;
+    assert_worker_threads(&backend)?;
+    Ok(())
+}
+
+#[test]
+fn queued_writers_from_a_shared_repository_do_not_block_reads() -> TestResult {
+    let backend = ObservedBackend::default();
+    let database = Database::builder()
+        .set_cache_size(1024 * 1024)
+        .create_with_backend(backend.clone())?;
+    let database = RedbDatabase::new(database);
+    let repository = RedbAccountRepository::from_database(database.clone())?;
+    let shared = RedbAccountRepository::from_database(database)?;
+    let existing = key("existing@example.com")?;
+    let new = key("new@example.com")?;
+    block_on(repository.create(NewAccount {
+        key: existing.clone(),
+        credentials: credentials(10),
+    }))?;
+    let (entered, release) = backend.block_next_sync()?;
+    let mut write = Box::pin(repository.create(NewAccount {
+        key: new.clone(),
+        credentials: credentials(20),
+    }));
+    assert!(
+        write
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    entered.recv_timeout(Duration::from_secs(5))?;
+
+    let mut waiting = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let mut queued = Box::pin(shared.replace_credentials(&existing, credentials(30)));
+        assert!(
+            queued
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        waiting.push(queued);
+    }
+    assert!(block_on(repository.get(&existing))?.is_some());
+    assert_scram(
+        block_on(repository.get_scram(&existing, ScramHash::Sha256))?,
+        13,
+    )?;
+    assert!(block_on(repository.get(&new))?.is_none());
+    release.send(())?;
+    block_on(write)?;
+    for queued in waiting {
+        block_on(queued)?;
+    }
+    assert!(block_on(repository.get(&new))?.is_some());
+    Ok(())
+}
+
+#[test]
+fn a_blocked_writer_does_not_block_writes_to_another_database() -> TestResult {
+    let backend = ObservedBackend::default();
+    let database = Database::builder()
+        .set_cache_size(1024 * 1024)
+        .create_with_backend(backend.clone())?;
+    let repository = RedbAccountRepository::from_database(RedbDatabase::new(database))?;
+    let independent = RedbAccountRepository::from_database(support::database()?)?;
+    let account = key("alice@example.com")?;
+    let (entered, release) = backend.block_next_sync()?;
+    let mut write = Box::pin(repository.create(NewAccount {
+        key: account.clone(),
+        credentials: credentials(10),
+    }));
+    assert!(
+        write
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    entered.recv_timeout(Duration::from_secs(5))?;
+
+    block_on(independent.create(NewAccount {
+        key: account,
+        credentials: credentials(20),
+    }))?;
+    release.send(())?;
+    block_on(write)?;
+    Ok(())
+}
+
+#[test]
+fn cancelling_a_started_write_does_not_abort_its_commit() -> TestResult {
+    let backend = ObservedBackend::default();
+    let database = Database::builder()
+        .set_cache_size(1024 * 1024)
+        .create_with_backend(backend.clone())?;
+    let repository = RedbAccountRepository::from_database(RedbDatabase::new(database))?;
+    let account = key("alice@example.com")?;
+    let (entered, release) = backend.block_next_sync()?;
+    let mut write = Box::pin(repository.create(NewAccount {
+        key: account.clone(),
+        credentials: credentials(10),
+    }));
+    assert!(
+        write
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    entered.recv_timeout(Duration::from_secs(5))?;
+    drop(write);
+    release.send(())?;
+
+    block_on(repository.create(NewAccount {
+        key: key("next@example.com")?,
+        credentials: credentials(20),
+    }))?;
+    assert_scram(
+        block_on(repository.get_scram(&account, ScramHash::Sha256))?,
+        13,
+    )?;
+    Ok(())
+}
+
+fn assert_worker_threads(backend: &ObservedBackend) -> TestResult {
+    let threads = backend.take_threads()?;
+    assert!(!threads.is_empty());
+    assert!(threads.iter().all(|id| *id != thread::current().id()));
     Ok(())
 }

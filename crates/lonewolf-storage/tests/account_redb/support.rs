@@ -3,12 +3,14 @@
 use std::error::Error;
 use std::io;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, ThreadId};
+use std::time::Duration;
 
 use lonewolf_auth::scram::{ScramCredentials, ScramVerifier, ScramVerifierData};
-use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::{AccountError, AccountKey};
+use lonewolf_storage::{RedbDatabase, StorageErrorKind};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use redb::backends::InMemoryBackend;
@@ -61,11 +63,11 @@ pub fn assert_storage_error<T>(result: Result<T, AccountError>, expected: Storag
     }
 }
 
-pub fn database() -> Result<Arc<Database>, redb::DatabaseError> {
+pub fn database() -> Result<RedbDatabase, redb::DatabaseError> {
     Database::builder()
         .set_cache_size(1024 * 1024)
         .create_with_backend(InMemoryBackend::new())
-        .map(Arc::new)
+        .map(RedbDatabase::new)
 }
 
 pub fn insert_record(database: &Database, key: &AccountKey, bytes: &[u8]) -> TestResult {
@@ -112,6 +114,85 @@ impl StorageBackend for FailingSyncBackend {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ObservedBackend {
+    inner: Arc<InMemoryBackend>,
+    threads: Arc<Mutex<Vec<ThreadId>>>,
+    sync_gate: Arc<Mutex<Option<SyncGate>>>,
+}
+
+#[derive(Debug)]
+struct SyncGate {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl ObservedBackend {
+    pub fn take_threads(&self) -> Result<Vec<ThreadId>, Box<dyn Error>> {
+        Ok(std::mem::take(
+            &mut *self.threads.lock().map_err(|_| "thread log poisoned")?,
+        ))
+    }
+
+    pub fn block_next_sync(
+        &self,
+    ) -> Result<(mpsc::Receiver<()>, mpsc::Sender<()>), Box<dyn Error>> {
+        let (entered, started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        *self.sync_gate.lock().map_err(|_| "sync gate poisoned")? = Some(SyncGate {
+            entered,
+            release: released,
+        });
+        Ok((started, release))
+    }
+
+    fn record_thread(&self) -> io::Result<()> {
+        self.threads
+            .lock()
+            .map_err(|_| io::Error::other("thread log poisoned"))?
+            .push(thread::current().id());
+        Ok(())
+    }
+}
+
+impl StorageBackend for ObservedBackend {
+    fn len(&self) -> io::Result<u64> {
+        self.record_thread()?;
+        self.inner.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.record_thread()?;
+        self.inner.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.record_thread()?;
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.record_thread()?;
+        let gate = self
+            .sync_gate
+            .lock()
+            .map_err(|_| io::Error::other("sync gate poisoned"))?
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.send(()).map_err(io::Error::other)?;
+            gate.release
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+        }
+        self.inner.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.record_thread()?;
         self.inner.write(offset, data)
     }
 }

@@ -8,10 +8,10 @@ publish.workspace = true
 
 [dependencies]
 lonewolf-auth.workspace = true
+lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
 redb.workspace = true
 
 [dev-dependencies]
 futures-executor.workspace = true
-lonewolf-util.workspace = true
 tempfile.workspace = true

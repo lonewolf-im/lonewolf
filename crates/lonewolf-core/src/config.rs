@@ -104,7 +104,7 @@ pub enum LogLevel {
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(try_from = "StorageConfigInput")]
 pub struct StorageConfig {
     pub default: String,
     pub stores: BTreeMap<String, StoreConfig>,
@@ -114,14 +114,48 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             default: "primary".into(),
-            stores: BTreeMap::from([(
-                "primary".into(),
-                StoreConfig::Redb {
-                    path: PathBuf::from("./data/lonewolf.redb"),
-                },
-            )]),
+            stores: default_stores(),
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageConfigInput {
+    default: Option<String>,
+    #[serde(default = "default_stores")]
+    stores: BTreeMap<String, StoreConfig>,
+}
+
+impl TryFrom<StorageConfigInput> for StorageConfig {
+    type Error = &'static str;
+
+    fn try_from(input: StorageConfigInput) -> Result<Self, Self::Error> {
+        let (first_name, _) = input
+            .stores
+            .first_key_value()
+            .ok_or("storage.stores must define at least one store")?;
+        let default = match input.default {
+            Some(default) => default,
+            None if input.stores.len() == 1 => first_name.clone(),
+            None => {
+                return Err("storage.default is required when multiple stores are defined");
+            }
+        };
+        Ok(Self {
+            default,
+            stores: input.stores,
+        })
+    }
+}
+
+fn default_stores() -> BTreeMap<String, StoreConfig> {
+    BTreeMap::from([(
+        "primary".into(),
+        StoreConfig::Redb {
+            path: PathBuf::from("./data/lonewolf.dat"),
+        },
+    )])
 }
 
 impl StorageConfig {

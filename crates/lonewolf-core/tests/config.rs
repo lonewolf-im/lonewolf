@@ -108,11 +108,82 @@ path = "db/archive.redb"
 }
 
 #[test]
+fn single_store_is_selected_when_default_is_omitted() -> TestResult {
+    for name in ["primary", "accounts"] {
+        let file = config_file(&format!(
+            "[storage.stores.{name}]\nbackend = 'redb'\npath = 'db/accounts.redb'"
+        ))?;
+        let config = Config::load(Some(file.path()))?;
+
+        assert_eq!(config.storage.default, name);
+        assert_eq!(config.account.storage, None);
+        assert_eq!(config.storage.stores.len(), 1);
+        assert!(matches!(
+            config.storage.stores.get(name),
+            Some(StoreConfig::Redb { path }) if path == Path::new("db/accounts.redb")
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn multiple_stores_require_an_explicit_default() -> TestResult {
+    for name in ["primary", "accounts"] {
+        let file = config_file(&format!(
+            r#"
+[account]
+storage = "{name}"
+
+[storage.stores.{name}]
+backend = "redb"
+path = "db/accounts.redb"
+
+[storage.stores.archive]
+backend = "redb"
+path = "db/archive.redb"
+"#
+        ))?;
+        let error = Config::load(Some(file.path())).expect_err("default must be explicit");
+        assert!(
+            error
+                .to_string()
+                .contains("storage.default is required when multiple stores are defined")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&file.path().display().to_string())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_store_lists_are_rejected() -> TestResult {
+    for contents in [
+        "[storage]\nstores = {}",
+        "[storage]\ndefault = 'primary'\nstores = {}",
+    ] {
+        let file = config_file(contents)?;
+        let error = Config::load(Some(file.path())).expect_err("at least one store is required");
+        assert!(
+            error
+                .to_string()
+                .contains("storage.stores must define at least one store")
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn account_storage_can_select_a_nondefault_store() -> TestResult {
     let file = config_file(
         r#"
 [account]
 storage = "accounts"
+
+[storage]
+default = "primary"
 
 [storage.stores.primary]
 backend = "redb"
@@ -136,8 +207,8 @@ fn invalid_storage_references_and_empty_values_are_rejected() -> TestResult {
         "[account]\nstorage = 'missing'",
         "[account]\nstorage = ''",
         "[storage]\ndefault = 'missing'",
-        "[storage]\nstores = {}",
-        "[storage.stores.archive]\nbackend = 'redb'\npath = 'archive.redb'",
+        "[storage]\ndefault = ''",
+        "[storage]\ndefault = 'primary'\n[storage.stores.archive]\nbackend = 'redb'\npath = 'archive.redb'",
         "[storage]\ndefault = ''\n[storage.stores.'']\nbackend = 'redb'\npath = 'db.redb'",
         "[storage.stores.primary]\nbackend = 'redb'\npath = ''",
     ] {

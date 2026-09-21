@@ -13,7 +13,8 @@
 # [storage]
 
 # Default store for components that do not select a store.
-# Must name a store defined below. The default is "primary".
+# Must name a store defined below. Required when more than one store is defined.
+# Omit to select the only store. The built-in store is "primary".
 # default = "primary"
 
 # Define each store once under storage.stores.<name>. Names must not be empty.
@@ -28,7 +29,7 @@
 # Database file path. Required and nonempty for each explicit redb store.
 # Relative paths use the working directory. Missing parent directories are created.
 # The built-in primary store uses this path.
-# path = "./data/lonewolf.redb"
+# path = "./data/lonewolf.dat"
 
 # --------------------------------- Accounts ----------------------------------
 # [account]

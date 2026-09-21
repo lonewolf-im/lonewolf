@@ -39,7 +39,12 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
 
     {
         let mut stores = StoreRegistry::new(&config.storage);
-        let _accounts = stores.accounts()?;
+        let account_store = config
+            .account
+            .storage
+            .as_deref()
+            .unwrap_or(&config.storage.default);
+        let _accounts = stores.accounts(account_store)?;
         let runtime = Runtime::new().map_err(RunError::Runtime)?;
         tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
         runtime

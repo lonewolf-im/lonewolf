@@ -15,9 +15,10 @@ pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    pub admin: AdminConfig,
     pub logging: LoggingConfig,
     pub storage: StorageConfig,
+    pub account: AccountConfig,
+    pub admin: AdminConfig,
 }
 
 impl Config {
@@ -42,15 +43,30 @@ impl Config {
             path: selected_path.to_path_buf(),
             source,
         })?;
-        config
-            .storage
-            .validate()
-            .map_err(|reason| ConfigError::Invalid {
-                path: selected_path.to_path_buf(),
-                reason,
-            })?;
+        config.validate().map_err(|reason| ConfigError::Invalid {
+            path: selected_path.to_path_buf(),
+            reason,
+        })?;
         Ok(config)
     }
+
+    fn validate(&self) -> Result<(), String> {
+        self.storage.validate()?;
+        if let Some(store) = &self.account.storage
+            && !self.storage.stores.contains_key(store)
+        {
+            return Err(format!(
+                "account.storage references unknown store {store:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountConfig {
+    pub storage: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]

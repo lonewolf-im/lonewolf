@@ -5,9 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-#[cfg(unix)]
-use lonewolf_core::config::AccountConfig;
-use lonewolf_core::config::{Config, ConfigError, StoreConfig};
+use lonewolf_core::config::{AccountConfig, Config, ConfigError, StoreConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -21,7 +19,7 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
 fn admin_defaults_are_enabled_on_a_unix_socket() {
     let config = Config::default();
 
-    assert_eq!(config.admin.enabled, cfg!(unix));
+    assert!(config.admin.enabled);
     assert_eq!(
         config.admin.socket_path,
         Path::new("./run/lonewolf/admin.sock")
@@ -60,7 +58,7 @@ fn partial_admin_settings_preserve_other_defaults() -> TestResult {
 
     let file = config_file("[admin]\nsocket_path = 'private/admin.sock'\n")?;
     let config = Config::load(Some(file.path()))?;
-    assert_eq!(config.admin.enabled, cfg!(unix));
+    assert!(config.admin.enabled);
     assert_eq!(config.admin.socket_path, Path::new("private/admin.sock"));
     Ok(())
 }
@@ -323,14 +321,6 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     }
     assert!(!uncommented.is_empty());
     let file = config_file(&uncommented)?;
-    #[cfg(not(unix))]
-    {
-        assert!(matches!(
-            Config::load(Some(file.path())),
-            Err(ConfigError::Invalid { .. })
-        ));
-    }
-    #[cfg(unix)]
     assert_eq!(
         Config::load(Some(file.path()))?,
         Config {

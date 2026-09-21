@@ -1,7 +1,6 @@
 # Copy this file to lonewolf.toml and uncomment the sections and values you need.
 # Omitted settings use their defaults. Values below are defaults unless marked as examples.
 
-# ---------------------------------- Logging ----------------------------------
 # [logging]
 
 # Log events at this level and more severe levels. Applied at startup.
@@ -9,7 +8,6 @@
 # Use "off" to disable logs. The default is "info".
 # level = "info"
 
-# ---------------------------------- Storage ----------------------------------
 # [storage]
 
 # Default store for components that do not select a store.
@@ -31,17 +29,14 @@
 # The built-in primary store uses this path.
 # path = "./data/lonewolf.dat"
 
-# --------------------------------- Accounts ----------------------------------
 # [account]
 
 # Optional store override. Omit to inherit storage.default.
 # storage = "primary"
 
-# ------------------------------ Administration -------------------------------
 # [admin]
 
-# Enable the admin server. Default: true on Unix, false on other platforms.
-# Set to false to disable it. Enabling it on a non-Unix system is an error.
+# Enable the admin server. Default: true. Set to false to disable it.
 # enabled = true
 
 # Unix socket path for the HTTP/JSON admin API. TCP is not supported.
@@ -49,5 +44,5 @@
 # The parent directory must be private (0700) and owned by the server user.
 # Missing directories are created with mode 0700; the socket uses mode 0600.
 # Existing paths are rejected. Remove a stale socket only after stopping its server.
-# The socket is removed on graceful shutdown. Non-Unix systems must disable admin.
+# The socket is removed on graceful shutdown.
 # socket_path = "./run/lonewolf/admin.sock"

@@ -2,7 +2,6 @@
 
 use std::fs::OpenOptions;
 use std::num::NonZeroUsize;
-#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,7 +39,6 @@ impl RedbDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
         options.mode(0o600);
         let file = options.open(path).map_err(storage_error)?;
         Database::builder()

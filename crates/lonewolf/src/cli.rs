@@ -17,7 +17,7 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;

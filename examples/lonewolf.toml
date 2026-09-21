@@ -39,10 +39,5 @@
 # Enable the admin server. Default: true.
 # enabled = true
 
-# Unix socket path for the HTTP/JSON admin API. TCP is not supported.
-# Default: ./run/lonewolf/admin.sock. Relative paths use the working directory.
-# The parent directory must be private (0700) and owned by the server user.
-# Missing directories are created with mode 0700; the socket uses mode 0600.
-# Existing paths are rejected. Remove a stale socket only after stopping its server.
-# The socket is removed on graceful shutdown.
+# Admin Unix socket path. Relative paths use the working directory.
 # socket_path = "./run/lonewolf/admin.sock"

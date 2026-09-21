@@ -74,33 +74,38 @@ impl Server {
         let mut shutdown = pin!(shutdown);
         let mut connections = FuturesUnordered::new();
         tracing::info!(socket_path = ?self.socket.path, "admin service started");
-        let result = loop {
-            let event = {
-                let progress = async {
-                    if connections.len() >= MAX_CONNECTIONS {
-                        connections.next().await;
-                        return Ok(None);
-                    }
-                    if connections.is_empty() {
-                        return self.listener.accept().await.map(Some);
-                    }
-                    match select(pin!(self.listener.accept()), pin!(connections.next())).await {
-                        Either::Left((accepted, _)) => accepted.map(Some),
-                        Either::Right(_) => Ok(None),
+        let result = {
+            // Cancelling a pending accept can discard a new connection.
+            let mut accept = pin!(self.listener.accept());
+            loop {
+                let event = {
+                    let progress = async {
+                        if connections.len() >= MAX_CONNECTIONS {
+                            connections.next().await;
+                            return Ok(None);
+                        }
+                        if connections.is_empty() {
+                            return accept.as_mut().await.map(Some);
+                        }
+                        match select(accept.as_mut(), pin!(connections.next())).await {
+                            Either::Left((accepted, _)) => accepted.map(Some),
+                            Either::Right(_) => Ok(None),
+                        }
+                    };
+                    match select(shutdown.as_mut(), pin!(progress)).await {
+                        Either::Left((result, _)) => Either::Left(result),
+                        Either::Right((result, _)) => Either::Right(result),
                     }
                 };
-                match select(shutdown.as_mut(), pin!(progress)).await {
-                    Either::Left((result, _)) => Either::Left(result),
-                    Either::Right((result, _)) => Either::Right(result),
+                match event {
+                    Either::Left(result) => break result,
+                    Either::Right(Ok(Some((stream, _)))) => {
+                        accept.set(self.listener.accept());
+                        connections.push(serve_connection(stream, self.router.clone()));
+                    }
+                    Either::Right(Ok(None)) => {}
+                    Either::Right(Err(error)) => break Err(error),
                 }
-            };
-            match event {
-                Either::Left(result) => break result,
-                Either::Right(Ok(Some((stream, _)))) => {
-                    connections.push(serve_connection(stream, self.router.clone()));
-                }
-                Either::Right(Ok(None)) => {}
-                Either::Right(Err(error)) => break Err(error),
             }
         };
         drop(self.listener);

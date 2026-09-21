@@ -128,9 +128,10 @@ fn unreadable_default_file_does_not_fall_back() -> TestResult {
     Ok(())
 }
 
-#[cfg(unix)]
+// macOS filesystems can reject non-UTF-8 filenames.
+#[cfg(target_os = "linux")]
 #[test]
-fn config_paths_do_not_require_utf8() -> TestResult {
+fn config_file_with_non_utf8_path_is_loaded() -> TestResult {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 

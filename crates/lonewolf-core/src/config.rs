@@ -15,6 +15,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub admin: AdminConfig,
+    pub logging: LoggingConfig,
 }
 
 impl Config {
@@ -56,6 +57,24 @@ impl Default for AdminConfig {
             listen_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    pub level: LogLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
 }
 
 #[derive(Debug)]

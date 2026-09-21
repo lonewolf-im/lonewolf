@@ -21,7 +21,8 @@ pub struct BuildInfo {
 /// Runs on the calling thread until Ctrl+C or, on Unix, SIGTERM requests shutdown.
 /// Installs the global tracing subscriber and flushes logs before returning.
 pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError> {
-    let _logging_guard = logging::init().map_err(RunError::Logging)?;
+    let config = Config::load(config_path).map_err(RunError::Config)?;
+    let _logging_guard = logging::init(config.logging.level).map_err(RunError::Logging)?;
     tracing::info!(
         version = build.version,
         branch = build.branch,
@@ -29,7 +30,6 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
         "lonewolf is starting..."
     );
 
-    let _config = Config::load(config_path).map_err(RunError::Config)?;
     {
         let runtime = Runtime::new().map_err(RunError::Runtime)?;
         tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");

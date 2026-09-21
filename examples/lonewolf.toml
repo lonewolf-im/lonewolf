@@ -1,6 +1,13 @@
 # Copy this file to lonewolf.toml and uncomment the sections and values you need.
 # The values below are the defaults. Omitted settings use their defaults.
 
+# [logging]
+
+# Log events at this level and more severe levels. Applied at startup.
+# Accepted values: "off", "error", "warn", "info", "debug", "trace".
+# Use "off" to disable logs. The default is "info".
+# level = "info"
+
 # [admin]
 
 # Enable the admin server. Set to false to disable it.

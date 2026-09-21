@@ -53,6 +53,16 @@ impl Server {
                 "admin socket directory must be owned by the current user with mode 0700",
             ));
         }
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "admin socket path already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         let listener = std::os::unix::net::UnixListener::bind(path)?;
         let metadata = fs::symlink_metadata(path)?;
         let socket = SocketFile {

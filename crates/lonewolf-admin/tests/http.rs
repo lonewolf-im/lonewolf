@@ -515,9 +515,14 @@ fn socket_permissions_and_existing_paths_are_preserved() -> TestResult {
         assert!(Server::bind(&path, accounts()?).is_err());
         assert_eq!(fs::read_to_string(&path)?, "keep");
         fs::remove_file(&path)?;
-        symlink(directory.path().join("target"), &path)?;
-        assert!(Server::bind(&path, accounts()?).is_err());
-        assert!(fs::symlink_metadata(&path)?.file_type().is_symlink());
+        let target = directory.path().join("target");
+        symlink(&target, &path)?;
+        let error = Server::bind(&path, accounts()?)
+            .err()
+            .ok_or("accepted an existing symlink")?;
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(fs::read_link(&path)?, target);
+        assert!(!target.try_exists()?);
         fs::remove_file(&path)?;
 
         let server = Server::bind(&path, accounts()?)?;

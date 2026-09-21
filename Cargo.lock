@@ -797,6 +797,7 @@ name = "lonewolf-storage"
 version = "0.1.0"
 dependencies = [
  "futures-executor",
+ "futures-util",
  "lonewolf-auth",
  "lonewolf-util",
  "lonewolf-xmpp",

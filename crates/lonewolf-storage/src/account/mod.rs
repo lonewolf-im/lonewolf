@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 
+use futures_util::Stream;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 
 use crate::StorageError;
@@ -36,6 +37,14 @@ pub trait AccountRepository {
     fn create(&self, account: NewAccount) -> impl Future<Output = Result<(), AccountError>>;
 
     fn get(&self, key: &AccountKey) -> impl Future<Output = Result<Option<Account>, AccountError>>;
+
+    /// Reads one account on demand in ascending canonical key order after an exclusive cursor.
+    /// The cursor need not exist. Holds one snapshot from the first read until end or drop.
+    /// Yields the first error, then ends.
+    fn list(&self, after: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>>;
+
+    /// Removes the account and all credentials atomically. Fails if the account is absent.
+    fn delete(&self, key: &AccountKey) -> impl Future<Output = Result<(), AccountError>>;
 
     fn get_scram(
         &self,

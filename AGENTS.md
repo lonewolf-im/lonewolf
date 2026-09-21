@@ -24,15 +24,16 @@ Whenever you modify, create, or delete Rust (`.rs`) files, you MUST follow this 
 
 ## 3. Code Comments
 
-- **Omit comments by default.** New code should carry no comments unless one of the exceptions below applies. Do not narrate what the code does — that is recoverable from the code itself. Never add a comment that restates the adjacent statement, labels an obvious block, or describes the change you just made.
-- **Exception 1 — non-obvious "why".** Add a comment when it explains *why* the code does something a certain way and that rationale is not obvious from reading it: a subtle correctness or performance reason, a non-obvious invariant or constraint, a workaround, or a reference to an external requirement.
-- **Exception 2 — the deliberate omission.** Add a comment when a casual reader would expect some action to happen here and it deliberately does not, so they don't "fix" it by adding it back. Explain why it was intentionally left out.
-- **Exception 3 — godoc on non-obvious functions.** For a new method or function whose behaviour isn't obvious or that carries important invariants, a brief godoc-style doc comment is fine. Keep it short and focused on the contract/invariants, not a line-by-line description.
-- **Keep comments self-contained.** Do not name specific symbols (functions, types, variables) or describe behaviour that lives far from the comment — those references silently go stale when the remote code changes. State the rationale in terms of the invariant or consequence itself, not by pointing at distant code that must be kept in sync.
-- **Describe stable contracts.** Write comments in terms of behavior, constraints, and invariants. Do not list current or planned consumers, modules, or extensions, or narrate implementation stages. Use generic terms for shared behavior. Name a specific consumer only when a correctness or safety constraint requires it.
-- **Tests get the same treatment, usually less.** Do not write a doc comment above a test function narrating the scenario, and do not annotate steps inside a test body ("bring the DB up", "simulate a newer binary", "now assert…"). A precise test name plus readable setup and assertion messages already convey intent; a step comment that restates the next line is noise. Keep a comment only for a genuine non-obvious "why" (Exceptions 1–2) — e.g. why the test forces an otherwise-invalid state.
-- **No decorative separators.** Never add divider/section comments (`// --- label ---`, `// === section ===`, trailing dashes). Group with blank lines or split the file instead.
-- **Test:** if a comment could be deleted without losing information not already in the code, delete it.
+These rules apply to code, API documentation, tests, and configuration examples. License headers and comments required by tools are exempt.
+
+- **Omit comments by default.** First make intent clear through names, types, and structure.
+- Keep a comment only to explain a non-obvious correctness, safety, performance, or external constraint, or a deliberate omission. Public API docs may state contracts that the signature cannot express.
+- **Use one short sentence by default.** Add another only when omitting it would cause misuse or an incorrect change.
+- Never narrate control flow, restate a name or value, explain obvious booleans, or label a block. Test names replace scenario and step comments.
+- **Configuration comments explain how to choose a value.** Omit implementation details, lifecycle descriptions, unsupported alternatives, and operational checklists. Do not repeat a default shown in the assignment or add phrases such as "set to false to disable".
+- State stable, self-contained constraints. Omit change history, planned consumers, and references to distant implementation details.
+- Use simple English, active voice, and one idea per sentence. No decorative separators, em dashes, or ellipses.
+- **Before committing, review all comments in each modified file.** Remove any comment or sentence that adds no necessary information beyond the code or setting.
 
 ## 4. License Header Rule
 
@@ -100,8 +101,8 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Keep `examples/lonewolf.toml` as the operator reference for every supported configuration key.
 - When adding, removing, or renaming a key, update this reference in the same change. Also update it when a key's type, default, accepted values, or behavior changes.
 - Keep all section headers and value assignments commented out. The unchanged reference must load with built-in defaults.
-- Document each key's purpose, default, accepted values or format, and units where applicable. Use short operator-facing comments. These comments are required documentation for the reference file.
-- Show the default value for each key. If a key has no default, mark its example value and state when the key is required.
+- Document only the purpose and non-obvious value constraints, formats, or units needed to configure each key. Apply the brevity rules in section 3.
+- Show each default in its commented assignment; do not repeat it in prose. If a key has no default, mark its example value and state when the key is required.
 - Keep configuration-reference tests consistent with the reference file.
 
 ## 11. README Change Rule

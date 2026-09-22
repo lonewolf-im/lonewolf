@@ -12,7 +12,7 @@ pub enum RunError {
     Logging(Box<dyn Error + Send + Sync>),
     Config(ConfigError),
     Runtime(io::Error),
-    WorkersCount(io::Error),
+    WorkerCount(io::Error),
     Dispatcher(io::Error),
     DispatcherShutdown(io::Error),
     Signal(io::Error),
@@ -29,7 +29,7 @@ impl fmt::Display for RunError {
             Self::Logging(source) => write!(formatter, "cannot initialize logging: {source}"),
             Self::Config(source) => source.fmt(formatter),
             Self::Runtime(source) => write!(formatter, "cannot create root runtime: {source}"),
-            Self::WorkersCount(source) => {
+            Self::WorkerCount(source) => {
                 write!(formatter, "cannot configure core workers: {source}")
             }
             Self::Dispatcher(source) => write!(formatter, "cannot start core dispatcher: {source}"),
@@ -60,7 +60,7 @@ impl Error for RunError {
             Self::Logging(source) => Some(source.as_ref()),
             Self::Config(source) => Some(source),
             Self::Runtime(source)
-            | Self::WorkersCount(source)
+            | Self::WorkerCount(source)
             | Self::Dispatcher(source)
             | Self::DispatcherShutdown(source)
             | Self::Signal(source)

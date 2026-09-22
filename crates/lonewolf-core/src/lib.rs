@@ -39,7 +39,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     panic::init(&build);
 
     let config = Config::load(config_path).map_err(RunError::Config)?;
-    let workers_count = workers_count().map_err(RunError::WorkersCount)?;
+    let worker_count = worker_count().map_err(RunError::WorkerCount)?;
 
     let _logging_guard = logging::init(config.logging.level).map_err(RunError::Logging)?;
     tracing::info!(
@@ -57,12 +57,9 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
             .as_deref()
             .unwrap_or(&config.storage.default);
         let runtime = Runtime::new().map_err(RunError::Runtime)?;
-        let dispatcher = CoreDispatcher::new(workers_count, DISPATCH_QUEUE_CAPACITY)
+        let dispatcher = CoreDispatcher::new(worker_count, DISPATCH_QUEUE_CAPACITY)
             .map_err(RunError::Dispatcher)?;
-        tracing::info!(
-            worker_count = workers_count.get(),
-            "core dispatcher started"
-        );
+        tracing::info!(worker_count = worker_count.get(), "core dispatcher started");
         runtime.block_on(async {
             let result = async {
                 let accounts = stores.accounts(account_store)?;
@@ -89,17 +86,17 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     Ok(())
 }
 
-fn workers_count() -> io::Result<NonZeroUsize> {
-    match env::var("LONEWOLF_WORKERS_COUNT") {
-        Ok(value) => value.parse().map_err(|_| invalid_workers_count()),
+fn worker_count() -> io::Result<NonZeroUsize> {
+    match env::var("LONEWOLF_WORKER_COUNT") {
+        Ok(value) => value.parse().map_err(|_| invalid_worker_count()),
         Err(env::VarError::NotPresent) => thread::available_parallelism(),
-        Err(env::VarError::NotUnicode(_)) => Err(invalid_workers_count()),
+        Err(env::VarError::NotUnicode(_)) => Err(invalid_worker_count()),
     }
 }
 
-fn invalid_workers_count() -> io::Error {
+fn invalid_worker_count() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "LONEWOLF_WORKERS_COUNT must be a positive integer",
+        "LONEWOLF_WORKER_COUNT must be a positive integer",
     )
 }

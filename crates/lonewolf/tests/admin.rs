@@ -64,7 +64,7 @@ path = "accounts.redb"
     let mut child = Process(
         Command::new(env!("CARGO_BIN_EXE_lonewolf"))
             .current_dir(directory.path())
-            .env("LONEWOLF_WORKERS_COUNT", "1")
+            .env("LONEWOLF_WORKER_COUNT", "1")
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log_path)?)
             .spawn()?,
@@ -176,7 +176,7 @@ fn occupied_socket_path_fails_startup_without_overwriting_it() -> TestResult {
     fs::write(directory.path().join("admin.sock"), "keep")?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
         .current_dir(directory.path())
-        .env_remove("LONEWOLF_WORKERS_COUNT")
+        .env_remove("LONEWOLF_WORKER_COUNT")
         .output()?;
     assert_eq!(output.status.code(), Some(1));
     let logs = std::str::from_utf8(&output.stderr)?;

@@ -22,13 +22,13 @@ fn invalid_worker_counts_fail_before_opening_storage() -> TestResult {
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
             .current_dir(directory.path())
-            .env("LONEWOLF_WORKERS_COUNT", value)
+            .env("LONEWOLF_WORKER_COUNT", value)
             .output()?;
 
         assert_eq!(output.status.code(), Some(1));
         assert_eq!(
             std::str::from_utf8(&output.stderr)?,
-            "cannot configure core workers: LONEWOLF_WORKERS_COUNT must be a positive integer\n"
+            "cannot configure core workers: LONEWOLF_WORKER_COUNT must be a positive integer\n"
         );
         assert!(!directory.path().join("data").exists());
     }
@@ -41,7 +41,7 @@ fn worker_count_above_the_allowed_cpu_count_fails_startup() -> TestResult {
     let directory = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
         .current_dir(directory.path())
-        .env("LONEWOLF_WORKERS_COUNT", usize::MAX.to_string())
+        .env("LONEWOLF_WORKER_COUNT", usize::MAX.to_string())
         .output()?;
 
     assert_eq!(output.status.code(), Some(1));
@@ -63,7 +63,7 @@ fn storage_failure_stops_the_dispatcher_with_admin_disabled() -> TestResult {
     )?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
         .current_dir(directory.path())
-        .env("LONEWOLF_WORKERS_COUNT", "1")
+        .env("LONEWOLF_WORKER_COUNT", "1")
         .output()?;
 
     assert_eq!(output.status.code(), Some(1));

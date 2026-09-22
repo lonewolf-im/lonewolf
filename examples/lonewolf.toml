@@ -1,9 +1,6 @@
 # Copy this file to lonewolf.toml and uncomment the sections and values you need.
 # Omitted settings use their defaults. Values below are defaults unless marked as examples.
 
-# LONEWOLF_WORKERS_COUNT: positive integer; defaults to available CPU parallelism.
-# On Linux, the count cannot exceed the process's allowed CPUs.
-
 # [logging]
 
 # Accepted values: "off", "error", "warn", "info", "debug", "trace".

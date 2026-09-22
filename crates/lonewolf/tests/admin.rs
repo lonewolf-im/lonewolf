@@ -152,7 +152,17 @@ path = "accounts.redb"
         line.contains("stanza arena pool initialized") && line.contains("reserved_bytes=8388608")
     }));
     assert!(logs.lines().any(|line| line.contains("core dispatcher started") && line.contains("worker_count=1")));
-    assert!(logs.contains("core dispatcher stopped"));
+    let waiting = logs
+        .find("waiting for stop signal... (press Ctrl+C to stop the server)")
+        .ok_or("missing wait log")?;
+    let received = logs
+        .find("received stop signal... gracefully shutting down...")
+        .ok_or("missing stop signal log")?;
+    let dispatcher_stopped = logs
+        .find("core dispatcher stopped")
+        .ok_or("missing dispatcher stop log")?;
+    assert!(waiting < received);
+    assert!(received < dispatcher_stopped);
     let mut events = logs
         .lines()
         .filter(|line| line.contains("admin request completed"));

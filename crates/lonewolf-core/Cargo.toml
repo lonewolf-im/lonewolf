@@ -11,6 +11,7 @@ compio.workspace = true
 futures-util.workspace = true
 lonewolf-admin.workspace = true
 lonewolf-storage.workspace = true
+lonewolf-util.workspace = true
 nix.workspace = true
 serde.workspace = true
 time.workspace = true

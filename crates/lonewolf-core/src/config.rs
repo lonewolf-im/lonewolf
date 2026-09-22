@@ -87,7 +87,7 @@ impl Config {
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct C2sConfig {
-    /// Replaces the default endpoint; an empty list disables c2s listeners.
+    /// Replaces the default endpoint and must contain at least one listener.
     pub listeners: Vec<TcpListenerConfig>,
 }
 
@@ -101,6 +101,9 @@ impl Default for C2sConfig {
 
 impl C2sConfig {
     fn validate(&self) -> Result<(), String> {
+        if self.listeners.is_empty() {
+            return Err("c2s.listeners must define at least one listener".into());
+        }
         for (index, listener) in self.listeners.iter().enumerate() {
             let address = listener.address;
             if address.port() == 0 {

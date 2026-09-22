@@ -48,8 +48,8 @@ fn configured_account_store_logs_route_templates_and_sigterm_cleans_up() -> Test
 level = "debug"
 [xmpp]
 stanza_pool_size_mib = 8
-[c2s]
-listeners = []
+[[c2s.listeners]]
+address = "127.0.0.1:0"
 [admin]
 socket_path = "private/admin.sock"
 [account]
@@ -192,7 +192,7 @@ fn occupied_socket_path_fails_startup_without_overwriting_it() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("lonewolf.toml"),
-        "[xmpp]\nstanza_pool_size_mib = 8\n[c2s]\nlisteners = []\n[admin]\nsocket_path = 'admin.sock'\n",
+        "[xmpp]\nstanza_pool_size_mib = 8\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[admin]\nsocket_path = 'admin.sock'\n",
     )?;
     fs::write(directory.path().join("admin.sock"), "keep")?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))

@@ -15,7 +15,7 @@
 # stanza_pool_size_mib = 256
 
 # Add one section per TCP endpoint. These sections replace the default endpoint.
-# To disable c2s, use an empty listeners array in the c2s section.
+# Lonewolf requires at least one client endpoint.
 # [[c2s.listeners]]
 
 # Choose the local IP address and port for client connections.

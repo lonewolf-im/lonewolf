@@ -222,11 +222,19 @@ fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
 }
 
 #[test]
-fn empty_listener_list_keeps_signal_handling_active() -> TestResult {
-    let mut server = Server::start("[admin]\nenabled = false\n[c2s]\nlisteners = []\n", 1)?;
-    server.ready(0)?;
-    server.stop(Signal::SIGTERM)?;
-    assert!(!server.logs()?.contains("c2s TCP listener"));
+fn empty_listener_list_fails_before_starting_services() -> TestResult {
+    for admin_enabled in [true, false] {
+        let mut server = Server::start(
+            &format!("[admin]\nenabled = {admin_enabled}\n[c2s]\nlisteners = []\n"),
+            1,
+        )?;
+        assert_eq!(server.wait()?.code(), Some(1));
+        let logs = server.logs()?;
+        assert!(logs.contains("c2s.listeners must define at least one listener"));
+        assert!(!logs.contains("core dispatcher started"));
+        assert!(!server.directory.path().join("data").exists());
+        assert!(!server.directory.path().join("run").exists());
+    }
     Ok(())
 }
 

@@ -56,8 +56,22 @@ fn configured_c2s_endpoints_replace_the_default_and_allow_ipv6() -> TestResult {
             },
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn empty_c2s_listener_list_is_rejected() -> TestResult {
     let file = config_file("[c2s]\nlisteners = []\n")?;
-    assert!(Config::load(Some(file.path()))?.c2s.listeners.is_empty());
+    let error = Config::load(Some(file.path()))
+        .err()
+        .ok_or("empty listener list accepted")?;
+
+    assert!(matches!(error, ConfigError::Invalid { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("c2s.listeners must define at least one listener")
+    );
     Ok(())
 }
 

@@ -284,7 +284,7 @@ async fn run_worker(context: WorkerContext, jobs: Inbox) -> io::Result<()> {
                     yield_to_runtime().await;
                 }
                 Either::Right(Ok(None)) => {}
-                Either::Right(Err(_)) => break Instant::now(),
+                Either::Right(Err(_)) => break stop.await,
             }
         }
     };
@@ -395,5 +395,5 @@ fn create_runtime(worker: WorkerInfo) -> io::Result<Runtime> {
 }
 
 #[cfg(test)]
-#[path = "../tests/core_dispatcher/startup.rs"]
+#[path = "../tests/core_dispatcher/lifecycle.rs"]
 mod tests;

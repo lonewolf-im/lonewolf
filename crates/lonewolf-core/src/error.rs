@@ -4,6 +4,7 @@ use std::error::Error;
 use std::{fmt, io};
 
 use lonewolf_storage::StorageError;
+use lonewolf_util::pool::PoolError;
 
 use crate::config::ConfigError;
 
@@ -11,6 +12,7 @@ use crate::config::ConfigError;
 pub enum RunError {
     Logging(Box<dyn Error + Send + Sync>),
     Config(ConfigError),
+    StanzaPool(PoolError),
     Runtime(io::Error),
     WorkerCount(io::Error),
     Dispatcher(io::Error),
@@ -28,6 +30,9 @@ impl fmt::Display for RunError {
         match self {
             Self::Logging(source) => write!(formatter, "cannot initialize logging: {source}"),
             Self::Config(source) => source.fmt(formatter),
+            Self::StanzaPool(source) => {
+                write!(formatter, "cannot initialize stanza arena pool: {source}")
+            }
             Self::Runtime(source) => write!(formatter, "cannot create root runtime: {source}"),
             Self::WorkerCount(source) => {
                 write!(formatter, "cannot configure core workers: {source}")
@@ -59,6 +64,7 @@ impl Error for RunError {
         match self {
             Self::Logging(source) => Some(source.as_ref()),
             Self::Config(source) => Some(source),
+            Self::StanzaPool(source) => Some(source),
             Self::Runtime(source)
             | Self::WorkerCount(source)
             | Self::Dispatcher(source)

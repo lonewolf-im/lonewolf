@@ -8,11 +8,14 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
 use serde::Deserialize;
 
 pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
+const MEBIBYTE: usize = 1024 * 1024;
 
 /// Applies defaults during deserialization and rejects unknown fields.
 ///
@@ -22,6 +25,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub logging: LoggingConfig,
+    pub xmpp: XmppConfig,
     pub storage: StorageConfig,
     pub account: AccountConfig,
     pub admin: AdminConfig,
@@ -37,7 +41,7 @@ impl Config {
     ///
     /// Returns [`ConfigError::Read`] for file or UTF-8 errors,
     /// [`ConfigError::Parse`] for invalid TOML or rejected fields, and
-    /// [`ConfigError::Invalid`] for invalid references or empty names and paths.
+    /// [`ConfigError::Invalid`] for values that violate configuration constraints.
     pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
         let selected_path = path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG_PATH));
         let contents = match fs::read_to_string(selected_path) {
@@ -65,6 +69,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.xmpp.validate()?;
         self.storage.validate()?;
         if self.admin.socket_path.as_os_str().is_empty() {
             return Err("admin.socket_path must not be empty".into());
@@ -77,6 +82,49 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct XmppConfig {
+    pub stanza_pool_size_mib: usize,
+}
+
+impl Default for XmppConfig {
+    fn default() -> Self {
+        Self {
+            stanza_pool_size_mib: DEFAULT_POOL_SIZE / MEBIBYTE,
+        }
+    }
+}
+
+impl XmppConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.stanza_pool_size_mib < MIN_POOL_SIZE / MEBIBYTE
+            || !self.stanza_pool_size_mib.is_power_of_two()
+        {
+            return Err(format!(
+                "xmpp.stanza_pool_size_mib must be a power of two of at least {} MiB",
+                MIN_POOL_SIZE / MEBIBYTE
+            ));
+        }
+        if self.stanza_pool_size_mib.checked_mul(MEBIBYTE).is_none() {
+            return Err("xmpp.stanza_pool_size_mib is too large for this platform".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stanza_pool_config(&self) -> Result<PoolConfig, PoolError> {
+        let total_bytes = self
+            .stanza_pool_size_mib
+            .checked_mul(MEBIBYTE)
+            .and_then(NonZeroUsize::new)
+            .ok_or(PoolError::InvalidConfiguration)?;
+        Ok(PoolConfig {
+            total_bytes,
+            ..PoolConfig::default()
+        })
     }
 }
 
@@ -124,7 +172,7 @@ pub enum LogLevel {
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(try_from = "StorageConfigInput")]
 pub struct StorageConfig {
-    /// Must name a configured store; deserialization infers a sole store.
+    /// Selects a configured store; a sole store is selected automatically.
     pub default: String,
     /// Replaces the built-in store map when present in TOML.
     pub stores: BTreeMap<String, StoreConfig>,

@@ -7,6 +7,13 @@
 # Use "off", "error", "warn", "info", "debug", or "trace".
 # level = "info"
 
+# [xmpp]
+
+# Reserve memory for reusing chunks while parsing and building stanzas.
+# Choose a power of two of at least 8 MiB. Lonewolf can use additional heap
+# memory when the pool is exhausted.
+# stanza_pool_size_mib = 256
+
 # [storage]
 
 # Choose the store Lonewolf uses by default.

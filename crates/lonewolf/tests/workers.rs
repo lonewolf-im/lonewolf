@@ -59,7 +59,7 @@ fn storage_failure_stops_the_dispatcher_with_admin_disabled() -> TestResult {
     fs::write(directory.path().join("not-directory"), "keep")?;
     fs::write(
         directory.path().join("lonewolf.toml"),
-        "[admin]\nenabled = false\n[storage.stores.primary]\nbackend = 'redb'\npath = 'not-directory/accounts.redb'\n",
+        "[xmpp]\nstanza_pool_size_mib = 8\n[admin]\nenabled = false\n[storage.stores.primary]\nbackend = 'redb'\npath = 'not-directory/accounts.redb'\n",
     )?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
         .current_dir(directory.path())

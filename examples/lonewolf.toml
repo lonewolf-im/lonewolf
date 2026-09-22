@@ -14,6 +14,16 @@
 # memory when the pool is exhausted.
 # stanza_pool_size_mib = 256
 
+# Add one section per TCP endpoint. These sections replace the default endpoint.
+# To disable c2s, use an empty listeners array in the c2s section.
+# [[c2s.listeners]]
+
+# Choose the local IP address and port for client connections.
+# Use a numeric IPv4 address or a bracketed IPv6 address followed by the port.
+# IPv6 endpoints accept IPv6 only. Endpoints in the same address family must not
+# overlap. Port 0 selects an available port shared by all workers for this endpoint.
+# address = "0.0.0.0:5222"
+
 # [storage]
 
 # Choose the store Lonewolf uses by default.

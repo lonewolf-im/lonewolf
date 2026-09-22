@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Owns process startup and shutdown, including global diagnostics, shared
-//! storage, and worker runtimes.
-
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 
 use std::env;
+use std::future::pending;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::pin::pin;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
+use futures_channel::oneshot;
+use futures_util::future::{Either, select};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
+mod c2s;
 pub mod config;
 mod error;
 mod logging;
@@ -49,7 +51,7 @@ pub struct BuildInfo {
 ///
 /// Returns [`RunError::Config`] for invalid configuration or
 /// [`RunError::WorkerCount`] if worker count selection fails. Startup failures
-/// identify logging, stanza pool, runtime, dispatcher, storage, or admin
+/// identify logging, stanza pool, runtime, dispatcher, storage, admin, or c2s
 /// initialization in [`RunError`]. Signal and worker shutdown failures also
 /// return [`RunError`]. If service execution and worker shutdown both fail, the
 /// service error wins.
@@ -96,14 +98,23 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
             .map_err(RunError::Dispatcher)?;
         tracing::info!(worker_count = worker_count.get(), "core dispatcher started");
         runtime.block_on(async {
+            let mut listeners = None;
             let result = async {
                 let accounts = stores.accounts(account_store)?;
-                if config.admin.enabled {
-                    let server = lonewolf_admin::Server::bind(&config.admin.socket_path, accounts)
-                        .map_err(RunError::Admin)?;
-                    return server.run(shutdown::wait()).await.map_err(RunError::Admin);
-                }
-                shutdown::wait().await.map_err(RunError::Signal)
+                let admin = if config.admin.enabled {
+                    Some(
+                        lonewolf_admin::Server::bind(&config.admin.socket_path, accounts)
+                            .map_err(RunError::Admin)?,
+                    )
+                } else {
+                    None
+                };
+                let listeners = listeners.insert(
+                    c2s::Listeners::start(&config.c2s, &dispatcher.handle())
+                        .await
+                        .map_err(RunError::C2s)?,
+                );
+                run_services(admin, listeners).await
             }
             .await;
             let stopped = dispatcher
@@ -113,12 +124,54 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
             if stopped.is_ok() {
                 tracing::info!("core dispatcher stopped");
             }
-            result.and(stopped)
+            let listeners_stopped = match listeners {
+                Some(mut listeners) => listeners.join().await.map_err(RunError::C2s),
+                None => Ok(()),
+            };
+            result.and(stopped).and(listeners_stopped)
         })?;
     }
 
     tracing::info!("heading back to the den");
     Ok(())
+}
+
+async fn run_services(
+    admin: Option<lonewolf_admin::Server>,
+    listeners: &mut c2s::Listeners,
+) -> Result<(), RunError> {
+    let admin_enabled = admin.is_some();
+    let (stop_admin, stopped) = oneshot::channel::<()>();
+    let mut admin = pin!(async move {
+        match admin {
+            Some(server) => server
+                .run(async move {
+                    let _ = stopped.await;
+                    Ok(())
+                })
+                .await
+                .map_err(RunError::Admin),
+            None => pending().await,
+        }
+    });
+    let result = {
+        let shutdown = async {
+            match select(pin!(shutdown::wait()), pin!(listeners.failure())).await {
+                Either::Left((result, _)) => result.map_err(RunError::Signal),
+                Either::Right((error, _)) => Err(RunError::C2s(error)),
+            }
+        };
+        match select(pin!(shutdown), admin.as_mut()).await {
+            Either::Left((result, _)) => Either::Left(result),
+            Either::Right((result, _)) => Either::Right(result),
+        }
+    };
+    listeners.stop();
+    drop(stop_admin);
+    match result {
+        Either::Left(result) if admin_enabled => result.and(admin.await),
+        Either::Left(result) | Either::Right(result) => result,
+    }
 }
 
 fn worker_count() -> io::Result<NonZeroUsize> {

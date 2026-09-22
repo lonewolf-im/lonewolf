@@ -971,12 +971,14 @@ name = "lonewolf-core"
 version = "0.1.0"
 dependencies = [
  "compio",
+ "futures-channel",
  "futures-util",
  "lonewolf-admin",
  "lonewolf-storage",
  "lonewolf-util",
  "nix",
  "serde",
+ "socket2",
  "tempfile",
  "time",
  "toml",

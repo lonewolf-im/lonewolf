@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Stores each account and all its verifiers in one versioned redb record.
+
 use std::num::NonZeroU32;
 use std::ops::Bound;
 use std::path::Path;
@@ -25,19 +27,37 @@ const SHA1: u8 = 1;
 const SHA256: u8 = 2;
 const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2);
 
-/// Account operations use a shared, bounded blocking pool.
-/// Dropping a future or stream does not stop an operation that has started.
+/// Runs account operations in a shared, bounded blocking pool.
+///
+/// Dropping a future or stream does not cancel work already submitted to the
+/// pool. Submitted writes can commit after the caller stops waiting.
 pub struct RedbAccountRepository {
     database: RedbDatabase,
 }
 
 impl RedbAccountRepository {
     /// Opens the database and initializes its schema synchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`RedbDatabase::open`] or [`Self::from_database`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::from_database(RedbDatabase::open(path)?)
     }
 
     /// Checks and initializes the schema synchronously.
+    ///
+    /// Shares operation limits with other repositories using the same
+    /// [`RedbDatabase`]. This schema check bypasses those limits and can wait
+    /// for an existing write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageErrorKind::CorruptData`] for an incomplete schema or
+    /// [`StorageErrorKind::UnsupportedVersion`] for an unknown schema version.
+    /// Backend failures return [`StorageErrorKind::Unavailable`],
+    /// [`StorageErrorKind::CorruptData`], or [`StorageErrorKind::Other`].
+    /// A failed schema commit can return [`StorageErrorKind::CommitUnknown`].
     pub fn from_database(database: RedbDatabase) -> Result<Self, StorageError> {
         let transaction = begin_write(database.as_ref())?;
         let initialize;
@@ -155,6 +175,7 @@ fn get(database: &Database, key: AccountKey) -> Result<Option<Account>, AccountE
 
 struct ListState {
     after: Option<AccountKey>,
+    // The owned range keeps the same read snapshot between blocking jobs.
     entries: Option<OwnedRange<&'static str, &'static [u8]>>,
 }
 
@@ -223,6 +244,7 @@ fn decode_account_key(text: &str) -> Result<AccountKey, StorageError> {
     let jid = jid
         .resolve(&arena)
         .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
+    // Normalizing stored keys would break cursor ordering and hide corruption.
     if jid.as_str() != text {
         return Err(StorageError::new(StorageErrorKind::CorruptData));
     }
@@ -312,6 +334,8 @@ struct DecodedCredentials {
     sha256: Option<ScramSha256Verifier>,
 }
 
+// The disk format uses a version and hash mask, then SHA-1 before SHA-256.
+// Each verifier stores salt, little-endian iterations, stored key, and server key.
 fn encode_credentials(credentials: &ScramCredentials) -> EncodedCredentials {
     let mut record = EncodedCredentials {
         bytes: [0; MAX_RECORD_BYTES],

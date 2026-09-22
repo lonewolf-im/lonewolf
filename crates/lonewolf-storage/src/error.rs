@@ -8,10 +8,15 @@ pub enum StorageErrorKind {
     Unavailable,
     CorruptData,
     UnsupportedVersion,
+    /// The write may have committed; an error does not imply rollback.
     CommitUnknown,
     Other,
 }
 
+/// Omits backend details from [`Debug`](fmt::Debug) and [`Display`](fmt::Display).
+///
+/// The source chain can contain credentials or account identifiers and must
+/// not be logged without redaction.
 pub struct StorageError {
     kind: StorageErrorKind,
     source: Option<Box<dyn Error + Send + Sync>>,
@@ -34,7 +39,6 @@ impl StorageError {
     }
 }
 
-// Backend errors can contain credentials or account identifiers.
 impl fmt::Debug for StorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

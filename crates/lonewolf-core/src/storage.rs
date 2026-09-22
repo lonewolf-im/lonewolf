@@ -10,6 +10,7 @@ use lonewolf_storage::account::redb::RedbAccountRepository;
 use crate::RunError;
 use crate::config::{StorageConfig, StoreConfig};
 
+/// Opens each selected store once so repositories share its lock and limits.
 pub(crate) struct StoreRegistry<'config> {
     config: &'config StorageConfig,
     databases: BTreeMap<&'config str, RedbDatabase>,

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Limits submitted blocking work across clones of one executor.
+
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -12,15 +14,22 @@ pub struct BlockingExecutor {
 }
 
 impl BlockingExecutor {
+    /// Creates an independent limit on queued and running blocking operations.
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             capacity: Arc::new(Semaphore::new(capacity.get())),
         }
     }
 
-    /// Waits for capacity before submitting work. A started operation retains its
-    /// capacity until it finishes, even if the caller drops the future.
-    /// Operation panics propagate to the caller.
+    /// Waits for capacity before submitting work to the process-wide pool.
+    ///
+    /// Dropping the future while it waits for capacity does not submit work.
+    /// Submitted work retains its capacity until it finishes, even if the
+    /// caller drops the future.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panic from `operation` when the result is awaited.
     pub async fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce() -> T + Send + 'static,

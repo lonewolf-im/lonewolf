@@ -54,6 +54,7 @@ pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
 async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
     let started = Instant::now();
     let response = next.run(request).await;
+    // Concrete paths and queries can contain account identities or secrets.
     tracing::debug!(
         route = route.as_ref().map_or("unmatched", MatchedPath::as_str),
         status = response.status().as_u16(),
@@ -303,6 +304,7 @@ fn account_key(text: &str) -> Result<AccountKey, ApiError> {
     AccountKey::try_from(jid).map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid_jid"))
 }
 
+// The percent decoder preserves malformed escapes instead of rejecting them.
 fn validate_percent_encoding(value: &str) -> Result<(), ApiError> {
     for (i, byte) in value.bytes().enumerate() {
         if byte == b'%'

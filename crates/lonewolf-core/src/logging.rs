@@ -11,6 +11,8 @@ use tracing_subscriber::fmt::time::UtcTime;
 
 use crate::config::LogLevel;
 
+/// Drops excess events when the queue is full instead of blocking callers.
+/// The caller must retain the guard until all log producers have stopped.
 pub(crate) fn init(level: LogLevel) -> Result<WorkerGuard, Box<dyn Error + Send + Sync>> {
     let filter = match level {
         LogLevel::Off => LevelFilter::OFF,

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Reuses fixed-size chunks across threads and falls back to the global heap.
+//!
+//! Configured capacity covers pooled chunks; heap fallback can exceed it.
+
 use std::alloc::Layout;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -32,10 +36,11 @@ thread_local! {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolConfig {
+    /// Excludes bookkeeping and heap fallback allocations.
+    ///
     /// Must be a power of two of at least 8 MiB that fits an allocation layout.
-    /// Excludes bookkeeping and heap fallback.
     pub total_bytes: NonZeroUsize,
-    /// Capped at construction by available CPU parallelism and each bucket's chunk count.
+    /// Capped by available CPU parallelism and each bucket's chunk count.
     pub shards_per_bucket: NonZeroUsize,
 }
 
@@ -52,7 +57,9 @@ fn available_shards() -> NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
-/// Concurrent snapshots are approximate. Allocation counters count successes and saturate.
+/// Reports approximate counts during concurrent allocations and returns.
+///
+/// Allocation counters count successes and saturate at [`u64::MAX`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolStats {
     /// Ordered by increasing chunk size.
@@ -94,7 +101,7 @@ impl std::error::Error for PoolError {
     }
 }
 
-/// Pooled storage remains allocated until the allocator is dropped.
+/// Retains pooled storage until the allocator drops, even when all chunks return.
 pub struct PooledChunkAllocator {
     config: PoolConfig,
     storage: Chunk,
@@ -104,8 +111,16 @@ pub struct PooledChunkAllocator {
 }
 
 impl PooledChunkAllocator {
-    /// Preallocates equal capacity per bucket, plus bookkeeping, from the global allocator.
-    /// Bookkeeping allocation failure uses the global allocation error handler.
+    /// Preallocates equal byte capacity per bucket from the global allocator.
+    ///
+    /// Bookkeeping needs extra capacity; its allocation failure uses the global
+    /// allocation error handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError::InvalidConfiguration`] if `total_bytes` violates
+    /// [`PoolConfig::total_bytes`], or [`PoolError::Allocation`] if allocation
+    /// of the chunk storage fails.
     pub fn try_new(mut config: PoolConfig) -> Result<Self, PoolError> {
         let total_bytes = config.total_bytes.get();
         if total_bytes < MIN_POOL_SIZE || !total_bytes.is_power_of_two() {
@@ -130,10 +145,16 @@ impl PooledChunkAllocator {
     }
 
     /// Includes the CPU cap applied at construction.
+    ///
+    /// Per-bucket chunk limits can reduce the actual shard counts further;
+    /// [`Self::stats`] reports those counts.
     pub fn config(&self) -> PoolConfig {
         self.config
     }
 
+    /// Reads counters independently without stopping allocations or returns.
+    ///
+    /// Concurrent changes can prevent the fields from describing one instant.
     pub fn stats(&self) -> PoolStats {
         let bucket_bytes = self.config.total_bytes.get() / BUCKET_SIZES.len();
         PoolStats {
@@ -165,8 +186,15 @@ impl PooledChunkAllocator {
 
 // Each queued slot grants exclusive access to a disjoint range in the retained allocation.
 unsafe impl ChunkAllocator for PooledChunkAllocator {
-    /// Tries buckets by increasing size. Pooled chunks are aligned to their full capacity.
-    /// If no compatible chunk is available, uses the exact layout from the global allocator.
+    /// Tries compatible buckets by increasing size before using the global heap.
+    ///
+    /// Pooled chunks are aligned to their full capacity. Heap fallback uses
+    /// the exact requested layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocationError::UnsupportedLayout`] for a zero-sized layout
+    /// or [`AllocationError::Exhausted`] if heap fallback allocation fails.
     fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
         if layout.size() == 0 {
             return Err(AllocationError::UnsupportedLayout);
@@ -196,10 +224,11 @@ unsafe impl ChunkAllocator for PooledChunkAllocator {
         Ok(chunk)
     }
 
-    /// Returns pooled chunks to their original bucket. Frees heap fallback chunks.
+    /// Returns pooled chunks to their original bucket and frees heap chunks.
     ///
     /// # Safety
-    /// Return each chunk once, to its source pool, with its layout intact.
+    ///
+    /// Each chunk must return once to its source pool with its layout intact.
     /// No references or pending accesses may remain.
     unsafe fn deallocate(&self, chunk: Chunk) {
         let offset = chunk

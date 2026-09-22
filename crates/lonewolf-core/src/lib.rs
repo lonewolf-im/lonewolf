@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Owns process startup and shutdown, including global diagnostics, shared
+//! storage, and worker runtimes.
+
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 
@@ -33,8 +36,24 @@ pub struct BuildInfo {
     pub commit: &'static str,
 }
 
-/// Installs process-wide panic and logging handlers; runs until SIGINT or SIGTERM.
-/// Joins workers and flushes logs before returning.
+/// Runs until SIGINT, SIGTERM, or a service failure.
+///
+/// Replaces the process panic hook and installs global logging. Worker threads
+/// are joined and buffered logs are flushed before returning. Configuration
+/// paths follow [`Config::load`]. `LONEWOLF_WORKER_COUNT` overrides the detected
+/// parallelism and must be a positive integer.
+///
+/// # Errors
+///
+/// Returns [`RunError::Config`] for invalid configuration or
+/// [`RunError::WorkerCount`] if worker count selection fails. Startup failures
+/// identify logging, runtime, dispatcher, storage, or admin initialization in
+/// [`RunError`]. Signal and worker shutdown failures also return [`RunError`].
+/// If service execution and worker shutdown both fail, the service error wins.
+///
+/// # Panics
+///
+/// Panics if called from a panicking thread while installing the panic hook.
 pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError> {
     panic::init(&build);
 

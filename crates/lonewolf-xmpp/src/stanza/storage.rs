@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Copies shared slices before mutation to preserve published XML trees.
+
 use lonewolf_util::arena::{Arena, ArenaError, ArenaRead, ChunkAllocator, Handle, HandleError};
 
 use super::BuildError;
@@ -133,6 +135,7 @@ impl<T: Copy + Send + Sync + 'static> SliceBuilder<T> {
         } else {
             len
         };
+        // Handles expose the full capacity, so unused slots must also hold valid values.
         let values = arena.try_alloc_slice_fill(capacity, fill)?;
         for index in 0..self.slice.len {
             let value = self.as_slice(arena)?[index];

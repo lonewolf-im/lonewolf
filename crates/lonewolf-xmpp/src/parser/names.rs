@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Resolves normalized namespace bindings before building typed stanza fields.
+
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, attributes::Attribute};

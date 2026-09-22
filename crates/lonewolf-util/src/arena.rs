@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Stores copied values under one byte budget and freezes them for shared reads.
+//!
+//! Handles identify an arena without retaining its storage. All returned
+//! storage, including metadata and spare capacity, counts against the budget.
+
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::Cell;
 use std::fmt;
@@ -22,7 +27,9 @@ thread_local! {
     static ARENA_IDS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
-/// Owns an uninitialized block. Return it through its allocator; dropping it does not free it.
+/// Owns a block without freeing it on drop.
+///
+/// The owner must return it through its allocator and preserve its layout.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::Chunk;
@@ -37,10 +44,14 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    /// Takes ownership of a block without initializing its bytes.
+    ///
     /// # Safety
+    ///
     /// The layout must describe the whole writable block and have a nonzero size.
-    /// The pointer must satisfy the layout's alignment and remain valid until deallocation.
-    /// The caller transfers sole ownership and must keep the originating allocator alive.
+    /// The pointer must satisfy the layout's alignment and remain valid until
+    /// deallocation. The caller transfers sole ownership and must keep the
+    /// originating allocator alive.
     pub unsafe fn from_raw_parts(pointer: NonNull<u8>, layout: Layout) -> Self {
         Self { pointer, layout }
     }
@@ -53,11 +64,12 @@ impl Chunk {
         self.layout.size()
     }
 
-    /// Includes the full usable capacity and alignment to preserve for deallocation.
+    /// Includes the usable capacity and alignment to preserve for deallocation.
     pub fn layout(&self) -> Layout {
         self.layout
     }
 
+    /// Transfers responsibility for deallocation to the caller.
     pub fn into_raw_parts(self) -> (NonNull<u8>, Layout) {
         (self.pointer, self.layout)
     }
@@ -70,25 +82,37 @@ unsafe impl Sync for Chunk {}
 /// Supplies both payload storage and ownership metadata.
 ///
 /// # Safety
-/// Successful allocations must be disjoint and writable for their full returned layouts.
+///
+/// Successful allocations must be disjoint and writable for their full layouts.
 /// The returned layout must provide at least the requested size and alignment.
 /// Blocks must stay valid until returned while the allocator is alive.
 /// Moving the allocator must not invalidate its live blocks.
 /// Releasing one block must not invalidate any other live block.
 /// Allocation and deallocation must be valid on any thread.
 pub unsafe trait ChunkAllocator: Send + Sync + 'static {
-    /// Returns uninitialized storage. Zero-sized layouts must return an error.
-    /// The allocator chooses any extra capacity. All returned bytes are usable by the caller.
-    /// Exhaustion must return an error without waiting for memory to become available.
+    /// Returns uninitialized storage with all returned bytes available for use.
+    ///
+    /// The allocator may return extra capacity. Exhaustion must return an error
+    /// without waiting for memory to become available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocationError::UnsupportedLayout`] for zero-sized or other
+    /// unsupported layouts, or [`AllocationError::Exhausted`] if allocation
+    /// fails.
     fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError>;
 
+    /// Returns storage without dropping any values it contains.
+    ///
     /// # Safety
-    /// The chunk must be a live allocation from this allocator with its returned layout intact.
+    ///
+    /// The chunk must be a live allocation from this allocator with its
+    /// returned layout intact.
     /// No references or pending accesses to the block may remain.
     unsafe fn deallocate(&self, chunk: Chunk);
 }
 
-/// Returns exactly the requested usable layout from the global heap, with no size-class rounding.
+/// Returns the exact requested layout from the global heap without rounding.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GlobalChunkAllocator;
 
@@ -121,15 +145,19 @@ unsafe impl<A: ChunkAllocator + ?Sized> ChunkAllocator for Arc<A> {
     }
 }
 
-/// Create one per long-lived producer to separate allocator reference counts.
-/// Clones share this handle's counter. Independent handles share only the allocator.
+/// Separates a producer's reference count from the shared allocator's count.
+///
+/// Clones share this handle's counter; independent handles share only the
+/// allocator. One handle per long-lived producer reduces counter contention.
 pub struct ChunkAllocatorHandle<A: ChunkAllocator + ?Sized> {
     // Alignment keeps the reference count apart from this read-only allocator pointer.
     owner: Arc<CachePadded<Arc<A>>>,
 }
 
 impl<A: ChunkAllocator + ?Sized> ChunkAllocatorHandle<A> {
-    /// Allocates bookkeeping on the global heap. Failure uses the global allocation error handler.
+    /// Allocates bookkeeping on the global heap.
+    ///
+    /// Allocation failure uses the global allocation error handler.
     pub fn new(allocator: Arc<A>) -> Self {
         Self {
             owner: Arc::new(CachePadded::new(allocator)),
@@ -159,7 +187,7 @@ unsafe impl<A: ChunkAllocator + ?Sized> ChunkAllocator for ChunkAllocatorHandle<
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AllocationError {
     UnsupportedLayout,
-    /// Global allocation failure can also indicate an unsupported size or alignment.
+    /// Global allocation failure can also mean an unsupported size or alignment.
     Exhausted,
 }
 
@@ -179,13 +207,14 @@ pub enum HandleError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArenaConfig {
-    /// Minimum bytes requested for each chunk, including the first.
-    /// Larger values request enough contiguous space.
-    /// The arena does not round requests to size classes.
-    /// Chunk metadata and alignment reduce the space available for values.
+    /// Minimum bytes requested per chunk, including metadata and alignment.
+    ///
+    /// Larger stored values require larger chunks; requests are not rounded to
+    /// size classes.
     pub chunk_size: NonZeroUsize,
-    /// Maximum total returned capacity, including unused bytes and ownership metadata.
-    /// A chunk that exceeds the remaining budget is returned and the allocation fails.
+    /// Maximum returned capacity, including spare bytes and ownership metadata.
+    ///
+    /// A chunk that exceeds the remaining budget is returned to the allocator.
     pub max_reserved_bytes: NonZeroUsize,
 }
 
@@ -208,8 +237,9 @@ pub struct ArenaStats {
     pub chunk_count: usize,
 }
 
-/// Does not retain storage. A handle stays valid through freezing.
-/// Handles cannot be used with another arena, even if the same memory is reused.
+/// Identifies a value without retaining storage and stays valid through freezing.
+///
+/// Another arena rejects the handle, even if it reuses the same memory.
 pub struct Handle<T: ?Sized + 'static> {
     identity: usize,
     pointer: NonNull<T>,
@@ -228,8 +258,13 @@ impl<T: ?Sized + 'static> Clone for Handle<T> {
     }
 }
 
-/// Only arena owners can resolve handles. Returned views cannot outlive the owner borrow.
+/// Resolves handles only while their storage owner remains borrowed.
 pub trait ArenaRead: sealed::ArenaRead {
+    /// Borrows a value from this arena or its frozen storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] if another arena issued the handle.
     fn get<T: ?Sized + Send + Sync + 'static>(&self, handle: Handle<T>) -> Result<&T, HandleError>;
 }
 
@@ -238,8 +273,11 @@ mod sealed {
 }
 
 /// Can move between threads, but cannot be shared between them.
-/// Keeps its allocator alive. All storage, including ownership metadata, uses that allocator.
-/// Dropping the arena returns every chunk to the allocator, which may cache or free it.
+///
+/// Keeps its allocator alive and uses it for all storage, including metadata.
+/// Dropping the arena returns every chunk; the allocator may cache or free it.
+/// Allocations remain valid until the arena or its final frozen owner drops.
+/// Zero-sized values and empty slices consume no additional storage.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::Arena;
@@ -256,6 +294,11 @@ pub struct Arena<A: ChunkAllocator = GlobalChunkAllocator> {
 unsafe impl<A: ChunkAllocator> Send for Arena<A> {}
 
 impl Arena<GlobalChunkAllocator> {
+    /// Reserves the first chunk with [`GlobalChunkAllocator`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the construction errors described by [`Self::try_new_in`].
     pub fn try_new(config: ArenaConfig) -> Result<Self, ArenaError> {
         Self::try_new_in(config, GlobalChunkAllocator)
     }
@@ -263,8 +306,17 @@ impl Arena<GlobalChunkAllocator> {
 
 impl<A: ChunkAllocator> Arena<A> {
     /// Reserves the first chunk before returning so freezing needs no allocation.
+    ///
     /// Each arena gets a fresh identity, even when its allocator reuses memory.
-    /// The chunk size must fit a layout. It and ownership metadata must each fit the budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArenaError::InvalidConfiguration`] if the chunk layout is
+    /// invalid or the configured chunk size or metadata exceeds the budget,
+    /// [`ArenaError::IdentityExhausted`] if no unique identity remains,
+    /// [`ArenaError::Allocation`] if the allocator fails, or
+    /// [`ArenaError::ArenaLimitExceeded`] if the returned chunk exceeds the
+    /// budget.
     pub fn try_new_in(config: ArenaConfig, allocator: A) -> Result<Self, ArenaError> {
         let (metadata_layout, header_offset) = Layout::new::<ArenaInner<A>>()
             .extend(Layout::new::<ChunkHeader>())
@@ -318,6 +370,14 @@ impl<A: ChunkAllocator> Arena<A> {
         })
     }
 
+    /// Keeps a copy until the arena's final owner drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArenaError::CapacityOverflow`] if layout or accounting
+    /// arithmetic overflows, [`ArenaError::ArenaLimitExceeded`] if another
+    /// chunk would exceed the budget, or [`ArenaError::Allocation`] if the
+    /// allocator fails. An error preserves existing values and statistics.
     pub fn try_alloc<T: Copy + Send + Sync + 'static>(
         &mut self,
         value: T,
@@ -327,6 +387,11 @@ impl<A: ChunkAllocator> Arena<A> {
         Ok(self.handle(pointer))
     }
 
+    /// Copies a slice into storage retained until the arena's final owner drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns the allocation errors described by [`Self::try_alloc`].
     pub fn try_alloc_slice_copy<T: Copy + Send + Sync + 'static>(
         &mut self,
         values: &[T],
@@ -338,6 +403,11 @@ impl<A: ChunkAllocator> Arena<A> {
         Ok(self.handle(pointer))
     }
 
+    /// Retains a filled slice until the arena's final owner drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns the allocation errors described by [`Self::try_alloc`].
     pub fn try_alloc_slice_fill<T: Copy + Send + Sync + 'static>(
         &mut self,
         length: usize,
@@ -352,6 +422,11 @@ impl<A: ChunkAllocator> Arena<A> {
         Ok(self.handle(pointer))
     }
 
+    /// Retains a string copy until the arena's final owner drops.
+    ///
+    /// # Errors
+    ///
+    /// Returns the allocation errors described by [`Self::try_alloc`].
     pub fn try_alloc_str(&mut self, value: &str) -> Result<Handle<str>, ArenaError> {
         let bytes = self.try_alloc_slice_copy(value.as_bytes())?;
         // The copied bytes preserve valid UTF-8 and the slice length.
@@ -359,6 +434,11 @@ impl<A: ChunkAllocator> Arena<A> {
         Ok(self.handle(pointer))
     }
 
+    /// Borrows the value without retaining storage beyond the owner borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] if another arena issued the handle.
     pub fn get<T: ?Sized + Send + Sync + 'static>(
         &self,
         handle: Handle<T>,
@@ -370,6 +450,11 @@ impl<A: ChunkAllocator> Arena<A> {
         Ok(unsafe { handle.pointer.as_ref() })
     }
 
+    /// Borrows a value exclusively, preventing access through copied handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] if another arena issued the handle.
     pub fn get_mut<T: ?Sized + Send + Sync + 'static>(
         &mut self,
         mut handle: Handle<T>,
@@ -381,7 +466,9 @@ impl<A: ChunkAllocator> Arena<A> {
         Ok(unsafe { handle.pointer.as_mut() })
     }
 
-    /// Transfers ownership without copying or allocating. Existing handles remain valid.
+    /// Transfers ownership without copying or allocating.
+    ///
+    /// Existing handles remain valid, but mutable borrows are no longer available.
     pub fn freeze(self) -> SharedArena<A> {
         let arena = ManuallyDrop::new(self);
         SharedArena { inner: arena.inner }
@@ -424,8 +511,10 @@ impl<A: ChunkAllocator> ArenaRead for Arena<A> {
     }
 }
 
-/// Allows concurrent reads. Borrowed views cannot outlive their owning shared handle.
-/// The final owner returns every chunk before dropping the allocator.
+/// Shares frozen storage until the final owner drops.
+///
+/// Borrowed views cannot outlive their owning shared handle. The final owner
+/// returns every chunk before dropping the allocator.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::{Handle, HandleError, SharedArena};
@@ -443,6 +532,11 @@ unsafe impl<A: ChunkAllocator> Send for SharedArena<A> {}
 unsafe impl<A: ChunkAllocator> Sync for SharedArena<A> {}
 
 impl<A: ChunkAllocator> SharedArena<A> {
+    /// Borrows the value while this shared owner retains its storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] if another arena issued the handle.
     pub fn get<T: ?Sized + Send + Sync + 'static>(
         &self,
         handle: Handle<T>,
@@ -607,6 +701,9 @@ fn reserve_identities(counter: &AtomicUsize) -> Result<(usize, usize), ArenaErro
     }
 }
 
+/// # Safety
+///
+/// `inner` must be live and have no remaining owners or borrowed views.
 unsafe fn release_storage<A: ChunkAllocator>(inner: NonNull<ArenaInner<A>>) {
     // Move the allocator out before returning the block that stores it.
     let allocator = unsafe { ptr::read(&raw const (*inner.as_ptr()).allocator) };

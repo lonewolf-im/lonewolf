@@ -25,6 +25,7 @@ use crate::api;
 const MAX_CONNECTIONS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Owns the socket path and removes it on drop if it still names this socket.
 pub struct Server {
     listener: UnixListener,
     socket: SocketFile,
@@ -33,8 +34,20 @@ pub struct Server {
 
 impl Server {
     /// Requires a private parent directory owned by the current user.
+    ///
     /// Creates missing directories with mode 0700 and the socket with mode 0600.
     /// Refuses existing paths, including stale sockets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::PermissionDenied`] if the parent has another
+    /// owner or permits group or other access, or [`io::ErrorKind::AddrInUse`]
+    /// if the path exists. Also returns filesystem, socket, or runtime
+    /// attachment errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when attaching the listener outside a compio runtime.
     pub fn bind(path: &Path, accounts: impl AccountRepository + 'static) -> io::Result<Self> {
         let parent = path
             .parent()
@@ -79,7 +92,19 @@ impl Server {
     }
 
     /// Stops accepting on shutdown, then drains connections within their deadlines.
+    ///
     /// Each connection serves one request with a 30-second deadline.
+    /// Up to 32 connections run concurrently on the calling runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an accept error or the error from `shutdown` after draining
+    /// accepted connections. Individual request failures do not stop the server.
+    ///
+    /// # Panics
+    ///
+    /// Panics if it submits socket I/O or registers a connection timeout
+    /// outside a compio runtime.
     pub async fn run(self, shutdown: impl Future<Output = io::Result<()>>) -> io::Result<()> {
         let mut shutdown = pin!(shutdown);
         let mut connections = FuturesUnordered::new();
@@ -148,6 +173,7 @@ struct SocketFile {
 
 impl Drop for SocketFile {
     fn drop(&mut self) {
+        // A replacement at this path must survive cleanup of the old listener.
         if let Ok(metadata) = fs::symlink_metadata(&self.path)
             && metadata.file_type().is_socket()
             && metadata.dev() == self.device

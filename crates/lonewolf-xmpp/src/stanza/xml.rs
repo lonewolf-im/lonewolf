@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Validates XML local names and escapes text without changing parsed values.
+
 use std::fmt;
 
 use super::BuildError;
@@ -53,6 +55,7 @@ pub(super) fn escape(output: &mut impl fmt::Write, text: &str, attribute: bool) 
             '<' => "&lt;",
             '>' => "&gt;",
             '"' if attribute => "&quot;",
+            // Character references bypass XML whitespace normalization.
             '\t' if attribute => "&#x9;",
             '\n' if attribute => "&#xA;",
             '\r' => "&#xD;",

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Runs local futures on dedicated workers with bounded submission queues.
+//!
+//! Only dispatched tasks are tracked; they must join their own child tasks.
+
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -22,7 +26,9 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 type Job = Box<dyn FnOnce(WorkerContext) -> JoinHandle<bool> + Send>;
 type Stop = Shared<BoxFuture<'static, Instant>>;
 
-/// Owns dedicated runtime threads; dropping it requests cancellation without waiting.
+/// Owns runtime threads and requests cancellation on drop without waiting.
+///
+/// [`Self::shutdown`] waits for cleanup and reports worker failures.
 pub struct CoreDispatcher {
     handle: DispatchHandle,
     workers: Vec<Worker>,
@@ -50,12 +56,15 @@ impl Drop for Inbox {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkerInfo {
+    /// Zero-based index accepted by [`DispatchHandle::dispatch_at`].
     pub index: usize,
     /// Pinned logical CPU on Linux; `None` on other Unix targets.
     pub cpu_id: Option<usize>,
 }
 
-/// Services must join their local child tasks during shutdown.
+/// Shares the worker identity and shutdown signal with a dispatched task.
+///
+/// Tasks must join their local child tasks before completing.
 #[derive(Clone)]
 pub struct WorkerContext {
     pub worker: WorkerInfo,
@@ -63,13 +72,18 @@ pub struct WorkerContext {
 }
 
 impl WorkerContext {
-    /// Completes on shutdown with the drain deadline.
+    /// Completes on shutdown with the deadline shared by all workers.
+    ///
+    /// Repeated calls return the same deadline, which may already have passed.
     pub async fn shutdown_requested(&self) -> Instant {
         self.stop.clone().await
     }
 }
 
-/// Dropping this handle detaches the task.
+/// Reports task completion; dropping the handle leaves the task running.
+///
+/// Awaiting it returns [`TaskError::Panicked`] for a panic in the factory or
+/// future, or [`TaskError::Cancelled`] if the worker drops the task.
 #[must_use = "Await the task to observe its result and any panic."]
 pub struct Task<T> {
     result: oneshot::Receiver<Result<T, TaskError>>,
@@ -103,8 +117,18 @@ impl<T> Future for Task<T> {
 }
 
 impl CoreDispatcher {
-    /// Blocks until all workers start; rolls back failures.
-    /// Linux workers pin to distinct allowed CPUs.
+    /// Blocks until all workers start and joins started workers on failure.
+    ///
+    /// Each worker has a queue of `queue_capacity` waiting jobs. Running tasks
+    /// do not consume queue capacity. Linux workers pin to distinct allowed
+    /// CPUs; other Unix targets do not pin workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the worker count exceeds the
+    /// allowed CPU count on Linux, or [`io::ErrorKind::Other`] if a worker exits
+    /// before reporting startup. Also returns CPU affinity, thread creation,
+    /// or runtime initialization errors.
     pub fn new(workers: NonZeroUsize, queue_capacity: NonZeroUsize) -> io::Result<Self> {
         Self::start(worker_assignment(workers)?, queue_capacity, create_runtime)
     }
@@ -141,8 +165,19 @@ impl CoreDispatcher {
         self.handle.clone()
     }
 
-    /// Closes queues and drains running tasks; cancels them at the deadline.
-    /// Joins workers and reports failures. Tasks must yield.
+    /// Closes queues, drops queued jobs, and waits for started tasks to finish.
+    ///
+    /// Signals the shared deadline, then joins every worker. Unfinished tasks
+    /// are cancelled at the deadline. Tasks must yield for the deadline to
+    /// take effect. Dropping this future after it starts does not stop worker
+    /// cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the deadline overflows,
+    /// [`io::ErrorKind::TimedOut`] if a worker exceeds it, or
+    /// [`io::ErrorKind::Other`] if a task or worker panicked. When several
+    /// workers fail, reports the first failure in worker order.
     pub async fn shutdown(mut self, grace_period: Duration) -> io::Result<()> {
         let deadline = Instant::now().checked_add(grace_period).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "shutdown deadline overflows")
@@ -171,8 +206,17 @@ impl DispatchHandle {
         self.senders.len()
     }
 
-    /// Creates and polls the future on the selected worker; the factory must not block.
-    /// Waits for queue space. Capacity excludes running tasks.
+    /// Waits for queue space and creates the future on the selected worker.
+    ///
+    /// The future stays on that worker and need not implement [`Send`]. The
+    /// factory must not block, and the future must yield to the runtime.
+    /// Dropping a pending submission does not enqueue it; a returned [`Task`]
+    /// can be dropped without cancelling the submitted work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] for an out-of-range worker index
+    /// or [`io::ErrorKind::BrokenPipe`] if that worker's queue has closed.
     pub async fn dispatch_at<F, Fut, T>(&self, worker: usize, factory: F) -> io::Result<Task<T>>
     where
         F: FnOnce(WorkerContext) -> Fut + Send + 'static,
@@ -281,9 +325,11 @@ async fn run_worker(context: WorkerContext, jobs: Inbox) -> io::Result<()> {
                 Either::Left(deadline) => break deadline,
                 Either::Right(Ok(Some(job))) => {
                     tasks.push(job(context.clone()));
+                    // A ready queue must not starve spawned tasks or timers.
                     yield_to_runtime().await;
                 }
                 Either::Right(Ok(None)) => {}
+                // Queue closure alone must not shorten the shared grace period.
                 Either::Right(Err(_)) => break stop.await,
             }
         }

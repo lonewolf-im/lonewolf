@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Preserves mixed-content order and namespace URIs in immutable element trees.
+
 use std::fmt;
 
 use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator, Handle, HandleError};
@@ -55,7 +57,9 @@ impl Attribute {
 
 #[derive(Clone, Copy)]
 pub struct AttributeRef<'a> {
+    /// Excludes the namespace prefix.
     pub name: &'a str,
+    /// Contains the resolved URI, or an empty string for no namespace.
     pub namespace: &'a str,
     pub value: &'a str,
 }
@@ -80,7 +84,7 @@ struct ElementData {
     nodes: usize,
 }
 
-/// An immutable, non-owning handle. All content belongs to one caller-owned arena.
+/// Holds immutable content from one arena without retaining that arena.
 #[derive(Clone, Copy)]
 pub struct Element {
     data: Handle<ElementData>,
@@ -94,7 +98,9 @@ pub struct ElementRef<'a, R: ArenaRead> {
     namespace: &'a str,
 }
 
-/// Failed builds can leave unused storage in the arena until it is dropped.
+/// Retains removed or replaced storage until the arena is dropped.
+///
+/// Failed builds do not reclaim allocations.
 pub struct ElementBuilder<'a, A: ChunkAllocator> {
     arena: &'a mut Arena<A>,
     name: Name,
@@ -167,6 +173,14 @@ impl ElementFrame {
 }
 
 impl Element {
+    /// Accepts a local XML name without a namespace prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::InvalidName`] for an invalid local name,
+    /// [`BuildError::InvalidNamespace`] for the reserved `xmlns` URI,
+    /// [`BuildError::InvalidText`] for invalid namespace characters, or
+    /// [`BuildError::Allocation`] if arena allocation fails.
     pub fn builder_in<'a, A: ChunkAllocator>(
         name: &str,
         namespace: &str,
@@ -181,6 +195,11 @@ impl Element {
         })
     }
 
+    /// Borrows from the arena that owns this element.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] for a different arena.
     pub fn resolve<'a, R: ArenaRead>(
         &self,
         arena: &'a R,
@@ -196,6 +215,10 @@ impl Element {
     }
 
     /// Shares unchanged storage. Edits do not alter the source element.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] unless `arena` owns the source.
     pub fn derive_in<'a, A: ChunkAllocator>(
         &self,
         arena: &'a mut Arena<A>,
@@ -223,12 +246,14 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         self.namespace
     }
 
+    /// Preserves attribute insertion order.
     pub fn attributes(
         &self,
     ) -> Result<impl Iterator<Item = Result<AttributeRef<'a>, HandleError>> + 'a, HandleError> {
         attributes(self.data.attributes, self.arena)
     }
 
+    /// Matches a local name and namespace URI, without a namespace prefix.
     pub fn attribute(&self, name: &str, namespace: &str) -> Result<Option<&'a str>, HandleError> {
         for attribute in self.attributes()? {
             let attribute = attribute?;
@@ -239,6 +264,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         Ok(None)
     }
 
+    /// Preserves the order of text and element children.
     pub fn children(
         &self,
     ) -> Result<impl Iterator<Item = Result<NodeRef<'a, R>, HandleError>> + 'a, HandleError> {
@@ -254,6 +280,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
             }))
     }
 
+    /// Returns only the first child with this local name and namespace URI.
     pub fn child(
         &self,
         name: &str,
@@ -270,7 +297,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         Ok(None)
     }
 
-    /// Returns text only when the element contains one text node and no other nodes.
+    /// Returns text only for an element with one text node and no other nodes.
     pub fn text(&self) -> Result<Option<&'a str>, HandleError> {
         match self.data.children.get(self.arena)? {
             [Node::Text(text)] => self.arena.get(*text).map(Some),
@@ -306,7 +333,13 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         })
     }
 
-    /// Writes explicit namespace declarations. Output failure can leave a partial element.
+    /// Writes namespace declarations without requiring an enclosing element.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::Access`] for an unresolved handle or
+    /// [`WriteError::Output`] if the destination rejects a write. Either error
+    /// can leave partial XML in `output`.
     pub fn write_xml(&self, output: &mut impl fmt::Write) -> Result<(), WriteError> {
         self.write_in(output, None)
     }
@@ -360,6 +393,17 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
 }
 
 impl<A: ChunkAllocator> ElementBuilder<'_, A> {
+    /// Replaces a matching attribute without changing its position.
+    ///
+    /// Matches local names and namespace URIs, without namespace prefixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::InvalidName`] for an invalid local name,
+    /// [`BuildError::InvalidNamespace`] for a reserved namespace declaration,
+    /// [`BuildError::InvalidText`] for invalid XML characters,
+    /// [`BuildError::Access`] for an unresolved handle, or
+    /// [`BuildError::Allocation`] if arena allocation fails.
     pub fn attribute(
         mut self,
         name: &str,
@@ -375,6 +419,16 @@ impl<A: ChunkAllocator> ElementBuilder<'_, A> {
         Ok(self)
     }
 
+    /// Appends a separate text node, ignoring empty strings.
+    ///
+    /// Consecutive calls do not merge nodes, so [`ElementRef::text`] returns
+    /// `None` when more than one nonempty string has been appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::InvalidText`] for invalid XML characters,
+    /// [`BuildError::Access`] for an unresolved handle, or
+    /// [`BuildError::Allocation`] if arena allocation fails.
     pub fn text(mut self, text: &str) -> Result<Self, BuildError> {
         xml::validate_text(text)?;
         if !text.is_empty() {
@@ -384,12 +438,19 @@ impl<A: ChunkAllocator> ElementBuilder<'_, A> {
         Ok(self)
     }
 
+    /// Shares the child's storage; the child must belong to this arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::Access`] for a different arena or
+    /// [`BuildError::Allocation`] if the child list cannot grow.
     pub fn child(mut self, element: Element) -> Result<Self, BuildError> {
         element.resolve(self.arena)?;
         self.children.push(Node::Element(element), self.arena)?;
         Ok(self)
     }
 
+    /// Removes all matching direct elements while retaining text nodes.
     pub fn remove_children(mut self, name: &str, namespace: &str) -> Result<Self, BuildError> {
         self.children.retain(self.arena, |node, arena| match node {
             Node::Element(element) => arena
@@ -407,6 +468,13 @@ impl<A: ChunkAllocator> ElementBuilder<'_, A> {
         self
     }
 
+    /// Checks tree limits with each shared subtree counted at every occurrence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::TreeLimitExceeded`] above [`MAX_ELEMENT_DEPTH`] or
+    /// [`MAX_ELEMENT_NODES`], [`BuildError::Access`] for an unresolved handle,
+    /// or [`BuildError::Allocation`] if arena allocation fails.
     pub fn build(self) -> Result<Element, BuildError> {
         let mut depth = 1;
         let mut nodes = 1;

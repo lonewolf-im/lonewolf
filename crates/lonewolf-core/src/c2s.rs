@@ -70,6 +70,12 @@ impl Listeners {
                 }
                 listeners.tasks.push(task);
             }
+            tracing::info!(
+                listener_id,
+                worker_count = dispatcher.worker_count(),
+                port = address.port(),
+                "c2s TCP listener started"
+            );
         }
         Ok(listeners)
     }
@@ -117,11 +123,11 @@ async fn run_listener(
     listener_id: usize,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
-    tracing::info!(
+    tracing::debug!(
         listener_id,
         worker_id,
         port = listener.local_addr()?.port(),
-        "c2s TCP listener started"
+        "c2s TCP worker listener started"
     );
     let shutdown = async {
         select(pin!(context.shutdown_requested()), pin!(stop)).await;
@@ -170,7 +176,7 @@ async fn run_listener(
         }
     };
     let closed = listener.close().await;
-    tracing::info!(listener_id, worker_id, "c2s TCP listener stopped");
+    tracing::debug!(listener_id, worker_id, "c2s TCP worker listener stopped");
     result.and(closed)
 }
 

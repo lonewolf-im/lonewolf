@@ -25,7 +25,7 @@ impl Server {
         let directory = tempfile::tempdir()?;
         fs::write(
             directory.path().join("lonewolf.toml"),
-            format!("[logging]\nlevel = 'trace'\n[xmpp]\nstanza_pool_size_mib = 8\n{config}"),
+            format!("[xmpp]\nstanza_pool_size_mib = 8\n{config}"),
         )?;
         let child = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
             .current_dir(directory.path())
@@ -97,26 +97,22 @@ fn field(line: &str, key: &str) -> Result<usize, Box<dyn Error>> {
 fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
     let mut server = Server::start(
-        "[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
+        "[logging]\nlevel = 'trace'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
-    let logs = server.ready(2 * workers)?;
+    let logs = server.ready(2)?;
     let mut ports = [0_u16; 2];
-    let mut sockets = std::collections::BTreeSet::new();
     for line in logs
         .lines()
         .filter(|line| line.contains("c2s TCP listener started"))
     {
+        assert!(line.contains(" INFO "));
+        assert_eq!(field(line, "worker_count=")?, workers);
+        assert!(!line.contains("worker_id="));
         let listener = field(line, "listener_id=")?;
-        let worker = field(line, "worker_id=")?;
-        let port = field(line, "port=")?.try_into()?;
         assert!(listener < 2);
-        assert!(worker < workers);
-        assert!(sockets.insert((listener, worker)));
-        if ports[listener] == 0 {
-            ports[listener] = port;
-        }
-        assert_eq!(ports[listener], port);
+        assert_eq!(ports[listener], 0);
+        ports[listener] = field(line, "port=")?.try_into()?;
     }
     assert_ne!(ports[0], ports[1]);
     assert!(!ports.contains(&0));
@@ -140,8 +136,22 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
     server.stop(Signal::SIGTERM)?;
     assert!(!socket.exists());
     let logs = server.logs()?;
+    let mut sockets = std::collections::BTreeSet::new();
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP worker listener started"))
+    {
+        assert!(line.contains(" DEBUG "));
+        let listener = field(line, "listener_id=")?;
+        let worker = field(line, "worker_id=")?;
+        assert!(listener < 2);
+        assert!(worker < workers);
+        assert!(sockets.insert((listener, worker)));
+        assert_eq!(usize::from(ports[listener]), field(line, "port=")?);
+    }
+    assert_eq!(sockets.len(), 2 * workers);
     assert_eq!(
-        logs.matches("c2s TCP listener stopped").count(),
+        logs.matches("c2s TCP worker listener stopped").count(),
         2 * workers
     );
     assert_eq!(logs.matches("c2s connection closed").count(), 32);
@@ -155,14 +165,24 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
 
 #[test]
 fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
+    let workers = thread::available_parallelism()?.get().min(2);
     let mut server = Server::start(
         "[admin]\nenabled = false\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
-        1,
+        workers,
     )?;
     let logs = server.ready(1)?;
     assert!(!logs.contains("admin service started"));
+    let started = logs
+        .lines()
+        .find(|line| line.contains("c2s TCP listener started"))
+        .ok_or("missing listener start log")?;
+    assert_eq!(field(started, "worker_count=")?, workers);
     server.stop(Signal::SIGINT)?;
-    assert!(server.logs()?.contains("c2s TCP listener stopped"));
+    let logs = server.logs()?;
+    assert_eq!(logs.matches("c2s TCP listener started").count(), 1);
+    assert!(!logs.contains("c2s TCP worker listener"));
+    assert!(!logs.contains("worker_id="));
+    assert!(logs.contains("core dispatcher stopped"));
     Ok(())
 }
 
@@ -180,7 +200,7 @@ fn occupied_endpoint_stops_started_listeners_and_removes_admin_socket() -> TestR
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let mut server = Server::start(
         &format!(
-            "[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '{}'\n",
+            "[logging]\nlevel = 'trace'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '{}'\n",
             occupied.local_addr()?
         ),
         1,
@@ -188,7 +208,7 @@ fn occupied_endpoint_stops_started_listeners_and_removes_admin_socket() -> TestR
     assert_eq!(server.wait()?.code(), Some(1));
     let logs = server.logs()?;
     assert!(logs.contains("c2s listener service failed: listener 1 on worker 0"));
-    assert!(logs.contains("c2s TCP listener stopped"));
+    assert!(logs.contains("c2s TCP worker listener stopped"));
     assert!(logs.contains("core dispatcher stopped"));
     assert!(
         !server

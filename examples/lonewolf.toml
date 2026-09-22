@@ -21,7 +21,7 @@
 # Choose the local IP address and port for client connections.
 # Use a numeric IPv4 address or a bracketed IPv6 address followed by the port.
 # IPv6 endpoints accept IPv6 only. Endpoints in the same address family must not
-# overlap. Port 0 selects an available port shared by all workers for this endpoint.
+# overlap.
 # address = "0.0.0.0:5222"
 
 # [storage]

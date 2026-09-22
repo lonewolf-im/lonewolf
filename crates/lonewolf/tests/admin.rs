@@ -64,6 +64,7 @@ path = "accounts.redb"
     let mut child = Process(
         Command::new(env!("CARGO_BIN_EXE_lonewolf"))
             .current_dir(directory.path())
+            .env("LONEWOLF_WORKERS_COUNT", "1")
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log_path)?)
             .spawn()?,
@@ -145,6 +146,8 @@ path = "accounts.redb"
     }
     assert!(!path.exists());
     let logs = fs::read_to_string(log_path)?;
+    assert!(logs.lines().any(|line| line.contains("core dispatcher started") && line.contains("worker_count=1")));
+    assert!(logs.contains("core dispatcher stopped"));
     let mut events = logs
         .lines()
         .filter(|line| line.contains("admin request completed"));
@@ -173,9 +176,17 @@ fn occupied_socket_path_fails_startup_without_overwriting_it() -> TestResult {
     fs::write(directory.path().join("admin.sock"), "keep")?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))
         .current_dir(directory.path())
+        .env_remove("LONEWOLF_WORKERS_COUNT")
         .output()?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("admin service failed"));
+    let logs = std::str::from_utf8(&output.stderr)?;
+    let expected_count = format!("worker_count={}", thread::available_parallelism()?);
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("core dispatcher started") && line.contains(&expected_count))
+    );
+    assert!(logs.contains("core dispatcher stopped"));
+    assert!(logs.contains("admin service failed"));
     assert_eq!(
         fs::read_to_string(directory.path().join("admin.sock"))?,
         "keep"

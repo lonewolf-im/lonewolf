@@ -7,12 +7,20 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-channel.workspace = true
 async-lock.workspace = true
 blocking.workspace = true
+compio = { workspace = true, features = ["time"] }
 crossbeam-queue.workspace = true
 crossbeam-utils.workspace = true
+futures-channel.workspace = true
+futures-util.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["sched"] }
 
 [dev-dependencies]
+compio = { workspace = true, features = ["net"] }
 futures-executor.workspace = true
 
 [[bench]]

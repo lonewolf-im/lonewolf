@@ -12,6 +12,9 @@ pub enum RunError {
     Logging(Box<dyn Error + Send + Sync>),
     Config(ConfigError),
     Runtime(io::Error),
+    WorkersCount(io::Error),
+    Dispatcher(io::Error),
+    DispatcherShutdown(io::Error),
     Signal(io::Error),
     Admin(io::Error),
     UnknownStore(String),
@@ -26,6 +29,13 @@ impl fmt::Display for RunError {
             Self::Logging(source) => write!(formatter, "cannot initialize logging: {source}"),
             Self::Config(source) => source.fmt(formatter),
             Self::Runtime(source) => write!(formatter, "cannot create root runtime: {source}"),
+            Self::WorkersCount(source) => {
+                write!(formatter, "cannot configure core workers: {source}")
+            }
+            Self::Dispatcher(source) => write!(formatter, "cannot start core dispatcher: {source}"),
+            Self::DispatcherShutdown(source) => {
+                write!(formatter, "cannot stop core dispatcher: {source}")
+            }
             Self::Admin(source) => write!(formatter, "admin service failed: {source}"),
             Self::Signal(source) => write!(formatter, "cannot wait for shutdown signal: {source}"),
             Self::UnknownStore(store) => write!(formatter, "unknown storage store {store:?}"),
@@ -49,7 +59,12 @@ impl Error for RunError {
         match self {
             Self::Logging(source) => Some(source.as_ref()),
             Self::Config(source) => Some(source),
-            Self::Runtime(source) | Self::Signal(source) | Self::Admin(source) => Some(source),
+            Self::Runtime(source)
+            | Self::WorkersCount(source)
+            | Self::Dispatcher(source)
+            | Self::DispatcherShutdown(source)
+            | Self::Signal(source)
+            | Self::Admin(source) => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),
             Self::Storage { source, .. } | Self::Accounts { source, .. } => Some(source),
             Self::UnknownStore(_) => None,

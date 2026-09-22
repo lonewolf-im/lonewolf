@@ -1,43 +1,39 @@
 # Copy this file to lonewolf.toml and uncomment the sections and values you need.
 # Omitted settings use their defaults. Values below are defaults unless marked as examples.
 
+# LONEWOLF_WORKERS_COUNT: positive integer; defaults to available CPU parallelism.
+# On Linux, the count cannot exceed the process's allowed CPUs.
+
 # [logging]
 
-# Log events at this level and more severe levels. Applied at startup.
 # Accepted values: "off", "error", "warn", "info", "debug", "trace".
-# Use "off" to disable logs. The default is "info".
 # level = "info"
 
 # [storage]
 
-# Default store for components that do not select a store.
-# Must name a store defined below. Required when more than one store is defined.
-# Omit to select the only store. The built-in store is "primary".
+# Must name a defined store. Required when more than one store is defined.
+# Omit to select the only store.
 # default = "primary"
 
 # Define each store once under storage.stores.<name>. Names must not be empty.
 # Omit all store definitions to use the primary store shown below.
 # Explicit store definitions replace the built-in store list.
-# Stores are opened only when used.
 # [storage.stores.primary]
 
-# Storage backend. Required for each explicit store. Only "redb" is supported.
+# Required for each explicit store. Only "redb" is supported.
 # backend = "redb"
 
-# Database file path. Required and nonempty for each explicit redb store.
-# Relative paths use the working directory. Missing parent directories are created.
-# The built-in primary store uses this path.
+# Required and nonempty for explicit stores. Relative paths use the working directory.
 # path = "./data/lonewolf.dat"
 
 # [account]
 
-# Optional store override. Omit to inherit storage.default.
+# Omit to inherit storage.default. The value below is an example.
 # storage = "primary"
 
 # [admin]
 
-# Enable the admin server. Default: true.
 # enabled = true
 
-# Admin Unix socket path. Relative paths use the working directory.
+# Relative paths use the working directory.
 # socket_path = "./run/lonewolf/admin.sock"

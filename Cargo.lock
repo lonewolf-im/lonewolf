@@ -974,6 +974,7 @@ dependencies = [
  "futures-util",
  "lonewolf-admin",
  "lonewolf-storage",
+ "lonewolf-util",
  "nix",
  "serde",
  "tempfile",
@@ -1001,11 +1002,16 @@ dependencies = [
 name = "lonewolf-util"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "async-lock",
  "blocking",
+ "compio",
  "crossbeam-queue",
  "crossbeam-utils",
+ "futures-channel",
  "futures-executor",
+ "futures-util",
+ "nix",
 ]
 
 [[package]]

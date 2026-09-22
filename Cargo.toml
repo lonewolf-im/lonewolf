@@ -17,6 +17,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+async-channel = "2.5.0"
 async-lock = "3.4.2"
 axum = { version = "0.8.9", default-features = false }
 base64 = "0.22.1"

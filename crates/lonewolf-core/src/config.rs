@@ -115,7 +115,10 @@ impl XmppConfig {
         Ok(())
     }
 
-    pub(crate) fn stanza_pool_config(&self) -> Result<PoolConfig, PoolError> {
+    pub(crate) fn stanza_pool_config(
+        &self,
+        worker_count: NonZeroUsize,
+    ) -> Result<PoolConfig, PoolError> {
         let total_bytes = self
             .stanza_pool_size_mib
             .checked_mul(MEBIBYTE)
@@ -123,7 +126,7 @@ impl XmppConfig {
             .ok_or(PoolError::InvalidConfiguration)?;
         Ok(PoolConfig {
             total_bytes,
-            ..PoolConfig::default()
+            shards_per_bucket: worker_count,
         })
     }
 }
@@ -304,5 +307,23 @@ impl Error for ConfigError {
             Self::Parse { source, .. } => Some(source),
             Self::Invalid { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::num::NonZeroUsize;
+
+    use super::XmppConfig;
+
+    #[test]
+    fn stanza_pool_shard_count_matches_worker_count() -> Result<(), Box<dyn Error>> {
+        let worker_count = NonZeroUsize::new(3).ok_or("worker count must be nonzero")?;
+
+        let config = XmppConfig::default().stanza_pool_config(worker_count)?;
+
+        assert_eq!(config.shards_per_bucket, worker_count);
+        Ok(())
     }
 }

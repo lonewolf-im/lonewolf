@@ -74,13 +74,14 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
         PooledChunkAllocator::try_new(
             config
                 .xmpp
-                .stanza_pool_config()
+                .stanza_pool_config(worker_count)
                 .map_err(RunError::StanzaPool)?,
         )
         .map_err(RunError::StanzaPool)?,
     );
     tracing::info!(
         reserved_bytes = stanza_pool.config().total_bytes.get(),
+        shards_per_bucket = stanza_pool.config().shards_per_bucket.get(),
         "stanza arena pool initialized"
     );
 

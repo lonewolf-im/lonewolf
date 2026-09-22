@@ -149,7 +149,9 @@ path = "accounts.redb"
     assert!(!path.exists());
     let logs = fs::read_to_string(log_path)?;
     assert!(logs.lines().any(|line| {
-        line.contains("stanza arena pool initialized") && line.contains("reserved_bytes=8388608")
+        line.contains("stanza arena pool initialized")
+            && line.contains("reserved_bytes=8388608")
+            && line.contains("shards_per_bucket=1")
     }));
     assert!(logs.lines().any(|line| line.contains("core dispatcher started") && line.contains("worker_count=1")));
     assert!(logs.contains("core dispatcher stopped"));

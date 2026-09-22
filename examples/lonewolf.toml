@@ -32,12 +32,6 @@
 # where Lonewolf was launched.
 # path = "./data/lonewolf.dat"
 
-# [account]
-
-# Choose where Lonewolf stores account records and credentials.
-# Leave this unset to use the default store. The value below is an example.
-# storage = "primary"
-
 # [admin]
 
 # Enable the local HTTP API used to manage accounts.
@@ -49,3 +43,9 @@
 # Lonewolf will not replace an existing file at this path. The parent directory
 # must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
+
+# [account]
+
+# Choose where Lonewolf stores account records and credentials.
+# Leave this unset to use the default store. The value below is an example.
+# storage = "primary"

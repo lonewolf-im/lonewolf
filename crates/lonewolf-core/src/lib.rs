@@ -10,11 +10,13 @@ use std::env;
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
+use lonewolf_util::pool::PooledChunkAllocator;
 
 pub mod config;
 mod error;
@@ -47,9 +49,10 @@ pub struct BuildInfo {
 ///
 /// Returns [`RunError::Config`] for invalid configuration or
 /// [`RunError::WorkerCount`] if worker count selection fails. Startup failures
-/// identify logging, runtime, dispatcher, storage, or admin initialization in
-/// [`RunError`]. Signal and worker shutdown failures also return [`RunError`].
-/// If service execution and worker shutdown both fail, the service error wins.
+/// identify logging, stanza pool, runtime, dispatcher, storage, or admin
+/// initialization in [`RunError`]. Signal and worker shutdown failures also
+/// return [`RunError`]. If service execution and worker shutdown both fail, the
+/// service error wins.
 ///
 /// # Panics
 ///
@@ -66,6 +69,19 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
         branch = build.branch,
         commit = build.commit,
         "lonewolf is starting..."
+    );
+    let stanza_pool = Arc::new(
+        PooledChunkAllocator::try_new(
+            config
+                .xmpp
+                .stanza_pool_config(worker_count)
+                .map_err(RunError::StanzaPool)?,
+        )
+        .map_err(RunError::StanzaPool)?,
+    );
+    tracing::info!(
+        reserved_bytes = stanza_pool.config().total_bytes.get(),
+        "stanza arena pool initialized"
     );
 
     {

@@ -46,6 +46,8 @@ fn configured_account_store_logs_route_templates_and_sigterm_cleans_up() -> Test
         r#"
 [logging]
 level = "debug"
+[xmpp]
+stanza_pool_size_mib = 8
 [admin]
 socket_path = "private/admin.sock"
 [account]
@@ -146,6 +148,9 @@ path = "accounts.redb"
     }
     assert!(!path.exists());
     let logs = fs::read_to_string(log_path)?;
+    assert!(logs.lines().any(|line| {
+        line.contains("stanza arena pool initialized") && line.contains("reserved_bytes=8388608")
+    }));
     assert!(logs.lines().any(|line| line.contains("core dispatcher started") && line.contains("worker_count=1")));
     assert!(logs.contains("core dispatcher stopped"));
     let mut events = logs
@@ -171,7 +176,7 @@ fn occupied_socket_path_fails_startup_without_overwriting_it() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("lonewolf.toml"),
-        "[admin]\nsocket_path = 'admin.sock'\n",
+        "[xmpp]\nstanza_pool_size_mib = 8\n[admin]\nsocket_path = 'admin.sock'\n",
     )?;
     fs::write(directory.path().join("admin.sock"), "keep")?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))

@@ -27,6 +27,11 @@ fn admin_defaults_are_enabled_on_a_unix_socket() {
 }
 
 #[test]
+fn xmpp_defaults_reserve_256_mib_for_stanza_arenas() {
+    assert_eq!(Config::default().xmpp.stanza_pool_size_mib, 256);
+}
+
+#[test]
 fn omitted_settings_use_defaults() -> TestResult {
     for contents in [
         "",
@@ -39,10 +44,50 @@ fn omitted_settings_use_defaults() -> TestResult {
         "[logging]",
         "storage = {}",
         "[storage]",
+        "xmpp = {}",
+        "[xmpp]",
     ] {
         let file = config_file(contents)?;
         assert_eq!(Config::load(Some(file.path()))?, Config::default());
     }
+    Ok(())
+}
+
+#[test]
+fn valid_stanza_pool_sizes_override_the_default() -> TestResult {
+    for size_mib in [8, 16, 128, 1024] {
+        let file = config_file(&format!("[xmpp]\nstanza_pool_size_mib = {size_mib}\n"))?;
+        assert_eq!(
+            Config::load(Some(file.path()))?.xmpp.stanza_pool_size_mib,
+            size_mib
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stanza_pool_size_requires_a_power_of_two_of_at_least_8_mib() -> TestResult {
+    for size_mib in [0, 1, 7, 9, 12, 255, 257] {
+        let file = config_file(&format!("[xmpp]\nstanza_pool_size_mib = {size_mib}\n"))?;
+        let error = Config::load(Some(file.path())).expect_err("invalid stanza pool size");
+        assert!(matches!(error, ConfigError::Invalid { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("must be a power of two of at least 8 MiB")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stanza_pool_size_must_fit_the_platform_address_space() -> TestResult {
+    let size_mib = 1_usize << (usize::BITS - 2);
+    let file = config_file(&format!("[xmpp]\nstanza_pool_size_mib = {size_mib}\n"))?;
+    let error = Config::load(Some(file.path())).expect_err("stanza pool size must fit");
+
+    assert!(matches!(error, ConfigError::Invalid { .. }));
+    assert!(error.to_string().contains("is too large for this platform"));
     Ok(())
 }
 
@@ -253,6 +298,10 @@ fn invalid_configuration_is_rejected() -> TestResult {
         "[storage.stores.primary]\npath = 'db.redb'",
         "[storage.stores.primary]\nbackend = 'redb'\npath = 'db.redb'\nunknown = true",
         "[storage.stores.primary]\nbackend = 'redb'\npath = 1",
+        "[xmpp]\nstanza_pool_size_mb = 256",
+        "[xmpp]\nstanza_pool_size_mib = '256'",
+        "[xmpp]\nstanza_pool_size_mib = -1",
+        "[xmpp]\nstanza_pool_size_mib = 1.5",
     ] {
         let file = config_file(contents)?;
         let error = Config::load(Some(file.path())).expect_err(contents);

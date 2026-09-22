@@ -102,6 +102,8 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - When adding, removing, or renaming a key, update this reference in the same change. Also update it when a key's type, default, accepted values, or behavior changes.
 - Keep all section headers and value assignments commented out. The unchanged reference must load with built-in defaults.
 - Document only the purpose and non-obvious value constraints, formats, or units needed to configure each key. Apply the brevity rules in section 3.
+- Write comments for operators in natural, complete sentences. Start with what the setting controls and when an operator should change it, then state only the non-obvious constraints or operational effects.
+- Avoid validator-style fragments such as "Must name", "Required and nonempty", or "Accepts". Use operator-facing language instead of parser or implementation terms when possible.
 - Show each default in its commented assignment; do not repeat it in prose. If a key has no default, mark its example value and state when the key is required.
 - Keep configuration-reference tests consistent with the reference file.
 

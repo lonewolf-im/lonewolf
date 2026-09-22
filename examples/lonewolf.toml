@@ -1,47 +1,51 @@
-# Copy this file to lonewolf.toml and uncomment the sections and values you need.
-# Omitted settings use their defaults.
-# Values below are defaults unless marked as examples.
+# Copy this file to lonewolf.toml and uncomment the settings you want to change.
+# The values shown are the defaults unless a comment identifies an example.
 
 # [logging]
 
-# Most verbose level written to standard error.
-# Accepted values: "off", "error", "warn", "info", "debug", "trace".
+# Choose how much detail Lonewolf writes to standard error.
+# Use "off", "error", "warn", "info", "debug", or "trace".
 # level = "info"
+
+# [xmpp]
+
+# Reserve memory for reusing chunks while parsing and building stanzas.
+# Choose a power of two of at least 8 MiB. Lonewolf can use additional heap
+# memory when the pool is exhausted.
+# stanza_pool_size_mib = 256
 
 # [storage]
 
-# Store used by components that do not select their own store.
-# Must name a defined store. Required when more than one store is defined.
-# Omit to select the only store.
+# Choose the store Lonewolf uses by default.
+# You only need this setting when you configure more than one store.
 # default = "primary"
 
-# Define each store once under storage.stores.<name>. Names must not be empty.
-# Omit all store definitions to use the primary store shown below.
-# Explicit store definitions replace the built-in store list.
+# Add one section for each database and replace "primary" with a unique name.
+# Without any store sections, Lonewolf uses the "primary" store shown below.
+# Defining a store replaces that built-in store.
 # [storage.stores.primary]
 
-# Storage engine, required for each explicit store. Accepts "redb".
+# Choose the database engine for this store. Lonewolf currently supports Redb.
 # backend = "redb"
 
-# Database file, required and nonempty for each explicit store.
-# Relative paths use the process working directory.
+# Choose where Redb keeps this database. Relative paths start from the directory
+# where Lonewolf was launched.
 # path = "./data/lonewolf.dat"
-
-# [account]
-
-# Store for account metadata and credentials; must name a defined store.
-# Omit to inherit storage.default. The value below is an example.
-# storage = "primary"
 
 # [admin]
 
-# Serves the account administration HTTP API over a Unix socket.
-# Socket permissions control access; the API has no separate authentication.
+# Enable the local HTTP API used to manage accounts.
+# Access is controlled only by the Unix socket permissions.
 # enabled = true
 
-# Socket file for local administration clients.
-# Must be nonempty and must not already exist when the API starts.
-# Relative paths use the process working directory.
-# The parent directory must belong to the user running Lonewolf and allow
-# no group or other access.
+# Choose where Lonewolf creates the administration socket. Relative paths start
+# from the directory where Lonewolf was launched.
+# Lonewolf will not replace an existing file at this path. The parent directory
+# must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
+
+# [account]
+
+# Choose where Lonewolf stores account records and credentials.
+# Leave this unset to use the default store. The value below is an example.
+# storage = "primary"

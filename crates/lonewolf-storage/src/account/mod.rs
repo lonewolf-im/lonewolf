@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Separates account metadata from credentials and defines atomic mutations.
+
 pub mod redb;
 
 use std::error::Error;
@@ -34,30 +36,62 @@ pub enum AccountError {
 }
 
 pub trait AccountRepository: Send + Sync {
+    /// Creates the account and its credentials atomically without replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::AlreadyExists`] if the key exists, or
+    /// [`AccountError::Storage`] if storage fails.
     fn create(&self, account: NewAccount) -> impl Future<Output = Result<(), AccountError>> + Send;
 
+    /// Returns `None` if the account is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::Storage`] if storage fails.
     fn get(
         &self,
         key: &AccountKey,
     ) -> impl Future<Output = Result<Option<Account>, AccountError>> + Send;
 
-    /// Reads one account on demand in ascending canonical key order after an exclusive cursor.
-    /// The cursor need not exist. Holds one snapshot from the first read until end or drop.
-    /// Yields the first error, then ends.
+    /// Reads accounts on demand in ascending canonical key order.
+    ///
+    /// The cursor is exclusive and need not exist. The stream holds one
+    /// snapshot from its first read until it ends or is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Yields [`AccountError::Storage`] on the first storage failure, then ends.
     fn list(
         &self,
         after: Option<AccountKey>,
     ) -> impl Stream<Item = Result<Account, AccountError>> + Send;
 
-    /// Removes the account and all credentials atomically. Fails if the account is absent.
+    /// Removes the account and all credentials atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::NotFound`] if the account is absent, or
+    /// [`AccountError::Storage`] if storage fails.
     fn delete(&self, key: &AccountKey) -> impl Future<Output = Result<(), AccountError>> + Send;
 
+    /// Returns `None` if the account or the requested hash is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::Storage`] if storage fails.
     fn get_scram(
         &self,
         key: &AccountKey,
         hash: ScramHash,
     ) -> impl Future<Output = Result<Option<ScramVerifier>, AccountError>> + Send;
 
+    /// Replaces all credentials atomically, removing any omitted hashes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::NotFound`] if the account is absent, or
+    /// [`AccountError::Storage`] if storage fails.
     fn replace_credentials(
         &self,
         key: &AccountKey,

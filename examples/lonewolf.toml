@@ -1,13 +1,16 @@
 # Copy this file to lonewolf.toml and uncomment the sections and values you need.
-# Omitted settings use their defaults. Values below are defaults unless marked as examples.
+# Omitted settings use their defaults.
+# Values below are defaults unless marked as examples.
 
 # [logging]
 
+# Most verbose level written to standard error.
 # Accepted values: "off", "error", "warn", "info", "debug", "trace".
 # level = "info"
 
 # [storage]
 
+# Store used by components that do not select their own store.
 # Must name a defined store. Required when more than one store is defined.
 # Omit to select the only store.
 # default = "primary"
@@ -17,20 +20,28 @@
 # Explicit store definitions replace the built-in store list.
 # [storage.stores.primary]
 
-# Required for each explicit store. Only "redb" is supported.
+# Storage engine, required for each explicit store. Accepts "redb".
 # backend = "redb"
 
-# Required and nonempty for explicit stores. Relative paths use the working directory.
+# Database file, required and nonempty for each explicit store.
+# Relative paths use the process working directory.
 # path = "./data/lonewolf.dat"
 
 # [account]
 
+# Store for account metadata and credentials; must name a defined store.
 # Omit to inherit storage.default. The value below is an example.
 # storage = "primary"
 
 # [admin]
 
+# Serves the account administration HTTP API over a Unix socket.
+# Socket permissions control access; the API has no separate authentication.
 # enabled = true
 
-# Relative paths use the working directory.
+# Socket file for local administration clients.
+# Must be nonempty and must not already exist when the API starts.
+# Relative paths use the process working directory.
+# The parent directory must belong to the user running Lonewolf and allow
+# no group or other access.
 # socket_path = "./run/lonewolf/admin.sock"

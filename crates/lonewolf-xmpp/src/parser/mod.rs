@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Parses UTF-8 XML 1.0 streams with XMPP restrictions and bounded event sizes.
+//!
+//! Each parsed value owns a separate arena and can outlive the parser.
+
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -23,22 +27,28 @@ mod names;
 
 use input::{InputLimit, LimitedReader};
 
+/// Applies separately to the XML declaration, stream header, and stream footer.
 pub const MAX_STREAM_HEADER_BYTES: usize = 16 * 1024;
+/// Includes namespace declarations in the per-element count.
 pub const MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ParserConfig {
-    /// Wire bytes per top-level element, including markup. Excludes stream whitespace.
+    /// Counts wire bytes per top-level element, including markup.
+    /// Excludes stream whitespace.
     pub max_stanza_bytes: NonZeroUsize,
+    /// Applies per parsed value, excluding parser scratch buffers.
     pub arena: ArenaConfig,
 }
 
+/// Keeps a parsed handle and its backing arena together.
 pub struct Parsed<T, A: ChunkAllocator> {
     value: T,
     arena: Arena<A>,
 }
 
 impl<T: Copy, A: ChunkAllocator> Parsed<T, A> {
+    /// Copies the handle without retaining the arena.
     pub fn value(&self) -> T {
         self.value
     }
@@ -53,6 +63,7 @@ impl<T: Copy, A: ChunkAllocator> Parsed<T, A> {
 }
 
 pub enum StreamEvent<A: ChunkAllocator> {
+    /// Contains only the opening element and its attributes, with no children.
     StreamStart(Parsed<Element, A>),
     Stanza(Parsed<Stanza, A>),
     Element(Parsed<Element, A>),
@@ -96,7 +107,7 @@ enum Phase {
     Closed,
 }
 
-/// The pinned adapter retains receive buffers and runs on the caller's executor.
+/// Retains receive buffers and runs on the caller's executor.
 pub fn compio_reader<R: compio_io::AsyncRead + Unpin + 'static>(
     reader: Pin<&mut AsyncReadStream<R>>,
 ) -> Compat<Pin<&mut AsyncReadStream<R>>> {
@@ -119,7 +130,14 @@ impl<R, A: ChunkAllocator> XmlStreamParser<R, A> {
         }
     }
 
-    /// Keeps unread transport bytes. Call only between completed stream events.
+    /// Resets stream context while preserving unread transport bytes.
+    ///
+    /// Requires an open stream between completed events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::ParserFailed`] after a failed or cancelled read.
+    /// Returns [`ParseError::UnexpectedEvent`] if the stream is not open.
     pub fn restart(mut self) -> Result<Self, ParseError> {
         if self.failed {
             return Err(ParseError::ParserFailed);
@@ -136,14 +154,25 @@ impl<R, A: ChunkAllocator> XmlStreamParser<R, A> {
         Ok(self)
     }
 
-    /// Returns the buffered transport, including bytes beyond the last completed event.
+    /// Preserves buffered transport bytes beyond the last completed event.
     pub fn into_inner(self) -> R {
         self.reader.into_inner().inner
     }
 }
 
 impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmlStreamParser<R, A> {
-    /// An error or a cancelled read makes this parser unusable. Partial arenas are dropped.
+    /// Returns `None` only after [`StreamEvent::StreamEnd`].
+    ///
+    /// An error or cancellation after the first poll makes the parser unusable.
+    /// The incomplete event's arena is dropped in either case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::ParserFailed`] after a failed or cancelled read.
+    /// Input violations return the matching [`ParseError`] variant;
+    /// transport errors use [`ParseError::Xml`], and arena or stanza validation
+    /// failures use [`ParseError::Build`]. EOF before the stream footer returns
+    /// [`ParseError::UnexpectedEof`].
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, ParseError> {
         if self.failed {
             return Err(ParseError::ParserFailed);
@@ -151,6 +180,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmlStreamParser<R, A> {
         if self.phase == Phase::Closed {
             return Ok(None);
         }
+        // Cancellation skips cleanup below, so failure must be recorded before awaiting.
         self.failed = true;
         let mut scratch = std::mem::take(&mut self.scratch);
         let result = self.read_next(&mut scratch).await;

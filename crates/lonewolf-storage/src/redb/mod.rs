@@ -19,6 +19,8 @@ pub(crate) use error::{commit_error, storage_error};
 pub(crate) const METADATA: TableDefinition<&str, u32> = TableDefinition::new("lonewolf_metadata");
 
 /// Clones share limits of 32 submitted reads and one submitted write.
+///
+/// Each [`Self::new`] call creates independent admission limits.
 #[derive(Clone)]
 pub struct RedbDatabase {
     database: Arc<Database>,
@@ -36,6 +38,17 @@ impl RedbDatabase {
     }
 
     /// Opens or creates the database synchronously.
+    ///
+    /// New files use mode 0600, subject to the process umask. Existing file
+    /// permissions are unchanged, and parent directories must exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::StorageErrorKind::Unavailable`] if the file cannot be
+    /// opened or is already locked. Invalid databases can return
+    /// [`crate::StorageErrorKind::CorruptData`] or
+    /// [`crate::StorageErrorKind::UnsupportedVersion`]. Other backend failures
+    /// return [`crate::StorageErrorKind::Other`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);

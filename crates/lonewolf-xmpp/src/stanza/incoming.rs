@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Builds incoming trees while rejecting duplicate extension attributes.
+
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 
 use super::element::ElementFrame;

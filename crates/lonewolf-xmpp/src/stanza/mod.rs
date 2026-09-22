@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Builds immutable stanza trees with all retained data in one arena.
+//!
+//! Builders validate XML structure; protocol handlers validate payload schemas.
+
 use std::fmt;
 
 use lonewolf_util::arena::{Arena, ArenaError, ArenaRead, ChunkAllocator, Handle, HandleError};
@@ -24,7 +28,7 @@ pub const XML_NAMESPACE: &str = xml::XML_NAMESPACE;
 
 /// Includes the root element. Bounds recursive copying and writing.
 pub const MAX_ELEMENT_DEPTH: usize = 128;
-/// Counts each occurrence of a shared subtree, including text nodes and the root.
+/// Counts each subtree occurrence, including text nodes and the root.
 pub const MAX_ELEMENT_NODES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,20 +182,26 @@ struct StanzaData {
     children: StoredSlice<Element>,
 }
 
-/// An immutable, non-owning handle. Keep its arena alive to resolve it.
+/// Holds an immutable stanza without retaining its arena.
 #[derive(Clone, Copy)]
 pub struct Stanza {
     data: Handle<StanzaData>,
 }
 
-/// Views cannot outlive the arena borrow, including after freezing.
+/// Borrows a stanza for no longer than the arena borrow, even after freezing.
 ///
 /// ```compile_fail
 /// use lonewolf_util::arena::{Arena, ArenaConfig};
-/// use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaNamespace, StanzaType};
+/// use lonewolf_xmpp::stanza::{
+///     PresenceType, Stanza, StanzaNamespace, StanzaType,
+/// };
 /// let view = {
 ///     let mut arena = Arena::try_new(ArenaConfig::default()).unwrap();
-///     let stanza = Stanza::builder_in(StanzaType::Presence(PresenceType::Available), StanzaNamespace::Client, &mut arena).build().unwrap();
+///     let stanza = Stanza::builder_in(
+///         StanzaType::Presence(PresenceType::Available),
+///         StanzaNamespace::Client,
+///         &mut arena,
+///     ).build().unwrap();
 ///     stanza.resolve(&arena).unwrap()
 /// };
 /// println!("{:?}", view.kind());
@@ -201,7 +211,9 @@ pub struct StanzaRef<'a, R: ArenaRead> {
     data: &'a StanzaData,
 }
 
-/// All retained storage uses the caller's arena. Failed builds do not reclaim allocations.
+/// Keeps retained storage in the caller's arena, including after failed builds.
+///
+/// Removing or replacing content does not reclaim its arena allocations.
 pub struct StanzaBuilder<'a, A: ChunkAllocator> {
     arena: &'a mut Arena<A>,
     header: Header,
@@ -230,6 +242,11 @@ impl Stanza {
         }
     }
 
+    /// Borrows from the arena that owns this stanza.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] for a different arena.
     pub fn resolve<'a, R: ArenaRead>(&self, arena: &'a R) -> Result<StanzaRef<'a, R>, HandleError> {
         Ok(StanzaRef {
             arena,
@@ -238,6 +255,10 @@ impl Stanza {
     }
 
     /// Shares unchanged storage. Edits do not alter the source stanza.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] unless `arena` owns the source.
     pub fn derive_in<'a, A: ChunkAllocator>(
         &self,
         arena: &'a mut Arena<A>,
@@ -251,7 +272,15 @@ impl Stanza {
         })
     }
 
-    /// Accepts only IQ get/set requests. Preserves the ID, swaps addresses, and clears content.
+    /// Builds an IQ result with the request ID and reversed addresses.
+    ///
+    /// Preserves the namespace and language but drops children and extension
+    /// attributes. All retained data stays in the source arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::NotIqRequest`] unless the source is an IQ request,
+    /// or [`BuildError::Access`] if `arena` does not own the source.
     pub fn reply_in<'a, A: ChunkAllocator>(
         &self,
         arena: &'a mut Arena<A>,
@@ -315,13 +344,19 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
             .transpose()
     }
 
-    /// Yields extension attributes. Common attributes have typed accessors.
+    /// Yields extension attributes in insertion order.
+    ///
+    /// Common attributes use [`Self::from`], [`Self::to`], [`Self::id`],
+    /// [`Self::lang`], and [`Self::stanza_type`].
     pub fn attributes(
         &self,
     ) -> Result<impl Iterator<Item = Result<AttributeRef<'a>, HandleError>> + 'a, HandleError> {
         element::attributes(self.data.attributes, self.arena)
     }
 
+    /// Matches extension attributes by local name and namespace URI.
+    ///
+    /// Common stanza attributes require their typed accessors.
     pub fn attribute(&self, name: &str, namespace: &str) -> Result<Option<&'a str>, HandleError> {
         for value in self.attributes()? {
             let value = value?;
@@ -332,6 +367,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         Ok(None)
     }
 
+    /// Preserves child insertion order.
     pub fn children(
         &self,
     ) -> Result<impl Iterator<Item = Result<ElementRef<'a, R>, HandleError>> + 'a, HandleError>
@@ -345,6 +381,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
             .map(move |child| child.resolve(arena)))
     }
 
+    /// Returns only the first child with this local name and namespace URI.
     pub fn child(
         &self,
         name: &str,
@@ -394,7 +431,13 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         })
     }
 
-    /// Writes explicit namespace declarations. Output failure can leave a partial stanza.
+    /// Writes namespace declarations without requiring an enclosing stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WriteError::Access`] for an unresolved handle or
+    /// [`WriteError::Output`] if the destination rejects a write. Either error
+    /// can leave partial XML in `output`.
     pub fn write_xml(&self, output: &mut impl fmt::Write) -> Result<(), WriteError> {
         let name = self.kind().as_str();
         write!(output, "<{name}")?;
@@ -434,6 +477,11 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         self
     }
 
+    /// Accepts an address from this builder's arena; `None` clears the address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::Access`] if the JID belongs to a different arena.
     pub fn from(mut self, jid: Option<Jid>) -> Result<Self, BuildError> {
         if let Some(jid) = jid {
             jid.resolve(self.arena)?;
@@ -442,6 +490,11 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
+    /// Accepts an address from this builder's arena; `None` clears the address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::Access`] if the JID belongs to a different arena.
     pub fn to(mut self, jid: Option<Jid>) -> Result<Self, BuildError> {
         if let Some(jid) = jid {
             jid.resolve(self.arena)?;
@@ -450,6 +503,13 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
+    /// Copies the ID into the arena; `None` clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::EmptyId`] for an empty string,
+    /// [`BuildError::InvalidText`] for invalid XML characters, or
+    /// [`BuildError::Allocation`] if arena allocation fails.
     pub fn id(mut self, id: Option<&str>) -> Result<Self, BuildError> {
         if id == Some("") {
             return Err(BuildError::EmptyId);
@@ -458,12 +518,28 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
+    /// Copies language text without validating it as a language tag.
+    ///
+    /// `None` removes the attribute; an empty string clears inherited language.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::InvalidText`] for invalid XML characters or
+    /// [`BuildError::Allocation`] if arena allocation fails.
     pub fn lang(mut self, lang: Option<&str>) -> Result<Self, BuildError> {
         self.header.lang = store_text(lang, self.arena)?;
         Ok(self)
     }
 
-    /// Sets an extension attribute. Common stanza attributes use their typed setters.
+    /// Replaces a matching extension attribute without changing its position.
+    ///
+    /// Matches local names and namespace URIs. Common stanza attributes require
+    /// their typed setters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::ReservedAttribute`] for common stanza attributes.
+    /// Other failures follow [`ElementBuilder::attribute`].
     pub fn attribute(
         mut self,
         name: &str,
@@ -477,6 +553,13 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
+    /// Leaves the builder unchanged when no extension attribute matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::ReservedAttribute`] for common stanza attributes,
+    /// [`BuildError::Access`] for an unresolved handle, or
+    /// [`BuildError::Allocation`] if copying shared storage fails.
     pub fn remove_attribute(mut self, name: &str, namespace: &str) -> Result<Self, BuildError> {
         if reserved_attribute(name, namespace) {
             return Err(BuildError::ReservedAttribute);
@@ -485,6 +568,12 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
+    /// Shares the child's storage; the child must belong to this arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::Access`] for a different arena or
+    /// [`BuildError::Allocation`] if the child list cannot grow.
     pub fn child(mut self, child: Element) -> Result<Self, BuildError> {
         child.resolve(self.arena)?;
         self.children.push(child, self.arena)?;
@@ -504,8 +593,17 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         self
     }
 
-    /// Checks IQ child counts, error-child placement, and required IDs and server addresses.
-    /// Payload schemas and language tags require validation by their protocol handlers.
+    /// Validates stanza structure, excluding payload schemas and language tags.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::MissingServerAddresses`] without both server
+    /// addresses, [`BuildError::MissingIqId`] without an IQ ID, or
+    /// [`BuildError::InvalidIqPayload`] for an invalid IQ child count.
+    /// [`BuildError::InvalidErrorPayload`] rejects a missing, unexpected,
+    /// repeated, or non-final error child. Tree limits, unresolved handles, and
+    /// allocation failures return [`BuildError::TreeLimitExceeded`],
+    /// [`BuildError::Access`], and [`BuildError::Allocation`], respectively.
     pub fn build(self) -> Result<Stanza, BuildError> {
         self.validate()?;
         Ok(Stanza {

@@ -4,6 +4,9 @@ use std::fmt;
 
 use lonewolf_xmpp::jid::JidRef;
 
+/// Owns a canonical bare JID with a username, independent of its source arena.
+///
+/// Ordering uses the canonical JID text. [`Debug`](fmt::Debug) omits the JID.
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AccountKey {
     text: Box<str>,
@@ -33,6 +36,8 @@ impl AccountKey {
 impl TryFrom<JidRef<'_>> for AccountKey {
     type Error = AccountKeyError;
 
+    /// Rejects resources with [`AccountKeyError::ResourceNotAllowed`] and
+    /// domain-only JIDs with [`AccountKeyError::MissingUsername`].
     fn try_from(jid: JidRef<'_>) -> Result<Self, Self::Error> {
         if jid.is_full() {
             return Err(AccountKeyError::ResourceNotAllowed);

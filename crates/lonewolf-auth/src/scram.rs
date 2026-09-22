@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Prepares passwords with SASLprep and derives SCRAM verifiers.
+//!
+//! Derivation blocks the caller for the full configured iteration count.
+
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
@@ -17,6 +21,11 @@ pub struct ScramIterations(NonZeroU32);
 impl ScramIterations {
     pub const MIN: u32 = 4096;
 
+    /// Enforces the minimum cost for newly derived verifiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScramError::InvalidIterations`] below [`Self::MIN`].
     pub fn new(iterations: u32) -> Result<Self, ScramError> {
         NonZeroU32::new(iterations)
             .filter(|iterations| iterations.get() >= Self::MIN)
@@ -63,6 +72,9 @@ pub enum ScramHash {
     Sha256,
 }
 
+/// Retains verifier keys without erasing them on drop.
+///
+/// `Debug` hides all fields.
 #[derive(Clone)]
 pub struct ScramVerifierData<const N: usize> {
     salt: [u8; 16],
@@ -75,6 +87,9 @@ pub type ScramSha1Verifier = ScramVerifierData<20>;
 pub type ScramSha256Verifier = ScramVerifierData<32>;
 
 impl<const N: usize> ScramVerifierData<N> {
+    /// Accepts stored values without validating their keys or minimum cost.
+    ///
+    /// Use [`ScramVerifier::generate`] to create credentials from a password.
     pub fn new(
         salt: [u8; 16],
         iterations: NonZeroU32,
@@ -121,6 +136,16 @@ pub enum ScramVerifier {
 }
 
 impl ScramVerifier {
+    /// Derives a verifier with a fresh cryptographic salt.
+    ///
+    /// The password must pass SASLprep and remain nonempty. The caller retains
+    /// responsibility for erasing its password buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScramError::InvalidPassword`] for a rejected password,
+    /// [`ScramError::RandomUnavailable`] if salt generation fails, or
+    /// [`ScramError::DerivationFailed`] if HMAC initialization fails.
     pub fn generate(
         hash: ScramHash,
         password: &str,
@@ -129,6 +154,15 @@ impl ScramVerifier {
         Self::generate_with_salt_source(hash, password, iterations, getrandom::fill)
     }
 
+    /// Derives a verifier using a caller-supplied salt.
+    ///
+    /// Password preparation and ownership follow [`Self::generate`]. New
+    /// credentials need an independently generated cryptographic salt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScramError::InvalidPassword`] for a rejected password or
+    /// [`ScramError::DerivationFailed`] if HMAC initialization fails.
     pub fn derive(
         hash: ScramHash,
         password: &str,
@@ -229,7 +263,7 @@ struct PreparedPassword<'a>(Cow<'a, str>);
 
 impl<'a> PreparedPassword<'a> {
     fn new(password: &'a str) -> Result<Self, ScramError> {
-        // Newer Unicode normalization can map unassigned input to an assigned character.
+        // Normalization can hide code points that SASLprep treats as unassigned.
         if password
             .chars()
             .any(stringprep::tables::unassigned_code_point)

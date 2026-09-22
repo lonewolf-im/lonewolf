@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Limits consumed wire bytes without charging inter-event whitespace.
+
 use std::fmt;
 use std::io;
 use std::pin::Pin;
@@ -69,6 +71,7 @@ impl<R: AsyncBufRead + Unpin> AsyncBufRead for LimitedReader<R> {
             Pin::new(&mut this.inner).consume(whitespace);
             this.whitespace_skipped = true;
             skipped += 1;
+            // Endless stream whitespace must not monopolize the executor.
             if skipped == 64 {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;

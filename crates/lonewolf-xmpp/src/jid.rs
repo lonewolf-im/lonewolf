@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Normalizes JIDs while keeping stored text in caller-owned arenas.
+
 use std::borrow::Cow;
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
@@ -24,10 +26,11 @@ pub const MAX_JID_LEN: usize = 3 * MAX_PART_LEN + 2;
 // NFC combines at most four scalars. Each input scalar uses at most four UTF-8 bytes.
 const MAX_INPUT_PART_LEN: usize = 16 * MAX_PART_LEN;
 
-/// Text is normalized under [RFC 7622]. Resourceparts remain case-sensitive.
-/// Storage uses the caller's arena. Unicode preparation can allocate temporary heap buffers.
-/// Handles do not retain storage. Compare and hash resolved views by their text.
-/// Localpart escaping is not automatic.
+/// Holds normalized [RFC 7622] text without retaining its arena.
+///
+/// Resourceparts remain case-sensitive; localpart escaping is not automatic.
+/// Unicode preparation can allocate temporary heap buffers. [`JidRef`] compares
+/// and hashes normalized text.
 ///
 /// [RFC 7622]: https://www.rfc-editor.org/rfc/rfc7622.html
 #[derive(Clone, Copy)]
@@ -70,12 +73,18 @@ pub enum JidError {
     EmptyPart(JidPart),
     PartTooLong(JidPart),
     InvalidPart(JidPart),
-    /// Temporary Unicode buffer allocation failures are not reported.
+    /// Covers arena allocation only, not temporary Unicode buffers.
     AllocationFailed(ArenaError),
     AccessFailed(HandleError),
 }
 
 impl Jid {
+    /// Normalizes the address before storing it in `arena`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the component errors from [`Self::from_parts_in`], or
+    /// [`JidError::AllocationFailed`] if arena allocation fails.
     pub fn parse_in<A: ChunkAllocator>(
         input: &str,
         arena: &mut Arena<A>,
@@ -89,6 +98,14 @@ impl Jid {
         Self::from_parts_in(localpart, domainpart, resourcepart, arena)
     }
 
+    /// Normalizes components without applying localpart escaping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JidError::EmptyPart`] for an empty supplied component,
+    /// [`JidError::PartTooLong`] for a component above the input or normalized
+    /// byte limit, [`JidError::InvalidPart`] for a rejected component, or
+    /// [`JidError::AllocationFailed`] if arena allocation fails.
     pub fn from_parts_in<A: ChunkAllocator>(
         localpart: Option<&str>,
         domainpart: &str,
@@ -107,8 +124,16 @@ impl Jid {
         )
     }
 
-    /// Requires components validated and normalized by this library before storage.
-    /// Skips Unicode preparation to reuse trusted stored values.
+    /// Reuses components already validated and normalized by this library.
+    ///
+    /// Skips Unicode preparation; callers must not pass untrusted text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JidError::EmptyPart`] or [`JidError::PartTooLong`] for invalid
+    /// component lengths, [`JidError::InvalidPart`] for address separators in
+    /// the localpart or domainpart, or [`JidError::AllocationFailed`] if arena
+    /// allocation fails.
     pub fn from_trusted_parts_in<A: ChunkAllocator>(
         localpart: Option<&str>,
         domainpart: &str,
@@ -119,6 +144,11 @@ impl Jid {
         compose_parts(localpart, domainpart, resourcepart, &mut buffer)?.clone_in(arena)
     }
 
+    /// Borrows text from the arena that owns this handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::WrongArena`] for a different arena.
     pub fn resolve<'arena>(
         &self,
         arena: &'arena impl ArenaRead,
@@ -150,7 +180,13 @@ impl Jid {
         }
     }
 
-    /// Requires the arena that owns the source text. Stores a new value in that arena.
+    /// Normalizes the resourcepart and stores a new JID in the source arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JidError::AccessFailed`] for a different arena, a component
+    /// error for an invalid resourcepart, or [`JidError::AllocationFailed`] if
+    /// arena allocation fails.
     pub fn with_resource_in<A: ChunkAllocator>(
         &self,
         resourcepart: &str,
@@ -208,6 +244,14 @@ impl<'arena> JidRef<'arena> {
         }
     }
 
+    /// Normalizes the resourcepart and copies the JID into `arena`.
+    ///
+    /// The destination can differ from the source arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns a component error for an invalid resourcepart or
+    /// [`JidError::AllocationFailed`] if arena allocation fails.
     pub fn with_resource_in<A: ChunkAllocator>(
         &self,
         resourcepart: &str,
@@ -222,7 +266,11 @@ impl<'arena> JidRef<'arena> {
         )
     }
 
-    /// Only arena allocation failure returns an error.
+    /// Copies normalized text without repeating Unicode preparation.
+    ///
+    /// # Errors
+    ///
+    /// Returns only [`JidError::AllocationFailed`] if arena allocation fails.
     pub fn clone_in<A: ChunkAllocator>(&self, arena: &mut Arena<A>) -> Result<Jid, JidError> {
         Ok(Jid {
             text: arena
@@ -240,14 +288,14 @@ impl<'arena> JidRef<'arena> {
     }
 }
 
-/// Omit address text to prevent disclosure in logs.
+// Omits address text to prevent disclosure in logs.
 impl fmt::Debug for Jid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Jid").finish_non_exhaustive()
     }
 }
 
-/// Omit address text to prevent disclosure in logs.
+// Omits address text to prevent disclosure in logs.
 impl fmt::Debug for JidRef<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("JidRef").finish_non_exhaustive()

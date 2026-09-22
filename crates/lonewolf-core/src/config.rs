@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+//! Loads TOML with defaults and validates references between configuration
+//! sections. Relative paths use the process working directory.
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -11,6 +14,10 @@ use serde::Deserialize;
 
 pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 
+/// Applies defaults during deserialization and rejects unknown fields.
+///
+/// [`Self::load`] also validates store references and nonempty paths; direct
+/// deserialization does not perform those checks.
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -21,8 +28,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// With no path, loads `lonewolf.toml` or uses defaults if that file is absent.
-    /// An explicit path must refer to a readable configuration file.
+    /// Loads the selected file and validates the resulting configuration.
+    ///
+    /// With no path, loads [`DEFAULT_CONFIG_PATH`] or uses defaults if that
+    /// file is absent. An explicit path must refer to a readable file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Read`] for file or UTF-8 errors,
+    /// [`ConfigError::Parse`] for invalid TOML or rejected fields, and
+    /// [`ConfigError::Invalid`] for invalid references or empty names and paths.
     pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
         let selected_path = path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG_PATH));
         let contents = match fs::read_to_string(selected_path) {
@@ -68,6 +83,7 @@ impl Config {
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccountConfig {
+    /// Selects a named store, or the default in [`StorageConfig`] when absent.
     pub storage: Option<String>,
 }
 
@@ -108,7 +124,9 @@ pub enum LogLevel {
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(try_from = "StorageConfigInput")]
 pub struct StorageConfig {
+    /// Must name a configured store; deserialization infers a sole store.
     pub default: String,
+    /// Replaces the built-in store map when present in TOML.
     pub stores: BTreeMap<String, StoreConfig>,
 }
 

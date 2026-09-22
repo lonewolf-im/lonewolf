@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use lonewolf_core::config::{AccountConfig, Config, ConfigError, StoreConfig};
+use lonewolf_core::config::{AccountConfig, Config, ConfigError, StoreConfig, TcpListenerConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -32,6 +32,92 @@ fn xmpp_defaults_reserve_256_mib_for_stanza_arenas() {
 }
 
 #[test]
+fn c2s_defaults_to_one_ipv4_endpoint_on_port_5222() -> TestResult {
+    let config = Config::default();
+    assert_eq!(config.c2s.listeners.len(), 1);
+    assert_eq!(config.c2s.listeners[0].address, "0.0.0.0:5222".parse()?);
+    Ok(())
+}
+
+#[test]
+fn configured_c2s_endpoints_replace_the_default_and_allow_ipv6() -> TestResult {
+    let file = config_file(
+        "[[c2s.listeners]]\naddress = '127.0.0.1:6222'\n[[c2s.listeners]]\naddress = '[::1]:6222'\n",
+    )?;
+    let config = Config::load(Some(file.path()))?;
+    assert_eq!(
+        config.c2s.listeners,
+        vec![
+            TcpListenerConfig {
+                address: "127.0.0.1:6222".parse()?
+            },
+            TcpListenerConfig {
+                address: "[::1]:6222".parse()?
+            },
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_c2s_listener_list_is_rejected() -> TestResult {
+    let file = config_file("[c2s]\nlisteners = []\n")?;
+    let error = Config::load(Some(file.path()))
+        .err()
+        .ok_or("empty listener list accepted")?;
+
+    assert!(matches!(error, ConfigError::Invalid { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("c2s.listeners must define at least one listener")
+    );
+    Ok(())
+}
+
+#[test]
+fn overlapping_c2s_endpoints_are_rejected() -> TestResult {
+    for (first, second) in [
+        ("127.0.0.1:5222", "127.0.0.1:5222"),
+        ("0.0.0.0:5222", "127.0.0.1:5222"),
+        ("127.0.0.1:5222", "0.0.0.0:5222"),
+        ("[::]:5222", "[::1]:5222"),
+        ("[::1]:5222", "[::]:5222"),
+        ("[::1]:5222", "[::1]:5222"),
+    ] {
+        let file = config_file(&format!(
+            "[[c2s.listeners]]\naddress = '{first}'\n[[c2s.listeners]]\naddress = '{second}'\n"
+        ))?;
+        let error = Config::load(Some(file.path()))
+            .err()
+            .ok_or("overlapping endpoints accepted")?;
+        assert!(matches!(error, ConfigError::Invalid { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("c2s.listeners[1] overlaps c2s.listeners[0]")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn distinct_c2s_endpoints_and_automatic_ports_are_valid() -> TestResult {
+    for (first, second) in [
+        ("127.0.0.1:5222", "127.0.0.1:6222"),
+        ("0.0.0.0:5222", "[::]:5222"),
+        ("127.0.0.1:5222", "127.0.0.2:5222"),
+        ("127.0.0.1:0", "127.0.0.1:0"),
+    ] {
+        let file = config_file(&format!(
+            "[[c2s.listeners]]\naddress = '{first}'\n[[c2s.listeners]]\naddress = '{second}'\n"
+        ))?;
+        assert_eq!(Config::load(Some(file.path()))?.c2s.listeners.len(), 2);
+    }
+    Ok(())
+}
+
+#[test]
 fn omitted_settings_use_defaults() -> TestResult {
     for contents in [
         "",
@@ -46,6 +132,9 @@ fn omitted_settings_use_defaults() -> TestResult {
         "[storage]",
         "xmpp = {}",
         "[xmpp]",
+        "c2s = {}",
+        "[c2s]",
+        "[[c2s.listeners]]",
     ] {
         let file = config_file(contents)?;
         assert_eq!(Config::load(Some(file.path()))?, Config::default());
@@ -302,6 +391,15 @@ fn invalid_configuration_is_rejected() -> TestResult {
         "[xmpp]\nstanza_pool_size_mib = '256'",
         "[xmpp]\nstanza_pool_size_mib = -1",
         "[xmpp]\nstanza_pool_size_mib = 1.5",
+        "[c2s]\nlistener = []",
+        "[c2s]\nlisteners = {}",
+        "[[c2s.listeners]]\nadress = '127.0.0.1:5222'",
+        "[[c2s.listeners]]\naddress = 'localhost:5222'",
+        "[[c2s.listeners]]\naddress = '127.0.0.1'",
+        "[[c2s.listeners]]\naddress = '127.0.0.1:65536'",
+        "[[c2s.listeners]]\naddress = '::1:5222'",
+        "[[c2s.listeners]]\naddress = 5222",
+        "[[c2s.listeners]]\ntransport = 'udp'",
     ] {
         let file = config_file(contents)?;
         let error = Config::load(Some(file.path())).expect_err(contents);

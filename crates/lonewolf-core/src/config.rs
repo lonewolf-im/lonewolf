@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loads TOML with defaults and validates references between configuration
-//! sections. Relative paths use the process working directory.
+//! Relative configuration paths use the process working directory.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
@@ -19,21 +19,19 @@ const MEBIBYTE: usize = 1024 * 1024;
 
 /// Applies defaults during deserialization and rejects unknown fields.
 ///
-/// [`Self::load`] also validates store references and nonempty paths; direct
-/// deserialization does not perform those checks.
+/// [`Self::load`] also validates value constraints; direct deserialization does not.
 #[derive(Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub logging: LoggingConfig,
     pub xmpp: XmppConfig,
+    pub c2s: C2sConfig,
     pub storage: StorageConfig,
     pub account: AccountConfig,
     pub admin: AdminConfig,
 }
 
 impl Config {
-    /// Loads the selected file and validates the resulting configuration.
-    ///
     /// With no path, loads [`DEFAULT_CONFIG_PATH`] or uses defaults if that
     /// file is absent. An explicit path must refer to a readable file.
     ///
@@ -70,6 +68,7 @@ impl Config {
 
     fn validate(&self) -> Result<(), String> {
         self.xmpp.validate()?;
+        self.c2s.validate()?;
         self.storage.validate()?;
         if self.admin.socket_path.as_os_str().is_empty() {
             return Err("admin.socket_path must not be empty".into());
@@ -82,6 +81,64 @@ impl Config {
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct C2sConfig {
+    /// Replaces the default endpoint and must contain at least one listener.
+    pub listeners: Vec<TcpListenerConfig>,
+}
+
+impl Default for C2sConfig {
+    fn default() -> Self {
+        Self {
+            listeners: vec![TcpListenerConfig::default()],
+        }
+    }
+}
+
+impl C2sConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.listeners.is_empty() {
+            return Err("c2s.listeners must define at least one listener".into());
+        }
+        for (index, listener) in self.listeners.iter().enumerate() {
+            let address = listener.address;
+            if address.port() == 0 {
+                continue;
+            }
+            for (previous, other) in self.listeners[..index].iter().enumerate() {
+                let other = other.address;
+                if address.port() == other.port()
+                    && address.is_ipv4() == other.is_ipv4()
+                    && (address == other
+                        || address.ip().is_unspecified()
+                        || other.ip().is_unspecified())
+                {
+                    return Err(format!(
+                        "c2s.listeners[{index}] overlaps c2s.listeners[{previous}]"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpListenerConfig {
+    /// IPv6 addresses accept IPv6 only; port zero selects one port for all workers.
+    pub address: SocketAddr,
+}
+
+impl Default for TcpListenerConfig {
+    fn default() -> Self {
+        Self {
+            address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5222)),
+        }
     }
 }
 

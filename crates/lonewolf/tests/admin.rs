@@ -48,6 +48,8 @@ fn configured_account_store_logs_route_templates_and_sigterm_cleans_up() -> Test
 level = "debug"
 [xmpp]
 stanza_pool_size_mib = 8
+[[c2s.listeners]]
+address = "127.0.0.1:0"
 [admin]
 socket_path = "private/admin.sock"
 [account]
@@ -155,12 +157,16 @@ path = "accounts.redb"
     let waiting = logs
         .find("waiting for stop signal... (press Ctrl+C to stop the server)")
         .ok_or("missing wait log")?;
+    let admin_started = logs
+        .find("admin service started")
+        .ok_or("missing admin start log")?;
     let received = logs
         .find("received stop signal... gracefully shutting down...")
         .ok_or("missing stop signal log")?;
     let dispatcher_stopped = logs
         .find("core dispatcher stopped")
         .ok_or("missing dispatcher stop log")?;
+    assert!(admin_started < waiting);
     assert!(waiting < received);
     assert!(received < dispatcher_stopped);
     let mut events = logs
@@ -186,7 +192,7 @@ fn occupied_socket_path_fails_startup_without_overwriting_it() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("lonewolf.toml"),
-        "[xmpp]\nstanza_pool_size_mib = 8\n[admin]\nsocket_path = 'admin.sock'\n",
+        "[xmpp]\nstanza_pool_size_mib = 8\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[admin]\nsocket_path = 'admin.sock'\n",
     )?;
     fs::write(directory.path().join("admin.sock"), "keep")?;
     let output = Command::new(env!("CARGO_BIN_EXE_lonewolf"))

@@ -81,7 +81,6 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     );
     tracing::info!(
         reserved_bytes = stanza_pool.config().total_bytes.get(),
-        shards_per_bucket = stanza_pool.config().shards_per_bucket.get(),
         "stanza arena pool initialized"
     );
 

@@ -121,13 +121,13 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                 .shutdown(WORKER_SHUTDOWN_GRACE)
                 .await
                 .map_err(RunError::DispatcherShutdown);
-            if stopped.is_ok() {
-                tracing::info!("core dispatcher stopped");
-            }
             let listeners_stopped = match listeners {
                 Some(mut listeners) => listeners.join().await.map_err(RunError::C2s),
                 None => Ok(()),
             };
+            if stopped.is_ok() {
+                tracing::info!("core dispatcher stopped");
+            }
             result.and(stopped).and(listeners_stopped)
         })?;
     }
@@ -161,9 +161,9 @@ async fn run_services(
                 Either::Right((error, _)) => Err(RunError::C2s(error)),
             }
         };
-        match select(pin!(shutdown), admin.as_mut()).await {
-            Either::Left((result, _)) => Either::Left(result),
-            Either::Right((result, _)) => Either::Right(result),
+        match select(admin.as_mut(), pin!(shutdown)).await {
+            Either::Left((result, _)) => Either::Right(result),
+            Either::Right((result, _)) => Either::Left(result),
         }
     };
     listeners.stop();

@@ -157,12 +157,16 @@ path = "accounts.redb"
     let waiting = logs
         .find("waiting for stop signal... (press Ctrl+C to stop the server)")
         .ok_or("missing wait log")?;
+    let admin_started = logs
+        .find("admin service started")
+        .ok_or("missing admin start log")?;
     let received = logs
         .find("received stop signal... gracefully shutting down...")
         .ok_or("missing stop signal log")?;
     let dispatcher_stopped = logs
         .find("core dispatcher stopped")
         .ok_or("missing dispatcher stop log")?;
+    assert!(admin_started < waiting);
     assert!(waiting < received);
     assert!(received < dispatcher_stopped);
     let mut events = logs

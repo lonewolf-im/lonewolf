@@ -101,6 +101,13 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
         workers,
     )?;
     let logs = server.ready(2)?;
+    let admin_started = logs
+        .find("admin service started")
+        .ok_or("missing admin start log")?;
+    let waiting = logs
+        .find("waiting for stop signal")
+        .ok_or("missing wait log")?;
+    assert!(admin_started < waiting);
     let mut ports = [0_u16; 2];
     for line in logs
         .lines()
@@ -109,6 +116,7 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
         assert!(line.contains(" INFO "));
         assert_eq!(field(line, "worker_count=")?, workers);
         assert!(!line.contains("worker_id="));
+        assert!(logs.find(line).ok_or("missing listener start log")? < waiting);
         let listener = field(line, "listener_id=")?;
         assert!(listener < 2);
         assert_eq!(ports[listener], 0);
@@ -154,6 +162,25 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
         logs.matches("c2s TCP worker listener stopped").count(),
         2 * workers
     );
+    let workers_stopped = logs
+        .rfind("c2s TCP worker listener stopped")
+        .ok_or("missing worker stop log")?;
+    let dispatcher_stopped = logs
+        .find("core dispatcher stopped")
+        .ok_or("missing dispatcher stop log")?;
+    let mut stopped_listeners = std::collections::BTreeSet::new();
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP listener stopped"))
+    {
+        let offset = logs.find(line).ok_or("missing listener stop log")?;
+        assert!(line.contains(" INFO "));
+        assert!(workers_stopped < offset);
+        assert!(offset < dispatcher_stopped);
+        assert_eq!(field(line, "worker_count=")?, workers);
+        assert!(stopped_listeners.insert(field(line, "listener_id=")?));
+    }
+    assert_eq!(stopped_listeners, std::collections::BTreeSet::from([0, 1]));
     assert_eq!(logs.matches("c2s connection closed").count(), 32);
     assert!(logs.contains("core dispatcher stopped"));
     assert!(!logs.contains("127.0.0.1"));
@@ -180,6 +207,14 @@ fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
     server.stop(Signal::SIGINT)?;
     let logs = server.logs()?;
     assert_eq!(logs.matches("c2s TCP listener started").count(), 1);
+    let stopped = logs
+        .lines()
+        .find(|line| line.contains("c2s TCP listener stopped"))
+        .ok_or("missing listener stop log")?;
+    assert!(stopped.contains(" INFO "));
+    assert_eq!(field(stopped, "worker_count=")?, workers);
+    assert_eq!(field(stopped, "listener_id=")?, 0);
+    assert_eq!(logs.matches("c2s TCP listener stopped").count(), 1);
     assert!(!logs.contains("c2s TCP worker listener"));
     assert!(!logs.contains("worker_id="));
     assert!(logs.contains("core dispatcher stopped"));

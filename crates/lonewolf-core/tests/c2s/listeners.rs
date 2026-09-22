@@ -165,6 +165,8 @@ fn listener_failures_reach_the_supervisor() -> TestResult {
         let mut listeners = Listeners {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
+            listener_count: 0,
+            worker_count: dispatcher.handle().worker_count(),
         };
         listeners.tasks.push(
             dispatcher

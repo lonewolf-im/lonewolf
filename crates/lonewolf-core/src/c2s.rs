@@ -25,6 +25,8 @@ type Stop = Shared<BoxFuture<'static, ()>>;
 pub(crate) struct Listeners {
     stop: Option<oneshot::Sender<()>>,
     tasks: FuturesUnordered<Task<io::Result<()>>>,
+    listener_count: usize,
+    worker_count: usize,
 }
 
 impl Listeners {
@@ -38,6 +40,8 @@ impl Listeners {
         let listeners = Self {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
+            listener_count: config.listeners.len(),
+            worker_count: dispatcher.worker_count(),
         };
         for (listener_id, config) in config.listeners.iter().enumerate() {
             let mut address = config.address;
@@ -97,6 +101,13 @@ impl Listeners {
         let mut result = Ok(());
         while let Some(task) = self.tasks.next().await {
             result = result.and(task.map_err(io::Error::other).and_then(|result| result));
+        }
+        for listener_id in 0..std::mem::take(&mut self.listener_count) {
+            tracing::info!(
+                listener_id,
+                worker_count = self.worker_count,
+                "c2s TCP listener stopped"
+            );
         }
         result
     }

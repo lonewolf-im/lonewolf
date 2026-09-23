@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::{pending, poll_fn};
+use std::future::pending;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use compio::io::AsyncRead;
 use compio::net::{TcpListener, TcpSocket, TcpStream};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use nix::errno::Errno;
 use socket2::SockRef;
@@ -23,13 +22,14 @@ use crate::config::limits::C2sLimits;
 
 mod attempt_limit;
 mod connection_limit;
+mod stream;
 
 use attempt_limit::{Admission, AttemptLimiter};
-use connection_limit::{ConnectionAdmission, ConnectionLimiter, ConnectionPermit};
+use connection_limit::{ConnectionAdmission, ConnectionLimiter};
+use stream::{StreamSettings, XmppStream};
 
 const BACKLOG: i32 = 128;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
-const READ_BUFFER_BYTES: usize = 1_024;
 
 type Stop = Shared<BoxFuture<'static, ()>>;
 
@@ -41,10 +41,11 @@ pub(crate) struct Listeners {
 }
 
 impl Listeners {
-    pub(crate) async fn start(
+    pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &C2sConfig,
         limits: &C2sLimits,
         dispatcher: &DispatchHandle,
+        allocator: A,
     ) -> io::Result<Self> {
         let (stop, stopped) = oneshot::channel();
         let stopped = async move {
@@ -69,12 +70,14 @@ impl Listeners {
             let attempts = Arc::new(AttemptLimiter::new(&profile.connection_attempts_per_ip));
             let connections =
                 Arc::new(ConnectionLimiter::new(profile.max_connections_per_ip.get()));
+            let max_stanza_bytes = profile.max_stanza_bytes;
             let mut address = config.address;
             for worker_id in 0..dispatcher.worker_count() {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
                 let attempts = Arc::clone(&attempts);
                 let connections = Arc::clone(&connections);
+                let settings = StreamSettings::new(max_stanza_bytes, allocator.clone());
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
                         let result = async {
@@ -90,6 +93,7 @@ impl Listeners {
                                 listener_id,
                                 attempts,
                                 connections,
+                                settings,
                             )
                             .await
                         }
@@ -162,13 +166,14 @@ async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(BACKLOG).await
 }
 
-async fn run_listener(
+async fn run_listener<A: ChunkAllocator + Clone>(
     listener: TcpListener,
     context: WorkerContext,
     stop: Stop,
     listener_id: usize,
     attempts: Arc<AttemptLimiter>,
     connections: Arc<ConnectionLimiter>,
+    settings: StreamSettings<A>,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
     tracing::debug!(
@@ -205,7 +210,8 @@ async fn run_listener(
                     Admission::Allowed => {
                         match connections.reserve(peer.ip(), Instant::now()).await {
                             ConnectionAdmission::Allowed(permit) => {
-                                active.push(wait_for_eof(stream, permit));
+                                active
+                                    .push(XmppStream::new(stream, permit, settings.clone()).run());
                             }
                             ConnectionAdmission::Denied {
                                 outcome,
@@ -241,21 +247,14 @@ async fn run_listener(
                     }
                 }
             }
-            ListenerEvent::Closed(Some(result)) => match result {
-                Ok(()) => tracing::trace!(
+            ListenerEvent::Closed(Some(outcome)) => {
+                tracing::trace!(
                     listener_id,
                     worker_id,
-                    outcome = "no_session_handler",
+                    outcome = outcome.as_str(),
                     "c2s connection closed"
-                ),
-                Err(error) => tracing::trace!(
-                    listener_id,
-                    worker_id,
-                    error_kind = ?error.kind(),
-                    outcome = "read_error",
-                    "c2s connection closed"
-                ),
-            },
+                );
+            }
             ListenerEvent::Closed(None) => {}
             ListenerEvent::Accepted(Err(error)) => {
                 accept.as_mut().set(listener.accept());
@@ -297,36 +296,7 @@ async fn run_listener(
 
 enum ListenerEvent {
     Accepted(io::Result<(TcpStream, SocketAddr)>),
-    Closed(Option<io::Result<()>>),
-}
-
-async fn wait_for_eof(mut stream: TcpStream, permit: ConnectionPermit) -> io::Result<()> {
-    let mut buffer = [0; READ_BUFFER_BYTES];
-    let result = loop {
-        let read = stream.read(buffer).await;
-        buffer = read.1;
-        match read.0 {
-            Ok(0) => break Ok(()),
-            Ok(_) => yield_to_runtime().await,
-            Err(error) => break Err(error),
-        }
-    };
-    let closed = stream.close().await;
-    drop(permit);
-    result.and(closed)
-}
-
-async fn yield_to_runtime() {
-    let mut yielded = false;
-    poll_fn(|context| {
-        if std::mem::replace(&mut yielded, true) {
-            Poll::Ready(())
-        } else {
-            context.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
+    Closed(Option<stream::CloseOutcome>),
 }
 
 fn close_unhandled_connection(stream: TcpStream) {

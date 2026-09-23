@@ -110,9 +110,14 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                     None
                 };
                 let listeners = listeners.insert(
-                    c2s::Listeners::start(&config.c2s, &config.limits.c2s, &dispatcher.handle())
-                        .await
-                        .map_err(RunError::C2s)?,
+                    c2s::Listeners::start(
+                        &config.c2s,
+                        &config.limits.c2s,
+                        &dispatcher.handle(),
+                        Arc::clone(&stanza_pool),
+                    )
+                    .await
+                    .map_err(RunError::C2s)?,
                 );
                 run_services(admin, listeners).await
             }

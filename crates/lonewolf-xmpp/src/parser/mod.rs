@@ -87,7 +87,7 @@ pub enum ParseError {
     ParserFailed,
 }
 
-pub struct XmlStreamParser<R, A: ChunkAllocator> {
+pub struct XmppParser<R, A: ChunkAllocator> {
     reader: Reader<LimitedReader<R>>,
     namespaces: NamespaceResolver,
     config: ParserConfig,
@@ -114,7 +114,7 @@ pub fn compio_reader<R: compio_io::AsyncRead + Unpin + 'static>(
     reader.compat()
 }
 
-impl<R, A: ChunkAllocator> XmlStreamParser<R, A> {
+impl<R, A: ChunkAllocator> XmppParser<R, A> {
     pub fn new(reader: R, config: ParserConfig, allocator: A) -> Self {
         Self {
             reader: Reader::from_reader(LimitedReader::new(reader, MAX_STREAM_HEADER_BYTES)),
@@ -160,7 +160,7 @@ impl<R, A: ChunkAllocator> XmlStreamParser<R, A> {
     }
 }
 
-impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmlStreamParser<R, A> {
+impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
     /// Returns `None` only after [`StreamEvent::StreamEnd`].
     ///
     /// An error or cancellation after the first poll makes the parser unusable.

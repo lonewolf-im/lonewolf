@@ -16,7 +16,7 @@ use lonewolf_util::arena::{
 use lonewolf_util::pool::{MIN_POOL_SIZE, PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::parser::{
     MAX_ATTRIBUTES_PER_ELEMENT, MAX_STREAM_HEADER_BYTES, ParseError, Parsed, ParserConfig,
-    StreamEvent, XmlStreamParser, compio_reader,
+    StreamEvent, XmppParser, compio_reader,
 };
 use lonewolf_xmpp::stanza::{
     BuildError, CLIENT_NAMESPACE, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, MessageType, NodeRef,
@@ -38,7 +38,7 @@ fn config(limit: usize) -> TestResult<ParserConfig> {
 }
 
 async fn open<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(
-    parser: &mut XmlStreamParser<R, A>,
+    parser: &mut XmppParser<R, A>,
 ) -> TestResult {
     assert!(matches!(
         parser.next_event().await?,
@@ -48,7 +48,7 @@ async fn open<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(
 }
 
 async fn stanza<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(
-    parser: &mut XmlStreamParser<R, A>,
+    parser: &mut XmppParser<R, A>,
 ) -> TestResult<Parsed<Stanza, A>> {
     match parser.next_event().await? {
         Some(StreamEvent::Stanza(stanza)) => Ok(stanza),
@@ -132,7 +132,7 @@ fn parses_every_transport_split_with_namespaces_entities_and_utf8() -> TestResul
         block_on(async {
             let mut source = Fragmented::new(input.as_bytes(), usize::MAX);
             source.split = split;
-            let mut parser = XmlStreamParser::new(source, config(4096)?, GlobalChunkAllocator);
+            let mut parser = XmppParser::new(source, config(4096)?, GlobalChunkAllocator);
             open(&mut parser).await?;
             let parsed = stanza(&mut parser).await?;
             let view = parsed.value().resolve(parsed.arena())?;
@@ -176,7 +176,7 @@ fn compio_adapter_parses_large_stanzas_without_a_tokio_runtime() -> TestResult {
                 capacity,
                 Cursor::new(input.into_bytes())
             ));
-            let mut parser = XmlStreamParser::new(
+            let mut parser = XmppParser::new(
                 compio_reader(source.as_mut()),
                 config(wire_stanza.len())?,
                 GlobalChunkAllocator,
@@ -210,7 +210,7 @@ fn size_limit_counts_wire_bytes_per_stanza_and_excludes_stream_whitespace() -> T
         let first = "<message><body>&amp;&#x1F43A;</body></message>";
         let input = format!("{OPEN}{}{first} \r\n{first}{CLOSE}", " ".repeat(100_000));
         let mut parser =
-            XmlStreamParser::new(input.as_bytes(), config(first.len())?, GlobalChunkAllocator);
+            XmppParser::new(input.as_bytes(), config(first.len())?, GlobalChunkAllocator);
         open(&mut parser).await?;
         stanza(&mut parser).await?;
         stanza(&mut parser).await?;
@@ -219,7 +219,7 @@ fn size_limit_counts_wire_bytes_per_stanza_and_excludes_stream_whitespace() -> T
             Some(StreamEvent::StreamEnd)
         ));
 
-        let mut parser = XmlStreamParser::new(
+        let mut parser = XmppParser::new(
             input.as_bytes(),
             config(first.len() - 1)?,
             GlobalChunkAllocator,
@@ -250,7 +250,7 @@ fn rejects_unterminated_tokens_at_the_limit_without_waiting_for_more_input() -> 
             let mut source = Fragmented::new(input.as_bytes(), 17);
             source.stall_at_end = true;
             let consumed = source.consumed.clone();
-            let mut parser = XmlStreamParser::new(source, config(4096)?, GlobalChunkAllocator);
+            let mut parser = XmppParser::new(source, config(4096)?, GlobalChunkAllocator);
             open(&mut parser).await?;
             assert!(matches!(
                 parser.next_event().await,
@@ -267,7 +267,7 @@ fn rejects_unterminated_tokens_at_the_limit_without_waiting_for_more_input() -> 
 fn namespace_scopes_normalize_values_and_preserve_mixed_content() -> TestResult {
     block_on(async {
         let input = "<s:stream xmlns:s='http://etherx.jabber.org/streams' xmlns='jabber:cl&#105;ent' xmlns:p='urn:a&amp;b' xml:lang='en'><message p:id='ext'><body>a<p:x xmlns:p='urn:inner' p:flag='1'/>b<p:y/></body><empty xmlns=''/></message><message xml:lang=''/></s:stream>";
-        let mut parser = XmlStreamParser::new(
+        let mut parser = XmppParser::new(
             Fragmented::new(input.as_bytes(), 1),
             config(4096)?,
             GlobalChunkAllocator,
@@ -301,8 +301,7 @@ fn namespace_scopes_normalize_values_and_preserve_mixed_content() -> TestResult 
 fn restart_preserves_buffered_bytes_and_resets_stream_context() -> TestResult {
     block_on(async {
         let input = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:x='urn:old' xml:lang='en'><success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server'><message from='a.example' to='b.example'/><message from='a.example' to='b.example'><x:test/></message>";
-        let mut parser =
-            XmlStreamParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
         open(&mut parser).await?;
         let Some(StreamEvent::Element(success)) = parser.next_event().await? else {
             return Err("success".into());
@@ -329,8 +328,7 @@ fn restart_preserves_buffered_bytes_and_resets_stream_context() -> TestResult {
 fn preserves_unread_bytes_for_transport_upgrade() -> TestResult {
     block_on(async {
         let input = format!("{OPEN}<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>TLS-BYTES");
-        let mut parser =
-            XmlStreamParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
         open(&mut parser).await?;
         assert!(matches!(
             parser.next_event().await?,
@@ -373,7 +371,7 @@ fn rejects_malformed_restricted_and_invalid_stanza_input() -> TestResult {
     for invalid in cases {
         block_on(async {
             let input = format!("{OPEN}{invalid}{CLOSE}");
-            let mut parser = XmlStreamParser::new(
+            let mut parser = XmppParser::new(
                 Fragmented::new(input.as_bytes(), 1),
                 config(4096)?,
                 GlobalChunkAllocator,
@@ -396,7 +394,7 @@ fn declaration_bom_encoding_and_unclosed_stream_are_checked() -> TestResult {
         let input = format!(
             "\u{feff}<?xml version='1.0' encoding='utf-8' standalone='yes'?>{OPEN}<presence/>{CLOSE}"
         );
-        let mut parser = XmlStreamParser::new(
+        let mut parser = XmppParser::new(
             Fragmented::new(input.as_bytes(), 1),
             config(32)?,
             GlobalChunkAllocator,
@@ -410,11 +408,10 @@ fn declaration_bom_encoding_and_unclosed_stream_are_checked() -> TestResult {
             "<?xml version='1.0' extra='1'?>",
         ] {
             let input = format!("{declaration}{OPEN}");
-            let mut parser =
-                XmlStreamParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
             assert!(parser.next_event().await.is_err());
         }
-        let mut parser = XmlStreamParser::new(OPEN.as_bytes(), config(32)?, GlobalChunkAllocator);
+        let mut parser = XmppParser::new(OPEN.as_bytes(), config(32)?, GlobalChunkAllocator);
         open(&mut parser).await?;
         assert!(matches!(
             parser.next_event().await,
@@ -429,7 +426,7 @@ fn header_attributes_depth_and_arena_capacity_have_independent_limits() -> TestR
     block_on(async {
         let header = format!("<stream:stream id='{}", "a".repeat(MAX_STREAM_HEADER_BYTES));
         let mut parser =
-            XmlStreamParser::new(header.as_bytes(), config(usize::MAX)?, GlobalChunkAllocator);
+            XmppParser::new(header.as_bytes(), config(usize::MAX)?, GlobalChunkAllocator);
         assert!(matches!(
             parser.next_event().await,
             Err(ParseError::SizeLimitExceeded {
@@ -441,8 +438,7 @@ fn header_attributes_depth_and_arena_capacity_have_independent_limits() -> TestR
             .map(|i| format!(" a{i}='v'"))
             .collect::<String>();
         let input = format!("{OPEN}<message{attributes}/>");
-        let mut parser =
-            XmlStreamParser::new(input.as_bytes(), config(16384)?, GlobalChunkAllocator);
+        let mut parser = XmppParser::new(input.as_bytes(), config(16384)?, GlobalChunkAllocator);
         open(&mut parser).await?;
         assert!(matches!(
             parser.next_event().await,
@@ -454,8 +450,7 @@ fn header_attributes_depth_and_arena_capacity_have_independent_limits() -> TestR
             "<x>".repeat(MAX_ELEMENT_DEPTH),
             "</x>".repeat(MAX_ELEMENT_DEPTH)
         );
-        let mut parser =
-            XmlStreamParser::new(input.as_bytes(), config(16384)?, GlobalChunkAllocator);
+        let mut parser = XmppParser::new(input.as_bytes(), config(16384)?, GlobalChunkAllocator);
         open(&mut parser).await?;
         assert!(matches!(
             parser.next_event().await,
@@ -465,7 +460,7 @@ fn header_attributes_depth_and_arena_capacity_have_independent_limits() -> TestR
         let input = format!("{OPEN}<message><body>{}</body></message>", "a".repeat(8192));
         let mut limits = config(16384)?;
         limits.arena.max_reserved_bytes = NonZeroUsize::new(4096).ok_or("arena limit")?;
-        let mut parser = XmlStreamParser::new(input.as_bytes(), limits, GlobalChunkAllocator);
+        let mut parser = XmppParser::new(input.as_bytes(), limits, GlobalChunkAllocator);
         open(&mut parser).await?;
         assert!(matches!(
             parser.next_event().await,
@@ -488,7 +483,7 @@ fn pooled_arenas_outlive_parser_and_release_partial_allocations_on_error() -> Te
         let input =
             format!("{OPEN}<message><body>retained</body></message><message><body>unfinished");
         let allocator = ChunkAllocatorHandle::new(pool.clone());
-        let mut parser = XmlStreamParser::new(input.as_bytes(), config(4096)?, allocator);
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, allocator);
         open(&mut parser).await?;
         let parsed = stanza(&mut parser).await?;
         let retained = pool.stats();
@@ -532,7 +527,7 @@ fn cancelling_mid_token_releases_the_arena_and_prevents_reentry() -> TestResult 
             total_bytes: NonZeroUsize::new(MIN_POOL_SIZE).ok_or("pool size")?,
             ..PoolConfig::default()
         })?);
-        let mut parser = XmlStreamParser::new(
+        let mut parser = XmppParser::new(
             source,
             config(4096)?,
             ChunkAllocatorHandle::new(pool.clone()),
@@ -562,7 +557,7 @@ fn stream_footer_does_not_consume_the_stanza_budget() -> TestResult {
     for chunk in [1, usize::MAX] {
         block_on(async {
             let input = format!("{OPEN}<presence/>{CLOSE}");
-            let mut parser = XmlStreamParser::new(
+            let mut parser = XmppParser::new(
                 Fragmented::new(input.as_bytes(), chunk),
                 config("<presence/>".len())?,
                 GlobalChunkAllocator,
@@ -574,7 +569,7 @@ fn stream_footer_does_not_consume_the_stanza_budget() -> TestResult {
                 Some(StreamEvent::StreamEnd)
             ));
             let input = format!("{OPEN}{CLOSE}");
-            let mut parser = XmlStreamParser::new(
+            let mut parser = XmppParser::new(
                 Fragmented::new(input.as_bytes(), chunk),
                 config(1)?,
                 GlobalChunkAllocator,
@@ -602,7 +597,7 @@ fn declaration_position_and_bom_are_independent_of_fragmentation() -> TestResult
                 "\u{feff} <?xml version='1.0'?>",
             ] {
                 let input = format!("{prefix}{OPEN}");
-                let mut parser = XmlStreamParser::new(
+                let mut parser = XmppParser::new(
                     Fragmented::new(input.as_bytes(), chunk),
                     config(4096)?,
                     GlobalChunkAllocator,
@@ -611,7 +606,7 @@ fn declaration_position_and_bom_are_independent_of_fragmentation() -> TestResult
             }
             for prefix in ["\u{feff} \r\n", " \r\n"] {
                 let input = format!("{prefix}{OPEN}");
-                let mut parser = XmlStreamParser::new(
+                let mut parser = XmppParser::new(
                     Fragmented::new(input.as_bytes(), chunk),
                     config(4096)?,
                     GlobalChunkAllocator,
@@ -632,7 +627,7 @@ fn node_limit_is_enforced_before_the_tree_is_complete() -> TestResult {
             let mut limits = config(input.len())?;
             limits.arena.max_reserved_bytes =
                 NonZeroUsize::new(32 * 1024 * 1024).ok_or("arena limit")?;
-            let mut parser = XmlStreamParser::new(input.as_bytes(), limits, GlobalChunkAllocator);
+            let mut parser = XmppParser::new(input.as_bytes(), limits, GlobalChunkAllocator);
             open(&mut parser).await?;
             if children < MAX_ELEMENT_NODES {
                 stanza(&mut parser).await?;

@@ -62,7 +62,8 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("distinct_recipients_per_connection.window_secs", 60),
     ];
     let actual = limit_values()?;
-    assert_eq!(actual.len(), expected.len() + 1);
+    assert_eq!(actual.len(), expected.len() + 2);
+    assert!(actual.contains(&("c2s.max_unauthenticated_connections".into(), 1_024)));
     assert!(actual.contains(&("c2s.max_resources_per_account".into(), 10)));
     for (path, value) in expected {
         assert!(
@@ -160,6 +161,7 @@ fn unrelated_limits_and_profile_inheritance_are_not_configurable() -> TestResult
         "[limits.c2s.stream_management]",
         "[limits.c2s.profiles.default.stream_management]",
         "[limits.c2s.profiles.default]\nmax_resources_per_account = 10",
+        "[limits.c2s.profiles.default]\nmax_unauthenticated_connections = 10",
         "[limits.c2s.profiles.default]\nextends = 'other'",
         "[[c2s.listeners]]\nlimits = { max_stanza_bytes = 262144 }",
     ] {

@@ -23,6 +23,8 @@ impl LimitsConfig {
 pub struct C2sLimits {
     /// A sole profile is selected automatically when the default is omitted.
     pub default: String,
+    /// Counts unauthenticated connections across all listeners.
+    pub max_unauthenticated_connections: NonZeroUsize,
     /// Counts bound resources across all listeners for each account.
     pub max_resources_per_account: NonZeroUsize,
     /// Replaces the built-in profiles when present in TOML.
@@ -33,6 +35,7 @@ impl Default for C2sLimits {
     fn default() -> Self {
         Self {
             default: "default".into(),
+            max_unauthenticated_connections: default_max_unauthenticated_connections(),
             max_resources_per_account: default_max_resources_per_account(),
             profiles: default_profiles(),
         }
@@ -43,6 +46,8 @@ impl Default for C2sLimits {
 #[serde(deny_unknown_fields)]
 struct C2sLimitsInput {
     default: Option<String>,
+    #[serde(default = "default_max_unauthenticated_connections")]
+    max_unauthenticated_connections: NonZeroUsize,
     #[serde(default = "default_max_resources_per_account")]
     max_resources_per_account: NonZeroUsize,
     #[serde(default = "default_profiles")]
@@ -66,6 +71,7 @@ impl TryFrom<C2sLimitsInput> for C2sLimits {
         };
         Ok(Self {
             default,
+            max_unauthenticated_connections: input.max_unauthenticated_connections,
             max_resources_per_account: input.max_resources_per_account,
             profiles: input.profiles,
         })
@@ -107,6 +113,10 @@ impl C2sLimits {
 
 fn default_profiles() -> BTreeMap<String, C2sLimitProfile> {
     BTreeMap::from([("default".into(), C2sLimitProfile::default())])
+}
+
+const fn default_max_unauthenticated_connections() -> NonZeroUsize {
+    nonzero(1_024)
 }
 
 const fn default_max_resources_per_account() -> NonZeroUsize {

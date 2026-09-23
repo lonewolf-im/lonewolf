@@ -43,8 +43,10 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         let mut tasks = Vec::with_capacity(handle.worker_count());
         let mut descriptors = Vec::with_capacity(handle.worker_count());
         let mut threads = Vec::with_capacity(handle.worker_count());
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
         for index in 0..handle.worker_count() {
             let (ready, readiness) = oneshot::channel();
+            let unauthenticated = Arc::clone(&unauthenticated);
             let task = handle
                 .dispatch_at(index, move |context| async move {
                     let listener = bind(address).await?;
@@ -53,22 +55,25 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         listener.as_raw_fd(),
                         thread::current().id(),
                     ));
-                    let attempts = Arc::new(AttemptLimiter::new(
-                        &C2sLimitProfile::default().connection_attempts_per_ip,
-                    ));
-                    let connections = Arc::new(ConnectionLimiter::new(
-                        C2sLimitProfile::default().max_connections_per_ip.get(),
-                    ));
+                    let profile = C2sLimitProfile::default();
+                    let admission = AdmissionLimits {
+                        attempts: Arc::new(AttemptLimiter::new(
+                            &profile.connection_attempts_per_ip,
+                        )),
+                        connections: Arc::new(ConnectionLimiter::new(
+                            profile.max_connections_per_ip.get(),
+                        )),
+                        unauthenticated,
+                    };
                     run_listener(
                         listener,
                         context,
                         pending().boxed().shared(),
                         0,
-                        attempts,
-                        connections,
+                        admission,
                         StreamSettings::new(
-                            C2sLimitProfile::default().max_stanza_bytes,
-                            &C2sLimitProfile::default().incoming_xml_per_connection,
+                            profile.max_stanza_bytes,
+                            &profile.incoming_xml_per_connection,
                             GlobalChunkAllocator,
                         ),
                     )
@@ -98,6 +103,85 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         }
         let rebound = bind(address).await?;
         rebound.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
+    run_test(async {
+        let dispatcher = dispatcher()?;
+        let handle = dispatcher.handle();
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let mut addresses = Vec::with_capacity(2);
+        let mut tasks = Vec::with_capacity(2);
+        for listener_id in 0..2 {
+            let (ready, readiness) = oneshot::channel();
+            let unauthenticated = Arc::clone(&unauthenticated);
+            let task = handle
+                .dispatch_at(
+                    listener_id % handle.worker_count(),
+                    move |context| async move {
+                        let listener = bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+                        let _ = ready.send(listener.local_addr()?);
+                        let profile = C2sLimitProfile::default();
+                        let admission = AdmissionLimits {
+                            attempts: Arc::new(AttemptLimiter::new(
+                                &profile.connection_attempts_per_ip,
+                            )),
+                            connections: Arc::new(ConnectionLimiter::new(
+                                profile.max_connections_per_ip.get(),
+                            )),
+                            unauthenticated,
+                        };
+                        run_listener(
+                            listener,
+                            context,
+                            pending().boxed().shared(),
+                            listener_id,
+                            admission,
+                            StreamSettings::new(
+                                profile.max_stanza_bytes,
+                                &profile.incoming_xml_per_connection,
+                                GlobalChunkAllocator,
+                            ),
+                        )
+                        .await
+                    },
+                )
+                .await?;
+            addresses.push(readiness.await?);
+            tasks.push(task);
+        }
+        let first = TcpStream::connect(addresses[0]).await?;
+        while unauthenticated.active_count() != 1 {
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let mut second = TcpStream::connect(addresses[1]).await?;
+        match second.read([0; 1]).await.0 {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) => {}
+            other => return Err(format!("rejected connection remained open: {other:?}").into()),
+        }
+        assert_eq!(unauthenticated.active_count(), 1);
+        drop(first);
+        while unauthenticated.active_count() != 0 {
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let third = TcpStream::connect(addresses[1]).await?;
+        while unauthenticated.active_count() != 1 {
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        dispatcher.shutdown(TIMEOUT).await?;
+        for task in tasks {
+            task.await??;
+        }
+        assert_eq!(unauthenticated.active_count(), 0);
+        drop(third);
         Ok(())
     })
 }

@@ -18,6 +18,25 @@
 # memory when the pool is exhausted.
 # stanza_pool_size_mib = 256
 
+# ------------------------------------ Hosts ----------------------------------------------------
+
+# Add one section for each XMPP domain served by Lonewolf.
+# Defining hosts replaces the built-in host map.
+# Use lowercase ASCII names or Punycode for internationalized domains.
+# [hosts.localhost]
+
+# Quote domain names that contain dots in TOML table headers.
+# The domain below is an example.
+# [hosts."example.com"]
+
+# Configure TLS for a host with a PEM certificate chain and private key.
+# Both paths are required when you add a TLS section.
+# Relative paths start from the directory where Lonewolf was launched.
+# The paths below are examples.
+# [hosts."example.com".tls]
+# certificate_chain_path = "./certs/example.com.crt"
+# private_key_path = "./certs/example.com.key"
+
 # ------------------------------------ Limits ---------------------------------------------------
 
 # Connection attempt limits apply at TCP admission.

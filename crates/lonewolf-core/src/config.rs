@@ -11,7 +11,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
+use lonewolf_xmpp::jid::Jid;
 use serde::Deserialize;
 
 pub mod limits;
@@ -24,16 +26,33 @@ const MEBIBYTE: usize = 1024 * 1024;
 /// Applies defaults during deserialization and rejects unknown fields.
 ///
 /// [`Self::load`] also validates value constraints; direct deserialization does not.
-#[derive(Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub logging: LoggingConfig,
     pub xmpp: XmppConfig,
+    #[serde(default = "default_hosts")]
+    pub hosts: BTreeMap<String, HostConfig>,
     pub c2s: C2sConfig,
     pub limits: LimitsConfig,
     pub storage: StorageConfig,
     pub account: AccountConfig,
     pub admin: AdminConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            logging: LoggingConfig::default(),
+            xmpp: XmppConfig::default(),
+            hosts: default_hosts(),
+            c2s: C2sConfig::default(),
+            limits: LimitsConfig::default(),
+            storage: StorageConfig::default(),
+            account: AccountConfig::default(),
+            admin: AdminConfig::default(),
+        }
+    }
 }
 
 impl Config {
@@ -73,6 +92,7 @@ impl Config {
 
     fn validate(&self) -> Result<(), String> {
         self.xmpp.validate()?;
+        self.validate_hosts()?;
         self.c2s.validate()?;
         self.limits.validate()?;
         for (index, listener) in self.c2s.listeners.iter().enumerate() {
@@ -97,6 +117,57 @@ impl Config {
         }
         Ok(())
     }
+
+    fn validate_hosts(&self) -> Result<(), String> {
+        if self.hosts.is_empty() {
+            return Err("hosts must define at least one domain".into());
+        }
+        for (domain, host) in &self.hosts {
+            let mut arena = Arena::try_new(ArenaConfig::default())
+                .map_err(|error| format!("cannot validate hosts.{domain}: {error}"))?;
+            let jid = Jid::from_parts_in(None, domain, None, &mut arena)
+                .map_err(|error| format!("hosts.{domain} is not a valid XMPP domain: {error}"))?;
+            let normalized = jid
+                .resolve(&arena)
+                .map_err(|error| format!("cannot validate hosts.{domain}: {error}"))?;
+            if normalized.domainpart() != domain {
+                return Err(format!(
+                    "hosts.{domain} must use the normalized form {:?}",
+                    normalized.domainpart()
+                ));
+            }
+            if let Some(tls) = &host.tls {
+                if tls.certificate_chain_path.as_os_str().is_empty() {
+                    return Err(format!(
+                        "hosts.{domain}.tls.certificate_chain_path must not be empty"
+                    ));
+                }
+                if tls.private_key_path.as_os_str().is_empty() {
+                    return Err(format!(
+                        "hosts.{domain}.tls.private_key_path must not be empty"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_hosts() -> BTreeMap<String, HostConfig> {
+    BTreeMap::from([(String::from("localhost"), HostConfig::default())])
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HostConfig {
+    pub tls: Option<HostTlsConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostTlsConfig {
+    pub certificate_chain_path: PathBuf,
+    pub private_key_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]

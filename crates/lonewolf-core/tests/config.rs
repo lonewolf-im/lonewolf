@@ -4,11 +4,15 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lonewolf_core::config::limits::C2sLimitProfile;
-use lonewolf_core::config::{AccountConfig, Config, ConfigError, StoreConfig, TcpListenerConfig};
+use lonewolf_core::config::{
+    AccountConfig, Config, ConfigError, HostConfig, HostTlsConfig, StoreConfig, TcpListenerConfig,
+};
 
+#[path = "config/hosts.rs"]
+mod hosts;
 #[path = "config/limits.rs"]
 mod limits;
 
@@ -139,6 +143,7 @@ fn omitted_settings_use_defaults() -> TestResult {
         "[storage]",
         "xmpp = {}",
         "[xmpp]",
+        "[hosts.localhost]",
         "c2s = {}",
         "[c2s]",
         "[[c2s.listeners]]",
@@ -497,6 +502,15 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         },
         ..Config::default()
     };
+    expected.hosts.insert(
+        "example.com".into(),
+        HostConfig {
+            tls: Some(HostTlsConfig {
+                certificate_chain_path: PathBuf::from("./certs/example.com.crt"),
+                private_key_path: PathBuf::from("./certs/example.com.key"),
+            }),
+        },
+    );
     expected.c2s.listeners[0].limits = Some("default".into());
     expected.c2s.listeners.push(TcpListenerConfig {
         address: "127.0.0.1:5223".parse()?,

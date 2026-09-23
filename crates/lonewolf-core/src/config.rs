@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
 use serde::Deserialize;
 
+pub mod limits;
+
+use limits::LimitsConfig;
+
 pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 const MEBIBYTE: usize = 1024 * 1024;
 
@@ -26,6 +30,7 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub xmpp: XmppConfig,
     pub c2s: C2sConfig,
+    pub limits: LimitsConfig,
     pub storage: StorageConfig,
     pub account: AccountConfig,
     pub admin: AdminConfig,
@@ -69,6 +74,16 @@ impl Config {
     fn validate(&self) -> Result<(), String> {
         self.xmpp.validate()?;
         self.c2s.validate()?;
+        self.limits.validate()?;
+        for (index, listener) in self.c2s.listeners.iter().enumerate() {
+            if let Some(profile) = &listener.limits
+                && !self.limits.c2s.profiles.contains_key(profile)
+            {
+                return Err(format!(
+                    "c2s.listeners[{index}].limits references unknown profile {profile:?}"
+                ));
+            }
+        }
         self.storage.validate()?;
         if self.admin.socket_path.as_os_str().is_empty() {
             return Err("admin.socket_path must not be empty".into());
@@ -127,17 +142,20 @@ impl C2sConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TcpListenerConfig {
     /// IPv6 addresses accept IPv6 only; port zero selects one port for all workers.
     pub address: SocketAddr,
+    /// Selects a named profile, or `limits.c2s.default` when absent.
+    pub limits: Option<String>,
 }
 
 impl Default for TcpListenerConfig {
     fn default() -> Self {
         Self {
             address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5222)),
+            limits: None,
         }
     }
 }

@@ -3,9 +3,14 @@
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
+use lonewolf_core::config::limits::C2sLimitProfile;
 use lonewolf_core::config::{AccountConfig, Config, ConfigError, StoreConfig, TcpListenerConfig};
+
+#[path = "config/limits.rs"]
+mod limits;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -49,10 +54,12 @@ fn configured_c2s_endpoints_replace_the_default_and_allow_ipv6() -> TestResult {
         config.c2s.listeners,
         vec![
             TcpListenerConfig {
-                address: "127.0.0.1:6222".parse()?
+                address: "127.0.0.1:6222".parse()?,
+                ..TcpListenerConfig::default()
             },
             TcpListenerConfig {
-                address: "[::1]:6222".parse()?
+                address: "[::1]:6222".parse()?,
+                ..TcpListenerConfig::default()
             },
         ]
     );
@@ -467,15 +474,41 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         }
     }
     assert!(!uncommented.is_empty());
-    let file = config_file(&uncommented)?;
+    let mut documented: toml::Value = toml::from_str(&uncommented)?;
+    let example_profile = documented
+        .get_mut("limits")
+        .and_then(|value| value.get_mut("c2s"))
+        .and_then(|value| value.get_mut("profiles"))
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|profiles| profiles.remove("internal"))
+        .ok_or("missing example profile")?;
     assert_eq!(
-        Config::load(Some(file.path()))?,
-        Config {
-            account: AccountConfig {
-                storage: Some("primary".into()),
-            },
-            ..Config::default()
-        }
+        example_profile,
+        toml::from_str::<toml::Value>("max_stanza_bytes = 524_288")?
     );
+    assert_eq!(
+        documented.get("limits"),
+        Some(&toml::Value::try_from(Config::default().limits)?)
+    );
+    let file = config_file(&uncommented)?;
+    let mut expected = Config {
+        account: AccountConfig {
+            storage: Some("primary".into()),
+        },
+        ..Config::default()
+    };
+    expected.c2s.listeners[0].limits = Some("default".into());
+    expected.c2s.listeners.push(TcpListenerConfig {
+        address: "127.0.0.1:5223".parse()?,
+        limits: Some("internal".into()),
+    });
+    expected.limits.c2s.profiles.insert(
+        "internal".into(),
+        C2sLimitProfile {
+            max_stanza_bytes: NonZeroUsize::new(524_288).ok_or("invalid example stanza size")?,
+            ..C2sLimitProfile::default()
+        },
+    );
+    assert_eq!(Config::load(Some(file.path()))?, expected);
     Ok(())
 }

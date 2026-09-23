@@ -89,9 +89,11 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
             listeners: vec![
                 TcpListenerConfig {
                     address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                    ..TcpListenerConfig::default()
                 },
                 TcpListenerConfig {
                     address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                    ..TcpListenerConfig::default()
                 },
             ],
         };
@@ -124,9 +126,13 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
         let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let config = C2sConfig {
             listeners: vec![
-                TcpListenerConfig { address: first },
+                TcpListenerConfig {
+                    address: first,
+                    ..TcpListenerConfig::default()
+                },
                 TcpListenerConfig {
                     address: occupied.local_addr()?,
+                    ..TcpListenerConfig::default()
                 },
             ],
         };

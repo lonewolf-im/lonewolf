@@ -24,6 +24,65 @@
 # overlap.
 # address = "0.0.0.0:5222"
 
+# Select a named limit profile for this endpoint.
+# Omit this setting to use limits.c2s.default; the value below is an example.
+# limits = "default"
+
+# These settings define policy values but do not enforce runtime limits.
+# All numeric limits are positive integers.
+# [limits.c2s]
+
+# Choose the profile for listeners that do not select one.
+# One configured profile is selected automatically; multiple profiles require this setting.
+# default = "default"
+
+# Allow enough bound resources for one account's devices and applications.
+# The account allowance covers all listeners.
+# max_resources_per_account = 10
+
+# Add one section per profile and use a nonblank name.
+# Without profile sections, Lonewolf uses the built-in profile shown below.
+# Defining profiles replaces that built-in map; an empty map is not allowed.
+# Omitted values use built-in defaults, not values from the selected default profile.
+# Sharing a profile between listeners shares settings, not quota counters.
+# [limits.c2s.profiles.default]
+
+# Allow enough simultaneous connections for clients sharing one IP address.
+# The allowance covers all workers of one listener.
+# max_connections_per_ip = 256
+
+# Set the largest incoming stanza to suit client payloads, including XML markup.
+# Choose at least 10,000 bytes and no more than the platform allocation range.
+# max_stanza_bytes = 262_144
+
+# Limit reconnect traffic from one IP while allowing clients behind shared NAT.
+# The allowance covers all workers of one listener.
+# Use per_second for the sustained event rate and burst for the bucket capacity.
+# connection_attempts_per_ip = { per_second = 10, burst = 50 }
+
+# Bound sustained stanza traffic while allowing short bursts on each connection.
+# Use per_second for the sustained event rate and burst for the bucket capacity.
+# incoming_stanzas_per_connection = { per_second = 20, burst = 100 }
+
+# Bound incoming XML traffic per connection, including control elements and whitespace.
+# TCP and TLS overhead do not count toward this allowance.
+# Use bytes_per_second for the sustained byte rate and burst_bytes for the bucket capacity.
+# incoming_xml_per_connection = { bytes_per_second = 262_144, burst_bytes = 1_048_576 }
+
+# Restrict how many distinct recipient bare JIDs one connection can address.
+# Set max to the recipient allowance within a rolling window of window_secs seconds.
+# The window duration must fit the platform clock range.
+# distinct_recipients_per_connection = { max = 100, window_secs = 60 }
+
+# To allow larger stanzas on a local endpoint, enable this example profile and
+# listener together with the default profile and selection above.
+# [limits.c2s.profiles.internal]
+# max_stanza_bytes = 524_288
+
+# [[c2s.listeners]]
+# address = "127.0.0.1:5223"
+# limits = "internal"
+
 # [storage]
 
 # Choose the store Lonewolf uses by default.

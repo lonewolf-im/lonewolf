@@ -4,6 +4,7 @@ use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use compio::runtime::Runtime;
@@ -12,6 +13,9 @@ use lonewolf_util::arena::GlobalChunkAllocator;
 
 use super::*;
 use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
+use crate::c2s::unauthenticated_limit::{
+    Admission as UnauthenticatedAdmission, UnauthenticatedLimiter,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN: &str =
@@ -54,10 +58,17 @@ fn run_case_with_rate(
         else {
             return Err("first connection was denied".into());
         };
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+            unauthenticated.reserve(Instant::now()).await
+        else {
+            return Err("first unauthenticated connection was denied".into());
+        };
         let started = Instant::now();
         let outcome = XmppStream::new(
             transport,
             permit,
+            unauthenticated_permit,
             StreamSettings::new(max_stanza_bytes, xml_rate, GlobalChunkAllocator),
         )
         .run()
@@ -66,6 +77,10 @@ fn run_case_with_rate(
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
             ConnectionAdmission::Allowed(_)
+        ));
+        assert!(matches!(
+            unauthenticated.reserve(Instant::now()).await,
+            UnauthenticatedAdmission::Allowed(_)
         ));
         let mut remaining = [0; 1];
         assert_eq!(client.read(&mut remaining)?, 0);
@@ -148,6 +163,12 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         else {
             return Err("first connection was denied".into());
         };
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+            unauthenticated.reserve(Instant::now()).await
+        else {
+            return Err("first unauthenticated connection was denied".into());
+        };
         let rate = ByteRate {
             bytes_per_second: NonZeroUsize::MIN,
             burst_bytes: NonZeroUsize::MIN,
@@ -155,6 +176,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         let stream = XmppStream::new(
             transport,
             permit,
+            unauthenticated_permit,
             StreamSettings::new(MAX_STANZA_BYTES, &rate, GlobalChunkAllocator),
         );
         assert!(
@@ -165,6 +187,10 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
             ConnectionAdmission::Allowed(_)
+        ));
+        assert!(matches!(
+            unauthenticated.reserve(Instant::now()).await,
+            UnauthenticatedAdmission::Allowed(_)
         ));
         listener.close().await?;
         Ok::<_, Box<dyn Error>>(())

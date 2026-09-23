@@ -23,15 +23,24 @@ use crate::config::limits::C2sLimits;
 mod attempt_limit;
 mod connection_limit;
 mod stream;
+mod unauthenticated_limit;
 
 use attempt_limit::{Admission, AttemptLimiter};
 use connection_limit::{ConnectionAdmission, ConnectionLimiter};
 use stream::{StreamSettings, XmppStream};
+use unauthenticated_limit::{Admission as UnauthenticatedAdmission, UnauthenticatedLimiter};
 
 const BACKLOG: i32 = 128;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 type Stop = Shared<BoxFuture<'static, ()>>;
+
+#[derive(Clone)]
+struct AdmissionLimits {
+    attempts: Arc<AttemptLimiter>,
+    connections: Arc<ConnectionLimiter>,
+    unauthenticated: Arc<UnauthenticatedLimiter>,
+}
 
 pub(crate) struct Listeners {
     stop: Option<oneshot::Sender<()>>,
@@ -53,6 +62,9 @@ impl Listeners {
         }
         .boxed()
         .shared();
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(
+            limits.max_unauthenticated_connections,
+        ));
         let listeners = Self {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
@@ -67,17 +79,18 @@ impl Listeners {
                     format!("c2s listener {listener_id} references unknown limit profile {profile_name:?}"),
                 )
             })?;
-            let attempts = Arc::new(AttemptLimiter::new(&profile.connection_attempts_per_ip));
-            let connections =
-                Arc::new(ConnectionLimiter::new(profile.max_connections_per_ip.get()));
+            let admission = AdmissionLimits {
+                attempts: Arc::new(AttemptLimiter::new(&profile.connection_attempts_per_ip)),
+                connections: Arc::new(ConnectionLimiter::new(profile.max_connections_per_ip.get())),
+                unauthenticated: Arc::clone(&unauthenticated),
+            };
             let max_stanza_bytes = profile.max_stanza_bytes;
             let xml_rate = &profile.incoming_xml_per_connection;
             let mut address = config.address;
             for worker_id in 0..dispatcher.worker_count() {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
-                let attempts = Arc::clone(&attempts);
-                let connections = Arc::clone(&connections);
+                let admission = admission.clone();
                 let settings = StreamSettings::new(max_stanza_bytes, xml_rate, allocator.clone());
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
@@ -87,16 +100,8 @@ impl Listeners {
                             if ready.send(bound).is_err() {
                                 return Ok(());
                             }
-                            run_listener(
-                                listener,
-                                context,
-                                stop,
-                                listener_id,
-                                attempts,
-                                connections,
-                                settings,
-                            )
-                            .await
+                            run_listener(listener, context, stop, listener_id, admission, settings)
+                                .await
                         }
                         .await;
                         result.map_err(|error| listener_error(listener_id, worker_id, error))
@@ -172,8 +177,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
     context: WorkerContext,
     stop: Stop,
     listener_id: usize,
-    attempts: Arc<AttemptLimiter>,
-    connections: Arc<ConnectionLimiter>,
+    admission: AdmissionLimits,
     settings: StreamSettings<A>,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
@@ -207,23 +211,48 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         match event {
             ListenerEvent::Accepted(Ok((stream, peer))) => {
                 accept.as_mut().set(listener.accept());
-                match attempts.admit(peer.ip(), Instant::now()).await {
+                match admission.attempts.admit(peer.ip(), Instant::now()).await {
                     Admission::Allowed => {
-                        match connections.reserve(peer.ip(), Instant::now()).await {
-                            ConnectionAdmission::Allowed(permit) => {
-                                active
-                                    .push(XmppStream::new(stream, permit, settings.clone()).run());
+                        match admission.unauthenticated.reserve(Instant::now()).await {
+                            UnauthenticatedAdmission::Allowed(unauthenticated_permit) => {
+                                match admission
+                                    .connections
+                                    .reserve(peer.ip(), Instant::now())
+                                    .await
+                                {
+                                    ConnectionAdmission::Allowed(ip_permit) => {
+                                        active.push(
+                                            XmppStream::new(
+                                                stream,
+                                                ip_permit,
+                                                unauthenticated_permit,
+                                                settings.clone(),
+                                            )
+                                            .run(),
+                                        );
+                                    }
+                                    ConnectionAdmission::Denied {
+                                        outcome,
+                                        report_count,
+                                    } => {
+                                        close_unhandled_connection(stream);
+                                        if let Some(rejected_connections) = report_count {
+                                            tracing::warn!(
+                                                listener_id,
+                                                worker_id,
+                                                outcome,
+                                                rejected_connections,
+                                                "c2s connection rejected"
+                                            );
+                                        }
+                                    }
+                                }
                             }
-                            ConnectionAdmission::Denied {
-                                outcome,
-                                report_count,
-                            } => {
+                            UnauthenticatedAdmission::Denied { report_count } => {
                                 close_unhandled_connection(stream);
                                 if let Some(rejected_connections) = report_count {
                                     tracing::warn!(
-                                        listener_id,
-                                        worker_id,
-                                        outcome,
+                                        outcome = "unauthenticated_connection_limit",
                                         rejected_connections,
                                         "c2s connection rejected"
                                     );

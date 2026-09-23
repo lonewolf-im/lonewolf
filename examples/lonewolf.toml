@@ -29,6 +29,10 @@
 # One configured profile is selected automatically; multiple profiles require this setting.
 # default = "default"
 
+# Limit unauthenticated client connections across all listeners.
+# Choose a value that leaves file descriptors for other services.
+# max_unauthenticated_connections = 1_024
+
 # Allow enough bound resources for one account's devices and applications.
 # The account allowance covers all listeners.
 # max_resources_per_account = 10

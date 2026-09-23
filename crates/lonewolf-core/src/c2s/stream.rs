@@ -10,13 +10,15 @@ use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
 
 use super::connection_limit::ConnectionPermit;
+use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::limits::ByteRate;
 
 const READ_BUFFER_BYTES: usize = 1_024;
 
 pub(super) struct XmppStream<A: ChunkAllocator> {
     transport: TcpStream,
-    permit: ConnectionPermit,
+    ip_permit: ConnectionPermit,
+    unauthenticated_permit: UnauthenticatedPermit,
     settings: StreamSettings<A>,
 }
 
@@ -42,12 +44,14 @@ impl<A: ChunkAllocator> StreamSettings<A> {
 impl<A: ChunkAllocator + Clone> XmppStream<A> {
     pub(super) fn new(
         transport: TcpStream,
-        permit: ConnectionPermit,
+        ip_permit: ConnectionPermit,
+        unauthenticated_permit: UnauthenticatedPermit,
         settings: StreamSettings<A>,
     ) -> Self {
         Self {
             transport,
-            permit,
+            ip_permit,
+            unauthenticated_permit,
             settings,
         }
     }
@@ -55,7 +59,8 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
     pub(super) async fn run(self) -> CloseOutcome {
         let Self {
             transport,
-            permit,
+            ip_permit,
+            unauthenticated_permit,
             settings,
         } = self;
         let outcome = {
@@ -87,7 +92,8 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 }
             }
         };
-        drop(permit);
+        drop(unauthenticated_permit);
+        drop(ip_permit);
         outcome
     }
 }

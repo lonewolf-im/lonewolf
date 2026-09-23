@@ -24,6 +24,21 @@ fn run_case(
     shutdown_write: bool,
     max_stanza_bytes: NonZeroUsize,
 ) -> Result<CloseOutcome, Box<dyn Error>> {
+    Ok(run_case_with_rate(
+        input,
+        shutdown_write,
+        max_stanza_bytes,
+        &ByteRate::default(),
+    )?
+    .0)
+}
+
+fn run_case_with_rate(
+    input: &[u8],
+    shutdown_write: bool,
+    max_stanza_bytes: NonZeroUsize,
+    xml_rate: &ByteRate,
+) -> Result<(CloseOutcome, Duration), Box<dyn Error>> {
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
         let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
@@ -39,13 +54,15 @@ fn run_case(
         else {
             return Err("first connection was denied".into());
         };
+        let started = Instant::now();
         let outcome = XmppStream::new(
             transport,
             permit,
-            StreamSettings::new(max_stanza_bytes, GlobalChunkAllocator),
+            StreamSettings::new(max_stanza_bytes, xml_rate, GlobalChunkAllocator),
         )
         .run()
         .await;
+        let elapsed = started.elapsed();
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
             ConnectionAdmission::Allowed(_)
@@ -53,7 +70,7 @@ fn run_case(
         let mut remaining = [0; 1];
         assert_eq!(client.read(&mut remaining)?, 0);
         listener.close().await?;
-        Ok(outcome)
+        Ok((outcome, elapsed))
     }))?
 }
 
@@ -104,4 +121,52 @@ fn invalid_xml_closes_connection() -> Result<(), Box<dyn Error>> {
         CloseOutcome::ParserError
     );
     Ok(())
+}
+
+#[test]
+fn stream_whitespace_consumes_xml_allowance() -> Result<(), Box<dyn Error>> {
+    let input = format!("{OPEN} {CLOSE}");
+    let rate = ByteRate {
+        bytes_per_second: NonZeroUsize::new(10).ok_or("invalid rate")?,
+        burst_bytes: NonZeroUsize::new(OPEN.len() + CLOSE.len()).ok_or("invalid burst")?,
+    };
+    let (outcome, elapsed) = run_case_with_rate(input.as_bytes(), false, MAX_STANZA_BYTES, &rate)?;
+    assert_eq!(outcome, CloseOutcome::StreamEnd);
+    assert!(elapsed >= Duration::from_millis(50));
+    Ok(())
+}
+
+#[test]
+fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let mut client = StdTcpStream::connect(listener.local_addr()?)?;
+        client.write_all(OPEN.as_bytes())?;
+        let (transport, peer) = listener.accept().await?;
+        let limiter = ConnectionLimiter::new(1);
+        let ConnectionAdmission::Allowed(permit) = limiter.reserve(peer.ip(), Instant::now()).await
+        else {
+            return Err("first connection was denied".into());
+        };
+        let rate = ByteRate {
+            bytes_per_second: NonZeroUsize::MIN,
+            burst_bytes: NonZeroUsize::MIN,
+        };
+        let stream = XmppStream::new(
+            transport,
+            permit,
+            StreamSettings::new(MAX_STANZA_BYTES, &rate, GlobalChunkAllocator),
+        );
+        assert!(
+            timeout(Duration::from_millis(20), stream.run())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            limiter.reserve(peer.ip(), Instant::now()).await,
+            ConnectionAdmission::Allowed(_)
+        ));
+        listener.close().await?;
+        Ok::<_, Box<dyn Error>>(())
+    })
 }

@@ -15,6 +15,7 @@ crossbeam-queue.workspace = true
 crossbeam-utils.workspace = true
 futures-channel.workspace = true
 futures-util.workspace = true
+tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["sched"] }

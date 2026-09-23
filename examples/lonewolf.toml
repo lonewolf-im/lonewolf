@@ -20,7 +20,8 @@
 
 # ------------------------------------ Limits ---------------------------------------------------
 
-# The connection attempt limit applies at TCP admission. Other limits have no runtime effect.
+# Connection attempt limits apply at TCP admission.
+# Resource count, stanza rate, and recipient count limits have no runtime effect.
 # All numeric limits are positive integers.
 # [limits.c2s]
 
@@ -58,6 +59,7 @@
 
 # Bound incoming XML traffic per connection, including control elements and whitespace.
 # TCP and TLS overhead do not count toward this allowance.
+# Reads pause when the byte allowance is empty.
 # Use bytes_per_second for the sustained byte rate and burst_bytes for the bucket capacity.
 # incoming_xml_per_connection = { bytes_per_second = 262_144, burst_bytes = 1_048_576 }
 

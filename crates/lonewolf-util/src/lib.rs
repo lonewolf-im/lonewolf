@@ -9,3 +9,4 @@ pub mod arena;
 pub mod blocking;
 pub mod core_dispatcher;
 pub mod pool;
+pub mod rate_limited_reader;

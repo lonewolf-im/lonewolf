@@ -1,11 +1,15 @@
 # Copy this file to lonewolf.toml and uncomment the settings you want to change.
 # The values shown are the defaults unless a comment identifies an example.
 
+# ------------------------------------ Logging --------------------------------------------------
+
 # [logging]
 
 # Choose how much detail Lonewolf writes to standard error.
 # Use "off", "error", "warn", "info", "debug", or "trace".
 # level = "info"
+
+# ------------------------------------ XMPP -----------------------------------------------------
 
 # [xmpp]
 
@@ -14,19 +18,7 @@
 # memory when the pool is exhausted.
 # stanza_pool_size_mib = 256
 
-# Add one section per TCP endpoint. These sections replace the default endpoint.
-# Lonewolf requires at least one client endpoint.
-# [[c2s.listeners]]
-
-# Choose the local IP address and port for client connections.
-# Use a numeric IPv4 address or a bracketed IPv6 address followed by the port.
-# IPv6 endpoints accept IPv6 only. Endpoints in the same address family must not
-# overlap.
-# address = "0.0.0.0:5222"
-
-# Select a named limit profile for this endpoint.
-# Omit this setting to use limits.c2s.default; the value below is an example.
-# limits = "default"
+# ------------------------------------ Limits ---------------------------------------------------
 
 # These settings define policy values but do not enforce runtime limits.
 # All numeric limits are positive integers.
@@ -74,14 +66,32 @@
 # The window duration must fit the platform clock range.
 # distinct_recipients_per_connection = { max = 100, window_secs = 60 }
 
-# To allow larger stanzas on a local endpoint, enable this example profile and
-# listener together with the default profile and selection above.
+# This example profile allows larger stanzas on the local endpoint shown below.
 # [limits.c2s.profiles.internal]
 # max_stanza_bytes = 524_288
 
+# ------------------------------------ C2S ------------------------------------------------------
+
+# Add one section per TCP endpoint. These sections replace the default endpoint.
+# Lonewolf requires at least one client endpoint.
+# [[c2s.listeners]]
+
+# Choose the local IP address and port for client connections.
+# Use a numeric IPv4 address or a bracketed IPv6 address followed by the port.
+# IPv6 endpoints accept IPv6 only. Endpoints in the same address family must not
+# overlap.
+# address = "0.0.0.0:5222"
+
+# Select a named limit profile for this endpoint.
+# Omit this setting to use limits.c2s.default; the value below is an example.
+# limits = "default"
+
+# This example local endpoint uses the internal profile defined above.
 # [[c2s.listeners]]
 # address = "127.0.0.1:5223"
 # limits = "internal"
+
+# ------------------------------------ Storage --------------------------------------------------
 
 # [storage]
 
@@ -101,6 +111,8 @@
 # where Lonewolf was launched.
 # path = "./data/lonewolf.dat"
 
+# ------------------------------------ Admin ----------------------------------------------------
+
 # [admin]
 
 # Enable the local HTTP API used to manage accounts.
@@ -112,6 +124,8 @@
 # Lonewolf will not replace an existing file at this path. The parent directory
 # must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
+
+# ------------------------------------ Account --------------------------------------------------
 
 # [account]
 

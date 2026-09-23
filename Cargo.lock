@@ -970,6 +970,7 @@ dependencies = [
 name = "lonewolf-core"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "compio",
  "futures-channel",
  "futures-util",

@@ -14,6 +14,7 @@ use lonewolf_util::core_dispatcher::CoreDispatcher;
 
 use super::*;
 use crate::config::TcpListenerConfig;
+use crate::config::limits::{C2sLimitProfile, C2sLimits};
 
 type TestResult = Result<(), Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,7 +52,10 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         listener.as_raw_fd(),
                         thread::current().id(),
                     ));
-                    run_listener(listener, context, pending().boxed().shared(), 0).await
+                    let attempts = Arc::new(AttemptLimiter::new(
+                        &C2sLimitProfile::default().connection_attempts_per_ip,
+                    ));
+                    run_listener(listener, context, pending().boxed().shared(), 0, attempts).await
                 })
                 .await?;
             let (bound, descriptor, owner) = readiness.await?;
@@ -97,7 +101,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
                 },
             ],
         };
-        let mut listeners = Listeners::start(&config, &handle).await?;
+        let mut listeners = Listeners::start(&config, &C2sLimits::default(), &handle).await?;
         assert_eq!(
             listeners.tasks.len(),
             config.listeners.len() * handle.worker_count()
@@ -136,7 +140,7 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
                 },
             ],
         };
-        let error = Listeners::start(&config, &dispatcher.handle())
+        let error = Listeners::start(&config, &C2sLimits::default(), &dispatcher.handle())
             .await
             .err()
             .ok_or("startup succeeded")?;

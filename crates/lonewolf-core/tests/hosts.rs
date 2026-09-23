@@ -154,6 +154,15 @@ fn empty_and_malformed_certificate_files_are_rejected() -> TestResult {
         Err(HostsError::NoCertificates(_))
     ));
 
+    fs::write(
+        &tls.certificate_chain_path,
+        b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n",
+    )?;
+    assert!(matches!(
+        Hosts::new(&config.hosts, None),
+        Err(HostsError::ReadCertificate { .. })
+    ));
+
     fs::write(&tls.certificate_chain_path, pem("CERTIFICATE", b"not DER")?)?;
     assert!(matches!(
         Hosts::new(&config.hosts, None),

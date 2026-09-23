@@ -4,13 +4,14 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io;
 use std::path::PathBuf;
 
 use graviola::hashing::Sha256;
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, PublicKeyData};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCertUsingSni;
 use rustls::sign::CertifiedKey;
@@ -109,12 +110,12 @@ fn load_certified_key(
             path: tls.certificate_chain_path.clone(),
             source,
         })?;
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(certificate_file))
+    let certificates = CertificateDer::pem_reader_iter(certificate_file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| HostsError::ReadCertificate {
             domain: domain.into(),
             path: tls.certificate_chain_path.clone(),
-            source,
+            source: io::Error::other(source),
         })?;
     if certificates.is_empty() {
         return Err(HostsError::NoCertificates(domain.into()));
@@ -126,13 +127,14 @@ fn load_certified_key(
             path: tls.private_key_path.clone(),
             source,
         })?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|source| HostsError::ReadPrivateKey {
+    let key = PrivateKeyDer::from_pem_reader(key_file).map_err(|source| match source {
+        PemError::NoItemsFound => HostsError::NoPrivateKey(domain.into()),
+        source => HostsError::ReadPrivateKey {
             domain: domain.into(),
             path: tls.private_key_path.clone(),
-            source,
-        })?
-        .ok_or_else(|| HostsError::NoPrivateKey(domain.into()))?;
+            source: io::Error::other(source),
+        },
+    })?;
     certified_key(domain, certificates, key, provider)
 }
 

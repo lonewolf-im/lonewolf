@@ -53,7 +53,6 @@ redb = { version = "4.3.0", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"] }
 rustls-graviola = "0.4.0"
-rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1 = { version = "0.11.0", default-features = false, features = ["zeroize"] }

@@ -71,13 +71,14 @@ impl Listeners {
             let connections =
                 Arc::new(ConnectionLimiter::new(profile.max_connections_per_ip.get()));
             let max_stanza_bytes = profile.max_stanza_bytes;
+            let xml_rate = &profile.incoming_xml_per_connection;
             let mut address = config.address;
             for worker_id in 0..dispatcher.worker_count() {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
                 let attempts = Arc::clone(&attempts);
                 let connections = Arc::clone(&connections);
-                let settings = StreamSettings::new(max_stanza_bytes, allocator.clone());
+                let settings = StreamSettings::new(max_stanza_bytes, xml_rate, allocator.clone());
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
                         let result = async {

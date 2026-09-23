@@ -404,6 +404,40 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
 }
 
 #[test]
+fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
+    let payload = [OPEN, b"</stream:stream>"].concat();
+    let config = format!(
+        "[admin]\nenabled = false\n[limits.c2s]\ndefault = 'fast'\n[limits.c2s.profiles.fast]\nincoming_xml_per_connection = {{ bytes_per_second = 1000000, burst_bytes = 1000000 }}\n[limits.c2s.profiles.slow]\nincoming_xml_per_connection = {{ bytes_per_second = 1, burst_bytes = {} }}\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'slow'\n",
+        payload.len() - 1
+    );
+    let mut server = Server::start(&config, 1)?;
+    let logs = server.ready(2)?;
+    let mut ports = [0_u16; 2];
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP listener started"))
+    {
+        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
+    }
+    assert!(!ports.contains(&0));
+    let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1]))?;
+    slow.set_read_timeout(Some(Duration::from_millis(100)))?;
+    slow.write_all(&payload)?;
+    assert!(matches!(
+        slow.read(&mut [0; 1]),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+    ));
+    let mut fast = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[0]))?;
+    fast.set_read_timeout(Some(TIMEOUT))?;
+    fast.write_all(&payload)?;
+    assert_eq!(fast.read(&mut [0; 1])?, 0);
+    slow.set_read_timeout(Some(TIMEOUT))?;
+    assert_eq!(slow.read(&mut [0; 1])?, 0);
+    server.stop(Signal::SIGINT)?;
+    Ok(())
+}
+
+#[test]
 fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
     let mut server = Server::start(

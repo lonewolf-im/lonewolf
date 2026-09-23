@@ -6,9 +6,11 @@ use std::pin::pin;
 use compio::io::compat::AsyncReadStream;
 use compio::net::TcpStream;
 use lonewolf_util::arena::{ArenaConfig, ChunkAllocator};
+use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
 
 use super::connection_limit::ConnectionPermit;
+use crate::config::limits::ByteRate;
 
 const READ_BUFFER_BYTES: usize = 1_024;
 
@@ -21,13 +23,17 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
 #[derive(Clone)]
 pub(super) struct StreamSettings<A: ChunkAllocator> {
     max_stanza_bytes: NonZeroUsize,
+    xml_bytes_per_second: NonZeroUsize,
+    xml_burst_bytes: NonZeroUsize,
     allocator: A,
 }
 
 impl<A: ChunkAllocator> StreamSettings<A> {
-    pub(super) fn new(max_stanza_bytes: NonZeroUsize, allocator: A) -> Self {
+    pub(super) fn new(max_stanza_bytes: NonZeroUsize, xml_rate: &ByteRate, allocator: A) -> Self {
         Self {
             max_stanza_bytes,
+            xml_bytes_per_second: xml_rate.bytes_per_second,
+            xml_burst_bytes: xml_rate.burst_bytes,
             allocator,
         }
     }
@@ -55,7 +61,11 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         let outcome = {
             let mut input = pin!(AsyncReadStream::with_capacity(READ_BUFFER_BYTES, transport));
             let mut parser = XmppParser::new(
-                compio_reader(input.as_mut()),
+                RateLimitedReader::new(
+                    compio_reader(input.as_mut()),
+                    settings.xml_bytes_per_second,
+                    settings.xml_burst_bytes,
+                ),
                 ParserConfig {
                     max_stanza_bytes: settings.max_stanza_bytes,
                     arena: ArenaConfig::default(),

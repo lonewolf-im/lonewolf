@@ -68,6 +68,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         connections,
                         StreamSettings::new(
                             C2sLimitProfile::default().max_stanza_bytes,
+                            &C2sLimitProfile::default().incoming_xml_per_connection,
                             GlobalChunkAllocator,
                         ),
                     )

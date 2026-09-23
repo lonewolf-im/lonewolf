@@ -1016,6 +1016,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "nix",
+ "tokio",
 ]
 
 [[package]]

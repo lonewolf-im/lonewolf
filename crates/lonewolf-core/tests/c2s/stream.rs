@@ -16,12 +16,22 @@ use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
 use crate::c2s::unauthenticated_limit::{
     Admission as UnauthenticatedAdmission, UnauthenticatedLimiter,
 };
+use crate::config::Config;
+use crate::hosts::HostsError;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN: &str =
     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+
+fn hosts() -> Result<Arc<Hosts>, HostsError> {
+    let config = Config::default();
+    Ok(Arc::new(Hosts::new(
+        &config.hosts,
+        config.xmpp.default_host.as_deref(),
+    )?))
+}
 
 fn run_case(
     input: &[u8],
@@ -64,15 +74,18 @@ fn run_case_with_rate(
         else {
             return Err("first unauthenticated connection was denied".into());
         };
+        let hosts = hosts()?;
         let started = Instant::now();
-        let outcome = XmppStream::new(
+        let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
+            Arc::clone(&hosts),
             StreamSettings::new(max_stanza_bytes, xml_rate, GlobalChunkAllocator),
-        )
-        .run()
-        .await;
+        );
+        assert_eq!(Arc::strong_count(&hosts), 2);
+        let outcome = stream.run().await;
+        assert_eq!(Arc::strong_count(&hosts), 1);
         let elapsed = started.elapsed();
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
@@ -173,17 +186,21 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
             bytes_per_second: NonZeroUsize::MIN,
             burst_bytes: NonZeroUsize::MIN,
         };
+        let hosts = hosts()?;
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
+            Arc::clone(&hosts),
             StreamSettings::new(MAX_STANZA_BYTES, &rate, GlobalChunkAllocator),
         );
+        assert_eq!(Arc::strong_count(&hosts), 2);
         assert!(
             timeout(Duration::from_millis(20), stream.run())
                 .await
                 .is_err()
         );
+        assert_eq!(Arc::strong_count(&hosts), 1);
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
             ConnectionAdmission::Allowed(_)

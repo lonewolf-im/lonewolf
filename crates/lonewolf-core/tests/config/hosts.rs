@@ -18,7 +18,12 @@ fn localhost_is_the_only_default_host_without_tls_files() {
 fn configured_hosts_replace_localhost_and_keep_tls_per_host() -> TestResult {
     let file = config_file(
         r#"
-[hosts."example.com"]
+[xmpp]
+default_host = "chat.example.org"
+
+[hosts."example.com".tls]
+certificate_chain_path = "certs/example.pem"
+private_key_path = "certs/example.key"
 
 [hosts."chat.example.org".tls]
 certificate_chain_path = "certs/chat.pem"
@@ -28,14 +33,50 @@ private_key_path = "certs/chat.key"
     let config = Config::load(Some(file.path()))?;
 
     assert_eq!(config.hosts.len(), 2);
+    assert_eq!(
+        config.xmpp.default_host.as_deref(),
+        Some("chat.example.org")
+    );
     assert!(!config.hosts.contains_key("localhost"));
-    assert!(config.hosts["example.com"].tls.is_none());
+    assert!(config.hosts["example.com"].tls.is_some());
     let tls = config.hosts["chat.example.org"]
         .tls
         .as_ref()
         .ok_or("missing TLS settings")?;
     assert_eq!(tls.certificate_chain_path, Path::new("certs/chat.pem"));
     assert_eq!(tls.private_key_path, Path::new("certs/chat.key"));
+    Ok(())
+}
+
+#[test]
+fn non_localhost_hosts_require_tls() -> TestResult {
+    for contents in [
+        "[hosts.\"example.com\"]",
+        "[xmpp]\ndefault_host = 'localhost'\n[hosts.localhost]\n[hosts.\"example.com\"]",
+    ] {
+        let file = config_file(contents)?;
+        let error = Config::load(Some(file.path())).expect_err(contents);
+        assert!(matches!(error, ConfigError::Invalid { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("hosts.example.com.tls is required")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn multiple_hosts_require_a_selected_default() -> TestResult {
+    for contents in [
+        "[hosts.localhost]\n[hosts.\"example.com\"]",
+        "[xmpp]\ndefault_host = 'missing.example'\n[hosts.localhost]",
+        "[xmpp]\ndefault_host = ''\n[hosts.localhost]",
+    ] {
+        let file = config_file(contents)?;
+        let error = Config::load(Some(file.path())).expect_err(contents);
+        assert!(matches!(error, ConfigError::Invalid { .. }), "{error}");
+    }
     Ok(())
 }
 

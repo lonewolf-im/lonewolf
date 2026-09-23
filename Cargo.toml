@@ -31,6 +31,7 @@ futures-channel = "0.3.34"
 futures-executor = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
+graviola = "0.4.1"
 hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
 http-body-util = { version = "0.1.4", default-features = false }
 hyper = { version = "1.11.0", default-features = false, features = ["server", "http1"] }
@@ -49,6 +50,10 @@ percent-encoding = "2.3.2"
 precis-profiles = { version = "0.2.0", default-features = false }
 quick-xml = { version = "0.41.0", default-features = false, features = ["async-tokio"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
+rcgen = { version = "0.14.10", default-features = false }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"] }
+rustls-graviola = "0.4.0"
+rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha1 = { version = "0.11.0", default-features = false, features = ["zeroize"] }

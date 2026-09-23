@@ -511,6 +511,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
             }),
         },
     );
+    expected.xmpp.default_host = Some("localhost".into());
     expected.c2s.listeners[0].limits = Some("default".into());
     expected.c2s.listeners.push(TcpListenerConfig {
         address: "127.0.0.1:5223".parse()?,

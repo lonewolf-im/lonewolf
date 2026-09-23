@@ -7,11 +7,13 @@ use lonewolf_storage::StorageError;
 use lonewolf_util::pool::PoolError;
 
 use crate::config::ConfigError;
+use crate::hosts::HostsError;
 
 #[derive(Debug)]
 pub enum RunError {
     Logging(Box<dyn Error + Send + Sync>),
     Config(ConfigError),
+    Hosts(HostsError),
     StanzaPool(PoolError),
     Runtime(io::Error),
     WorkerCount(io::Error),
@@ -31,6 +33,7 @@ impl fmt::Display for RunError {
         match self {
             Self::Logging(source) => write!(formatter, "cannot initialize logging: {source}"),
             Self::Config(source) => source.fmt(formatter),
+            Self::Hosts(source) => write!(formatter, "cannot initialize hosts: {source}"),
             Self::StanzaPool(source) => {
                 write!(formatter, "cannot initialize stanza arena pool: {source}")
             }
@@ -66,6 +69,7 @@ impl Error for RunError {
         match self {
             Self::Logging(source) => Some(source.as_ref()),
             Self::Config(source) => Some(source),
+            Self::Hosts(source) => Some(source),
             Self::StanzaPool(source) => Some(source),
             Self::Runtime(source)
             | Self::WorkerCount(source)

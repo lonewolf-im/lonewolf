@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 use std::pin::pin;
+use std::sync::Arc;
 
 use compio::io::compat::AsyncReadStream;
 use compio::net::TcpStream;
@@ -12,6 +13,7 @@ use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, c
 use super::connection_limit::ConnectionPermit;
 use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::limits::ByteRate;
+use crate::hosts::Hosts;
 
 const READ_BUFFER_BYTES: usize = 1_024;
 
@@ -19,6 +21,7 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
     transport: TcpStream,
     ip_permit: ConnectionPermit,
     unauthenticated_permit: UnauthenticatedPermit,
+    _hosts: Arc<Hosts>,
     settings: StreamSettings<A>,
 }
 
@@ -46,12 +49,14 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         transport: TcpStream,
         ip_permit: ConnectionPermit,
         unauthenticated_permit: UnauthenticatedPermit,
+        hosts: Arc<Hosts>,
         settings: StreamSettings<A>,
     ) -> Self {
         Self {
             transport,
             ip_permit,
             unauthenticated_permit,
+            _hosts: hosts,
             settings,
         }
     }
@@ -61,6 +66,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             transport,
             ip_permit,
             unauthenticated_permit,
+            _hosts,
             settings,
         } = self;
         let outcome = {

@@ -4,7 +4,8 @@ use std::future::pending;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use compio::net::{TcpListener, TcpSocket, TcpStream};
 use futures_channel::oneshot;
@@ -16,6 +17,11 @@ use nix::errno::Errno;
 use socket2::SockRef;
 
 use crate::config::C2sConfig;
+use crate::config::limits::C2sLimits;
+
+mod attempt_limit;
+
+use attempt_limit::{Admission, AttemptLimiter};
 
 const BACKLOG: i32 = 128;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -30,7 +36,11 @@ pub(crate) struct Listeners {
 }
 
 impl Listeners {
-    pub(crate) async fn start(config: &C2sConfig, dispatcher: &DispatchHandle) -> io::Result<Self> {
+    pub(crate) async fn start(
+        config: &C2sConfig,
+        limits: &C2sLimits,
+        dispatcher: &DispatchHandle,
+    ) -> io::Result<Self> {
         let (stop, stopped) = oneshot::channel();
         let stopped = async move {
             let _ = stopped.await;
@@ -44,10 +54,19 @@ impl Listeners {
             worker_count: dispatcher.worker_count(),
         };
         for (listener_id, config) in config.listeners.iter().enumerate() {
+            let profile_name = config.limits.as_deref().unwrap_or(&limits.default);
+            let profile = limits.profiles.get(profile_name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("c2s listener {listener_id} references unknown limit profile {profile_name:?}"),
+                )
+            })?;
+            let attempts = Arc::new(AttemptLimiter::new(&profile.connection_attempts_per_ip));
             let mut address = config.address;
             for worker_id in 0..dispatcher.worker_count() {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
+                let attempts = Arc::clone(&attempts);
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
                         let result = async {
@@ -56,7 +75,7 @@ impl Listeners {
                             if ready.send(bound).is_err() {
                                 return Ok(());
                             }
-                            run_listener(listener, context, stop, listener_id).await
+                            run_listener(listener, context, stop, listener_id, attempts).await
                         }
                         .await;
                         result.map_err(|error| listener_error(listener_id, worker_id, error))
@@ -132,6 +151,7 @@ async fn run_listener(
     context: WorkerContext,
     stop: Stop,
     listener_id: usize,
+    attempts: Arc<AttemptLimiter>,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
     tracing::debug!(
@@ -147,14 +167,33 @@ async fn run_listener(
     let result = loop {
         match select(shutdown.as_mut(), pin!(listener.accept())).await {
             Either::Left(_) => break Ok(()),
-            Either::Right((Ok((stream, _)), _)) => {
-                close_unhandled_connection(stream);
-                tracing::trace!(
-                    listener_id,
-                    worker_id,
-                    outcome = "no_session_handler",
-                    "c2s connection closed"
-                );
+            Either::Right((Ok((stream, peer)), _)) => {
+                match attempts.admit(peer.ip(), Instant::now()).await {
+                    Admission::Allowed => {
+                        close_unhandled_connection(stream);
+                        tracing::trace!(
+                            listener_id,
+                            worker_id,
+                            outcome = "no_session_handler",
+                            "c2s connection closed"
+                        );
+                    }
+                    Admission::Denied {
+                        outcome,
+                        report_count,
+                    } => {
+                        close_unhandled_connection(stream);
+                        if let Some(rejected_attempts) = report_count {
+                            tracing::warn!(
+                                listener_id,
+                                worker_id,
+                                outcome,
+                                rejected_attempts,
+                                "c2s connection attempt rejected"
+                            );
+                        }
+                    }
+                }
             }
             Either::Right((Err(error), _)) => {
                 if matches!(

@@ -20,7 +20,7 @@
 
 # ------------------------------------ Limits ---------------------------------------------------
 
-# These settings define policy values but do not enforce runtime limits.
+# The connection attempt limit applies at TCP admission. Other limits have no runtime effect.
 # All numeric limits are positive integers.
 # [limits.c2s]
 

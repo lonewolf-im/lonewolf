@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Policy configuration only; these values do not enforce runtime limits.
-
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};

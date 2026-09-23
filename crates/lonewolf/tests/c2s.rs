@@ -222,6 +222,129 @@ fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
 }
 
 #[test]
+fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
+    let workers = thread::available_parallelism()?.get().min(2);
+    let mut server = Server::start(
+        "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.default]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
+        workers,
+    )?;
+    let logs = server.ready(1)?;
+    let started = logs
+        .lines()
+        .find(|line| line.contains("c2s TCP listener started"))
+        .ok_or("missing listener start log")?;
+    let port = u16::try_from(field(started, "port=")?)?;
+    for _ in 0..16 {
+        let mut stream =
+            TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), TIMEOUT)?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        assert_eq!(stream.read(&mut [0; 1])?, 0);
+    }
+    server.stop(Signal::SIGINT)?;
+    let logs = server.logs()?;
+    assert_eq!(
+        logs.matches("outcome=\"no_session_handler\"").count(),
+        1,
+        "{logs}"
+    );
+    assert_eq!(
+        logs.matches("c2s connection attempt rejected").count(),
+        1,
+        "{logs}"
+    );
+    assert!(logs.contains("outcome=\"rate_limited\""));
+    assert!(!logs.contains("127.0.0.1"));
+    Ok(())
+}
+
+#[test]
+fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult {
+    let workers = thread::available_parallelism()?.get().min(2);
+    let mut server = Server::start(
+        "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.shared]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n",
+        workers,
+    )?;
+    let logs = server.ready(2)?;
+    let mut ports = [0_u16; 2];
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP listener started"))
+    {
+        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
+    }
+    assert!(!ports.contains(&0));
+    for port in ports {
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                TIMEOUT,
+            )?;
+            stream.set_read_timeout(Some(TIMEOUT))?;
+            assert_eq!(stream.read(&mut [0; 1])?, 0);
+        }
+    }
+    server.stop(Signal::SIGINT)?;
+    let logs = server.logs()?;
+    assert_eq!(
+        logs.matches("outcome=\"no_session_handler\"").count(),
+        2,
+        "{logs}"
+    );
+    let mut rejected = std::collections::BTreeSet::new();
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s connection attempt rejected"))
+    {
+        assert!(line.contains("outcome=\"rate_limited\""));
+        assert!(rejected.insert(field(line, "listener_id=")?));
+    }
+    assert_eq!(rejected, std::collections::BTreeSet::from([0, 1]));
+    assert!(!logs.contains("127.0.0.1"));
+    Ok(())
+}
+
+#[test]
+fn listener_uses_its_selected_attempt_limit_profile() -> TestResult {
+    let mut server = Server::start(
+        "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s]\ndefault = 'strict'\n[limits.c2s.profiles.strict]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[limits.c2s.profiles.relaxed]\nconnection_attempts_per_ip = { per_second = 1, burst = 3 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'relaxed'\n",
+        1,
+    )?;
+    let logs = server.ready(2)?;
+    let mut ports = [0_u16; 2];
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP listener started"))
+    {
+        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
+    }
+    assert!(!ports.contains(&0));
+    for port in ports {
+        for _ in 0..2 {
+            let mut stream = TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                TIMEOUT,
+            )?;
+            stream.set_read_timeout(Some(TIMEOUT))?;
+            assert_eq!(stream.read(&mut [0; 1])?, 0);
+        }
+    }
+    server.stop(Signal::SIGINT)?;
+    let logs = server.logs()?;
+    assert_eq!(
+        logs.matches("outcome=\"no_session_handler\"").count(),
+        3,
+        "{logs}"
+    );
+    let rejections: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("c2s connection attempt rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 1, "{logs}");
+    assert_eq!(field(rejections[0], "listener_id=")?, 0);
+    Ok(())
+}
+
+#[test]
 fn empty_listener_list_fails_before_starting_services() -> TestResult {
     for admin_enabled in [true, false] {
         let mut server = Server::start(

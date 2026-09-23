@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::future::Future;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::thread;
@@ -55,7 +55,18 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                     let attempts = Arc::new(AttemptLimiter::new(
                         &C2sLimitProfile::default().connection_attempts_per_ip,
                     ));
-                    run_listener(listener, context, pending().boxed().shared(), 0, attempts).await
+                    let connections = Arc::new(ConnectionLimiter::new(
+                        C2sLimitProfile::default().max_connections_per_ip.get(),
+                    ));
+                    run_listener(
+                        listener,
+                        context,
+                        pending().boxed().shared(),
+                        0,
+                        attempts,
+                        connections,
+                    )
+                    .await
                 })
                 .await?;
             let (bound, descriptor, owner) = readiness.await?;
@@ -72,6 +83,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         }
         for _ in 0..16 {
             let mut client = TcpStream::connect(address).await?;
+            SockRef::from(&client).shutdown(Shutdown::Write)?;
             assert_eq!(client.read([0; 1]).await.0?, 0);
         }
         dispatcher.shutdown(TIMEOUT).await?;

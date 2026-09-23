@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -93,6 +93,19 @@ fn field(line: &str, key: &str) -> Result<usize, Box<dyn Error>> {
         .and_then(|value| value.parse().map_err(Into::into))
 }
 
+fn connect_until_eof(port: u16) -> TestResult {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    match stream.shutdown(Shutdown::Write) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
+        Err(error) => return Err(error.into()),
+    }
+    assert_eq!(stream.read(&mut [0; 1])?, 0);
+    Ok(())
+}
+
 #[test]
 fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
@@ -126,12 +139,7 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
     assert!(!ports.contains(&0));
     for port in ports {
         for _ in 0..16 {
-            let mut stream = TcpStream::connect_timeout(
-                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                TIMEOUT,
-            )?;
-            stream.set_read_timeout(Some(TIMEOUT))?;
-            assert_eq!(stream.read(&mut [0; 1])?, 0);
+            connect_until_eof(port)?;
         }
     }
     let socket = server.directory.path().join("run/lonewolf/admin.sock");
@@ -235,10 +243,7 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
         .ok_or("missing listener start log")?;
     let port = u16::try_from(field(started, "port=")?)?;
     for _ in 0..16 {
-        let mut stream =
-            TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), TIMEOUT)?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
-        assert_eq!(stream.read(&mut [0; 1])?, 0);
+        connect_until_eof(port)?;
     }
     server.stop(Signal::SIGINT)?;
     let logs = server.logs()?;
@@ -254,6 +259,106 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
     );
     assert!(logs.contains("outcome=\"rate_limited\""));
     assert!(!logs.contains("127.0.0.1"));
+    Ok(())
+}
+
+#[test]
+fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> TestResult {
+    let workers = thread::available_parallelism()?.get().min(2);
+    let mut server = Server::start(
+        "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.default]\nmax_connections_per_ip = 1\nconnection_attempts_per_ip = { per_second = 1000, burst = 1000 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
+        workers,
+    )?;
+    let logs = server.ready(1)?;
+    let started = logs
+        .lines()
+        .find(|line| line.contains("c2s TCP listener started"))
+        .ok_or("missing listener start log")?;
+    let address = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        u16::try_from(field(started, "port=")?)?,
+    ));
+    let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    first.set_read_timeout(Some(Duration::from_millis(200)))?;
+    first.write_all(b"still open")?;
+    assert!(matches!(
+        first.read(&mut [0; 1]),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+    ));
+    let mut rejected = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    rejected.set_read_timeout(Some(TIMEOUT))?;
+    assert_eq!(rejected.read(&mut [0; 1])?, 0);
+    first.shutdown(Shutdown::Write)?;
+    assert_eq!(first.read(&mut [0; 1])?, 0);
+    let deadline = Instant::now() + TIMEOUT;
+    while !server.logs()?.contains("c2s connection closed") {
+        if Instant::now() >= deadline {
+            return Err("accepted connection did not finish after EOF".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut replacement = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    replacement.set_read_timeout(Some(Duration::from_millis(200)))?;
+    replacement.write_all(b"still open")?;
+    assert!(matches!(
+        replacement.read(&mut [0; 1]),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+    ));
+    server.stop(Signal::SIGINT)?;
+    replacement.set_read_timeout(Some(TIMEOUT))?;
+    assert_eq!(replacement.read(&mut [0; 1])?, 0);
+    let logs = server.logs()?;
+    assert!(logs.contains("outcome=\"connection_limit\""));
+    assert!(!logs.contains("127.0.0.1"));
+    Ok(())
+}
+
+#[test]
+fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult {
+    let workers = thread::available_parallelism()?.get().min(2);
+    let mut server = Server::start(
+        "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.shared]\nmax_connections_per_ip = 1\nconnection_attempts_per_ip = { per_second = 1000, burst = 1000 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n",
+        workers,
+    )?;
+    let logs = server.ready(2)?;
+    let mut ports = [0_u16; 2];
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP listener started"))
+    {
+        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
+    }
+    assert!(!ports.contains(&0));
+    let mut held = Vec::with_capacity(2);
+    for port in ports {
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
+        first.set_read_timeout(Some(Duration::from_millis(200)))?;
+        first.write_all(b"open")?;
+        assert!(matches!(
+            first.read(&mut [0; 1]),
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+        ));
+        let mut rejected = TcpStream::connect_timeout(&address, TIMEOUT)?;
+        rejected.set_read_timeout(Some(TIMEOUT))?;
+        assert_eq!(rejected.read(&mut [0; 1])?, 0);
+        held.push(first);
+    }
+    server.stop(Signal::SIGINT)?;
+    for mut stream in held {
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        assert_eq!(stream.read(&mut [0; 1])?, 0);
+    }
+    let logs = server.logs()?;
+    let mut rejected = std::collections::BTreeSet::new();
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s connection rejected"))
+    {
+        assert!(line.contains("outcome=\"connection_limit\""));
+        assert!(rejected.insert(field(line, "listener_id=")?));
+    }
+    assert_eq!(rejected, std::collections::BTreeSet::from([0, 1]));
     Ok(())
 }
 
@@ -275,12 +380,7 @@ fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult
     assert!(!ports.contains(&0));
     for port in ports {
         for _ in 0..2 {
-            let mut stream = TcpStream::connect_timeout(
-                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                TIMEOUT,
-            )?;
-            stream.set_read_timeout(Some(TIMEOUT))?;
-            assert_eq!(stream.read(&mut [0; 1])?, 0);
+            connect_until_eof(port)?;
         }
     }
     server.stop(Signal::SIGINT)?;
@@ -320,12 +420,7 @@ fn listener_uses_its_selected_attempt_limit_profile() -> TestResult {
     assert!(!ports.contains(&0));
     for port in ports {
         for _ in 0..2 {
-            let mut stream = TcpStream::connect_timeout(
-                &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                TIMEOUT,
-            )?;
-            stream.set_read_timeout(Some(TIMEOUT))?;
-            assert_eq!(stream.read(&mut [0; 1])?, 0);
+            connect_until_eof(port)?;
         }
     }
     server.stop(Signal::SIGINT)?;

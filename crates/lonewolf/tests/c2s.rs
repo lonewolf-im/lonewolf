@@ -14,6 +14,8 @@ use nix::unistd::Pid;
 
 type TestResult = Result<(), Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(10);
+const OPEN: &[u8] =
+    b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 
 struct Server {
     child: Child,
@@ -247,11 +249,7 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
     }
     server.stop(Signal::SIGINT)?;
     let logs = server.logs()?;
-    assert_eq!(
-        logs.matches("outcome=\"no_session_handler\"").count(),
-        1,
-        "{logs}"
-    );
+    assert_eq!(logs.matches("outcome=\"eof\"").count(), 1, "{logs}");
     assert_eq!(
         logs.matches("c2s connection attempt rejected").count(),
         1,
@@ -280,7 +278,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     ));
     let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
     first.set_read_timeout(Some(Duration::from_millis(200)))?;
-    first.write_all(b"still open")?;
+    first.write_all(OPEN)?;
     assert!(matches!(
         first.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
@@ -299,7 +297,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     }
     let mut replacement = TcpStream::connect_timeout(&address, TIMEOUT)?;
     replacement.set_read_timeout(Some(Duration::from_millis(200)))?;
-    replacement.write_all(b"still open")?;
+    replacement.write_all(OPEN)?;
     assert!(matches!(
         replacement.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
@@ -334,7 +332,7 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
         first.set_read_timeout(Some(Duration::from_millis(200)))?;
-        first.write_all(b"open")?;
+        first.write_all(OPEN)?;
         assert!(matches!(
             first.read(&mut [0; 1]),
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
@@ -363,6 +361,49 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
 }
 
 #[test]
+fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
+    let mut server = Server::start(
+        "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s]\ndefault = 'large'\n[limits.c2s.profiles.large]\nmax_stanza_bytes = 262144\n[limits.c2s.profiles.small]\nmax_stanza_bytes = 10000\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'small'\n",
+        1,
+    )?;
+    let logs = server.ready(2)?;
+    let mut ports = [0_u16; 2];
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP listener started"))
+    {
+        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
+    }
+    assert!(!ports.contains(&0));
+    let mut large = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[0]))?;
+    let mut small = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1]))?;
+    large.set_read_timeout(Some(Duration::from_millis(200)))?;
+    small.set_read_timeout(Some(TIMEOUT))?;
+    let payload = format!("<message><body>{}", "x".repeat(12_000));
+    large.write_all(OPEN)?;
+    large.write_all(payload.as_bytes())?;
+    small.write_all(OPEN)?;
+    small.write_all(payload.as_bytes())?;
+    assert!(matches!(
+        large.read(&mut [0; 1]),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+    ));
+    match small.read(&mut [0; 1]) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => return Err(format!("limited connection remained open: {other:?}").into()),
+    }
+    large.shutdown(Shutdown::Write)?;
+    large.set_read_timeout(Some(TIMEOUT))?;
+    assert_eq!(large.read(&mut [0; 1])?, 0);
+    server.stop(Signal::SIGINT)?;
+    let logs = server.logs()?;
+    assert!(logs.contains("outcome=\"size_limit_exceeded\""));
+    assert!(!logs.contains("127.0.0.1"));
+    Ok(())
+}
+
+#[test]
 fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
     let mut server = Server::start(
@@ -385,11 +426,7 @@ fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult
     }
     server.stop(Signal::SIGINT)?;
     let logs = server.logs()?;
-    assert_eq!(
-        logs.matches("outcome=\"no_session_handler\"").count(),
-        2,
-        "{logs}"
-    );
+    assert_eq!(logs.matches("outcome=\"eof\"").count(), 2, "{logs}");
     let mut rejected = std::collections::BTreeSet::new();
     for line in logs
         .lines()
@@ -425,11 +462,7 @@ fn listener_uses_its_selected_attempt_limit_profile() -> TestResult {
     }
     server.stop(Signal::SIGINT)?;
     let logs = server.logs()?;
-    assert_eq!(
-        logs.matches("outcome=\"no_session_handler\"").count(),
-        3,
-        "{logs}"
-    );
+    assert_eq!(logs.matches("outcome=\"eof\"").count(), 3, "{logs}");
     let rejections: Vec<_> = logs
         .lines()
         .filter(|line| line.contains("c2s connection attempt rejected"))

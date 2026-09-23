@@ -977,6 +977,7 @@ dependencies = [
  "lonewolf-admin",
  "lonewolf-storage",
  "lonewolf-util",
+ "lonewolf-xmpp",
  "nix",
  "serde",
  "socket2",

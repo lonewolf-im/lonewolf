@@ -10,6 +10,7 @@ use std::thread;
 use compio::io::AsyncRead;
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 
 use super::*;
@@ -65,6 +66,10 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         0,
                         attempts,
                         connections,
+                        StreamSettings::new(
+                            C2sLimitProfile::default().max_stanza_bytes,
+                            GlobalChunkAllocator,
+                        ),
                     )
                     .await
                 })
@@ -113,7 +118,13 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
                 },
             ],
         };
-        let mut listeners = Listeners::start(&config, &C2sLimits::default(), &handle).await?;
+        let mut listeners = Listeners::start(
+            &config,
+            &C2sLimits::default(),
+            &handle,
+            GlobalChunkAllocator,
+        )
+        .await?;
         assert_eq!(
             listeners.tasks.len(),
             config.listeners.len() * handle.worker_count()
@@ -152,10 +163,15 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
                 },
             ],
         };
-        let error = Listeners::start(&config, &C2sLimits::default(), &dispatcher.handle())
-            .await
-            .err()
-            .ok_or("startup succeeded")?;
+        let error = Listeners::start(
+            &config,
+            &C2sLimits::default(),
+            &dispatcher.handle(),
+            GlobalChunkAllocator,
+        )
+        .await
+        .err()
+        .ok_or("startup succeeded")?;
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert!(error.to_string().contains("listener 1 on worker 0"));
         dispatcher.shutdown(TIMEOUT).await?;

@@ -14,6 +14,7 @@ futures-util.workspace = true
 lonewolf-admin.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
+lonewolf-xmpp.workspace = true
 nix.workspace = true
 serde.workspace = true
 socket2.workspace = true

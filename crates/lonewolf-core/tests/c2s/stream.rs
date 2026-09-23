@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::error::Error;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
+use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
+
+use compio::runtime::Runtime;
+use compio::time::timeout;
+use lonewolf_util::arena::GlobalChunkAllocator;
+
+use super::*;
+use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
+
+const TIMEOUT: Duration = Duration::from_secs(5);
+const OPEN: &str =
+    "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
+const CLOSE: &str = "</stream:stream>";
+const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+
+fn run_case(
+    input: &[u8],
+    shutdown_write: bool,
+    max_stanza_bytes: NonZeroUsize,
+) -> Result<CloseOutcome, Box<dyn Error>> {
+    Runtime::new()?.block_on(timeout(TIMEOUT, async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let address = listener.local_addr()?;
+        let mut client = StdTcpStream::connect(address)?;
+        client.set_read_timeout(Some(TIMEOUT))?;
+        client.write_all(input)?;
+        if shutdown_write {
+            client.shutdown(Shutdown::Write)?;
+        }
+        let (transport, peer) = listener.accept().await?;
+        let limiter = ConnectionLimiter::new(1);
+        let ConnectionAdmission::Allowed(permit) = limiter.reserve(peer.ip(), Instant::now()).await
+        else {
+            return Err("first connection was denied".into());
+        };
+        let outcome = XmppStream::new(
+            transport,
+            permit,
+            StreamSettings::new(max_stanza_bytes, GlobalChunkAllocator),
+        )
+        .run()
+        .await;
+        assert!(matches!(
+            limiter.reserve(peer.ip(), Instant::now()).await,
+            ConnectionAdmission::Allowed(_)
+        ));
+        let mut remaining = [0; 1];
+        assert_eq!(client.read(&mut remaining)?, 0);
+        listener.close().await?;
+        Ok(outcome)
+    }))?
+}
+
+#[test]
+fn stream_footer_closes_without_tcp_eof() -> Result<(), Box<dyn Error>> {
+    let input = format!("{OPEN}{CLOSE}");
+    assert_eq!(
+        run_case(input.as_bytes(), false, MAX_STANZA_BYTES)?,
+        CloseOutcome::StreamEnd
+    );
+    Ok(())
+}
+
+#[test]
+fn tcp_eof_before_stream_footer_releases_connection() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        run_case(OPEN.as_bytes(), true, MAX_STANZA_BYTES)?,
+        CloseOutcome::Eof
+    );
+    assert_eq!(run_case(&[], true, MAX_STANZA_BYTES)?, CloseOutcome::Eof);
+    Ok(())
+}
+
+#[test]
+fn early_stanza_closes_without_tcp_eof() -> Result<(), Box<dyn Error>> {
+    let input = format!("{OPEN}<message/>");
+    assert_eq!(
+        run_case(input.as_bytes(), false, MAX_STANZA_BYTES)?,
+        CloseOutcome::UnsupportedInput
+    );
+    Ok(())
+}
+
+#[test]
+fn configured_stanza_size_is_enforced() -> Result<(), Box<dyn Error>> {
+    let input = format!("{OPEN}<message><body>{}", "x".repeat(10_000));
+    assert_eq!(
+        run_case(input.as_bytes(), false, MAX_STANZA_BYTES)?,
+        CloseOutcome::SizeLimitExceeded
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_xml_closes_connection() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        run_case(b"invalid", false, MAX_STANZA_BYTES)?,
+        CloseOutcome::ParserError
+    );
+    Ok(())
+}

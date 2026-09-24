@@ -4,8 +4,11 @@ use std::error::Error;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use hmac::{Hmac, KeyInit, Mac};
 use lonewolf_auth::scram::{ScramHash, ScramIterations, ScramVerifier};
 use lonewolf_auth::server::{ClientFirst, Mechanism, ScramDecoy, ServerError};
+use pbkdf2::pbkdf2_hmac;
+use sha2::{Digest, Sha256};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -39,6 +42,46 @@ fn sha256_server_matches_rfc7677_exchange() -> TestResult {
         ),
         Ok("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=".into())
     );
+    Ok(())
+}
+
+#[test]
+fn optional_extensions_are_authenticated() -> TestResult {
+    let extension = "x=é=\u{1}\t\u{7f},z=漢";
+    let first_bare = format!("n=user,r=nonce,{extension}");
+    let first_message = format!("n,,{first_bare}");
+    let first = ClientFirst::parse(Mechanism::Sha256, first_message.as_bytes())
+        .map_err(|error| format!("invalid client first: {error:?}"))?;
+    let verifier = ScramVerifier::derive(
+        ScramHash::Sha256,
+        "pencil",
+        [7; 16],
+        ScramIterations::new(4096)?,
+    )?;
+    let (server, challenge) = first
+        .start(verifier, "server")
+        .map_err(|error| format!("cannot start: {error:?}"))?;
+    let without_proof = format!("c=biws,r=nonceserver,{extension}");
+    let auth_message = format!("{first_bare},{challenge},{without_proof}");
+
+    let mut salted = [0; 32];
+    pbkdf2_hmac::<Sha256>(b"pencil", &[7; 16], 4096, &mut salted);
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&salted)?;
+    mac.update(b"Client Key");
+    let client_key = mac.finalize().into_bytes();
+    let stored_key = Sha256::digest(client_key);
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&stored_key)?;
+    mac.update(auth_message.as_bytes());
+    let signature = mac.finalize().into_bytes();
+    let mut proof = [0; 32];
+    for (output, (key, signature)) in proof
+        .iter_mut()
+        .zip(client_key.iter().zip(signature.iter()))
+    {
+        *output = key ^ signature;
+    }
+    let final_message = format!("{without_proof},p={}", STANDARD.encode(proof));
+    assert!(server.finish(final_message.as_bytes(), &[]).is_ok());
     Ok(())
 }
 
@@ -140,6 +183,9 @@ fn malformed_first_messages_are_rejected() {
         "n,,n=user,r=bad,nonce",
         "n,,n=user,r=nonce,m=required",
         "n,,n=user,r=nonce,n=other",
+        "n,,n=user,r=nonce,x=",
+        "n,,n=user,r=nonce,x=a\0",
+        "n,,n=user,r=nonce,x=a,b",
         "n,,n=bad=XX,r=nonce",
         "y,,n=user,r=nonce",
     ] {
@@ -151,4 +197,37 @@ fn malformed_first_messages_are_rejected() {
     assert!(ClientFirst::parse(Mechanism::Sha256, b"p=tls-exporter,,n=user,r=nonce").is_err());
     assert!(ClientFirst::parse(Mechanism::Sha256Plus, b"n,,n=user,r=nonce").is_err());
     assert!(ClientFirst::parse(Mechanism::Sha256, &[b'a'; 4_097]).is_err());
+    assert!(ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce,x=\xff").is_err());
+}
+
+#[test]
+fn malformed_final_extensions_are_rejected() -> TestResult {
+    let verifier = ScramVerifier::derive(
+        ScramHash::Sha256,
+        "pencil",
+        [7; 16],
+        ScramIterations::new(4096)?,
+    )?;
+    let first = ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce")
+        .map_err(|error| format!("invalid client first: {error:?}"))?;
+    let (server, _) = first
+        .start(verifier, "server")
+        .map_err(|error| format!("cannot start: {error:?}"))?;
+    let proof = STANDARD.encode([0; 32]);
+    for extension in ["x=", "x=a\0", "x=a,b", "m=required", "n=other"] {
+        let input = format!("c=biws,r=nonceserver,{extension},p={proof}");
+        assert_eq!(
+            server.finish(input.as_bytes(), &[]),
+            Err(ServerError::Malformed),
+            "{extension:?}"
+        );
+    }
+    let mut invalid_utf8 = b"c=biws,r=nonceserver,x=".to_vec();
+    invalid_utf8.push(0xff);
+    invalid_utf8.extend_from_slice(format!(",p={proof}").as_bytes());
+    assert_eq!(
+        server.finish(&invalid_utf8, &[]),
+        Err(ServerError::Malformed)
+    );
+    Ok(())
 }

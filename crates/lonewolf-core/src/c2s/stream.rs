@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::net::Shutdown;
 use std::num::NonZeroUsize;
@@ -313,35 +314,34 @@ async fn establish<A: ChunkAllocator + Clone>(
         })) => match validate_header(&header, &content_namespace, hosts) {
             Ok(header) => header,
             Err(outcome) => {
-                send_setup_error_tls(
+                return Err(send_setup_error_tls(
                     &mut writer,
                     &selected_host,
                     response_to_from_header(&header).as_deref(),
                     content_namespace == CLIENT_NAMESPACE,
                     outcome,
                 )
-                .await?;
-                return Err(outcome);
+                .await);
             }
         },
         Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
         Err(error) => {
             let outcome = CloseOutcome::from_parse_error(&error);
-            send_setup_error_tls(&mut writer, &selected_host, None, false, outcome).await?;
-            return Err(outcome);
+            return Err(
+                send_setup_error_tls(&mut writer, &selected_host, None, false, outcome).await,
+            );
         }
         _ => return Err(CloseOutcome::ParserError),
     };
     if header.host != selected_host {
-        send_setup_error_tls(
+        return Err(send_setup_error_tls(
             &mut writer,
             &selected_host,
             header.response_to.as_deref(),
             header.client_content_namespace,
             CloseOutcome::HostUnknown,
         )
-        .await?;
-        return Err(CloseOutcome::HostUnknown);
+        .await);
     }
     send_response_header_tls(
         &mut writer,
@@ -525,7 +525,10 @@ async fn authenticate<A: ChunkAllocator + Clone>(
         let known = verifier.is_some() && authzid_matches;
         let verifier = match verifier {
             Some(verifier) => verifier,
-            None => match auth.decoy.verifier(mechanism.hash(), first.username()) {
+            None => match auth.decoy.verifier(
+                mechanism.hash(),
+                &decoy_identity(account.as_ref(), first.username(), &established.host),
+            ) {
                 Ok(verifier) => verifier,
                 Err(_) => {
                     return Err(send_stream_error_tls(
@@ -680,7 +683,16 @@ async fn post_auth_stream<A: ChunkAllocator + Clone>(
     } = established;
     let mut parser = match parser.restart() {
         Ok(parser) => parser,
-        Err(_) => return CloseOutcome::ParserError,
+        Err(_) => {
+            return send_setup_error_tls(
+                &mut writer,
+                &host,
+                None,
+                false,
+                CloseOutcome::ParserError,
+            )
+            .await;
+        }
     };
     let header = match parser.next_event().await {
         Ok(Some(StreamEvent::StreamStart {
@@ -688,14 +700,38 @@ async fn post_auth_stream<A: ChunkAllocator + Clone>(
             content_namespace,
         })) => match validate_header(&header, &content_namespace, hosts) {
             Ok(header) => header,
-            Err(outcome) => return send_stream_error_tls(&mut writer, outcome).await,
+            Err(outcome) => {
+                return send_setup_error_tls(
+                    &mut writer,
+                    &host,
+                    response_to_from_header(&header).as_deref(),
+                    content_namespace == CLIENT_NAMESPACE,
+                    outcome,
+                )
+                .await;
+            }
         },
         Err(ParseError::UnexpectedEof) => return CloseOutcome::Eof,
         Err(error) => {
-            return send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error))
-                .await;
+            return send_setup_error_tls(
+                &mut writer,
+                &host,
+                None,
+                false,
+                CloseOutcome::from_parse_error(&error),
+            )
+            .await;
         }
-        _ => return CloseOutcome::ParserError,
+        _ => {
+            return send_setup_error_tls(
+                &mut writer,
+                &host,
+                None,
+                false,
+                CloseOutcome::ParserError,
+            )
+            .await;
+        }
     };
     if header.host != host
         || header
@@ -703,7 +739,14 @@ async fn post_auth_stream<A: ChunkAllocator + Clone>(
             .as_deref()
             .is_some_and(|from| from != account.as_str())
     {
-        return send_stream_error_tls(&mut writer, CloseOutcome::InvalidFrom).await;
+        return send_setup_error_tls(
+            &mut writer,
+            &host,
+            header.response_to.as_deref(),
+            header.client_content_namespace,
+            CloseOutcome::InvalidFrom,
+        )
+        .await;
     }
     if send_response_header_tls(
         &mut writer,
@@ -732,6 +775,13 @@ fn account_key(username: &str, host: &str) -> Option<AccountKey> {
     let mut arena = Arena::try_new(ArenaConfig::default()).ok()?;
     let jid = Jid::from_parts_in(Some(username), host, None, &mut arena).ok()?;
     AccountKey::try_from(jid.resolve(&arena).ok()?).ok()
+}
+
+fn decoy_identity<'a>(account: Option<&'a AccountKey>, username: &str, host: &str) -> Cow<'a, str> {
+    match account {
+        Some(account) => Cow::Borrowed(account.as_str()),
+        None => Cow::Owned(format!("\0{host}\0{username}")),
+    }
 }
 
 fn account_key_from_jid(jid: &str) -> Option<AccountKey> {
@@ -1127,21 +1177,19 @@ async fn send_setup_error_tls<W: FuturesAsyncWrite + Unpin>(
     to: Option<&str>,
     client_content_namespace: bool,
     outcome: CloseOutcome,
-) -> Result<(), CloseOutcome> {
-    send_response_header_tls(
+) -> CloseOutcome {
+    if let Err(outcome) = send_response_header_tls(
         writer,
         host,
         to,
         client_content_namespace,
         outcome != CloseOutcome::UnsupportedVersion,
     )
-    .await?;
-    let sent = send_stream_error_tls(writer, outcome).await;
-    if sent == CloseOutcome::TransportError {
-        Err(sent)
-    } else {
-        Ok(())
+    .await
+    {
+        return outcome;
     }
+    send_stream_error_tls(writer, outcome).await
 }
 
 fn escape_attribute(output: &mut String, value: &str) {

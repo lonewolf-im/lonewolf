@@ -401,5 +401,5 @@ fn valid_extension(value: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && !matches!(bytes[0], b'n' | b'r' | b'c' | b'p' | b'm')
         && bytes[1] == b'='
-        && bytes[2..].iter().all(|byte| (0x21..=0x7e).contains(byte))
+        && bytes[2..].iter().all(|&byte| !matches!(byte, 0 | b','))
 }

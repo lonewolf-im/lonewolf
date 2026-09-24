@@ -745,6 +745,60 @@ fn malformed_scram_final_does_not_reveal_account_existence()
 }
 
 #[test]
+fn missing_account_challenge_uses_normalized_identity() -> Result<(), Box<dyn Error + Send + Sync>>
+{
+    for (known_account, usernames) in [(false, ["Mallory", "mallory"]), (true, ["Alice", "alice"])]
+    {
+        let outcome = run_sasl_case(PSI_OPEN, known_account, move |tls| {
+            let mut parameters = None;
+            for username in usernames {
+                tls.write_all(
+                    sasl_auth("SCRAM-SHA-256", &format!("n,,n={username},r=clientnonce"))
+                        .as_bytes(),
+                )?;
+                let challenge = sasl_challenge(tls)?;
+                let current = challenge.split_once(",s=").ok_or("missing SCRAM salt")?.1;
+                if let Some(previous) = parameters.as_deref() {
+                    assert_eq!(current, previous);
+                } else {
+                    parameters = Some(current.to_owned());
+                }
+                tls.write_all(format!("<abort xmlns='{SASL_NAMESPACE}'/>").as_bytes())?;
+                let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
+                assert!(failure.contains("<aborted/>"));
+            }
+            tls.write_all(CLOSE.as_bytes())?;
+            let mut rest = String::new();
+            tls.read_to_string(&mut rest)?;
+            assert!(rest.ends_with(STREAM_FOOTER));
+            Ok(())
+        })?;
+        assert_eq!(outcome, CloseOutcome::StreamEnd);
+    }
+    Ok(())
+}
+
+#[test]
+fn decoy_identity_separates_hosts_and_invalid_account_names()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let localhost = account_key("Alice", "localhost").ok_or("invalid account key")?;
+    let other_host = account_key("alice", "other.example").ok_or("invalid account key")?;
+    assert_eq!(
+        decoy_identity(Some(&localhost), "Alice", "localhost"),
+        decoy_identity(Some(&localhost), "alice", "localhost")
+    );
+    assert_ne!(
+        decoy_identity(Some(&localhost), "Alice", "localhost"),
+        decoy_identity(Some(&other_host), "alice", "other.example")
+    );
+    assert_ne!(
+        decoy_identity(None, "Alice", "localhost"),
+        decoy_identity(Some(&localhost), "alice", "localhost")
+    );
+    Ok(())
+}
+
+#[test]
 fn unsupported_scram_binding_uses_standard_sasl_condition()
 -> Result<(), Box<dyn Error + Send + Sync>> {
     let outcome = run_sasl_case(PSI_OPEN, false, |tls| {
@@ -841,7 +895,29 @@ fn run_scram(
     authentication_timeout: Duration,
     post_auth_delay: Duration,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        hash,
+        binding,
+        tls_open,
+        expected_outcome,
+        authentication_timeout,
+        post_auth_delay,
+        None,
+    )
+}
+
+fn run_scram_with_restart(
+    hash: ScramHash,
+    binding: Option<&'static str>,
+    tls_open: &str,
+    expected_outcome: CloseOutcome,
+    authentication_timeout: Duration,
+    post_auth_delay: Duration,
+    post_auth_restart: Option<(&str, &str)>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let tls_open = tls_open.to_owned();
+    let post_auth_restart =
+        post_auth_restart.map(|(opening, condition)| (opening.to_owned(), condition.to_owned()));
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
         let hosts = hosts()?;
         let mut roots = RootCertStore::empty();
@@ -954,7 +1030,7 @@ fn run_scram(
                 )
                 .as_bytes(),
             )?;
-            if expected_outcome == CloseOutcome::InvalidFrom {
+            if expected_outcome == CloseOutcome::InvalidFrom && post_auth_restart.is_none() {
                 let mut response = String::new();
                 tls.read_to_string(&mut response)?;
                 assert!(
@@ -981,10 +1057,27 @@ fn run_scram(
                 )
             );
             std::thread::sleep(post_auth_delay);
-            tls.write_all(format!("{PSI_OPEN}{CLOSE}").as_bytes())?;
+            if let Some((opening, _)) = &post_auth_restart {
+                tls.write_all(opening.as_bytes())?;
+            } else {
+                tls.write_all(format!("{PSI_OPEN}{CLOSE}").as_bytes())?;
+            }
             let mut rest = String::new();
             tls.read_to_string(&mut rest)?;
-            assert!(rest.contains(EMPTY_FEATURES));
+            if let Some((_, condition)) = &post_auth_restart {
+                let opening = rest
+                    .find("<stream:stream")
+                    .ok_or("server stream opening missing")?;
+                let error = rest.find("<stream:error>").ok_or("stream error missing")?;
+                assert!(opening < error, "{rest}");
+                assert!(
+                    rest.contains(&format!("<{condition} xmlns='{STREAM_ERROR_NAMESPACE}'/>")),
+                    "{rest}"
+                );
+                assert!(!rest.contains(EMPTY_FEATURES));
+            } else {
+                assert!(rest.contains(EMPTY_FEATURES));
+            }
             assert!(rest.ends_with(STREAM_FOOTER));
             Ok(())
         });
@@ -1033,6 +1126,49 @@ fn run_scram(
         assert_eq!(outcome, expected_outcome);
         Ok::<_, Box<dyn Error + Send + Sync>>(())
     }))?
+}
+
+#[test]
+fn invalid_post_auth_opening_starts_server_stream_before_error()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    for (opening, outcome, condition) in [
+        (
+            PSI_OPEN.replace("version='1.0'", "version='0.9'"),
+            CloseOutcome::UnsupportedVersion,
+            "unsupported-version",
+        ),
+        (
+            PSI_OPEN.replace("to='localhost'", "to='unknown.example'"),
+            CloseOutcome::HostUnknown,
+            "host-unknown",
+        ),
+        (
+            PSI_OPEN.replace("to='localhost'", "from='bob@localhost' to='localhost'"),
+            CloseOutcome::InvalidFrom,
+            "invalid-from",
+        ),
+        (
+            PSI_OPEN.replace("xmlns='jabber:client'", "xmlns='jabber:server'"),
+            CloseOutcome::InvalidNamespace,
+            "invalid-namespace",
+        ),
+        (
+            PSI_OPEN.replace("version='1.0'", "version='1.0' to='localhost'"),
+            CloseOutcome::ParserError,
+            "bad-format",
+        ),
+    ] {
+        run_scram_with_restart(
+            ScramHash::Sha256,
+            None,
+            PSI_OPEN,
+            outcome,
+            Duration::from_secs(10),
+            Duration::ZERO,
+            Some((&opening, condition)),
+        )?;
+    }
+    Ok(())
 }
 
 #[test]

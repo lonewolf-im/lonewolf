@@ -39,7 +39,7 @@ fn connect(path: &Path, child: &mut Child) -> Result<UnixStream, Box<dyn std::er
 }
 
 #[test]
-fn configured_account_store_logs_route_templates_and_sigterm_cleans_up() -> TestResult {
+fn configured_account_store_logs_admin_commands_and_sigterm_cleans_up() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
         directory.path().join("lonewolf.toml"),
@@ -88,45 +88,73 @@ path = "accounts.redb"
         (
             "GET",
             "/v1/accounts?after=private-account%40example.org",
-            "/v1/accounts",
+            "",
+            "account_list",
             200,
+        ),
+        (
+            "POST",
+            "/v1/accounts",
+            r#"{"jid":"private-account@example.org","password":"private-password"}"#,
+            "account_create",
+            201,
         ),
         (
             "GET",
             "/v1/accounts/private-account%40example.org",
-            "/v1/accounts/{jid}",
-            404,
+            "",
+            "account_get",
+            200,
         ),
         (
             "PUT",
             "/v1/accounts/private-account%40example.org/password",
-            "/v1/accounts/{jid}/password",
-            400,
+            r#"{"password":"private-new-password"}"#,
+            "account_password",
+            204,
         ),
         (
             "PATCH",
             "/v1/accounts/private-account%40example.org",
+            "",
             "/v1/accounts/{jid}",
             405,
         ),
         (
             "GET",
             "/private-account%40example.org?token=private-token",
+            "",
             "unmatched",
             404,
         ),
         (
             "GET",
             "/v1/accounts/private-account%40example.org?token=private-token",
-            "/v1/accounts/{jid}",
+            "",
+            "account_get",
             400,
         ),
+        (
+            "DELETE",
+            "/v1/accounts/private-account%40example.org",
+            "",
+            "account_delete",
+            204,
+        ),
+        (
+            "GET",
+            "/v1/accounts/private-account%40example.org",
+            "",
+            "account_get",
+            404,
+        ),
     ];
-    for (method, target, _, status) in &requests {
+    for (method, target, body, _, status) in &requests {
         let mut stream = connect(&path, &mut child.0)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let request = format!(
-            "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n"
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
         );
         stream.write_all(request.as_bytes())?;
         response.clear();
@@ -169,21 +197,30 @@ path = "accounts.redb"
     assert!(admin_started < waiting);
     assert!(waiting < received);
     assert!(received < dispatcher_stopped);
-    let mut events = logs
-        .lines()
-        .filter(|line| line.contains("admin request completed"));
-    for (route, status) in std::iter::once(("/v1/accounts", 200)).chain(
+    let mut events = logs.lines().filter(|line| {
+        line.contains("admin request completed") || line.contains("admin command handled")
+    });
+    for (action, status) in std::iter::once(("account_list", 200)).chain(
         requests
             .iter()
-            .map(|(_, _, route, status)| (*route, *status)),
+            .map(|(_, _, _, action, status)| (*action, *status)),
     ) {
         let event = events.next().ok_or("missing request log")?;
-        assert!(event.contains(&format!("route={route:?}")), "{event}");
+        if action == "unmatched" || action.starts_with("/v1/") {
+            assert!(event.contains("admin request completed"), "{event}");
+            assert!(event.contains(&format!("route={action:?}")), "{event}");
+        } else {
+            assert!(event.contains(" INFO "), "{event}");
+            assert!(event.contains("admin command handled"), "{event}");
+            assert!(event.contains(&format!("command={action:?}")), "{event}");
+        }
         assert!(event.contains(&format!("status={status}")), "{event}");
     }
     assert!(events.next().is_none());
     assert!(!logs.contains("private-account"));
     assert!(!logs.contains("private-token"));
+    assert!(!logs.contains("private-password"));
+    assert!(!logs.contains("private-new-password"));
     Ok(())
 }
 

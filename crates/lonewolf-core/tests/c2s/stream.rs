@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_util::arena::GlobalChunkAllocator;
+use lonewolf_xmpp::stream::STREAM_ERROR_NAMESPACE;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 

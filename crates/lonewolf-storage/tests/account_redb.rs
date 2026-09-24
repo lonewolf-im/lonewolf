@@ -465,43 +465,65 @@ fn new_database_files_are_private_to_the_owner() -> TestResult {
 }
 
 #[test]
-fn missing_tables_are_initialized() -> TestResult {
-    for accounts_exist in [false, true] {
-        let database = database()?;
-        let transaction = database.as_ref().begin_write()?;
-        if accounts_exist {
-            transaction.open_table(ACCOUNTS)?;
-        } else {
-            transaction.open_table(DECOY_SECRET)?;
-        }
-        transaction.commit()?;
-        let repository = RedbAccountRepository::from_database(database.clone())?;
-        assert!(block_on(repository.get(&key("alice@example.com")?))?.is_none());
-        let transaction = database.as_ref().begin_read()?;
-        assert_eq!(transaction.list_tables()?.count(), 2);
-        assert_eq!(
-            transaction
-                .open_table(DECOY_SECRET)?
-                .get(DECOY_SECRET_KEY)?
-                .ok_or("missing decoy secret")?
-                .value()
-                .len(),
-            32
-        );
-    }
+fn missing_decoy_table_is_initialized_for_empty_account_store() -> TestResult {
+    let database = database()?;
+    let transaction = database.as_ref().begin_write()?;
+    transaction.open_table(ACCOUNTS)?;
+    transaction.commit()?;
+    let repository = RedbAccountRepository::from_database(database.clone())?;
+    assert!(block_on(repository.get(&key("alice@example.com")?))?.is_none());
+    let transaction = database.as_ref().begin_read()?;
+    assert_eq!(transaction.list_tables()?.count(), 2);
+    assert_eq!(
+        transaction
+            .open_table(DECOY_SECRET)?
+            .get(DECOY_SECRET_KEY)?
+            .ok_or("missing decoy secret")?
+            .value()
+            .len(),
+        32
+    );
     Ok(())
 }
 
 #[test]
-fn invalid_persisted_decoy_secret_is_not_replaced() -> TestResult {
-    for value in [&[7][..], &[9; 32][..]] {
+fn missing_decoy_table_with_accounts_is_rejected() -> TestResult {
+    let database = database()?;
+    let repository = RedbAccountRepository::from_database(database.clone())?;
+    let account = key("alice@example.com")?;
+    block_on(repository.create(NewAccount {
+        key: account.clone(),
+        credentials: credentials(10),
+    }))?;
+    let transaction = database.as_ref().begin_write()?;
+    transaction.delete_table(DECOY_SECRET)?;
+    transaction.commit()?;
+
+    match RedbAccountRepository::from_database(database.clone()) {
+        Err(error) => assert_eq!(error.kind(), StorageErrorKind::CorruptData),
+        Ok(_) => return Err("replaced the missing decoy table".into()),
+    }
+    assert!(block_on(repository.get(&account))?.is_some());
+    Ok(())
+}
+
+#[test]
+fn missing_or_invalid_persisted_decoy_secret_is_not_replaced() -> TestResult {
+    for value in [None, Some(&[7][..]), Some(&[9; 32][..])] {
         let database = database()?;
         let _repository = RedbAccountRepository::from_database(database.clone())?;
         let transaction = database.as_ref().begin_write()?;
         {
             let mut table = transaction.open_table(DECOY_SECRET)?;
-            table.insert(DECOY_SECRET_KEY, value)?;
-            if value.len() == 32 {
+            match value {
+                Some(bytes) => {
+                    table.insert(DECOY_SECRET_KEY, bytes)?;
+                }
+                None => {
+                    table.remove(DECOY_SECRET_KEY)?;
+                }
+            }
+            if value.is_some_and(|bytes| bytes.len() == 32) {
                 table.insert("extra", &[1][..])?;
             }
         }
@@ -517,7 +539,7 @@ fn invalid_persisted_decoy_secret_is_not_replaced() -> TestResult {
             table
                 .get(DECOY_SECRET_KEY)?
                 .map(|stored| stored.value().to_vec()),
-            Some(value.to_vec())
+            value.map(<[u8]>::to_vec)
         );
     }
     Ok(())

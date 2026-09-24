@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use ::redb::{
     Database, OwnedRange, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle,
 };
 use futures_util::{Stream, stream};
 use lonewolf_auth::scram::{
@@ -60,15 +61,21 @@ impl RedbAccountRepository {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageErrorKind::CorruptData`] for an invalid decoy secret.
+    /// Returns [`StorageErrorKind::CorruptData`] for missing or invalid decoy state in an existing store.
     /// Backend failures return [`StorageErrorKind::Unavailable`],
     /// [`StorageErrorKind::CorruptData`], or [`StorageErrorKind::Other`].
     /// A failed commit can return [`StorageErrorKind::CommitUnknown`].
     pub fn from_database(database: RedbDatabase) -> Result<Self, StorageError> {
         let transaction = begin_write(database.as_ref())?;
+        let decoy_table_exists = transaction
+            .list_tables()
+            .map_err(storage_error)?
+            .any(|table| table.name() == DECOY_SECRET.name());
         let mut secret = Zeroizing::new([0; 32]);
         {
-            transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+            let accounts = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+            let has_accounts = !accounts.is_empty().map_err(storage_error)?;
+            drop(accounts);
             let mut table = transaction
                 .open_table(DECOY_SECRET)
                 .map_err(storage_error)?;
@@ -82,7 +89,10 @@ impl RedbAccountRepository {
                     }
                     secret.copy_from_slice(stored.value());
                 }
-                None if !table.is_empty().map_err(storage_error)? => {
+                None if decoy_table_exists
+                    || has_accounts
+                    || !table.is_empty().map_err(storage_error)? =>
+                {
                     return Err(StorageError::new(StorageErrorKind::CorruptData));
                 }
                 None => {}

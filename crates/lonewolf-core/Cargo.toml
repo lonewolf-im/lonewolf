@@ -12,6 +12,7 @@ compio = { workspace = true, features = ["net", "rustls", "time"] }
 futures-channel.workspace = true
 futures-util.workspace = true
 graviola.workspace = true
+langtag.workspace = true
 lonewolf-admin.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true

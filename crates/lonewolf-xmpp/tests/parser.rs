@@ -75,6 +75,34 @@ fn opening_stream_exposes_content_namespace() -> TestResult {
     })
 }
 
+#[test]
+fn explicit_attributes_exclude_inherited_stream_language() -> TestResult {
+    block_on(async {
+        let input = format!(
+            "{}<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' flag='1'/>",
+            OPEN.replace('>', " xml:lang='es'>")
+        );
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let Some(StreamEvent::Element(first)) = parser.next_event().await? else {
+            return Err("expected first element".into());
+        };
+        assert!(!first.has_explicit_attributes());
+        assert_eq!(
+            first
+                .value()
+                .resolve(first.arena())?
+                .attribute("lang", "http://www.w3.org/XML/1998/namespace")?,
+            Some("es")
+        );
+        let Some(StreamEvent::Element(second)) = parser.next_event().await? else {
+            return Err("expected second element".into());
+        };
+        assert!(second.has_explicit_attributes());
+        Ok(())
+    })
+}
+
 async fn stanza<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(
     parser: &mut XmppParser<R, A>,
 ) -> TestResult<Parsed<Stanza, A>> {

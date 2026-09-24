@@ -23,6 +23,7 @@ use crate::hosts::HostsError;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";
+const PSI_OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0' xmlns='jabber:client' xml:lang='es' xmlns:xml='http://www.w3.org/XML/1998/namespace'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
@@ -151,7 +152,12 @@ fn early_stanza_closes_without_tcp_eof() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn unknown_host_returns_stream_error() -> Result<(), Box<dyn Error>> {
-    let input = OPEN.replace("to='localhost'", "to='elsewhere.example'");
+    let input = OPEN
+        .replace("to='localhost'", "to='elsewhere.example'")
+        .replace(
+            "version='1.0'",
+            "from='Alice@LOCALHOST/Phone' version='1.0'",
+        );
     let (outcome, _, response) = run_case_with_rate(
         input.as_bytes(),
         false,
@@ -160,7 +166,112 @@ fn unknown_host_returns_stream_error() -> Result<(), Box<dyn Error>> {
     )?;
     assert_eq!(outcome, CloseOutcome::HostUnknown);
     assert!(response.contains("<host-unknown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"));
+    assert!(response.contains(" to='alice@localhost'"));
     assert!(!response.contains(STARTTLS_FEATURES));
+    Ok(())
+}
+
+#[test]
+fn absent_to_uses_default_host() -> Result<(), Box<dyn Error>> {
+    let input = format!("{}{CLOSE}", OPEN.replace(" to='localhost'", ""));
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::StreamEnd);
+    assert!(response.contains(" from='localhost'"));
+    Ok(())
+}
+
+#[test]
+fn invalid_stream_opening_returns_stream_error() -> Result<(), Box<dyn Error>> {
+    for (input, outcome, condition) in [
+        (
+            OPEN.replace("to='localhost'", "to='alice@localhost'"),
+            CloseOutcome::HostUnknown,
+            "host-unknown",
+        ),
+        (
+            OPEN.replace("to='localhost'", "to='localhost/phone'"),
+            CloseOutcome::HostUnknown,
+            "host-unknown",
+        ),
+        (
+            OPEN.replace("version='1.0'", "version='0.9'"),
+            CloseOutcome::UnsupportedVersion,
+            "unsupported-version",
+        ),
+        (
+            OPEN.replace(" version='1.0'", ""),
+            CloseOutcome::UnsupportedVersion,
+            "unsupported-version",
+        ),
+        (
+            OPEN.replace("version='1.0'", "version='+1.0'"),
+            CloseOutcome::UnsupportedVersion,
+            "unsupported-version",
+        ),
+        (
+            OPEN.replace("version='1.0'", "version='1.x'"),
+            CloseOutcome::UnsupportedVersion,
+            "unsupported-version",
+        ),
+        (
+            OPEN.replace("version='1.0'", "xml:lang='en_US' version='1.0'"),
+            CloseOutcome::InvalidLanguage,
+            "bad-format",
+        ),
+        (
+            OPEN.replace("version='1.0'", "xml:lang='' version='1.0'"),
+            CloseOutcome::InvalidLanguage,
+            "bad-format",
+        ),
+        (
+            OPEN.replace("http://etherx.jabber.org/streams", "urn:invalid:stream"),
+            CloseOutcome::InvalidNamespace,
+            "invalid-namespace",
+        ),
+    ] {
+        let (actual, _, response) = run_case_with_rate(
+            input.as_bytes(),
+            false,
+            MAX_STANZA_BYTES,
+            &ByteRate::default(),
+        )?;
+        assert_eq!(actual, outcome, "{input}");
+        assert!(
+            response.contains(&format!("<{condition} xmlns='{STREAM_ERROR_NAMESPACE}'/>")),
+            "{input}: {response}"
+        );
+        if outcome == CloseOutcome::UnsupportedVersion {
+            assert!(
+                !response.contains(" version='1.0' xml:lang"),
+                "{input}: {response}"
+            );
+        }
+        assert!(!response.contains(STARTTLS_FEATURES));
+    }
+    Ok(())
+}
+
+#[test]
+fn stream_version_numbers_are_compared_numerically() -> Result<(), Box<dyn Error>> {
+    for version in ["01.000", "1.13", "12.3", "999999999999999999999.0"] {
+        let input = format!(
+            "{}{CLOSE}",
+            OPEN.replace("version='1.0'", &format!("version='{version}'"))
+        );
+        let (outcome, _, response) = run_case_with_rate(
+            input.as_bytes(),
+            false,
+            MAX_STANZA_BYTES,
+            &ByteRate::default(),
+        )?;
+        assert_eq!(outcome, CloseOutcome::StreamEnd, "{version}");
+        assert!(response.contains(" version='1.0'"));
+    }
     Ok(())
 }
 
@@ -243,6 +354,34 @@ fn starttls_rejects_nonempty_request() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn starttls_rejects_explicit_attribute() -> Result<(), Box<dyn Error>> {
+    let input = format!("{PSI_OPEN}<starttls xmlns='{STARTTLS_NAMESPACE}' flag='1'/>");
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::StartTlsRejected);
+    assert!(response.contains(STARTTLS_FAILURE));
+    Ok(())
+}
+
+#[test]
+fn starttls_rejects_text_content() -> Result<(), Box<dyn Error>> {
+    let input = format!("{PSI_OPEN}<starttls xmlns='{STARTTLS_NAMESPACE}'>text</starttls>");
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::StartTlsRejected);
+    assert!(response.contains(STARTTLS_FAILURE));
+    Ok(())
+}
+
 fn read_through(stream: &mut StdTcpStream, marker: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut byte = [0];
@@ -265,9 +404,10 @@ fn stream_id(response: &str) -> Option<&str> {
         .map(|(id, _)| id)
 }
 
-#[test]
-fn starttls_restarts_stream_and_stops_before_authentication()
--> Result<(), Box<dyn Error + Send + Sync>> {
+fn run_starttls_restart_case(
+    restart_open: &str,
+) -> Result<(CloseOutcome, String, String), Box<dyn Error + Send + Sync>> {
+    let restart_open = restart_open.to_owned();
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
         let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let hosts = hosts()?;
@@ -289,7 +429,7 @@ fn starttls_restarts_stream_and_stops_before_authentication()
                 let mut socket = StdTcpStream::connect(address)?;
                 socket.set_read_timeout(Some(TIMEOUT))?;
                 socket.set_write_timeout(Some(TIMEOUT))?;
-                socket.write_all(OPEN.as_bytes())?;
+                socket.write_all(PSI_OPEN.as_bytes())?;
                 let response = read_through(&mut socket, b"</stream:features>")?;
                 let before_tls = String::from_utf8(response)?;
                 socket.write_all(format!("<starttls xmlns='{STARTTLS_NAMESPACE}'/>").as_bytes())?;
@@ -302,7 +442,7 @@ fn starttls_restarts_stream_and_stops_before_authentication()
                     ServerName::try_from("localhost")?,
                 )?;
                 let mut tls = StreamOwned::new(connection, socket);
-                tls.write_all(OPEN.as_bytes())?;
+                tls.write_all(restart_open.as_bytes())?;
                 let mut after_tls = String::new();
                 tls.read_to_string(&mut after_tls)?;
                 Ok((before_tls, after_tls))
@@ -327,19 +467,57 @@ fn starttls_restarts_stream_and_stops_before_authentication()
             hosts,
             StreamSettings::new(MAX_STANZA_BYTES, &ByteRate::default(), GlobalChunkAllocator),
         );
-        assert_eq!(stream.run().await, CloseOutcome::AuthenticationUnavailable);
+        let outcome = stream.run().await;
         let (before_tls, after_tls) = client.join().map_err(|_| "client thread panicked")??;
+        listener.close().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>((outcome, before_tls, after_tls))
+    }))?
+}
+
+#[test]
+fn starttls_restarts_stream_and_stops_before_authentication()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let (outcome, before_tls, after_tls) = run_starttls_restart_case(PSI_OPEN)?;
+    assert_eq!(outcome, CloseOutcome::AuthenticationUnavailable);
+    assert!(before_tls.contains(STARTTLS_FEATURES));
+    assert!(after_tls.contains(" from='localhost'"));
+    assert!(
+        after_tls.contains("<internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>")
+    );
+    assert!(!after_tls.contains(STARTTLS_FEATURES));
+    assert_ne!(stream_id(&before_tls), stream_id(&after_tls));
+    Ok(())
+}
+
+#[test]
+fn restarted_stream_header_is_validated() -> Result<(), Box<dyn Error + Send + Sync>> {
+    for (open, outcome, condition) in [
+        (
+            PSI_OPEN.replace("to='localhost'", "to='elsewhere.example'"),
+            CloseOutcome::HostUnknown,
+            "host-unknown",
+        ),
+        (
+            PSI_OPEN.replace("xml:lang='es'", "xml:lang='en_US'"),
+            CloseOutcome::InvalidLanguage,
+            "bad-format",
+        ),
+        (
+            PSI_OPEN.replace("version='1.0'", "version='0.9'"),
+            CloseOutcome::UnsupportedVersion,
+            "unsupported-version",
+        ),
+    ] {
+        let (actual, before_tls, after_tls) = run_starttls_restart_case(&open)?;
+        assert_eq!(actual, outcome, "{open}");
         assert!(before_tls.contains(STARTTLS_FEATURES));
-        assert!(after_tls.contains(" from='localhost'"));
         assert!(
-            after_tls
-                .contains("<internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>")
+            after_tls.contains(&format!("<{condition} xmlns='{STREAM_ERROR_NAMESPACE}'/>")),
+            "{open}: {after_tls}"
         );
         assert!(!after_tls.contains(STARTTLS_FEATURES));
-        assert_ne!(stream_id(&before_tls), stream_id(&after_tls));
-        listener.close().await?;
-        Ok::<_, Box<dyn Error + Send + Sync>>(())
-    }))?
+    }
+    Ok(())
 }
 
 #[test]

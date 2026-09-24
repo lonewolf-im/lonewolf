@@ -44,6 +44,7 @@ pub struct ParserConfig {
 pub struct Parsed<T, A: ChunkAllocator> {
     value: T,
     arena: Arena<A>,
+    explicit_attributes: bool,
 }
 
 impl<T: Copy, A: ChunkAllocator> Parsed<T, A> {
@@ -53,6 +54,11 @@ impl<T: Copy, A: ChunkAllocator> Parsed<T, A> {
 
     pub fn arena(&self) -> &Arena<A> {
         &self.arena
+    }
+
+    /// Excludes namespace declarations and attributes inherited from the stream.
+    pub fn has_explicit_attributes(&self) -> bool {
+        self.explicit_attributes
     }
 
     pub fn into_parts(self) -> (T, Arena<A>) {
@@ -96,6 +102,7 @@ pub struct XmppParser<R, A: ChunkAllocator> {
     text: String,
     frames: Vec<Frame>,
     stream_lang: String,
+    root_explicit_attributes: bool,
     phase: Phase,
     failed: bool,
 }
@@ -125,6 +132,7 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
             text: String::new(),
             frames: Vec::new(),
             stream_lang: String::new(),
+            root_explicit_attributes: false,
             phase: Phase::Initial,
             failed: false,
         }
@@ -150,6 +158,7 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
         self.reader = Reader::from_reader(input);
         self.namespaces = NamespaceResolver::default();
         self.stream_lang.clear();
+        self.root_explicit_attributes = false;
         self.phase = Phase::Initial;
         Ok(self)
     }
@@ -255,7 +264,10 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                     names::push(&mut self.namespaces, start)?;
                     if self.phase == Phase::Initial {
                         let (name, namespace) = names::element(&self.namespaces, start)?;
-                        if empty || name != "stream" || namespace != STREAM_NAMESPACE {
+                        if namespace != STREAM_NAMESPACE {
+                            return Err(ParseError::InvalidNamespace);
+                        }
+                        if empty || name != "stream" {
                             return Err(ParseError::UnexpectedEvent);
                         }
                         let mut header_arena =
@@ -268,6 +280,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                             return Err(ParseError::UnexpectedEvent);
                         };
                         let content_namespace = names::content_namespace(&self.namespaces)?.into();
+                        let explicit_attributes = has_explicit_attributes(start)?;
                         if let Some(lang) = value
                             .resolve(&header_arena)
                             .map_err(BuildError::from)?
@@ -284,6 +297,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                             header: Parsed {
                                 value,
                                 arena: header_arena,
+                                explicit_attributes,
                             },
                             content_namespace,
                         });
@@ -293,6 +307,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                         if name == "stream" && namespace == STREAM_NAMESPACE {
                             return Err(ParseError::UnexpectedEvent);
                         }
+                        self.root_explicit_attributes = has_explicit_attributes(start)?;
                     }
                     if arena.is_none() {
                         arena = Some(
@@ -402,7 +417,11 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
             self.reader
                 .get_mut()
                 .reset(self.config.max_stanza_bytes.get());
-            Ok(Some(completed_event(completed, arena)))
+            Ok(Some(completed_event(
+                completed,
+                arena,
+                self.root_explicit_attributes,
+            )))
         }
     }
 }
@@ -415,11 +434,37 @@ fn count_node(nodes: &mut usize) -> Result<(), ParseError> {
     Ok(())
 }
 
-fn completed_event<A: ChunkAllocator>(completed: Completed, arena: Arena<A>) -> StreamEvent<A> {
+fn completed_event<A: ChunkAllocator>(
+    completed: Completed,
+    arena: Arena<A>,
+    explicit_attributes: bool,
+) -> StreamEvent<A> {
     match completed {
-        Completed::Element(value) => StreamEvent::Element(Parsed { value, arena }),
-        Completed::Stanza(value) => StreamEvent::Stanza(Parsed { value, arena }),
+        Completed::Element(value) => StreamEvent::Element(Parsed {
+            value,
+            arena,
+            explicit_attributes,
+        }),
+        Completed::Stanza(value) => StreamEvent::Stanza(Parsed {
+            value,
+            arena,
+            explicit_attributes,
+        }),
     }
+}
+
+fn has_explicit_attributes(start: &BytesStart<'_>) -> Result<bool, ParseError> {
+    for attribute in start.attributes() {
+        if attribute
+            .map_err(quick_xml::Error::from)?
+            .key
+            .as_namespace_binding()
+            .is_none()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {

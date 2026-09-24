@@ -9,6 +9,7 @@ use compio::io::compat::AsyncReadStream;
 use compio::io::{AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::tls::TlsAcceptor;
+use langtag::LangTag;
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_xmpp::jid::Jid;
@@ -116,9 +117,11 @@ async fn establish<A: ChunkAllocator + Clone>(
             })) => match validate_header(&header, &content_namespace, hosts) {
                 Ok(header) => header,
                 Err(outcome) => {
+                    let response_to = response_to_from_header(&header);
                     return send_setup_error(
                         &mut transport,
                         hosts.default_host_name(),
+                        response_to.as_deref(),
                         content_namespace == CLIENT_NAMESPACE,
                         outcome,
                     )
@@ -128,8 +131,14 @@ async fn establish<A: ChunkAllocator + Clone>(
             Err(ParseError::UnexpectedEof) => return CloseOutcome::Eof,
             Err(error) => {
                 let outcome = CloseOutcome::from_parse_error(&error);
-                return send_setup_error(&mut transport, hosts.default_host_name(), false, outcome)
-                    .await;
+                return send_setup_error(
+                    &mut transport,
+                    hosts.default_host_name(),
+                    None,
+                    false,
+                    outcome,
+                )
+                .await;
             }
             _ => return CloseOutcome::ParserError,
         };
@@ -138,6 +147,7 @@ async fn establish<A: ChunkAllocator + Clone>(
             &header.host,
             header.response_to.as_deref(),
             header.client_content_namespace,
+            true,
         )
         .await
         .is_err()
@@ -192,6 +202,7 @@ async fn establish<A: ChunkAllocator + Clone>(
                 &header.host,
                 header.response_to.as_deref(),
                 header.client_content_namespace,
+                true,
             )
             .await
             .is_err()
@@ -204,16 +215,18 @@ async fn establish<A: ChunkAllocator + Clone>(
             send_setup_error(
                 &mut transport,
                 &selected_host,
+                header.response_to.as_deref(),
                 header.client_content_namespace,
                 CloseOutcome::HostUnknown,
             )
             .await
         }
-        Err((CloseOutcome::Eof, _)) => CloseOutcome::Eof,
-        Err((outcome, client_content_namespace)) => {
+        Err((CloseOutcome::Eof, _, _)) => CloseOutcome::Eof,
+        Err((outcome, client_content_namespace, response_to)) => {
             send_setup_error(
                 &mut transport,
                 &selected_host,
+                response_to.as_deref(),
                 client_content_namespace,
                 outcome,
             )
@@ -229,7 +242,7 @@ async fn read_restarted_header<A: ChunkAllocator + Clone>(
     hosts: &Hosts,
     settings: &StreamSettings<A>,
     rate_state: RateLimitState,
-) -> Result<ClientHeader, (CloseOutcome, bool)> {
+) -> Result<ClientHeader, (CloseOutcome, bool, Option<String>)> {
     let mut parser = XmppParser::new(
         RateLimitedReader::from_state(
             BufReader::with_capacity(READ_BUFFER_BYTES, Pin::new(transport).compat()),
@@ -245,11 +258,16 @@ async fn read_restarted_header<A: ChunkAllocator + Clone>(
         Ok(Some(StreamEvent::StreamStart {
             header,
             content_namespace,
-        })) => validate_header(&header, &content_namespace, hosts)
-            .map_err(|outcome| (outcome, content_namespace == CLIENT_NAMESPACE)),
-        Err(ParseError::UnexpectedEof) => Err((CloseOutcome::Eof, false)),
-        Err(error) => Err((CloseOutcome::from_parse_error(&error), false)),
-        _ => Err((CloseOutcome::ParserError, false)),
+        })) => validate_header(&header, &content_namespace, hosts).map_err(|outcome| {
+            (
+                outcome,
+                content_namespace == CLIENT_NAMESPACE,
+                response_to_from_header(&header),
+            )
+        }),
+        Err(ParseError::UnexpectedEof) => Err((CloseOutcome::Eof, false, None)),
+        Err(error) => Err((CloseOutcome::from_parse_error(&error), false, None)),
+        _ => Err((CloseOutcome::ParserError, false, None)),
     }
 }
 
@@ -278,11 +296,11 @@ fn validate_header<A: ChunkAllocator>(
     let (major, minor) = version
         .split_once('.')
         .ok_or(CloseOutcome::UnsupportedVersion)?;
-    if major
-        .parse::<u32>()
-        .map_err(|_| CloseOutcome::UnsupportedVersion)?
-        < 1
-        || minor.parse::<u32>().is_err()
+    if major.is_empty()
+        || minor.is_empty()
+        || major.bytes().all(|digit| digit == b'0')
+        || !major.bytes().all(|digit| digit.is_ascii_digit())
+        || !minor.bytes().all(|digit| digit.is_ascii_digit())
     {
         return Err(CloseOutcome::UnsupportedVersion);
     }
@@ -292,6 +310,13 @@ fn validate_header<A: ChunkAllocator>(
     let from = header
         .attribute("from", "")
         .map_err(|_| CloseOutcome::InternalError)?;
+    if header
+        .attribute("lang", lonewolf_xmpp::stanza::XML_NAMESPACE)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .is_some_and(|lang| LangTag::new(lang).is_err())
+    {
+        return Err(CloseOutcome::InvalidLanguage);
+    }
     let mut arena =
         Arena::try_new(ArenaConfig::default()).map_err(|_| CloseOutcome::InternalError)?;
     let host = match to {
@@ -329,17 +354,26 @@ fn validate_header<A: ChunkAllocator>(
 }
 
 fn is_starttls<A: ChunkAllocator>(element: &lonewolf_xmpp::parser::Parsed<Element, A>) -> bool {
-    let Ok(element) = element.value().resolve(element.arena()) else {
+    let Ok(view) = element.value().resolve(element.arena()) else {
         return false;
     };
-    element.name() == "starttls"
-        && element.namespace() == STARTTLS_NAMESPACE
-        && element
-            .attributes()
-            .is_ok_and(|mut attrs| attrs.next().is_none())
-        && element
+    view.name() == "starttls"
+        && view.namespace() == STARTTLS_NAMESPACE
+        && !element.has_explicit_attributes()
+        && view
             .children()
             .is_ok_and(|mut children| children.next().is_none())
+        && view.text().is_ok_and(|text| text.is_none())
+}
+
+fn response_to_from_header<A: ChunkAllocator>(
+    header: &lonewolf_xmpp::parser::Parsed<Element, A>,
+) -> Option<String> {
+    let header = header.value().resolve(header.arena()).ok()?;
+    let from = header.attribute("from", "").ok()??;
+    let mut arena = Arena::try_new(ArenaConfig::default()).ok()?;
+    let jid = Jid::parse_in(from, &mut arena).ok()?;
+    Some(jid.bare().resolve(&arena).ok()?.as_str().to_owned())
 }
 
 fn is_starttls_element<A: ChunkAllocator>(
@@ -356,12 +390,19 @@ fn is_starttls_element<A: ChunkAllocator>(
 async fn send_setup_error<W: AsyncWrite>(
     transport: &mut W,
     host: &str,
+    to: Option<&str>,
     client_content_namespace: bool,
     outcome: CloseOutcome,
 ) -> CloseOutcome {
-    if send_response_header(transport, host, None, client_content_namespace)
-        .await
-        .is_err()
+    if send_response_header(
+        transport,
+        host,
+        to,
+        client_content_namespace,
+        outcome != CloseOutcome::UnsupportedVersion,
+    )
+    .await
+    .is_err()
     {
         return CloseOutcome::TransportError;
     }
@@ -389,6 +430,7 @@ async fn send_response_header<W: AsyncWrite>(
     host: &str,
     to: Option<&str>,
     client_content_namespace: bool,
+    include_version: bool,
 ) -> Result<(), CloseOutcome> {
     let mut id = [0_u8; 16];
     graviola::random::fill(&mut id).map_err(|_| CloseOutcome::InternalError)?;
@@ -403,7 +445,11 @@ async fn send_response_header<W: AsyncWrite>(
     escape_attribute(&mut xml, host);
     xml.push_str("' id='");
     write!(xml, "{:032x}", u128::from_be_bytes(id)).map_err(|_| CloseOutcome::InternalError)?;
-    xml.push_str("' version='1.0' xml:lang='en'");
+    xml.push('\'');
+    if include_version {
+        xml.push_str(" version='1.0'");
+    }
+    xml.push_str(" xml:lang='en'");
     if let Some(to) = to {
         xml.push_str(" to='");
         escape_attribute(&mut xml, to);
@@ -449,6 +495,7 @@ pub(super) enum CloseOutcome {
     UnsupportedVersion,
     InvalidNamespace,
     InvalidFrom,
+    InvalidLanguage,
     InvalidXml,
     RestrictedXml,
     UnsupportedEncoding,
@@ -481,6 +528,7 @@ impl CloseOutcome {
             Self::UnsupportedVersion => Some("unsupported-version"),
             Self::InvalidNamespace => Some("invalid-namespace"),
             Self::InvalidFrom => Some("invalid-from"),
+            Self::InvalidLanguage => Some("bad-format"),
             Self::InvalidXml => Some("invalid-xml"),
             Self::RestrictedXml => Some("restricted-xml"),
             Self::UnsupportedEncoding => Some("unsupported-encoding"),
@@ -500,6 +548,7 @@ impl CloseOutcome {
             Self::UnsupportedVersion => "unsupported_version",
             Self::InvalidNamespace => "invalid_namespace",
             Self::InvalidFrom => "invalid_from",
+            Self::InvalidLanguage => "invalid_language",
             Self::InvalidXml => "invalid_xml",
             Self::RestrictedXml => "restricted_xml",
             Self::UnsupportedEncoding => "unsupported_encoding",

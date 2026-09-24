@@ -65,9 +65,8 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     panic::init(&build);
 
     let config = Config::load(config_path).map_err(RunError::Config)?;
-    let hosts = Arc::new(
-        Hosts::new(&config.hosts, config.xmpp.default_host.as_deref()).map_err(RunError::Hosts)?,
-    );
+    let hosts =
+        Hosts::new(&config.hosts, config.xmpp.default_host.as_deref()).map_err(RunError::Hosts)?;
     let worker_count = worker_count().map_err(RunError::WorkerCount)?;
 
     let _logging_guard = logging::init(config.logging.level).map_err(RunError::Logging)?;
@@ -118,7 +117,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                     c2s::Listeners::start(
                         &config.c2s,
                         &config.limits.c2s,
-                        Arc::clone(&hosts),
+                        hosts,
                         &dispatcher.handle(),
                         Arc::clone(&stanza_pool),
                     )

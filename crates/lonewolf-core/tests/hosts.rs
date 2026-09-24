@@ -72,6 +72,43 @@ fn explicit_default_selects_a_host_and_tls_stays_per_host() -> TestResult {
 }
 
 #[test]
+fn sorted_hosts_support_exact_domain_lookups() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let alpha_tls = test_tls_files(&directory, "alpha.example", "alpha")?;
+    let zeta_tls = test_tls_files(&directory, "zeta.example", "zeta")?;
+    let mut config = Config::default();
+    config.hosts.insert(
+        "zeta.example".into(),
+        HostConfig {
+            tls: Some(zeta_tls.clone()),
+        },
+    );
+    config.hosts.insert(
+        "alpha.example".into(),
+        HostConfig {
+            tls: Some(alpha_tls.clone()),
+        },
+    );
+    let hosts = Hosts::new(&config.hosts, Some("localhost"))?;
+
+    assert_eq!(
+        hosts.host_names().collect::<Vec<_>>(),
+        ["alpha.example", "localhost", "zeta.example"]
+    );
+    assert_eq!(hosts.tls_config("alpha.example"), Some(&alpha_tls));
+    assert_eq!(hosts.tls_config("zeta.example"), Some(&zeta_tls));
+    for domain in ["alpha.example", "localhost", "zeta.example"] {
+        assert!(hosts.is_local_host(domain));
+        assert!(hosts.certified_key(domain).is_some());
+    }
+    for domain in ["aardvark.example", "middle.example", "zzzz.example"] {
+        assert!(!hosts.is_local_host(domain));
+        assert!(hosts.certified_key(domain).is_none());
+    }
+    Ok(())
+}
+
+#[test]
 fn certificate_files_are_checked_during_bootstrap() -> TestResult {
     let directory = tempfile::tempdir()?;
     let tls = test_tls_files(&directory, "example.com", "one")?;
@@ -226,6 +263,26 @@ fn invalid_default_selection_is_rejected() {
 fn hosts_can_be_shared_across_workers() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Hosts>();
+}
+
+#[test]
+fn cloned_hosts_share_the_loaded_registry() -> TestResult {
+    let config = Config::default();
+    let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
+    let cloned = hosts.clone();
+
+    assert_eq!(cloned.default_host_name(), "localhost");
+    assert!(std::ptr::eq(
+        hosts
+            .certified_key("localhost")
+            .ok_or("missing certificate")?,
+        cloned
+            .certified_key("localhost")
+            .ok_or("missing cloned certificate")?
+    ));
+    drop(hosts);
+    assert!(cloned.is_local_host("localhost"));
+    Ok(())
 }
 
 fn test_tls_files(

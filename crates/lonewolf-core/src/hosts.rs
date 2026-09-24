@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use graviola::hashing::Sha256;
 use graviola::key_agreement::p256::StaticPrivateKey;
@@ -19,14 +20,15 @@ use zeroize::Zeroizing;
 
 use crate::config::{HostConfig, HostTlsConfig};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Hosts {
-    default_host: String,
-    hosts: BTreeMap<String, Host>,
+    default_host_index: usize,
+    hosts: Arc<[Host]>,
 }
 
 #[derive(Debug)]
 struct Host {
+    domain: String,
     config: HostConfig,
     certified_key: CertifiedKey,
 }
@@ -50,7 +52,7 @@ impl Hosts {
         };
         let provider = rustls_graviola::default_provider();
         let mut resolver = ResolvesServerCertUsingSni::new();
-        let mut loaded_hosts = BTreeMap::new();
+        let mut sorted_hosts = Vec::with_capacity(hosts.len());
         for (domain, config) in hosts {
             let certified_key = match config.tls.as_ref() {
                 Some(tls) => load_certified_key(domain, tls, &provider)?,
@@ -63,39 +65,48 @@ impl Hosts {
                     domain: domain.clone(),
                     source,
                 })?;
-            loaded_hosts.insert(
-                domain.clone(),
-                Host {
-                    config: config.clone(),
-                    certified_key,
-                },
-            );
+            sorted_hosts.push(Host {
+                domain: domain.clone(),
+                config: config.clone(),
+                certified_key,
+            });
         }
+        let default_host_index = sorted_hosts
+            .binary_search_by(|host| host.domain.as_str().cmp(selected))
+            .map_err(|_| HostsError::UnknownDefault(selected.into()))?;
         Ok(Self {
-            default_host: selected.into(),
-            hosts: loaded_hosts,
+            default_host_index,
+            hosts: sorted_hosts.into(),
         })
     }
 
     pub fn default_host_name(&self) -> &str {
-        &self.default_host
+        &self.hosts[self.default_host_index].domain
     }
 
     /// The input must be a normalized XMPP domainpart.
     pub fn is_local_host(&self, domain: &str) -> bool {
-        self.hosts.contains_key(domain)
+        self.find_host(domain).is_some()
     }
 
     pub fn host_names(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.hosts.keys().map(String::as_str)
+        self.hosts.iter().map(|host| host.domain.as_str())
     }
 
     pub fn tls_config(&self, domain: &str) -> Option<&HostTlsConfig> {
-        self.hosts.get(domain)?.config.tls.as_ref()
+        self.find_host(domain)?.config.tls.as_ref()
     }
 
     pub fn certified_key(&self, domain: &str) -> Option<&CertifiedKey> {
-        Some(&self.hosts.get(domain)?.certified_key)
+        Some(&self.find_host(domain)?.certified_key)
+    }
+
+    fn find_host(&self, domain: &str) -> Option<&Host> {
+        let index = self
+            .hosts
+            .binary_search_by(|host| host.domain.as_str().cmp(domain))
+            .ok()?;
+        self.hosts.get(index)
     }
 }
 

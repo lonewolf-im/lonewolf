@@ -35,12 +35,9 @@ fn dispatcher() -> io::Result<CoreDispatcher> {
     }
 }
 
-fn hosts() -> Result<Arc<Hosts>, HostsError> {
+fn hosts() -> Result<Hosts, HostsError> {
     let config = Config::default();
-    Ok(Arc::new(Hosts::new(
-        &config.hosts,
-        config.xmpp.default_host.as_deref(),
-    )?))
+    Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
 }
 
 #[test]
@@ -57,7 +54,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         for index in 0..handle.worker_count() {
             let (ready, readiness) = oneshot::channel();
             let unauthenticated = Arc::clone(&unauthenticated);
-            let hosts = Arc::clone(&hosts);
+            let hosts = hosts.clone();
             let task = handle
                 .dispatch_at(index, move |context| async move {
                     let listener = bind(address).await?;
@@ -131,7 +128,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
         for listener_id in 0..2 {
             let (ready, readiness) = oneshot::channel();
             let unauthenticated = Arc::clone(&unauthenticated);
-            let hosts = Arc::clone(&hosts);
+            let hosts = hosts.clone();
             let task = handle
                 .dispatch_at(
                     listener_id % handle.worker_count(),

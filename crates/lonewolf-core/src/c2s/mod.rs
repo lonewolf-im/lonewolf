@@ -54,7 +54,7 @@ impl Listeners {
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &C2sConfig,
         limits: &C2sLimits,
-        hosts: Arc<Hosts>,
+        hosts: Hosts,
         dispatcher: &DispatchHandle,
         allocator: A,
     ) -> io::Result<Self> {
@@ -93,7 +93,7 @@ impl Listeners {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
                 let admission = admission.clone();
-                let hosts = Arc::clone(&hosts);
+                let hosts = hosts.clone();
                 let settings = StreamSettings::new(max_stanza_bytes, xml_rate, allocator.clone());
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
@@ -189,7 +189,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
     stop: Stop,
     listener_id: usize,
     admission: AdmissionLimits,
-    hosts: Arc<Hosts>,
+    hosts: Hosts,
     settings: StreamSettings<A>,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
@@ -238,7 +238,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                                 stream,
                                                 ip_permit,
                                                 unauthenticated_permit,
-                                                Arc::clone(&hosts),
+                                                hosts.clone(),
                                                 settings.clone(),
                                             )
                                             .run(),

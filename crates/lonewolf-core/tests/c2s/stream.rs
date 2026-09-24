@@ -25,12 +25,9 @@ const OPEN: &str =
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
-fn hosts() -> Result<Arc<Hosts>, HostsError> {
+fn hosts() -> Result<Hosts, HostsError> {
     let config = Config::default();
-    Ok(Arc::new(Hosts::new(
-        &config.hosts,
-        config.xmpp.default_host.as_deref(),
-    )?))
+    Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
 }
 
 fn run_case(
@@ -80,12 +77,10 @@ fn run_case_with_rate(
             transport,
             permit,
             unauthenticated_permit,
-            Arc::clone(&hosts),
+            hosts.clone(),
             StreamSettings::new(max_stanza_bytes, xml_rate, GlobalChunkAllocator),
         );
-        assert_eq!(Arc::strong_count(&hosts), 2);
         let outcome = stream.run().await;
-        assert_eq!(Arc::strong_count(&hosts), 1);
         let elapsed = started.elapsed();
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
@@ -191,16 +186,14 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
             transport,
             permit,
             unauthenticated_permit,
-            Arc::clone(&hosts),
+            hosts.clone(),
             StreamSettings::new(MAX_STANZA_BYTES, &rate, GlobalChunkAllocator),
         );
-        assert_eq!(Arc::strong_count(&hosts), 2);
         assert!(
             timeout(Duration::from_millis(20), stream.run())
                 .await
                 .is_err()
         );
-        assert_eq!(Arc::strong_count(&hosts), 1);
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
             ConnectionAdmission::Allowed(_)

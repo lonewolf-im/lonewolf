@@ -2,7 +2,6 @@
 
 use std::num::NonZeroUsize;
 use std::pin::pin;
-use std::sync::Arc;
 
 use compio::io::compat::AsyncReadStream;
 use compio::net::TcpStream;
@@ -21,7 +20,7 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
     transport: TcpStream,
     ip_permit: ConnectionPermit,
     unauthenticated_permit: UnauthenticatedPermit,
-    _hosts: Arc<Hosts>,
+    _hosts: Hosts,
     settings: StreamSettings<A>,
 }
 
@@ -49,7 +48,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         transport: TcpStream,
         ip_permit: ConnectionPermit,
         unauthenticated_permit: UnauthenticatedPermit,
-        hosts: Arc<Hosts>,
+        hosts: Hosts,
         settings: StreamSettings<A>,
     ) -> Self {
         Self {

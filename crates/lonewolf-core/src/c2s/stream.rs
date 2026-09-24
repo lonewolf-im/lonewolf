@@ -14,6 +14,7 @@ use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
 use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element, STREAM_NAMESPACE};
+use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
 use tokio::io::BufReader;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -25,7 +26,6 @@ use crate::hosts::Hosts;
 
 const READ_BUFFER_BYTES: usize = 1_024;
 const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
-const STREAM_ERROR_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-streams";
 const STARTTLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
 const STARTTLS_PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/></stream:stream>";
@@ -416,9 +416,11 @@ async fn send_stream_error<W: AsyncWrite>(
     let Some(condition) = outcome.stream_condition() else {
         return outcome;
     };
-    let xml = format!(
-        "<stream:error><{condition} xmlns='{STREAM_ERROR_NAMESPACE}'/></stream:error>{STREAM_FOOTER}"
-    );
+    let mut xml = String::with_capacity(128);
+    if StreamError::new(condition).write_xml(&mut xml).is_err() {
+        return CloseOutcome::InternalError;
+    }
+    xml.push_str(STREAM_FOOTER);
     if send_owned(transport, xml).await.is_err() {
         return CloseOutcome::TransportError;
     }
@@ -519,20 +521,21 @@ impl CloseOutcome {
         }
     }
 
-    fn stream_condition(&self) -> Option<&'static str> {
+    fn stream_condition(&self) -> Option<StreamErrorCondition> {
         match self {
-            Self::UnsupportedInput => Some("not-authorized"),
-            Self::SizeLimitExceeded => Some("policy-violation"),
-            Self::ParserError => Some("bad-format"),
-            Self::HostUnknown => Some("host-unknown"),
-            Self::UnsupportedVersion => Some("unsupported-version"),
-            Self::InvalidNamespace => Some("invalid-namespace"),
-            Self::InvalidFrom => Some("invalid-from"),
-            Self::InvalidLanguage => Some("bad-format"),
-            Self::InvalidXml => Some("invalid-xml"),
-            Self::RestrictedXml => Some("restricted-xml"),
-            Self::UnsupportedEncoding => Some("unsupported-encoding"),
-            Self::AuthenticationUnavailable | Self::InternalError => Some("internal-server-error"),
+            Self::UnsupportedInput => Some(StreamErrorCondition::NotAuthorized),
+            Self::SizeLimitExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::ParserError | Self::InvalidLanguage => Some(StreamErrorCondition::BadFormat),
+            Self::HostUnknown => Some(StreamErrorCondition::HostUnknown),
+            Self::UnsupportedVersion => Some(StreamErrorCondition::UnsupportedVersion),
+            Self::InvalidNamespace => Some(StreamErrorCondition::InvalidNamespace),
+            Self::InvalidFrom => Some(StreamErrorCondition::InvalidFrom),
+            Self::InvalidXml => Some(StreamErrorCondition::InvalidXml),
+            Self::RestrictedXml => Some(StreamErrorCondition::RestrictedXml),
+            Self::UnsupportedEncoding => Some(StreamErrorCondition::UnsupportedEncoding),
+            Self::AuthenticationUnavailable | Self::InternalError => {
+                Some(StreamErrorCondition::InternalServerError)
+            }
             _ => None,
         }
     }

@@ -8,3 +8,4 @@ compile_error!("Lonewolf supports Unix targets only.");
 pub mod jid;
 pub mod parser;
 pub mod stanza;
+pub mod stream;

@@ -9,12 +9,12 @@ use compio::io::compat::AsyncReadStream;
 use compio::io::{AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::tls::TlsAcceptor;
-use langtag::LangTag;
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
 use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element, STREAM_NAMESPACE};
+use oxilangtag::LanguageTag;
 use tokio::io::BufReader;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
@@ -313,7 +313,7 @@ fn validate_header<A: ChunkAllocator>(
     if header
         .attribute("lang", lonewolf_xmpp::stanza::XML_NAMESPACE)
         .map_err(|_| CloseOutcome::InternalError)?
-        .is_some_and(|lang| LangTag::new(lang).is_err())
+        .is_some_and(|lang| LanguageTag::parse(lang).is_err())
     {
         return Err(CloseOutcome::InvalidLanguage);
     }

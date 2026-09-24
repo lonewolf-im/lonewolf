@@ -8,12 +8,15 @@ publish.workspace = true
 
 [dependencies]
 async-lock.workspace = true
+base64.workspace = true
 compio = { workspace = true, features = ["net", "rustls", "time"] }
 futures-channel.workspace = true
-futures-util.workspace = true
+futures-rustls.workspace = true
+futures-util = { workspace = true, features = ["io"] }
 graviola.workspace = true
 oxilangtag.workspace = true
 lonewolf-admin.workspace = true
+lonewolf-auth.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
@@ -31,7 +34,10 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 tokio-util.workspace = true
 zeroize.workspace = true
+x509-cert.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+sha2.workspace = true
 tempfile.workspace = true

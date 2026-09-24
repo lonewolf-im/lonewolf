@@ -7,12 +7,20 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use hmac::{Hmac, KeyInit, Mac};
+use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramIterations, ScramVerifier};
+use lonewolf_auth::server::ScramDecoy;
+use lonewolf_storage::account::redb::RedbAccountRepository;
+use lonewolf_storage::account::{AccountRepository, NewAccount};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_xmpp::stream::STREAM_ERROR_NAMESPACE;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
@@ -31,6 +39,15 @@ const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 fn hosts() -> Result<Hosts, HostsError> {
     let config = Config::default();
     Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
+}
+
+fn auth() -> std::io::Result<(Arc<AuthService>, tempfile::TempDir)> {
+    let directory = tempfile::tempdir()?;
+    let accounts = RedbAccountRepository::open(directory.path().join("accounts.redb"))
+        .map_err(std::io::Error::other)?;
+    let decoy = ScramDecoy::new()
+        .map_err(|error| std::io::Error::other(format!("no randomness: {error:?}")))?;
+    Ok((Arc::new(AuthService { accounts, decoy }), directory))
 }
 
 fn run_case(
@@ -52,6 +69,24 @@ fn run_case_with_rate(
     shutdown_write: bool,
     max_stanza_bytes: NonZeroUsize,
     xml_rate: &ByteRate,
+) -> Result<(CloseOutcome, Duration, String), Box<dyn Error>> {
+    run_case_with_timeouts(
+        input,
+        shutdown_write,
+        max_stanza_bytes,
+        xml_rate,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+}
+
+fn run_case_with_timeouts(
+    input: &[u8],
+    shutdown_write: bool,
+    max_stanza_bytes: NonZeroUsize,
+    xml_rate: &ByteRate,
+    establishment_timeout: Duration,
+    authentication_timeout: Duration,
 ) -> Result<(CloseOutcome, Duration, String), Box<dyn Error>> {
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
         let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
@@ -75,13 +110,21 @@ fn run_case_with_rate(
             return Err("first unauthenticated connection was denied".into());
         };
         let hosts = hosts()?;
+        let (auth, _directory) = auth()?;
         let started = Instant::now();
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts.clone(),
-            StreamSettings::new(max_stanza_bytes, xml_rate, GlobalChunkAllocator),
+            auth,
+            StreamSettings::new(
+                max_stanza_bytes,
+                xml_rate,
+                establishment_timeout,
+                authentication_timeout,
+                GlobalChunkAllocator,
+            ),
         );
         let outcome = stream.run().await;
         let elapsed = started.elapsed();
@@ -107,6 +150,21 @@ fn run_case_with_rate(
         listener.close().await?;
         Ok((outcome, elapsed, response))
     }))?
+}
+
+#[test]
+fn connection_establishment_has_one_deadline_from_accept() -> Result<(), Box<dyn Error>> {
+    let (outcome, elapsed, _) = run_case_with_timeouts(
+        &[],
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+    )?;
+    assert_eq!(outcome, CloseOutcome::EstablishmentTimeout);
+    assert!(elapsed >= Duration::from_millis(50));
+    Ok(())
 }
 
 #[test]
@@ -383,7 +441,7 @@ fn starttls_rejects_text_content() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_through(stream: &mut StdTcpStream, marker: &[u8]) -> std::io::Result<Vec<u8>> {
+fn read_through(stream: &mut impl Read, marker: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut byte = [0];
     while response.len() < 16 * 1024 && !response.ends_with(marker) {
@@ -407,6 +465,14 @@ fn stream_id(response: &str) -> Option<&str> {
 
 fn run_starttls_restart_case(
     restart_open: &str,
+) -> Result<(CloseOutcome, String, String), Box<dyn Error + Send + Sync>> {
+    run_starttls_restart_case_with_timeout(restart_open, Duration::from_secs(10), false)
+}
+
+fn run_starttls_restart_case_with_timeout(
+    restart_open: &str,
+    authentication_timeout: Duration,
+    wait_for_timeout: bool,
 ) -> Result<(CloseOutcome, String, String), Box<dyn Error + Send + Sync>> {
     let restart_open = restart_open.to_owned();
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
@@ -444,7 +510,17 @@ fn run_starttls_restart_case(
                 )?;
                 let mut tls = StreamOwned::new(connection, socket);
                 tls.write_all(restart_open.as_bytes())?;
-                let mut after_tls = String::new();
+                let mut after_tls = if restart_open == PSI_OPEN {
+                    let features = read_through(&mut tls, b"</stream:features>")?;
+                    if wait_for_timeout {
+                        std::thread::sleep(authentication_timeout + Duration::from_millis(50));
+                        return Ok((before_tls, String::from_utf8(features)?));
+                    }
+                    tls.write_all(CLOSE.as_bytes())?;
+                    String::from_utf8(features)?
+                } else {
+                    String::new()
+                };
                 tls.read_to_string(&mut after_tls)?;
                 Ok((before_tls, after_tls))
             },
@@ -461,12 +537,20 @@ fn run_starttls_restart_case(
         else {
             return Err("first unauthenticated connection was denied".into());
         };
+        let (auth, _directory) = auth()?;
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts,
-            StreamSettings::new(MAX_STANZA_BYTES, &ByteRate::default(), GlobalChunkAllocator),
+            auth,
+            StreamSettings::new(
+                MAX_STANZA_BYTES,
+                &ByteRate::default(),
+                Duration::from_secs(10),
+                authentication_timeout,
+                GlobalChunkAllocator,
+            ),
         );
         let outcome = stream.run().await;
         let (before_tls, after_tls) = client.join().map_err(|_| "client thread panicked")??;
@@ -476,18 +560,349 @@ fn run_starttls_restart_case(
 }
 
 #[test]
-fn starttls_restarts_stream_and_stops_before_authentication()
--> Result<(), Box<dyn Error + Send + Sync>> {
+fn authentication_deadline_starts_after_sasl_offer() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (outcome, before_tls, after_tls) =
+        run_starttls_restart_case_with_timeout(PSI_OPEN, Duration::from_millis(50), true)?;
+    assert_eq!(outcome, CloseOutcome::AuthenticationTimeout);
+    assert!(before_tls.contains(STARTTLS_FEATURES));
+    assert!(after_tls.contains(SASL_FEATURES));
+    Ok(())
+}
+
+#[test]
+fn starttls_restarts_stream_and_offers_authentication() -> Result<(), Box<dyn Error + Send + Sync>>
+{
     let (outcome, before_tls, after_tls) = run_starttls_restart_case(PSI_OPEN)?;
-    assert_eq!(outcome, CloseOutcome::AuthenticationUnavailable);
+    assert_eq!(outcome, CloseOutcome::StreamEnd);
     assert!(before_tls.contains(STARTTLS_FEATURES));
     assert!(after_tls.contains(" from='localhost'"));
-    assert!(
-        after_tls.contains("<internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>")
-    );
+    assert!(after_tls.contains(SASL_FEATURES));
     assert!(!after_tls.contains(STARTTLS_FEATURES));
     assert_ne!(stream_id(&before_tls), stream_id(&after_tls));
     Ok(())
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<[u8; 32], Box<dyn Error + Send + Sync>> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)?;
+    mac.update(message);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+fn run_scram_sha256(
+    binding: Option<&'static str>,
+    authentication_timeout: Duration,
+    post_auth_delay: Duration,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    Runtime::new()?.block_on(timeout(TIMEOUT, async {
+        let hosts = hosts()?;
+        let mut roots = RootCertStore::empty();
+        roots.add(
+            hosts
+                .certified_key("localhost")
+                .ok_or("no certificate")?
+                .cert[0]
+                .clone(),
+        )?;
+        let endpoint = hosts
+            .tls_server_end_point("localhost")
+            .ok_or("no endpoint binding")?
+            .to_vec();
+        let tls_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let address = listener.local_addr()?;
+        let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let mut socket = StdTcpStream::connect(address)?;
+            socket.set_read_timeout(Some(TIMEOUT))?;
+            socket.set_write_timeout(Some(TIMEOUT))?;
+            socket.write_all(PSI_OPEN.as_bytes())?;
+            read_through(&mut socket, b"</stream:features>")?;
+            socket.write_all(format!("<starttls xmlns='{STARTTLS_NAMESPACE}'/>").as_bytes())?;
+            read_through(&mut socket, STARTTLS_PROCEED.as_bytes())?;
+            let connection =
+                ClientConnection::new(Arc::new(tls_config), ServerName::try_from("localhost")?)?;
+            let mut tls = StreamOwned::new(connection, socket);
+            tls.write_all(PSI_OPEN.as_bytes())?;
+            let features = String::from_utf8(read_through(&mut tls, b"</stream:features>")?)?;
+            assert!(features.contains(SASL_FEATURES));
+            let gs2 = match binding {
+                Some("tls-exporter") => "p=tls-exporter,,",
+                Some("tls-server-end-point") => "p=tls-server-end-point,,",
+                Some(_) => return Err("unsupported binding test".into()),
+                None => "n,,",
+            };
+            let first = format!("{gs2}n=alice,r=clientnonce");
+            let mechanism = if binding.is_some() {
+                "SCRAM-SHA-256-PLUS"
+            } else {
+                "SCRAM-SHA-256"
+            };
+            tls.write_all(
+                format!(
+                    "<auth xmlns='{SASL_NAMESPACE}' mechanism='{mechanism}'>{}</auth>",
+                    STANDARD.encode(first)
+                )
+                .as_bytes(),
+            )?;
+            let challenge = String::from_utf8(read_through(&mut tls, b"</challenge>")?)?;
+            let challenge = challenge.split_once('>').ok_or("invalid challenge")?.1;
+            let challenge = challenge
+                .strip_suffix("</challenge>")
+                .ok_or("invalid challenge")?;
+            let challenge = String::from_utf8(STANDARD.decode(challenge)?)?;
+            let nonce = challenge
+                .split(',')
+                .next()
+                .ok_or("missing nonce")?
+                .strip_prefix("r=")
+                .ok_or("missing nonce")?;
+            let mut channel_binding = gs2.as_bytes().to_vec();
+            if binding == Some("tls-exporter") {
+                let mut exporter = [0; 32];
+                tls.conn.export_keying_material(
+                    &mut exporter,
+                    b"EXPORTER-Channel-Binding",
+                    None,
+                )?;
+                channel_binding.extend_from_slice(&exporter);
+            } else if binding == Some("tls-server-end-point") {
+                channel_binding.extend_from_slice(&endpoint);
+            }
+            let without_proof = format!("c={},r={nonce}", STANDARD.encode(channel_binding));
+            let auth_message = format!("n=alice,r=clientnonce,{challenge},{without_proof}");
+            let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==")?;
+            let mut salted = [0; 32];
+            pbkdf2::pbkdf2_hmac::<Sha256>(b"pencil", &salt, 4096, &mut salted);
+            let client_key = hmac_sha256(&salted, b"Client Key")?;
+            let stored_key = Sha256::digest(client_key);
+            let signature = hmac_sha256(&stored_key, auth_message.as_bytes())?;
+            let mut proof = client_key;
+            for (byte, signature) in proof.iter_mut().zip(signature) {
+                *byte ^= signature;
+            }
+            let response = format!("{without_proof},p={}", STANDARD.encode(proof));
+            tls.write_all(
+                format!(
+                    "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
+                    STANDARD.encode(response)
+                )
+                .as_bytes(),
+            )?;
+            let success = String::from_utf8(read_through(&mut tls, b"</success>")?)?;
+            let success = success
+                .split_once('>')
+                .ok_or("invalid success")?
+                .1
+                .strip_suffix("</success>")
+                .ok_or("invalid success")?;
+            let success = String::from_utf8(STANDARD.decode(success)?)?;
+            let server_key = hmac_sha256(&salted, b"Server Key")?;
+            assert_eq!(
+                success,
+                format!(
+                    "v={}",
+                    STANDARD.encode(hmac_sha256(&server_key, auth_message.as_bytes())?)
+                )
+            );
+            std::thread::sleep(post_auth_delay);
+            tls.write_all(format!("{PSI_OPEN}{CLOSE}").as_bytes())?;
+            let mut rest = String::new();
+            tls.read_to_string(&mut rest)?;
+            assert!(rest.contains(EMPTY_FEATURES));
+            assert!(rest.ends_with(STREAM_FOOTER));
+            Ok(())
+        });
+        let (transport, peer) = listener.accept().await?;
+        let limiter = ConnectionLimiter::new(1);
+        let ConnectionAdmission::Allowed(permit) = limiter.reserve(peer.ip(), Instant::now()).await
+        else {
+            return Err("connection denied".into());
+        };
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+            unauthenticated.reserve(Instant::now()).await
+        else {
+            return Err("unauthenticated connection denied".into());
+        };
+        let (auth, _directory) = auth()?;
+        let key = account_key("alice", "localhost").ok_or("invalid account key")?;
+        let salt: [u8; 16] = STANDARD
+            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")?
+            .try_into()
+            .map_err(|_| "bad salt")?;
+        let verifier = ScramVerifier::derive(
+            ScramHash::Sha256,
+            "pencil",
+            salt,
+            ScramIterations::new(4096)?,
+        )?;
+        auth.accounts
+            .create(NewAccount {
+                key,
+                credentials: ScramCredentials::new(verifier),
+            })
+            .await?;
+        let stream = XmppStream::new(
+            transport,
+            permit,
+            unauthenticated_permit,
+            hosts,
+            auth,
+            StreamSettings::new(
+                MAX_STANZA_BYTES,
+                &ByteRate::default(),
+                Duration::from_secs(10),
+                authentication_timeout,
+                GlobalChunkAllocator,
+            ),
+        );
+        let outcome = stream.run().await;
+        client.join().map_err(|_| "client thread panicked")??;
+        listener.close().await?;
+        assert_eq!(outcome, CloseOutcome::StreamEnd);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    }))?
+}
+
+#[test]
+fn scram_sha256_authenticates_and_restarts_with_empty_features()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_sha256(None, Duration::from_secs(10), Duration::ZERO)
+}
+
+#[test]
+fn scram_sha256_plus_uses_tls_exporter() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_sha256(
+        Some("tls-exporter"),
+        Duration::from_secs(10),
+        Duration::ZERO,
+    )
+}
+
+#[test]
+fn scram_sha256_plus_uses_tls_server_end_point() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_sha256(
+        Some("tls-server-end-point"),
+        Duration::from_secs(10),
+        Duration::ZERO,
+    )
+}
+
+#[test]
+fn authentication_deadline_ends_at_sasl_success() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_sha256(None, Duration::from_secs(1), Duration::from_millis(1200))
+}
+
+#[test]
+fn unknown_account_gets_three_scram_attempts_before_stream_closes()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    Runtime::new()?.block_on(timeout(TIMEOUT, async {
+        let hosts = hosts()?;
+        let mut roots = RootCertStore::empty();
+        roots.add(
+            hosts
+                .certified_key("localhost")
+                .ok_or("no certificate")?
+                .cert[0]
+                .clone(),
+        )?;
+        let tls_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let address = listener.local_addr()?;
+        let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let mut socket = StdTcpStream::connect(address)?;
+            socket.set_read_timeout(Some(TIMEOUT))?;
+            socket.set_write_timeout(Some(TIMEOUT))?;
+            socket.write_all(PSI_OPEN.as_bytes())?;
+            read_through(&mut socket, b"</stream:features>")?;
+            socket.write_all(format!("<starttls xmlns='{STARTTLS_NAMESPACE}'/>").as_bytes())?;
+            read_through(&mut socket, STARTTLS_PROCEED.as_bytes())?;
+            let connection =
+                ClientConnection::new(Arc::new(tls_config), ServerName::try_from("localhost")?)?;
+            let mut tls = StreamOwned::new(connection, socket);
+            tls.write_all(PSI_OPEN.as_bytes())?;
+            read_through(&mut tls, b"</stream:features>")?;
+            for _ in 0..MAX_AUTH_ATTEMPTS {
+                tls.write_all(
+                    format!(
+                        "<auth xmlns='{SASL_NAMESPACE}' mechanism='SCRAM-SHA-256'>{}</auth>",
+                        STANDARD.encode("n,,n=missing,r=clientnonce")
+                    )
+                    .as_bytes(),
+                )?;
+                let challenge = String::from_utf8(read_through(&mut tls, b"</challenge>")?)?;
+                let challenge = challenge.split_once('>').ok_or("invalid challenge")?.1;
+                let challenge = String::from_utf8(
+                    STANDARD.decode(
+                        challenge
+                            .strip_suffix("</challenge>")
+                            .ok_or("invalid challenge")?,
+                    )?,
+                )?;
+                let nonce = challenge
+                    .split(',')
+                    .next()
+                    .ok_or("missing nonce")?
+                    .strip_prefix("r=")
+                    .ok_or("missing nonce")?;
+                let response = format!("c=biws,r={nonce},p={}", STANDARD.encode([0; 32]));
+                tls.write_all(
+                    format!(
+                        "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
+                        STANDARD.encode(response)
+                    )
+                    .as_bytes(),
+                )?;
+                let failure = String::from_utf8(read_through(&mut tls, b"</failure>")?)?;
+                assert!(failure.contains("<not-authorized/>"));
+            }
+            let mut rest = String::new();
+            tls.read_to_string(&mut rest)?;
+            assert!(
+                rest.contains("<policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>")
+            );
+            Ok(())
+        });
+        let (transport, peer) = listener.accept().await?;
+        let limiter = ConnectionLimiter::new(1);
+        let ConnectionAdmission::Allowed(permit) = limiter.reserve(peer.ip(), Instant::now()).await
+        else {
+            return Err("connection denied".into());
+        };
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+            unauthenticated.reserve(Instant::now()).await
+        else {
+            return Err("unauthenticated connection denied".into());
+        };
+        let (auth, _directory) = auth()?;
+        let stream = XmppStream::new(
+            transport,
+            permit,
+            unauthenticated_permit,
+            hosts,
+            auth,
+            StreamSettings::new(
+                MAX_STANZA_BYTES,
+                &ByteRate::default(),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                GlobalChunkAllocator,
+            ),
+        );
+        let outcome = stream.run().await;
+        client.join().map_err(|_| "client thread panicked")??;
+        listener.close().await?;
+        assert_eq!(outcome, CloseOutcome::AuthenticationAttemptsExceeded);
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    }))?
 }
 
 #[test]
@@ -577,12 +992,20 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
             burst_bytes: NonZeroUsize::MIN,
         };
         let hosts = hosts()?;
+        let (auth, _directory) = auth()?;
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts.clone(),
-            StreamSettings::new(MAX_STANZA_BYTES, &rate, GlobalChunkAllocator),
+            auth,
+            StreamSettings::new(
+                MAX_STANZA_BYTES,
+                &rate,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+                GlobalChunkAllocator,
+            ),
         );
         assert!(
             timeout(Duration::from_millis(20), stream.run())

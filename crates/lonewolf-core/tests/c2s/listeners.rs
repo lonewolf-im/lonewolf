@@ -10,6 +10,7 @@ use std::thread;
 use compio::io::AsyncRead;
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 
@@ -40,6 +41,13 @@ fn hosts() -> Result<Hosts, HostsError> {
     Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
 }
 
+fn auth() -> Result<(Arc<AuthService>, tempfile::TempDir), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let accounts = RedbAccountRepository::open(directory.path().join("accounts.redb"))?;
+    let decoy = ScramDecoy::new().map_err(|error| format!("no randomness: {error:?}"))?;
+    Ok((Arc::new(AuthService { accounts, decoy }), directory))
+}
+
 #[test]
 fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
     run_test(async {
@@ -51,10 +59,12 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         let mut threads = Vec::with_capacity(handle.worker_count());
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
         let hosts = hosts()?;
+        let (auth, _directory) = auth()?;
         for index in 0..handle.worker_count() {
             let (ready, readiness) = oneshot::channel();
             let unauthenticated = Arc::clone(&unauthenticated);
             let hosts = hosts.clone();
+            let auth = Arc::clone(&auth);
             let task = handle
                 .dispatch_at(index, move |context| async move {
                     let listener = bind(address).await?;
@@ -79,10 +89,14 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         pending().boxed().shared(),
                         0,
                         admission,
-                        hosts,
+                        StreamServices { hosts, auth },
                         StreamSettings::new(
                             profile.max_stanza_bytes,
                             &profile.incoming_xml_per_connection,
+                            Duration::from_secs(
+                                profile.connection_establishment_timeout_secs.get(),
+                            ),
+                            Duration::from_secs(profile.authentication_timeout_secs.get()),
                             GlobalChunkAllocator,
                         ),
                     )
@@ -123,12 +137,14 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
         let handle = dispatcher.handle();
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
         let hosts = hosts()?;
+        let (auth, _directory) = auth()?;
         let mut addresses = Vec::with_capacity(2);
         let mut tasks = Vec::with_capacity(2);
         for listener_id in 0..2 {
             let (ready, readiness) = oneshot::channel();
             let unauthenticated = Arc::clone(&unauthenticated);
             let hosts = hosts.clone();
+            let auth = Arc::clone(&auth);
             let task = handle
                 .dispatch_at(
                     listener_id % handle.worker_count(),
@@ -151,10 +167,14 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                             pending().boxed().shared(),
                             listener_id,
                             admission,
-                            hosts,
+                            StreamServices { hosts, auth },
                             StreamSettings::new(
                                 profile.max_stanza_bytes,
                                 &profile.incoming_xml_per_connection,
+                                Duration::from_secs(
+                                    profile.connection_establishment_timeout_secs.get(),
+                                ),
+                                Duration::from_secs(profile.authentication_timeout_secs.get()),
                                 GlobalChunkAllocator,
                             ),
                         )
@@ -215,10 +235,12 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
                 },
             ],
         };
+        let (auth, _directory) = auth()?;
         let mut listeners = Listeners::start(
             &config,
             &C2sLimits::default(),
             hosts()?,
+            auth.accounts.clone(),
             &handle,
             GlobalChunkAllocator,
         )
@@ -261,10 +283,12 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
                 },
             ],
         };
+        let (auth, _directory) = auth()?;
         let error = Listeners::start(
             &config,
             &C2sLimits::default(),
             hosts()?,
+            auth.accounts.clone(),
             &dispatcher.handle(),
             GlobalChunkAllocator,
         )

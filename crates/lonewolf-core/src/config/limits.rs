@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,25 @@ impl C2sLimits {
                     isize::MAX
                 ));
             }
+            for (field, value) in [
+                (
+                    "connection_establishment_timeout_secs",
+                    profile.connection_establishment_timeout_secs,
+                ),
+                (
+                    "authentication_timeout_secs",
+                    profile.authentication_timeout_secs,
+                ),
+            ] {
+                if Instant::now()
+                    .checked_add(Duration::from_secs(value.get()))
+                    .is_none()
+                {
+                    return Err(format!(
+                        "limits.c2s.profiles.{name}.{field} exceeds the platform clock range"
+                    ));
+                }
+            }
             if Instant::now()
                 .checked_add(Duration::from_secs(
                     profile.distinct_recipients_per_connection.window_secs.get() as u64,
@@ -131,6 +150,8 @@ pub struct C2sLimitProfile {
     pub max_connections_per_ip: NonZeroUsize,
     /// Includes XML markup and must allow at least 10,000 bytes (RFC 6120 section 13.12).
     pub max_stanza_bytes: NonZeroUsize,
+    pub connection_establishment_timeout_secs: NonZeroU64,
+    pub authentication_timeout_secs: NonZeroU64,
     /// Shares one bucket per IP across all workers of one listener.
     pub connection_attempts_per_ip: EventRate,
     pub incoming_stanzas_per_connection: EventRate,
@@ -144,6 +165,8 @@ impl Default for C2sLimitProfile {
         Self {
             max_connections_per_ip: const { nonzero(256) },
             max_stanza_bytes: const { nonzero(262_144) },
+            connection_establishment_timeout_secs: nonzero_secs(10),
+            authentication_timeout_secs: nonzero_secs(10),
             connection_attempts_per_ip: EventRate {
                 per_second: const { nonzero(10) },
                 burst: const { nonzero(50) },
@@ -163,6 +186,8 @@ impl Default for C2sLimitProfile {
 struct C2sLimitProfileInput {
     max_connections_per_ip: Option<NonZeroUsize>,
     max_stanza_bytes: Option<NonZeroUsize>,
+    connection_establishment_timeout_secs: Option<NonZeroU64>,
+    authentication_timeout_secs: Option<NonZeroU64>,
     connection_attempts_per_ip: EventRateInput,
     incoming_stanzas_per_connection: EventRateInput,
     incoming_xml_per_connection: ByteRate,
@@ -177,6 +202,12 @@ impl From<C2sLimitProfileInput> for C2sLimitProfile {
                 .max_connections_per_ip
                 .unwrap_or(defaults.max_connections_per_ip),
             max_stanza_bytes: input.max_stanza_bytes.unwrap_or(defaults.max_stanza_bytes),
+            connection_establishment_timeout_secs: input
+                .connection_establishment_timeout_secs
+                .unwrap_or(defaults.connection_establishment_timeout_secs),
+            authentication_timeout_secs: input
+                .authentication_timeout_secs
+                .unwrap_or(defaults.authentication_timeout_secs),
             connection_attempts_per_ip: input
                 .connection_attempts_per_ip
                 .with_defaults(defaults.connection_attempts_per_ip),
@@ -255,5 +286,12 @@ const fn nonzero(value: usize) -> NonZeroUsize {
     match NonZeroUsize::new(value) {
         Some(value) => value,
         None => panic!("default limit must be positive"),
+    }
+}
+
+const fn nonzero_secs(value: u64) -> NonZeroU64 {
+    match NonZeroU64::new(value) {
+        Some(value) => value,
+        None => panic!("default timeout must be positive"),
     }
 }

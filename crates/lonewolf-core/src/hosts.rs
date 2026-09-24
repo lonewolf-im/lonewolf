@@ -8,7 +8,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use graviola::hashing::Sha256;
+use graviola::hashing::{Hash, Sha256, Sha384, Sha512};
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, PublicKeyData};
@@ -16,6 +16,8 @@ use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
 use rustls::sign::CertifiedKey;
+use x509_cert::Certificate;
+use x509_cert::der::Decode;
 use zeroize::Zeroizing;
 
 use crate::config::{HostConfig, HostTlsConfig};
@@ -32,6 +34,7 @@ struct Host {
     config: HostConfig,
     certified_key: Arc<CertifiedKey>,
     tls_server_config: Arc<rustls::ServerConfig>,
+    tls_server_end_point: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -82,7 +85,12 @@ impl Hosts {
                     source,
                 })?;
             let certified_key = Arc::new(certified_key);
-            let tls_server_config =
+            let tls_server_end_point = certified_key
+                .cert
+                .first()
+                .and_then(|cert| tls_server_end_point(cert.as_ref()))
+                .ok_or_else(|| HostsError::UnsupportedChannelBinding(domain.clone()))?;
+            let mut tls_server_config =
                 rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
                     .with_safe_default_protocol_versions()
                     .map_err(HostsError::TlsConfiguration)?
@@ -91,11 +99,14 @@ impl Hosts {
                         domain: domain.clone(),
                         certified_key: Arc::clone(&certified_key),
                     }));
+            // TLS 1.2 exporters need an extended master secret for channel binding.
+            tls_server_config.require_ems = true;
             sorted_hosts.push(Host {
                 domain: domain.clone(),
                 config: config.clone(),
                 certified_key,
                 tls_server_config: Arc::new(tls_server_config),
+                tls_server_end_point,
             });
         }
         let default_host_index = sorted_hosts
@@ -132,6 +143,10 @@ impl Hosts {
         Some(&self.find_host(domain)?.tls_server_config)
     }
 
+    pub fn tls_server_end_point(&self, domain: &str) -> Option<&[u8]> {
+        Some(&self.find_host(domain)?.tls_server_end_point)
+    }
+
     fn find_host(&self, domain: &str) -> Option<&Host> {
         let index = self
             .hosts
@@ -139,6 +154,21 @@ impl Hosts {
             .ok()?;
         self.hosts.get(index)
     }
+}
+
+fn tls_server_end_point(certificate: &[u8]) -> Option<Vec<u8>> {
+    let parsed = Certificate::from_der(certificate).ok()?;
+    let oid = parsed.signature_algorithm().oid.to_string();
+    let digest = match oid.as_str() {
+        "1.2.840.113549.1.1.5" | "1.2.840.113549.1.1.4" => Sha256::hash(certificate),
+        "1.2.840.113549.1.1.11" | "1.2.840.10045.4.3.2" | "2.16.840.1.101.3.4.3.2" => {
+            Sha256::hash(certificate)
+        }
+        "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" => Sha384::hash(certificate),
+        "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => Sha512::hash(certificate),
+        _ => return None,
+    };
+    Some(digest.as_ref().to_vec())
 }
 
 fn load_certified_key(
@@ -291,6 +321,7 @@ pub enum HostsError {
         domain: String,
         source: rustls::Error,
     },
+    UnsupportedChannelBinding(String),
     TlsConfiguration(rustls::Error),
     GenerateLocalhost(String),
 }
@@ -339,6 +370,10 @@ impl fmt::Display for HostsError {
                     "invalid TLS material for hosts.{domain}: {source}"
                 )
             }
+            Self::UnsupportedChannelBinding(domain) => write!(
+                formatter,
+                "TLS certificate for hosts.{domain} has no supported signature hash for tls-server-end-point channel binding"
+            ),
             Self::TlsConfiguration(source) => {
                 write!(formatter, "cannot initialize TLS server: {source}")
             }

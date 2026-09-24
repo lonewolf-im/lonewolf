@@ -107,7 +107,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                 let accounts = stores.accounts(account_store)?;
                 let admin = if config.admin.enabled {
                     Some(
-                        lonewolf_admin::Server::bind(&config.admin.socket_path, accounts)
+                        lonewolf_admin::Server::bind(&config.admin.socket_path, accounts.clone())
                             .map_err(RunError::Admin)?,
                     )
                 } else {
@@ -118,6 +118,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                         &config.c2s,
                         &config.limits.c2s,
                         hosts,
+                        accounts,
                         &dispatcher.handle(),
                         Arc::clone(&stanza_pool),
                     )

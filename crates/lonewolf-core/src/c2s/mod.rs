@@ -12,6 +12,8 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use lonewolf_auth::server::ScramDecoy;
+use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use nix::errno::Errno;
@@ -43,6 +45,16 @@ struct AdmissionLimits {
     unauthenticated: Arc<UnauthenticatedLimiter>,
 }
 
+struct AuthService {
+    accounts: RedbAccountRepository,
+    decoy: ScramDecoy,
+}
+
+struct StreamServices {
+    hosts: Hosts,
+    auth: Arc<AuthService>,
+}
+
 pub(crate) struct Listeners {
     stop: Option<oneshot::Sender<()>>,
     tasks: FuturesUnordered<Task<io::Result<()>>>,
@@ -55,6 +67,7 @@ impl Listeners {
         config: &C2sConfig,
         limits: &C2sLimits,
         hosts: Hosts,
+        accounts: RedbAccountRepository,
         dispatcher: &DispatchHandle,
         allocator: A,
     ) -> io::Result<Self> {
@@ -67,6 +80,11 @@ impl Listeners {
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(
             limits.max_unauthenticated_connections,
         ));
+        let auth = Arc::new(AuthService {
+            accounts,
+            decoy: ScramDecoy::new()
+                .map_err(|_| io::Error::other("secure random source is unavailable"))?,
+        });
         let listeners = Self {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
@@ -88,13 +106,26 @@ impl Listeners {
             };
             let max_stanza_bytes = profile.max_stanza_bytes;
             let xml_rate = &profile.incoming_xml_per_connection;
+            let establishment_timeout =
+                Duration::from_secs(profile.connection_establishment_timeout_secs.get());
+            let authentication_timeout =
+                Duration::from_secs(profile.authentication_timeout_secs.get());
             let mut address = config.address;
             for worker_id in 0..dispatcher.worker_count() {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
                 let admission = admission.clone();
-                let hosts = hosts.clone();
-                let settings = StreamSettings::new(max_stanza_bytes, xml_rate, allocator.clone());
+                let services = StreamServices {
+                    hosts: hosts.clone(),
+                    auth: Arc::clone(&auth),
+                };
+                let settings = StreamSettings::new(
+                    max_stanza_bytes,
+                    xml_rate,
+                    establishment_timeout,
+                    authentication_timeout,
+                    allocator.clone(),
+                );
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
                         let result = async {
@@ -109,7 +140,7 @@ impl Listeners {
                                 stop,
                                 listener_id,
                                 admission,
-                                hosts,
+                                services,
                                 settings,
                             )
                             .await
@@ -189,7 +220,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
     stop: Stop,
     listener_id: usize,
     admission: AdmissionLimits,
-    hosts: Hosts,
+    services: StreamServices,
     settings: StreamSettings<A>,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
@@ -238,7 +269,8 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                                 stream,
                                                 ip_permit,
                                                 unauthenticated_permit,
-                                                hosts.clone(),
+                                                services.hosts.clone(),
+                                                Arc::clone(&services.auth),
                                                 settings.clone(),
                                             )
                                             .run(),

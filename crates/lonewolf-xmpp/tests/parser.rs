@@ -478,6 +478,27 @@ fn declaration_bom_encoding_and_unclosed_stream_are_checked() -> TestResult {
 }
 
 #[test]
+fn invalid_utf8_is_rejected_as_unsupported_encoding() -> TestResult {
+    block_on(async {
+        for invalid in [
+            b"<message>\xff</message>".as_slice(),
+            b"<mess\xffage/>",
+            b"<message id='\xff'/>",
+        ] {
+            let mut input = OPEN.as_bytes().to_vec();
+            input.extend_from_slice(invalid);
+            let mut parser = XmppParser::new(input.as_slice(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            assert!(matches!(
+                parser.next_event().await,
+                Err(ParseError::UnsupportedEncoding)
+            ));
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn header_attributes_depth_and_arena_capacity_have_independent_limits() -> TestResult {
     block_on(async {
         let header = format!("<stream:stream id='{}", "a".repeat(MAX_STREAM_HEADER_BYTES));

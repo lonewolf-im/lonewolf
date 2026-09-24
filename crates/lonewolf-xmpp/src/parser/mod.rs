@@ -350,18 +350,16 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                     if self.frames.is_empty() {
                         return Err(ParseError::UnexpectedEvent);
                     }
-                    if text.as_ref().windows(3).any(|bytes| bytes == b"]]>") {
+                    if text.contains("]]>") {
                         return Err(ParseError::InvalidXml);
                     }
-                    self.text
-                        .push_str(&text.xml10_content().map_err(quick_xml::Error::from)?);
+                    self.text.push_str(&text.xml10_content());
                 }
                 Event::CData(text) => {
                     if self.frames.is_empty() {
                         return Err(ParseError::UnexpectedEvent);
                     }
-                    self.text
-                        .push_str(&text.xml10_content().map_err(quick_xml::Error::from)?);
+                    self.text.push_str(&text.xml10_content());
                 }
                 Event::GeneralRef(reference) => {
                     if self.frames.is_empty() {
@@ -370,8 +368,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                     if let Some(ch) = reference.resolve_char_ref()? {
                         self.text.push(ch);
                     } else {
-                        let name = reference.decode().map_err(quick_xml::Error::from)?;
-                        let replacement = quick_xml::escape::resolve_predefined_entity(&name)
+                        let replacement = quick_xml::escape::resolve_predefined_entity(&reference)
                             .ok_or(ParseError::RestrictedXml)?;
                         self.text.push_str(replacement);
                     }
@@ -468,18 +465,16 @@ fn has_explicit_attributes(start: &BytesStart<'_>) -> Result<bool, ParseError> {
 }
 
 fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {
-    let declaration =
-        std::str::from_utf8(declaration.as_ref()).map_err(|_| ParseError::InvalidXml)?;
-    let start = BytesStart::from_content(declaration, 3);
+    let start = BytesStart::from_content(declaration.as_ref(), 3);
     let mut previous = 0;
     for attribute in start.attributes() {
         let attribute = attribute.map_err(quick_xml::Error::from)?;
         let order = match attribute.key.as_ref() {
-            b"version" if attribute.value.as_ref() == b"1.0" => 1,
-            b"version" => return Err(ParseError::UnsupportedVersion),
-            b"encoding" if attribute.value.eq_ignore_ascii_case(b"UTF-8") => 2,
-            b"encoding" => return Err(ParseError::UnsupportedEncoding),
-            b"standalone" if matches!(attribute.value.as_ref(), b"yes" | b"no") => 3,
+            "version" if attribute.value.as_ref() == "1.0" => 1,
+            "version" => return Err(ParseError::UnsupportedVersion),
+            "encoding" if attribute.value.eq_ignore_ascii_case("UTF-8") => 2,
+            "encoding" => return Err(ParseError::UnsupportedEncoding),
+            "standalone" if matches!(attribute.value.as_ref(), "yes" | "no") => 3,
             _ => return Err(ParseError::InvalidXml),
         };
         if order <= previous || (previous == 0 && order != 1) {
@@ -495,6 +490,9 @@ fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {
 
 impl From<quick_xml::Error> for ParseError {
     fn from(error: quick_xml::Error) -> Self {
+        if matches!(error, quick_xml::Error::Encoding(_)) {
+            return Self::UnsupportedEncoding;
+        }
         if let quick_xml::Error::Io(error) = &error
             && let Some(limit) = error
                 .get_ref()

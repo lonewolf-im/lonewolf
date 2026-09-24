@@ -6,7 +6,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use ::redb::{Database, Durability, TableDefinition, WriteTransaction};
+use ::redb::{Database, Durability, WriteTransaction};
 
 use lonewolf_util::blocking::BlockingExecutor;
 
@@ -15,8 +15,6 @@ use crate::StorageError;
 mod error;
 
 pub(crate) use error::{commit_error, storage_error};
-
-pub(crate) const METADATA: TableDefinition<&str, u32> = TableDefinition::new("lonewolf_metadata");
 
 /// Clones share limits of 32 submitted reads and one submitted write.
 ///

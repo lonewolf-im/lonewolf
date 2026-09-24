@@ -8,10 +8,12 @@ publish.workspace = true
 
 [dependencies]
 futures-util.workspace = true
+getrandom.workspace = true
 lonewolf-auth.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
 redb.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 futures-executor.workspace = true

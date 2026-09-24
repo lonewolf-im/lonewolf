@@ -14,7 +14,9 @@ use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::join;
 use lonewolf_admin::Server;
-use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramIterations, ScramVerifier};
+use lonewolf_auth::scram::{
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
+};
 use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountKey, AccountRepository, NewAccount};
@@ -116,7 +118,7 @@ async fn seed(accounts: &RedbAccountRepository, text: &str) -> TestResult {
         ScramHash::Sha256,
         "initial",
         [1; 16],
-        ScramIterations::new(4096)?,
+        ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
     )?;
     accounts
         .create(NewAccount {

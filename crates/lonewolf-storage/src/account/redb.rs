@@ -5,23 +5,29 @@
 use std::num::NonZeroU32;
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::Arc;
 
-use ::redb::{Database, OwnedRange, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use ::redb::{
+    Database, OwnedRange, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle,
+};
 use futures_util::{Stream, stream};
 use lonewolf_auth::scram::{
-    ScramCredentials, ScramHash, ScramSha1Verifier, ScramSha256Verifier, ScramVerifier,
-    ScramVerifierData,
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramSha1Verifier, ScramSha256Verifier,
+    ScramVerifier, ScramVerifierData,
 };
+use lonewolf_auth::server::ScramDecoy;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
+use zeroize::Zeroizing;
 
 use crate::account::{Account, AccountError, AccountKey, AccountRepository, NewAccount};
-use crate::redb::{METADATA, begin_write, commit_error, storage_error};
+use crate::redb::{begin_write, commit_error, storage_error};
 use crate::{RedbDatabase, StorageError, StorageErrorKind};
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
-const SCHEMA_KEY: &str = "accounts_schema";
-const SCHEMA_VERSION: u32 = 1;
+const DECOY_SECRET: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_scram_decoy");
+const DECOY_SECRET_KEY: &str = "secret";
 const RECORD_VERSION: u8 = 1;
 const SHA1: u8 = 1;
 const SHA256: u8 = 2;
@@ -34,10 +40,11 @@ const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2);
 #[derive(Clone)]
 pub struct RedbAccountRepository {
     database: RedbDatabase,
+    decoy: Arc<ScramDecoy>,
 }
 
 impl RedbAccountRepository {
-    /// Opens the database and initializes its schema synchronously.
+    /// Opens the database and initializes required tables synchronously.
     ///
     /// # Errors
     ///
@@ -46,55 +53,70 @@ impl RedbAccountRepository {
         Self::from_database(RedbDatabase::open(path)?)
     }
 
-    /// Checks and initializes the schema synchronously.
+    /// Initializes required tables and loads or creates the SCRAM decoy secret.
     ///
     /// Shares operation limits with other repositories using the same
-    /// [`RedbDatabase`]. This schema check bypasses those limits and can wait
+    /// [`RedbDatabase`]. This initialization bypasses those limits and can wait
     /// for an existing write transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageErrorKind::CorruptData`] for an incomplete schema or
-    /// [`StorageErrorKind::UnsupportedVersion`] for an unknown schema version.
+    /// Returns [`StorageErrorKind::CorruptData`] for incomplete account or decoy state.
     /// Backend failures return [`StorageErrorKind::Unavailable`],
     /// [`StorageErrorKind::CorruptData`], or [`StorageErrorKind::Other`].
-    /// A failed schema commit can return [`StorageErrorKind::CommitUnknown`].
+    /// A failed commit can return [`StorageErrorKind::CommitUnknown`].
     pub fn from_database(database: RedbDatabase) -> Result<Self, StorageError> {
         let transaction = begin_write(database.as_ref())?;
-        let initialize;
+        let mut accounts_table_exists = false;
+        let mut decoy_table_exists = false;
+        for table in transaction.list_tables().map_err(storage_error)? {
+            accounts_table_exists |= table.name() == ACCOUNTS.name();
+            decoy_table_exists |= table.name() == DECOY_SECRET.name();
+        }
+        if decoy_table_exists != accounts_table_exists {
+            return Err(StorageError::new(StorageErrorKind::CorruptData));
+        }
+        let fresh = !accounts_table_exists;
+        let mut secret = Zeroizing::new([0; 32]);
         {
-            let accounts_exist = transaction
-                .list_tables()
-                .map_err(storage_error)?
-                .any(|table| table.name() == ACCOUNTS.name());
-            let mut metadata = transaction.open_table(METADATA).map_err(storage_error)?;
-            let version = metadata
-                .get(SCHEMA_KEY)
-                .map_err(storage_error)?
-                .map(|value| value.value());
-            initialize = match version {
-                Some(SCHEMA_VERSION) if accounts_exist => false,
-                None if !accounts_exist => true,
-                Some(SCHEMA_VERSION) | None => {
+            transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+            let mut table = transaction
+                .open_table(DECOY_SECRET)
+                .map_err(storage_error)?;
+            let existing = table.get(DECOY_SECRET_KEY).map_err(storage_error)?;
+            match existing.as_ref() {
+                Some(stored) => {
+                    if stored.value().len() != secret.len()
+                        || table.len().map_err(storage_error)? != 1
+                    {
+                        return Err(StorageError::new(StorageErrorKind::CorruptData));
+                    }
+                    secret.copy_from_slice(stored.value());
+                }
+                None if !fresh => {
                     return Err(StorageError::new(StorageErrorKind::CorruptData));
                 }
-                Some(_) => {
-                    return Err(StorageError::new(StorageErrorKind::UnsupportedVersion));
-                }
-            };
-            transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-            if initialize {
-                metadata
-                    .insert(SCHEMA_KEY, SCHEMA_VERSION)
+                None => {}
+            }
+            let missing = existing.is_none();
+            drop(existing);
+            if missing {
+                getrandom::fill(secret.as_mut())
+                    .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
+                table
+                    .insert(DECOY_SECRET_KEY, &secret[..])
                     .map_err(storage_error)?;
             }
         }
-        if initialize {
-            transaction.commit().map_err(commit_error)?;
-        } else {
-            transaction.abort().map_err(storage_error)?;
-        }
-        Ok(Self { database })
+        transaction.commit().map_err(commit_error)?;
+        Ok(Self {
+            database,
+            decoy: Arc::new(ScramDecoy::from_secret(*secret)),
+        })
+    }
+
+    pub fn scram_decoy(&self) -> Arc<ScramDecoy> {
+        Arc::clone(&self.decoy)
     }
 }
 
@@ -145,7 +167,6 @@ impl AccountRepository for RedbAccountRepository {
 }
 
 fn create(database: &Database, account: NewAccount) -> Result<(), AccountError> {
-    let record = encode_credentials(&account.credentials);
     let transaction = begin_write(database)?;
     {
         let mut table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
@@ -156,6 +177,8 @@ fn create(database: &Database, account: NewAccount) -> Result<(), AccountError> 
         {
             return Err(AccountError::AlreadyExists);
         }
+        validate_iterations(&account.credentials)?;
+        let record = encode_credentials(&account.credentials);
         table
             .insert(account.key.as_str(), record.as_slice())
             .map_err(storage_error)?;
@@ -289,7 +312,6 @@ fn replace_credentials(
     key: &AccountKey,
     credentials: ScramCredentials,
 ) -> Result<(), AccountError> {
-    let record = encode_credentials(&credentials);
     let transaction = begin_write(database)?;
     {
         let mut table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
@@ -299,11 +321,26 @@ fn replace_credentials(
             };
             decode_credentials(existing.value())?;
         }
+        validate_iterations(&credentials)?;
+        let record = encode_credentials(&credentials);
         table
             .insert(key.as_str(), record.as_slice())
             .map_err(storage_error)?;
     }
     transaction.commit().map_err(commit_error)?;
+    Ok(())
+}
+
+fn validate_iterations(credentials: &ScramCredentials) -> Result<(), AccountError> {
+    if credentials
+        .sha1()
+        .is_some_and(|verifier| verifier.iterations() != SCRAM_POLICY_ITERATIONS)
+        || credentials
+            .sha256()
+            .is_some_and(|verifier| verifier.iterations() != SCRAM_POLICY_ITERATIONS)
+    {
+        return Err(AccountError::UnsupportedIterations);
+    }
     Ok(())
 }
 

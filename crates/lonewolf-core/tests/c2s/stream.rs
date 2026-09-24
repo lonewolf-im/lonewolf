@@ -12,12 +12,15 @@ use base64::engine::general_purpose::STANDARD;
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use hmac::{Hmac, KeyInit, Mac};
-use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramIterations, ScramVerifier};
-use lonewolf_auth::server::ScramDecoy;
+use lonewolf_auth::scram::{
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
+};
+use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountRepository, NewAccount};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_xmpp::stream::STREAM_ERROR_NAMESPACE;
+use redb::{ReadableTable, TableDefinition};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use sha1::Sha1;
@@ -43,12 +46,22 @@ fn hosts() -> Result<Hosts, HostsError> {
 }
 
 fn auth() -> std::io::Result<(Arc<AuthService>, tempfile::TempDir)> {
+    let (auth, _database, directory) = auth_with_database()?;
+    Ok((auth, directory))
+}
+
+fn auth_with_database() -> std::io::Result<(Arc<AuthService>, RedbDatabase, tempfile::TempDir)> {
     let directory = tempfile::tempdir()?;
-    let accounts = RedbAccountRepository::open(directory.path().join("accounts.redb"))
+    let database = RedbDatabase::open(directory.path().join("accounts.redb"))
         .map_err(std::io::Error::other)?;
-    let decoy = ScramDecoy::new()
-        .map_err(|error| std::io::Error::other(format!("no randomness: {error:?}")))?;
-    Ok((Arc::new(AuthService { accounts, decoy }), directory))
+    let accounts =
+        RedbAccountRepository::from_database(database.clone()).map_err(std::io::Error::other)?;
+    let decoy = accounts.scram_decoy();
+    Ok((
+        Arc::new(AuthService { accounts, decoy }),
+        database,
+        directory,
+    ))
 }
 
 fn run_case(
@@ -616,6 +629,25 @@ where
         + Send
         + 'static,
 {
+    run_sasl_case_with_iterations(
+        tls_open,
+        known_account.then_some(SCRAM_POLICY_ITERATIONS.get()),
+        exchange,
+    )
+}
+
+fn run_sasl_case_with_iterations<F>(
+    tls_open: &str,
+    stored_iterations: Option<u32>,
+    exchange: F,
+) -> Result<CloseOutcome, Box<dyn Error + Send + Sync>>
+where
+    F: FnOnce(
+            &mut StreamOwned<ClientConnection, StdTcpStream>,
+        ) -> Result<(), Box<dyn Error + Send + Sync>>
+        + Send
+        + 'static,
+{
     let tls_open = tls_open.to_owned();
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
         let hosts = hosts()?;
@@ -661,21 +693,36 @@ where
         else {
             return Err("unauthenticated connection denied".into());
         };
-        let (auth, _directory) = auth()?;
-        if known_account {
+        let (auth, database, _directory) = auth_with_database()?;
+        if let Some(stored_iterations) = stored_iterations {
             let key = account_key("alice", "localhost").ok_or("invalid account key")?;
             let verifier = ScramVerifier::derive(
                 ScramHash::Sha256,
                 "pencil",
                 [7; 16],
-                ScramIterations::new(4096)?,
+                ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
             )?;
             auth.accounts
                 .create(NewAccount {
-                    key,
+                    key: key.clone(),
                     credentials: ScramCredentials::new(verifier),
                 })
                 .await?;
+            if stored_iterations != SCRAM_POLICY_ITERATIONS.get() {
+                let transaction = database.as_ref().begin_write()?;
+                {
+                    let mut table = transaction
+                        .open_table(TableDefinition::<&str, &[u8]>::new("lonewolf_accounts"))?;
+                    let mut record = table
+                        .get(key.as_str())?
+                        .ok_or("missing account record")?
+                        .value()
+                        .to_vec();
+                    record[18..22].copy_from_slice(&stored_iterations.to_le_bytes());
+                    table.insert(key.as_str(), record.as_slice())?;
+                }
+                transaction.commit()?;
+            }
         }
         let outcome = XmppStream::new(
             transport,
@@ -775,6 +822,52 @@ fn missing_account_challenge_uses_normalized_identity() -> Result<(), Box<dyn Er
         })?;
         assert_eq!(outcome, CloseOutcome::StreamEnd);
     }
+    Ok(())
+}
+
+#[test]
+fn legacy_iteration_account_gets_decoy_challenge_and_cannot_log_in()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let outcome = run_sasl_case_with_iterations(PSI_OPEN, Some(4096), |tls| {
+        tls.write_all(sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=clientnonce").as_bytes())?;
+        let challenge = sasl_challenge(tls)?;
+        let (nonce, parameters) = challenge
+            .split_once(",s=")
+            .ok_or("missing challenge salt")?;
+        let (encoded_salt, iterations) = parameters
+            .split_once(",i=")
+            .ok_or("missing challenge iterations")?;
+        assert_eq!(iterations, SCRAM_POLICY_ITERATIONS.get().to_string());
+        assert_ne!(encoded_salt, STANDARD.encode([7; 16]));
+        let salt = STANDARD.decode(encoded_salt)?;
+        let mut salted = [0; 32];
+        pbkdf2::pbkdf2_hmac::<Sha256>(b"pencil", &salt, SCRAM_POLICY_ITERATIONS.get(), &mut salted);
+        let client_key = hmac_scram(ScramHash::Sha256, &salted, b"Client Key")?;
+        let stored_key = Sha256::digest(&client_key);
+        let without_proof = format!("c=biws,{nonce}");
+        let auth_message = format!("n=alice,r=clientnonce,{challenge},{without_proof}");
+        let signature = hmac_scram(ScramHash::Sha256, &stored_key, auth_message.as_bytes())?;
+        let mut proof = client_key;
+        for (byte, signature) in proof.iter_mut().zip(signature) {
+            *byte ^= signature;
+        }
+        let response = format!("{without_proof},p={}", STANDARD.encode(proof));
+        tls.write_all(
+            format!(
+                "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
+                STANDARD.encode(response)
+            )
+            .as_bytes(),
+        )?;
+        let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
+        assert!(failure.contains("<not-authorized/>"), "{failure}");
+        tls.write_all(CLOSE.as_bytes())?;
+        let mut rest = String::new();
+        tls.read_to_string(&mut rest)?;
+        assert!(rest.ends_with(STREAM_FOOTER));
+        Ok(())
+    })?;
+    assert_eq!(outcome, CloseOutcome::StreamEnd);
     Ok(())
 }
 
@@ -937,6 +1030,32 @@ fn run_scram_with_restart(
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+        let salt: [u8; 16] = STANDARD
+            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")?
+            .try_into()
+            .map_err(|_| "bad salt")?;
+        let salted = match hash {
+            ScramHash::Sha1 => {
+                let mut salted = [0; 20];
+                pbkdf2::pbkdf2_hmac::<Sha1>(
+                    b"pencil",
+                    &salt,
+                    SCRAM_POLICY_ITERATIONS.get(),
+                    &mut salted,
+                );
+                salted.to_vec()
+            }
+            ScramHash::Sha256 => {
+                let mut salted = [0; 32];
+                pbkdf2::pbkdf2_hmac::<Sha256>(
+                    b"pencil",
+                    &salt,
+                    SCRAM_POLICY_ITERATIONS.get(),
+                    &mut salted,
+                );
+                salted.to_vec()
+            }
+        };
         let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
         let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -999,19 +1118,6 @@ fn run_scram_with_restart(
             }
             let without_proof = format!("c={},r={nonce}", STANDARD.encode(channel_binding));
             let auth_message = format!("n=alice,r=clientnonce,{challenge},{without_proof}");
-            let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==")?;
-            let salted = match hash {
-                ScramHash::Sha1 => {
-                    let mut salted = [0; 20];
-                    pbkdf2::pbkdf2_hmac::<Sha1>(b"pencil", &salt, 4096, &mut salted);
-                    salted.to_vec()
-                }
-                ScramHash::Sha256 => {
-                    let mut salted = [0; 32];
-                    pbkdf2::pbkdf2_hmac::<Sha256>(b"pencil", &salt, 4096, &mut salted);
-                    salted.to_vec()
-                }
-            };
             let client_key = hmac_scram(hash, &salted, b"Client Key")?;
             let stored_key = match hash {
                 ScramHash::Sha1 => Sha1::digest(&client_key).to_vec(),
@@ -1095,11 +1201,12 @@ fn run_scram_with_restart(
         };
         let (auth, _directory) = auth()?;
         let key = account_key("alice", "localhost").ok_or("invalid account key")?;
-        let salt: [u8; 16] = STANDARD
-            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")?
-            .try_into()
-            .map_err(|_| "bad salt")?;
-        let verifier = ScramVerifier::derive(hash, "pencil", salt, ScramIterations::new(4096)?)?;
+        let verifier = ScramVerifier::derive(
+            hash,
+            "pencil",
+            salt,
+            ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
+        )?;
         auth.accounts
             .create(NewAccount {
                 key,

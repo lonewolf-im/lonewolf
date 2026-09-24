@@ -18,6 +18,7 @@ use futures_rustls::TlsAcceptor;
 use futures_util::io::{
     AsyncReadExt as _, AsyncWrite as FuturesAsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf,
 };
+use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
@@ -522,6 +523,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             },
             None => None,
         };
+        let verifier = verifier.filter(|verifier| verifier.iterations() == SCRAM_POLICY_ITERATIONS);
         let known = verifier.is_some() && authzid_matches;
         let verifier = match verifier {
             Some(verifier) => verifier,

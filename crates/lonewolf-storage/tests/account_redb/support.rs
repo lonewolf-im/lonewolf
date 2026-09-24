@@ -2,13 +2,14 @@
 
 use std::error::Error;
 use std::io;
-use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use lonewolf_auth::scram::{ScramCredentials, ScramVerifier, ScramVerifierData};
+use lonewolf_auth::scram::{
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramVerifier, ScramVerifierData,
+};
 use lonewolf_storage::account::{AccountError, AccountKey};
 use lonewolf_storage::{RedbDatabase, StorageErrorKind};
 use lonewolf_util::arena::{Arena, ArenaConfig};
@@ -19,6 +20,8 @@ use redb::{Database, StorageBackend, TableDefinition};
 pub type TestResult = Result<(), Box<dyn Error>>;
 
 pub const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
+pub const DECOY_SECRET: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_scram_decoy");
+pub const DECOY_SECRET_KEY: &str = "secret";
 pub const METADATA: TableDefinition<&str, u32> = TableDefinition::new("lonewolf_metadata");
 pub const SCHEMA_KEY: &str = "accounts_schema";
 
@@ -31,7 +34,7 @@ pub fn key(input: &str) -> Result<AccountKey, Box<dyn Error>> {
 pub fn verifier<const N: usize>(marker: u8) -> ScramVerifierData<N> {
     ScramVerifierData::new(
         [marker; 16],
-        NonZeroU32::MIN.saturating_add(4095),
+        SCRAM_POLICY_ITERATIONS,
         [marker + 1; N],
         [marker + 2; N],
     )
@@ -43,7 +46,7 @@ pub fn credentials(marker: u8) -> ScramCredentials {
 
 pub fn assert_verifier<const N: usize>(actual: &ScramVerifierData<N>, marker: u8) {
     assert_eq!(actual.salt(), &[marker; 16]);
-    assert_eq!(actual.iterations().get(), 4096);
+    assert_eq!(actual.iterations(), SCRAM_POLICY_ITERATIONS);
     assert_eq!(actual.stored_key(), &[marker + 1; N]);
     assert_eq!(actual.server_key(), &[marker + 2; N]);
 }

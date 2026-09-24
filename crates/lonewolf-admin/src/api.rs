@@ -17,7 +17,8 @@ use axum::routing::{get, put};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use lonewolf_auth::scram::{
-    ScramCredentials, ScramError, ScramHash, ScramIterations, ScramVerifier,
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramError, ScramHash, ScramIterations,
+    ScramVerifier,
 };
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountRepository, NewAccount};
@@ -225,7 +226,7 @@ impl<R: AccountRepository> Api<R> {
     async fn credentials(&self, password: Password) -> Result<ScramCredentials, ApiError> {
         self.passwords
             .run(move || {
-                let iterations = ScramIterations::new(100_000)?;
+                let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?;
                 let sha1 = ScramVerifier::generate(ScramHash::Sha1, &password.0, iterations)?;
                 let sha256 = ScramVerifier::generate(ScramHash::Sha256, &password.0, iterations)?;
                 match (sha1, sha256) {
@@ -429,6 +430,10 @@ impl From<AccountError> for ApiError {
         match error {
             AccountError::AlreadyExists => Self::new(StatusCode::CONFLICT, "account_exists"),
             AccountError::NotFound => Self::not_found(),
+            AccountError::UnsupportedIterations => {
+                tracing::error!("admin generated unsupported SCRAM iterations");
+                Self::internal()
+            }
             AccountError::Storage(error) => {
                 tracing::error!(kind = ?error.kind(), "admin storage operation failed");
                 match error.kind() {

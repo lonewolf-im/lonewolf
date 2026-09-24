@@ -47,7 +47,7 @@ struct AdmissionLimits {
 
 struct AuthService {
     accounts: RedbAccountRepository,
-    decoy: ScramDecoy,
+    decoy: Arc<ScramDecoy>,
 }
 
 struct StreamServices {
@@ -80,11 +80,8 @@ impl Listeners {
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(
             limits.max_unauthenticated_connections,
         ));
-        let auth = Arc::new(AuthService {
-            accounts,
-            decoy: ScramDecoy::new()
-                .map_err(|_| io::Error::other("secure random source is unavailable"))?,
-        });
+        let decoy = accounts.scram_decoy();
+        let auth = Arc::new(AuthService { accounts, decoy });
         let listeners = Self {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),

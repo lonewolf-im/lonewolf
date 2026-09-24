@@ -44,7 +44,7 @@ fn hosts() -> Result<Hosts, HostsError> {
 fn auth() -> Result<(Arc<AuthService>, tempfile::TempDir), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let accounts = RedbAccountRepository::open(directory.path().join("accounts.redb"))?;
-    let decoy = ScramDecoy::new().map_err(|error| format!("no randomness: {error:?}"))?;
+    let decoy = accounts.scram_decoy();
     Ok((Arc::new(AuthService { accounts, decoy }), directory))
 }
 

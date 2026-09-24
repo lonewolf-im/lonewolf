@@ -14,8 +14,9 @@ use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 
 use super::*;
-use crate::config::TcpListenerConfig;
 use crate::config::limits::{C2sLimitProfile, C2sLimits};
+use crate::config::{Config, TcpListenerConfig};
+use crate::hosts::HostsError;
 
 type TestResult = Result<(), Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,6 +35,11 @@ fn dispatcher() -> io::Result<CoreDispatcher> {
     }
 }
 
+fn hosts() -> Result<Hosts, HostsError> {
+    let config = Config::default();
+    Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
+}
+
 #[test]
 fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
     run_test(async {
@@ -44,9 +50,11 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         let mut descriptors = Vec::with_capacity(handle.worker_count());
         let mut threads = Vec::with_capacity(handle.worker_count());
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let hosts = hosts()?;
         for index in 0..handle.worker_count() {
             let (ready, readiness) = oneshot::channel();
             let unauthenticated = Arc::clone(&unauthenticated);
+            let hosts = hosts.clone();
             let task = handle
                 .dispatch_at(index, move |context| async move {
                     let listener = bind(address).await?;
@@ -71,6 +79,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         pending().boxed().shared(),
                         0,
                         admission,
+                        hosts,
                         StreamSettings::new(
                             profile.max_stanza_bytes,
                             &profile.incoming_xml_per_connection,
@@ -113,11 +122,13 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
         let dispatcher = dispatcher()?;
         let handle = dispatcher.handle();
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let hosts = hosts()?;
         let mut addresses = Vec::with_capacity(2);
         let mut tasks = Vec::with_capacity(2);
         for listener_id in 0..2 {
             let (ready, readiness) = oneshot::channel();
             let unauthenticated = Arc::clone(&unauthenticated);
+            let hosts = hosts.clone();
             let task = handle
                 .dispatch_at(
                     listener_id % handle.worker_count(),
@@ -140,6 +151,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                             pending().boxed().shared(),
                             listener_id,
                             admission,
+                            hosts,
                             StreamSettings::new(
                                 profile.max_stanza_bytes,
                                 &profile.incoming_xml_per_connection,
@@ -206,6 +218,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
         let mut listeners = Listeners::start(
             &config,
             &C2sLimits::default(),
+            hosts()?,
             &handle,
             GlobalChunkAllocator,
         )
@@ -251,6 +264,7 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
         let error = Listeners::start(
             &config,
             &C2sLimits::default(),
+            hosts()?,
             &dispatcher.handle(),
             GlobalChunkAllocator,
         )

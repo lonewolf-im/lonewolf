@@ -19,6 +19,7 @@ use socket2::SockRef;
 
 use crate::config::C2sConfig;
 use crate::config::limits::C2sLimits;
+use crate::hosts::Hosts;
 
 mod attempt_limit;
 mod connection_limit;
@@ -53,6 +54,7 @@ impl Listeners {
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &C2sConfig,
         limits: &C2sLimits,
+        hosts: Hosts,
         dispatcher: &DispatchHandle,
         allocator: A,
     ) -> io::Result<Self> {
@@ -91,6 +93,7 @@ impl Listeners {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
                 let admission = admission.clone();
+                let hosts = hosts.clone();
                 let settings = StreamSettings::new(max_stanza_bytes, xml_rate, allocator.clone());
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
@@ -100,8 +103,16 @@ impl Listeners {
                             if ready.send(bound).is_err() {
                                 return Ok(());
                             }
-                            run_listener(listener, context, stop, listener_id, admission, settings)
-                                .await
+                            run_listener(
+                                listener,
+                                context,
+                                stop,
+                                listener_id,
+                                admission,
+                                hosts,
+                                settings,
+                            )
+                            .await
                         }
                         .await;
                         result.map_err(|error| listener_error(listener_id, worker_id, error))
@@ -178,6 +189,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
     stop: Stop,
     listener_id: usize,
     admission: AdmissionLimits,
+    hosts: Hosts,
     settings: StreamSettings<A>,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
@@ -226,6 +238,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                                 stream,
                                                 ip_permit,
                                                 unauthenticated_permit,
+                                                hosts.clone(),
                                                 settings.clone(),
                                             )
                                             .run(),

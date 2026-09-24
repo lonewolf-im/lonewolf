@@ -11,11 +11,15 @@ async-lock.workspace = true
 compio = { workspace = true, features = ["net", "time"] }
 futures-channel.workspace = true
 futures-util.workspace = true
+graviola.workspace = true
 lonewolf-admin.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
 nix.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-graviola.workspace = true
 serde.workspace = true
 socket2.workspace = true
 time.workspace = true
@@ -23,6 +27,8 @@ toml.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 tempfile.workspace = true

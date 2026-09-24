@@ -22,6 +22,7 @@ use lonewolf_util::pool::PooledChunkAllocator;
 mod c2s;
 pub mod config;
 mod error;
+pub mod hosts;
 mod logging;
 mod panic;
 mod shutdown;
@@ -29,6 +30,7 @@ mod storage;
 
 use config::Config;
 pub use error::RunError;
+use hosts::Hosts;
 use storage::StoreRegistry;
 
 const DISPATCH_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
@@ -51,7 +53,7 @@ pub struct BuildInfo {
 ///
 /// Returns [`RunError::Config`] for invalid configuration or
 /// [`RunError::WorkerCount`] if worker count selection fails. Startup failures
-/// identify logging, stanza pool, runtime, dispatcher, storage, admin, or c2s
+/// identify logging, hosts, stanza pool, runtime, dispatcher, storage, admin, or c2s
 /// initialization in [`RunError`]. Signal and worker shutdown failures also
 /// return [`RunError`]. If service execution and worker shutdown both fail, the
 /// service error wins.
@@ -63,6 +65,8 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     panic::init(&build);
 
     let config = Config::load(config_path).map_err(RunError::Config)?;
+    let hosts =
+        Hosts::new(&config.hosts, config.xmpp.default_host.as_deref()).map_err(RunError::Hosts)?;
     let worker_count = worker_count().map_err(RunError::WorkerCount)?;
 
     let _logging_guard = logging::init(config.logging.level).map_err(RunError::Logging)?;
@@ -113,6 +117,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                     c2s::Listeners::start(
                         &config.c2s,
                         &config.limits.c2s,
+                        hosts,
                         &dispatcher.handle(),
                         Arc::clone(&stanza_pool),
                     )

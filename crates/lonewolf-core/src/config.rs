@@ -122,6 +122,17 @@ impl Config {
         if self.hosts.is_empty() {
             return Err("hosts must define at least one domain".into());
         }
+        match self.xmpp.default_host.as_deref() {
+            Some(default) if !self.hosts.contains_key(default) => {
+                return Err(format!(
+                    "xmpp.default_host references unknown host {default:?}"
+                ));
+            }
+            None if self.hosts.len() > 1 => {
+                return Err("xmpp.default_host is required when multiple hosts are defined".into());
+            }
+            _ => {}
+        }
         for (domain, host) in &self.hosts {
             let mut arena = Arena::try_new(ArenaConfig::default())
                 .map_err(|error| format!("cannot validate hosts.{domain}: {error}"))?;
@@ -135,6 +146,9 @@ impl Config {
                     "hosts.{domain} must use the normalized form {:?}",
                     normalized.domainpart()
                 ));
+            }
+            if domain != "localhost" && host.tls.is_none() {
+                return Err(format!("hosts.{domain}.tls is required"));
             }
             if let Some(tls) = &host.tls {
                 if tls.certificate_chain_path.as_os_str().is_empty() {
@@ -235,12 +249,14 @@ impl Default for TcpListenerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct XmppConfig {
     pub stanza_pool_size_mib: usize,
+    pub default_host: Option<String>,
 }
 
 impl Default for XmppConfig {
     fn default() -> Self {
         Self {
             stanza_pool_size_mib: DEFAULT_POOL_SIZE / MEBIBYTE,
+            default_host: None,
         }
     }
 }

@@ -13,6 +13,10 @@
 
 # [xmpp]
 
+# Choose the default served domain when you configure multiple hosts.
+# A sole host is selected automatically; the value below is an example.
+# default_host = "localhost"
+
 # Reserve memory for reusing chunks while parsing and building stanzas.
 # Choose a power of two of at least 8 MiB. Lonewolf can use additional heap
 # memory when the pool is exhausted.
@@ -29,8 +33,8 @@
 # The domain below is an example.
 # [hosts."example.com"]
 
-# Configure TLS for a host with a PEM certificate chain and private key.
-# Both paths are required when you add a TLS section.
+# Configure a PEM certificate chain and private key for each host except localhost.
+# Localhost uses a new self-signed certificate on each start if you omit its TLS section.
 # Relative paths start from the directory where Lonewolf was launched.
 # The paths below are examples.
 # [hosts."example.com".tls]

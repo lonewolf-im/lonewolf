@@ -1030,6 +1030,32 @@ fn run_scram_with_restart(
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
+        let salt: [u8; 16] = STANDARD
+            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")?
+            .try_into()
+            .map_err(|_| "bad salt")?;
+        let salted = match hash {
+            ScramHash::Sha1 => {
+                let mut salted = [0; 20];
+                pbkdf2::pbkdf2_hmac::<Sha1>(
+                    b"pencil",
+                    &salt,
+                    SCRAM_POLICY_ITERATIONS.get(),
+                    &mut salted,
+                );
+                salted.to_vec()
+            }
+            ScramHash::Sha256 => {
+                let mut salted = [0; 32];
+                pbkdf2::pbkdf2_hmac::<Sha256>(
+                    b"pencil",
+                    &salt,
+                    SCRAM_POLICY_ITERATIONS.get(),
+                    &mut salted,
+                );
+                salted.to_vec()
+            }
+        };
         let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
         let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -1092,29 +1118,6 @@ fn run_scram_with_restart(
             }
             let without_proof = format!("c={},r={nonce}", STANDARD.encode(channel_binding));
             let auth_message = format!("n=alice,r=clientnonce,{challenge},{without_proof}");
-            let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==")?;
-            let salted = match hash {
-                ScramHash::Sha1 => {
-                    let mut salted = [0; 20];
-                    pbkdf2::pbkdf2_hmac::<Sha1>(
-                        b"pencil",
-                        &salt,
-                        SCRAM_POLICY_ITERATIONS.get(),
-                        &mut salted,
-                    );
-                    salted.to_vec()
-                }
-                ScramHash::Sha256 => {
-                    let mut salted = [0; 32];
-                    pbkdf2::pbkdf2_hmac::<Sha256>(
-                        b"pencil",
-                        &salt,
-                        SCRAM_POLICY_ITERATIONS.get(),
-                        &mut salted,
-                    );
-                    salted.to_vec()
-                }
-            };
             let client_key = hmac_scram(hash, &salted, b"Client Key")?;
             let stored_key = match hash {
                 ScramHash::Sha1 => Sha1::digest(&client_key).to_vec(),
@@ -1198,10 +1201,6 @@ fn run_scram_with_restart(
         };
         let (auth, _directory) = auth()?;
         let key = account_key("alice", "localhost").ok_or("invalid account key")?;
-        let salt: [u8; 16] = STANDARD
-            .decode("W22ZaJ0SNY7soEsUEjb6gQ==")?
-            .try_into()
-            .map_err(|_| "bad salt")?;
         let verifier = ScramVerifier::derive(
             hash,
             "pencil",

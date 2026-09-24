@@ -14,7 +14,7 @@ use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier, ScramVeri
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountError, AccountRepository, NewAccount};
 use lonewolf_storage::{RedbDatabase, StorageErrorKind};
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadableDatabase, ReadableTable, TableHandle};
 
 #[path = "account_redb/support.rs"]
 mod support;
@@ -504,6 +504,33 @@ fn missing_decoy_table_with_accounts_is_rejected() -> TestResult {
         Ok(_) => return Err("replaced the missing decoy table".into()),
     }
     assert!(block_on(repository.get(&account))?.is_some());
+    Ok(())
+}
+
+#[test]
+fn missing_accounts_table_with_decoy_secret_is_rejected() -> TestResult {
+    let database = database()?;
+    let _repository = RedbAccountRepository::from_database(database.clone())?;
+    let transaction = database.as_ref().begin_write()?;
+    transaction.delete_table(ACCOUNTS)?;
+    transaction.commit()?;
+
+    match RedbAccountRepository::from_database(database.clone()) {
+        Err(error) => assert_eq!(error.kind(), StorageErrorKind::CorruptData),
+        Ok(_) => return Err("recreated the missing accounts table".into()),
+    }
+    let transaction = database.as_ref().begin_read()?;
+    assert!(
+        !transaction
+            .list_tables()?
+            .any(|table| table.name() == ACCOUNTS.name())
+    );
+    assert!(
+        transaction
+            .open_table(DECOY_SECRET)?
+            .get(DECOY_SECRET_KEY)?
+            .is_some()
+    );
     Ok(())
 }
 

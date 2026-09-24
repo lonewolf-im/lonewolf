@@ -61,16 +61,21 @@ impl RedbAccountRepository {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageErrorKind::CorruptData`] for missing or invalid decoy state in an existing store.
+    /// Returns [`StorageErrorKind::CorruptData`] for incomplete account or decoy state.
     /// Backend failures return [`StorageErrorKind::Unavailable`],
     /// [`StorageErrorKind::CorruptData`], or [`StorageErrorKind::Other`].
     /// A failed commit can return [`StorageErrorKind::CommitUnknown`].
     pub fn from_database(database: RedbDatabase) -> Result<Self, StorageError> {
         let transaction = begin_write(database.as_ref())?;
-        let decoy_table_exists = transaction
-            .list_tables()
-            .map_err(storage_error)?
-            .any(|table| table.name() == DECOY_SECRET.name());
+        let mut accounts_table_exists = false;
+        let mut decoy_table_exists = false;
+        for table in transaction.list_tables().map_err(storage_error)? {
+            accounts_table_exists |= table.name() == ACCOUNTS.name();
+            decoy_table_exists |= table.name() == DECOY_SECRET.name();
+        }
+        if decoy_table_exists && !accounts_table_exists {
+            return Err(StorageError::new(StorageErrorKind::CorruptData));
+        }
         let mut secret = Zeroizing::new([0; 32]);
         {
             let accounts = transaction.open_table(ACCOUNTS).map_err(storage_error)?;

@@ -56,6 +56,11 @@ pub(super) fn element<'a, 'b>(
     Ok((utf8(name.into_inner())?, resolved_namespace(namespace)?))
 }
 
+pub(super) fn content_namespace(resolver: &NamespaceResolver) -> Result<&str, ParseError> {
+    let (namespace, _) = resolver.resolve_element(QName(b"content"));
+    resolved_namespace(namespace)
+}
+
 pub(super) fn frame<A: ChunkAllocator>(
     resolver: &NamespaceResolver,
     start: &BytesStart<'_>,

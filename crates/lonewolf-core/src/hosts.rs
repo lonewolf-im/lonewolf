@@ -14,7 +14,7 @@ use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, PublicKeyData};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::ResolvesServerCertUsingSni;
+use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
 use rustls::sign::CertifiedKey;
 use zeroize::Zeroizing;
 
@@ -30,7 +30,23 @@ pub struct Hosts {
 struct Host {
     domain: String,
     config: HostConfig,
-    certified_key: CertifiedKey,
+    certified_key: Arc<CertifiedKey>,
+    tls_server_config: Arc<rustls::ServerConfig>,
+}
+
+#[derive(Debug)]
+struct HostCertResolver {
+    domain: String,
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for HostCertResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        match hello.server_name() {
+            Some(name) if !name.eq_ignore_ascii_case(&self.domain) => None,
+            _ => Some(Arc::clone(&self.certified_key)),
+        }
+    }
 }
 
 impl Hosts {
@@ -50,7 +66,7 @@ impl Hosts {
                 .ok_or(HostsError::Empty)?,
             None => return Err(HostsError::DefaultRequired),
         };
-        let provider = rustls_graviola::default_provider();
+        let provider = Arc::new(rustls_graviola::default_provider());
         let mut resolver = ResolvesServerCertUsingSni::new();
         let mut sorted_hosts = Vec::with_capacity(hosts.len());
         for (domain, config) in hosts {
@@ -65,10 +81,21 @@ impl Hosts {
                     domain: domain.clone(),
                     source,
                 })?;
+            let certified_key = Arc::new(certified_key);
+            let tls_server_config =
+                rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                    .with_safe_default_protocol_versions()
+                    .map_err(HostsError::TlsConfiguration)?
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(HostCertResolver {
+                        domain: domain.clone(),
+                        certified_key: Arc::clone(&certified_key),
+                    }));
             sorted_hosts.push(Host {
                 domain: domain.clone(),
                 config: config.clone(),
                 certified_key,
+                tls_server_config: Arc::new(tls_server_config),
             });
         }
         let default_host_index = sorted_hosts
@@ -99,6 +126,10 @@ impl Hosts {
 
     pub fn certified_key(&self, domain: &str) -> Option<&CertifiedKey> {
         Some(&self.find_host(domain)?.certified_key)
+    }
+
+    pub fn tls_server_config(&self, domain: &str) -> Option<&Arc<rustls::ServerConfig>> {
+        Some(&self.find_host(domain)?.tls_server_config)
     }
 
     fn find_host(&self, domain: &str) -> Option<&Host> {
@@ -260,6 +291,7 @@ pub enum HostsError {
         domain: String,
         source: rustls::Error,
     },
+    TlsConfiguration(rustls::Error),
     GenerateLocalhost(String),
 }
 
@@ -306,6 +338,9 @@ impl fmt::Display for HostsError {
                     formatter,
                     "invalid TLS material for hosts.{domain}: {source}"
                 )
+            }
+            Self::TlsConfiguration(source) => {
+                write!(formatter, "cannot initialize TLS server: {source}")
             }
             Self::GenerateLocalhost(reason) => {
                 write!(

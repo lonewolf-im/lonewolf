@@ -22,6 +22,16 @@ pub struct RateLimitedReader<R> {
     refill_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
 }
 
+/// Keeps one connection's XML rate allowance across transport upgrades.
+pub struct RateLimitState {
+    bytes_per_second: usize,
+    burst_bytes: usize,
+    tokens: usize,
+    remainder: u128,
+    updated_at: Instant,
+    refill_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
 impl<R> RateLimitedReader<R> {
     pub fn new(inner: R, bytes_per_second: NonZeroUsize, burst_bytes: NonZeroUsize) -> Self {
         Self {
@@ -32,6 +42,29 @@ impl<R> RateLimitedReader<R> {
             remainder: 0,
             updated_at: Instant::now(),
             refill_wait: None,
+        }
+    }
+
+    pub fn from_state(inner: R, state: RateLimitState) -> Self {
+        Self {
+            inner,
+            bytes_per_second: state.bytes_per_second,
+            burst_bytes: state.burst_bytes,
+            tokens: state.tokens,
+            remainder: state.remainder,
+            updated_at: state.updated_at,
+            refill_wait: state.refill_wait,
+        }
+    }
+
+    pub fn into_state(self) -> RateLimitState {
+        RateLimitState {
+            bytes_per_second: self.bytes_per_second,
+            burst_bytes: self.burst_bytes,
+            tokens: self.tokens,
+            remainder: self.remainder,
+            updated_at: self.updated_at,
+            refill_wait: self.refill_wait,
         }
     }
 

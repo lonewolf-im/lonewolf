@@ -42,9 +42,65 @@ async fn open<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(
 ) -> TestResult {
     assert!(matches!(
         parser.next_event().await?,
-        Some(StreamEvent::StreamStart(_))
+        Some(StreamEvent::StreamStart { .. })
     ));
     Ok(())
+}
+
+#[test]
+fn opening_stream_exposes_content_namespace() -> TestResult {
+    block_on(async {
+        for (declaration, expected) in [
+            ("xmlns='jabber:client'", "jabber:client"),
+            ("xmlns='jabber:server'", "jabber:server"),
+            (
+                "xmlns='http://etherx.jabber.org/streams'",
+                "http://etherx.jabber.org/streams",
+            ),
+            ("", ""),
+        ] {
+            let input = format!(
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' {declaration}>"
+            );
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            let Some(StreamEvent::StreamStart {
+                content_namespace, ..
+            }) = parser.next_event().await?
+            else {
+                return Err("expected stream start".into());
+            };
+            assert_eq!(content_namespace, expected);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn explicit_attributes_exclude_inherited_stream_language() -> TestResult {
+    block_on(async {
+        let input = format!(
+            "{}<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' flag='1'/>",
+            OPEN.replace('>', " xml:lang='es'>")
+        );
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let Some(StreamEvent::Element(first)) = parser.next_event().await? else {
+            return Err("expected first element".into());
+        };
+        assert!(!first.has_explicit_attributes());
+        assert_eq!(
+            first
+                .value()
+                .resolve(first.arena())?
+                .attribute("lang", "http://www.w3.org/XML/1998/namespace")?,
+            Some("es")
+        );
+        let Some(StreamEvent::Element(second)) = parser.next_event().await? else {
+            return Err("expected second element".into());
+        };
+        assert!(second.has_explicit_attributes());
+        Ok(())
+    })
 }
 
 async fn stanza<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(

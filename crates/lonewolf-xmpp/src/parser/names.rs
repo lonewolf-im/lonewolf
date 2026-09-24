@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Resolves normalized namespace bindings before building typed stanza fields.
-
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, attributes::Attribute};
@@ -35,13 +33,13 @@ pub(super) fn push(
             let value = normalized(&attribute)?;
             xml::validate_text(&value)?;
             if value == XMLNS_NAMESPACE
-                || (value == XML_NAMESPACE && prefix != PrefixDeclaration::Named(b"xml"))
+                || (value == XML_NAMESPACE && prefix != PrefixDeclaration::Named("xml"))
                 || (value.is_empty() && matches!(prefix, PrefixDeclaration::Named(_)))
             {
                 return Err(ParseError::InvalidNamespace);
             }
             resolver
-                .add(prefix, Namespace(value.as_bytes()))
+                .add(prefix, Namespace(&value))
                 .map_err(quick_xml::Error::from)?;
         }
     }
@@ -53,11 +51,11 @@ pub(super) fn element<'a, 'b>(
     start: &'b BytesStart<'_>,
 ) -> Result<(&'b str, &'a str), ParseError> {
     let (namespace, name) = resolver.resolve_element(start.name());
-    Ok((utf8(name.into_inner())?, resolved_namespace(namespace)?))
+    Ok((name.into_inner(), resolved_namespace(namespace)?))
 }
 
 pub(super) fn content_namespace(resolver: &NamespaceResolver) -> Result<&str, ParseError> {
-    let (namespace, _) = resolver.resolve_element(QName(b"content"));
+    let (namespace, _) = resolver.resolve_element(QName("content"));
     resolved_namespace(namespace)
 }
 
@@ -94,7 +92,7 @@ pub(super) fn frame<A: ChunkAllocator>(
         }
         let (namespace, name) = resolver.resolve_attribute(attribute.key);
         let namespace = resolved_namespace(namespace)?;
-        let name = utf8(name.into_inner())?;
+        let name = name.into_inner();
         let value = normalized(&attribute)?;
         has_lang |= name == "lang" && namespace == XML_NAMESPACE;
         frame.attribute(name, namespace, &value, arena)?;
@@ -106,7 +104,7 @@ pub(super) fn frame<A: ChunkAllocator>(
 }
 
 fn normalized<'a>(attribute: &Attribute<'a>) -> Result<std::borrow::Cow<'a, str>, ParseError> {
-    if attribute.value.contains(&b'<') {
+    if attribute.value.contains('<') {
         return Err(ParseError::InvalidXml);
     }
     attribute
@@ -117,13 +115,13 @@ fn normalized<'a>(attribute: &Attribute<'a>) -> Result<std::borrow::Cow<'a, str>
 fn resolved_namespace(namespace: ResolveResult<'_>) -> Result<&str, ParseError> {
     match namespace {
         ResolveResult::Unbound => Ok(""),
-        ResolveResult::Bound(namespace) => utf8(namespace.into_inner()),
+        ResolveResult::Bound(namespace) => Ok(namespace.into_inner()),
         ResolveResult::Unknown(_) => Err(ParseError::InvalidNamespace),
     }
 }
 
 fn validate_qname(name: QName<'_>) -> Result<(), ParseError> {
-    let name = utf8(name.into_inner())?;
+    let name = name.into_inner();
     if let Some((prefix, local)) = name.split_once(':') {
         xml::validate_name(prefix, "", false)?;
         xml::validate_name(local, "", false)?;
@@ -131,10 +129,6 @@ fn validate_qname(name: QName<'_>) -> Result<(), ParseError> {
         xml::validate_name(name, "", false)?;
     }
     Ok(())
-}
-
-fn utf8(bytes: &[u8]) -> Result<&str, ParseError> {
-    std::str::from_utf8(bytes).map_err(|_| ParseError::UnsupportedEncoding)
 }
 
 fn stanza_type(name: &str, value: Option<&str>) -> Result<StanzaType, ParseError> {

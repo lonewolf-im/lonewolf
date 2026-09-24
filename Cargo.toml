@@ -21,7 +21,7 @@ publish = false
 async-channel = "2.5.0"
 async-lock = "3.4.2"
 axum = { version = "0.8.9", default-features = false }
-base64 = "0.22.1"
+base64 = "0.23.1"
 blocking = "1.7.0"
 clap = { version = "4.6.7", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 compio = { version = "0.19.2", default-features = false, features = ["runtime", "signal", "io-uring", "polling"] }
@@ -50,7 +50,7 @@ nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 percent-encoding = "2.3.2"
 precis-profiles = { version = "0.2.0", default-features = false }
-quick-xml = { version = "0.41.0", default-features = false, features = ["async-tokio"] }
+quick-xml = { version = "0.42.0", default-features = false, features = ["async-tokio"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
 rpassword = "7.5.4"
 rcgen = { version = "0.14.10", default-features = false }

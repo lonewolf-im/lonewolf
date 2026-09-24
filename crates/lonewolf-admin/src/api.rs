@@ -10,7 +10,7 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Path, Request, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderValue, StatusCode, Uri, request::Parts};
+use axum::http::{HeaderValue, Method, StatusCode, Uri, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -52,16 +52,37 @@ pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
 }
 
 async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
+    let command = admin_command(request.method(), route.as_ref());
     let started = Instant::now();
     let response = next.run(request).await;
-    // Concrete paths and queries can contain account identities or secrets.
-    tracing::debug!(
-        route = route.as_ref().map_or("unmatched", MatchedPath::as_str),
-        status = response.status().as_u16(),
-        latency_ms = started.elapsed().as_millis(),
-        "admin request completed"
-    );
+    if let Some(command) = command {
+        tracing::info!(
+            command,
+            status = response.status().as_u16(),
+            latency_ms = started.elapsed().as_millis(),
+            "admin command handled"
+        );
+    } else {
+        // Concrete paths and queries can contain account identities or secrets.
+        tracing::debug!(
+            route = route.as_ref().map_or("unmatched", MatchedPath::as_str),
+            status = response.status().as_u16(),
+            latency_ms = started.elapsed().as_millis(),
+            "admin request completed"
+        );
+    }
     response
+}
+
+fn admin_command(method: &Method, route: Option<&MatchedPath>) -> Option<&'static str> {
+    match (method.as_str(), route.map(MatchedPath::as_str)) {
+        ("GET", Some("/v1/accounts")) => Some("account_list"),
+        ("POST", Some("/v1/accounts")) => Some("account_create"),
+        ("GET", Some("/v1/accounts/{jid}")) => Some("account_get"),
+        ("DELETE", Some("/v1/accounts/{jid}")) => Some("account_delete"),
+        ("PUT", Some("/v1/accounts/{jid}/password")) => Some("account_password"),
+        _ => None,
+    }
 }
 
 async fn list_accounts<R: AccountRepository>(

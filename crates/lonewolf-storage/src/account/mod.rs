@@ -32,6 +32,7 @@ pub struct NewAccount {
 pub enum AccountError {
     AlreadyExists,
     NotFound,
+    UnsupportedIterations,
     Storage(StorageError),
 }
 
@@ -40,8 +41,9 @@ pub trait AccountRepository: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`AccountError::AlreadyExists`] if the key exists, or
-    /// [`AccountError::Storage`] if storage fails.
+    /// Returns [`AccountError::AlreadyExists`] if the key exists,
+    /// [`AccountError::UnsupportedIterations`] for a non-policy verifier,
+    /// or [`AccountError::Storage`] if storage fails.
     fn create(&self, account: NewAccount) -> impl Future<Output = Result<(), AccountError>> + Send;
 
     /// Returns `None` if the account is absent.
@@ -90,8 +92,9 @@ pub trait AccountRepository: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`AccountError::NotFound`] if the account is absent, or
-    /// [`AccountError::Storage`] if storage fails.
+    /// Returns [`AccountError::NotFound`] if the account is absent,
+    /// [`AccountError::UnsupportedIterations`] for a non-policy verifier,
+    /// or [`AccountError::Storage`] if storage fails.
     fn replace_credentials(
         &self,
         key: &AccountKey,
@@ -104,6 +107,9 @@ impl fmt::Display for AccountError {
         match self {
             Self::AlreadyExists => formatter.write_str("account already exists"),
             Self::NotFound => formatter.write_str("account not found"),
+            Self::UnsupportedIterations => {
+                formatter.write_str("SCRAM iteration count is not supported")
+            }
             Self::Storage(error) => write!(formatter, "account storage failed: {error}"),
         }
     }

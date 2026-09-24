@@ -15,6 +15,11 @@ use sha1::Sha1;
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
+pub const SCRAM_POLICY_ITERATIONS: NonZeroU32 = match NonZeroU32::new(100_000) {
+    Some(iterations) => iterations,
+    None => panic!("SCRAM policy iterations must be positive"),
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScramIterations(NonZeroU32);
 
@@ -219,6 +224,13 @@ impl ScramVerifier {
         match self {
             Self::Sha1(_) => ScramHash::Sha1,
             Self::Sha256(_) => ScramHash::Sha256,
+        }
+    }
+
+    pub fn iterations(&self) -> NonZeroU32 {
+        match self {
+            Self::Sha1(verifier) => verifier.iterations(),
+            Self::Sha256(verifier) => verifier.iterations(),
         }
     }
 }

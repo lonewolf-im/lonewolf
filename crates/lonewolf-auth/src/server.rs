@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::num::NonZeroU32;
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use hmac::digest::Output;
@@ -11,12 +9,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::scram::{ScramHash, ScramVerifier, ScramVerifierData};
+use crate::scram::{SCRAM_POLICY_ITERATIONS, ScramHash, ScramVerifier, ScramVerifierData};
 
-const DECOY_ITERATIONS: NonZeroU32 = match NonZeroU32::new(100_000) {
-    Some(value) => value,
-    None => panic!("SCRAM decoy iterations must be positive"),
-};
 const MAX_SCRAM_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -282,6 +276,11 @@ impl ScramServer {
 pub struct ScramDecoy(Zeroizing<[u8; 32]>);
 
 impl ScramDecoy {
+    /// The secret must be random and stable for the account store lifetime.
+    pub fn from_secret(secret: [u8; 32]) -> Self {
+        Self(Zeroizing::new(secret))
+    }
+
     pub fn new() -> Result<Self, ServerError> {
         let mut secret = Zeroizing::new([0; 32]);
         getrandom::fill(secret.as_mut()).map_err(|_| ServerError::RandomUnavailable)?;
@@ -306,14 +305,14 @@ impl ScramDecoy {
                 server20.copy_from_slice(&server[..20]);
                 ScramVerifier::Sha1(ScramVerifierData::new(
                     salt16,
-                    DECOY_ITERATIONS,
+                    SCRAM_POLICY_ITERATIONS,
                     stored20,
                     server20,
                 ))
             }
             ScramHash::Sha256 => ScramVerifier::Sha256(ScramVerifierData::new(
                 salt16,
-                DECOY_ITERATIONS,
+                SCRAM_POLICY_ITERATIONS,
                 stored,
                 server,
             )),

@@ -31,6 +31,7 @@ const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2);
 ///
 /// Dropping a future or stream does not cancel work already submitted to the
 /// pool. Submitted writes can commit after the caller stops waiting.
+#[derive(Clone)]
 pub struct RedbAccountRepository {
     database: RedbDatabase,
 }

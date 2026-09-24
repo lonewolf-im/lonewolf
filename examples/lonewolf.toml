@@ -35,16 +35,15 @@
 
 # Configure a PEM certificate chain and private key for each host except localhost.
 # Localhost uses a new self-signed certificate on each start if you omit its TLS section.
+# Use a leaf certificate signed with RSA PKCS#1 v1.5 or ECDSA and SHA-256, SHA-384, or SHA-512.
+# Ed25519 certificates cannot provide the required SCRAM channel binding.
 # Relative paths start from the directory where Lonewolf was launched.
-# The paths below are examples.
 # [hosts."example.com".tls]
 # certificate_chain_path = "./certs/example.com.crt"
 # private_key_path = "./certs/example.com.key"
 
 # ------------------------------------ Limits ---------------------------------------------------
 
-# Connection attempt limits apply at TCP admission.
-# Resource count, stanza rate, and recipient count limits have no runtime effect.
 # All numeric limits are positive integers.
 # [limits.c2s]
 
@@ -75,6 +74,12 @@
 # Choose at least 10,000 bytes and no more than the platform allocation range.
 # max_stanza_bytes = 262_144
 
+# Limit the time from TCP accept through the TLS-protected stream opening.
+# connection_establishment_timeout_secs = 10
+
+# Limit the time from the SASL offer through authentication success.
+# authentication_timeout_secs = 10
+
 # Limit reconnect traffic from one IP while allowing clients behind shared NAT.
 # The allowance covers all workers of one listener.
 # Use per_second for the sustained event rate and burst for the bucket capacity.
@@ -95,7 +100,6 @@
 # The window duration must fit the platform clock range.
 # distinct_recipients_per_connection = { max = 100, window_secs = 60 }
 
-# This example profile allows larger stanzas on the local endpoint shown below.
 # [limits.c2s.profiles.internal]
 # max_stanza_bytes = 524_288
 

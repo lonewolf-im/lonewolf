@@ -9,6 +9,7 @@ use base64::Engine;
 use graviola::hashing::Sha256;
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
+use graviola::signing::eddsa::Ed25519SigningKey;
 use lonewolf_core::config::{Config, HostConfig, HostTlsConfig};
 use lonewolf_core::hosts::{Hosts, HostsError};
 use rcgen::{CertificateParams, PublicKeyData};
@@ -27,6 +28,10 @@ fn single_host_is_the_default_and_has_generated_tls() -> TestResult {
     assert!(hosts.is_local_host("localhost"));
     assert!(!hosts.is_local_host("other.example"));
     assert!(hosts.tls_config("localhost").is_none());
+    assert_eq!(
+        hosts.tls_server_end_point("localhost").map(<[u8]>::len),
+        Some(32)
+    );
     let localhost = hosts
         .certified_key("localhost")
         .ok_or("missing certificate")?;
@@ -237,6 +242,48 @@ fn configured_localhost_certificate_replaces_generated_certificate() -> TestResu
 }
 
 #[test]
+fn hashless_certificate_signature_is_rejected_at_bootstrap() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let key = Ed25519SigningKey::generate()?;
+    let signer = Ed25519TestSigner {
+        public_key: key.public_key().as_bytes(),
+        key,
+    };
+    let mut parameters = CertificateParams::new(vec!["example.com".into()])?;
+    parameters.serial_number = Some(rcgen::SerialNumber::from(1_u64));
+    let certificate = parameters.self_signed(&signer)?;
+    let certificate_chain_path = directory.path().join("ed25519-cert.pem");
+    let private_key_path = directory.path().join("ed25519-key.pem");
+    fs::write(
+        &certificate_chain_path,
+        pem("CERTIFICATE", certificate.der())?,
+    )?;
+    let mut private_key = [0_u8; 512];
+    fs::write(
+        &private_key_path,
+        pem("PRIVATE KEY", signer.key.to_pkcs8_der(&mut private_key)?)?,
+    )?;
+    let mut config = Config::default();
+    config.hosts.clear();
+    config.hosts.insert(
+        "example.com".into(),
+        HostConfig {
+            tls: Some(HostTlsConfig {
+                certificate_chain_path,
+                private_key_path,
+            }),
+        },
+    );
+    let error = Hosts::new(&config.hosts, None)
+        .err()
+        .ok_or("hashless certificate accepted")?;
+    assert!(
+        matches!(error, HostsError::UnsupportedChannelBinding(domain) if domain == "example.com")
+    );
+    Ok(())
+}
+
+#[test]
 fn invalid_default_selection_is_rejected() {
     let empty = BTreeMap::new();
     assert!(matches!(Hosts::new(&empty, None), Err(HostsError::Empty)));
@@ -348,5 +395,26 @@ impl rcgen::SigningKey for TestSigner {
             .sign_asn1::<Sha256>(&[message], &mut signature)
             .map(<[u8]>::to_vec)
             .map_err(|_| rcgen::Error::RemoteKeyError)
+    }
+}
+
+struct Ed25519TestSigner {
+    key: Ed25519SigningKey,
+    public_key: [u8; 32],
+}
+
+impl PublicKeyData for Ed25519TestSigner {
+    fn der_bytes(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+        &rcgen::PKCS_ED25519
+    }
+}
+
+impl rcgen::SigningKey for Ed25519TestSigner {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+        Ok(self.key.sign(message).to_vec())
     }
 }

@@ -30,6 +30,7 @@ crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 futures-channel = "0.3.34"
 futures-executor = "0.3.34"
+futures-rustls = { version = "0.26.0", default-features = false }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
 graviola = "0.4.1"
@@ -71,3 +72,4 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-appender = { version = "0.2.5", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt", "std", "time"] }
 zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
+x509-cert = { version = "0.3.0", default-features = false }

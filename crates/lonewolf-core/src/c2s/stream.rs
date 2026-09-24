@@ -1,24 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::Write as _;
+use std::net::Shutdown;
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use compio::io::compat::AsyncReadStream;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use compio::io::compat::{AsyncReadStream, AsyncStream};
 use compio::io::{AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
-use compio::tls::TlsAcceptor;
+use compio::time::timeout;
+use futures_rustls::TlsAcceptor;
+use futures_util::io::{
+    AsyncReadExt as _, AsyncWrite as FuturesAsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf,
+};
+use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
+use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
-use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
+use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
-use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element, STREAM_NAMESPACE};
+use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element, NodeRef, STREAM_NAMESPACE, XML_NAMESPACE};
 use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
+use socket2::SockRef;
 use tokio::io::BufReader;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
+use super::AuthService;
 use super::connection_limit::ConnectionPermit;
 use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::limits::ByteRate;
@@ -30,13 +42,37 @@ const STARTTLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:para
 const STARTTLS_PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/></stream:stream>";
 const STREAM_FOOTER: &str = "</stream:stream>";
+const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
+const SASL_FEATURES: &str = "<stream:features><sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/><channel-binding type='tls-exporter'/></sasl-channel-binding><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>SCRAM-SHA-256-PLUS</mechanism><mechanism>SCRAM-SHA-256</mechanism><mechanism>SCRAM-SHA-1-PLUS</mechanism><mechanism>SCRAM-SHA-1</mechanism></mechanisms></stream:features>";
+const EMPTY_FEATURES: &str = "<stream:features/>";
+const MAX_AUTH_ATTEMPTS: usize = 3;
+
+type TlsTransport = futures_rustls::server::TlsStream<Pin<Box<AsyncStream<TcpStream>>>>;
+type TlsReader = ReadHalf<TlsTransport>;
+type TlsWriter = WriteHalf<TlsTransport>;
+type XmlInput = RateLimitedReader<BufReader<tokio_util::compat::Compat<TlsReader>>>;
+
+struct Established<A: ChunkAllocator> {
+    parser: XmppParser<XmlInput, A>,
+    writer: TlsWriter,
+    host: String,
+    client_from: Option<String>,
+    binding: TlsBinding,
+    auth_started_at: Instant,
+}
+
+struct TlsBinding {
+    exporter: [u8; 32],
+}
 
 pub(super) struct XmppStream<A: ChunkAllocator> {
     transport: TcpStream,
     ip_permit: ConnectionPermit,
     unauthenticated_permit: UnauthenticatedPermit,
     hosts: Hosts,
+    auth: Arc<AuthService>,
     settings: StreamSettings<A>,
+    accepted_at: Instant,
 }
 
 #[derive(Clone)]
@@ -44,15 +80,25 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
     max_stanza_bytes: NonZeroUsize,
     xml_bytes_per_second: NonZeroUsize,
     xml_burst_bytes: NonZeroUsize,
+    establishment_timeout: Duration,
+    authentication_timeout: Duration,
     allocator: A,
 }
 
 impl<A: ChunkAllocator> StreamSettings<A> {
-    pub(super) fn new(max_stanza_bytes: NonZeroUsize, xml_rate: &ByteRate, allocator: A) -> Self {
+    pub(super) fn new(
+        max_stanza_bytes: NonZeroUsize,
+        xml_rate: &ByteRate,
+        establishment_timeout: Duration,
+        authentication_timeout: Duration,
+        allocator: A,
+    ) -> Self {
         Self {
             max_stanza_bytes,
             xml_bytes_per_second: xml_rate.bytes_per_second,
             xml_burst_bytes: xml_rate.burst_bytes,
+            establishment_timeout,
+            authentication_timeout,
             allocator,
         }
     }
@@ -64,6 +110,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         ip_permit: ConnectionPermit,
         unauthenticated_permit: UnauthenticatedPermit,
         hosts: Hosts,
+        auth: Arc<AuthService>,
         settings: StreamSettings<A>,
     ) -> Self {
         Self {
@@ -71,7 +118,9 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             ip_permit,
             unauthenticated_permit,
             hosts,
+            auth,
             settings,
+            accepted_at: Instant::now(),
         }
     }
 
@@ -81,9 +130,52 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             ip_permit,
             unauthenticated_permit,
             hosts,
+            auth,
             settings,
+            accepted_at,
         } = self;
-        let outcome = establish(transport, &hosts, settings).await;
+        let close_control = transport.clone();
+        let established = timeout(
+            accepted_at
+                .checked_add(settings.establishment_timeout)
+                .map_or(Duration::ZERO, |deadline| {
+                    deadline.saturating_duration_since(Instant::now())
+                }),
+            establish(transport, &hosts, &settings),
+        )
+        .await;
+        let mut unauthenticated_permit = Some(unauthenticated_permit);
+        let outcome = match established {
+            Ok(Ok(mut established)) => {
+                let authentication_remaining = established
+                    .auth_started_at
+                    .checked_add(settings.authentication_timeout)
+                    .map_or(Duration::ZERO, |deadline| {
+                        deadline.saturating_duration_since(Instant::now())
+                    });
+                match timeout(
+                    authentication_remaining,
+                    authenticate(&mut established, &hosts, &auth),
+                )
+                .await
+                {
+                    Ok(Ok(account)) => {
+                        unauthenticated_permit.take();
+                        post_auth_stream(established, &hosts, &account).await
+                    }
+                    Ok(Err(outcome)) => outcome,
+                    Err(_) => {
+                        let _ = SockRef::from(&close_control).shutdown(Shutdown::Both);
+                        CloseOutcome::AuthenticationTimeout
+                    }
+                }
+            }
+            Ok(Err(outcome)) => outcome,
+            Err(_) => {
+                let _ = SockRef::from(&close_control).shutdown(Shutdown::Both);
+                CloseOutcome::EstablishmentTimeout
+            }
+        };
         drop(unauthenticated_permit);
         drop(ip_permit);
         outcome
@@ -93,8 +185,8 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
 async fn establish<A: ChunkAllocator + Clone>(
     mut transport: TcpStream,
     hosts: &Hosts,
-    settings: StreamSettings<A>,
-) -> CloseOutcome {
+    settings: &StreamSettings<A>,
+) -> Result<Established<A>, CloseOutcome> {
     let (selected_host, rate_state) = {
         // One-byte reads cannot consume TLS records before the STARTTLS boundary.
         let mut input = pin!(AsyncReadStream::with_capacity(1, transport.clone()));
@@ -118,29 +210,29 @@ async fn establish<A: ChunkAllocator + Clone>(
                 Ok(header) => header,
                 Err(outcome) => {
                     let response_to = response_to_from_header(&header);
-                    return send_setup_error(
+                    return Err(send_setup_error(
                         &mut transport,
                         hosts.default_host_name(),
                         response_to.as_deref(),
                         content_namespace == CLIENT_NAMESPACE,
                         outcome,
                     )
-                    .await;
+                    .await);
                 }
             },
-            Err(ParseError::UnexpectedEof) => return CloseOutcome::Eof,
+            Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
             Err(error) => {
                 let outcome = CloseOutcome::from_parse_error(&error);
-                return send_setup_error(
+                return Err(send_setup_error(
                     &mut transport,
                     hosts.default_host_name(),
                     None,
                     false,
                     outcome,
                 )
-                .await;
+                .await);
             }
-            _ => return CloseOutcome::ParserError,
+            _ => return Err(CloseOutcome::ParserError),
         };
         if send_response_header(
             &mut transport,
@@ -153,99 +245,59 @@ async fn establish<A: ChunkAllocator + Clone>(
         .is_err()
             || send(&mut transport, STARTTLS_FEATURES).await.is_err()
         {
-            return CloseOutcome::TransportError;
+            return Err(CloseOutcome::TransportError);
         }
         let rate_state = match parser.next_event().await {
             Ok(Some(StreamEvent::Element(element))) if is_starttls(&element) => {
                 if send(&mut transport, STARTTLS_PROCEED).await.is_err() {
-                    return CloseOutcome::TransportError;
+                    return Err(CloseOutcome::TransportError);
                 }
                 parser.into_inner().into_state()
             }
             Ok(Some(StreamEvent::Element(element))) if is_starttls_element(&element) => {
                 if send(&mut transport, STARTTLS_FAILURE).await.is_err() {
-                    return CloseOutcome::TransportError;
+                    return Err(CloseOutcome::TransportError);
                 }
-                return CloseOutcome::StartTlsRejected;
+                return Err(CloseOutcome::StartTlsRejected);
             }
             Ok(Some(StreamEvent::StreamEnd) | None) => {
                 if send(&mut transport, STREAM_FOOTER).await.is_err() {
-                    return CloseOutcome::TransportError;
+                    return Err(CloseOutcome::TransportError);
                 }
-                return CloseOutcome::StreamEnd;
+                return Err(CloseOutcome::StreamEnd);
             }
-            Err(ParseError::UnexpectedEof) => return CloseOutcome::Eof,
+            Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
             Err(error) => {
                 let outcome = CloseOutcome::from_parse_error(&error);
-                return send_stream_error(&mut transport, outcome).await;
+                return Err(send_stream_error(&mut transport, outcome).await);
             }
             _ => {
-                return send_stream_error(&mut transport, CloseOutcome::UnsupportedInput).await;
+                return Err(
+                    send_stream_error(&mut transport, CloseOutcome::UnsupportedInput).await,
+                );
             }
         };
         (header.host, rate_state)
     };
 
     let Some(tls_config) = hosts.tls_server_config(&selected_host) else {
-        return CloseOutcome::InternalError;
+        return Err(CloseOutcome::InternalError);
     };
     let acceptor = TlsAcceptor::from(Arc::clone(tls_config));
-    let mut transport = match acceptor.accept(transport).await {
+    let transport = match acceptor.accept(Box::pin(AsyncStream::new(transport))).await {
         Ok(transport) => transport,
-        Err(_) => return CloseOutcome::TlsFailure,
+        Err(_) => return Err(CloseOutcome::TlsFailure),
     };
-    let restarted = read_restarted_header(&mut transport, hosts, &settings, rate_state).await;
-    let outcome = match restarted {
-        Ok(header) if header.host == selected_host => {
-            if send_response_header(
-                &mut transport,
-                &header.host,
-                header.response_to.as_deref(),
-                header.client_content_namespace,
-                true,
-            )
-            .await
-            .is_err()
-            {
-                return CloseOutcome::TransportError;
-            }
-            send_stream_error(&mut transport, CloseOutcome::AuthenticationUnavailable).await
-        }
-        Ok(header) => {
-            send_setup_error(
-                &mut transport,
-                &selected_host,
-                header.response_to.as_deref(),
-                header.client_content_namespace,
-                CloseOutcome::HostUnknown,
-            )
-            .await
-        }
-        Err((CloseOutcome::Eof, _, _)) => CloseOutcome::Eof,
-        Err((outcome, client_content_namespace, response_to)) => {
-            send_setup_error(
-                &mut transport,
-                &selected_host,
-                response_to.as_deref(),
-                client_content_namespace,
-                outcome,
-            )
-            .await
-        }
-    };
-    let _ = transport.shutdown().await;
-    outcome
-}
-
-async fn read_restarted_header<A: ChunkAllocator + Clone>(
-    transport: &mut compio::tls::TlsStream<TcpStream>,
-    hosts: &Hosts,
-    settings: &StreamSettings<A>,
-    rate_state: RateLimitState,
-) -> Result<ClientHeader, (CloseOutcome, bool, Option<String>)> {
+    let mut exporter = [0_u8; 32];
+    transport
+        .get_ref()
+        .1
+        .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", None)
+        .map_err(|_| CloseOutcome::TlsFailure)?;
+    let (reader, mut writer) = transport.split();
     let mut parser = XmppParser::new(
         RateLimitedReader::from_state(
-            BufReader::with_capacity(READ_BUFFER_BYTES, Pin::new(transport).compat()),
+            BufReader::with_capacity(READ_BUFFER_BYTES, reader.compat()),
             rate_state,
         ),
         ParserConfig {
@@ -254,21 +306,567 @@ async fn read_restarted_header<A: ChunkAllocator + Clone>(
         },
         settings.allocator.clone(),
     );
-    match parser.next_event().await {
+    let header = match parser.next_event().await {
         Ok(Some(StreamEvent::StreamStart {
             header,
             content_namespace,
-        })) => validate_header(&header, &content_namespace, hosts).map_err(|outcome| {
-            (
-                outcome,
-                content_namespace == CLIENT_NAMESPACE,
-                response_to_from_header(&header),
-            )
-        }),
-        Err(ParseError::UnexpectedEof) => Err((CloseOutcome::Eof, false, None)),
-        Err(error) => Err((CloseOutcome::from_parse_error(&error), false, None)),
-        _ => Err((CloseOutcome::ParserError, false, None)),
+        })) => match validate_header(&header, &content_namespace, hosts) {
+            Ok(header) => header,
+            Err(outcome) => {
+                send_setup_error_tls(
+                    &mut writer,
+                    &selected_host,
+                    response_to_from_header(&header).as_deref(),
+                    content_namespace == CLIENT_NAMESPACE,
+                    outcome,
+                )
+                .await?;
+                return Err(outcome);
+            }
+        },
+        Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
+        Err(error) => {
+            let outcome = CloseOutcome::from_parse_error(&error);
+            send_setup_error_tls(&mut writer, &selected_host, None, false, outcome).await?;
+            return Err(outcome);
+        }
+        _ => return Err(CloseOutcome::ParserError),
+    };
+    if header.host != selected_host {
+        send_setup_error_tls(
+            &mut writer,
+            &selected_host,
+            header.response_to.as_deref(),
+            header.client_content_namespace,
+            CloseOutcome::HostUnknown,
+        )
+        .await?;
+        return Err(CloseOutcome::HostUnknown);
     }
+    send_response_header_tls(
+        &mut writer,
+        &selected_host,
+        header.response_to.as_deref(),
+        header.client_content_namespace,
+        true,
+    )
+    .await?;
+    send_tls(&mut writer, SASL_FEATURES).await?;
+    Ok(Established {
+        parser,
+        writer,
+        host: selected_host,
+        client_from: header.response_to,
+        binding: TlsBinding { exporter },
+        auth_started_at: Instant::now(),
+    })
+}
+
+async fn authenticate<A: ChunkAllocator + Clone>(
+    established: &mut Established<A>,
+    hosts: &Hosts,
+    auth: &AuthService,
+) -> Result<AccountKey, CloseOutcome> {
+    let Some(endpoint) = hosts.tls_server_end_point(&established.host) else {
+        return Err(CloseOutcome::InternalError);
+    };
+    let mut replacement_auth = None;
+    for attempt in 0..MAX_AUTH_ATTEMPTS {
+        let (mechanism, initial) = if let Some(auth) = replacement_auth.take() {
+            auth
+        } else {
+            let event = match established.parser.next_event().await {
+                Ok(Some(event)) => event,
+                Ok(None) | Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
+                Err(error) => {
+                    return Err(send_stream_error_tls(
+                        &mut established.writer,
+                        CloseOutcome::from_parse_error(&error),
+                    )
+                    .await);
+                }
+            };
+            match event {
+                StreamEvent::Element(element) => match parse_sasl_message(&element) {
+                    Ok(SaslMessage::Auth { mechanism, payload }) => (mechanism, payload),
+                    Ok(SaslMessage::Abort) => {
+                        if send_sasl_failure(&mut established.writer, "aborted")
+                            .await
+                            .is_err()
+                        {
+                            return Err(CloseOutcome::TransportError);
+                        }
+                        if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(condition) => {
+                        if send_sasl_failure(&mut established.writer, condition)
+                            .await
+                            .is_err()
+                        {
+                            return Err(CloseOutcome::TransportError);
+                        }
+                        if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        return Err(send_stream_error_tls(
+                            &mut established.writer,
+                            CloseOutcome::UnsupportedInput,
+                        )
+                        .await);
+                    }
+                },
+                StreamEvent::StreamEnd => {
+                    return Err(send_footer_tls(&mut established.writer).await);
+                }
+                _ => {
+                    return Err(send_stream_error_tls(
+                        &mut established.writer,
+                        CloseOutcome::UnsupportedInput,
+                    )
+                    .await);
+                }
+            }
+        };
+        let Some(mechanism) = mechanism else {
+            if send_sasl_failure(&mut established.writer, "invalid-mechanism")
+                .await
+                .is_err()
+            {
+                return Err(CloseOutcome::TransportError);
+            }
+            if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                break;
+            }
+            continue;
+        };
+        let initial = if initial.is_empty() {
+            if send_tls(
+                &mut established.writer,
+                "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>",
+            )
+            .await
+            .is_err()
+            {
+                return Err(CloseOutcome::TransportError);
+            }
+            match next_sasl_response(established).await {
+                SaslResponse::Data(response) => response,
+                SaslResponse::Auth { mechanism, payload } => {
+                    replacement_auth = Some((mechanism, payload));
+                    continue;
+                }
+                SaslResponse::Eof => return Err(CloseOutcome::Eof),
+                SaslResponse::StreamEnd => {
+                    return Err(send_footer_tls(&mut established.writer).await);
+                }
+                SaslResponse::ParseError(outcome) => {
+                    return Err(send_stream_error_tls(&mut established.writer, outcome).await);
+                }
+                SaslResponse::Failure(condition) => {
+                    if send_sasl_failure(&mut established.writer, condition)
+                        .await
+                        .is_err()
+                    {
+                        return Err(CloseOutcome::TransportError);
+                    }
+                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            initial
+        };
+        let first = match ClientFirst::parse(mechanism, &initial) {
+            Ok(first) => first,
+            Err(error) => {
+                if send_sasl_failure(&mut established.writer, scram_failure(error))
+                    .await
+                    .is_err()
+                {
+                    return Err(CloseOutcome::TransportError);
+                }
+                if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                    break;
+                }
+                continue;
+            }
+        };
+        let binding_kind = first.binding();
+        let account = account_key(first.username(), &established.host);
+        let authzid_matches = first
+            .authzid()
+            .is_none_or(|authzid| account_key_from_jid(authzid).as_ref() == account.as_ref());
+        let verifier = match account.as_ref() {
+            Some(key) => match auth.accounts.get_scram(key, mechanism.hash()).await {
+                Ok(verifier) => verifier,
+                Err(_) => {
+                    if send_sasl_failure(&mut established.writer, "temporary-auth-failure")
+                        .await
+                        .is_err()
+                    {
+                        return Err(CloseOutcome::TransportError);
+                    }
+                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                        break;
+                    }
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let known = verifier.is_some() && authzid_matches;
+        let verifier = match verifier {
+            Some(verifier) => verifier,
+            None => match auth.decoy.verifier(mechanism.hash(), first.username()) {
+                Ok(verifier) => verifier,
+                Err(_) => {
+                    return Err(send_stream_error_tls(
+                        &mut established.writer,
+                        CloseOutcome::InternalError,
+                    )
+                    .await);
+                }
+            },
+        };
+        let mut server_nonce = [0_u8; 24];
+        if graviola::random::fill(&mut server_nonce).is_err() {
+            return Err(send_stream_error_tls(
+                &mut established.writer,
+                CloseOutcome::InternalError,
+            )
+            .await);
+        }
+        let nonce = STANDARD.encode(server_nonce);
+        let (server, challenge) = match first.start(verifier, &nonce) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(send_stream_error_tls(
+                    &mut established.writer,
+                    CloseOutcome::InternalError,
+                )
+                .await);
+            }
+        };
+        if send_sasl_data(&mut established.writer, "challenge", &challenge)
+            .await
+            .is_err()
+        {
+            return Err(CloseOutcome::TransportError);
+        }
+        let response = match next_sasl_response(established).await {
+            SaslResponse::Data(response) => response,
+            SaslResponse::Auth { mechanism, payload } => {
+                replacement_auth = Some((mechanism, payload));
+                continue;
+            }
+            SaslResponse::Eof => return Err(CloseOutcome::Eof),
+            SaslResponse::StreamEnd => return Err(send_footer_tls(&mut established.writer).await),
+            SaslResponse::ParseError(outcome) => {
+                return Err(send_stream_error_tls(&mut established.writer, outcome).await);
+            }
+            SaslResponse::Failure(condition) => {
+                if send_sasl_failure(&mut established.writer, condition)
+                    .await
+                    .is_err()
+                {
+                    return Err(CloseOutcome::TransportError);
+                }
+                if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                    break;
+                }
+                continue;
+            }
+        };
+        let binding_data: &[u8] = match binding_kind {
+            Some(BindingType::TlsExporter) => &established.binding.exporter,
+            Some(BindingType::TlsServerEndPoint) => endpoint,
+            None => &[],
+        };
+        let final_message = server.finish(&response, binding_data);
+        let authenticated = match final_message {
+            Ok(message) if known => Some(message),
+            Ok(_) | Err(ServerError::InvalidProof | ServerError::ChannelBindingMismatch) => None,
+            Err(error) => {
+                if send_sasl_failure(&mut established.writer, scram_failure(error))
+                    .await
+                    .is_err()
+                {
+                    return Err(CloseOutcome::TransportError);
+                }
+                if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                    break;
+                }
+                continue;
+            }
+        };
+        if let Some(final_message) = authenticated {
+            let Some(account_key) = account.as_ref() else {
+                return Err(CloseOutcome::InternalError);
+            };
+            let current = match auth.accounts.get_scram(account_key, mechanism.hash()).await {
+                Ok(current) => current,
+                Err(_) => {
+                    if send_sasl_failure(&mut established.writer, "temporary-auth-failure")
+                        .await
+                        .is_err()
+                    {
+                        return Err(CloseOutcome::TransportError);
+                    }
+                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if current
+                .as_ref()
+                .is_some_and(|current| server.credential_is_current(current))
+            {
+                if established
+                    .client_from
+                    .as_deref()
+                    .is_some_and(|from| from != account_key.as_str())
+                {
+                    return Err(send_stream_error_tls(
+                        &mut established.writer,
+                        CloseOutcome::InvalidFrom,
+                    )
+                    .await);
+                }
+                if send_sasl_data(&mut established.writer, "success", &final_message)
+                    .await
+                    .is_err()
+                {
+                    return Err(CloseOutcome::TransportError);
+                }
+                return account.ok_or(CloseOutcome::InternalError);
+            }
+        }
+        if send_sasl_failure(&mut established.writer, "not-authorized")
+            .await
+            .is_err()
+        {
+            return Err(CloseOutcome::TransportError);
+        }
+        if attempt + 1 == MAX_AUTH_ATTEMPTS {
+            break;
+        }
+    }
+    Err(send_stream_error_tls(
+        &mut established.writer,
+        CloseOutcome::AuthenticationAttemptsExceeded,
+    )
+    .await)
+}
+
+async fn post_auth_stream<A: ChunkAllocator + Clone>(
+    established: Established<A>,
+    hosts: &Hosts,
+    account: &AccountKey,
+) -> CloseOutcome {
+    let Established {
+        parser,
+        mut writer,
+        host,
+        ..
+    } = established;
+    let mut parser = match parser.restart() {
+        Ok(parser) => parser,
+        Err(_) => return CloseOutcome::ParserError,
+    };
+    let header = match parser.next_event().await {
+        Ok(Some(StreamEvent::StreamStart {
+            header,
+            content_namespace,
+        })) => match validate_header(&header, &content_namespace, hosts) {
+            Ok(header) => header,
+            Err(outcome) => return send_stream_error_tls(&mut writer, outcome).await,
+        },
+        Err(ParseError::UnexpectedEof) => return CloseOutcome::Eof,
+        Err(error) => {
+            return send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error))
+                .await;
+        }
+        _ => return CloseOutcome::ParserError,
+    };
+    if header.host != host
+        || header
+            .response_to
+            .as_deref()
+            .is_some_and(|from| from != account.as_str())
+    {
+        return send_stream_error_tls(&mut writer, CloseOutcome::InvalidFrom).await;
+    }
+    if send_response_header_tls(
+        &mut writer,
+        &host,
+        header.response_to.as_deref(),
+        header.client_content_namespace,
+        true,
+    )
+    .await
+    .is_err()
+        || send_tls(&mut writer, EMPTY_FEATURES).await.is_err()
+    {
+        return CloseOutcome::TransportError;
+    }
+    match parser.next_event().await {
+        Ok(Some(StreamEvent::StreamEnd) | None) => send_footer_tls(&mut writer).await,
+        Err(ParseError::UnexpectedEof) => CloseOutcome::Eof,
+        Err(error) => {
+            send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error)).await
+        }
+        _ => send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedInput).await,
+    }
+}
+
+fn account_key(username: &str, host: &str) -> Option<AccountKey> {
+    let mut arena = Arena::try_new(ArenaConfig::default()).ok()?;
+    let jid = Jid::from_parts_in(Some(username), host, None, &mut arena).ok()?;
+    AccountKey::try_from(jid.resolve(&arena).ok()?).ok()
+}
+
+fn account_key_from_jid(jid: &str) -> Option<AccountKey> {
+    let mut arena = Arena::try_new(ArenaConfig::default()).ok()?;
+    let jid = Jid::parse_in(jid, &mut arena).ok()?;
+    AccountKey::try_from(jid.resolve(&arena).ok()?).ok()
+}
+
+fn scram_failure(error: ServerError) -> &'static str {
+    match error {
+        ServerError::Malformed => "malformed-request",
+        ServerError::UnsupportedBinding => "malformed-request",
+        ServerError::ChannelBindingMismatch | ServerError::InvalidProof => "not-authorized",
+        ServerError::HashMismatch | ServerError::RandomUnavailable => "temporary-auth-failure",
+    }
+}
+
+enum SaslMessage {
+    Auth {
+        mechanism: Option<Mechanism>,
+        payload: Vec<u8>,
+    },
+    Response(Vec<u8>),
+    Abort,
+}
+
+fn parse_sasl_message<A: ChunkAllocator>(
+    element: &lonewolf_xmpp::parser::Parsed<Element, A>,
+) -> Result<SaslMessage, &'static str> {
+    let view = element
+        .value()
+        .resolve(element.arena())
+        .map_err(|_| "malformed-request")?;
+    if view.namespace() != SASL_NAMESPACE {
+        return Err("malformed-request");
+    }
+    let mut mechanism = None;
+    let mut attribute_count = 0;
+    for attribute in view.attributes().map_err(|_| "malformed-request")? {
+        let attribute = attribute.map_err(|_| "malformed-request")?;
+        if attribute.name == "lang" && attribute.namespace == XML_NAMESPACE {
+            continue;
+        }
+        attribute_count += 1;
+        if attribute.name == "mechanism" && attribute.namespace.is_empty() {
+            mechanism = Some(attribute.value);
+        }
+    }
+    let mut content = None;
+    for child in view.children().map_err(|_| "malformed-request")? {
+        let child = child.map_err(|_| "malformed-request")?;
+        match child {
+            NodeRef::Text(text) if content.is_none() => content = Some(text),
+            _ => return Err("malformed-request"),
+        }
+    }
+    match view.name() {
+        "auth" if attribute_count == 1 => {
+            let mechanism = mechanism.ok_or("malformed-request")?;
+            Ok(SaslMessage::Auth {
+                mechanism: Mechanism::from_name(mechanism),
+                payload: decode_sasl_text(content)?,
+            })
+        }
+        "response" if attribute_count == 0 => Ok(SaslMessage::Response(decode_sasl_text(content)?)),
+        "abort" if attribute_count == 0 && content.is_none() => Ok(SaslMessage::Abort),
+        _ => Err("malformed-request"),
+    }
+}
+
+fn decode_sasl_text(text: Option<&str>) -> Result<Vec<u8>, &'static str> {
+    let text = text.unwrap_or_default();
+    if text == "=" || text.is_empty() {
+        return Ok(Vec::new());
+    }
+    if text.len() > 8_192 {
+        return Err("malformed-request");
+    }
+    STANDARD.decode(text).map_err(|_| "incorrect-encoding")
+}
+
+enum SaslResponse {
+    Data(Vec<u8>),
+    Auth {
+        mechanism: Option<Mechanism>,
+        payload: Vec<u8>,
+    },
+    Failure(&'static str),
+    StreamEnd,
+    Eof,
+    ParseError(CloseOutcome),
+}
+
+async fn next_sasl_response<A: ChunkAllocator + Clone>(
+    established: &mut Established<A>,
+) -> SaslResponse {
+    match established.parser.next_event().await {
+        Ok(Some(StreamEvent::Element(element))) => match parse_sasl_message(&element) {
+            Ok(SaslMessage::Response(response)) => SaslResponse::Data(response),
+            Ok(SaslMessage::Auth { mechanism, payload }) => {
+                SaslResponse::Auth { mechanism, payload }
+            }
+            Ok(SaslMessage::Abort) => SaslResponse::Failure("aborted"),
+            Err(condition) => SaslResponse::Failure(condition),
+        },
+        Ok(Some(StreamEvent::StreamEnd)) => SaslResponse::StreamEnd,
+        Ok(None) | Err(ParseError::UnexpectedEof) => SaslResponse::Eof,
+        Err(error) => SaslResponse::ParseError(CloseOutcome::from_parse_error(&error)),
+        _ => SaslResponse::Failure("malformed-request"),
+    }
+}
+
+async fn send_sasl_failure(
+    writer: &mut TlsWriter,
+    condition: &'static str,
+) -> Result<(), CloseOutcome> {
+    let mut xml = String::with_capacity(SASL_NAMESPACE.len() + condition.len() + 48);
+    write!(
+        xml,
+        "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
+    )
+    .map_err(|_| CloseOutcome::InternalError)?;
+    send_tls(writer, &xml).await
+}
+
+async fn send_sasl_data(
+    writer: &mut TlsWriter,
+    kind: &'static str,
+    message: &str,
+) -> Result<(), CloseOutcome> {
+    let mut xml = String::with_capacity(message.len() * 4 / 3 + 96);
+    write!(xml, "<{kind} xmlns='{SASL_NAMESPACE}'>").map_err(|_| CloseOutcome::InternalError)?;
+    STANDARD.encode_string(message, &mut xml);
+    write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
+    send_tls(writer, &xml).await
 }
 
 struct ClientHeader {
@@ -413,14 +1011,9 @@ async fn send_stream_error<W: AsyncWrite>(
     transport: &mut W,
     outcome: CloseOutcome,
 ) -> CloseOutcome {
-    let Some(condition) = outcome.stream_condition() else {
+    let Some(xml) = stream_error_xml(outcome) else {
         return outcome;
     };
-    let mut xml = String::with_capacity(128);
-    if StreamError::new(condition).write_xml(&mut xml).is_err() {
-        return CloseOutcome::InternalError;
-    }
-    xml.push_str(STREAM_FOOTER);
     if send_owned(transport, xml).await.is_err() {
         return CloseOutcome::TransportError;
     }
@@ -434,6 +1027,18 @@ async fn send_response_header<W: AsyncWrite>(
     client_content_namespace: bool,
     include_version: bool,
 ) -> Result<(), CloseOutcome> {
+    let xml = response_header_xml(host, to, client_content_namespace, include_version)?;
+    send_owned(transport, xml)
+        .await
+        .map_err(|_| CloseOutcome::TransportError)
+}
+
+fn response_header_xml(
+    host: &str,
+    to: Option<&str>,
+    client_content_namespace: bool,
+    include_version: bool,
+) -> Result<String, CloseOutcome> {
     let mut id = [0_u8; 16];
     graviola::random::fill(&mut id).map_err(|_| CloseOutcome::InternalError)?;
     let mut xml = String::with_capacity(192 + host.len() + to.map_or(0, str::len));
@@ -458,9 +1063,85 @@ async fn send_response_header<W: AsyncWrite>(
         xml.push('\'');
     }
     xml.push('>');
-    send_owned(transport, xml)
+    Ok(xml)
+}
+
+fn stream_error_xml(outcome: CloseOutcome) -> Option<String> {
+    let condition = outcome.stream_condition()?;
+    let mut xml = String::with_capacity(128);
+    StreamError::new(condition).write_xml(&mut xml).ok()?;
+    xml.push_str(STREAM_FOOTER);
+    Some(xml)
+}
+
+async fn send_tls<W: FuturesAsyncWrite + Unpin>(
+    writer: &mut W,
+    xml: &str,
+) -> Result<(), CloseOutcome> {
+    writer
+        .write_all(xml.as_bytes())
+        .await
+        .map_err(|_| CloseOutcome::TransportError)?;
+    writer
+        .flush()
         .await
         .map_err(|_| CloseOutcome::TransportError)
+}
+
+async fn send_footer_tls<W: FuturesAsyncWrite + Unpin>(writer: &mut W) -> CloseOutcome {
+    if send_tls(writer, STREAM_FOOTER).await.is_err() || writer.close().await.is_err() {
+        CloseOutcome::TransportError
+    } else {
+        CloseOutcome::StreamEnd
+    }
+}
+
+async fn send_response_header_tls<W: FuturesAsyncWrite + Unpin>(
+    writer: &mut W,
+    host: &str,
+    to: Option<&str>,
+    client_content_namespace: bool,
+    include_version: bool,
+) -> Result<(), CloseOutcome> {
+    let xml = response_header_xml(host, to, client_content_namespace, include_version)?;
+    send_tls(writer, &xml).await
+}
+
+async fn send_stream_error_tls<W: FuturesAsyncWrite + Unpin>(
+    writer: &mut W,
+    outcome: CloseOutcome,
+) -> CloseOutcome {
+    let Some(xml) = stream_error_xml(outcome) else {
+        return outcome;
+    };
+    if send_tls(writer, &xml).await.is_err() || writer.close().await.is_err() {
+        CloseOutcome::TransportError
+    } else {
+        outcome
+    }
+}
+
+async fn send_setup_error_tls<W: FuturesAsyncWrite + Unpin>(
+    writer: &mut W,
+    host: &str,
+    to: Option<&str>,
+    client_content_namespace: bool,
+    outcome: CloseOutcome,
+) -> Result<(), CloseOutcome> {
+    send_response_header_tls(
+        writer,
+        host,
+        to,
+        client_content_namespace,
+        outcome != CloseOutcome::UnsupportedVersion,
+    )
+    .await?;
+    let sent = send_stream_error_tls(writer, outcome).await;
+    if sent == CloseOutcome::TransportError {
+        Err(sent)
+    } else {
+        Ok(())
+    }
 }
 
 fn escape_attribute(output: &mut String, value: &str) {
@@ -486,7 +1167,7 @@ async fn send_owned<W: AsyncWrite>(transport: &mut W, xml: String) -> std::io::R
     transport.write_all(xml.into_bytes()).await.0
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CloseOutcome {
     StreamEnd,
     Eof,
@@ -503,7 +1184,9 @@ pub(super) enum CloseOutcome {
     UnsupportedEncoding,
     StartTlsRejected,
     TlsFailure,
-    AuthenticationUnavailable,
+    AuthenticationTimeout,
+    EstablishmentTimeout,
+    AuthenticationAttemptsExceeded,
     InternalError,
     TransportError,
 }
@@ -533,9 +1216,8 @@ impl CloseOutcome {
             Self::InvalidXml => Some(StreamErrorCondition::InvalidXml),
             Self::RestrictedXml => Some(StreamErrorCondition::RestrictedXml),
             Self::UnsupportedEncoding => Some(StreamErrorCondition::UnsupportedEncoding),
-            Self::AuthenticationUnavailable | Self::InternalError => {
-                Some(StreamErrorCondition::InternalServerError)
-            }
+            Self::AuthenticationAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::InternalError => Some(StreamErrorCondition::InternalServerError),
             _ => None,
         }
     }
@@ -557,7 +1239,9 @@ impl CloseOutcome {
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::StartTlsRejected => "starttls_rejected",
             Self::TlsFailure => "tls_failure",
-            Self::AuthenticationUnavailable => "authentication_unavailable",
+            Self::AuthenticationTimeout => "authentication_timeout",
+            Self::EstablishmentTimeout => "establishment_timeout",
+            Self::AuthenticationAttemptsExceeded => "authentication_attempts_exceeded",
             Self::InternalError => "internal_error",
             Self::TransportError => "transport_error",
         }

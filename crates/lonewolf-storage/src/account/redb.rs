@@ -73,14 +73,13 @@ impl RedbAccountRepository {
             accounts_table_exists |= table.name() == ACCOUNTS.name();
             decoy_table_exists |= table.name() == DECOY_SECRET.name();
         }
-        if decoy_table_exists && !accounts_table_exists {
+        if decoy_table_exists != accounts_table_exists {
             return Err(StorageError::new(StorageErrorKind::CorruptData));
         }
+        let fresh = !accounts_table_exists;
         let mut secret = Zeroizing::new([0; 32]);
         {
-            let accounts = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-            let has_accounts = !accounts.is_empty().map_err(storage_error)?;
-            drop(accounts);
+            transaction.open_table(ACCOUNTS).map_err(storage_error)?;
             let mut table = transaction
                 .open_table(DECOY_SECRET)
                 .map_err(storage_error)?;
@@ -94,10 +93,7 @@ impl RedbAccountRepository {
                     }
                     secret.copy_from_slice(stored.value());
                 }
-                None if decoy_table_exists
-                    || has_accounts
-                    || !table.is_empty().map_err(storage_error)? =>
-                {
+                None if !fresh => {
                     return Err(StorageError::new(StorageErrorKind::CorruptData));
                 }
                 None => {}

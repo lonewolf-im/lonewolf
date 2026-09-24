@@ -14,7 +14,7 @@ use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier, ScramVeri
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountError, AccountRepository, NewAccount};
 use lonewolf_storage::{RedbDatabase, StorageErrorKind};
-use redb::{Database, ReadableDatabase, ReadableTable, TableHandle};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
 
 #[path = "account_redb/support.rs"]
 mod support;
@@ -150,9 +150,9 @@ fn decoy_salt_survives_reopening_and_differs_between_databases() -> TestResult {
 #[test]
 fn existing_schema_metadata_is_ignored() -> TestResult {
     let database = database()?;
+    let _repository = RedbAccountRepository::from_database(database.clone())?;
     let transaction = database.as_ref().begin_write()?;
     transaction.open_table(METADATA)?.insert(SCHEMA_KEY, 1)?;
-    transaction.open_table(ACCOUNTS)?;
     transaction.commit()?;
 
     let repository = RedbAccountRepository::from_database(database.clone())?;
@@ -465,11 +465,12 @@ fn new_database_files_are_private_to_the_owner() -> TestResult {
 }
 
 #[test]
-fn missing_decoy_table_is_initialized_for_empty_account_store() -> TestResult {
+fn fresh_database_initializes_required_tables() -> TestResult {
     let database = database()?;
-    let transaction = database.as_ref().begin_write()?;
-    transaction.open_table(ACCOUNTS)?;
-    transaction.commit()?;
+    let transaction = database.as_ref().begin_read()?;
+    assert_eq!(transaction.list_tables()?.count(), 0);
+    drop(transaction);
+
     let repository = RedbAccountRepository::from_database(database.clone())?;
     assert!(block_on(repository.get(&key("alice@example.com")?))?.is_none());
     let transaction = database.as_ref().begin_read()?;
@@ -483,6 +484,23 @@ fn missing_decoy_table_is_initialized_for_empty_account_store() -> TestResult {
             .len(),
         32
     );
+    Ok(())
+}
+
+#[test]
+fn missing_decoy_table_is_rejected_for_empty_account_store() -> TestResult {
+    let database = database()?;
+    let transaction = database.as_ref().begin_write()?;
+    transaction.open_table(ACCOUNTS)?;
+    transaction.commit()?;
+
+    match RedbAccountRepository::from_database(database.clone()) {
+        Err(error) => assert_eq!(error.kind(), StorageErrorKind::CorruptData),
+        Ok(_) => return Err("created a decoy secret for an existing account store".into()),
+    }
+    let transaction = database.as_ref().begin_read()?;
+    assert_eq!(transaction.list_tables()?.count(), 1);
+    assert!(transaction.open_table(ACCOUNTS)?.is_empty()?);
     Ok(())
 }
 

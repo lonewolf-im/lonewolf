@@ -4,6 +4,7 @@ members = [
     "crates/lonewolf-admin",
     "crates/lonewolf-auth",
     "crates/lonewolf-core",
+    "crates/lonewolfctl",
     "crates/lonewolf-storage",
     "crates/lonewolf-util",
     "crates/lonewolf-xmpp",
@@ -50,6 +51,7 @@ percent-encoding = "2.3.2"
 precis-profiles = { version = "0.2.0", default-features = false }
 quick-xml = { version = "0.41.0", default-features = false, features = ["async-tokio"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
+rpassword = "7.5.4"
 rcgen = { version = "0.14.10", default-features = false }
 rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12"] }
 rustls-graviola = "0.4.0"

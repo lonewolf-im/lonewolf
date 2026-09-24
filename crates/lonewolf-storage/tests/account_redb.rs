@@ -14,7 +14,7 @@ use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier, ScramVeri
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountError, AccountRepository, NewAccount};
 use lonewolf_storage::{RedbDatabase, StorageErrorKind};
-use redb::{Database, ReadableDatabase, ReadableTable, TableHandle};
+use redb::{Database, ReadableDatabase, ReadableTable};
 
 #[path = "account_redb/support.rs"]
 mod support;
@@ -148,17 +148,15 @@ fn decoy_salt_survives_reopening_and_differs_between_databases() -> TestResult {
 }
 
 #[test]
-fn legacy_schema_is_rejected_without_modification() -> TestResult {
+fn existing_schema_metadata_is_ignored() -> TestResult {
     let database = database()?;
     let transaction = database.as_ref().begin_write()?;
     transaction.open_table(METADATA)?.insert(SCHEMA_KEY, 1)?;
     transaction.open_table(ACCOUNTS)?;
     transaction.commit()?;
 
-    match RedbAccountRepository::from_database(database.clone()) {
-        Err(error) => assert_eq!(error.kind(), StorageErrorKind::UnsupportedVersion),
-        Ok(_) => return Err("accepted the legacy account schema".into()),
-    }
+    let repository = RedbAccountRepository::from_database(database.clone())?;
+    assert!(block_on(repository.get(&key("alice@example.com")?))?.is_none());
     let transaction = database.as_ref().begin_read()?;
     assert_eq!(
         transaction
@@ -168,10 +166,14 @@ fn legacy_schema_is_rejected_without_modification() -> TestResult {
             .value(),
         1
     );
-    assert!(
+    assert_eq!(
         transaction
-            .list_tables()?
-            .all(|table| table.name() != DECOY_SECRET.name())
+            .open_table(DECOY_SECRET)?
+            .get(DECOY_SECRET_KEY)?
+            .ok_or("missing decoy secret")?
+            .value()
+            .len(),
+        32
     );
     Ok(())
 }
@@ -463,66 +465,43 @@ fn new_database_files_are_private_to_the_owner() -> TestResult {
 }
 
 #[test]
-fn incompatible_schema_is_rejected_without_modifying_it() -> TestResult {
-    let database = database()?;
-    let transaction = database.as_ref().begin_write()?;
-    transaction.open_table(METADATA)?.insert(SCHEMA_KEY, 3)?;
-    transaction.open_table(ACCOUNTS)?;
-    transaction.commit()?;
-
-    match RedbAccountRepository::from_database(database.clone()) {
-        Err(error) => assert_eq!(error.kind(), StorageErrorKind::UnsupportedVersion),
-        Ok(_) => return Err("accepted incompatible schema".into()),
-    }
-    let transaction = database.as_ref().begin_read()?;
-    assert_eq!(
-        transaction
-            .open_table(METADATA)?
-            .get(SCHEMA_KEY)?
-            .ok_or("missing schema")?
-            .value(),
-        3
-    );
-    Ok(())
-}
-
-#[test]
-fn incomplete_schema_is_rejected_without_recreating_tables() -> TestResult {
+fn missing_tables_are_initialized() -> TestResult {
     for accounts_exist in [false, true] {
         let database = database()?;
         let transaction = database.as_ref().begin_write()?;
         if accounts_exist {
             transaction.open_table(ACCOUNTS)?;
         } else {
-            transaction.open_table(METADATA)?.insert(SCHEMA_KEY, 2)?;
+            transaction.open_table(DECOY_SECRET)?;
         }
         transaction.commit()?;
-        match RedbAccountRepository::from_database(database.clone()) {
-            Err(error) => assert_eq!(error.kind(), StorageErrorKind::CorruptData),
-            Ok(_) => return Err("accepted incomplete schema".into()),
-        }
-        assert_eq!(database.as_ref().begin_read()?.list_tables()?.count(), 1);
+        let repository = RedbAccountRepository::from_database(database.clone())?;
+        assert!(block_on(repository.get(&key("alice@example.com")?))?.is_none());
+        let transaction = database.as_ref().begin_read()?;
+        assert_eq!(transaction.list_tables()?.count(), 2);
+        assert_eq!(
+            transaction
+                .open_table(DECOY_SECRET)?
+                .get(DECOY_SECRET_KEY)?
+                .ok_or("missing decoy secret")?
+                .value()
+                .len(),
+            32
+        );
     }
     Ok(())
 }
 
 #[test]
-fn missing_or_invalid_persisted_decoy_secret_is_not_replaced() -> TestResult {
-    for value in [None, Some(&[7][..]), Some(&[9; 32][..])] {
+fn invalid_persisted_decoy_secret_is_not_replaced() -> TestResult {
+    for value in [&[7][..], &[9; 32][..]] {
         let database = database()?;
         let _repository = RedbAccountRepository::from_database(database.clone())?;
         let transaction = database.as_ref().begin_write()?;
         {
             let mut table = transaction.open_table(DECOY_SECRET)?;
-            match value {
-                Some(bytes) => {
-                    table.insert(DECOY_SECRET_KEY, bytes)?;
-                }
-                None => {
-                    table.remove(DECOY_SECRET_KEY)?;
-                }
-            }
-            if value.is_some_and(|bytes| bytes.len() == 32) {
+            table.insert(DECOY_SECRET_KEY, value)?;
+            if value.len() == 32 {
                 table.insert("extra", &[1][..])?;
             }
         }
@@ -538,7 +517,7 @@ fn missing_or_invalid_persisted_decoy_secret_is_not_replaced() -> TestResult {
             table
                 .get(DECOY_SECRET_KEY)?
                 .map(|stored| stored.value().to_vec()),
-            value.map(<[u8]>::to_vec)
+            Some(value.to_vec())
         );
     }
     Ok(())

@@ -111,3 +111,8 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 
 - Never change `README.md` unless the user explicitly requests changes to that file.
 - Do not infer permission from requests to change code or other documentation.
+
+## 12. Storage Compatibility Rule
+
+- Before the first stable release, do not add storage schema version checks or data migrations unless the user explicitly requests them.
+- Initialize the tables and values required by the current code. Do not rewrite or delete existing account records during initialization.

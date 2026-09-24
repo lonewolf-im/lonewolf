@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use ::redb::{
     Database, OwnedRange, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-    TableHandle,
 };
 use futures_util::{Stream, stream};
 use lonewolf_auth::scram::{
@@ -22,14 +21,12 @@ use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
 use zeroize::Zeroizing;
 
 use crate::account::{Account, AccountError, AccountKey, AccountRepository, NewAccount};
-use crate::redb::{METADATA, begin_write, commit_error, storage_error};
+use crate::redb::{begin_write, commit_error, storage_error};
 use crate::{RedbDatabase, StorageError, StorageErrorKind};
 
 const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
 const DECOY_SECRET: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_scram_decoy");
 const DECOY_SECRET_KEY: &str = "secret";
-const SCHEMA_KEY: &str = "accounts_schema";
-const SCHEMA_VERSION: u32 = 2;
 const RECORD_VERSION: u8 = 1;
 const SHA1: u8 = 1;
 const SHA256: u8 = 2;
@@ -46,7 +43,7 @@ pub struct RedbAccountRepository {
 }
 
 impl RedbAccountRepository {
-    /// Opens the database and initializes its schema synchronously.
+    /// Opens the database and initializes required tables synchronously.
     ///
     /// # Errors
     ///
@@ -55,75 +52,52 @@ impl RedbAccountRepository {
         Self::from_database(RedbDatabase::open(path)?)
     }
 
-    /// Initializes the schema and loads the SCRAM decoy secret.
+    /// Initializes required tables and loads or creates the SCRAM decoy secret.
     ///
     /// Shares operation limits with other repositories using the same
-    /// [`RedbDatabase`]. This schema check bypasses those limits and can wait
+    /// [`RedbDatabase`]. This initialization bypasses those limits and can wait
     /// for an existing write transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageErrorKind::CorruptData`] for an incomplete schema or
-    /// [`StorageErrorKind::UnsupportedVersion`] for an unknown schema version.
+    /// Returns [`StorageErrorKind::CorruptData`] for an invalid decoy secret.
     /// Backend failures return [`StorageErrorKind::Unavailable`],
     /// [`StorageErrorKind::CorruptData`], or [`StorageErrorKind::Other`].
-    /// A failed schema commit can return [`StorageErrorKind::CommitUnknown`].
+    /// A failed commit can return [`StorageErrorKind::CommitUnknown`].
     pub fn from_database(database: RedbDatabase) -> Result<Self, StorageError> {
         let transaction = begin_write(database.as_ref())?;
-        let mut accounts_exist = false;
-        let mut decoy_secret_exists = false;
-        let version;
-        {
-            for table in transaction.list_tables().map_err(storage_error)? {
-                accounts_exist |= table.name() == ACCOUNTS.name();
-                decoy_secret_exists |= table.name() == DECOY_SECRET.name();
-            }
-            let metadata = transaction.open_table(METADATA).map_err(storage_error)?;
-            version = metadata
-                .get(SCHEMA_KEY)
-                .map_err(storage_error)?
-                .map(|value| value.value());
-        }
-        let initialize = match version {
-            None if !accounts_exist && !decoy_secret_exists => true,
-            Some(SCHEMA_VERSION) if accounts_exist && decoy_secret_exists => false,
-            None | Some(SCHEMA_VERSION) => {
-                return Err(StorageError::new(StorageErrorKind::CorruptData));
-            }
-            Some(_) => return Err(StorageError::new(StorageErrorKind::UnsupportedVersion)),
-        };
         let mut secret = Zeroizing::new([0; 32]);
-        if initialize {
-            getrandom::fill(secret.as_mut())
-                .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
+        {
             transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-            transaction
-                .open_table(DECOY_SECRET)
-                .map_err(storage_error)?
-                .insert(DECOY_SECRET_KEY, &secret[..])
-                .map_err(storage_error)?;
-            transaction
-                .open_table(METADATA)
-                .map_err(storage_error)?
-                .insert(SCHEMA_KEY, SCHEMA_VERSION)
-                .map_err(storage_error)?;
-            transaction.commit().map_err(commit_error)?;
-        } else {
-            let table = transaction
+            let mut table = transaction
                 .open_table(DECOY_SECRET)
                 .map_err(storage_error)?;
-            let stored = table
-                .get(DECOY_SECRET_KEY)
-                .map_err(storage_error)?
-                .ok_or_else(|| StorageError::new(StorageErrorKind::CorruptData))?;
-            if stored.value().len() != secret.len() || table.len().map_err(storage_error)? != 1 {
-                return Err(StorageError::new(StorageErrorKind::CorruptData));
+            let existing = table.get(DECOY_SECRET_KEY).map_err(storage_error)?;
+            match existing.as_ref() {
+                Some(stored) => {
+                    if stored.value().len() != secret.len()
+                        || table.len().map_err(storage_error)? != 1
+                    {
+                        return Err(StorageError::new(StorageErrorKind::CorruptData));
+                    }
+                    secret.copy_from_slice(stored.value());
+                }
+                None if !table.is_empty().map_err(storage_error)? => {
+                    return Err(StorageError::new(StorageErrorKind::CorruptData));
+                }
+                None => {}
             }
-            secret.copy_from_slice(stored.value());
-            drop(stored);
-            drop(table);
-            transaction.abort().map_err(storage_error)?;
+            let missing = existing.is_none();
+            drop(existing);
+            if missing {
+                getrandom::fill(secret.as_mut())
+                    .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
+                table
+                    .insert(DECOY_SECRET_KEY, &secret[..])
+                    .map_err(storage_error)?;
+            }
         }
+        transaction.commit().map_err(commit_error)?;
         Ok(Self {
             database,
             decoy: Arc::new(ScramDecoy::from_secret(*secret)),

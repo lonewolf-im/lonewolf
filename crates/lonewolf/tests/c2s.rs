@@ -15,7 +15,8 @@ use nix::unistd::Pid;
 type TestResult = Result<(), Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN: &[u8] =
-    b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
+    b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";
+const FEATURES_END: &[u8] = b"</stream:features>";
 
 struct Server {
     child: Child,
@@ -106,6 +107,37 @@ fn connect_until_eof(port: u16) -> TestResult {
     }
     assert_eq!(stream.read(&mut [0; 1])?, 0);
     Ok(())
+}
+
+fn read_features(stream: &mut TcpStream) -> TestResult {
+    let mut response = Vec::new();
+    let mut byte = [0];
+    while response.len() < 16 * 1024 && !response.ends_with(FEATURES_END) {
+        stream.read_exact(&mut byte)?;
+        response.push(byte[0]);
+    }
+    assert!(response.ends_with(FEATURES_END));
+    assert!(
+        response
+            .windows(b"<required/>".len())
+            .any(|part| part == b"<required/>")
+    );
+    Ok(())
+}
+
+fn read_until_closed(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut buffer = [0; 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(response),
+            Ok(amount) => response.extend_from_slice(&buffer[..amount]),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Ok(response);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[test]
@@ -279,6 +311,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
     first.set_read_timeout(Some(Duration::from_millis(200)))?;
     first.write_all(OPEN)?;
+    read_features(&mut first)?;
     assert!(matches!(
         first.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
@@ -298,6 +331,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     let mut replacement = TcpStream::connect_timeout(&address, TIMEOUT)?;
     replacement.set_read_timeout(Some(Duration::from_millis(200)))?;
     replacement.write_all(OPEN)?;
+    read_features(&mut replacement)?;
     assert!(matches!(
         replacement.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
@@ -333,6 +367,7 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
         let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
         first.set_read_timeout(Some(Duration::from_millis(200)))?;
         first.write_all(OPEN)?;
+        read_features(&mut first)?;
         assert!(matches!(
             first.read(&mut [0; 1]),
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
@@ -384,15 +419,18 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
     large.write_all(payload.as_bytes())?;
     small.write_all(OPEN)?;
     small.write_all(payload.as_bytes())?;
+    read_features(&mut large)?;
+    read_features(&mut small)?;
     assert!(matches!(
         large.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
     ));
-    match small.read(&mut [0; 1]) {
-        Ok(0) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-        other => return Err(format!("limited connection remained open: {other:?}").into()),
-    }
+    let response = read_until_closed(&mut small)?;
+    assert!(
+        response
+            .windows(b"<policy-violation".len())
+            .any(|part| part == b"<policy-violation")
+    );
     large.shutdown(Shutdown::Write)?;
     large.set_read_timeout(Some(TIMEOUT))?;
     assert_eq!(large.read(&mut [0; 1])?, 0);
@@ -423,6 +461,7 @@ fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
     let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1]))?;
     slow.set_read_timeout(Some(Duration::from_millis(100)))?;
     slow.write_all(&payload)?;
+    read_features(&mut slow)?;
     assert!(matches!(
         slow.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
@@ -430,9 +469,10 @@ fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
     let mut fast = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[0]))?;
     fast.set_read_timeout(Some(TIMEOUT))?;
     fast.write_all(&payload)?;
-    assert_eq!(fast.read(&mut [0; 1])?, 0);
+    read_features(&mut fast)?;
+    assert_eq!(read_until_closed(&mut fast)?, b"</stream:stream>");
     slow.set_read_timeout(Some(TIMEOUT))?;
-    assert_eq!(slow.read(&mut [0; 1])?, 0);
+    assert_eq!(read_until_closed(&mut slow)?, b"</stream:stream>");
     server.stop(Signal::SIGINT)?;
     Ok(())
 }

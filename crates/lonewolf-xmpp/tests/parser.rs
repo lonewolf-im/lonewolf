@@ -42,9 +42,37 @@ async fn open<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(
 ) -> TestResult {
     assert!(matches!(
         parser.next_event().await?,
-        Some(StreamEvent::StreamStart(_))
+        Some(StreamEvent::StreamStart { .. })
     ));
     Ok(())
+}
+
+#[test]
+fn opening_stream_exposes_content_namespace() -> TestResult {
+    block_on(async {
+        for (declaration, expected) in [
+            ("xmlns='jabber:client'", "jabber:client"),
+            ("xmlns='jabber:server'", "jabber:server"),
+            (
+                "xmlns='http://etherx.jabber.org/streams'",
+                "http://etherx.jabber.org/streams",
+            ),
+            ("", ""),
+        ] {
+            let input = format!(
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' {declaration}>"
+            );
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            let Some(StreamEvent::StreamStart {
+                content_namespace, ..
+            }) = parser.next_event().await?
+            else {
+                return Err("expected stream start".into());
+            };
+            assert_eq!(content_namespace, expected);
+        }
+        Ok(())
+    })
 }
 
 async fn stanza<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone>(

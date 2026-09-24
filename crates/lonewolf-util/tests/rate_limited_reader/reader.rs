@@ -72,6 +72,30 @@ fn burst_then_refill_paces_all_bytes() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn transport_upgrade_keeps_rate_allowance() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let mut before = RateLimitedReader::new(
+            SliceReader { bytes: b"ab" },
+            NonZeroUsize::new(10).ok_or("invalid rate")?,
+            NonZeroUsize::new(2).ok_or("invalid burst")?,
+        );
+        let mut initial = [0; 2];
+        before.read_exact(&mut initial).await?;
+        let mut after =
+            RateLimitedReader::from_state(SliceReader { bytes: b"c" }, before.into_state());
+        let mut next = [0; 1];
+        assert!(
+            timeout(Duration::from_millis(20), after.read_exact(&mut next))
+                .await
+                .is_err()
+        );
+        timeout(Duration::from_millis(200), after.read_exact(&mut next)).await??;
+        assert_eq!(&next, b"c");
+        Ok::<_, Box<dyn Error>>(())
+    })
+}
+
+#[test]
 fn refill_keeps_fractional_credit_and_caps_at_burst() {
     let mut reader = RateLimitedReader::new(
         SliceReader { bytes: b"" },

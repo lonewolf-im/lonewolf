@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_util::arena::GlobalChunkAllocator;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 use super::*;
 use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
@@ -20,8 +22,7 @@ use crate::config::Config;
 use crate::hosts::HostsError;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-const OPEN: &str =
-    "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
+const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
@@ -49,7 +50,7 @@ fn run_case_with_rate(
     shutdown_write: bool,
     max_stanza_bytes: NonZeroUsize,
     xml_rate: &ByteRate,
-) -> Result<(CloseOutcome, Duration), Box<dyn Error>> {
+) -> Result<(CloseOutcome, Duration, String), Box<dyn Error>> {
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
         let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
@@ -90,20 +91,37 @@ fn run_case_with_rate(
             unauthenticated.reserve(Instant::now()).await,
             UnauthenticatedAdmission::Allowed(_)
         ));
-        let mut remaining = [0; 1];
-        assert_eq!(client.read(&mut remaining)?, 0);
+        let mut response = Vec::new();
+        let mut buffer = [0; 1024];
+        loop {
+            match client.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(amount) => response.extend_from_slice(&buffer[..amount]),
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let response = String::from_utf8(response)?;
         listener.close().await?;
-        Ok((outcome, elapsed))
+        Ok((outcome, elapsed, response))
     }))?
 }
 
 #[test]
 fn stream_footer_closes_without_tcp_eof() -> Result<(), Box<dyn Error>> {
     let input = format!("{OPEN}{CLOSE}");
-    assert_eq!(
-        run_case(input.as_bytes(), false, MAX_STANZA_BYTES)?,
-        CloseOutcome::StreamEnd
-    );
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::StreamEnd);
+    assert!(response.contains(" from='localhost'"));
+    assert!(response.contains(" id='"));
+    assert!(response.contains(" version='1.0' xml:lang='en'"));
+    assert!(response.contains(STARTTLS_FEATURES));
+    assert!(response.ends_with(STREAM_FOOTER));
     Ok(())
 }
 
@@ -120,11 +138,208 @@ fn tcp_eof_before_stream_footer_releases_connection() -> Result<(), Box<dyn Erro
 #[test]
 fn early_stanza_closes_without_tcp_eof() -> Result<(), Box<dyn Error>> {
     let input = format!("{OPEN}<message/>");
-    assert_eq!(
-        run_case(input.as_bytes(), false, MAX_STANZA_BYTES)?,
-        CloseOutcome::UnsupportedInput
-    );
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::UnsupportedInput);
+    assert!(response.contains("<not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"));
     Ok(())
+}
+
+#[test]
+fn unknown_host_returns_stream_error() -> Result<(), Box<dyn Error>> {
+    let input = OPEN.replace("to='localhost'", "to='elsewhere.example'");
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::HostUnknown);
+    assert!(response.contains("<host-unknown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"));
+    assert!(!response.contains(STARTTLS_FEATURES));
+    Ok(())
+}
+
+#[test]
+fn response_uses_bare_client_from() -> Result<(), Box<dyn Error>> {
+    let input = OPEN.replace(
+        "version='1.0'",
+        "from='Alice@LOCALHOST/Phone' version='1.0'",
+    );
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        true,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::Eof);
+    assert!(response.contains(" to='alice@localhost'"));
+    Ok(())
+}
+
+#[test]
+fn invalid_client_from_returns_stream_error() -> Result<(), Box<dyn Error>> {
+    let input = OPEN.replace("version='1.0'", "from='@' version='1.0'");
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::InvalidFrom);
+    assert!(response.contains("<invalid-from xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"));
+    Ok(())
+}
+
+#[test]
+fn wrong_content_namespace_returns_stream_error() -> Result<(), Box<dyn Error>> {
+    let input = OPEN.replace("xmlns='jabber:client'", "xmlns='jabber:server'");
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::InvalidNamespace);
+    assert!(response.contains("<invalid-namespace xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"));
+    Ok(())
+}
+
+#[test]
+fn response_preserves_prefix_free_namespace_style() -> Result<(), Box<dyn Error>> {
+    for input in [
+        format!("{}{CLOSE}", OPEN.replace(" xmlns='jabber:client'", "")),
+        "<stream xmlns='http://etherx.jabber.org/streams' to='localhost' version='1.0'></stream>"
+            .to_owned(),
+    ] {
+        let (outcome, _, response) = run_case_with_rate(
+            input.as_bytes(),
+            false,
+            MAX_STANZA_BYTES,
+            &ByteRate::default(),
+        )?;
+        assert_eq!(outcome, CloseOutcome::StreamEnd);
+        assert!(!response.contains("xmlns='jabber:client'"));
+        assert!(response.contains(STARTTLS_FEATURES));
+    }
+    Ok(())
+}
+
+#[test]
+fn starttls_rejects_nonempty_request() -> Result<(), Box<dyn Error>> {
+    let input = format!("{OPEN}<starttls xmlns='{STARTTLS_NAMESPACE}'><x/></starttls>");
+    let (outcome, _, response) = run_case_with_rate(
+        input.as_bytes(),
+        false,
+        MAX_STANZA_BYTES,
+        &ByteRate::default(),
+    )?;
+    assert_eq!(outcome, CloseOutcome::StartTlsRejected);
+    assert!(response.contains(STARTTLS_FAILURE));
+    Ok(())
+}
+
+fn read_through(stream: &mut StdTcpStream, marker: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    let mut byte = [0];
+    while response.len() < 16 * 1024 && !response.ends_with(marker) {
+        stream.read_exact(&mut byte)?;
+        response.push(byte[0]);
+    }
+    if response.ends_with(marker) {
+        Ok(response)
+    } else {
+        Err(std::io::Error::other("response marker missing"))
+    }
+}
+
+fn stream_id(response: &str) -> Option<&str> {
+    response
+        .split(" id='")
+        .nth(1)
+        .and_then(|tail| tail.split_once('\''))
+        .map(|(id, _)| id)
+}
+
+#[test]
+fn starttls_restarts_stream_and_stops_before_authentication()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    Runtime::new()?.block_on(timeout(TIMEOUT, async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let hosts = hosts()?;
+        let mut roots = RootCertStore::empty();
+        let certificate = hosts
+            .certified_key("localhost")
+            .ok_or("missing certificate")?
+            .cert[0]
+            .clone();
+        roots.add(certificate)?;
+        let tls_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let address = listener.local_addr()?;
+        let client = std::thread::spawn(
+            move || -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+                let mut socket = StdTcpStream::connect(address)?;
+                socket.set_read_timeout(Some(TIMEOUT))?;
+                socket.set_write_timeout(Some(TIMEOUT))?;
+                socket.write_all(OPEN.as_bytes())?;
+                let response = read_through(&mut socket, b"</stream:features>")?;
+                let before_tls = String::from_utf8(response)?;
+                socket.write_all(format!("<starttls xmlns='{STARTTLS_NAMESPACE}'/>").as_bytes())?;
+                assert_eq!(
+                    read_through(&mut socket, STARTTLS_PROCEED.as_bytes())?,
+                    STARTTLS_PROCEED.as_bytes()
+                );
+                let connection = ClientConnection::new(
+                    Arc::new(tls_config),
+                    ServerName::try_from("localhost")?,
+                )?;
+                let mut tls = StreamOwned::new(connection, socket);
+                tls.write_all(OPEN.as_bytes())?;
+                let mut after_tls = String::new();
+                tls.read_to_string(&mut after_tls)?;
+                Ok((before_tls, after_tls))
+            },
+        );
+        let (transport, peer) = listener.accept().await?;
+        let limiter = ConnectionLimiter::new(1);
+        let ConnectionAdmission::Allowed(permit) = limiter.reserve(peer.ip(), Instant::now()).await
+        else {
+            return Err("first connection was denied".into());
+        };
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+            unauthenticated.reserve(Instant::now()).await
+        else {
+            return Err("first unauthenticated connection was denied".into());
+        };
+        let stream = XmppStream::new(
+            transport,
+            permit,
+            unauthenticated_permit,
+            hosts,
+            StreamSettings::new(MAX_STANZA_BYTES, &ByteRate::default(), GlobalChunkAllocator),
+        );
+        assert_eq!(stream.run().await, CloseOutcome::AuthenticationUnavailable);
+        let (before_tls, after_tls) = client.join().map_err(|_| "client thread panicked")??;
+        assert!(before_tls.contains(STARTTLS_FEATURES));
+        assert!(after_tls.contains(" from='localhost'"));
+        assert!(
+            after_tls
+                .contains("<internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>")
+        );
+        assert!(!after_tls.contains(STARTTLS_FEATURES));
+        assert_ne!(stream_id(&before_tls), stream_id(&after_tls));
+        listener.close().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
+    }))?
 }
 
 #[test]
@@ -153,7 +368,8 @@ fn stream_whitespace_consumes_xml_allowance() -> Result<(), Box<dyn Error>> {
         bytes_per_second: NonZeroUsize::new(10).ok_or("invalid rate")?,
         burst_bytes: NonZeroUsize::new(OPEN.len() + CLOSE.len()).ok_or("invalid burst")?,
     };
-    let (outcome, elapsed) = run_case_with_rate(input.as_bytes(), false, MAX_STANZA_BYTES, &rate)?;
+    let (outcome, elapsed, _) =
+        run_case_with_rate(input.as_bytes(), false, MAX_STANZA_BYTES, &rate)?;
     assert_eq!(outcome, CloseOutcome::StreamEnd);
     assert!(elapsed >= Duration::from_millis(50));
     Ok(())

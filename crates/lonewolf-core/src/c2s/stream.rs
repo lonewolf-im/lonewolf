@@ -56,6 +56,7 @@ struct Established<A: ChunkAllocator> {
     parser: XmppParser<XmlInput, A>,
     writer: TlsWriter,
     host: String,
+    client_from: Option<String>,
     binding: TlsBinding,
     auth_started_at: Instant,
 }
@@ -355,6 +356,7 @@ async fn establish<A: ChunkAllocator + Clone>(
         parser,
         writer,
         host: selected_host,
+        client_from: header.response_to,
         binding: TlsBinding { exporter },
         auth_started_at: Instant::now(),
     })
@@ -368,44 +370,59 @@ async fn authenticate<A: ChunkAllocator + Clone>(
     let Some(endpoint) = hosts.tls_server_end_point(&established.host) else {
         return Err(CloseOutcome::InternalError);
     };
+    let mut replacement_auth = None;
     for attempt in 0..MAX_AUTH_ATTEMPTS {
-        let event = match established.parser.next_event().await {
-            Ok(Some(event)) => event,
-            Ok(None) | Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
-            Err(error) => {
-                return Err(send_stream_error_tls(
-                    &mut established.writer,
-                    CloseOutcome::from_parse_error(&error),
-                )
-                .await);
-            }
-        };
-        let (mechanism, initial) = match event {
-            StreamEvent::Element(element) => match parse_sasl_message(&element) {
-                Ok(SaslMessage::Auth { mechanism, payload }) => (mechanism, payload),
-                Ok(SaslMessage::Abort) => {
-                    if send_sasl_failure(&mut established.writer, "aborted")
-                        .await
-                        .is_err()
-                    {
-                        return Err(CloseOutcome::TransportError);
-                    }
-                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                        break;
-                    }
-                    continue;
+        let (mechanism, initial) = if let Some(auth) = replacement_auth.take() {
+            auth
+        } else {
+            let event = match established.parser.next_event().await {
+                Ok(Some(event)) => event,
+                Ok(None) | Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
+                Err(error) => {
+                    return Err(send_stream_error_tls(
+                        &mut established.writer,
+                        CloseOutcome::from_parse_error(&error),
+                    )
+                    .await);
                 }
-                Err(condition) => {
-                    if send_sasl_failure(&mut established.writer, condition)
-                        .await
-                        .is_err()
-                    {
-                        return Err(CloseOutcome::TransportError);
+            };
+            match event {
+                StreamEvent::Element(element) => match parse_sasl_message(&element) {
+                    Ok(SaslMessage::Auth { mechanism, payload }) => (mechanism, payload),
+                    Ok(SaslMessage::Abort) => {
+                        if send_sasl_failure(&mut established.writer, "aborted")
+                            .await
+                            .is_err()
+                        {
+                            return Err(CloseOutcome::TransportError);
+                        }
+                        if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                            break;
+                        }
+                        continue;
                     }
-                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                        break;
+                    Err(condition) => {
+                        if send_sasl_failure(&mut established.writer, condition)
+                            .await
+                            .is_err()
+                        {
+                            return Err(CloseOutcome::TransportError);
+                        }
+                        if attempt + 1 == MAX_AUTH_ATTEMPTS {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
+                    _ => {
+                        return Err(send_stream_error_tls(
+                            &mut established.writer,
+                            CloseOutcome::UnsupportedInput,
+                        )
+                        .await);
+                    }
+                },
+                StreamEvent::StreamEnd => {
+                    return Err(send_footer_tls(&mut established.writer).await);
                 }
                 _ => {
                     return Err(send_stream_error_tls(
@@ -414,16 +431,6 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                     )
                     .await);
                 }
-            },
-            StreamEvent::StreamEnd => {
-                return Err(send_footer_tls(&mut established.writer).await);
-            }
-            _ => {
-                return Err(send_stream_error_tls(
-                    &mut established.writer,
-                    CloseOutcome::UnsupportedInput,
-                )
-                .await);
             }
         };
         let Some(mechanism) = mechanism else {
@@ -450,6 +457,10 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             }
             match next_sasl_response(established).await {
                 SaslResponse::Data(response) => response,
+                SaslResponse::Auth { mechanism, payload } => {
+                    replacement_auth = Some((mechanism, payload));
+                    continue;
+                }
                 SaslResponse::Eof => return Err(CloseOutcome::Eof),
                 SaslResponse::StreamEnd => {
                     return Err(send_footer_tls(&mut established.writer).await);
@@ -552,6 +563,10 @@ async fn authenticate<A: ChunkAllocator + Clone>(
         }
         let response = match next_sasl_response(established).await {
             SaslResponse::Data(response) => response,
+            SaslResponse::Auth { mechanism, payload } => {
+                replacement_auth = Some((mechanism, payload));
+                continue;
+            }
             SaslResponse::Eof => return Err(CloseOutcome::Eof),
             SaslResponse::StreamEnd => return Err(send_footer_tls(&mut established.writer).await),
             SaslResponse::ParseError(outcome) => {
@@ -576,11 +591,10 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             None => &[],
         };
         let final_message = server.finish(&response, binding_data);
-        let authenticated = match (known, final_message) {
-            (true, Ok(message)) => Some(message),
-            (false, _)
-            | (_, Err(ServerError::InvalidProof | ServerError::ChannelBindingMismatch)) => None,
-            (_, Err(error)) => {
+        let authenticated = match final_message {
+            Ok(message) if known => Some(message),
+            Ok(_) | Err(ServerError::InvalidProof | ServerError::ChannelBindingMismatch) => None,
+            Err(error) => {
                 if send_sasl_failure(&mut established.writer, scram_failure(error))
                     .await
                     .is_err()
@@ -616,6 +630,17 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                 .as_ref()
                 .is_some_and(|current| server.credential_is_current(current))
             {
+                if established
+                    .client_from
+                    .as_deref()
+                    .is_some_and(|from| from != account_key.as_str())
+                {
+                    return Err(send_stream_error_tls(
+                        &mut established.writer,
+                        CloseOutcome::InvalidFrom,
+                    )
+                    .await);
+                }
                 if send_sasl_data(&mut established.writer, "success", &final_message)
                     .await
                     .is_err()
@@ -718,7 +743,7 @@ fn account_key_from_jid(jid: &str) -> Option<AccountKey> {
 fn scram_failure(error: ServerError) -> &'static str {
     match error {
         ServerError::Malformed => "malformed-request",
-        ServerError::UnsupportedBinding => "channel-binding-not-supported",
+        ServerError::UnsupportedBinding => "malformed-request",
         ServerError::ChannelBindingMismatch | ServerError::InvalidProof => "not-authorized",
         ServerError::HashMismatch | ServerError::RandomUnavailable => "temporary-auth-failure",
     }
@@ -790,6 +815,10 @@ fn decode_sasl_text(text: Option<&str>) -> Result<Vec<u8>, &'static str> {
 
 enum SaslResponse {
     Data(Vec<u8>),
+    Auth {
+        mechanism: Option<Mechanism>,
+        payload: Vec<u8>,
+    },
     Failure(&'static str),
     StreamEnd,
     Eof,
@@ -802,8 +831,10 @@ async fn next_sasl_response<A: ChunkAllocator + Clone>(
     match established.parser.next_event().await {
         Ok(Some(StreamEvent::Element(element))) => match parse_sasl_message(&element) {
             Ok(SaslMessage::Response(response)) => SaslResponse::Data(response),
+            Ok(SaslMessage::Auth { mechanism, payload }) => {
+                SaslResponse::Auth { mechanism, payload }
+            }
             Ok(SaslMessage::Abort) => SaslResponse::Failure("aborted"),
-            Ok(_) => SaslResponse::Failure("malformed-request"),
             Err(condition) => SaslResponse::Failure(condition),
         },
         Ok(Some(StreamEvent::StreamEnd)) => SaslResponse::StreamEnd,

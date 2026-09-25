@@ -1243,11 +1243,13 @@ version = "0.1.0"
 dependencies = [
  "compio-io",
  "futures-executor",
+ "futures-util",
  "icu_properties",
  "idna",
  "lonewolf-util",
  "precis-profiles",
  "quick-xml",
+ "smallvec",
  "tokio",
  "tokio-util",
 ]

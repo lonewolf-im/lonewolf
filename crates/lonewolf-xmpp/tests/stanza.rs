@@ -2,10 +2,14 @@
 
 use std::alloc::Layout;
 use std::fmt;
+use std::io;
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
+use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::{
     AllocationError, Arena, ArenaConfig, ArenaError, ArenaRead, Chunk, ChunkAllocator,
     GlobalChunkAllocator, HandleError,
@@ -13,12 +17,54 @@ use lonewolf_util::arena::{
 use lonewolf_util::pool::{MIN_POOL_SIZE, PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
-    BuildError, CLIENT_NAMESPACE, Element, IqType, MAX_ELEMENT_DEPTH, MessageType, NodeRef,
-    PresenceType, SERVER_NAMESPACE, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza,
+    AsyncWriteError, BuildError, CLIENT_NAMESPACE, Element, IqType, MAX_ELEMENT_DEPTH, MessageType,
+    NodeRef, PresenceType, SERVER_NAMESPACE, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza,
     StanzaErrorCondition, StanzaKind, StanzaNamespace, StanzaType, WriteError, XML_NAMESPACE,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[derive(Default)]
+struct FragmentedWriter {
+    bytes: Vec<u8>,
+    pending: bool,
+    flushes: usize,
+    fail_after: Option<usize>,
+}
+
+impl AsyncWrite for FragmentedWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let writer = self.get_mut();
+        if writer.pending {
+            writer.pending = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        if writer
+            .fail_after
+            .is_some_and(|limit| writer.bytes.len() >= limit)
+        {
+            return Poll::Ready(Err(io::Error::other("output failed")));
+        }
+        writer.pending = true;
+        let len = input.len().min(3);
+        writer.bytes.extend_from_slice(&input[..len]);
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().flushes += 1;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
 
 fn stanza_xml(
     stanza: Stanza,
@@ -275,6 +321,72 @@ fn preserves_mixed_content_expanded_names_and_xml_whitespace() -> TestResult {
         "<xml:custom><empty xmlns=\"\"/></xml:custom>"
     );
     assert_eq!(element_xml(empty, &arena)?, "<empty xmlns=\"\"/>");
+    Ok(())
+}
+
+#[test]
+fn async_xml_matches_sync_with_partial_writes_and_backpressure() -> TestResult {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let from = Jid::parse_in("alice@example.com/Desk", &mut arena)?;
+    let to = Jid::parse_in("bob@example.net", &mut arena)?;
+    let empty = Element::builder_in("empty", "", &mut arena)?.build()?;
+    let item = Element::builder_in("item", "urn:content", &mut arena)?
+        .attribute("lang", XML_NAMESPACE, "es")?
+        .attribute("key", "urn:attribute", "a\t\n\r\"<&>")?
+        .text("before <&>\r")?
+        .child(empty)?
+        .text("after & ]]>\n")?
+        .build()?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .id(Some("id\"<&"))?
+    .lang(Some("en"))?
+    .attribute("flag", "urn:flag", "yes & no")?
+    .child(item)?
+    .build()?;
+    let mut writer = FragmentedWriter::default();
+    futures_executor::block_on(stanza.resolve(&arena)?.write_xml_async(&mut writer))?;
+    assert_eq!(writer.bytes, stanza_xml(stanza, &arena)?.as_bytes());
+    assert_eq!(writer.flushes, 0);
+
+    let feature = Element::builder_in("features", STREAM_NAMESPACE, &mut arena)?
+        .child(item)?
+        .build()?;
+    let mut writer = FragmentedWriter::default();
+    futures_executor::block_on(feature.resolve(&arena)?.write_xml_async(&mut writer))?;
+    assert_eq!(writer.bytes, element_xml(feature, &arena)?.as_bytes());
+
+    let mut deep = Element::builder_in("leaf", "urn:tree", &mut arena)?.build()?;
+    for _ in 1..MAX_ELEMENT_DEPTH {
+        deep = Element::builder_in("node", "urn:tree", &mut arena)?
+            .child(deep)?
+            .build()?;
+    }
+    let mut writer = FragmentedWriter::default();
+    futures_executor::block_on(deep.resolve(&arena)?.write_xml_async(&mut writer))?;
+    assert_eq!(writer.bytes, element_xml(deep, &arena)?.as_bytes());
+    Ok(())
+}
+
+#[test]
+fn async_xml_propagates_output_errors() -> TestResult {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let body = body(&mut arena, "hello")?;
+    let stanza = message(&mut arena, body)?;
+    let mut writer = FragmentedWriter {
+        fail_after: Some(6),
+        ..FragmentedWriter::default()
+    };
+    assert!(matches!(
+        futures_executor::block_on(stanza.resolve(&arena)?.write_xml_async(&mut writer)),
+        Err(AsyncWriteError::Output(_))
+    ));
+    assert!(!writer.bytes.is_empty());
     Ok(())
 }
 

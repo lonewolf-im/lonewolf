@@ -93,6 +93,37 @@ pub enum IqType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StanzaErrorCondition {
+    BadRequest,
+    Conflict,
+    InternalServerError,
+    NotAllowed,
+    ResourceConstraint,
+    ServiceUnavailable,
+}
+
+impl StanzaErrorCondition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BadRequest => "bad-request",
+            Self::Conflict => "conflict",
+            Self::InternalServerError => "internal-server-error",
+            Self::NotAllowed => "not-allowed",
+            Self::ResourceConstraint => "resource-constraint",
+            Self::ServiceUnavailable => "service-unavailable",
+        }
+    }
+
+    pub const fn error_type(self) -> &'static str {
+        match self {
+            Self::BadRequest => "modify",
+            Self::Conflict | Self::NotAllowed | Self::ServiceUnavailable => "cancel",
+            Self::InternalServerError | Self::ResourceConstraint => "wait",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StanzaType {
     Message(MessageType),
     Presence(PresenceType),
@@ -156,6 +187,7 @@ pub enum BuildError {
     InvalidErrorPayload,
     MissingServerAddresses,
     NotIqRequest,
+    InvalidErrorSource,
     TreeLimitExceeded,
 }
 
@@ -300,6 +332,44 @@ impl Stanza {
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::new(),
         })
+    }
+
+    /// Keeps the payload and ID, swaps addresses, and drops extension attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::InvalidErrorSource`] for an IQ response or an error stanza.
+    pub fn error_reply_in<'a, A: ChunkAllocator>(
+        &self,
+        arena: &'a mut Arena<A>,
+        condition: StanzaErrorCondition,
+    ) -> Result<StanzaBuilder<'a, A>, BuildError> {
+        let mut header = arena.get(self.data)?.header;
+        header.stanza_type = match header.stanza_type {
+            StanzaType::Iq(IqType::Get | IqType::Set) => StanzaType::Iq(IqType::Error),
+            StanzaType::Message(_) if !header.stanza_type.is_error() => {
+                StanzaType::Message(MessageType::Error)
+            }
+            StanzaType::Presence(_) if !header.stanza_type.is_error() => {
+                StanzaType::Presence(PresenceType::Error)
+            }
+            _ => return Err(BuildError::InvalidErrorSource),
+        };
+        let children = arena.get(self.data)?.children;
+        let defined_condition =
+            Element::builder_in(condition.as_str(), STANZA_ERROR_NAMESPACE, arena)?.build()?;
+        let error = Element::builder_in("error", header.namespace.as_str(), arena)?
+            .attribute("type", "", condition.error_type())?
+            .child(defined_condition)?
+            .build()?;
+        std::mem::swap(&mut header.from, &mut header.to);
+        StanzaBuilder {
+            arena,
+            header,
+            attributes: AttributesBuilder::new(),
+            children: SliceBuilder::from_slice(children),
+        }
+        .child(error)
     }
 }
 
@@ -738,6 +808,9 @@ impl fmt::Display for BuildError {
             }
             Self::NotIqRequest => {
                 formatter.write_str("only IQ requests can produce result replies")
+            }
+            Self::InvalidErrorSource => {
+                formatter.write_str("IQ responses and error stanzas cannot produce error replies")
             }
             Self::TreeLimitExceeded => {
                 formatter.write_str("XML tree depth or expanded node count exceeds the limit")

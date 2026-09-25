@@ -22,6 +22,7 @@ use socket2::SockRef;
 use crate::config::C2sConfig;
 use crate::config::limits::C2sLimits;
 use crate::hosts::Hosts;
+use crate::router::RouterHandle;
 
 mod attempt_limit;
 mod connection_limit;
@@ -30,7 +31,7 @@ mod unauthenticated_limit;
 
 use attempt_limit::{Admission, AttemptLimiter};
 use connection_limit::{ConnectionAdmission, ConnectionLimiter};
-use stream::{StreamSettings, XmppStream};
+use stream::{StreamSettings, StreamTimeouts, XmppStream};
 use unauthenticated_limit::{Admission as UnauthenticatedAdmission, UnauthenticatedLimiter};
 
 const BACKLOG: i32 = 128;
@@ -50,9 +51,10 @@ struct AuthService {
     decoy: Arc<ScramDecoy>,
 }
 
-struct StreamServices {
+struct StreamServices<A: ChunkAllocator> {
     hosts: Hosts,
     auth: Arc<AuthService>,
+    router: RouterHandle<A>,
 }
 
 pub(crate) struct Listeners {
@@ -68,6 +70,7 @@ impl Listeners {
         limits: &C2sLimits,
         hosts: Hosts,
         accounts: RedbAccountRepository,
+        router: RouterHandle<A>,
         dispatcher: &DispatchHandle,
         allocator: A,
     ) -> io::Result<Self> {
@@ -107,6 +110,7 @@ impl Listeners {
                 Duration::from_secs(profile.connection_establishment_timeout_secs.get());
             let authentication_timeout =
                 Duration::from_secs(profile.authentication_timeout_secs.get());
+            let binding_timeout = Duration::from_secs(profile.resource_binding_timeout_secs.get());
             let mut address = config.address;
             for worker_id in 0..dispatcher.worker_count() {
                 let (ready, readiness) = oneshot::channel();
@@ -115,13 +119,18 @@ impl Listeners {
                 let services = StreamServices {
                     hosts: hosts.clone(),
                     auth: Arc::clone(&auth),
+                    router: router.clone(),
                 };
                 let settings = StreamSettings::new(
                     config.auth_mechanisms,
                     max_stanza_bytes,
                     xml_rate,
-                    establishment_timeout,
-                    authentication_timeout,
+                    StreamTimeouts {
+                        establishment: establishment_timeout,
+                        authentication: authentication_timeout,
+                        binding: binding_timeout,
+                    },
+                    limits.max_resources_per_account,
                     allocator.clone(),
                 );
                 let task = dispatcher
@@ -218,7 +227,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
     stop: Stop,
     listener_id: usize,
     admission: AdmissionLimits,
-    services: StreamServices,
+    services: StreamServices<A>,
     settings: StreamSettings<A>,
 ) -> io::Result<()> {
     let worker_id = context.worker.index;
@@ -269,6 +278,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                                 unauthenticated_permit,
                                                 services.hosts.clone(),
                                                 Arc::clone(&services.auth),
+                                                services.router.clone(),
                                                 settings.clone(),
                                             )
                                             .run(),

@@ -32,6 +32,8 @@ mod storage;
 use config::Config;
 pub use error::RunError;
 use hosts::Hosts;
+use router::Router;
+use router::local::LocalRouter;
 use storage::StoreRegistry;
 
 const DISPATCH_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
@@ -54,7 +56,7 @@ pub struct BuildInfo {
 ///
 /// Returns [`RunError::Config`] for invalid configuration or
 /// [`RunError::WorkerCount`] if worker count selection fails. Startup failures
-/// identify logging, hosts, stanza pool, runtime, dispatcher, storage, admin, or c2s
+/// identify logging, hosts, stanza pool, runtime, dispatcher, storage, router, admin, or c2s
 /// initialization in [`RunError`]. Signal and worker shutdown failures also
 /// return [`RunError`]. If service execution and worker shutdown both fail, the
 /// service error wins.
@@ -104,6 +106,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
         tracing::info!(worker_count = worker_count.get(), "core dispatcher started");
         runtime.block_on(async {
             let mut listeners = None;
+            let mut router = None;
             let result = async {
                 let accounts = stores.accounts(account_store)?;
                 let admin = if config.admin.enabled {
@@ -114,12 +117,17 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                 } else {
                     None
                 };
+                let local = LocalRouter::start(&dispatcher.handle())
+                    .await
+                    .map_err(RunError::Router)?;
+                let router_handle = router.insert(Router::new(hosts.clone(), local)).handle();
                 let listeners = listeners.insert(
                     c2s::Listeners::start(
                         &config.c2s,
                         &config.limits.c2s,
                         hosts,
                         accounts,
+                        router_handle,
                         &dispatcher.handle(),
                         Arc::clone(&stanza_pool),
                     )
@@ -137,10 +145,17 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                 Some(mut listeners) => listeners.join().await.map_err(RunError::C2s),
                 None => Ok(()),
             };
+            let router_stopped = match router {
+                Some(router) => router.shutdown().await.map_err(RunError::RouterShutdown),
+                None => Ok(()),
+            };
             if stopped.is_ok() {
                 tracing::info!("core dispatcher stopped");
             }
-            result.and(stopped).and(listeners_stopped)
+            result
+                .and(stopped)
+                .and(listeners_stopped)
+                .and(router_stopped)
         })?;
     }
 

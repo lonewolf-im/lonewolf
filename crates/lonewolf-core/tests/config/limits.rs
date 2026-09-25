@@ -54,6 +54,7 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("max_stanza_bytes", 262_144),
         ("connection_establishment_timeout_secs", 10),
         ("authentication_timeout_secs", 10),
+        ("resource_binding_timeout_secs", 10),
         ("connection_attempts_per_ip.per_second", 10),
         ("connection_attempts_per_ip.burst", 50),
         ("incoming_stanzas_per_connection.per_second", 20),

@@ -19,6 +19,7 @@ use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountRepository, NewAccount};
 use lonewolf_util::arena::GlobalChunkAllocator;
+use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_xmpp::stream::STREAM_ERROR_NAMESPACE;
 use redb::{ReadableTable, TableDefinition};
 use rustls::pki_types::ServerName;
@@ -33,6 +34,8 @@ use crate::c2s::unauthenticated_limit::{
 };
 use crate::config::{Config, TcpListenerConfig};
 use crate::hosts::HostsError;
+use crate::router::Router;
+use crate::router::local::LocalRouter;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";
@@ -43,6 +46,14 @@ const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 fn hosts() -> Result<Hosts, HostsError> {
     let config = Config::default();
     Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
+}
+
+async fn test_router(
+    hosts: &Hosts,
+) -> std::io::Result<(Router<GlobalChunkAllocator>, CoreDispatcher)> {
+    let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
+    let local = LocalRouter::start(&dispatcher.handle()).await?;
+    Ok((Router::new(hosts.clone(), local), dispatcher))
 }
 
 fn auth() -> std::io::Result<(Arc<AuthService>, tempfile::TempDir)> {
@@ -125,6 +136,7 @@ fn run_case_with_timeouts(
         };
         let hosts = hosts()?;
         let (auth, _directory) = auth()?;
+        let (router, router_dispatcher) = test_router(&hosts).await?;
         let started = Instant::now();
         let stream = XmppStream::new(
             transport,
@@ -132,16 +144,23 @@ fn run_case_with_timeouts(
             unauthenticated_permit,
             hosts.clone(),
             auth,
+            router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 max_stanza_bytes,
                 xml_rate,
-                establishment_timeout,
-                authentication_timeout,
+                StreamTimeouts {
+                    establishment: establishment_timeout,
+                    authentication: authentication_timeout,
+                    binding: Duration::from_secs(10),
+                },
+                NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
             ),
         );
         let outcome = stream.run().await;
+        router.shutdown().await?;
+        router_dispatcher.shutdown(TIMEOUT).await?;
         let elapsed = started.elapsed();
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
@@ -553,22 +572,30 @@ fn run_starttls_restart_case_with_timeout(
             return Err("first unauthenticated connection was denied".into());
         };
         let (auth, _directory) = auth()?;
+        let (router, router_dispatcher) = test_router(&hosts).await?;
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts,
             auth,
+            router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
-                Duration::from_secs(10),
-                authentication_timeout,
+                StreamTimeouts {
+                    establishment: Duration::from_secs(10),
+                    authentication: authentication_timeout,
+                    binding: Duration::from_secs(10),
+                },
+                NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
             ),
         );
         let outcome = stream.run().await;
+        router.shutdown().await?;
+        router_dispatcher.shutdown(TIMEOUT).await?;
         let (before_tls, after_tls) = client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         Ok::<_, Box<dyn Error + Send + Sync>>((outcome, before_tls, after_tls))
@@ -728,23 +755,31 @@ where
                 transaction.commit()?;
             }
         }
+        let (router, router_dispatcher) = test_router(&hosts).await?;
         let outcome = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts,
             auth,
+            router.handle(),
             StreamSettings::new(
                 mechanisms,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
-                Duration::from_secs(10),
-                Duration::from_secs(10),
+                StreamTimeouts {
+                    establishment: Duration::from_secs(10),
+                    authentication: Duration::from_secs(10),
+                    binding: Duration::from_secs(10),
+                },
+                NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
             ),
         )
         .run()
         .await;
+        router.shutdown().await?;
+        router_dispatcher.shutdown(TIMEOUT).await?;
         client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(outcome)
@@ -1046,10 +1081,51 @@ fn run_scram(
         binding,
         tls_open,
         expected_outcome,
-        authentication_timeout,
-        post_auth_delay,
+        ScramTiming {
+            authentication_timeout,
+            post_auth_delay,
+        },
         None,
+        BindingCase::default(),
     )
+}
+
+#[derive(Clone, Copy)]
+struct ScramTiming {
+    authentication_timeout: Duration,
+    post_auth_delay: Duration,
+}
+
+impl Default for ScramTiming {
+    fn default() -> Self {
+        Self {
+            authentication_timeout: Duration::from_secs(10),
+            post_auth_delay: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BindingCase {
+    payload: Option<&'static str>,
+    expected_responses: &'static [&'static str],
+    timeout: Duration,
+    occupied_resource: Option<&'static str>,
+    released_resource: Option<&'static str>,
+    resource_limit: NonZeroUsize,
+}
+
+impl Default for BindingCase {
+    fn default() -> Self {
+        Self {
+            payload: None,
+            expected_responses: &[],
+            timeout: Duration::from_secs(10),
+            occupied_resource: None,
+            released_resource: None,
+            resource_limit: NonZeroUsize::new(10).unwrap(),
+        }
+    }
 }
 
 fn run_scram_with_restart(
@@ -1057,13 +1133,14 @@ fn run_scram_with_restart(
     binding: Option<&'static str>,
     tls_open: &str,
     expected_outcome: CloseOutcome,
-    authentication_timeout: Duration,
-    post_auth_delay: Duration,
+    timing: ScramTiming,
     post_auth_restart: Option<(&str, &str)>,
+    binding_case: BindingCase,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let tls_open = tls_open.to_owned();
     let post_auth_restart =
         post_auth_restart.map(|(opening, condition)| (opening.to_owned(), condition.to_owned()));
+    let client_binding_case = binding_case;
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
         let hosts = hosts()?;
         let mut roots = RootCertStore::empty();
@@ -1215,14 +1292,23 @@ fn run_scram_with_restart(
                     STANDARD.encode(hmac_scram(hash, &server_key, auth_message.as_bytes())?)
                 )
             );
-            std::thread::sleep(post_auth_delay);
+            std::thread::sleep(timing.post_auth_delay);
             if let Some((opening, _)) = &post_auth_restart {
                 tls.write_all(opening.as_bytes())?;
             } else {
-                tls.write_all(format!("{PSI_OPEN}{CLOSE}").as_bytes())?;
+                tls.write_all(
+                    format!("{PSI_OPEN}{}", client_binding_case.payload.unwrap_or(CLOSE))
+                        .as_bytes(),
+                )?;
             }
             let mut rest = String::new();
-            tls.read_to_string(&mut rest)?;
+            match tls.read_to_string(&mut rest) {
+                Ok(_) => {}
+                Err(error)
+                    if expected_outcome == CloseOutcome::BindingTimeout
+                        && error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                Err(error) => return Err(error.into()),
+            }
             if let Some((_, condition)) = &post_auth_restart {
                 let opening = rest
                     .find("<stream:stream")
@@ -1233,11 +1319,16 @@ fn run_scram_with_restart(
                     rest.contains(&format!("<{condition} xmlns='{STREAM_ERROR_NAMESPACE}'/>")),
                     "{rest}"
                 );
-                assert!(!rest.contains(EMPTY_FEATURES));
+                assert!(!rest.contains(BIND_FEATURES));
             } else {
-                assert!(rest.contains(EMPTY_FEATURES));
+                assert!(rest.contains(BIND_FEATURES));
+                for expected in client_binding_case.expected_responses {
+                    assert!(rest.contains(expected), "{rest}");
+                }
             }
-            assert!(rest.ends_with(STREAM_FOOTER));
+            if expected_outcome != CloseOutcome::BindingTimeout {
+                assert!(rest.ends_with(STREAM_FOOTER));
+            }
             Ok(())
         });
         let (transport, peer) = listener.accept().await?;
@@ -1262,26 +1353,52 @@ fn run_scram_with_restart(
         )?;
         auth.accounts
             .create(NewAccount {
-                key,
+                key: key.clone(),
                 credentials: ScramCredentials::new(verifier),
             })
             .await?;
+        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let occupied = if let Some(resource) = binding_case.occupied_resource {
+            Some(
+                router
+                    .handle()
+                    .register(&key, Some(resource), binding_case.resource_limit)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts,
             auth,
+            router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
-                Duration::from_secs(10),
-                authentication_timeout,
+                StreamTimeouts {
+                    establishment: Duration::from_secs(10),
+                    authentication: timing.authentication_timeout,
+                    binding: binding_case.timeout,
+                },
+                binding_case.resource_limit,
                 GlobalChunkAllocator,
             ),
         );
         let outcome = stream.run().await;
+        drop(occupied);
+        if let Some(resource) = binding_case.released_resource {
+            let registration = router
+                .handle()
+                .register(&key, Some(resource), binding_case.resource_limit)
+                .await?;
+            assert_eq!(registration.resource(), resource);
+        }
+        router.shutdown().await?;
+        router_dispatcher.shutdown(TIMEOUT).await?;
         client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         assert_eq!(outcome, expected_outcome);
@@ -1324,16 +1441,16 @@ fn invalid_post_auth_opening_starts_server_stream_before_error()
             None,
             PSI_OPEN,
             outcome,
-            Duration::from_secs(10),
-            Duration::ZERO,
+            ScramTiming::default(),
             Some((&opening, condition)),
+            BindingCase::default(),
         )?;
     }
     Ok(())
 }
 
 #[test]
-fn scram_sha256_authenticates_and_restarts_with_empty_features()
+fn scram_sha256_authenticates_and_restarts_with_bind_feature()
 -> Result<(), Box<dyn Error + Send + Sync>> {
     run_scram(
         ScramHash::Sha256,
@@ -1342,6 +1459,161 @@ fn scram_sha256_authenticates_and_restarts_with_empty_features()
         CloseOutcome::StreamEnd,
         Duration::from_secs(10),
         Duration::ZERO,
+    )
+}
+
+#[test]
+fn client_resource_binding_returns_full_jid() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>",
+            ),
+            expected_responses: &[
+                "<iq type='result' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/desk</jid></bind></iq>",
+            ],
+            released_resource: Some("desk"),
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn server_generated_binding_uses_random_resource() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='b2'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></iq></stream:stream>",
+            ),
+            expected_responses: &[
+                "<iq type='result' id='b2'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/lw-",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn malformed_resource_can_be_retried() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq><iq type='set' id='good'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>",
+            ),
+            expected_responses: &[
+                "<iq type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+                "<jid>alice@localhost/desk</jid>",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn resource_limit_returns_stanza_error() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>new</resource></bind></iq></stream:stream>",
+            ),
+            expected_responses: &[
+                "<iq type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+            ],
+            occupied_resource: Some("desk"),
+            resource_limit: NonZeroUsize::MIN,
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn binding_allows_five_invalid_resource_retries() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(concat!(
+                "<iq type='set' id='retry1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry2'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry3'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry4'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry5'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='good'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>"
+            )),
+            expected_responses: &["<jid>alice@localhost/desk</jid>"],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn sixth_invalid_resource_closes_stream() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::BindingAttemptsExceeded,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(concat!(
+                "<iq type='set' id='retry1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry2'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry3'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry4'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry5'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>",
+                "<iq type='set' id='retry6'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>"
+            )),
+            expected_responses: &[
+                "<policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn binding_deadline_closes_idle_authenticated_stream() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::BindingTimeout,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(""),
+            timeout: Duration::from_millis(50),
+            ..BindingCase::default()
+        },
     )
 }
 
@@ -1520,22 +1792,30 @@ fn unknown_account_gets_three_scram_attempts_before_stream_closes()
             return Err("unauthenticated connection denied".into());
         };
         let (auth, _directory) = auth()?;
+        let (router, router_dispatcher) = test_router(&hosts).await?;
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts,
             auth,
+            router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
-                Duration::from_secs(10),
-                Duration::from_secs(10),
+                StreamTimeouts {
+                    establishment: Duration::from_secs(10),
+                    authentication: Duration::from_secs(10),
+                    binding: Duration::from_secs(10),
+                },
+                NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
             ),
         );
         let outcome = stream.run().await;
+        router.shutdown().await?;
+        router_dispatcher.shutdown(TIMEOUT).await?;
         client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         assert_eq!(outcome, CloseOutcome::AuthenticationAttemptsExceeded);
@@ -1631,18 +1911,24 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         };
         let hosts = hosts()?;
         let (auth, _directory) = auth()?;
+        let (router, router_dispatcher) = test_router(&hosts).await?;
         let stream = XmppStream::new(
             transport,
             permit,
             unauthenticated_permit,
             hosts.clone(),
             auth,
+            router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &rate,
-                Duration::from_secs(10),
-                Duration::from_secs(10),
+                StreamTimeouts {
+                    establishment: Duration::from_secs(10),
+                    authentication: Duration::from_secs(10),
+                    binding: Duration::from_secs(10),
+                },
+                NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
             ),
         );
@@ -1660,6 +1946,8 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
             UnauthenticatedAdmission::Allowed(_)
         ));
         listener.close().await?;
+        router.shutdown().await?;
+        router_dispatcher.shutdown(TIMEOUT).await?;
         Ok::<_, Box<dyn Error>>(())
     })
 }

@@ -374,7 +374,7 @@ fn restart_preserves_buffered_bytes_and_resets_stream_context() -> TestResult {
         assert_eq!(view.lang()?, None);
         assert!(matches!(
             parser.next_event().await,
-            Err(ParseError::InvalidNamespace)
+            Err(ParseError::UnboundNamespacePrefix)
         ));
         Ok(())
     })
@@ -442,6 +442,43 @@ fn rejects_malformed_restricted_and_invalid_stanza_input() -> TestResult {
         })?;
     }
     Ok(())
+}
+
+#[test]
+fn distinguishes_unbound_prefix_from_invalid_stanza_type() -> TestResult {
+    block_on(async {
+        for (input, expected) in [
+            ("<x:message/>", "prefix"),
+            ("<iq type='subscribe'/>", "stanza type"),
+        ] {
+            let input = format!("{OPEN}{input}");
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            let error = parser
+                .next_event()
+                .await
+                .err()
+                .ok_or("accepted invalid input")?;
+            assert!(
+                matches!(
+                    (&error, expected),
+                    (ParseError::UnboundNamespacePrefix, "prefix")
+                        | (ParseError::InvalidStanzaType, "stanza type")
+                ),
+                "{error}: {input}"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn distinguishes_transport_errors_from_invalid_xml() {
+    let transport = ParseError::from(quick_xml::Error::Io(Arc::new(io::Error::other(
+        "read failed",
+    ))));
+    assert!(transport.is_transport_error());
+    assert!(!ParseError::InvalidXml.is_transport_error());
 }
 
 #[test]

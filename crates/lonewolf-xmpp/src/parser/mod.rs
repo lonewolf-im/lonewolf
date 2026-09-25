@@ -84,6 +84,7 @@ pub enum ParseError {
     TooManyAttributes,
     InvalidXml,
     InvalidNamespace,
+    UnboundNamespacePrefix,
     UnsupportedEncoding,
     UnsupportedVersion,
     RestrictedXml,
@@ -91,6 +92,12 @@ pub enum ParseError {
     UnexpectedEof,
     InvalidStanzaType,
     ParserFailed,
+}
+
+impl ParseError {
+    pub fn is_transport_error(&self) -> bool {
+        matches!(self, Self::Xml(quick_xml::Error::Io(_)))
+    }
 }
 
 pub struct XmppParser<R, A: ChunkAllocator> {
@@ -518,6 +525,7 @@ impl fmt::Display for ParseError {
             Self::SizeLimitExceeded { .. } => "XML input exceeds the byte limit",
             Self::TooManyAttributes => "too many XML attributes",
             Self::InvalidNamespace => "invalid XML namespace",
+            Self::UnboundNamespacePrefix => "unbound XML namespace prefix",
             Self::UnsupportedEncoding => "XMPP requires UTF-8 input",
             Self::UnsupportedVersion => "XMPP requires XML 1.0",
             Self::RestrictedXml => "restricted XML construct",

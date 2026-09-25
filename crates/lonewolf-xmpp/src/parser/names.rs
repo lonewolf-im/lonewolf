@@ -116,7 +116,7 @@ fn resolved_namespace(namespace: ResolveResult<'_>) -> Result<&str, ParseError> 
     match namespace {
         ResolveResult::Unbound => Ok(""),
         ResolveResult::Bound(namespace) => Ok(namespace.into_inner()),
-        ResolveResult::Unknown(_) => Err(ParseError::InvalidNamespace),
+        ResolveResult::Unknown(_) => Err(ParseError::UnboundNamespacePrefix),
     }
 }
 

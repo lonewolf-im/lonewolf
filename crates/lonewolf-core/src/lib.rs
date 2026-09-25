@@ -25,6 +25,7 @@ mod error;
 pub mod hosts;
 mod logging;
 mod panic;
+pub mod router;
 mod shutdown;
 mod storage;
 

@@ -116,6 +116,32 @@ fn registration_uses_one_account_shard_across_handles() -> TestResult {
 }
 
 #[test]
+fn generated_resources_are_unique_random_identifiers() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let alice = account("alice@localhost")?;
+        let handle = router.handle();
+        let first = handle
+            .register(&alice, None, NonZeroUsize::new(2).unwrap())
+            .await?;
+        let second = handle
+            .register(&alice, None, NonZeroUsize::new(2).unwrap())
+            .await?;
+        assert_ne!(first.resource(), second.resource());
+        for resource in [first.resource(), second.resource()] {
+            assert_eq!(resource.len(), 35);
+            assert!(resource.starts_with("lw-"));
+            assert!(resource[3..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        drop(first);
+        drop(second);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn concurrent_registration_on_different_workers_is_atomic() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;

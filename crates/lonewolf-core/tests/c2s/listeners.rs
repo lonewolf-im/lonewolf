@@ -12,12 +12,14 @@ use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_util::arena::GlobalChunkAllocator;
-use lonewolf_util::core_dispatcher::CoreDispatcher;
+use lonewolf_util::core_dispatcher::{CoreDispatcher, DispatchHandle};
 
 use super::*;
 use crate::config::limits::{C2sLimitProfile, C2sLimits};
 use crate::config::{AuthMechanisms, Config, TcpListenerConfig};
 use crate::hosts::HostsError;
+use crate::router::Router;
+use crate::router::local::LocalRouter;
 
 type TestResult = Result<(), Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -41,6 +43,14 @@ fn hosts() -> Result<Hosts, HostsError> {
     Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
 }
 
+async fn router(
+    dispatcher: &DispatchHandle,
+    hosts: &Hosts,
+) -> io::Result<Router<GlobalChunkAllocator>> {
+    let local = LocalRouter::start(dispatcher).await?;
+    Ok(Router::new(hosts.clone(), local))
+}
+
 fn auth() -> Result<(Arc<AuthService>, tempfile::TempDir), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let accounts = RedbAccountRepository::open(directory.path().join("accounts.redb"))?;
@@ -59,12 +69,14 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         let mut threads = Vec::with_capacity(handle.worker_count());
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
         let hosts = hosts()?;
+        let router = router(&handle, &hosts).await?;
         let (auth, _directory) = auth()?;
         for index in 0..handle.worker_count() {
             let (ready, readiness) = oneshot::channel();
             let unauthenticated = Arc::clone(&unauthenticated);
             let hosts = hosts.clone();
             let auth = Arc::clone(&auth);
+            let router_handle = router.handle();
             let task = handle
                 .dispatch_at(index, move |context| async move {
                     let listener = bind(address).await?;
@@ -89,15 +101,27 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         pending().boxed().shared(),
                         0,
                         admission,
-                        StreamServices { hosts, auth },
+                        StreamServices {
+                            hosts,
+                            auth,
+                            router: router_handle,
+                        },
                         StreamSettings::new(
                             AuthMechanisms::ALL,
                             profile.max_stanza_bytes,
                             &profile.incoming_xml_per_connection,
-                            Duration::from_secs(
-                                profile.connection_establishment_timeout_secs.get(),
-                            ),
-                            Duration::from_secs(profile.authentication_timeout_secs.get()),
+                            StreamTimeouts {
+                                establishment: Duration::from_secs(
+                                    profile.connection_establishment_timeout_secs.get(),
+                                ),
+                                authentication: Duration::from_secs(
+                                    profile.authentication_timeout_secs.get(),
+                                ),
+                                binding: Duration::from_secs(
+                                    profile.resource_binding_timeout_secs.get(),
+                                ),
+                            },
+                            NonZeroUsize::new(10).unwrap(),
                             GlobalChunkAllocator,
                         ),
                     )
@@ -125,6 +149,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         for task in tasks {
             task.await??;
         }
+        router.shutdown().await?;
         let rebound = bind(address).await?;
         rebound.close().await?;
         Ok(())
@@ -138,6 +163,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
         let handle = dispatcher.handle();
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
         let hosts = hosts()?;
+        let router = router(&handle, &hosts).await?;
         let (auth, _directory) = auth()?;
         let mut addresses = Vec::with_capacity(2);
         let mut tasks = Vec::with_capacity(2);
@@ -146,6 +172,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
             let unauthenticated = Arc::clone(&unauthenticated);
             let hosts = hosts.clone();
             let auth = Arc::clone(&auth);
+            let router_handle = router.handle();
             let task = handle
                 .dispatch_at(
                     listener_id % handle.worker_count(),
@@ -168,15 +195,27 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                             pending().boxed().shared(),
                             listener_id,
                             admission,
-                            StreamServices { hosts, auth },
+                            StreamServices {
+                                hosts,
+                                auth,
+                                router: router_handle,
+                            },
                             StreamSettings::new(
                                 AuthMechanisms::ALL,
                                 profile.max_stanza_bytes,
                                 &profile.incoming_xml_per_connection,
-                                Duration::from_secs(
-                                    profile.connection_establishment_timeout_secs.get(),
-                                ),
-                                Duration::from_secs(profile.authentication_timeout_secs.get()),
+                                StreamTimeouts {
+                                    establishment: Duration::from_secs(
+                                        profile.connection_establishment_timeout_secs.get(),
+                                    ),
+                                    authentication: Duration::from_secs(
+                                        profile.authentication_timeout_secs.get(),
+                                    ),
+                                    binding: Duration::from_secs(
+                                        profile.resource_binding_timeout_secs.get(),
+                                    ),
+                                },
+                                NonZeroUsize::new(10).unwrap(),
                                 GlobalChunkAllocator,
                             ),
                         )
@@ -214,6 +253,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
         for task in tasks {
             task.await??;
         }
+        router.shutdown().await?;
         assert_eq!(unauthenticated.active_count(), 0);
         drop(third);
         Ok(())
@@ -238,11 +278,14 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
             ],
         };
         let (auth, _directory) = auth()?;
+        let hosts = hosts()?;
+        let router = router(&handle, &hosts).await?;
         let mut listeners = Listeners::start(
             &config,
             &C2sLimits::default(),
-            hosts()?,
+            hosts,
             auth.accounts.clone(),
+            router.handle(),
             &handle,
             GlobalChunkAllocator,
         )
@@ -262,6 +305,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
             assert_eq!(task.await?, index);
         }
         dispatcher.shutdown(TIMEOUT).await?;
+        router.shutdown().await?;
         Ok(())
     })
 }
@@ -286,11 +330,14 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
             ],
         };
         let (auth, _directory) = auth()?;
+        let hosts = hosts()?;
+        let router = router(&dispatcher.handle(), &hosts).await?;
         let error = Listeners::start(
             &config,
             &C2sLimits::default(),
-            hosts()?,
+            hosts,
             auth.accounts.clone(),
+            router.handle(),
             &dispatcher.handle(),
             GlobalChunkAllocator,
         )
@@ -300,6 +347,7 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert!(error.to_string().contains("listener 1 on worker 0"));
         dispatcher.shutdown(TIMEOUT).await?;
+        router.shutdown().await?;
         probe.close().await?;
         let _rebound = std::net::TcpListener::bind(first)?;
         Ok(())

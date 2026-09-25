@@ -80,6 +80,9 @@
 # Limit the time from the SASL offer through authentication success.
 # authentication_timeout_secs = 10
 
+# Limit the time from authentication success through resource binding.
+# resource_binding_timeout_secs = 10
+
 # Limit reconnect traffic from one IP while allowing clients behind shared NAT.
 # The allowance covers all workers of one listener.
 # Use per_second for the sustained event rate and burst for the bucket capacity.

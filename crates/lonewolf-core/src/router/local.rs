@@ -342,17 +342,14 @@ impl<A: ChunkAllocator> Shard<A> {
         self.next_token = token;
         let resource = match requested {
             Some(resource) if !sessions.contains_key(resource.as_ref()) => resource,
-            _ => {
-                let mut candidate = format!("lw-{token:x}").into_boxed_str();
-                while sessions.contains_key(candidate.as_ref()) {
-                    self.next_token = self
-                        .next_token
-                        .checked_add(1)
-                        .ok_or(RouterError::Unavailable)?;
-                    candidate = format!("lw-{:x}", self.next_token).into_boxed_str();
+            _ => loop {
+                let mut random = [0; 16];
+                graviola::random::fill(&mut random).map_err(|_| RouterError::Unavailable)?;
+                let candidate = format!("lw-{:032x}", u128::from_be_bytes(random)).into_boxed_str();
+                if !sessions.contains_key(candidate.as_ref()) {
+                    break candidate;
                 }
-                candidate
-            }
+            },
         };
         let (lease, closed) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));

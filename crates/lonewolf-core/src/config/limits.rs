@@ -105,6 +105,10 @@ impl C2sLimits {
                     "authentication_timeout_secs",
                     profile.authentication_timeout_secs,
                 ),
+                (
+                    "resource_binding_timeout_secs",
+                    profile.resource_binding_timeout_secs,
+                ),
             ] {
                 if Instant::now()
                     .checked_add(Duration::from_secs(value.get()))
@@ -152,6 +156,7 @@ pub struct C2sLimitProfile {
     pub max_stanza_bytes: NonZeroUsize,
     pub connection_establishment_timeout_secs: NonZeroU64,
     pub authentication_timeout_secs: NonZeroU64,
+    pub resource_binding_timeout_secs: NonZeroU64,
     /// Shares one bucket per IP across all workers of one listener.
     pub connection_attempts_per_ip: EventRate,
     pub incoming_stanzas_per_connection: EventRate,
@@ -167,6 +172,7 @@ impl Default for C2sLimitProfile {
             max_stanza_bytes: const { nonzero(262_144) },
             connection_establishment_timeout_secs: nonzero_secs(10),
             authentication_timeout_secs: nonzero_secs(10),
+            resource_binding_timeout_secs: nonzero_secs(10),
             connection_attempts_per_ip: EventRate {
                 per_second: const { nonzero(10) },
                 burst: const { nonzero(50) },
@@ -188,6 +194,7 @@ struct C2sLimitProfileInput {
     max_stanza_bytes: Option<NonZeroUsize>,
     connection_establishment_timeout_secs: Option<NonZeroU64>,
     authentication_timeout_secs: Option<NonZeroU64>,
+    resource_binding_timeout_secs: Option<NonZeroU64>,
     connection_attempts_per_ip: EventRateInput,
     incoming_stanzas_per_connection: EventRateInput,
     incoming_xml_per_connection: ByteRate,
@@ -208,6 +215,9 @@ impl From<C2sLimitProfileInput> for C2sLimitProfile {
             authentication_timeout_secs: input
                 .authentication_timeout_secs
                 .unwrap_or(defaults.authentication_timeout_secs),
+            resource_binding_timeout_secs: input
+                .resource_binding_timeout_secs
+                .unwrap_or(defaults.resource_binding_timeout_secs),
             connection_attempts_per_ip: input
                 .connection_attempts_per_ip
                 .with_defaults(defaults.connection_attempts_per_ip),

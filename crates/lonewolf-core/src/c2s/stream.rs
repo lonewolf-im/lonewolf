@@ -21,11 +21,14 @@ use futures_util::io::{
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
-use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
+use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
-use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element, NodeRef, STREAM_NAMESPACE, XML_NAMESPACE};
+use lonewolf_xmpp::stanza::{
+    CLIENT_NAMESPACE, Element, IqType, NodeRef, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE,
+    StanzaNamespace, StanzaRef, StanzaType, XML_NAMESPACE,
+};
 use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
 use socket2::SockRef;
@@ -38,6 +41,8 @@ use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::AuthMechanisms;
 use crate::config::limits::ByteRate;
 use crate::hosts::Hosts;
+use crate::router::Registration;
+use crate::router::{RouterError, RouterHandle};
 
 const READ_BUFFER_BYTES: usize = 1_024;
 const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
@@ -46,8 +51,11 @@ const STARTTLS_PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'
 const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/></stream:stream>";
 const STREAM_FOOTER: &str = "</stream:stream>";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
-const EMPTY_FEATURES: &str = "<stream:features/>";
+const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
+const BIND_FEATURES: &str =
+    "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
 const MAX_AUTH_ATTEMPTS: usize = 3;
+const MAX_BIND_FAILURES: usize = 6;
 
 fn sasl_features(mechanisms: AuthMechanisms) -> String {
     let mut features = String::with_capacity(440);
@@ -86,6 +94,17 @@ struct Established<A: ChunkAllocator> {
     auth_started_at: Instant,
 }
 
+struct Bound<A: ChunkAllocator> {
+    parser: XmppParser<XmlInput, A>,
+    writer: TlsWriter,
+    registration: Registration<A>,
+}
+
+enum BindRequestError {
+    Malformed,
+    Internal,
+}
+
 struct TlsBinding {
     exporter: [u8; 32],
 }
@@ -96,6 +115,7 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
     unauthenticated_permit: UnauthenticatedPermit,
     hosts: Hosts,
     auth: Arc<AuthService>,
+    router: RouterHandle<A>,
     settings: StreamSettings<A>,
     accepted_at: Instant,
 }
@@ -109,7 +129,16 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
     xml_burst_bytes: NonZeroUsize,
     establishment_timeout: Duration,
     authentication_timeout: Duration,
+    binding_timeout: Duration,
+    max_resources_per_account: NonZeroUsize,
     allocator: A,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StreamTimeouts {
+    pub(super) establishment: Duration,
+    pub(super) authentication: Duration,
+    pub(super) binding: Duration,
 }
 
 impl<A: ChunkAllocator> StreamSettings<A> {
@@ -117,8 +146,8 @@ impl<A: ChunkAllocator> StreamSettings<A> {
         auth_mechanisms: AuthMechanisms,
         max_stanza_bytes: NonZeroUsize,
         xml_rate: &ByteRate,
-        establishment_timeout: Duration,
-        authentication_timeout: Duration,
+        timeouts: StreamTimeouts,
+        max_resources_per_account: NonZeroUsize,
         allocator: A,
     ) -> Self {
         Self {
@@ -127,8 +156,10 @@ impl<A: ChunkAllocator> StreamSettings<A> {
             max_stanza_bytes,
             xml_bytes_per_second: xml_rate.bytes_per_second,
             xml_burst_bytes: xml_rate.burst_bytes,
-            establishment_timeout,
-            authentication_timeout,
+            establishment_timeout: timeouts.establishment,
+            authentication_timeout: timeouts.authentication,
+            binding_timeout: timeouts.binding,
+            max_resources_per_account,
             allocator,
         }
     }
@@ -141,6 +172,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         unauthenticated_permit: UnauthenticatedPermit,
         hosts: Hosts,
         auth: Arc<AuthService>,
+        router: RouterHandle<A>,
         settings: StreamSettings<A>,
     ) -> Self {
         Self {
@@ -149,6 +181,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             unauthenticated_permit,
             hosts,
             auth,
+            router,
             settings,
             accepted_at: Instant::now(),
         }
@@ -161,6 +194,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             unauthenticated_permit,
             hosts,
             auth,
+            router,
             settings,
             accepted_at,
         } = self;
@@ -191,7 +225,31 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 {
                     Ok(Ok(account)) => {
                         unauthenticated_permit.take();
-                        post_auth_stream(established, &hosts, &account).await
+                        let binding_started_at = Instant::now();
+                        let binding_remaining = binding_started_at
+                            .checked_add(settings.binding_timeout)
+                            .map_or(Duration::ZERO, |deadline| {
+                                deadline.saturating_duration_since(Instant::now())
+                            });
+                        match timeout(
+                            binding_remaining,
+                            bind_resource(
+                                established,
+                                &hosts,
+                                &account,
+                                &router,
+                                settings.max_resources_per_account,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(bound)) => bound_stream(bound).await,
+                            Ok(Err(outcome)) => outcome,
+                            Err(_) => {
+                                let _ = SockRef::from(&close_control).shutdown(Shutdown::Both);
+                                CloseOutcome::BindingTimeout
+                            }
+                        }
                     }
                     Ok(Err(outcome)) => outcome,
                     Err(_) => {
@@ -701,11 +759,13 @@ async fn authenticate<A: ChunkAllocator + Clone>(
     .await)
 }
 
-async fn post_auth_stream<A: ChunkAllocator + Clone>(
+async fn bind_resource<A: ChunkAllocator + Clone>(
     established: Established<A>,
     hosts: &Hosts,
     account: &AccountKey,
-) -> CloseOutcome {
+    router: &RouterHandle<A>,
+    max_resources_per_account: NonZeroUsize,
+) -> Result<Bound<A>, CloseOutcome> {
     let Established {
         parser,
         mut writer,
@@ -715,14 +775,14 @@ async fn post_auth_stream<A: ChunkAllocator + Clone>(
     let mut parser = match parser.restart() {
         Ok(parser) => parser,
         Err(_) => {
-            return send_setup_error_tls(
+            return Err(send_setup_error_tls(
                 &mut writer,
                 &host,
                 None,
                 false,
                 CloseOutcome::ParserError,
             )
-            .await;
+            .await);
         }
     };
     let header = match parser.next_event().await {
@@ -732,36 +792,36 @@ async fn post_auth_stream<A: ChunkAllocator + Clone>(
         })) => match validate_header(&header, &content_namespace, hosts) {
             Ok(header) => header,
             Err(outcome) => {
-                return send_setup_error_tls(
+                return Err(send_setup_error_tls(
                     &mut writer,
                     &host,
                     response_to_from_header(&header).as_deref(),
                     content_namespace == CLIENT_NAMESPACE,
                     outcome,
                 )
-                .await;
+                .await);
             }
         },
-        Err(ParseError::UnexpectedEof) => return CloseOutcome::Eof,
+        Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
         Err(error) => {
-            return send_setup_error_tls(
+            return Err(send_setup_error_tls(
                 &mut writer,
                 &host,
                 None,
                 false,
                 CloseOutcome::from_parse_error(&error),
             )
-            .await;
+            .await);
         }
         _ => {
-            return send_setup_error_tls(
+            return Err(send_setup_error_tls(
                 &mut writer,
                 &host,
                 None,
                 false,
                 CloseOutcome::ParserError,
             )
-            .await;
+            .await);
         }
     };
     if header.host != host
@@ -770,14 +830,14 @@ async fn post_auth_stream<A: ChunkAllocator + Clone>(
             .as_deref()
             .is_some_and(|from| from != account.as_str())
     {
-        return send_setup_error_tls(
+        return Err(send_setup_error_tls(
             &mut writer,
             &host,
             header.response_to.as_deref(),
             header.client_content_namespace,
             CloseOutcome::InvalidFrom,
         )
-        .await;
+        .await);
     }
     if send_response_header_tls(
         &mut writer,
@@ -788,18 +848,249 @@ async fn post_auth_stream<A: ChunkAllocator + Clone>(
     )
     .await
     .is_err()
-        || send_tls(&mut writer, EMPTY_FEATURES).await.is_err()
+        || send_tls(&mut writer, BIND_FEATURES).await.is_err()
     {
-        return CloseOutcome::TransportError;
+        return Err(CloseOutcome::TransportError);
     }
-    match parser.next_event().await {
+    let mut invalid_attempts = 0;
+    loop {
+        let parsed = match parser.next_event().await {
+            Ok(Some(StreamEvent::Stanza(parsed))) => parsed,
+            Ok(Some(StreamEvent::StreamEnd) | None) => {
+                return Err(send_footer_tls(&mut writer).await);
+            }
+            Err(ParseError::UnexpectedEof) => return Err(CloseOutcome::Eof),
+            Err(error) => {
+                return Err(send_stream_error_tls(
+                    &mut writer,
+                    CloseOutcome::from_parse_error(&error),
+                )
+                .await);
+            }
+            _ => {
+                return Err(
+                    send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedInput).await,
+                );
+            }
+        };
+        let stanza = match parsed.value().resolve(parsed.arena()) {
+            Ok(stanza) => stanza,
+            Err(_) => {
+                return Err(send_stream_error_tls(&mut writer, CloseOutcome::InternalError).await);
+            }
+        };
+        if stanza.namespace() != StanzaNamespace::Client {
+            return Err(send_stream_error_tls(&mut writer, CloseOutcome::InvalidNamespace).await);
+        }
+        if stanza.stanza_type() != StanzaType::Iq(IqType::Set) {
+            return Err(send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedInput).await);
+        }
+        let id = match stanza.id() {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return Err(send_stream_error_tls(&mut writer, CloseOutcome::ParserError).await);
+            }
+            Err(_) => {
+                return Err(send_stream_error_tls(&mut writer, CloseOutcome::InternalError).await);
+            }
+        };
+        let from = match stanza.from() {
+            Ok(from) => from,
+            Err(_) => {
+                return Err(send_stream_error_tls(&mut writer, CloseOutcome::InternalError).await);
+            }
+        };
+        if from.is_some_and(|from| from.as_str() != account.as_str()) {
+            return Err(send_stream_error_tls(&mut writer, CloseOutcome::InvalidFrom).await);
+        }
+        let to = match stanza.to() {
+            Ok(to) => to,
+            Err(_) => {
+                return Err(send_stream_error_tls(&mut writer, CloseOutcome::InternalError).await);
+            }
+        };
+        if to.is_some_and(|to| to.as_str() != host) {
+            return Err(send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedInput).await);
+        }
+        let requested = match requested_resource(&stanza) {
+            Ok(requested) => requested,
+            Err(BindRequestError::Malformed) => {
+                send_bind_error(&mut writer, id, "modify", "bad-request").await?;
+                invalid_attempts += 1;
+                if invalid_attempts == MAX_BIND_FAILURES {
+                    return Err(send_stream_error_tls(
+                        &mut writer,
+                        CloseOutcome::BindingAttemptsExceeded,
+                    )
+                    .await);
+                }
+                continue;
+            }
+            Err(BindRequestError::Internal) => {
+                return Err(send_stream_error_tls(&mut writer, CloseOutcome::InternalError).await);
+            }
+        };
+        let registration = match router
+            .register(account, requested, max_resources_per_account)
+            .await
+        {
+            Ok(registration) => registration,
+            Err(RouterError::InvalidResource) => {
+                send_bind_error(&mut writer, id, "modify", "bad-request").await?;
+                invalid_attempts += 1;
+                if invalid_attempts == MAX_BIND_FAILURES {
+                    return Err(send_stream_error_tls(
+                        &mut writer,
+                        CloseOutcome::BindingAttemptsExceeded,
+                    )
+                    .await);
+                }
+                continue;
+            }
+            Err(RouterError::ResourceLimit) => {
+                send_bind_error(&mut writer, id, "wait", "resource-constraint").await?;
+                continue;
+            }
+            Err(_) => {
+                return Err(send_stream_error_tls(&mut writer, CloseOutcome::InternalError).await);
+            }
+        };
+        send_bind_result(&mut writer, id, &registration).await?;
+        return Ok(Bound {
+            parser,
+            writer,
+            registration,
+        });
+    }
+}
+
+fn requested_resource<'a, R: ArenaRead>(
+    stanza: &StanzaRef<'a, R>,
+) -> Result<Option<&'a str>, BindRequestError> {
+    let mut children = stanza.children().map_err(|_| BindRequestError::Internal)?;
+    let bind = children
+        .next()
+        .ok_or(BindRequestError::Malformed)?
+        .map_err(|_| BindRequestError::Internal)?;
+    if children
+        .next()
+        .transpose()
+        .map_err(|_| BindRequestError::Internal)?
+        .is_some()
+        || bind.name() != "bind"
+        || bind.namespace() != BIND_NAMESPACE
+    {
+        return Err(BindRequestError::Malformed);
+    }
+    if bind
+        .attributes()
+        .map_err(|_| BindRequestError::Internal)?
+        .next()
+        .transpose()
+        .map_err(|_| BindRequestError::Internal)?
+        .is_some()
+    {
+        return Err(BindRequestError::Malformed);
+    }
+    let mut resource = None;
+    for child in bind.children().map_err(|_| BindRequestError::Internal)? {
+        match child.map_err(|_| BindRequestError::Internal)? {
+            NodeRef::Text(text) if text.trim().is_empty() => {}
+            NodeRef::Element(element)
+                if element.name() == "resource"
+                    && element.namespace() == BIND_NAMESPACE
+                    && resource.is_none() =>
+            {
+                if element
+                    .attributes()
+                    .map_err(|_| BindRequestError::Internal)?
+                    .next()
+                    .transpose()
+                    .map_err(|_| BindRequestError::Internal)?
+                    .is_some()
+                {
+                    return Err(BindRequestError::Malformed);
+                }
+                let text = element
+                    .text()
+                    .map_err(|_| BindRequestError::Internal)?
+                    .filter(|text| !text.is_empty())
+                    .ok_or(BindRequestError::Malformed)?;
+                resource = Some(text);
+            }
+            _ => return Err(BindRequestError::Malformed),
+        }
+    }
+    Ok(resource)
+}
+
+async fn send_bind_result<A: ChunkAllocator>(
+    writer: &mut TlsWriter,
+    id: &str,
+    registration: &Registration<A>,
+) -> Result<(), CloseOutcome> {
+    let jid = registration.full_jid();
+    let mut xml = String::with_capacity(119 + CLIENT_NAMESPACE.len() + id.len() + jid.len());
+    xml.push_str("<iq xmlns='");
+    xml.push_str(CLIENT_NAMESPACE);
+    xml.push_str("' type='result' id='");
+    escape_attribute(&mut xml, id);
+    xml.push_str("'><bind xmlns='");
+    xml.push_str(BIND_NAMESPACE);
+    xml.push_str("'><jid>");
+    escape_text(&mut xml, &jid);
+    xml.push_str("</jid></bind></iq>");
+    send_tls(writer, &xml).await
+}
+
+async fn send_bind_error(
+    writer: &mut TlsWriter,
+    id: &str,
+    error_type: &str,
+    condition: &str,
+) -> Result<(), CloseOutcome> {
+    let mut xml = String::with_capacity(129 + CLIENT_NAMESPACE.len() + id.len());
+    xml.push_str("<iq xmlns='");
+    xml.push_str(CLIENT_NAMESPACE);
+    xml.push_str("' type='error' id='");
+    escape_attribute(&mut xml, id);
+    xml.push_str("'><error type='");
+    xml.push_str(error_type);
+    xml.push_str("'><");
+    xml.push_str(condition);
+    xml.push_str(" xmlns='");
+    xml.push_str(STANZA_ERROR_NAMESPACE);
+    xml.push_str("'/></error></iq>");
+    send_tls(writer, &xml).await
+}
+
+fn escape_text(output: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            _ => output.push(ch),
+        }
+    }
+}
+
+async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcome {
+    let Bound {
+        mut parser,
+        mut writer,
+        registration,
+    } = bound;
+    let outcome = match parser.next_event().await {
         Ok(Some(StreamEvent::StreamEnd) | None) => send_footer_tls(&mut writer).await,
         Err(ParseError::UnexpectedEof) => CloseOutcome::Eof,
         Err(error) => {
             send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error)).await
         }
-        _ => send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedInput).await,
-    }
+        _ => send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedBoundInput).await,
+    };
+    drop(registration);
+    outcome
 }
 
 fn account_key(username: &str, host: &str) -> Option<AccountKey> {
@@ -1251,6 +1542,7 @@ pub(super) enum CloseOutcome {
     StreamEnd,
     Eof,
     UnsupportedInput,
+    UnsupportedBoundInput,
     SizeLimitExceeded,
     ParserError,
     HostUnknown,
@@ -1264,6 +1556,8 @@ pub(super) enum CloseOutcome {
     StartTlsRejected,
     TlsFailure,
     AuthenticationTimeout,
+    BindingTimeout,
+    BindingAttemptsExceeded,
     EstablishmentTimeout,
     AuthenticationAttemptsExceeded,
     InternalError,
@@ -1296,6 +1590,9 @@ impl CloseOutcome {
             Self::RestrictedXml => Some(StreamErrorCondition::RestrictedXml),
             Self::UnsupportedEncoding => Some(StreamErrorCondition::UnsupportedEncoding),
             Self::AuthenticationAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::BindingAttemptsExceeded | Self::UnsupportedBoundInput => {
+                Some(StreamErrorCondition::PolicyViolation)
+            }
             Self::InternalError => Some(StreamErrorCondition::InternalServerError),
             _ => None,
         }
@@ -1306,6 +1603,7 @@ impl CloseOutcome {
             Self::StreamEnd => "stream_end",
             Self::Eof => "eof",
             Self::UnsupportedInput => "unsupported_input",
+            Self::UnsupportedBoundInput => "unsupported_bound_input",
             Self::SizeLimitExceeded => "size_limit_exceeded",
             Self::ParserError => "parser_error",
             Self::HostUnknown => "host_unknown",
@@ -1319,6 +1617,8 @@ impl CloseOutcome {
             Self::StartTlsRejected => "starttls_rejected",
             Self::TlsFailure => "tls_failure",
             Self::AuthenticationTimeout => "authentication_timeout",
+            Self::BindingTimeout => "binding_timeout",
+            Self::BindingAttemptsExceeded => "binding_attempts_exceeded",
             Self::EstablishmentTimeout => "establishment_timeout",
             Self::AuthenticationAttemptsExceeded => "authentication_attempts_exceeded",
             Self::InternalError => "internal_error",

@@ -13,9 +13,11 @@ pub enum StreamErrorCondition {
     InvalidNamespace,
     InvalidXml,
     NotAuthorized,
+    NotWellFormed,
     PolicyViolation,
     RestrictedXml,
     UnsupportedEncoding,
+    UnsupportedStanzaType,
     UnsupportedVersion,
 }
 
@@ -29,9 +31,11 @@ impl StreamErrorCondition {
             Self::InvalidNamespace => "invalid-namespace",
             Self::InvalidXml => "invalid-xml",
             Self::NotAuthorized => "not-authorized",
+            Self::NotWellFormed => "not-well-formed",
             Self::PolicyViolation => "policy-violation",
             Self::RestrictedXml => "restricted-xml",
             Self::UnsupportedEncoding => "unsupported-encoding",
+            Self::UnsupportedStanzaType => "unsupported-stanza-type",
             Self::UnsupportedVersion => "unsupported-version",
         }
     }

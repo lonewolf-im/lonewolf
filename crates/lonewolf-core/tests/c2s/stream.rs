@@ -296,6 +296,27 @@ fn early_stanza_closes_without_tcp_eof() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn server_namespace_before_starttls_returns_invalid_namespace() -> Result<(), Box<dyn Error>> {
+    for element in [
+        "<message xmlns='jabber:server' from='alice@localhost' to='localhost'/>",
+        "<other xmlns='jabber:server'/>",
+    ] {
+        let input = format!("{OPEN}{element}");
+        let (outcome, _, response) = run_case_with_rate(
+            input.as_bytes(),
+            false,
+            MAX_STANZA_BYTES,
+            &ByteRate::default(),
+        )?;
+        assert_eq!(outcome, CloseOutcome::InvalidNamespace);
+        assert!(
+            response.contains("<invalid-namespace xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>")
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn unknown_host_returns_stream_error() -> Result<(), Box<dyn Error>> {
     let input = OPEN
         .replace("to='localhost'", "to='elsewhere.example'")
@@ -335,13 +356,18 @@ fn invalid_stream_opening_returns_stream_error() -> Result<(), Box<dyn Error>> {
     for (input, outcome, condition) in [
         (
             OPEN.replace("to='localhost'", "to='alice@localhost'"),
-            CloseOutcome::HostUnknown,
-            "host-unknown",
+            CloseOutcome::InvalidTo,
+            "bad-format",
         ),
         (
             OPEN.replace("to='localhost'", "to='localhost/phone'"),
-            CloseOutcome::HostUnknown,
-            "host-unknown",
+            CloseOutcome::InvalidTo,
+            "bad-format",
+        ),
+        (
+            OPEN.replace("to='localhost'", "to='bad domain'"),
+            CloseOutcome::InvalidTo,
+            "bad-format",
         ),
         (
             OPEN.replace("version='1.0'", "version='0.9'"),
@@ -1920,6 +1946,79 @@ fn server_namespace_bind_iq_is_rejected_before_registration()
             ..BindingCase::default()
         },
     )
+}
+
+#[test]
+fn server_namespace_element_before_binding_returns_invalid_namespace()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::InvalidNamespace,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some("<other xmlns='jabber:server'/>"),
+            expected_responses: &[
+                "<invalid-namespace xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn bound_stream_reports_specific_protocol_errors() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let cases: [(&str, CloseOutcome, &[&str]); 6] = [
+        (
+            "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><message xmlns='jabber:server' from='alice@localhost' to='localhost'/>",
+            CloseOutcome::InvalidNamespace,
+            &["<invalid-namespace xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"],
+        ),
+        (
+            "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><other/>",
+            CloseOutcome::UnsupportedStanzaType,
+            &["<unsupported-stanza-type xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"],
+        ),
+        (
+            "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><other xmlns='jabber:server'/>",
+            CloseOutcome::InvalidNamespace,
+            &["<invalid-namespace xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"],
+        ),
+        (
+            "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><other xmlns='urn:example:unknown'/>",
+            CloseOutcome::UnsupportedStanzaType,
+            &["<unsupported-stanza-type xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"],
+        ),
+        (
+            "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><iq type='subscribe'/>",
+            CloseOutcome::InvalidXml,
+            &["<invalid-xml xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"],
+        ),
+        (
+            "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><x:message/>",
+            CloseOutcome::NotWellFormed,
+            &["<not-well-formed xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>"],
+        ),
+    ];
+    for (payload, outcome, expected_responses) in cases {
+        run_scram_with_restart(
+            ScramHash::Sha256,
+            None,
+            PSI_OPEN,
+            outcome,
+            ScramTiming::default(),
+            None,
+            BindingCase {
+                payload: Some(payload),
+                expected_responses,
+                released_resource: Some("desk"),
+                ..BindingCase::default()
+            },
+        )?;
+    }
+    Ok(())
 }
 
 #[test]

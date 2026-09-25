@@ -17,11 +17,16 @@ fn stream_error_conditions_write_their_protocol_names() -> fmt::Result {
         (StreamErrorCondition::InvalidNamespace, "invalid-namespace"),
         (StreamErrorCondition::InvalidXml, "invalid-xml"),
         (StreamErrorCondition::NotAuthorized, "not-authorized"),
+        (StreamErrorCondition::NotWellFormed, "not-well-formed"),
         (StreamErrorCondition::PolicyViolation, "policy-violation"),
         (StreamErrorCondition::RestrictedXml, "restricted-xml"),
         (
             StreamErrorCondition::UnsupportedEncoding,
             "unsupported-encoding",
+        ),
+        (
+            StreamErrorCondition::UnsupportedStanzaType,
+            "unsupported-stanza-type",
         ),
         (
             StreamErrorCondition::UnsupportedVersion,

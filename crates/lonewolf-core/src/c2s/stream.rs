@@ -32,8 +32,8 @@ use lonewolf_xmpp::parser::{
 };
 use lonewolf_xmpp::stanza::{
     AsyncWriteError, CLIENT_NAMESPACE, Element, IqType, MessageType, NodeRef, PresenceType,
-    STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza, StanzaErrorCondition, StanzaNamespace,
-    StanzaRef, StanzaType, XML_NAMESPACE,
+    SERVER_NAMESPACE, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza, StanzaErrorCondition,
+    StanzaNamespace, StanzaRef, StanzaType, XML_NAMESPACE,
 };
 use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
@@ -475,10 +475,9 @@ async fn establish<A: ChunkAllocator + Clone>(
                 let outcome = CloseOutcome::from_parse_error(&error);
                 return Err(send_stream_error(&mut transport, outcome).await);
             }
-            _ => {
-                return Err(
-                    send_stream_error(&mut transport, CloseOutcome::UnsupportedInput).await,
-                );
+            Ok(Some(event)) => {
+                let outcome = c2s_namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedInput);
+                return Err(send_stream_error(&mut transport, outcome).await);
             }
         };
         (header.host, rate_state)
@@ -590,6 +589,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                     .await);
                 }
             };
+            if let Some(outcome) = c2s_namespace_error(&event) {
+                return Err(send_stream_error_tls(&mut established.writer, outcome).await);
+            }
             match event {
                 StreamEvent::Element(element) => match parse_sasl_message(&element) {
                     Ok(SaslMessage::Auth { mechanism, payload }) => (mechanism, payload),
@@ -669,7 +671,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                 SaslResponse::StreamEnd => {
                     return Err(send_footer_tls(&mut established.writer).await);
                 }
-                SaslResponse::ParseError(outcome) => {
+                SaslResponse::StreamError(outcome) => {
                     return Err(send_stream_error_tls(&mut established.writer, outcome).await);
                 }
                 SaslResponse::Failure(condition) => {
@@ -777,7 +779,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             }
             SaslResponse::Eof => return Err(CloseOutcome::Eof),
             SaslResponse::StreamEnd => return Err(send_footer_tls(&mut established.writer).await),
-            SaslResponse::ParseError(outcome) => {
+            SaslResponse::StreamError(outcome) => {
                 return Err(send_stream_error_tls(&mut established.writer, outcome).await);
             }
             SaslResponse::Failure(condition) => {
@@ -986,10 +988,9 @@ async fn bind_resource<A: ChunkAllocator + Clone>(
                 )
                 .await);
             }
-            _ => {
-                return Err(
-                    send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedInput).await,
-                );
+            Ok(Some(event)) => {
+                let outcome = c2s_namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedInput);
+                return Err(send_stream_error_tls(&mut writer, outcome).await);
             }
         };
         let stanza = match parsed.value().resolve(parsed.arena()) {
@@ -1250,9 +1251,10 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
                 break send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error))
                     .await;
             }
-            _ => {
-                break send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedBoundInput)
-                    .await;
+            Ok(Some(event)) => {
+                let outcome =
+                    c2s_namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
+                break send_stream_error_tls(&mut writer, outcome).await;
             }
         }
     };
@@ -1272,7 +1274,7 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
         .resolve(parsed.arena())
         .map_err(|_| CloseOutcome::InternalError)?;
     if stanza.namespace() != StanzaNamespace::Client {
-        return Err(CloseOutcome::UnsupportedBoundInput);
+        return Err(CloseOutcome::InvalidNamespace);
     }
     match stanza.stanza_type() {
         StanzaType::Iq(IqType::Get | IqType::Set) => {
@@ -1360,6 +1362,26 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
             }
             Ok(())
         }
+    }
+}
+
+fn c2s_namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Option<CloseOutcome> {
+    match event {
+        StreamEvent::Stanza(parsed) => match parsed.value().resolve(parsed.arena()) {
+            Ok(stanza) if stanza.namespace() != StanzaNamespace::Client => {
+                Some(CloseOutcome::InvalidNamespace)
+            }
+            Ok(_) => None,
+            Err(_) => Some(CloseOutcome::InternalError),
+        },
+        StreamEvent::Element(parsed) => match parsed.value().resolve(parsed.arena()) {
+            Ok(element) if element.namespace() == SERVER_NAMESPACE => {
+                Some(CloseOutcome::InvalidNamespace)
+            }
+            Ok(_) => None,
+            Err(_) => Some(CloseOutcome::InternalError),
+        },
+        _ => None,
     }
 }
 
@@ -1640,14 +1662,24 @@ enum SaslResponse {
     Failure(&'static str),
     StreamEnd,
     Eof,
-    ParseError(CloseOutcome),
+    StreamError(CloseOutcome),
 }
 
 async fn next_sasl_response<A: ChunkAllocator + Clone>(
     established: &mut Established<A>,
 ) -> SaslResponse {
-    match established.parser.next_event().await {
-        Ok(Some(StreamEvent::Element(element))) => match parse_sasl_message(&element) {
+    let event = match established.parser.next_event().await {
+        Ok(Some(event)) => event,
+        Ok(None) | Err(ParseError::UnexpectedEof) => return SaslResponse::Eof,
+        Err(error) => {
+            return SaslResponse::StreamError(CloseOutcome::from_parse_error(&error));
+        }
+    };
+    if let Some(outcome) = c2s_namespace_error(&event) {
+        return SaslResponse::StreamError(outcome);
+    }
+    match event {
+        StreamEvent::Element(element) => match parse_sasl_message(&element) {
             Ok(SaslMessage::Response(response)) => SaslResponse::Data(response),
             Ok(SaslMessage::Auth { mechanism, payload }) => {
                 SaslResponse::Auth { mechanism, payload }
@@ -1655,9 +1687,7 @@ async fn next_sasl_response<A: ChunkAllocator + Clone>(
             Ok(SaslMessage::Abort) => SaslResponse::Failure("aborted"),
             Err(condition) => SaslResponse::Failure(condition),
         },
-        Ok(Some(StreamEvent::StreamEnd)) => SaslResponse::StreamEnd,
-        Ok(None) | Err(ParseError::UnexpectedEof) => SaslResponse::Eof,
-        Err(error) => SaslResponse::ParseError(CloseOutcome::from_parse_error(&error)),
+        StreamEvent::StreamEnd => SaslResponse::StreamEnd,
         _ => SaslResponse::Failure("malformed-request"),
     }
 }
@@ -1737,12 +1767,12 @@ fn validate_header<A: ChunkAllocator>(
         Arena::try_new(ArenaConfig::default()).map_err(|_| CloseOutcome::InternalError)?;
     let host = match to {
         Some(to) => {
-            let jid = Jid::parse_in(to, &mut arena).map_err(|_| CloseOutcome::HostUnknown)?;
+            let jid = Jid::parse_in(to, &mut arena).map_err(|_| CloseOutcome::InvalidTo)?;
             let jid = jid
                 .resolve(&arena)
                 .map_err(|_| CloseOutcome::InternalError)?;
             if jid.localpart().is_some() || jid.resourcepart().is_some() {
-                return Err(CloseOutcome::HostUnknown);
+                return Err(CloseOutcome::InvalidTo);
             }
             if !hosts.is_local_host(jid.domainpart()) {
                 return Err(CloseOutcome::HostUnknown);
@@ -1988,15 +2018,17 @@ pub(super) enum CloseOutcome {
     StreamEnd,
     Eof,
     UnsupportedInput,
-    UnsupportedBoundInput,
+    UnsupportedStanzaType,
     SizeLimitExceeded,
     ParserError,
     HostUnknown,
+    InvalidTo,
     UnsupportedVersion,
     InvalidNamespace,
     InvalidFrom,
     InvalidLanguage,
     InvalidXml,
+    NotWellFormed,
     RestrictedXml,
     UnsupportedEncoding,
     StartTlsRejected,
@@ -2012,10 +2044,14 @@ pub(super) enum CloseOutcome {
 
 impl CloseOutcome {
     fn from_parse_error(error: &ParseError) -> Self {
+        if error.is_transport_error() {
+            return Self::TransportError;
+        }
         match error {
             ParseError::SizeLimitExceeded { .. } => Self::SizeLimitExceeded,
             ParseError::InvalidNamespace => Self::InvalidNamespace,
-            ParseError::InvalidXml => Self::InvalidXml,
+            ParseError::InvalidXml | ParseError::InvalidStanzaType => Self::InvalidXml,
+            ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
             ParseError::RestrictedXml => Self::RestrictedXml,
             ParseError::UnsupportedEncoding => Self::UnsupportedEncoding,
             ParseError::UnsupportedVersion => Self::UnsupportedVersion,
@@ -2027,18 +2063,20 @@ impl CloseOutcome {
         match self {
             Self::UnsupportedInput => Some(StreamErrorCondition::NotAuthorized),
             Self::SizeLimitExceeded => Some(StreamErrorCondition::PolicyViolation),
-            Self::ParserError | Self::InvalidLanguage => Some(StreamErrorCondition::BadFormat),
+            Self::ParserError | Self::InvalidLanguage | Self::InvalidTo => {
+                Some(StreamErrorCondition::BadFormat)
+            }
             Self::HostUnknown => Some(StreamErrorCondition::HostUnknown),
             Self::UnsupportedVersion => Some(StreamErrorCondition::UnsupportedVersion),
             Self::InvalidNamespace => Some(StreamErrorCondition::InvalidNamespace),
             Self::InvalidFrom => Some(StreamErrorCondition::InvalidFrom),
             Self::InvalidXml => Some(StreamErrorCondition::InvalidXml),
+            Self::NotWellFormed => Some(StreamErrorCondition::NotWellFormed),
             Self::RestrictedXml => Some(StreamErrorCondition::RestrictedXml),
             Self::UnsupportedEncoding => Some(StreamErrorCondition::UnsupportedEncoding),
             Self::AuthenticationAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
-            Self::BindingAttemptsExceeded | Self::UnsupportedBoundInput => {
-                Some(StreamErrorCondition::PolicyViolation)
-            }
+            Self::BindingAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::UnsupportedStanzaType => Some(StreamErrorCondition::UnsupportedStanzaType),
             Self::InternalError => Some(StreamErrorCondition::InternalServerError),
             _ => None,
         }
@@ -2049,15 +2087,17 @@ impl CloseOutcome {
             Self::StreamEnd => "stream_end",
             Self::Eof => "eof",
             Self::UnsupportedInput => "unsupported_input",
-            Self::UnsupportedBoundInput => "unsupported_bound_input",
+            Self::UnsupportedStanzaType => "unsupported_stanza_type",
             Self::SizeLimitExceeded => "size_limit_exceeded",
             Self::ParserError => "parser_error",
             Self::HostUnknown => "host_unknown",
+            Self::InvalidTo => "invalid_to",
             Self::UnsupportedVersion => "unsupported_version",
             Self::InvalidNamespace => "invalid_namespace",
             Self::InvalidFrom => "invalid_from",
             Self::InvalidLanguage => "invalid_language",
             Self::InvalidXml => "invalid_xml",
+            Self::NotWellFormed => "not_well_formed",
             Self::RestrictedXml => "restricted_xml",
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::StartTlsRejected => "starttls_rejected",

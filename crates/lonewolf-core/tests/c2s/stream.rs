@@ -1593,6 +1593,7 @@ fn successful_stream_logs_each_lifecycle_transition() -> Result<(), Box<dyn Erro
     assert_eq!(lines.len(), events.len(), "{logs}");
     for (line, event) in lines.iter().zip(events) {
         assert!(line.contains(event), "{logs}");
+        assert!(line.contains("connection_type=\"c2s\""), "{logs}");
         assert!(line.contains("listener_id=0"), "{logs}");
         assert!(line.contains("worker_id=0"), "{logs}");
     }
@@ -1609,10 +1610,18 @@ fn successful_stream_logs_each_lifecycle_transition() -> Result<(), Box<dyn Erro
     }
     assert!(lines[0].contains("host=\"localhost\""), "{logs}");
     assert!(lines[1].contains("SCRAM-SHA-256"), "{logs}");
-    assert!(lines[2].contains("generated_resource=false"), "{logs}");
+    assert!(lines[2].contains("resource_requested=true"), "{logs}");
     assert!(lines[3].contains("stream_phase=\"bound\""), "{logs}");
     assert!(lines[3].contains("outcome=\"stream_end\""), "{logs}");
     assert!(!logs.contains("alice@localhost"), "{logs}");
+    Ok(())
+}
+
+#[test]
+fn generated_binding_logs_absent_resource_request() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (result, logs) = capture_logs(server_generated_binding_uses_random_resource)?;
+    result?;
+    assert!(logs.contains("resource_requested=false"), "{logs}");
     Ok(())
 }
 
@@ -2166,6 +2175,7 @@ fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
         });
     })?;
     assert!(logs.contains("c2s stream disconnected"), "{logs}");
+    assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
     assert!(logs.contains("stream_phase=\"binding\""), "{logs}");
     assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
     Ok(())
@@ -2195,6 +2205,7 @@ fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
     })?;
     result?;
     assert!(logs.contains("c2s stream disconnected"), "{logs}");
+    assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
     assert!(logs.contains("listener_id=2"), "{logs}");
     assert!(logs.contains("worker_id=3"), "{logs}");
     assert!(logs.contains("outcome=\"cancelled\""), "{logs}");

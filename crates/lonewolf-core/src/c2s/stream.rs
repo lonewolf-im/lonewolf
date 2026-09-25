@@ -104,7 +104,7 @@ struct Bound<A: ChunkAllocator> {
     parser: XmppParser<XmlInput, A>,
     writer: TlsWriter,
     registration: Registration<A>,
-    generated_resource: bool,
+    resource_requested: bool,
 }
 
 struct ConnectionLifecycle {
@@ -189,6 +189,7 @@ impl ConnectionLifecycle {
     fn established(&mut self, host: &str) {
         self.stream_phase = "established";
         tracing::info!(
+            connection_type = "c2s",
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
@@ -201,6 +202,7 @@ impl ConnectionLifecycle {
     fn authenticated(&mut self, host: &str, mechanism: Mechanism, started_at: Instant) {
         self.stream_phase = "authenticated";
         tracing::info!(
+            connection_type = "c2s",
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
@@ -211,13 +213,14 @@ impl ConnectionLifecycle {
         );
     }
 
-    fn bound(&mut self, generated_resource: bool, started_at: Instant) {
+    fn bound(&mut self, resource_requested: bool, started_at: Instant) {
         self.stream_phase = "bound";
         tracing::info!(
+            connection_type = "c2s",
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
-            generated_resource,
+            resource_requested,
             binding_ms = started_at.elapsed().as_millis(),
             "c2s resource bound"
         );
@@ -249,6 +252,7 @@ impl StreamAdmission {
 impl Drop for ConnectionLifecycle {
     fn drop(&mut self) {
         tracing::info!(
+            connection_type = "c2s",
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
@@ -348,7 +352,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                         .await
                         {
                             Ok(Ok(bound)) => {
-                                lifecycle.bound(bound.generated_resource, binding_started_at);
+                                lifecycle.bound(bound.resource_requested, binding_started_at);
                                 bound_stream(bound).await
                             }
                             Ok(Err(outcome)) => outcome,
@@ -1070,7 +1074,7 @@ async fn bind_resource<A: ChunkAllocator + Clone>(
             parser,
             writer,
             registration,
-            generated_resource: requested.is_none(),
+            resource_requested: requested.is_some(),
         });
     }
 }
@@ -1191,7 +1195,7 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
         mut parser,
         writer,
         registration,
-        generated_resource: _,
+        resource_requested: _,
     } = bound;
     let mut writer = FuturesBufWriter::with_capacity(IO_BUFFER_BYTES, writer);
     let outcome = loop {

@@ -295,6 +295,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                         close_unhandled_connection(stream);
                                         if let Some(rejected_connections) = report_count {
                                             tracing::warn!(
+                                                connection_type = "c2s",
                                                 listener_id,
                                                 worker_id,
                                                 outcome,
@@ -309,6 +310,9 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                 close_unhandled_connection(stream);
                                 if let Some(rejected_connections) = report_count {
                                     tracing::warn!(
+                                        connection_type = "c2s",
+                                        listener_id,
+                                        worker_id,
                                         outcome = "unauthenticated_connection_limit",
                                         rejected_connections,
                                         "c2s connection rejected"
@@ -324,6 +328,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                         close_unhandled_connection(stream);
                         if let Some(rejected_attempts) = report_count {
                             tracing::warn!(
+                                connection_type = "c2s",
                                 listener_id,
                                 worker_id,
                                 outcome,

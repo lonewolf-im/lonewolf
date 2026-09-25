@@ -27,7 +27,7 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
 use lonewolf_xmpp::stanza::{
     CLIENT_NAMESPACE, Element, IqType, NodeRef, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE,
-    StanzaRef, StanzaType, XML_NAMESPACE,
+    StanzaNamespace, StanzaRef, StanzaType, XML_NAMESPACE,
 };
 use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
@@ -879,6 +879,9 @@ async fn bind_resource<A: ChunkAllocator + Clone>(
                 return Err(send_stream_error_tls(&mut writer, CloseOutcome::InternalError).await);
             }
         };
+        if stanza.namespace() != StanzaNamespace::Client {
+            return Err(send_stream_error_tls(&mut writer, CloseOutcome::InvalidNamespace).await);
+        }
         if stanza.stanza_type() != StanzaType::Iq(IqType::Set) {
             return Err(send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedInput).await);
         }
@@ -1027,8 +1030,10 @@ async fn send_bind_result<A: ChunkAllocator>(
     registration: &Registration<A>,
 ) -> Result<(), CloseOutcome> {
     let jid = registration.full_jid();
-    let mut xml = String::with_capacity(110 + id.len() + jid.len());
-    xml.push_str("<iq type='result' id='");
+    let mut xml = String::with_capacity(119 + CLIENT_NAMESPACE.len() + id.len() + jid.len());
+    xml.push_str("<iq xmlns='");
+    xml.push_str(CLIENT_NAMESPACE);
+    xml.push_str("' type='result' id='");
     escape_attribute(&mut xml, id);
     xml.push_str("'><bind xmlns='");
     xml.push_str(BIND_NAMESPACE);
@@ -1044,8 +1049,10 @@ async fn send_bind_error(
     error_type: &str,
     condition: &str,
 ) -> Result<(), CloseOutcome> {
-    let mut xml = String::with_capacity(120 + id.len());
-    xml.push_str("<iq type='error' id='");
+    let mut xml = String::with_capacity(129 + CLIENT_NAMESPACE.len() + id.len());
+    xml.push_str("<iq xmlns='");
+    xml.push_str(CLIENT_NAMESPACE);
+    xml.push_str("' type='error' id='");
     escape_attribute(&mut xml, id);
     xml.push_str("'><error type='");
     xml.push_str(error_type);

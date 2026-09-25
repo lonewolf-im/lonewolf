@@ -18,8 +18,10 @@ use lonewolf_auth::scram::{
 use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::account::{AccountRepository, NewAccount};
-use lonewolf_util::arena::GlobalChunkAllocator;
+use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
+use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
+use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, IqType, StanzaNamespace};
 use lonewolf_xmpp::stream::STREAM_ERROR_NAMESPACE;
 use redb::{ReadableTable, TableDefinition};
 use rustls::pki_types::ServerName;
@@ -40,6 +42,8 @@ use crate::router::local::LocalRouter;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";
 const PSI_OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0' xmlns='jabber:client' xml:lang='es' xmlns:xml='http://www.w3.org/XML/1998/namespace'>";
+const PREFIX_FREE_OPEN: &str =
+    "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
 
@@ -1107,8 +1111,10 @@ impl Default for ScramTiming {
 
 #[derive(Clone, Copy)]
 struct BindingCase {
+    opening: Option<&'static str>,
     payload: Option<&'static str>,
     expected_responses: &'static [&'static str],
+    client_iq_responses: &'static [(&'static str, IqType)],
     timeout: Duration,
     occupied_resource: Option<&'static str>,
     released_resource: Option<&'static str>,
@@ -1118,14 +1124,61 @@ struct BindingCase {
 impl Default for BindingCase {
     fn default() -> Self {
         Self {
+            opening: None,
             payload: None,
             expected_responses: &[],
+            client_iq_responses: &[],
             timeout: Duration::from_secs(10),
             occupied_resource: None,
             released_resource: None,
             resource_limit: NonZeroUsize::new(10).unwrap(),
         }
     }
+}
+
+async fn assert_client_iq_namespaces(
+    response: &str,
+    expected: &[(&str, IqType)],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut parser = XmppParser::new(
+        response.as_bytes(),
+        ParserConfig {
+            max_stanza_bytes: MAX_STANZA_BYTES,
+            arena: ArenaConfig::default(),
+        },
+        GlobalChunkAllocator,
+    );
+    let Some(StreamEvent::StreamStart {
+        content_namespace, ..
+    }) = parser.next_event().await?
+    else {
+        return Err("server stream opening missing".into());
+    };
+    assert_eq!(content_namespace, "");
+    let mut expected = expected.iter();
+    while let Some(event) = parser.next_event().await? {
+        match event {
+            StreamEvent::Stanza(parsed) => {
+                let (id, kind) = expected.next().ok_or("unexpected IQ response")?;
+                let stanza = parsed.value().resolve(parsed.arena())?;
+                assert_eq!(stanza.namespace(), StanzaNamespace::Client);
+                assert_eq!(stanza.stanza_type(), super::StanzaType::Iq(*kind));
+                assert_eq!(stanza.id()?, Some(*id));
+                if *kind == IqType::Error {
+                    let child = stanza
+                        .children()?
+                        .next()
+                        .ok_or("IQ error child missing")??;
+                    assert_eq!(child.name(), "error");
+                    assert_eq!(child.namespace(), CLIENT_NAMESPACE);
+                }
+            }
+            StreamEvent::StreamEnd => break,
+            _ => {}
+        }
+    }
+    assert!(expected.next().is_none());
+    Ok(())
 }
 
 fn run_scram_with_restart(
@@ -1188,7 +1241,7 @@ fn run_scram_with_restart(
         };
         let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
-        let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+        let client = std::thread::spawn(move || -> Result<String, Box<dyn Error + Send + Sync>> {
             let mut socket = StdTcpStream::connect(address)?;
             socket.set_read_timeout(Some(TIMEOUT))?;
             socket.set_write_timeout(Some(TIMEOUT))?;
@@ -1274,7 +1327,7 @@ fn run_scram_with_restart(
                         .contains("<invalid-from xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>")
                 );
                 assert!(!response.contains("<success"));
-                return Ok(());
+                return Ok(String::new());
             }
             let success = String::from_utf8(read_through(&mut tls, b"</success>")?)?;
             let success = success
@@ -1297,8 +1350,12 @@ fn run_scram_with_restart(
                 tls.write_all(opening.as_bytes())?;
             } else {
                 tls.write_all(
-                    format!("{PSI_OPEN}{}", client_binding_case.payload.unwrap_or(CLOSE))
-                        .as_bytes(),
+                    format!(
+                        "{}{}",
+                        client_binding_case.opening.unwrap_or(PSI_OPEN),
+                        client_binding_case.payload.unwrap_or(CLOSE)
+                    )
+                    .as_bytes(),
                 )?;
             }
             let mut rest = String::new();
@@ -1329,7 +1386,7 @@ fn run_scram_with_restart(
             if expected_outcome != CloseOutcome::BindingTimeout {
                 assert!(rest.ends_with(STREAM_FOOTER));
             }
-            Ok(())
+            Ok(rest)
         });
         let (transport, peer) = listener.accept().await?;
         let limiter = ConnectionLimiter::new(1);
@@ -1399,7 +1456,10 @@ fn run_scram_with_restart(
         }
         router.shutdown().await?;
         router_dispatcher.shutdown(TIMEOUT).await?;
-        client.join().map_err(|_| "client thread panicked")??;
+        let response = client.join().map_err(|_| "client thread panicked")??;
+        if !binding_case.client_iq_responses.is_empty() {
+            assert_client_iq_namespaces(&response, binding_case.client_iq_responses).await?;
+        }
         listener.close().await?;
         assert_eq!(outcome, expected_outcome);
         Ok::<_, Box<dyn Error + Send + Sync>>(())
@@ -1472,12 +1532,14 @@ fn client_resource_binding_returns_full_jid() -> Result<(), Box<dyn Error + Send
         ScramTiming::default(),
         None,
         BindingCase {
+            opening: Some(PREFIX_FREE_OPEN),
             payload: Some(
-                "<iq type='set' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>",
+                "<iq xmlns='jabber:client' type='set' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>",
             ),
             expected_responses: &[
-                "<iq type='result' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/desk</jid></bind></iq>",
+                "<iq xmlns='jabber:client' type='result' id='b1'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/desk</jid></bind></iq>",
             ],
+            client_iq_responses: &[("b1", IqType::Result)],
             released_resource: Some("desk"),
             ..BindingCase::default()
         },
@@ -1498,7 +1560,7 @@ fn server_generated_binding_uses_random_resource() -> Result<(), Box<dyn Error +
                 "<iq type='set' id='b2'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></iq></stream:stream>",
             ),
             expected_responses: &[
-                "<iq type='result' id='b2'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/lw-",
+                "<iq xmlns='jabber:client' type='result' id='b2'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/lw-",
             ],
             ..BindingCase::default()
         },
@@ -1515,13 +1577,39 @@ fn malformed_resource_can_be_retried() -> Result<(), Box<dyn Error + Send + Sync
         ScramTiming::default(),
         None,
         BindingCase {
+            opening: Some(PREFIX_FREE_OPEN),
             payload: Some(
-                "<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq><iq type='set' id='good'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>",
+                "<iq xmlns='jabber:client' type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq><iq xmlns='jabber:client' type='set' id='good'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>",
             ),
             expected_responses: &[
-                "<iq type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+                "<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
                 "<jid>alice@localhost/desk</jid>",
             ],
+            client_iq_responses: &[("bad", IqType::Error), ("good", IqType::Result)],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn server_namespace_bind_iq_is_rejected_before_registration()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::InvalidNamespace,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            opening: Some(PREFIX_FREE_OPEN),
+            payload: Some(
+                "<iq xmlns='jabber:server' type='set' id='server' from='alice@localhost' to='localhost'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq></stream:stream>",
+            ),
+            expected_responses: &[
+                "<invalid-namespace xmlns='urn:ietf:params:xml:ns:xmpp-streams'/>",
+            ],
+            released_resource: Some("desk"),
             ..BindingCase::default()
         },
     )
@@ -1541,7 +1629,7 @@ fn resource_limit_returns_stanza_error() -> Result<(), Box<dyn Error + Send + Sy
                 "<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>new</resource></bind></iq></stream:stream>",
             ),
             expected_responses: &[
-                "<iq type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+                "<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
             ],
             occupied_resource: Some("desk"),
             resource_limit: NonZeroUsize::MIN,

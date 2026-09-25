@@ -10,6 +10,7 @@ use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_core::config::Config;
 use lonewolf_core::hosts::Hosts;
+use lonewolf_core::router::local::LocalRouter;
 use lonewolf_core::router::{RoutedStanza, Router, RouterError};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
@@ -36,7 +37,8 @@ async fn setup() -> Result<(Router<GlobalChunkAllocator>, CoreDispatcher), Box<d
     };
     let config = Config::default();
     let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
-    let router = Router::start(hosts, &dispatcher.handle()).await?;
+    let local = LocalRouter::start(&dispatcher.handle()).await?;
+    let router = Router::new(hosts, local);
     Ok((router, dispatcher))
 }
 

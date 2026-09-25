@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, hash_map::RandomState};
-use std::fmt;
 use std::hash::BuildHasher;
 use std::io;
 use std::num::NonZeroUsize;
@@ -16,27 +15,23 @@ use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_storage::account::AccountKey;
-use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
+use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use lonewolf_xmpp::jid::JidError;
-use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{Stanza, StanzaRef};
 
-use crate::hosts::Hosts;
+use super::{RoutedStanza, RouterError};
 
 const SHARD_QUEUE_CAPACITY: usize = 256;
 const RESOURCE_QUEUE_CAPACITY: usize = 16;
 const SHARD_BATCH_SIZE: usize = 64;
 
 /// Owns one account shard on each core worker.
-pub struct Router<A: ChunkAllocator> {
-    handle: RouterHandle<A>,
+pub struct LocalRouter<A: ChunkAllocator> {
+    handle: LocalRouterHandle<A>,
     tasks: Vec<Task<()>>,
 }
 
-/// Sends account operations to the shard selected by bare JID.
-pub struct RouterHandle<A: ChunkAllocator> {
-    hosts: Hosts,
+pub(super) struct LocalRouterHandle<A: ChunkAllocator> {
     shards: Arc<[Sender<Command<A>>]>,
     hash_state: RandomState,
 }
@@ -48,24 +43,6 @@ pub struct Registration<A: ChunkAllocator> {
     alive: Arc<AtomicBool>,
     _lease: oneshot::Sender<()>,
     inbound: Receiver<RoutedStanza<A>>,
-}
-
-/// Retains the parsed stanza and its immutable arena across workers.
-pub struct RoutedStanza<A: ChunkAllocator> {
-    stanza: Stanza,
-    arena: SharedArena<A>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RouterError {
-    InvalidTarget,
-    RemoteUnsupported,
-    InvalidResource,
-    ResourceLimit,
-    NotFound,
-    Busy,
-    Unavailable,
-    Stopped,
 }
 
 enum Command<A: ChunkAllocator> {
@@ -95,13 +72,13 @@ struct Shard<A: ChunkAllocator> {
     cleanups: FuturesUnordered<BoxFuture<'static, (AccountKey, Box<str>, u64)>>,
 }
 
-impl<A: ChunkAllocator> Router<A> {
+impl<A: ChunkAllocator> LocalRouter<A> {
     /// Starts the shard actors on the core dispatcher.
     ///
     /// # Errors
     ///
     /// Returns a dispatcher error if a worker cannot accept its actor.
-    pub async fn start(hosts: Hosts, dispatcher: &DispatchHandle) -> io::Result<Self> {
+    pub async fn start(dispatcher: &DispatchHandle) -> io::Result<Self> {
         let count = dispatcher.worker_count();
         let mut senders = Vec::with_capacity(count);
         let mut tasks = Vec::with_capacity(count);
@@ -114,8 +91,7 @@ impl<A: ChunkAllocator> Router<A> {
             tasks.push(task);
         }
         Ok(Self {
-            handle: RouterHandle {
-                hosts,
+            handle: LocalRouterHandle {
                 shards: senders.into(),
                 hash_state: RandomState::new(),
             },
@@ -123,7 +99,7 @@ impl<A: ChunkAllocator> Router<A> {
         })
     }
 
-    pub fn handle(&self) -> RouterHandle<A> {
+    pub(super) fn handle(&self) -> LocalRouterHandle<A> {
         self.handle.clone()
     }
 
@@ -139,27 +115,22 @@ impl<A: ChunkAllocator> Router<A> {
     }
 }
 
-impl<A: ChunkAllocator> Clone for RouterHandle<A> {
+impl<A: ChunkAllocator> Clone for LocalRouterHandle<A> {
     fn clone(&self) -> Self {
         Self {
-            hosts: self.hosts.clone(),
             shards: Arc::clone(&self.shards),
             hash_state: self.hash_state.clone(),
         }
     }
 }
 
-impl<A: ChunkAllocator> RouterHandle<A> {
-    /// Applies the incoming listener's limit to resources on all listeners.
-    pub async fn register(
+impl<A: ChunkAllocator> LocalRouterHandle<A> {
+    pub(crate) async fn register(
         &self,
         account: &AccountKey,
         requested: Option<&str>,
         limit: NonZeroUsize,
     ) -> Result<Registration<A>, RouterError> {
-        if !self.hosts.is_local_host(account.domain()) {
-            return Err(RouterError::RemoteUnsupported);
-        }
         let requested = requested
             .map(|resource| validate_resource(account, resource))
             .transpose()?;
@@ -179,17 +150,13 @@ impl<A: ChunkAllocator> RouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
-    /// Enqueues a stanza for a connected full JID without waiting for socket I/O.
-    pub async fn route_full(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+    pub(crate) async fn deliver_full(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             let to = view
                 .to()
                 .map_err(|_| RouterError::InvalidTarget)?
                 .ok_or(RouterError::InvalidTarget)?;
-            if !self.hosts.is_local_host(to.domainpart()) {
-                return Err(RouterError::RemoteUnsupported);
-            }
             to.resourcepart().ok_or(RouterError::InvalidTarget)?;
             to.localpart().ok_or(RouterError::InvalidTarget)?;
             self.shard_index(to.bare().as_str())
@@ -234,46 +201,6 @@ impl<A: ChunkAllocator> Drop for Registration<A> {
         self.alive.store(false, Ordering::Release);
     }
 }
-
-impl<A: ChunkAllocator> RoutedStanza<A> {
-    pub fn from_parsed(parsed: Parsed<Stanza, A>) -> Self {
-        let (stanza, arena) = parsed.into_parts();
-        Self {
-            stanza,
-            arena: arena.freeze(),
-        }
-    }
-
-    pub fn resolve(&self) -> Result<StanzaRef<'_, SharedArena<A>>, HandleError> {
-        self.stanza.resolve(&self.arena)
-    }
-}
-
-impl<A: ChunkAllocator> Clone for RoutedStanza<A> {
-    fn clone(&self) -> Self {
-        Self {
-            stanza: self.stanza,
-            arena: self.arena.clone(),
-        }
-    }
-}
-
-impl fmt::Display for RouterError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidTarget => "destination must be a full user JID",
-            Self::RemoteUnsupported => "remote routing is unavailable",
-            Self::InvalidResource => "resource identifier is invalid",
-            Self::ResourceLimit => "account resource limit reached",
-            Self::NotFound => "destination resource is not connected",
-            Self::Busy => "destination resource cannot accept a stanza",
-            Self::Unavailable => "router cannot register a resource",
-            Self::Stopped => "router has stopped",
-        })
-    }
-}
-
-impl std::error::Error for RouterError {}
 
 fn validate_resource(account: &AccountKey, input: &str) -> Result<Box<str>, RouterError> {
     let mut arena = Arena::try_new(Default::default()).map_err(|_| RouterError::Unavailable)?;

@@ -1562,7 +1562,9 @@ fn unsupported_bound_iqs_receive_errors_without_closing_stream()
                 "<iq xmlns='jabber:client' type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>\
                  <iq xmlns='jabber:client' type='get' id='private' from='mallory@localhost/Spy'><query xmlns='jabber:iq:private'><roster xmlns='roster:delimiter'/></query></iq>\
                  <iq xmlns='jabber:client' type='set' id='other'><query xmlns='urn:unsupported'/></iq>\
-                 <iq xmlns='jabber:client' type='get' id='addressed' to='remote.example'><query xmlns='urn:unsupported'/></iq>\
+                 <iq xmlns='jabber:client' type='get' id='addressed' to='remote.example' from='mallory@localhost/Spy'><query xmlns='urn:unsupported'/></iq>\
+                 <iq xmlns='jabber:client' type='get' id='bare' to='alice@localhost'><query xmlns='urn:unsupported'/></iq>\
+                 <iq xmlns='jabber:client' type='get' id='full' to='alice@localhost/desk'><query xmlns='urn:unsupported'/></iq>\
                  <iq xmlns='jabber:client' type='result' id='orphan'/>\
                  </stream:stream>",
             ),
@@ -1572,13 +1574,17 @@ fn unsupported_bound_iqs_receive_errors_without_closing_stream()
                 "<error type=\"cancel\">",
                 "<service-unavailable xmlns=\"urn:ietf:params:xml:ns:xmpp-stanzas\"/>",
                 "<iq xmlns=\"jabber:client\" id=\"other\" type=\"error\"",
-                "<iq xmlns=\"jabber:client\" from=\"localhost\" id=\"addressed\" type=\"error\">",
+                "<iq xmlns=\"jabber:client\" from=\"remote.example\" id=\"addressed\" type=\"error\">",
+                "<iq xmlns=\"jabber:client\" from=\"alice@localhost\" id=\"bare\" type=\"error\">",
+                "<iq xmlns=\"jabber:client\" from=\"alice@localhost/desk\" id=\"full\" type=\"error\">",
             ],
             client_iq_responses: &[
                 ("bind", IqType::Result),
                 ("private", IqType::Error),
                 ("other", IqType::Error),
                 ("addressed", IqType::Error),
+                ("bare", IqType::Error),
+                ("full", IqType::Error),
             ],
             ..BindingCase::default()
         },

@@ -1101,9 +1101,7 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
                 }
                 match stanza_type {
                     StanzaType::Iq(IqType::Get | IqType::Set) => {
-                        if let Err(outcome) =
-                            unsupported_iq_xml(parsed, &registration, &mut response)
-                        {
+                        if let Err(outcome) = unsupported_iq_xml(parsed, &mut response) {
                             break send_stream_error_tls(&mut writer, outcome).await;
                         }
                         if let Err(outcome) = send_tls(&mut writer, &response).await {
@@ -1137,30 +1135,11 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
 
 fn unsupported_iq_xml<A: ChunkAllocator>(
     parsed: Parsed<Stanza, A>,
-    registration: &Registration<A>,
     xml: &mut String,
 ) -> Result<(), CloseOutcome> {
     let (request, mut arena) = parsed.into_parts();
-    let addressed = request
-        .resolve(&arena)
-        .map_err(|_| CloseOutcome::InternalError)?
-        .to()
-        .map_err(|_| CloseOutcome::InternalError)?
-        .is_some();
-    let from = if addressed {
-        let (_, domain) = registration
-            .account()
-            .as_str()
-            .split_once('@')
-            .ok_or(CloseOutcome::InternalError)?;
-        Some(Jid::parse_in(domain, &mut arena).map_err(|_| CloseOutcome::InternalError)?)
-    } else {
-        None
-    };
     let reply = request
         .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)
-        .map_err(|_| CloseOutcome::InternalError)?
-        .from(from)
         .map_err(|_| CloseOutcome::InternalError)?
         .to(None)
         .map_err(|_| CloseOutcome::InternalError)?

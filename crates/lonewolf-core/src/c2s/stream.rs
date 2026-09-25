@@ -195,7 +195,7 @@ impl ConnectionLifecycle {
             worker_id = self.worker_id,
             host,
             establishment_ms = self.accepted_at.elapsed().as_millis(),
-            "c2s connection established"
+            "connection established"
         );
     }
 
@@ -209,7 +209,7 @@ impl ConnectionLifecycle {
             host,
             auth_mechanism = mechanism.name(),
             authentication_ms = started_at.elapsed().as_millis(),
-            "c2s connection authenticated"
+            "connection authenticated"
         );
     }
 
@@ -222,7 +222,7 @@ impl ConnectionLifecycle {
             worker_id = self.worker_id,
             resource_requested,
             binding_ms = started_at.elapsed().as_millis(),
-            "c2s resource bound"
+            "resource bound"
         );
     }
 }
@@ -259,7 +259,7 @@ impl Drop for ConnectionLifecycle {
             stream_phase = self.stream_phase,
             outcome = self.outcome.map_or("cancelled", |outcome| outcome.as_str()),
             duration_ms = self.accepted_at.elapsed().as_millis(),
-            "c2s stream disconnected"
+            "stream disconnected"
         );
     }
 }

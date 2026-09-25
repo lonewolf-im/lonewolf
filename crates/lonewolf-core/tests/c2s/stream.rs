@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::RefCell;
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -46,17 +47,21 @@ const PREFIX_FREE_OPEN: &str =
     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+static LOG_SUBSCRIBER: OnceLock<Result<(), String>> = OnceLock::new();
 
-#[derive(Clone)]
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
+thread_local! {
+    static LOG_CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+struct LogWriter;
 
 impl Write for LogWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut output = self
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("log buffer poisoned"))?;
-        output.extend_from_slice(bytes);
+        LOG_CAPTURE.with(|capture| {
+            if let Some(output) = capture.borrow_mut().as_mut() {
+                output.extend_from_slice(bytes);
+            }
+        });
         Ok(bytes.len())
     }
 
@@ -66,19 +71,29 @@ impl Write for LogWriter {
 }
 
 fn capture_logs<R>(run: impl FnOnce() -> R) -> io::Result<(R, String)> {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogWriter(Arc::clone(&output));
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(move || writer.clone())
-        .finish();
-    let result = tracing::subscriber::with_default(subscriber, run);
-    let bytes = output
-        .lock()
-        .map_err(|_| io::Error::other("log buffer poisoned"))?
-        .clone();
-    Ok((result, String::from_utf8(bytes).map_err(io::Error::other)?))
+    LOG_SUBSCRIBER
+        .get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| LogWriter)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))?;
+    LOG_CAPTURE.with(|capture| {
+        if capture.borrow().is_some() {
+            return Err(io::Error::other("nested log capture"));
+        }
+        capture.replace(Some(Vec::new()));
+        let result = run();
+        let bytes = capture
+            .replace(None)
+            .ok_or_else(|| io::Error::other("log capture missing"))?;
+        Ok((result, String::from_utf8(bytes).map_err(io::Error::other)?))
+    })
 }
 
 fn hosts() -> Result<Hosts, HostsError> {
@@ -1581,10 +1596,10 @@ fn successful_stream_logs_each_lifecycle_transition() -> Result<(), Box<dyn Erro
     let (result, logs) = capture_logs(client_resource_binding_returns_full_jid)?;
     result?;
     let events = [
-        "c2s connection established",
-        "c2s connection authenticated",
-        "c2s resource bound",
-        "c2s stream disconnected",
+        "connection established",
+        "connection authenticated",
+        "resource bound",
+        "stream disconnected",
     ];
     let lines: Vec<_> = logs
         .lines()
@@ -2174,7 +2189,7 @@ fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
             outcome: None,
         });
     })?;
-    assert!(logs.contains("c2s stream disconnected"), "{logs}");
+    assert!(logs.contains("stream disconnected"), "{logs}");
     assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
     assert!(logs.contains("stream_phase=\"binding\""), "{logs}");
     assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
@@ -2204,7 +2219,7 @@ fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
         })
     })?;
     result?;
-    assert!(logs.contains("c2s stream disconnected"), "{logs}");
+    assert!(logs.contains("stream disconnected"), "{logs}");
     assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
     assert!(logs.contains("listener_id=2"), "{logs}");
     assert!(logs.contains("worker_id=3"), "{logs}");

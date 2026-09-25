@@ -20,6 +20,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use lonewolf_xmpp::jid::JidError;
+use lonewolf_xmpp::stanza::{MessageType, StanzaType};
 
 use super::{RoutedStanza, RouterError};
 
@@ -42,9 +43,11 @@ pub(super) struct LocalRouterHandle<A: ChunkAllocator> {
 pub struct Registration<A: ChunkAllocator> {
     account: AccountKey,
     resource: Box<str>,
+    token: u64,
     alive: Arc<AtomicBool>,
     _lease: oneshot::Sender<()>,
     inbound: Receiver<RoutedStanza<A>>,
+    shard: Sender<Command<A>>,
 }
 
 enum Command<A: ChunkAllocator> {
@@ -54,10 +57,24 @@ enum Command<A: ChunkAllocator> {
         limit: NonZeroUsize,
         outbound: Sender<RoutedStanza<A>>,
         inbound: Receiver<RoutedStanza<A>>,
+        shard: Sender<Command<A>>,
         reply: oneshot::Sender<Result<Registration<A>, RouterError>>,
     },
     Deliver {
         stanza: RoutedStanza<A>,
+        reply: oneshot::Sender<Result<(), RouterError>>,
+    },
+    DeliverBare {
+        stanza: RoutedStanza<A>,
+        reply: oneshot::Sender<Result<(), RouterError>>,
+    },
+    Presence {
+        account: AccountKey,
+        resource: Box<str>,
+        token: u64,
+        priority: Option<i8>,
+        stanza: RoutedStanza<A>,
+        unavailable: Option<RoutedStanza<A>>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
 }
@@ -66,6 +83,9 @@ struct Session<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
     outbound: Sender<RoutedStanza<A>>,
+    priority: Option<i8>,
+    presence: Option<RoutedStanza<A>>,
+    unavailable: Option<RoutedStanza<A>>,
 }
 
 struct Shard<A: ChunkAllocator> {
@@ -148,13 +168,15 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
             .transpose()?;
         let (reply, result) = oneshot::channel();
         let (outbound, inbound) = async_channel::bounded(RESOURCE_QUEUE_CAPACITY);
-        self.shard(account.as_str())
+        let shard = self.shard(account.as_str()).clone();
+        shard
             .send(Command::Register {
                 account: account.clone(),
                 requested,
                 limit,
                 outbound,
                 inbound,
+                shard: shard.clone(),
                 reply,
             })
             .await
@@ -176,6 +198,27 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
         let (reply, result) = oneshot::channel();
         self.shards[shard]
             .send(Command::Deliver { stanza, reply })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
+    pub(crate) async fn deliver_bare(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            let to = view
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            to.localpart().ok_or(RouterError::InvalidTarget)?;
+            if to.resourcepart().is_some() {
+                return Err(RouterError::InvalidTarget);
+            }
+            self.shard_index(to.as_str())
+        };
+        let (reply, result) = oneshot::channel();
+        self.shards[shard]
+            .send(Command::DeliverBare { stanza, reply })
             .await
             .map_err(|_| RouterError::Stopped)?;
         result.await.map_err(|_| RouterError::Stopped)?
@@ -205,6 +248,28 @@ impl<A: ChunkAllocator> Registration<A> {
 
     pub async fn recv(&self) -> Option<RoutedStanza<A>> {
         self.inbound.recv().await.ok()
+    }
+
+    pub async fn set_presence(
+        &self,
+        priority: Option<i8>,
+        stanza: RoutedStanza<A>,
+        unavailable: Option<RoutedStanza<A>>,
+    ) -> Result<(), RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard
+            .send(Command::Presence {
+                account: self.account.clone(),
+                resource: self.resource.clone(),
+                token: self.token,
+                priority,
+                stanza,
+                unavailable,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
     }
 }
 
@@ -308,13 +373,31 @@ impl<A: ChunkAllocator> Shard<A> {
                 limit,
                 outbound,
                 inbound,
+                shard,
                 reply,
             } => {
-                let result = self.register(account, requested, limit, outbound, inbound);
+                let result = self.register(account, requested, limit, outbound, inbound, shard);
                 let _ = reply.send(result);
             }
             Command::Deliver { stanza, reply } => {
                 let result = self.deliver(stanza);
+                let _ = reply.send(result);
+            }
+            Command::DeliverBare { stanza, reply } => {
+                let result = self.deliver_bare(stanza);
+                let _ = reply.send(result);
+            }
+            Command::Presence {
+                account,
+                resource,
+                token,
+                priority,
+                stanza,
+                unavailable,
+                reply,
+            } => {
+                let result =
+                    self.presence(&account, &resource, token, priority, stanza, unavailable);
                 let _ = reply.send(result);
             }
         }
@@ -327,11 +410,21 @@ impl<A: ChunkAllocator> Shard<A> {
         limit: NonZeroUsize,
         outbound: Sender<RoutedStanza<A>>,
         inbound: Receiver<RoutedStanza<A>>,
+        shard: Sender<Command<A>>,
     ) -> Result<Registration<A>, RouterError> {
+        if let Some(sessions) = self.accounts.get(account.as_str()) {
+            let stale: Vec<_> = sessions
+                .iter()
+                .filter(|(_, session)| {
+                    !session.alive.load(Ordering::Acquire) || session.outbound.is_closed()
+                })
+                .map(|(resource, session)| (resource.clone(), session.token))
+                .collect();
+            for (resource, token) in stale {
+                self.remove(&account, &resource, token);
+            }
+        }
         let sessions = self.accounts.entry(account.as_str().into()).or_default();
-        sessions.retain(|_, session| {
-            session.alive.load(Ordering::Acquire) && !session.outbound.is_closed()
-        });
         if sessions.len() >= limit.get() {
             return Err(RouterError::ResourceLimit);
         }
@@ -368,14 +461,19 @@ impl<A: ChunkAllocator> Shard<A> {
                 token,
                 alive: Arc::clone(&alive),
                 outbound,
+                priority: None,
+                presence: None,
+                unavailable: None,
             },
         );
         Ok(Registration {
             account,
             resource,
+            token,
             alive,
             _lease: lease,
             inbound,
+            shard,
         })
     }
 
@@ -407,13 +505,108 @@ impl<A: ChunkAllocator> Shard<A> {
         }
     }
 
+    fn deliver_bare(&mut self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let sessions = self
+            .accounts
+            .get(to.as_str())
+            .ok_or(RouterError::NotFound)?;
+        match view.stanza_type() {
+            StanzaType::Message(MessageType::Normal | MessageType::Chat) => {
+                let recipient = sessions
+                    .values()
+                    .filter(|session| {
+                        session.alive.load(Ordering::Acquire)
+                            && session.priority.is_some_and(|priority| priority >= 0)
+                    })
+                    .max_by_key(|session| (session.priority, std::cmp::Reverse(session.token)))
+                    .ok_or(RouterError::NotFound)?;
+                match recipient.outbound.try_send(stanza) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(_)) => Err(RouterError::Busy),
+                    Err(TrySendError::Closed(_)) => Err(RouterError::NotFound),
+                }
+            }
+            StanzaType::Message(MessageType::Headline) => {
+                let mut delivered = false;
+                let mut busy = false;
+                for session in sessions.values().filter(|session| {
+                    session.alive.load(Ordering::Acquire)
+                        && session.priority.is_some_and(|priority| priority >= 0)
+                }) {
+                    match session.outbound.try_send(stanza.clone()) {
+                        Ok(()) => delivered = true,
+                        Err(TrySendError::Full(_)) => busy = true,
+                        Err(TrySendError::Closed(_)) => {}
+                    }
+                }
+                if delivered {
+                    Ok(())
+                } else if busy {
+                    Err(RouterError::Busy)
+                } else {
+                    Err(RouterError::NotFound)
+                }
+            }
+            _ => Err(RouterError::InvalidTarget),
+        }
+    }
+
+    fn presence(
+        &mut self,
+        account: &AccountKey,
+        resource: &str,
+        token: u64,
+        priority: Option<i8>,
+        stanza: RoutedStanza<A>,
+        unavailable: Option<RoutedStanza<A>>,
+    ) -> Result<(), RouterError> {
+        let sessions = self
+            .accounts
+            .get_mut(account.as_str())
+            .ok_or(RouterError::NotFound)?;
+        let source = sessions.get(resource).ok_or(RouterError::NotFound)?;
+        if source.token != token || !source.alive.load(Ordering::Acquire) {
+            return Err(RouterError::NotFound);
+        }
+        if priority.is_some() && source.priority.is_none() {
+            for session in sessions.values().filter(|session| session.token != token) {
+                if let Some(presence) = &session.presence {
+                    let _ = source.outbound.try_send(presence.clone());
+                }
+            }
+        }
+        for session in sessions.values() {
+            if session.alive.load(Ordering::Acquire)
+                && (session.priority.is_some() || session.token == token)
+            {
+                let _ = session.outbound.try_send(stanza.clone());
+            }
+        }
+        let source = sessions.get_mut(resource).ok_or(RouterError::NotFound)?;
+        source.priority = priority;
+        source.presence = priority.map(|_| stanza);
+        source.unavailable = unavailable;
+        Ok(())
+    }
+
     fn remove(&mut self, account: &AccountKey, resource: &str, token: u64) {
         if let Some(sessions) = self.accounts.get_mut(account.as_str()) {
             if sessions
                 .get(resource)
                 .is_some_and(|session| session.token == token)
+                && let Some(session) = sessions.remove(resource)
+                && let Some(unavailable) = session.unavailable
             {
-                sessions.remove(resource);
+                for recipient in sessions.values().filter(|session| {
+                    session.alive.load(Ordering::Acquire) && session.priority.is_some()
+                }) {
+                    let _ = recipient.outbound.try_send(unavailable.clone());
+                }
             }
             if sessions.is_empty() {
                 self.accounts.remove(account.as_str());
@@ -461,6 +654,7 @@ mod tests {
     ) {
         let (reply, result) = oneshot::channel();
         let (outbound, inbound) = async_channel::bounded(1);
+        let (shard, _) = async_channel::bounded(1);
         (
             Command::Register {
                 account: account.clone(),
@@ -468,6 +662,7 @@ mod tests {
                 limit: NonZeroUsize::MIN,
                 outbound,
                 inbound,
+                shard,
                 reply,
             },
             result,

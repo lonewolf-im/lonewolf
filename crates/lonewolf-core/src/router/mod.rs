@@ -5,9 +5,9 @@ use std::io;
 use std::num::NonZeroUsize;
 
 use lonewolf_storage::account::AccountKey;
-use lonewolf_util::arena::{ChunkAllocator, HandleError, SharedArena};
+use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
 use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{Stanza, StanzaRef};
+use lonewolf_xmpp::stanza::{Stanza, StanzaRef, StanzaType};
 
 use crate::hosts::Hosts;
 
@@ -98,15 +98,55 @@ impl<A: ChunkAllocator> RouterHandle<A> {
         }
         self.local.deliver_full(stanza).await
     }
+
+    pub async fn route_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        if !matches!(view.stanza_type(), StanzaType::Message(_)) {
+            return Err(RouterError::InvalidTarget);
+        }
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !self.hosts.is_local_host(to.domainpart()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        if to.localpart().is_none() {
+            return Err(RouterError::NotFound);
+        }
+        if to.resourcepart().is_some() {
+            self.local.deliver_full(stanza).await
+        } else {
+            self.local.deliver_bare(stanza).await
+        }
+    }
 }
 
 impl<A: ChunkAllocator> RoutedStanza<A> {
     pub fn from_parsed(parsed: Parsed<Stanza, A>) -> Self {
         let (stanza, arena) = parsed.into_parts();
+        Self::from_parts(stanza, arena)
+    }
+
+    pub(crate) fn from_parts(stanza: Stanza, arena: Arena<A>) -> Self {
         Self {
             stanza,
             arena: arena.freeze(),
         }
+    }
+
+    pub(crate) fn from_parts_pair(first: Stanza, second: Stanza, arena: Arena<A>) -> (Self, Self) {
+        let arena = arena.freeze();
+        (
+            Self {
+                stanza: first,
+                arena: arena.clone(),
+            },
+            Self {
+                stanza: second,
+                arena,
+            },
+        )
     }
 
     pub fn resolve(&self) -> Result<StanzaRef<'_, SharedArena<A>>, HandleError> {
@@ -126,7 +166,7 @@ impl<A: ChunkAllocator> Clone for RoutedStanza<A> {
 impl fmt::Display for RouterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidTarget => "destination must be a full user JID",
+            Self::InvalidTarget => "destination JID is invalid",
             Self::RemoteUnsupported => "remote routing is unavailable",
             Self::InvalidResource => "resource identifier is invalid",
             Self::ResourceLimit => "account resource limit reached",

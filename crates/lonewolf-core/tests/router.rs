@@ -48,9 +48,9 @@ fn account(value: &str) -> Result<AccountKey, Box<dyn Error>> {
     Ok(AccountKey::try_from(jid.resolve(&arena)?)?)
 }
 
-async fn stanza(to: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
+async fn parse_stanza(xml: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
     let xml = format!(
-        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' version='1.0'><message to='{to}'><body>Hello</body></message>"
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' version='1.0'>{xml}"
     );
     let mut parser = XmppParser::new(
         xml.as_bytes(),
@@ -66,8 +66,26 @@ async fn stanza(to: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn 
     ));
     match parser.next_event().await? {
         Some(StreamEvent::Stanza(parsed)) => Ok(RoutedStanza::from_parsed(parsed)),
-        _ => Err("expected a message stanza".into()),
+        _ => Err("expected a stanza".into()),
     }
+}
+
+async fn stanza(to: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
+    parse_stanza(&format!("<message to='{to}'><body>Hello</body></message>")).await
+}
+
+async fn typed_message(
+    to: &str,
+    message_type: &str,
+) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
+    parse_stanza(&format!(
+        "<message to='{to}' type='{message_type}'><body>Hello</body></message>"
+    ))
+    .await
+}
+
+async fn presence(resource: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
+    parse_stanza(&format!("<presence from='alice@localhost/{resource}'/>")).await
 }
 
 #[test]
@@ -239,6 +257,235 @@ fn invalid_and_remote_destinations_are_not_routed_locally() -> TestResult {
             Err(RouterError::RemoteUnsupported)
         ));
 
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bare_messages_follow_available_priority_and_full_messages_ignore_it() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+
+        assert!(matches!(
+            handle
+                .route_message(typed_message("alice@localhost", "chat").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+        desk.set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        desk.recv().await.ok_or("missing own presence")?;
+        phone
+            .set_presence(Some(5), presence("phone").await?, None)
+            .await?;
+        phone.recv().await.ok_or("missing presence snapshot")?;
+        phone.recv().await.ok_or("missing own presence")?;
+        desk.recv().await.ok_or("missing phone presence")?;
+
+        handle
+            .route_message(typed_message("alice@localhost", "chat").await?)
+            .await?;
+        assert_eq!(
+            phone
+                .recv()
+                .await
+                .ok_or("missing message")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+        assert!(
+            timeout(Duration::from_millis(20), desk.recv())
+                .await
+                .is_err()
+        );
+
+        phone
+            .set_presence(
+                None,
+                parse_stanza("<presence from='alice@localhost/phone' type='unavailable'/>").await?,
+                None,
+            )
+            .await?;
+        desk.recv().await.ok_or("missing unavailable presence")?;
+        phone
+            .recv()
+            .await
+            .ok_or("missing own unavailable presence")?;
+        handle
+            .route_message(typed_message("alice@localhost", "normal").await?)
+            .await?;
+        assert_eq!(
+            desk.recv()
+                .await
+                .ok_or("missing message")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+        handle
+            .route_message(stanza("alice@localhost/phone").await?)
+            .await?;
+        assert_eq!(
+            phone
+                .recv()
+                .await
+                .ok_or("missing direct message")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+
+        desk.set_presence(Some(-1), presence("desk").await?, None)
+            .await?;
+        desk.recv()
+            .await
+            .ok_or("missing negative-priority presence")?;
+        assert!(matches!(
+            handle
+                .route_message(typed_message("alice@localhost", "chat").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+        handle
+            .route_message(stanza("alice@localhost/desk").await?)
+            .await?;
+        assert_eq!(
+            desk.recv()
+                .await
+                .ok_or("missing direct message")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+
+        drop(desk);
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bare_headline_fans_out_and_chat_ties_use_oldest_resource() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        desk.set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        desk.recv().await.ok_or("missing own presence")?;
+        phone
+            .set_presence(Some(0), presence("phone").await?, None)
+            .await?;
+        phone.recv().await.ok_or("missing presence snapshot")?;
+        phone.recv().await.ok_or("missing own presence")?;
+        desk.recv().await.ok_or("missing phone presence")?;
+
+        handle
+            .route_message(typed_message("alice@localhost", "chat").await?)
+            .await?;
+        assert_eq!(
+            desk.recv()
+                .await
+                .ok_or("missing tied message")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+        assert!(
+            timeout(Duration::from_millis(20), phone.recv())
+                .await
+                .is_err()
+        );
+        handle
+            .route_message(typed_message("alice@localhost", "headline").await?)
+            .await?;
+        assert_eq!(
+            desk.recv()
+                .await
+                .ok_or("missing headline")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+        assert_eq!(
+            phone
+                .recv()
+                .await
+                .ok_or("missing headline")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+
+        drop(desk);
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_available_resource_broadcasts_unavailable_presence() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let unavailable =
+            parse_stanza("<presence from='alice@localhost/desk' type='unavailable'/>").await?;
+        desk.set_presence(Some(0), presence("desk").await?, Some(unavailable))
+            .await?;
+        desk.recv().await.ok_or("missing own presence")?;
+        phone
+            .set_presence(Some(0), presence("phone").await?, None)
+            .await?;
+        phone.recv().await.ok_or("missing presence snapshot")?;
+        phone.recv().await.ok_or("missing own presence")?;
+        desk.recv().await.ok_or("missing phone presence")?;
+
+        drop(desk);
+        let unavailable = phone.recv().await.ok_or("missing unavailable presence")?;
+        assert_eq!(
+            unavailable.resolve()?.stanza_type(),
+            lonewolf_xmpp::stanza::StanzaType::Presence(
+                lonewolf_xmpp::stanza::PresenceType::Unavailable
+            )
+        );
+        assert_eq!(
+            unavailable
+                .resolve()?
+                .from()?
+                .ok_or("missing sender")?
+                .as_str(),
+            "alice@localhost/desk"
+        );
+
+        drop(phone);
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())

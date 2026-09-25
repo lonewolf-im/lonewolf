@@ -16,6 +16,7 @@ use compio::io::{AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::time::timeout;
 use futures_rustls::TlsAcceptor;
+use futures_util::future::{Either, select};
 use futures_util::io::{
     AsyncReadExt as _, AsyncWrite as FuturesAsyncWrite, AsyncWriteExt as _,
     BufWriter as FuturesBufWriter, ReadHalf, WriteHalf,
@@ -30,9 +31,9 @@ use lonewolf_xmpp::parser::{
     ParseError, Parsed, ParserConfig, StreamEvent, XmppParser, compio_reader,
 };
 use lonewolf_xmpp::stanza::{
-    AsyncWriteError, CLIENT_NAMESPACE, Element, IqType, NodeRef, STANZA_ERROR_NAMESPACE,
-    STREAM_NAMESPACE, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
-    XML_NAMESPACE,
+    AsyncWriteError, CLIENT_NAMESPACE, Element, IqType, MessageType, NodeRef, PresenceType,
+    STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza, StanzaErrorCondition, StanzaNamespace,
+    StanzaRef, StanzaType, XML_NAMESPACE,
 };
 use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
@@ -46,7 +47,7 @@ use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::AuthMechanisms;
 use crate::config::limits::ByteRate;
 use crate::hosts::Hosts;
-use crate::router::Registration;
+use crate::router::{Registration, RoutedStanza};
 use crate::router::{RouterError, RouterHandle};
 
 const IO_BUFFER_BYTES: usize = 4_096;
@@ -104,6 +105,8 @@ struct Bound<A: ChunkAllocator> {
     parser: XmppParser<XmlInput, A>,
     writer: TlsWriter,
     registration: Registration<A>,
+    router: RouterHandle<A>,
+    allocator: A,
     resource_requested: bool,
 }
 
@@ -347,6 +350,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                                 &account,
                                 &router,
                                 settings.max_resources_per_account,
+                                settings.allocator.clone(),
                             ),
                         )
                         .await
@@ -879,6 +883,7 @@ async fn bind_resource<A: ChunkAllocator + Clone>(
     account: &AccountKey,
     router: &RouterHandle<A>,
     max_resources_per_account: NonZeroUsize,
+    allocator: A,
 ) -> Result<Bound<A>, CloseOutcome> {
     let Established {
         parser,
@@ -1074,6 +1079,8 @@ async fn bind_resource<A: ChunkAllocator + Clone>(
             parser,
             writer,
             registration,
+            router: router.clone(),
+            allocator,
             resource_requested: requested.is_some(),
         });
     }
@@ -1195,60 +1202,34 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
         mut parser,
         writer,
         registration,
+        router,
+        allocator,
         resource_requested: _,
     } = bound;
     let mut writer = FuturesBufWriter::with_capacity(IO_BUFFER_BYTES, writer);
-    let outcome = loop {
-        match parser.next_event().await {
+    let outcome = 'stream: loop {
+        // Cancelling an in-progress parser read can lose buffered XML.
+        let mut next = pin!(parser.next_event());
+        let event = loop {
+            let receive = pin!(registration.recv());
+            match select(next.as_mut(), receive).await {
+                Either::Left((event, _)) => break event,
+                Either::Right((Some(stanza), _)) => {
+                    if let Err(outcome) = write_routed_stanza(&mut writer, &stanza).await {
+                        break 'stream outcome;
+                    }
+                }
+                Either::Right((None, _)) => break 'stream CloseOutcome::InternalError,
+            }
+        };
+        match event {
             Ok(Some(StreamEvent::StreamEnd) | None) => break send_footer_tls(&mut writer).await,
             Ok(Some(StreamEvent::Stanza(parsed))) => {
-                let (stanza_type, namespace) = match parsed.value().resolve(parsed.arena()) {
-                    Ok(stanza) => (stanza.stanza_type(), stanza.namespace()),
-                    Err(_) => {
-                        break send_stream_error_tls(&mut writer, CloseOutcome::InternalError)
-                            .await;
-                    }
-                };
-                if namespace != StanzaNamespace::Client {
-                    break send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedBoundInput)
-                        .await;
-                }
-                match stanza_type {
-                    StanzaType::Iq(IqType::Get | IqType::Set) => {
-                        let (reply, arena) = match unsupported_iq_reply(parsed) {
-                            Ok(reply) => reply,
-                            Err(outcome) => {
-                                break send_stream_error_tls(&mut writer, outcome).await;
-                            }
-                        };
-                        let reply = match reply.resolve(&arena) {
-                            Ok(reply) => reply,
-                            Err(_) => {
-                                break send_stream_error_tls(
-                                    &mut writer,
-                                    CloseOutcome::InternalError,
-                                )
-                                .await;
-                            }
-                        };
-                        if let Err(error) = reply.write_xml_async(&mut writer).await {
-                            break match error {
-                                AsyncWriteError::Access(_) => CloseOutcome::InternalError,
-                                AsyncWriteError::Output(_) => CloseOutcome::TransportError,
-                            };
-                        }
-                        if writer.flush().await.is_err() {
-                            break CloseOutcome::TransportError;
-                        }
-                    }
-                    StanzaType::Iq(IqType::Result | IqType::Error) => {}
-                    _ => {
-                        break send_stream_error_tls(
-                            &mut writer,
-                            CloseOutcome::UnsupportedBoundInput,
-                        )
-                        .await;
-                    }
+                if let Err(outcome) =
+                    handle_bound_stanza(parsed, &mut writer, &registration, &router, &allocator)
+                        .await
+                {
+                    break send_stream_error_tls(&mut writer, outcome).await;
                 }
             }
             Err(ParseError::UnexpectedEof) => break CloseOutcome::Eof,
@@ -1264,6 +1245,271 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
     };
     drop(registration);
     outcome
+}
+
+async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
+    parsed: Parsed<Stanza, A>,
+    writer: &mut FuturesBufWriter<TlsWriter>,
+    registration: &Registration<A>,
+    router: &RouterHandle<A>,
+    allocator: &A,
+) -> Result<(), CloseOutcome> {
+    let stanza = parsed
+        .value()
+        .resolve(parsed.arena())
+        .map_err(|_| CloseOutcome::InternalError)?;
+    if stanza.namespace() != StanzaNamespace::Client {
+        return Err(CloseOutcome::UnsupportedBoundInput);
+    }
+    match stanza.stanza_type() {
+        StanzaType::Iq(IqType::Get | IqType::Set) => {
+            let (reply, arena) = unsupported_iq_reply(parsed)?;
+            let reply = reply
+                .resolve(&arena)
+                .map_err(|_| CloseOutcome::InternalError)?;
+            write_stanza(writer, &reply).await
+        }
+        StanzaType::Iq(IqType::Result | IqType::Error) => Ok(()),
+        StanzaType::Presence(kind) => {
+            let directed = stanza
+                .to()
+                .map_err(|_| CloseOutcome::InternalError)?
+                .is_some();
+            if directed || !matches!(kind, PresenceType::Available | PresenceType::Unavailable) {
+                return Ok(());
+            }
+            let priority = if kind == PresenceType::Available {
+                Some(presence_priority(&stanza))
+            } else {
+                None
+            };
+            let (priority, routed, unavailable) = match priority {
+                Some(Ok(priority)) => {
+                    let (routed, unavailable) = stamp_available_presence(parsed, registration)?;
+                    (Some(priority), routed, Some(unavailable))
+                }
+                Some(Err(condition)) => {
+                    let routed = stamp_client_stanza(parsed, registration, true)?;
+                    send_stanza_error(writer, &routed, allocator, condition).await?;
+                    return Ok(());
+                }
+                None => (None, stamp_client_stanza(parsed, registration, true)?, None),
+            };
+            registration
+                .set_presence(priority, routed, unavailable)
+                .await
+                .map_err(|_| CloseOutcome::InternalError)
+        }
+        StanzaType::Message(kind) => {
+            let routed = stamp_client_stanza(parsed, registration, true)?;
+            let bare = routed
+                .resolve()
+                .map_err(|_| CloseOutcome::InternalError)?
+                .to()
+                .map_err(|_| CloseOutcome::InternalError)?
+                .ok_or(CloseOutcome::InternalError)?
+                .resourcepart()
+                .is_none();
+            if bare && kind == MessageType::Error {
+                return Ok(());
+            }
+            if bare && kind == MessageType::Groupchat {
+                send_stanza_error(
+                    writer,
+                    &routed,
+                    allocator,
+                    StanzaErrorCondition::ServiceUnavailable,
+                )
+                .await?;
+                return Ok(());
+            }
+            if let Err(error) = router.route_message(routed.clone()).await {
+                if kind == MessageType::Error
+                    || (bare && kind == MessageType::Headline && error == RouterError::NotFound)
+                {
+                    return Ok(());
+                }
+                let condition = match error {
+                    RouterError::Busy | RouterError::ResourceLimit => {
+                        StanzaErrorCondition::ResourceConstraint
+                    }
+                    RouterError::InvalidTarget | RouterError::InvalidResource => {
+                        StanzaErrorCondition::BadRequest
+                    }
+                    RouterError::NotFound | RouterError::RemoteUnsupported => {
+                        StanzaErrorCondition::ServiceUnavailable
+                    }
+                    RouterError::Unavailable | RouterError::Stopped => {
+                        return Err(CloseOutcome::InternalError);
+                    }
+                };
+                send_stanza_error(writer, &routed, allocator, condition).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn presence_priority<R: ArenaRead>(stanza: &StanzaRef<'_, R>) -> Result<i8, StanzaErrorCondition> {
+    let mut priority = None;
+    for child in stanza
+        .children()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+    {
+        let child = child.map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        if child.name() != "priority" || child.namespace() != CLIENT_NAMESPACE {
+            continue;
+        }
+        if priority.is_some()
+            || child
+                .attributes()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                .next()
+                .transpose()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                .is_some()
+        {
+            return Err(StanzaErrorCondition::BadRequest);
+        }
+        let text = child
+            .text()
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?
+            .ok_or(StanzaErrorCondition::BadRequest)?;
+        priority = Some(
+            text.trim()
+                .parse::<i8>()
+                .map_err(|_| StanzaErrorCondition::BadRequest)?,
+        );
+    }
+    Ok(priority.unwrap_or(0))
+}
+
+fn stamp_client_stanza<A: ChunkAllocator>(
+    parsed: Parsed<Stanza, A>,
+    registration: &Registration<A>,
+    default_to_self: bool,
+) -> Result<RoutedStanza<A>, CloseOutcome> {
+    let (stanza, mut arena) = parsed.into_parts();
+    let needs_to = default_to_self
+        && stanza
+            .resolve(&arena)
+            .map_err(|_| CloseOutcome::InternalError)?
+            .to()
+            .map_err(|_| CloseOutcome::InternalError)?
+            .is_none();
+    let account = registration.account();
+    let from = Jid::from_trusted_parts_in(
+        Some(account.username()),
+        account.domain(),
+        Some(registration.resource()),
+        &mut arena,
+    )
+    .map_err(|_| CloseOutcome::InternalError)?;
+    let to = needs_to
+        .then(|| {
+            Jid::from_trusted_parts_in(Some(account.username()), account.domain(), None, &mut arena)
+        })
+        .transpose()
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let mut builder = stanza
+        .derive_in(&mut arena)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .from(Some(from))
+        .map_err(|_| CloseOutcome::InternalError)?;
+    if let Some(to) = to {
+        builder = builder
+            .to(Some(to))
+            .map_err(|_| CloseOutcome::InternalError)?;
+    }
+    let stanza = builder.build().map_err(|_| CloseOutcome::InternalError)?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
+}
+
+fn stamp_available_presence<A: ChunkAllocator>(
+    parsed: Parsed<Stanza, A>,
+    registration: &Registration<A>,
+) -> Result<(RoutedStanza<A>, RoutedStanza<A>), CloseOutcome> {
+    let (stanza, mut arena) = parsed.into_parts();
+    let account = registration.account();
+    let from = Jid::from_trusted_parts_in(
+        Some(account.username()),
+        account.domain(),
+        Some(registration.resource()),
+        &mut arena,
+    )
+    .map_err(|_| CloseOutcome::InternalError)?;
+    let to =
+        Jid::from_trusted_parts_in(Some(account.username()), account.domain(), None, &mut arena)
+            .map_err(|_| CloseOutcome::InternalError)?;
+    let available = stanza
+        .derive_in(&mut arena)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .from(Some(from))
+        .map_err(|_| CloseOutcome::InternalError)?
+        .to(Some(to))
+        .map_err(|_| CloseOutcome::InternalError)?
+        .build()
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let unavailable = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Unavailable),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))
+    .map_err(|_| CloseOutcome::InternalError)?
+    .to(Some(to))
+    .map_err(|_| CloseOutcome::InternalError)?
+    .build()
+    .map_err(|_| CloseOutcome::InternalError)?;
+    Ok(RoutedStanza::from_parts_pair(available, unavailable, arena))
+}
+
+async fn write_stanza<R: ArenaRead>(
+    writer: &mut FuturesBufWriter<TlsWriter>,
+    stanza: &StanzaRef<'_, R>,
+) -> Result<(), CloseOutcome> {
+    stanza
+        .write_xml_async(writer)
+        .await
+        .map_err(|error| match error {
+            AsyncWriteError::Access(_) => CloseOutcome::InternalError,
+            AsyncWriteError::Output(_) => CloseOutcome::TransportError,
+        })?;
+    writer
+        .flush()
+        .await
+        .map_err(|_| CloseOutcome::TransportError)
+}
+
+async fn write_routed_stanza<A: ChunkAllocator>(
+    writer: &mut FuturesBufWriter<TlsWriter>,
+    stanza: &RoutedStanza<A>,
+) -> Result<(), CloseOutcome> {
+    let view = stanza.resolve().map_err(|_| CloseOutcome::InternalError)?;
+    write_stanza(writer, &view).await
+}
+
+async fn send_stanza_error<A: ChunkAllocator + Clone>(
+    writer: &mut FuturesBufWriter<TlsWriter>,
+    source: &RoutedStanza<A>,
+    allocator: &A,
+    condition: StanzaErrorCondition,
+) -> Result<(), CloseOutcome> {
+    let mut arena = Arena::try_new_in(Default::default(), allocator.clone())
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let source = source.resolve().map_err(|_| CloseOutcome::InternalError)?;
+    let source = source
+        .clone_in(&mut arena)
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let reply = source
+        .error_reply_in(&mut arena, condition)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .build()
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let reply = reply
+        .resolve(&arena)
+        .map_err(|_| CloseOutcome::InternalError)?;
+    write_stanza(writer, &reply).await
 }
 
 fn unsupported_iq_reply<A: ChunkAllocator>(

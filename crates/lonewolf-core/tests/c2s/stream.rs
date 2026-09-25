@@ -1159,6 +1159,7 @@ impl Default for ScramTiming {
 struct BindingCase {
     opening: Option<&'static str>,
     payload: Option<&'static str>,
+    wait_for: Option<&'static [u8]>,
     expected_responses: &'static [&'static str],
     client_iq_responses: &'static [(&'static str, IqType)],
     timeout: Duration,
@@ -1172,6 +1173,7 @@ impl Default for BindingCase {
         Self {
             opening: None,
             payload: None,
+            wait_for: None,
             expected_responses: &[],
             client_iq_responses: &[],
             timeout: Duration::from_secs(10),
@@ -1404,7 +1406,13 @@ fn run_scram_with_restart(
                     .as_bytes(),
                 )?;
             }
-            let mut rest = String::new();
+            let mut rest = if let Some(marker) = client_binding_case.wait_for {
+                let response = String::from_utf8(read_through(&mut tls, marker)?)?;
+                tls.write_all(CLOSE.as_bytes())?;
+                response
+            } else {
+                String::new()
+            };
             match tls.read_to_string(&mut rest) {
                 Ok(_) => {}
                 Err(error)
@@ -1679,6 +1687,130 @@ fn unsupported_bound_iqs_receive_errors_without_closing_stream()
                 ("addressed", IqType::Error),
                 ("bare", IqType::Error),
                 ("full", IqType::Error),
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn available_presence_enables_bare_self_delivery() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>\
+                 <presence from='mallory@localhost/spy'><priority>7</priority></presence>\
+                 <message type='chat' to='alice@localhost' from='mallory@localhost/spy'><body>Self route</body></message>",
+            ),
+            wait_for: Some(b"</message>"),
+            expected_responses: &[
+                "<presence xmlns=\"jabber:client\" from=\"alice@localhost/desk\" to=\"alice@localhost\"",
+                "<message xmlns=\"jabber:client\" from=\"alice@localhost/desk\" to=\"alice@localhost\" type=\"chat\"",
+                "<body>Self route</body>",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn full_self_delivery_does_not_require_presence() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>\
+                 <message type='chat' to='alice@localhost/desk'><body>Direct route</body></message>",
+            ),
+            wait_for: Some(b"</message>"),
+            expected_responses: &[
+                "<message xmlns=\"jabber:client\" from=\"alice@localhost/desk\" to=\"alice@localhost/desk\" type=\"chat\"",
+                "<body>Direct route</body>",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn unavailable_bare_chat_returns_stanza_error() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>\
+                 <message type='chat' to='alice@localhost'><body>No presence</body></message>",
+            ),
+            wait_for: Some(b"</message>"),
+            expected_responses: &[
+                "<message xmlns=\"jabber:client\" from=\"alice@localhost\" to=\"alice@localhost/desk\" type=\"error\"",
+                "<service-unavailable xmlns=\"urn:ietf:params:xml:ns:xmpp-stanzas\"/>",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn bare_groupchat_returns_stanza_error() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>\
+                 <message type='groupchat' to='alice@localhost'><body>Not a room</body></message>",
+            ),
+            wait_for: Some(b"</message>"),
+            expected_responses: &[
+                "<message xmlns=\"jabber:client\" from=\"alice@localhost\" to=\"alice@localhost/desk\" type=\"error\"",
+                "<service-unavailable xmlns=\"urn:ietf:params:xml:ns:xmpp-stanzas\"/>",
+            ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn invalid_presence_priority_does_not_make_resource_available()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            payload: Some(
+                "<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>\
+                 <presence><priority>128</priority></presence>\
+                 <message type='chat' to='alice@localhost'><body>No presence</body></message>",
+            ),
+            wait_for: Some(b"</message>"),
+            expected_responses: &[
+                "<bad-request xmlns=\"urn:ietf:params:xml:ns:xmpp-stanzas\"/>",
+                "<service-unavailable xmlns=\"urn:ietf:params:xml:ns:xmpp-stanzas\"/>",
             ],
             ..BindingCase::default()
         },

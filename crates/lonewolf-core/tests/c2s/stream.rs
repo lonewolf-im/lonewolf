@@ -1160,6 +1160,7 @@ struct BindingCase {
     opening: Option<&'static str>,
     payload: Option<&'static str>,
     wait_for: Option<&'static [u8]>,
+    self_message_burst: usize,
     expected_responses: &'static [&'static str],
     client_iq_responses: &'static [(&'static str, IqType)],
     timeout: Duration,
@@ -1174,6 +1175,7 @@ impl Default for BindingCase {
             opening: None,
             payload: None,
             wait_for: None,
+            self_message_burst: 0,
             expected_responses: &[],
             client_iq_responses: &[],
             timeout: Duration::from_secs(10),
@@ -1397,16 +1399,25 @@ fn run_scram_with_restart(
             if let Some((opening, _)) = &post_auth_restart {
                 tls.write_all(opening.as_bytes())?;
             } else {
-                tls.write_all(
-                    format!(
-                        "{}{}",
-                        client_binding_case.opening.unwrap_or(PSI_OPEN),
-                        client_binding_case.payload.unwrap_or(CLOSE)
-                    )
-                    .as_bytes(),
-                )?;
+                let mut request = String::from(client_binding_case.opening.unwrap_or(PSI_OPEN));
+                if client_binding_case.self_message_burst > 0 {
+                    request.push_str("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><presence/>");
+                    for _ in 0..client_binding_case.self_message_burst {
+                        request.push_str("<message><body>x</body></message>");
+                    }
+                } else {
+                    request.push_str(client_binding_case.payload.unwrap_or(CLOSE));
+                }
+                tls.write_all(request.as_bytes())?;
             }
-            let mut rest = if let Some(marker) = client_binding_case.wait_for {
+            let mut rest = if client_binding_case.self_message_burst > 0 {
+                let mut response = Vec::new();
+                for _ in 0..client_binding_case.self_message_burst {
+                    response.extend_from_slice(&read_through(&mut tls, b"</message>")?);
+                }
+                tls.write_all(CLOSE.as_bytes())?;
+                String::from_utf8(response)?
+            } else if let Some(marker) = client_binding_case.wait_for {
                 let response = String::from_utf8(read_through(&mut tls, marker)?)?;
                 tls.write_all(CLOSE.as_bytes())?;
                 response
@@ -1435,6 +1446,15 @@ fn run_scram_with_restart(
                 assert!(rest.contains(BIND_FEATURES));
                 for expected in client_binding_case.expected_responses {
                     assert!(rest.contains(expected), "{rest}");
+                }
+                if client_binding_case.self_message_burst > 0 {
+                    assert_eq!(
+                        rest.matches("<message xmlns=\"jabber:client\" from=\"alice@localhost/desk\" to=\"alice@localhost\"")
+                            .count(),
+                        client_binding_case.self_message_burst,
+                        "{rest}"
+                    );
+                    assert!(!rest.contains("<resource-constraint"), "{rest}");
                 }
             }
             if expected_outcome != CloseOutcome::BindingTimeout {
@@ -1714,6 +1734,22 @@ fn available_presence_enables_bare_self_delivery() -> Result<(), Box<dyn Error +
                 "<message xmlns=\"jabber:client\" from=\"alice@localhost/desk\" to=\"alice@localhost\" type=\"chat\"",
                 "<body>Self route</body>",
             ],
+            ..BindingCase::default()
+        },
+    )
+}
+
+#[test]
+fn pipelined_self_messages_drain_outbound_mailbox() -> Result<(), Box<dyn Error + Send + Sync>> {
+    run_scram_with_restart(
+        ScramHash::Sha256,
+        None,
+        PSI_OPEN,
+        CloseOutcome::StreamEnd,
+        ScramTiming::default(),
+        None,
+        BindingCase {
+            self_message_burst: 80,
             ..BindingCase::default()
         },
     )

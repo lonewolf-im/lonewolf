@@ -115,7 +115,7 @@ impl<A: ChunkAllocator> RouterHandle<A> {
             return Err(RouterError::NotFound);
         }
         if to.resourcepart().is_some() {
-            self.local.deliver_full(stanza).await
+            self.local.deliver_message(stanza).await
         } else {
             self.local.deliver_bare(stanza).await
         }

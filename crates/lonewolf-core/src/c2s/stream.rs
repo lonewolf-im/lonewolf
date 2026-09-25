@@ -1207,19 +1207,32 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
         resource_requested: _,
     } = bound;
     let mut writer = FuturesBufWriter::with_capacity(IO_BUFFER_BYTES, writer);
+    let mut prefer_outbound = true;
     let outcome = 'stream: loop {
         // Cancelling an in-progress parser read can lose buffered XML.
         let mut next = pin!(parser.next_event());
         let event = loop {
             let receive = pin!(registration.recv());
-            match select(next.as_mut(), receive).await {
-                Either::Left((event, _)) => break event,
-                Either::Right((Some(stanza), _)) => {
+            let selected = if prefer_outbound {
+                match select(receive, next.as_mut()).await {
+                    Either::Left((stanza, _)) => Either::Right(stanza),
+                    Either::Right((event, _)) => Either::Left(event),
+                }
+            } else {
+                match select(next.as_mut(), receive).await {
+                    Either::Left((event, _)) => Either::Left(event),
+                    Either::Right((stanza, _)) => Either::Right(stanza),
+                }
+            };
+            prefer_outbound = !prefer_outbound;
+            match selected {
+                Either::Left(event) => break event,
+                Either::Right(Some(stanza)) => {
                     if let Err(outcome) = write_routed_stanza(&mut writer, &stanza).await {
                         break 'stream outcome;
                     }
                 }
-                Either::Right((None, _)) => break 'stream CloseOutcome::InternalError,
+                Either::Right(None) => break 'stream CloseOutcome::InternalError,
             }
         };
         match event {

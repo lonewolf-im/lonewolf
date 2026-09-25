@@ -88,6 +88,15 @@ async fn presence(resource: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, 
     parse_stanza(&format!("<presence from='alice@localhost/{resource}'/>")).await
 }
 
+async fn unavailable_presence(
+    resource: &str,
+) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
+    parse_stanza(&format!(
+        "<presence from='alice@localhost/{resource}' type='unavailable'/>"
+    ))
+    .await
+}
+
 #[test]
 fn registration_uses_one_account_shard_across_handles() -> TestResult {
     run_test(async {
@@ -437,6 +446,165 @@ fn bare_headline_fans_out_and_chat_ties_use_oldest_resource() -> TestResult {
         );
 
         drop(desk);
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn missing_full_chat_falls_back_to_available_resource_without_changing_destination() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        desk.recv().await.ok_or("missing own presence")?;
+
+        handle
+            .route_message(typed_message("alice@localhost/missing", "chat").await?)
+            .await?;
+        let received = desk.recv().await.ok_or("missing fallback message")?;
+        assert_eq!(
+            received
+                .resolve()?
+                .to()?
+                .ok_or("missing destination")?
+                .as_str(),
+            "alice@localhost/missing"
+        );
+        assert!(matches!(
+            handle
+                .route_message(typed_message("alice@localhost/missing", "normal").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+
+        drop(desk);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        desk.set_presence(
+            Some(0),
+            presence("desk").await?,
+            Some(unavailable_presence("desk").await?),
+        )
+        .await?;
+        desk.recv().await.ok_or("missing own presence")?;
+        phone
+            .set_presence(
+                Some(0),
+                presence("phone").await?,
+                Some(unavailable_presence("phone").await?),
+            )
+            .await?;
+        phone.recv().await.ok_or("missing presence snapshot")?;
+        phone.recv().await.ok_or("missing own presence")?;
+        desk.recv().await.ok_or("missing peer presence")?;
+
+        for _ in 0..64 {
+            handle
+                .route_full(stanza("alice@localhost/phone").await?)
+                .await?;
+        }
+        desk.set_presence(
+            Some(1),
+            presence("desk").await?,
+            Some(unavailable_presence("desk").await?),
+        )
+        .await?;
+        desk.recv().await.ok_or("missing updated presence")?;
+        let unavailable = desk.recv().await.ok_or("missing peer unavailable")?;
+        assert_eq!(
+            unavailable
+                .resolve()?
+                .from()?
+                .ok_or("missing sender")?
+                .as_str(),
+            "alice@localhost/phone"
+        );
+        assert!(matches!(
+            handle
+                .route_full(stanza("alice@localhost/phone").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+        for _ in 0..64 {
+            phone.recv().await.ok_or("missing queued message")?;
+        }
+        assert!(phone.recv().await.is_none());
+
+        drop(desk);
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn full_unavailable_mailbox_retires_recipient() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        desk.set_presence(
+            Some(0),
+            presence("desk").await?,
+            Some(unavailable_presence("desk").await?),
+        )
+        .await?;
+        desk.recv().await.ok_or("missing own presence")?;
+        phone
+            .set_presence(Some(0), presence("phone").await?, None)
+            .await?;
+        phone.recv().await.ok_or("missing presence snapshot")?;
+        phone.recv().await.ok_or("missing own presence")?;
+        desk.recv().await.ok_or("missing peer presence")?;
+        for _ in 0..64 {
+            handle
+                .route_full(stanza("alice@localhost/phone").await?)
+                .await?;
+        }
+
+        drop(desk);
+        assert!(matches!(
+            handle
+                .route_full(stanza("alice@localhost/phone").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+        for _ in 0..64 {
+            phone.recv().await.ok_or("missing queued message")?;
+        }
+        assert!(phone.recv().await.is_none());
+
         drop(phone);
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;

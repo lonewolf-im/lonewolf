@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, hash_map::RandomState};
+use std::future::Future;
 use std::hash::BuildHasher;
 use std::io;
 use std::num::NonZeroUsize;
@@ -8,6 +9,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
+use std::time::Instant;
 
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
@@ -72,8 +74,17 @@ struct Shard<A: ChunkAllocator> {
     cleanups: FuturesUnordered<BoxFuture<'static, (AccountKey, Box<str>, u64)>>,
 }
 
+struct Inbox<A: ChunkAllocator>(Receiver<Command<A>>);
+
+impl<A: ChunkAllocator> Drop for Inbox<A> {
+    fn drop(&mut self) {
+        self.0.close();
+        while self.0.try_recv().is_ok() {}
+    }
+}
+
 impl<A: ChunkAllocator> LocalRouter<A> {
-    /// Starts the shard actors on the core dispatcher.
+    /// Starts one shard actor per dispatcher worker.
     ///
     /// # Errors
     ///
@@ -84,6 +95,7 @@ impl<A: ChunkAllocator> LocalRouter<A> {
         let mut tasks = Vec::with_capacity(count);
         for worker in 0..count {
             let (sender, receiver) = async_channel::bounded(SHARD_QUEUE_CAPACITY);
+            let receiver = Inbox(receiver);
             let task = dispatcher
                 .dispatch_at(worker, move |context| Shard::new().run(receiver, context))
                 .await?;
@@ -230,31 +242,13 @@ impl<A: ChunkAllocator> Shard<A> {
         }
     }
 
-    async fn run(mut self, receiver: Receiver<Command<A>>, context: WorkerContext) {
+    async fn run(mut self, receiver: Inbox<A>, context: WorkerContext) {
         let mut processed = 0;
+        let mut prefer_cleanup = true;
         loop {
-            let event = if self.cleanups.is_empty() {
-                match select(pin!(receiver.recv()), pin!(context.shutdown_requested())).await {
-                    Either::Left((Ok(command), _)) => Some(Either::Left(command)),
-                    _ => None,
-                }
-            } else {
-                let receive = receiver.recv();
-                let cleanup = self.cleanups.next();
-                let mut receive = pin!(receive);
-                let mut cleanup = pin!(cleanup);
-                let work = select(receive.as_mut(), cleanup.as_mut());
-                let work = pin!(work);
-                match select(work, pin!(context.shutdown_requested())).await {
-                    Either::Left((Either::Left((Ok(command), _)), _)) => {
-                        Some(Either::Left(command))
-                    }
-                    Either::Left((Either::Right((Some(cleanup), _)), _)) => {
-                        Some(Either::Right(cleanup))
-                    }
-                    _ => None,
-                }
-            };
+            let event = self
+                .next_event(&receiver.0, context.shutdown_requested(), prefer_cleanup)
+                .await;
             match event {
                 Some(Either::Left(command)) => self.command(command),
                 Some(Either::Right((account, resource, token))) => {
@@ -262,6 +256,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 }
                 None => break,
             }
+            prefer_cleanup = !prefer_cleanup;
             processed += 1;
             if processed == SHARD_BATCH_SIZE {
                 processed = 0;
@@ -270,6 +265,38 @@ impl<A: ChunkAllocator> Shard<A> {
                 }
                 yield_to_runtime().await;
             }
+        }
+    }
+
+    async fn next_event<S: Future<Output = Instant>>(
+        &mut self,
+        receiver: &Receiver<Command<A>>,
+        shutdown: S,
+        prefer_cleanup: bool,
+    ) -> Option<Either<Command<A>, (AccountKey, Box<str>, u64)>> {
+        let work = async {
+            if self.cleanups.is_empty() {
+                return receiver.recv().await.ok().map(Either::Left);
+            }
+            let mut receive = pin!(receiver.recv());
+            let mut cleanup = pin!(self.cleanups.next());
+            if prefer_cleanup {
+                match select(cleanup.as_mut(), receive.as_mut()).await {
+                    Either::Left((Some(cleanup), _)) => Some(Either::Right(cleanup)),
+                    Either::Right((Ok(command), _)) => Some(Either::Left(command)),
+                    _ => None,
+                }
+            } else {
+                match select(receive.as_mut(), cleanup.as_mut()).await {
+                    Either::Left((Ok(command), _)) => Some(Either::Left(command)),
+                    Either::Right((Some(cleanup), _)) => Some(Either::Right(cleanup)),
+                    _ => None,
+                }
+            }
+        };
+        match select(pin!(shutdown), pin!(work)).await {
+            Either::Left(_) => None,
+            Either::Right((event, _)) => event,
         }
     }
 
@@ -410,4 +437,100 @@ async fn yield_to_runtime() {
         }
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::future::pending;
+
+    use compio::runtime::Runtime;
+    use lonewolf_util::arena::GlobalChunkAllocator;
+    use lonewolf_xmpp::jid::Jid;
+
+    use super::*;
+
+    fn account() -> Result<AccountKey, Box<dyn Error>> {
+        let mut arena = Arena::try_new(Default::default())?;
+        let jid = Jid::parse_in("alice@localhost", &mut arena)?;
+        Ok(AccountKey::try_from(jid.resolve(&arena)?)?)
+    }
+
+    fn register_command(
+        account: &AccountKey,
+    ) -> (
+        Command<GlobalChunkAllocator>,
+        oneshot::Receiver<Result<Registration<GlobalChunkAllocator>, RouterError>>,
+    ) {
+        let (reply, result) = oneshot::channel();
+        let (outbound, inbound) = async_channel::bounded(1);
+        (
+            Command::Register {
+                account: account.clone(),
+                requested: None,
+                limit: NonZeroUsize::MIN,
+                outbound,
+                inbound,
+                reply,
+            },
+            result,
+        )
+    }
+
+    #[test]
+    fn ready_cleanups_progress_with_a_full_command_queue() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let account = account()?;
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let (sender, receiver) = async_channel::bounded(SHARD_BATCH_SIZE);
+            for token in 0..SHARD_BATCH_SIZE {
+                let (command, _reply) = register_command(&account);
+                assert!(sender.try_send(command).is_ok());
+                let (lease, closed) = oneshot::channel::<()>();
+                let cleanup_account = account.clone();
+                shard.cleanups.push(
+                    async move {
+                        let _ = closed.await;
+                        (
+                            cleanup_account,
+                            format!("resource-{token}").into(),
+                            token as u64,
+                        )
+                    }
+                    .boxed(),
+                );
+                drop(lease);
+            }
+
+            let mut cleaned = 0;
+            for turn in 0..SHARD_BATCH_SIZE {
+                match shard.next_event(&receiver, pending(), turn % 2 == 1).await {
+                    Some(Either::Left(_)) => {}
+                    Some(Either::Right(_)) => cleaned += 1,
+                    None => panic!("queued work ended early"),
+                }
+            }
+            assert_eq!(cleaned, SHARD_BATCH_SIZE / 2);
+            assert_eq!(receiver.len(), SHARD_BATCH_SIZE / 2);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn dropping_inbox_closes_and_drains_queued_replies() -> Result<(), Box<dyn Error>> {
+        let account = account()?;
+        let (sender, receiver) = async_channel::bounded(2);
+        let inbox = Inbox(receiver);
+        let (first, first_reply) = register_command(&account);
+        let (second, second_reply) = register_command(&account);
+        assert!(sender.try_send(first).is_ok());
+        assert!(sender.try_send(second).is_ok());
+
+        drop(inbox);
+
+        assert!(sender.is_closed());
+        assert!(matches!(first_reply.now_or_never(), Some(Err(_))));
+        assert!(matches!(second_reply.now_or_never(), Some(Err(_))));
+        Ok(())
+    }
 }

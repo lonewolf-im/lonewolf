@@ -24,7 +24,7 @@ fn sha256_server_matches_rfc7677_exchange() -> TestResult {
         salt,
         ScramIterations::new(4096)?,
     )?;
-    let first = ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO")
+    let first = ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=rOprNGfwEbeRWgbNEkqO", true)
         .map_err(|error| format!("invalid client first: {error:?}"))?;
     assert_eq!(first.username(), "user");
     assert_eq!(first.authzid(), None);
@@ -50,7 +50,7 @@ fn optional_extensions_are_authenticated() -> TestResult {
     let extension = "x=é=\u{1}\t\u{7f},z=漢";
     let first_bare = format!("n=user,r=nonce,{extension}");
     let first_message = format!("n,,{first_bare}");
-    let first = ClientFirst::parse(Mechanism::Sha256, first_message.as_bytes())
+    let first = ClientFirst::parse(Mechanism::Sha256, first_message.as_bytes(), true)
         .map_err(|error| format!("invalid client first: {error:?}"))?;
     let verifier = ScramVerifier::derive(
         ScramHash::Sha256,
@@ -93,8 +93,12 @@ fn incorrect_proof_and_channel_binding_fail() -> TestResult {
         [7; 16],
         ScramIterations::new(4096)?,
     )?;
-    let first = ClientFirst::parse(Mechanism::Sha256Plus, b"p=tls-exporter,,n=user,r=nonce")
-        .map_err(|error| format!("invalid client first: {error:?}"))?;
+    let first = ClientFirst::parse(
+        Mechanism::Sha256Plus,
+        b"p=tls-exporter,,n=user,r=nonce",
+        true,
+    )
+    .map_err(|error| format!("invalid client first: {error:?}"))?;
     let (server, _) = first
         .start(verifier, "server")
         .map_err(|error| format!("cannot start: {error:?}"))?;
@@ -127,7 +131,7 @@ fn credential_recheck_rejects_rotation() -> TestResult {
         [7; 16],
         ScramIterations::new(4096)?,
     )?;
-    let first = ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce")
+    let first = ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce", true)
         .map_err(|error| format!("invalid client first: {error:?}"))?;
     let (server, _) = first
         .start(verifier, "server")
@@ -190,14 +194,41 @@ fn malformed_first_messages_are_rejected() {
         "y,,n=user,r=nonce",
     ] {
         assert!(
-            ClientFirst::parse(Mechanism::Sha256, input.as_bytes()).is_err(),
+            ClientFirst::parse(Mechanism::Sha256, input.as_bytes(), true).is_err(),
             "{input}"
         );
     }
-    assert!(ClientFirst::parse(Mechanism::Sha256, b"p=tls-exporter,,n=user,r=nonce").is_err());
-    assert!(ClientFirst::parse(Mechanism::Sha256Plus, b"n,,n=user,r=nonce").is_err());
-    assert!(ClientFirst::parse(Mechanism::Sha256, &[b'a'; 4_097]).is_err());
-    assert!(ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce,x=\xff").is_err());
+    assert!(
+        ClientFirst::parse(Mechanism::Sha256, b"p=tls-exporter,,n=user,r=nonce", true).is_err()
+    );
+    assert!(ClientFirst::parse(Mechanism::Sha256Plus, b"n,,n=user,r=nonce", true).is_err());
+    assert!(ClientFirst::parse(Mechanism::Sha256, &[b'a'; 4_097], true).is_err());
+    assert!(ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce,x=\xff", true).is_err());
+}
+
+#[test]
+fn channel_binding_flag_depends_on_listener_offer() -> TestResult {
+    let input = b"y,,n=user,r=nonce";
+    assert_eq!(
+        ClientFirst::parse(Mechanism::Sha256, input, true).map(|_| ()),
+        Err(ServerError::ChannelBindingMismatch)
+    );
+    let first = ClientFirst::parse(Mechanism::Sha256, input, false)
+        .map_err(|error| format!("invalid client first: {error:?}"))?;
+    assert_eq!(first.binding(), None);
+    Ok(())
+}
+
+#[test]
+fn mechanism_names_round_trip() {
+    for mechanism in [
+        Mechanism::Sha1,
+        Mechanism::Sha1Plus,
+        Mechanism::Sha256,
+        Mechanism::Sha256Plus,
+    ] {
+        assert_eq!(Mechanism::from_name(mechanism.name()), Some(mechanism));
+    }
 }
 
 #[test]
@@ -208,7 +239,7 @@ fn malformed_final_extensions_are_rejected() -> TestResult {
         [7; 16],
         ScramIterations::new(4096)?,
     )?;
-    let first = ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce")
+    let first = ClientFirst::parse(Mechanism::Sha256, b"n,,n=user,r=nonce", true)
         .map_err(|error| format!("invalid client first: {error:?}"))?;
     let (server, _) = first
         .start(verifier, "server")

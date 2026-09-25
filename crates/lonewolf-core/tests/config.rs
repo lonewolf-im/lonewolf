@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use lonewolf_auth::server::Mechanism;
 use lonewolf_core::config::limits::C2sLimitProfile;
 use lonewolf_core::config::{
     AccountConfig, Config, ConfigError, HostConfig, HostTlsConfig, StoreConfig, TcpListenerConfig,
@@ -45,6 +46,14 @@ fn c2s_defaults_to_one_ipv4_endpoint_on_port_5222() -> TestResult {
     let config = Config::default();
     assert_eq!(config.c2s.listeners.len(), 1);
     assert_eq!(config.c2s.listeners[0].address, "0.0.0.0:5222".parse()?);
+    for mechanism in [
+        Mechanism::Sha1,
+        Mechanism::Sha1Plus,
+        Mechanism::Sha256,
+        Mechanism::Sha256Plus,
+    ] {
+        assert!(config.c2s.listeners[0].auth_mechanisms.allows(mechanism));
+    }
     Ok(())
 }
 
@@ -83,6 +92,55 @@ fn empty_c2s_listener_list_is_rejected() -> TestResult {
             .to_string()
             .contains("c2s.listeners must define at least one listener")
     );
+    Ok(())
+}
+
+#[test]
+fn auth_mechanisms_are_configured_per_listener() -> TestResult {
+    let file = config_file(
+        "[[c2s.listeners]]\naddress = '127.0.0.1:5222'\nauth_mechanisms = ['SCRAM-SHA-256']\n[[c2s.listeners]]\naddress = '127.0.0.1:5223'\nauth_mechanisms = ['SCRAM-SHA-1-PLUS']\n",
+    )?;
+    let config = Config::load(Some(file.path()))?;
+    let first = config.c2s.listeners[0].auth_mechanisms;
+    let second = config.c2s.listeners[1].auth_mechanisms;
+
+    assert!(first.allows(Mechanism::Sha256));
+    assert!(!first.allows(Mechanism::Sha1Plus));
+    assert!(!first.has_plus());
+    assert!(second.allows(Mechanism::Sha1Plus));
+    assert!(!second.allows(Mechanism::Sha256));
+    assert!(second.has_plus());
+    Ok(())
+}
+
+#[test]
+fn empty_auth_mechanisms_are_rejected() -> TestResult {
+    let file = config_file("[[c2s.listeners]]\nauth_mechanisms = []\n")?;
+    let error = Config::load(Some(file.path())).expect_err("empty mechanism list accepted");
+
+    assert!(matches!(error, ConfigError::Invalid { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("auth_mechanisms must define at least one mechanism")
+    );
+    Ok(())
+}
+
+#[test]
+fn unsupported_or_duplicate_auth_mechanisms_are_rejected() -> TestResult {
+    for (names, reason) in [
+        ("['PLAIN']", "unsupported auth mechanism"),
+        (
+            "['SCRAM-SHA-256', 'SCRAM-SHA-256']",
+            "duplicate auth mechanism",
+        ),
+    ] {
+        let file = config_file(&format!("[[c2s.listeners]]\nauth_mechanisms = {names}\n"))?;
+        let error = Config::load(Some(file.path())).expect_err("invalid mechanism list accepted");
+        assert!(matches!(error, ConfigError::Parse { .. }));
+        assert!(error.to_string().contains(reason));
+    }
     Ok(())
 }
 
@@ -516,6 +574,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     expected.c2s.listeners.push(TcpListenerConfig {
         address: "127.0.0.1:5223".parse()?,
         limits: Some("internal".into()),
+        ..TcpListenerConfig::default()
     });
     expected.limits.c2s.profiles.insert(
         "internal".into(),

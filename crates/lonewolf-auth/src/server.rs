@@ -22,6 +22,15 @@ pub enum Mechanism {
 }
 
 impl Mechanism {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "SCRAM-SHA-1",
+            Self::Sha1Plus => "SCRAM-SHA-1-PLUS",
+            Self::Sha256 => "SCRAM-SHA-256",
+            Self::Sha256Plus => "SCRAM-SHA-256-PLUS",
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "SCRAM-SHA-1" => Self::Sha1,
@@ -71,7 +80,11 @@ pub struct ClientFirst {
 }
 
 impl ClientFirst {
-    pub fn parse(mechanism: Mechanism, input: &[u8]) -> Result<Self, ServerError> {
+    pub fn parse(
+        mechanism: Mechanism,
+        input: &[u8],
+        channel_binding_offered: bool,
+    ) -> Result<Self, ServerError> {
         if input.len() > MAX_SCRAM_BYTES {
             return Err(ServerError::Malformed);
         }
@@ -86,6 +99,7 @@ impl ClientFirst {
             "n" if !mechanism.is_plus() => None,
             "p=tls-exporter" if mechanism.is_plus() => Some(BindingType::TlsExporter),
             "p=tls-server-end-point" if mechanism.is_plus() => Some(BindingType::TlsServerEndPoint),
+            "y" if !mechanism.is_plus() && !channel_binding_offered => None,
             "y" if !mechanism.is_plus() => return Err(ServerError::ChannelBindingMismatch),
             value if value.starts_with("p=") => return Err(ServerError::UnsupportedBinding),
             _ => return Err(ServerError::Malformed),

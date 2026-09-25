@@ -31,7 +31,7 @@ use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
 use crate::c2s::unauthenticated_limit::{
     Admission as UnauthenticatedAdmission, UnauthenticatedLimiter,
 };
-use crate::config::Config;
+use crate::config::{Config, TcpListenerConfig};
 use crate::hosts::HostsError;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -133,6 +133,7 @@ fn run_case_with_timeouts(
             hosts.clone(),
             auth,
             StreamSettings::new(
+                AuthMechanisms::ALL,
                 max_stanza_bytes,
                 xml_rate,
                 establishment_timeout,
@@ -559,6 +560,7 @@ fn run_starttls_restart_case_with_timeout(
             hosts,
             auth,
             StreamSettings::new(
+                AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
                 Duration::from_secs(10),
@@ -579,7 +581,7 @@ fn authentication_deadline_starts_after_sasl_offer() -> Result<(), Box<dyn Error
         run_starttls_restart_case_with_timeout(PSI_OPEN, Duration::from_millis(50), true)?;
     assert_eq!(outcome, CloseOutcome::AuthenticationTimeout);
     assert!(before_tls.contains(STARTTLS_FEATURES));
-    assert!(after_tls.contains(SASL_FEATURES));
+    assert!(after_tls.contains(sasl_features(AuthMechanisms::ALL).as_str()));
     Ok(())
 }
 
@@ -590,7 +592,7 @@ fn starttls_restarts_stream_and_offers_authentication() -> Result<(), Box<dyn Er
     assert_eq!(outcome, CloseOutcome::StreamEnd);
     assert!(before_tls.contains(STARTTLS_FEATURES));
     assert!(after_tls.contains(" from='localhost'"));
-    assert!(after_tls.contains(SASL_FEATURES));
+    assert!(after_tls.contains(sasl_features(AuthMechanisms::ALL).as_str()));
     assert!(!after_tls.contains(STARTTLS_FEATURES));
     assert_ne!(stream_id(&before_tls), stream_id(&after_tls));
     Ok(())
@@ -632,6 +634,7 @@ where
     run_sasl_case_with_iterations(
         tls_open,
         known_account.then_some(SCRAM_POLICY_ITERATIONS.get()),
+        AuthMechanisms::ALL,
         exchange,
     )
 }
@@ -639,6 +642,7 @@ where
 fn run_sasl_case_with_iterations<F>(
     tls_open: &str,
     stored_iterations: Option<u32>,
+    mechanisms: AuthMechanisms,
     exchange: F,
 ) -> Result<CloseOutcome, Box<dyn Error + Send + Sync>>
 where
@@ -731,6 +735,7 @@ where
             hosts,
             auth,
             StreamSettings::new(
+                mechanisms,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
                 Duration::from_secs(10),
@@ -762,6 +767,48 @@ fn sasl_challenge(tls: &mut impl Read) -> Result<String, Box<dyn Error + Send + 
         .strip_suffix("</challenge>")
         .ok_or("invalid challenge")?;
     Ok(String::from_utf8(STANDARD.decode(encoded)?)?)
+}
+
+#[test]
+fn listener_mechanisms_control_sasl_features() -> Result<(), Box<dyn Error>> {
+    let sha256: TcpListenerConfig = toml::from_str("auth_mechanisms = ['SCRAM-SHA-256']")?;
+    assert_eq!(
+        sasl_features(sha256.auth_mechanisms),
+        "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>SCRAM-SHA-256</mechanism></mechanisms></stream:features>"
+    );
+    let plus: TcpListenerConfig = toml::from_str("auth_mechanisms = ['SCRAM-SHA-1-PLUS']")?;
+    let features = sasl_features(plus.auth_mechanisms);
+    assert!(features.contains("<sasl-channel-binding"));
+    assert!(features.contains("<mechanism>SCRAM-SHA-1-PLUS</mechanism>"));
+    assert!(!features.contains("<mechanism>SCRAM-SHA-1</mechanism>"));
+    Ok(())
+}
+
+#[test]
+fn listener_rejects_disabled_mechanism_and_accepts_non_plus_y_flag()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let config: TcpListenerConfig = toml::from_str("auth_mechanisms = ['SCRAM-SHA-256']")?;
+    let outcome = run_sasl_case_with_iterations(PSI_OPEN, None, config.auth_mechanisms, |tls| {
+        tls.write_all(
+            sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice,r=nonce").as_bytes(),
+        )?;
+        let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
+        assert!(failure.contains("<invalid-mechanism/>"), "{failure}");
+
+        tls.write_all(sasl_auth("SCRAM-SHA-256", "y,,n=alice,r=nonce").as_bytes())?;
+        sasl_challenge(tls)?;
+        tls.write_all(format!("<abort xmlns='{SASL_NAMESPACE}'/>").as_bytes())?;
+        let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
+        assert!(failure.contains("<aborted/>"), "{failure}");
+
+        tls.write_all(CLOSE.as_bytes())?;
+        let mut rest = String::new();
+        tls.read_to_string(&mut rest)?;
+        assert!(rest.ends_with(STREAM_FOOTER));
+        Ok(())
+    })?;
+    assert_eq!(outcome, CloseOutcome::StreamEnd);
+    Ok(())
 }
 
 #[test]
@@ -828,45 +875,51 @@ fn missing_account_challenge_uses_normalized_identity() -> Result<(), Box<dyn Er
 #[test]
 fn legacy_iteration_account_gets_decoy_challenge_and_cannot_log_in()
 -> Result<(), Box<dyn Error + Send + Sync>> {
-    let outcome = run_sasl_case_with_iterations(PSI_OPEN, Some(4096), |tls| {
-        tls.write_all(sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=clientnonce").as_bytes())?;
-        let challenge = sasl_challenge(tls)?;
-        let (nonce, parameters) = challenge
-            .split_once(",s=")
-            .ok_or("missing challenge salt")?;
-        let (encoded_salt, iterations) = parameters
-            .split_once(",i=")
-            .ok_or("missing challenge iterations")?;
-        assert_eq!(iterations, SCRAM_POLICY_ITERATIONS.get().to_string());
-        assert_ne!(encoded_salt, STANDARD.encode([7; 16]));
-        let salt = STANDARD.decode(encoded_salt)?;
-        let mut salted = [0; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(b"pencil", &salt, SCRAM_POLICY_ITERATIONS.get(), &mut salted);
-        let client_key = hmac_scram(ScramHash::Sha256, &salted, b"Client Key")?;
-        let stored_key = Sha256::digest(&client_key);
-        let without_proof = format!("c=biws,{nonce}");
-        let auth_message = format!("n=alice,r=clientnonce,{challenge},{without_proof}");
-        let signature = hmac_scram(ScramHash::Sha256, &stored_key, auth_message.as_bytes())?;
-        let mut proof = client_key;
-        for (byte, signature) in proof.iter_mut().zip(signature) {
-            *byte ^= signature;
-        }
-        let response = format!("{without_proof},p={}", STANDARD.encode(proof));
-        tls.write_all(
-            format!(
-                "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
-                STANDARD.encode(response)
-            )
-            .as_bytes(),
-        )?;
-        let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
-        assert!(failure.contains("<not-authorized/>"), "{failure}");
-        tls.write_all(CLOSE.as_bytes())?;
-        let mut rest = String::new();
-        tls.read_to_string(&mut rest)?;
-        assert!(rest.ends_with(STREAM_FOOTER));
-        Ok(())
-    })?;
+    let outcome =
+        run_sasl_case_with_iterations(PSI_OPEN, Some(4096), AuthMechanisms::ALL, |tls| {
+            tls.write_all(sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=clientnonce").as_bytes())?;
+            let challenge = sasl_challenge(tls)?;
+            let (nonce, parameters) = challenge
+                .split_once(",s=")
+                .ok_or("missing challenge salt")?;
+            let (encoded_salt, iterations) = parameters
+                .split_once(",i=")
+                .ok_or("missing challenge iterations")?;
+            assert_eq!(iterations, SCRAM_POLICY_ITERATIONS.get().to_string());
+            assert_ne!(encoded_salt, STANDARD.encode([7; 16]));
+            let salt = STANDARD.decode(encoded_salt)?;
+            let mut salted = [0; 32];
+            pbkdf2::pbkdf2_hmac::<Sha256>(
+                b"pencil",
+                &salt,
+                SCRAM_POLICY_ITERATIONS.get(),
+                &mut salted,
+            );
+            let client_key = hmac_scram(ScramHash::Sha256, &salted, b"Client Key")?;
+            let stored_key = Sha256::digest(&client_key);
+            let without_proof = format!("c=biws,{nonce}");
+            let auth_message = format!("n=alice,r=clientnonce,{challenge},{without_proof}");
+            let signature = hmac_scram(ScramHash::Sha256, &stored_key, auth_message.as_bytes())?;
+            let mut proof = client_key;
+            for (byte, signature) in proof.iter_mut().zip(signature) {
+                *byte ^= signature;
+            }
+            let response = format!("{without_proof},p={}", STANDARD.encode(proof));
+            tls.write_all(
+                format!(
+                    "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
+                    STANDARD.encode(response)
+                )
+                .as_bytes(),
+            )?;
+            let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
+            assert!(failure.contains("<not-authorized/>"), "{failure}");
+            tls.write_all(CLOSE.as_bytes())?;
+            let mut rest = String::new();
+            tls.read_to_string(&mut rest)?;
+            assert!(rest.ends_with(STREAM_FOOTER));
+            Ok(())
+        })?;
     assert_eq!(outcome, CloseOutcome::StreamEnd);
     Ok(())
 }
@@ -1071,7 +1124,7 @@ fn run_scram_with_restart(
             let mut tls = StreamOwned::new(connection, socket);
             tls.write_all(tls_open.as_bytes())?;
             let features = String::from_utf8(read_through(&mut tls, b"</stream:features>")?)?;
-            assert!(features.contains(SASL_FEATURES));
+            assert!(features.contains(sasl_features(AuthMechanisms::ALL).as_str()));
             let gs2 = match binding {
                 Some("tls-exporter") => "p=tls-exporter,,",
                 Some("tls-server-end-point") => "p=tls-server-end-point,,",
@@ -1220,6 +1273,7 @@ fn run_scram_with_restart(
             hosts,
             auth,
             StreamSettings::new(
+                AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
                 Duration::from_secs(10),
@@ -1473,6 +1527,7 @@ fn unknown_account_gets_three_scram_attempts_before_stream_closes()
             hosts,
             auth,
             StreamSettings::new(
+                AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &ByteRate::default(),
                 Duration::from_secs(10),
@@ -1583,6 +1638,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
             hosts.clone(),
             auth,
             StreamSettings::new(
+                AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
                 &rate,
                 Duration::from_secs(10),

@@ -21,8 +21,8 @@ use lonewolf_xmpp::jid::JidError;
 
 use super::{RoutedStanza, RouterError};
 
-const SHARD_QUEUE_CAPACITY: usize = 256;
-const RESOURCE_QUEUE_CAPACITY: usize = 16;
+const SHARD_QUEUE_CAPACITY: usize = 1_024;
+const RESOURCE_QUEUE_CAPACITY: usize = 64;
 const SHARD_BATCH_SIZE: usize = 64;
 
 /// Owns one account shard on each core worker.

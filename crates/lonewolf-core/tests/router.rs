@@ -159,7 +159,7 @@ fn exact_delivery_respects_mailbox_capacity_and_lease() -> TestResult {
         let registration = handle
             .register(&alice, Some("desk"), NonZeroUsize::MIN)
             .await?;
-        for _ in 0..16 {
+        for _ in 0..64 {
             handle
                 .route_full(stanza("alice@localhost/desk").await?)
                 .await?;

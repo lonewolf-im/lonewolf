@@ -5,7 +5,9 @@
 //! Builders validate XML structure; protocol handlers validate payload schemas.
 
 use std::fmt;
+use std::io;
 
+use futures_util::io::{AsyncWrite, AsyncWriteExt};
 use lonewolf_util::arena::{Arena, ArenaError, ArenaRead, ChunkAllocator, Handle, HandleError};
 
 use crate::jid::{Jid, JidError, JidRef};
@@ -195,6 +197,12 @@ pub enum BuildError {
 pub enum WriteError {
     Access(HandleError),
     Output(fmt::Error),
+}
+
+#[derive(Debug)]
+pub enum AsyncWriteError {
+    Access(HandleError),
+    Output(io::Error),
 }
 
 #[derive(Clone, Copy)]
@@ -539,6 +547,51 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         write!(output, "</{name}>")?;
         Ok(())
     }
+
+    /// Writes XML without flushing the destination.
+    ///
+    /// # Errors
+    ///
+    /// Access or I/O errors can leave partial XML in `output`.
+    pub async fn write_xml_async<W: AsyncWrite + Unpin>(
+        &self,
+        output: &mut W,
+    ) -> Result<(), AsyncWriteError> {
+        let name = self.kind().as_str();
+        output.write_all(b"<").await?;
+        output.write_all(name.as_bytes()).await?;
+        xml::attribute_async(output, "xmlns", self.namespace().as_str()).await?;
+        if let Some(jid) = self.from()? {
+            xml::attribute_async(output, "from", jid.as_str()).await?;
+        }
+        if let Some(jid) = self.to()? {
+            xml::attribute_async(output, "to", jid.as_str()).await?;
+        }
+        if let Some(id) = self.id()? {
+            xml::attribute_async(output, "id", id).await?;
+        }
+        if let Some(stanza_type) = self.stanza_type().as_str() {
+            xml::attribute_async(output, "type", stanza_type).await?;
+        }
+        if let Some(lang) = self.lang()? {
+            xml::attribute_async(output, "xml:lang", lang).await?;
+        }
+        element::write_attributes_async(self.data.attributes, self.arena, output).await?;
+        if self.data.children.get(self.arena)?.is_empty() {
+            output.write_all(b"/>").await?;
+            return Ok(());
+        }
+        output.write_all(b">").await?;
+        for child in self.children()? {
+            child?
+                .write_in_async(output, Some(self.namespace().as_str()))
+                .await?;
+        }
+        output.write_all(b"</").await?;
+        output.write_all(name.as_bytes()).await?;
+        output.write_all(b">").await?;
+        Ok(())
+    }
 }
 
 impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
@@ -785,6 +838,18 @@ impl From<fmt::Error> for WriteError {
     }
 }
 
+impl From<HandleError> for AsyncWriteError {
+    fn from(error: HandleError) -> Self {
+        Self::Access(error)
+    }
+}
+
+impl From<io::Error> for AsyncWriteError {
+    fn from(error: io::Error) -> Self {
+        Self::Output(error)
+    }
+}
+
 impl fmt::Display for BuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -840,6 +905,24 @@ impl fmt::Display for WriteError {
 }
 
 impl std::error::Error for WriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Access(error) => Some(error),
+            Self::Output(error) => Some(error),
+        }
+    }
+}
+
+impl fmt::Display for AsyncWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Access(error) => write!(formatter, "XML arena access failed: {error}"),
+            Self::Output(error) => write!(formatter, "XML output failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AsyncWriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Access(error) => Some(error),

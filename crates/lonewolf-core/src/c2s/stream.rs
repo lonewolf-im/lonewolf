@@ -16,7 +16,8 @@ use compio::net::TcpStream;
 use compio::time::timeout;
 use futures_rustls::TlsAcceptor;
 use futures_util::io::{
-    AsyncReadExt as _, AsyncWrite as FuturesAsyncWrite, AsyncWriteExt as _, ReadHalf, WriteHalf,
+    AsyncReadExt as _, AsyncWrite as FuturesAsyncWrite, AsyncWriteExt as _,
+    BufWriter as FuturesBufWriter, ReadHalf, WriteHalf,
 };
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
@@ -28,8 +29,9 @@ use lonewolf_xmpp::parser::{
     ParseError, Parsed, ParserConfig, StreamEvent, XmppParser, compio_reader,
 };
 use lonewolf_xmpp::stanza::{
-    CLIENT_NAMESPACE, Element, IqType, NodeRef, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza,
-    StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType, XML_NAMESPACE,
+    AsyncWriteError, CLIENT_NAMESPACE, Element, IqType, NodeRef, STANZA_ERROR_NAMESPACE,
+    STREAM_NAMESPACE, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
+    XML_NAMESPACE,
 };
 use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
@@ -46,7 +48,7 @@ use crate::hosts::Hosts;
 use crate::router::Registration;
 use crate::router::{RouterError, RouterHandle};
 
-const READ_BUFFER_BYTES: usize = 1_024;
+const IO_BUFFER_BYTES: usize = 4_096;
 const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const STARTTLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
 const STARTTLS_PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
@@ -387,7 +389,7 @@ async fn establish<A: ChunkAllocator + Clone>(
     let (reader, mut writer) = transport.split();
     let mut parser = XmppParser::new(
         RateLimitedReader::from_state(
-            BufReader::with_capacity(READ_BUFFER_BYTES, reader.compat()),
+            BufReader::with_capacity(IO_BUFFER_BYTES, reader.compat()),
             rate_state,
         ),
         ParserConfig {
@@ -1080,10 +1082,10 @@ fn escape_text(output: &mut String, text: &str) {
 async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcome {
     let Bound {
         mut parser,
-        mut writer,
+        writer,
         registration,
     } = bound;
-    let mut response = String::new();
+    let mut writer = FuturesBufWriter::with_capacity(IO_BUFFER_BYTES, writer);
     let outcome = loop {
         match parser.next_event().await {
             Ok(Some(StreamEvent::StreamEnd) | None) => break send_footer_tls(&mut writer).await,
@@ -1101,11 +1103,30 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
                 }
                 match stanza_type {
                     StanzaType::Iq(IqType::Get | IqType::Set) => {
-                        if let Err(outcome) = unsupported_iq_xml(parsed, &mut response) {
-                            break send_stream_error_tls(&mut writer, outcome).await;
+                        let (reply, arena) = match unsupported_iq_reply(parsed) {
+                            Ok(reply) => reply,
+                            Err(outcome) => {
+                                break send_stream_error_tls(&mut writer, outcome).await;
+                            }
+                        };
+                        let reply = match reply.resolve(&arena) {
+                            Ok(reply) => reply,
+                            Err(_) => {
+                                break send_stream_error_tls(
+                                    &mut writer,
+                                    CloseOutcome::InternalError,
+                                )
+                                .await;
+                            }
+                        };
+                        if let Err(error) = reply.write_xml_async(&mut writer).await {
+                            break match error {
+                                AsyncWriteError::Access(_) => CloseOutcome::InternalError,
+                                AsyncWriteError::Output(_) => CloseOutcome::TransportError,
+                            };
                         }
-                        if let Err(outcome) = send_tls(&mut writer, &response).await {
-                            break outcome;
+                        if writer.flush().await.is_err() {
+                            break CloseOutcome::TransportError;
                         }
                     }
                     StanzaType::Iq(IqType::Result | IqType::Error) => {}
@@ -1133,10 +1154,9 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
     outcome
 }
 
-fn unsupported_iq_xml<A: ChunkAllocator>(
+fn unsupported_iq_reply<A: ChunkAllocator>(
     parsed: Parsed<Stanza, A>,
-    xml: &mut String,
-) -> Result<(), CloseOutcome> {
+) -> Result<(Stanza, Arena<A>), CloseOutcome> {
     let (request, mut arena) = parsed.into_parts();
     let reply = request
         .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)
@@ -1145,13 +1165,7 @@ fn unsupported_iq_xml<A: ChunkAllocator>(
         .map_err(|_| CloseOutcome::InternalError)?
         .build()
         .map_err(|_| CloseOutcome::InternalError)?;
-    xml.clear();
-    reply
-        .resolve(&arena)
-        .map_err(|_| CloseOutcome::InternalError)?
-        .write_xml(xml)
-        .map_err(|_| CloseOutcome::InternalError)?;
-    Ok(())
+    Ok((reply, arena))
 }
 
 fn account_key(username: &str, host: &str) -> Option<AccountKey> {

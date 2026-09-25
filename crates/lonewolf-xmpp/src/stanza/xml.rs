@@ -4,7 +4,9 @@
 
 use std::fmt;
 
-use super::BuildError;
+use futures_util::io::{AsyncWrite, AsyncWriteExt};
+
+use super::{AsyncWriteError, BuildError};
 
 pub(super) const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
@@ -50,16 +52,8 @@ pub(crate) fn validate_text(text: &str) -> Result<(), BuildError> {
 pub(super) fn escape(output: &mut impl fmt::Write, text: &str, attribute: bool) -> fmt::Result {
     let mut start = 0;
     for (index, ch) in text.char_indices() {
-        let replacement = match ch {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '"' if attribute => "&quot;",
-            // Character references bypass XML whitespace normalization.
-            '\t' if attribute => "&#x9;",
-            '\n' if attribute => "&#xA;",
-            '\r' => "&#xD;",
-            _ => continue,
+        let Some(replacement) = escape_replacement(ch, attribute) else {
+            continue;
         };
         output.write_str(&text[start..index])?;
         output.write_str(replacement)?;
@@ -72,4 +66,71 @@ pub(super) fn attribute(output: &mut impl fmt::Write, name: &str, value: &str) -
     write!(output, " {name}=\"")?;
     escape(output, value, true)?;
     output.write_char('"')
+}
+
+pub(super) async fn escape_async<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    text: &str,
+    attribute: bool,
+) -> Result<(), AsyncWriteError> {
+    let mut start = 0;
+    for (index, ch) in text.char_indices() {
+        let Some(replacement) = escape_replacement(ch, attribute) else {
+            continue;
+        };
+        if start < index {
+            output.write_all(&text.as_bytes()[start..index]).await?;
+        }
+        output.write_all(replacement.as_bytes()).await?;
+        start = index + ch.len_utf8();
+    }
+    if start < text.len() {
+        output.write_all(&text.as_bytes()[start..]).await?;
+    }
+    Ok(())
+}
+
+fn escape_replacement(ch: char, attribute: bool) -> Option<&'static str> {
+    match ch {
+        '&' => Some("&amp;"),
+        '<' => Some("&lt;"),
+        '>' => Some("&gt;"),
+        '"' if attribute => Some("&quot;"),
+        // Character references bypass XML whitespace normalization.
+        '\t' if attribute => Some("&#x9;"),
+        '\n' if attribute => Some("&#xA;"),
+        '\r' => Some("&#xD;"),
+        _ => None,
+    }
+}
+
+pub(super) async fn attribute_async<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    name: &str,
+    value: &str,
+) -> Result<(), AsyncWriteError> {
+    output.write_all(b" ").await?;
+    output.write_all(name.as_bytes()).await?;
+    output.write_all(b"=\"").await?;
+    escape_async(output, value, true).await?;
+    output.write_all(b"\"").await?;
+    Ok(())
+}
+
+pub(super) async fn number_async<W: AsyncWrite + Unpin>(
+    output: &mut W,
+    mut number: usize,
+) -> Result<(), AsyncWriteError> {
+    let mut digits = [0_u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (number % 10) as u8;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    output.write_all(&digits[start..]).await?;
+    Ok(())
 }

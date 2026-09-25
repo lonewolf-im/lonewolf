@@ -8,11 +8,13 @@ publish.workspace = true
 
 [dependencies]
 compio-io.workspace = true
+futures-util = { workspace = true, features = ["io"] }
 icu_properties.workspace = true
 idna.workspace = true
 lonewolf-util.workspace = true
 precis-profiles.workspace = true
 quick-xml.workspace = true
+smallvec.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

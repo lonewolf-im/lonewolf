@@ -115,6 +115,10 @@
 # overlap.
 # address = "0.0.0.0:5222"
 
+# Choose the SASL mechanisms this endpoint offers and accepts after TLS.
+# Include at least one mechanism.
+# auth_mechanisms = ["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-1-PLUS", "SCRAM-SHA-1"]
+
 # Select a named limit profile for this endpoint.
 # Omit this setting to use limits.c2s.default; the value below is an example.
 # limits = "default"

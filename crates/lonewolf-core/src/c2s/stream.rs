@@ -35,6 +35,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use super::AuthService;
 use super::connection_limit::ConnectionPermit;
 use super::unauthenticated_limit::UnauthenticatedPermit;
+use crate::config::AuthMechanisms;
 use crate::config::limits::ByteRate;
 use crate::hosts::Hosts;
 
@@ -45,9 +46,31 @@ const STARTTLS_PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'
 const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/></stream:stream>";
 const STREAM_FOOTER: &str = "</stream:stream>";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
-const SASL_FEATURES: &str = "<stream:features><sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/><channel-binding type='tls-exporter'/></sasl-channel-binding><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>SCRAM-SHA-256-PLUS</mechanism><mechanism>SCRAM-SHA-256</mechanism><mechanism>SCRAM-SHA-1-PLUS</mechanism><mechanism>SCRAM-SHA-1</mechanism></mechanisms></stream:features>";
 const EMPTY_FEATURES: &str = "<stream:features/>";
 const MAX_AUTH_ATTEMPTS: usize = 3;
+
+fn sasl_features(mechanisms: AuthMechanisms) -> String {
+    let mut features = String::with_capacity(440);
+    features.push_str("<stream:features>");
+    if mechanisms.has_plus() {
+        features.push_str("<sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/><channel-binding type='tls-exporter'/></sasl-channel-binding>");
+    }
+    features.push_str("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>");
+    for mechanism in [
+        Mechanism::Sha256Plus,
+        Mechanism::Sha256,
+        Mechanism::Sha1Plus,
+        Mechanism::Sha1,
+    ] {
+        if mechanisms.allows(mechanism) {
+            features.push_str("<mechanism>");
+            features.push_str(mechanism.name());
+            features.push_str("</mechanism>");
+        }
+    }
+    features.push_str("</mechanisms></stream:features>");
+    features
+}
 
 type TlsTransport = futures_rustls::server::TlsStream<Pin<Box<AsyncStream<TcpStream>>>>;
 type TlsReader = ReadHalf<TlsTransport>;
@@ -79,6 +102,8 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
 
 #[derive(Clone)]
 pub(super) struct StreamSettings<A: ChunkAllocator> {
+    auth_mechanisms: AuthMechanisms,
+    sasl_features: Arc<str>,
     max_stanza_bytes: NonZeroUsize,
     xml_bytes_per_second: NonZeroUsize,
     xml_burst_bytes: NonZeroUsize,
@@ -89,6 +114,7 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
 
 impl<A: ChunkAllocator> StreamSettings<A> {
     pub(super) fn new(
+        auth_mechanisms: AuthMechanisms,
         max_stanza_bytes: NonZeroUsize,
         xml_rate: &ByteRate,
         establishment_timeout: Duration,
@@ -96,6 +122,8 @@ impl<A: ChunkAllocator> StreamSettings<A> {
         allocator: A,
     ) -> Self {
         Self {
+            auth_mechanisms,
+            sasl_features: sasl_features(auth_mechanisms).into(),
             max_stanza_bytes,
             xml_bytes_per_second: xml_rate.bytes_per_second,
             xml_burst_bytes: xml_rate.burst_bytes,
@@ -157,7 +185,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                     });
                 match timeout(
                     authentication_remaining,
-                    authenticate(&mut established, &hosts, &auth),
+                    authenticate(&mut established, &hosts, &auth, settings.auth_mechanisms),
                 )
                 .await
                 {
@@ -352,7 +380,7 @@ async fn establish<A: ChunkAllocator + Clone>(
         true,
     )
     .await?;
-    send_tls(&mut writer, SASL_FEATURES).await?;
+    send_tls(&mut writer, &settings.sasl_features).await?;
     Ok(Established {
         parser,
         writer,
@@ -367,6 +395,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
     established: &mut Established<A>,
     hosts: &Hosts,
     auth: &AuthService,
+    mechanisms: AuthMechanisms,
 ) -> Result<AccountKey, CloseOutcome> {
     let Some(endpoint) = hosts.tls_server_end_point(&established.host) else {
         return Err(CloseOutcome::InternalError);
@@ -434,7 +463,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                 }
             }
         };
-        let Some(mechanism) = mechanism else {
+        let Some(mechanism) = mechanism.filter(|mechanism| mechanisms.allows(*mechanism)) else {
             if send_sasl_failure(&mut established.writer, "invalid-mechanism")
                 .await
                 .is_err()
@@ -485,7 +514,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
         } else {
             initial
         };
-        let first = match ClientFirst::parse(mechanism, &initial) {
+        let first = match ClientFirst::parse(mechanism, &initial, mechanisms.has_plus()) {
             Ok(first) => first,
             Err(error) => {
                 if send_sasl_failure(&mut established.writer, scram_failure(error))

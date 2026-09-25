@@ -11,10 +11,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use lonewolf_auth::server::Mechanism;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
 use lonewolf_xmpp::jid::Jid;
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 
 pub mod limits;
 
@@ -205,6 +207,11 @@ impl C2sConfig {
             return Err("c2s.listeners must define at least one listener".into());
         }
         for (index, listener) in self.listeners.iter().enumerate() {
+            if listener.auth_mechanisms.is_empty() {
+                return Err(format!(
+                    "c2s.listeners[{index}].auth_mechanisms must define at least one mechanism"
+                ));
+            }
             let address = listener.address;
             if address.port() == 0 {
                 continue;
@@ -232,6 +239,7 @@ impl C2sConfig {
 pub struct TcpListenerConfig {
     /// IPv6 addresses accept IPv6 only; port zero selects one port for all workers.
     pub address: SocketAddr,
+    pub auth_mechanisms: AuthMechanisms,
     /// Selects a named profile, or `limits.c2s.default` when absent.
     pub limits: Option<String>,
 }
@@ -240,8 +248,62 @@ impl Default for TcpListenerConfig {
     fn default() -> Self {
         Self {
             address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5222)),
+            auth_mechanisms: AuthMechanisms::ALL,
             limits: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthMechanisms(u8);
+
+impl AuthMechanisms {
+    pub const ALL: Self = Self(0b1111);
+
+    const fn bit(mechanism: Mechanism) -> u8 {
+        match mechanism {
+            Mechanism::Sha1 => 0b0001,
+            Mechanism::Sha1Plus => 0b0010,
+            Mechanism::Sha256 => 0b0100,
+            Mechanism::Sha256Plus => 0b1000,
+        }
+    }
+
+    pub fn allows(self, mechanism: Mechanism) -> bool {
+        self.0 & Self::bit(mechanism) != 0
+    }
+
+    pub fn has_plus(self) -> bool {
+        self.allows(Mechanism::Sha1Plus) || self.allows(Mechanism::Sha256Plus)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Default for AuthMechanisms {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthMechanisms {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let names = Vec::<String>::deserialize(deserializer)?;
+        let mut enabled = Self(0);
+        for name in names {
+            let mechanism = Mechanism::from_name(&name)
+                .ok_or_else(|| D::Error::custom(format!("unsupported auth mechanism {name:?}")))?;
+            let bit = Self::bit(mechanism);
+            if enabled.0 & bit != 0 {
+                return Err(D::Error::custom(format!(
+                    "duplicate auth mechanism {name:?}"
+                )));
+            }
+            enabled.0 |= bit;
+        }
+        Ok(enabled)
     }
 }
 

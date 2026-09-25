@@ -117,6 +117,7 @@ impl Listeners {
                     auth: Arc::clone(&auth),
                 };
                 let settings = StreamSettings::new(
+                    config.auth_mechanisms,
                     max_stanza_bytes,
                     xml_rate,
                     establishment_timeout,

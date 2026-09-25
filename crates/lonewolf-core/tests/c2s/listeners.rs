@@ -16,7 +16,7 @@ use lonewolf_util::core_dispatcher::CoreDispatcher;
 
 use super::*;
 use crate::config::limits::{C2sLimitProfile, C2sLimits};
-use crate::config::{Config, TcpListenerConfig};
+use crate::config::{AuthMechanisms, Config, TcpListenerConfig};
 use crate::hosts::HostsError;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -91,6 +91,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         admission,
                         StreamServices { hosts, auth },
                         StreamSettings::new(
+                            AuthMechanisms::ALL,
                             profile.max_stanza_bytes,
                             &profile.incoming_xml_per_connection,
                             Duration::from_secs(
@@ -169,6 +170,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                             admission,
                             StreamServices { hosts, auth },
                             StreamSettings::new(
+                                AuthMechanisms::ALL,
                                 profile.max_stanza_bytes,
                                 &profile.incoming_xml_per_connection,
                                 Duration::from_secs(

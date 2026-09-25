@@ -1168,6 +1168,7 @@ dependencies = [
 name = "lonewolf-core"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "async-lock",
  "base64",
  "compio",

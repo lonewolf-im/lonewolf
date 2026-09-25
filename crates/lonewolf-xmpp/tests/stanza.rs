@@ -14,8 +14,8 @@ use lonewolf_util::pool::{MIN_POOL_SIZE, PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
     BuildError, CLIENT_NAMESPACE, Element, IqType, MAX_ELEMENT_DEPTH, MessageType, NodeRef,
-    PresenceType, SERVER_NAMESPACE, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza, StanzaKind,
-    StanzaNamespace, StanzaType, WriteError, XML_NAMESPACE,
+    PresenceType, SERVER_NAMESPACE, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza,
+    StanzaErrorCondition, StanzaKind, StanzaNamespace, StanzaType, WriteError, XML_NAMESPACE,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -737,6 +737,89 @@ fn requires_one_final_error_child_for_error_stanzas() -> TestResult {
         .err(),
         Some(BuildError::InvalidIqPayload)
     );
+    Ok(())
+}
+
+#[test]
+fn derives_stanza_errors_without_changing_the_source() -> TestResult {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let from = Jid::parse_in("alice@example.com/Phone", &mut arena)?;
+    let to = Jid::parse_in("example.com", &mut arena)?;
+    let query = Element::builder_in("query", "jabber:iq:private", &mut arena)?.build()?;
+    let request = Stanza::builder_in(
+        StanzaType::Iq(IqType::Get),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .id(Some("request"))?
+    .child(query)?
+    .build()?;
+    let reply = request
+        .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)?
+        .build()?;
+    let view = reply.resolve(&arena)?;
+    assert_eq!(view.stanza_type(), StanzaType::Iq(IqType::Error));
+    assert_eq!(view.id()?, Some("request"));
+    assert_eq!(view.from()?.ok_or("from")?.as_str(), "example.com");
+    assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@example.com/Phone");
+    let children = view.children()?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].name(), "query");
+    assert_eq!(children[0].namespace(), "jabber:iq:private");
+    assert_eq!(children[1].name(), "error");
+    assert_eq!(children[1].attribute("type", "")?, Some("cancel"));
+    let NodeRef::Element(condition) = children[1].children()?.next().ok_or("condition")?? else {
+        return Err("condition is not an element".into());
+    };
+    assert_eq!(condition.name(), "service-unavailable");
+    assert_eq!(condition.namespace(), STANZA_ERROR_NAMESPACE);
+    assert_eq!(
+        request.resolve(&arena)?.stanza_type(),
+        StanzaType::Iq(IqType::Get)
+    );
+    assert_eq!(request.resolve(&arena)?.children()?.count(), 1);
+    assert_eq!(
+        reply
+            .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)
+            .err(),
+        Some(BuildError::InvalidErrorSource)
+    );
+    let result = request.reply_in(&mut arena)?.build()?;
+    assert_eq!(
+        result
+            .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)
+            .err(),
+        Some(BuildError::InvalidErrorSource)
+    );
+    Ok(())
+}
+
+#[test]
+fn derives_message_and_presence_errors() -> TestResult {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    for (source_type, error_type) in [
+        (
+            StanzaType::Message(MessageType::Chat),
+            StanzaType::Message(MessageType::Error),
+        ),
+        (
+            StanzaType::Presence(PresenceType::Available),
+            StanzaType::Presence(PresenceType::Error),
+        ),
+    ] {
+        let source =
+            Stanza::builder_in(source_type, StanzaNamespace::Client, &mut arena).build()?;
+        let reply = source
+            .error_reply_in(&mut arena, StanzaErrorCondition::InternalServerError)?
+            .build()?;
+        let view = reply.resolve(&arena)?;
+        assert_eq!(view.stanza_type(), error_type);
+        let error = view.children()?.next().ok_or("missing error")??;
+        assert_eq!(error.attribute("type", "")?, Some("wait"));
+        assert_eq!(source.resolve(&arena)?.stanza_type(), source_type);
+    }
     Ok(())
 }
 

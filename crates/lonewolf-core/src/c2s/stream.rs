@@ -24,10 +24,12 @@ use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::jid::Jid;
-use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser, compio_reader};
+use lonewolf_xmpp::parser::{
+    ParseError, Parsed, ParserConfig, StreamEvent, XmppParser, compio_reader,
+};
 use lonewolf_xmpp::stanza::{
-    CLIENT_NAMESPACE, Element, IqType, NodeRef, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE,
-    StanzaNamespace, StanzaRef, StanzaType, XML_NAMESPACE,
+    CLIENT_NAMESPACE, Element, IqType, NodeRef, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza,
+    StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType, XML_NAMESPACE,
 };
 use lonewolf_xmpp::stream::{StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
@@ -1081,16 +1083,75 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
         mut writer,
         registration,
     } = bound;
-    let outcome = match parser.next_event().await {
-        Ok(Some(StreamEvent::StreamEnd) | None) => send_footer_tls(&mut writer).await,
-        Err(ParseError::UnexpectedEof) => CloseOutcome::Eof,
-        Err(error) => {
-            send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error)).await
+    let mut response = String::new();
+    let outcome = loop {
+        match parser.next_event().await {
+            Ok(Some(StreamEvent::StreamEnd) | None) => break send_footer_tls(&mut writer).await,
+            Ok(Some(StreamEvent::Stanza(parsed))) => {
+                let (stanza_type, namespace) = match parsed.value().resolve(parsed.arena()) {
+                    Ok(stanza) => (stanza.stanza_type(), stanza.namespace()),
+                    Err(_) => {
+                        break send_stream_error_tls(&mut writer, CloseOutcome::InternalError)
+                            .await;
+                    }
+                };
+                if namespace != StanzaNamespace::Client {
+                    break send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedBoundInput)
+                        .await;
+                }
+                match stanza_type {
+                    StanzaType::Iq(IqType::Get | IqType::Set) => {
+                        if let Err(outcome) = unsupported_iq_xml(parsed, &mut response) {
+                            break send_stream_error_tls(&mut writer, outcome).await;
+                        }
+                        if let Err(outcome) = send_tls(&mut writer, &response).await {
+                            break outcome;
+                        }
+                    }
+                    StanzaType::Iq(IqType::Result | IqType::Error) => {}
+                    _ => {
+                        break send_stream_error_tls(
+                            &mut writer,
+                            CloseOutcome::UnsupportedBoundInput,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Err(ParseError::UnexpectedEof) => break CloseOutcome::Eof,
+            Err(error) => {
+                break send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error))
+                    .await;
+            }
+            _ => {
+                break send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedBoundInput)
+                    .await;
+            }
         }
-        _ => send_stream_error_tls(&mut writer, CloseOutcome::UnsupportedBoundInput).await,
     };
     drop(registration);
     outcome
+}
+
+fn unsupported_iq_xml<A: ChunkAllocator>(
+    parsed: Parsed<Stanza, A>,
+    xml: &mut String,
+) -> Result<(), CloseOutcome> {
+    let (request, mut arena) = parsed.into_parts();
+    let reply = request
+        .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .to(None)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .build()
+        .map_err(|_| CloseOutcome::InternalError)?;
+    xml.clear();
+    reply
+        .resolve(&arena)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .write_xml(xml)
+        .map_err(|_| CloseOutcome::InternalError)?;
+    Ok(())
 }
 
 fn account_key(username: &str, host: &str) -> Option<AccountKey> {

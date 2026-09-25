@@ -171,8 +171,8 @@ impl Default for C2sLimitProfile {
             max_connections_per_ip: const { nonzero(256) },
             max_stanza_bytes: const { nonzero(262_144) },
             connection_establishment_timeout_secs: nonzero_secs(10),
-            authentication_timeout_secs: nonzero_secs(10),
-            resource_binding_timeout_secs: nonzero_secs(10),
+            authentication_timeout_secs: nonzero_secs(15),
+            resource_binding_timeout_secs: nonzero_secs(5),
             connection_attempts_per_ip: EventRate {
                 per_second: const { nonzero(10) },
                 burst: const { nonzero(50) },

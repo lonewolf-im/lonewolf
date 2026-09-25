@@ -31,7 +31,7 @@ mod unauthenticated_limit;
 
 use attempt_limit::{Admission, AttemptLimiter};
 use connection_limit::{ConnectionAdmission, ConnectionLimiter};
-use stream::{StreamSettings, StreamTimeouts, XmppStream};
+use stream::{StreamAdmission, StreamSettings, StreamTimeouts, XmppStream};
 use unauthenticated_limit::{Admission as UnauthenticatedAdmission, UnauthenticatedLimiter};
 
 const BACKLOG: i32 = 128;
@@ -249,7 +249,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                 ListenerEvent::Accepted(accept.as_mut().await)
             } else {
                 match select(pin!(active.next()), accept.as_mut()).await {
-                    Either::Left((result, _)) => ListenerEvent::Closed(result),
+                    Either::Left((_, _)) => ListenerEvent::Closed,
                     Either::Right((result, _)) => ListenerEvent::Accepted(result),
                 }
             }
@@ -274,8 +274,12 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                         active.push(
                                             XmppStream::new(
                                                 stream,
-                                                ip_permit,
-                                                unauthenticated_permit,
+                                                StreamAdmission::new(
+                                                    ip_permit,
+                                                    unauthenticated_permit,
+                                                    listener_id,
+                                                    worker_id,
+                                                ),
                                                 services.hosts.clone(),
                                                 Arc::clone(&services.auth),
                                                 services.router.clone(),
@@ -291,6 +295,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                         close_unhandled_connection(stream);
                                         if let Some(rejected_connections) = report_count {
                                             tracing::warn!(
+                                                connection_type = "c2s",
                                                 listener_id,
                                                 worker_id,
                                                 outcome,
@@ -305,6 +310,9 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                 close_unhandled_connection(stream);
                                 if let Some(rejected_connections) = report_count {
                                     tracing::warn!(
+                                        connection_type = "c2s",
+                                        listener_id,
+                                        worker_id,
                                         outcome = "unauthenticated_connection_limit",
                                         rejected_connections,
                                         "c2s connection rejected"
@@ -320,6 +328,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                         close_unhandled_connection(stream);
                         if let Some(rejected_attempts) = report_count {
                             tracing::warn!(
+                                connection_type = "c2s",
                                 listener_id,
                                 worker_id,
                                 outcome,
@@ -330,15 +339,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                     }
                 }
             }
-            ListenerEvent::Closed(Some(outcome)) => {
-                tracing::trace!(
-                    listener_id,
-                    worker_id,
-                    outcome = outcome.as_str(),
-                    "c2s connection closed"
-                );
-            }
-            ListenerEvent::Closed(None) => {}
+            ListenerEvent::Closed => {}
             ListenerEvent::Accepted(Err(error)) => {
                 accept.as_mut().set(listener.accept());
                 if matches!(
@@ -379,7 +380,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
 
 enum ListenerEvent {
     Accepted(io::Result<(TcpStream, SocketAddr)>),
-    Closed(Option<stream::CloseOutcome>),
+    Closed,
 }
 
 fn close_unhandled_connection(stream: TcpStream) {

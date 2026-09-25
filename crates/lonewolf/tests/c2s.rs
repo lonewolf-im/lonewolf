@@ -223,7 +223,7 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
         assert!(stopped_listeners.insert(field(line, "listener_id=")?));
     }
     assert_eq!(stopped_listeners, std::collections::BTreeSet::from([0, 1]));
-    assert_eq!(logs.matches("c2s connection closed").count(), 32);
+    assert_eq!(logs.matches("stream disconnected").count(), 32);
     assert!(logs.contains("core dispatcher stopped"));
     assert!(!logs.contains("127.0.0.1"));
     for port in ports {
@@ -322,7 +322,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     first.shutdown(Shutdown::Write)?;
     assert_eq!(first.read(&mut [0; 1])?, 0);
     let deadline = Instant::now() + TIMEOUT;
-    while !server.logs()?.contains("c2s connection closed") {
+    while !server.logs()?.contains("stream disconnected") {
         if Instant::now() >= deadline {
             return Err("accepted connection did not finish after EOF".into());
         }

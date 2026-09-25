@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::RefCell;
 use std::error::Error;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -46,6 +47,54 @@ const PREFIX_FREE_OPEN: &str =
     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+static LOG_SUBSCRIBER: OnceLock<Result<(), String>> = OnceLock::new();
+
+thread_local! {
+    static LOG_CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+struct LogWriter;
+
+impl Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        LOG_CAPTURE.with(|capture| {
+            if let Some(output) = capture.borrow_mut().as_mut() {
+                output.extend_from_slice(bytes);
+            }
+        });
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_logs<R>(run: impl FnOnce() -> R) -> io::Result<(R, String)> {
+    LOG_SUBSCRIBER
+        .get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(|| LogWriter)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| io::Error::other(error.clone()))?;
+    LOG_CAPTURE.with(|capture| {
+        if capture.borrow().is_some() {
+            return Err(io::Error::other("nested log capture"));
+        }
+        capture.replace(Some(Vec::new()));
+        let result = run();
+        let bytes = capture
+            .replace(None)
+            .ok_or_else(|| io::Error::other("log capture missing"))?;
+        Ok((result, String::from_utf8(bytes).map_err(io::Error::other)?))
+    })
+}
 
 fn hosts() -> Result<Hosts, HostsError> {
     let config = Config::default();
@@ -144,8 +193,7 @@ fn run_case_with_timeouts(
         let started = Instant::now();
         let stream = XmppStream::new(
             transport,
-            permit,
-            unauthenticated_permit,
+            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
             hosts.clone(),
             auth,
             router.handle(),
@@ -579,8 +627,7 @@ fn run_starttls_restart_case_with_timeout(
         let (router, router_dispatcher) = test_router(&hosts).await?;
         let stream = XmppStream::new(
             transport,
-            permit,
-            unauthenticated_permit,
+            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
             hosts,
             auth,
             router.handle(),
@@ -762,8 +809,7 @@ where
         let (router, router_dispatcher) = test_router(&hosts).await?;
         let outcome = XmppStream::new(
             transport,
-            permit,
-            unauthenticated_permit,
+            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
             hosts,
             auth,
             router.handle(),
@@ -1427,8 +1473,7 @@ fn run_scram_with_restart(
         };
         let stream = XmppStream::new(
             transport,
-            permit,
-            unauthenticated_permit,
+            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
             hosts,
             auth,
             router.handle(),
@@ -1544,6 +1589,55 @@ fn client_resource_binding_returns_full_jid() -> Result<(), Box<dyn Error + Send
             ..BindingCase::default()
         },
     )
+}
+
+#[test]
+fn successful_stream_logs_each_lifecycle_transition() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (result, logs) = capture_logs(client_resource_binding_returns_full_jid)?;
+    result?;
+    let events = [
+        "connection established",
+        "connection authenticated",
+        "resource bound",
+        "stream disconnected",
+    ];
+    let lines: Vec<_> = logs
+        .lines()
+        .filter(|line| events.iter().any(|event| line.contains(event)))
+        .collect();
+    assert_eq!(lines.len(), events.len(), "{logs}");
+    for (line, event) in lines.iter().zip(events) {
+        assert!(line.contains(event), "{logs}");
+        assert!(line.contains("connection_type=\"c2s\""), "{logs}");
+        assert!(line.contains("listener_id=0"), "{logs}");
+        assert!(line.contains("worker_id=0"), "{logs}");
+    }
+    let connection_id = lines[0]
+        .split("connection_id=")
+        .nth(1)
+        .and_then(|field| field.split_whitespace().next())
+        .ok_or("missing connection ID")?;
+    for line in &lines[1..] {
+        assert!(
+            line.contains(&format!("connection_id={connection_id}")),
+            "{logs}"
+        );
+    }
+    assert!(lines[0].contains("host=\"localhost\""), "{logs}");
+    assert!(lines[1].contains("SCRAM-SHA-256"), "{logs}");
+    assert!(lines[2].contains("resource_requested=true"), "{logs}");
+    assert!(lines[3].contains("stream_phase=\"bound\""), "{logs}");
+    assert!(lines[3].contains("outcome=\"stream_end\""), "{logs}");
+    assert!(!logs.contains("alice@localhost"), "{logs}");
+    Ok(())
+}
+
+#[test]
+fn generated_binding_logs_absent_resource_request() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (result, logs) = capture_logs(server_generated_binding_uses_random_resource)?;
+    result?;
+    assert!(logs.contains("resource_requested=false"), "{logs}");
+    Ok(())
 }
 
 #[test]
@@ -1928,8 +2022,7 @@ fn unknown_account_gets_three_scram_attempts_before_stream_closes()
         let (router, router_dispatcher) = test_router(&hosts).await?;
         let stream = XmppStream::new(
             transport,
-            permit,
-            unauthenticated_permit,
+            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
             hosts,
             auth,
             router.handle(),
@@ -2047,8 +2140,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         let (router, router_dispatcher) = test_router(&hosts).await?;
         let stream = XmppStream::new(
             transport,
-            permit,
-            unauthenticated_permit,
+            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
             hosts.clone(),
             auth,
             router.handle(),
@@ -2083,4 +2175,54 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         router_dispatcher.shutdown(TIMEOUT).await?;
         Ok::<_, Box<dyn Error>>(())
     })
+}
+
+#[test]
+fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
+    let ((), logs) = capture_logs(|| {
+        drop(ConnectionLifecycle {
+            connection_id: 7,
+            listener_id: 2,
+            worker_id: 3,
+            accepted_at: Instant::now(),
+            stream_phase: "binding",
+            outcome: None,
+        });
+    })?;
+    assert!(logs.contains("stream disconnected"), "{logs}");
+    assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
+    assert!(logs.contains("stream_phase=\"binding\""), "{logs}");
+    assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
+    Ok(())
+}
+
+#[test]
+fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
+    let (result, logs) = capture_logs(|| {
+        Runtime::new()?.block_on(async {
+            let limiter = ConnectionLimiter::new(1);
+            let ConnectionAdmission::Allowed(permit) = limiter
+                .reserve(Ipv4Addr::LOCALHOST.into(), Instant::now())
+                .await
+            else {
+                return Err("connection denied".into());
+            };
+            let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+            let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+                unauthenticated.reserve(Instant::now()).await
+            else {
+                return Err("unauthenticated connection denied".into());
+            };
+            drop(StreamAdmission::new(permit, unauthenticated_permit, 2, 3));
+            assert_eq!(unauthenticated.active_count(), 0);
+            Ok::<_, Box<dyn Error>>(())
+        })
+    })?;
+    result?;
+    assert!(logs.contains("stream disconnected"), "{logs}");
+    assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
+    assert!(logs.contains("listener_id=2"), "{logs}");
+    assert!(logs.contains("worker_id=3"), "{logs}");
+    assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
+    Ok(())
 }

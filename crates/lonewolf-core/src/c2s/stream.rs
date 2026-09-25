@@ -6,6 +6,7 @@ use std::net::Shutdown;
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -60,6 +61,7 @@ const BIND_FEATURES: &str =
     "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
 const MAX_AUTH_ATTEMPTS: usize = 3;
 const MAX_BIND_FAILURES: usize = 6;
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn sasl_features(mechanisms: AuthMechanisms) -> String {
     let mut features = String::with_capacity(440);
@@ -102,6 +104,22 @@ struct Bound<A: ChunkAllocator> {
     parser: XmppParser<XmlInput, A>,
     writer: TlsWriter,
     registration: Registration<A>,
+    resource_requested: bool,
+}
+
+struct ConnectionLifecycle {
+    connection_id: u64,
+    listener_id: usize,
+    worker_id: usize,
+    accepted_at: Instant,
+    stream_phase: &'static str,
+    outcome: Option<CloseOutcome>,
+}
+
+pub(super) struct StreamAdmission {
+    ip_permit: ConnectionPermit,
+    unauthenticated_permit: UnauthenticatedPermit,
+    lifecycle: ConnectionLifecycle,
 }
 
 enum BindRequestError {
@@ -115,13 +133,11 @@ struct TlsBinding {
 
 pub(super) struct XmppStream<A: ChunkAllocator> {
     transport: TcpStream,
-    ip_permit: ConnectionPermit,
-    unauthenticated_permit: UnauthenticatedPermit,
+    admission: StreamAdmission,
     hosts: Hosts,
     auth: Arc<AuthService>,
     router: RouterHandle<A>,
     settings: StreamSettings<A>,
-    accepted_at: Instant,
 }
 
 #[derive(Clone)]
@@ -169,11 +185,89 @@ impl<A: ChunkAllocator> StreamSettings<A> {
     }
 }
 
+impl ConnectionLifecycle {
+    fn established(&mut self, host: &str) {
+        self.stream_phase = "established";
+        tracing::info!(
+            connection_type = "c2s",
+            connection_id = self.connection_id,
+            listener_id = self.listener_id,
+            worker_id = self.worker_id,
+            host,
+            establishment_ms = self.accepted_at.elapsed().as_millis(),
+            "connection established"
+        );
+    }
+
+    fn authenticated(&mut self, host: &str, mechanism: Mechanism, started_at: Instant) {
+        self.stream_phase = "authenticated";
+        tracing::info!(
+            connection_type = "c2s",
+            connection_id = self.connection_id,
+            listener_id = self.listener_id,
+            worker_id = self.worker_id,
+            host,
+            auth_mechanism = mechanism.name(),
+            authentication_ms = started_at.elapsed().as_millis(),
+            "connection authenticated"
+        );
+    }
+
+    fn bound(&mut self, resource_requested: bool, started_at: Instant) {
+        self.stream_phase = "bound";
+        tracing::info!(
+            connection_type = "c2s",
+            connection_id = self.connection_id,
+            listener_id = self.listener_id,
+            worker_id = self.worker_id,
+            resource_requested,
+            binding_ms = started_at.elapsed().as_millis(),
+            "resource bound"
+        );
+    }
+}
+
+impl StreamAdmission {
+    pub(super) fn new(
+        ip_permit: ConnectionPermit,
+        unauthenticated_permit: UnauthenticatedPermit,
+        listener_id: usize,
+        worker_id: usize,
+    ) -> Self {
+        Self {
+            ip_permit,
+            unauthenticated_permit,
+            lifecycle: ConnectionLifecycle {
+                connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+                listener_id,
+                worker_id,
+                accepted_at: Instant::now(),
+                stream_phase: "establishing",
+                outcome: None,
+            },
+        }
+    }
+}
+
+impl Drop for ConnectionLifecycle {
+    fn drop(&mut self) {
+        tracing::info!(
+            connection_type = "c2s",
+            connection_id = self.connection_id,
+            listener_id = self.listener_id,
+            worker_id = self.worker_id,
+            stream_phase = self.stream_phase,
+            outcome = self.outcome.map_or("cancelled", |outcome| outcome.as_str()),
+            duration_ms = self.accepted_at.elapsed().as_millis(),
+            "stream disconnected"
+        );
+    }
+}
+
 impl<A: ChunkAllocator + Clone> XmppStream<A> {
     pub(super) fn new(
         transport: TcpStream,
-        ip_permit: ConnectionPermit,
-        unauthenticated_permit: UnauthenticatedPermit,
+        admission: StreamAdmission,
         hosts: Hosts,
         auth: Arc<AuthService>,
         router: RouterHandle<A>,
@@ -181,27 +275,29 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
     ) -> Self {
         Self {
             transport,
-            ip_permit,
-            unauthenticated_permit,
+            admission,
             hosts,
             auth,
             router,
             settings,
-            accepted_at: Instant::now(),
         }
     }
 
     pub(super) async fn run(self) -> CloseOutcome {
         let Self {
             transport,
-            ip_permit,
-            unauthenticated_permit,
+            admission,
             hosts,
             auth,
             router,
             settings,
-            accepted_at,
         } = self;
+        let StreamAdmission {
+            ip_permit,
+            unauthenticated_permit,
+            mut lifecycle,
+        } = admission;
+        let accepted_at = lifecycle.accepted_at;
         let close_control = transport.clone();
         let established = timeout(
             accepted_at
@@ -215,6 +311,8 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         let mut unauthenticated_permit = Some(unauthenticated_permit);
         let outcome = match established {
             Ok(Ok(mut established)) => {
+                lifecycle.established(&established.host);
+                lifecycle.stream_phase = "authenticating";
                 let authentication_remaining = established
                     .auth_started_at
                     .checked_add(settings.authentication_timeout)
@@ -227,7 +325,13 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 )
                 .await
                 {
-                    Ok(Ok(account)) => {
+                    Ok(Ok((account, mechanism))) => {
+                        lifecycle.authenticated(
+                            &established.host,
+                            mechanism,
+                            established.auth_started_at,
+                        );
+                        lifecycle.stream_phase = "binding";
                         unauthenticated_permit.take();
                         let binding_started_at = Instant::now();
                         let binding_remaining = binding_started_at
@@ -247,7 +351,10 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                         )
                         .await
                         {
-                            Ok(Ok(bound)) => bound_stream(bound).await,
+                            Ok(Ok(bound)) => {
+                                lifecycle.bound(bound.resource_requested, binding_started_at);
+                                bound_stream(bound).await
+                            }
                             Ok(Err(outcome)) => outcome,
                             Err(_) => {
                                 let _ = SockRef::from(&close_control).shutdown(Shutdown::Both);
@@ -270,6 +377,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         };
         drop(unauthenticated_permit);
         drop(ip_permit);
+        lifecycle.outcome = Some(outcome);
         outcome
     }
 }
@@ -458,7 +566,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
     hosts: &Hosts,
     auth: &AuthService,
     mechanisms: AuthMechanisms,
-) -> Result<AccountKey, CloseOutcome> {
+) -> Result<(AccountKey, Mechanism), CloseOutcome> {
     let Some(endpoint) = hosts.tls_server_end_point(&established.host) else {
         return Err(CloseOutcome::InternalError);
     };
@@ -743,7 +851,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                 {
                     return Err(CloseOutcome::TransportError);
                 }
-                return account.ok_or(CloseOutcome::InternalError);
+                return account
+                    .map(|account| (account, mechanism))
+                    .ok_or(CloseOutcome::InternalError);
             }
         }
         if send_sasl_failure(&mut established.writer, "not-authorized")
@@ -964,6 +1074,7 @@ async fn bind_resource<A: ChunkAllocator + Clone>(
             parser,
             writer,
             registration,
+            resource_requested: requested.is_some(),
         });
     }
 }
@@ -1084,6 +1195,7 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
         mut parser,
         writer,
         registration,
+        resource_requested: _,
     } = bound;
     let mut writer = FuturesBufWriter::with_capacity(IO_BUFFER_BYTES, writer);
     let outcome = loop {

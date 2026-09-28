@@ -55,6 +55,7 @@ fn explicit_default_selects_a_host_and_tls_stays_per_host() -> TestResult {
         "example.com".into(),
         HostConfig {
             tls: Some(tls.clone()),
+            ..HostConfig::default()
         },
     );
     let hosts = Hosts::new(&config.hosts, Some("example.com"))?;
@@ -86,12 +87,14 @@ fn sorted_hosts_support_exact_domain_lookups() -> TestResult {
         "zeta.example".into(),
         HostConfig {
             tls: Some(zeta_tls.clone()),
+            ..HostConfig::default()
         },
     );
     config.hosts.insert(
         "alpha.example".into(),
         HostConfig {
             tls: Some(alpha_tls.clone()),
+            ..HostConfig::default()
         },
     );
     let hosts = Hosts::new(&config.hosts, Some("localhost"))?;
@@ -123,6 +126,7 @@ fn certificate_files_are_checked_during_bootstrap() -> TestResult {
         "example.com".into(),
         HostConfig {
             tls: Some(tls.clone()),
+            ..HostConfig::default()
         },
     );
     let hosts = Hosts::new(&config.hosts, None)?;
@@ -168,6 +172,7 @@ fn mismatched_private_key_is_rejected() -> TestResult {
                 certificate_chain_path: tls.certificate_chain_path,
                 private_key_path: other.private_key_path,
             }),
+            ..HostConfig::default()
         },
     );
     assert!(matches!(
@@ -187,6 +192,7 @@ fn empty_and_malformed_certificate_files_are_rejected() -> TestResult {
         "example.com".into(),
         HostConfig {
             tls: Some(tls.clone()),
+            ..HostConfig::default()
         },
     );
 
@@ -272,6 +278,7 @@ fn hashless_certificate_signature_is_rejected_at_bootstrap() -> TestResult {
                 certificate_chain_path,
                 private_key_path,
             }),
+            ..HostConfig::default()
         },
     );
     let error = Hosts::new(&config.hosts, None)

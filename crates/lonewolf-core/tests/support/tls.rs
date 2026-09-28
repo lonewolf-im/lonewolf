@@ -22,7 +22,8 @@ pub fn configure(directory: &Path) -> TestResult<ClientConfig> {
         public_key: key.private_key.public_key_uncompressed(),
         key,
     };
-    let mut parameters = CertificateParams::new(vec!["localhost".into()])?;
+    let mut parameters =
+        CertificateParams::new(vec!["localhost".into(), "other.localhost".into()])?;
     parameters.serial_number = Some(1u64.into());
     let certificate = parameters.self_signed(&signer)?;
     let mut key_bytes = [0; 512];

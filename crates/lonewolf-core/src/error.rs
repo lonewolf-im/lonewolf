@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::{fmt, io};
 
+use lonewolf_extension::iq::RegistrationError;
 use lonewolf_storage::StorageError;
 use lonewolf_util::pool::PoolError;
 
@@ -14,6 +15,10 @@ pub enum RunError {
     Logging(Box<dyn Error + Send + Sync>),
     Config(ConfigError),
     Hosts(HostsError),
+    Extensions {
+        host: String,
+        source: RegistrationError,
+    },
     StanzaPool(PoolError),
     Runtime(io::Error),
     WorkerCount(io::Error),
@@ -25,9 +30,18 @@ pub enum RunError {
     Admin(io::Error),
     C2s(io::Error),
     UnknownStore(String),
-    StorageDirectory { store: String, source: io::Error },
-    Storage { store: String, source: StorageError },
-    Accounts { store: String, source: StorageError },
+    StorageDirectory {
+        store: String,
+        source: io::Error,
+    },
+    Storage {
+        store: String,
+        source: StorageError,
+    },
+    Accounts {
+        store: String,
+        source: StorageError,
+    },
 }
 
 impl fmt::Display for RunError {
@@ -36,6 +50,10 @@ impl fmt::Display for RunError {
             Self::Logging(source) => write!(formatter, "cannot initialize logging: {source}"),
             Self::Config(source) => source.fmt(formatter),
             Self::Hosts(source) => write!(formatter, "cannot initialize hosts: {source}"),
+            Self::Extensions { host, source } => write!(
+                formatter,
+                "cannot initialize extensions for {host:?}: {source}"
+            ),
             Self::StanzaPool(source) => {
                 write!(formatter, "cannot initialize stanza arena pool: {source}")
             }
@@ -74,6 +92,7 @@ impl Error for RunError {
             Self::Logging(source) => Some(source.as_ref()),
             Self::Config(source) => Some(source),
             Self::Hosts(source) => Some(source),
+            Self::Extensions { source, .. } => Some(source),
             Self::StanzaPool(source) => Some(source),
             Self::Runtime(source)
             | Self::WorkerCount(source)

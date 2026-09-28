@@ -18,6 +18,7 @@ graviola.workspace = true
 oxilangtag.workspace = true
 lonewolf-admin.workspace = true
 lonewolf-auth.workspace = true
+lonewolf-extension.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true

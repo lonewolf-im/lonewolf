@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
+use lonewolf_extension::iq::IqRegistry;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
 use lonewolf_xmpp::parser::Parsed;
@@ -24,6 +27,7 @@ pub struct Router<A: ChunkAllocator> {
 pub struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
     local: LocalRouterHandle<A>,
+    extensions: Arc<BTreeMap<String, IqRegistry<A>>>,
 }
 
 /// Retains the parsed stanza and its immutable arena across workers.
@@ -49,12 +53,18 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         let handle = RouterHandle {
             hosts,
             local: local.handle(),
+            extensions: Arc::default(),
         };
         Self { local, handle }
     }
 
     pub fn handle(&self) -> RouterHandle<A> {
         self.handle.clone()
+    }
+
+    pub(crate) fn with_extensions(mut self, extensions: BTreeMap<String, IqRegistry<A>>) -> Self {
+        self.handle.extensions = Arc::new(extensions);
+        self
     }
 
     pub async fn shutdown(self) -> io::Result<()> {
@@ -67,11 +77,16 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
         Self {
             hosts: self.hosts.clone(),
             local: self.local.clone(),
+            extensions: Arc::clone(&self.extensions),
         }
     }
 }
 
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
+    pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A>> {
+        self.extensions.get(domain)
+    }
+
     /// Applies the incoming listener's limit to resources on all listeners.
     pub async fn register(
         &self,

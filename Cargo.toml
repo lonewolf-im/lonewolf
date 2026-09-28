@@ -4,6 +4,7 @@ members = [
     "crates/lonewolf-admin",
     "crates/lonewolf-auth",
     "crates/lonewolf-core",
+    "crates/lonewolf-extension",
     "crates/lonewolfctl",
     "crates/lonewolf-storage",
     "crates/lonewolf-util",
@@ -47,6 +48,7 @@ oxilangtag = { version = "0.1.6", default-features = false }
 lonewolf-admin = { path = "crates/lonewolf-admin" }
 lonewolf-auth = { path = "crates/lonewolf-auth" }
 lonewolf-core = { path = "crates/lonewolf-core" }
+lonewolf-extension = { path = "crates/lonewolf-extension" }
 lonewolf-storage = { path = "crates/lonewolf-storage" }
 lonewolf-util = { path = "crates/lonewolf-util" }
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }

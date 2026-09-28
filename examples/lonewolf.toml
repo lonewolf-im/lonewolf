@@ -29,6 +29,10 @@
 # Use lowercase ASCII names or Punycode for internationalized domains.
 # [hosts.localhost]
 
+# Choose the extensions enabled for this host when the server starts.
+# Names must identify extensions included in the server build.
+# extensions = []
+
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
 # [hosts."example.com"]
@@ -144,7 +148,7 @@
 # Defining a store replaces that built-in store.
 # [storage.stores.primary]
 
-# Choose the database engine for this store. Lonewolf currently supports Redb.
+# Choose the database engine for this store. Lonewolf supports Redb.
 # backend = "redb"
 
 # Choose where Redb keeps this database. Relative paths start from the directory

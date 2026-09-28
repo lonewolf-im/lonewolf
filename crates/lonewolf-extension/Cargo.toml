@@ -1,0 +1,11 @@
+[package]
+name = "lonewolf-extension"
+description = "Extension registration and IQ handling for Lonewolf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+lonewolf-util.workspace = true
+lonewolf-xmpp.workspace = true

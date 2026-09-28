@@ -54,6 +54,14 @@ impl C2sSuite {
         Self::configured("", "")
     }
 
+    pub fn with_extensions(extensions: &str) -> TestResult<Self> {
+        Self::with_hosts(&format!("[hosts.localhost]\nextensions = [{extensions}]"))
+    }
+
+    pub fn with_hosts(hosts: &str) -> TestResult<Self> {
+        Self::settings("", "", 10, hosts)
+    }
+
     pub fn with_limits(limits: &str) -> TestResult<Self> {
         Self::configured("", limits)
     }
@@ -71,14 +79,14 @@ impl C2sSuite {
     }
 
     fn configured(listener: &str, limits: &str) -> TestResult<Self> {
-        Self::settings(listener, limits, 10)
+        Self::settings(listener, limits, 10, "")
     }
 
     pub fn resource_limit(limit: usize) -> TestResult<Self> {
-        Self::settings("", "", limit)
+        Self::settings("", "", limit, "")
     }
 
-    fn settings(listener: &str, limits: &str, resources: usize) -> TestResult<Self> {
+    fn settings(listener: &str, limits: &str, resources: usize, hosts: &str) -> TestResult<Self> {
         let permit = C2sSuitePermit::acquire();
         let directory = tempfile::tempdir()?;
         let tls = tls::configure(directory.path())?;
@@ -88,9 +96,11 @@ impl C2sSuite {
                 r#"
 [xmpp]
 stanza_pool_size_mib = 8
+default_host = "localhost"
 [[c2s.listeners]]
 address = "127.0.0.1:0"
 {listener}
+{hosts}
 [hosts.localhost.tls]
 certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
@@ -130,6 +140,7 @@ max_resources_per_account = {resources}
         loop {
             let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
             if self.child.try_wait()?.is_some() {
+                let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 return Err(format!("server exited before readiness: {logs}").into());
             }
             if logs.contains("waiting for stop signal") {
@@ -221,13 +232,15 @@ fn server_process() -> TestResult {
     if std::env::var_os("LONEWOLF_PROTOCOL_TEST_SERVER").is_none() {
         return Ok(());
     }
-    lonewolf_core::run(
+    lonewolf_core::run_with_extensions(
         None,
         lonewolf_core::BuildInfo {
             version: "integration-test",
             branch: "test",
             commit: "test",
         },
-    )?;
+        super::extensions::catalog()?,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }

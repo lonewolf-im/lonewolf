@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod client;
+mod extensions;
 mod server;
 mod tls;
 pub mod xml;

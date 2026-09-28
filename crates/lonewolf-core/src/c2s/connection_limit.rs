@@ -92,5 +92,5 @@ impl Drop for ConnectionPermit {
 }
 
 #[cfg(test)]
-#[path = "../../tests/c2s/connection_limit.rs"]
+#[path = "tests/connection_limit.rs"]
 mod tests;

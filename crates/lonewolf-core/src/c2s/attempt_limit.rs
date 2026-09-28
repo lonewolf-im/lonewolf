@@ -115,5 +115,5 @@ impl Bucket {
 }
 
 #[cfg(test)]
-#[path = "../../tests/c2s/attempt_limit.rs"]
+#[path = "tests/attempt_limit.rs"]
 mod tests;

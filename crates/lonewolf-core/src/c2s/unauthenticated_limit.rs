@@ -68,5 +68,5 @@ impl Drop for UnauthenticatedPermit {
 }
 
 #[cfg(test)]
-#[path = "../../tests/c2s/unauthenticated_limit.rs"]
+#[path = "tests/unauthenticated_limit.rs"]
 mod tests;

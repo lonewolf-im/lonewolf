@@ -26,5 +26,5 @@ impl RejectionReport {
 }
 
 #[cfg(test)]
-#[path = "../../tests/c2s/rejection_report.rs"]
+#[path = "tests/rejection_report.rs"]
 mod tests;

@@ -446,5 +446,5 @@ fn listener_error(listener_id: usize, worker_id: usize, error: io::Error) -> io:
 }
 
 #[cfg(test)]
-#[path = "../../tests/c2s/listeners.rs"]
+#[path = "tests/listeners.rs"]
 mod tests;

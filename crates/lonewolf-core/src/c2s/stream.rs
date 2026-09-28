@@ -2041,5 +2041,5 @@ impl CloseOutcome {
 }
 
 #[cfg(test)]
-#[path = "../../tests/c2s/stream.rs"]
+#[path = "tests/stream.rs"]
 mod tests;

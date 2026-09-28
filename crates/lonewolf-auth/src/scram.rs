@@ -325,5 +325,4 @@ where
 }
 
 #[cfg(test)]
-#[path = "scram_tests.rs"]
 mod tests;

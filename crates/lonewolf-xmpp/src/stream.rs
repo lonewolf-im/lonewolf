@@ -64,3 +64,6 @@ impl StreamError {
         output.write_str("'/></stream:error>")
     }
 }
+
+#[cfg(test)]
+mod tests;

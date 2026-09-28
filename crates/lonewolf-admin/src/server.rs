@@ -184,3 +184,6 @@ impl Drop for SocketFile {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

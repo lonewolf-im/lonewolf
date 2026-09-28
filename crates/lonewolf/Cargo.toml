@@ -13,3 +13,19 @@ lonewolf-core.workspace = true
 [dev-dependencies]
 nix.workspace = true
 tempfile.workspace = true
+
+[[test]]
+name = "admin"
+path = "../lonewolf-core/tests/server/admin.rs"
+
+[[test]]
+name = "c2s"
+path = "../lonewolf-core/tests/server/c2s.rs"
+
+[[test]]
+name = "cli"
+path = "../lonewolf-core/tests/server/cli.rs"
+
+[[test]]
+name = "workers"
+path = "../lonewolf-core/tests/server/workers.rs"

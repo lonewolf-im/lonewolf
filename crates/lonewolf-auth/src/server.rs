@@ -416,3 +416,6 @@ fn valid_extension(value: &str) -> bool {
         && bytes[1] == b'='
         && bytes[2..].iter().all(|&byte| !matches!(byte, 0 | b','))
 }
+
+#[cfg(test)]
+mod tests;

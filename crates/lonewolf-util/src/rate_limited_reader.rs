@@ -139,5 +139,4 @@ impl<R: AsyncBufRead + Unpin> AsyncRead for RateLimitedReader<R> {
 }
 
 #[cfg(test)]
-#[path = "../tests/rate_limited_reader/reader.rs"]
 mod tests;

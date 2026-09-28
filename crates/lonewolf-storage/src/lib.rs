@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stores canonical account identities and SCRAM verifiers behind repository
-//! contracts with explicit commit outcomes.
+//! Stores server state behind repository contracts with explicit commit outcomes.
 
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 
 pub mod account;
+pub mod roster;
 
 mod error;
 mod redb;

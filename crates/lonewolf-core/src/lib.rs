@@ -117,7 +117,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                 } else {
                     None
                 };
-                let local = LocalRouter::start(&dispatcher.handle())
+                let local = LocalRouter::start(&dispatcher.handle(), Arc::clone(&stanza_pool))
                     .await
                     .map_err(RunError::Router)?;
                 let router_handle = router.insert(Router::new(hosts.clone(), local)).handle();

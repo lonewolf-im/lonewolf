@@ -16,7 +16,6 @@ pub mod local;
 pub use local::Registration;
 use local::{LocalRouter, LocalRouterHandle};
 
-/// Dispatches stanzas by destination domain.
 pub struct Router<A: ChunkAllocator> {
     local: LocalRouter<A>,
     handle: RouterHandle<A>,
@@ -45,7 +44,7 @@ pub enum RouterError {
     Stopped,
 }
 
-impl<A: ChunkAllocator> Router<A> {
+impl<A: ChunkAllocator + Clone> Router<A> {
     pub fn new(hosts: Hosts, local: LocalRouter<A>) -> Self {
         let handle = RouterHandle {
             hosts,
@@ -63,7 +62,7 @@ impl<A: ChunkAllocator> Router<A> {
     }
 }
 
-impl<A: ChunkAllocator> Clone for RouterHandle<A> {
+impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
     fn clone(&self) -> Self {
         Self {
             hosts: self.hosts.clone(),
@@ -72,7 +71,7 @@ impl<A: ChunkAllocator> Clone for RouterHandle<A> {
     }
 }
 
-impl<A: ChunkAllocator> RouterHandle<A> {
+impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     /// Applies the incoming listener's limit to resources on all listeners.
     pub async fn register(
         &self,

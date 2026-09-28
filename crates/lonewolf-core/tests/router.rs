@@ -4,6 +4,7 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
@@ -15,6 +16,7 @@ use lonewolf_core::router::{RoutedStanza, Router, RouterError};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
+use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::StanzaKind;
@@ -37,7 +39,7 @@ async fn setup() -> Result<(Router<GlobalChunkAllocator>, CoreDispatcher), Box<d
     };
     let config = Config::default();
     let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
-    let local = LocalRouter::start(&dispatcher.handle()).await?;
+    let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
     let router = Router::new(hosts, local);
     Ok((router, dispatcher))
 }
@@ -136,6 +138,33 @@ fn registration_uses_one_account_shard_across_handles() -> TestResult {
         assert_eq!(reused.resource(), "desk");
         drop(duplicate);
         drop(reused);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn resource_validation_uses_router_allocator() -> TestResult {
+    run_test(async {
+        let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
+        let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
+            total_bytes: NonZeroUsize::new(8 * 1024 * 1024).unwrap(),
+            shards_per_bucket: NonZeroUsize::MIN,
+        })?);
+        let config = Config::default();
+        let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
+        let local = LocalRouter::start(&dispatcher.handle(), Arc::clone(&pool)).await?;
+        let router = Router::new(hosts, local);
+        let before = pool.stats().buckets[0].allocation_count;
+        let alice = account("alice@localhost")?;
+        let registration = router
+            .handle()
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        assert_eq!(registration.resource(), "desk");
+        assert_eq!(pool.stats().buckets[0].allocation_count, before + 1);
+        drop(registration);
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())

@@ -2,7 +2,7 @@
 
 use std::future::pending;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,9 +31,11 @@ mod stream;
 mod unauthenticated_limit;
 
 use attempt_limit::{Admission, AttemptLimiter};
-use connection_limit::{ConnectionAdmission, ConnectionLimiter};
+use connection_limit::{ConnectionAdmission, ConnectionLimiter, ConnectionPermit};
 use stream::{StreamAdmission, StreamSettings, StreamTimeouts, XmppStream};
-use unauthenticated_limit::{Admission as UnauthenticatedAdmission, UnauthenticatedLimiter};
+use unauthenticated_limit::{
+    Admission as UnauthenticatedAdmission, UnauthenticatedLimiter, UnauthenticatedPermit,
+};
 
 const BACKLOG: i32 = 128;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -45,6 +47,56 @@ struct AdmissionLimits {
     attempts: Arc<AttemptLimiter>,
     connections: Arc<ConnectionLimiter>,
     unauthenticated: Arc<UnauthenticatedLimiter>,
+}
+
+enum AdmissionRejection {
+    Attempt {
+        outcome: &'static str,
+        report_count: Option<u64>,
+    },
+    Unauthenticated {
+        report_count: Option<u64>,
+    },
+    PerIp {
+        outcome: &'static str,
+        report_count: Option<u64>,
+        unauthenticated_permit: UnauthenticatedPermit,
+    },
+}
+
+impl AdmissionLimits {
+    async fn reserve(
+        &self,
+        source: IpAddr,
+    ) -> Result<(ConnectionPermit, UnauthenticatedPermit), AdmissionRejection> {
+        if let Admission::Denied {
+            outcome,
+            report_count,
+        } = self.attempts.admit(source, Instant::now()).await
+        {
+            return Err(AdmissionRejection::Attempt {
+                outcome,
+                report_count,
+            });
+        }
+        let unauthenticated_permit = match self.unauthenticated.reserve(Instant::now()).await {
+            UnauthenticatedAdmission::Allowed(permit) => permit,
+            UnauthenticatedAdmission::Denied { report_count } => {
+                return Err(AdmissionRejection::Unauthenticated { report_count });
+            }
+        };
+        match self.connections.reserve(source, Instant::now()).await {
+            ConnectionAdmission::Allowed(permit) => Ok((permit, unauthenticated_permit)),
+            ConnectionAdmission::Denied {
+                outcome,
+                report_count,
+            } => Err(AdmissionRejection::PerIp {
+                outcome,
+                report_count,
+                unauthenticated_permit,
+            }),
+        }
+    }
 }
 
 struct AuthService {
@@ -262,70 +314,60 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         match event {
             ListenerEvent::Accepted(Ok((stream, peer))) => {
                 accept.as_mut().set(listener.accept());
-                match admission.attempts.admit(peer.ip(), Instant::now()).await {
-                    Admission::Allowed => {
-                        match admission.unauthenticated.reserve(Instant::now()).await {
-                            UnauthenticatedAdmission::Allowed(unauthenticated_permit) => {
-                                match admission
-                                    .connections
-                                    .reserve(peer.ip(), Instant::now())
-                                    .await
-                                {
-                                    ConnectionAdmission::Allowed(ip_permit) => {
-                                        active.push(
-                                            XmppStream::new(
-                                                stream,
-                                                StreamAdmission::new(
-                                                    ip_permit,
-                                                    unauthenticated_permit,
-                                                    listener_id,
-                                                    worker_id,
-                                                ),
-                                                services.hosts.clone(),
-                                                Arc::clone(&services.auth),
-                                                services.router.clone(),
-                                                settings.clone(),
-                                            )
-                                            .run(),
-                                        );
-                                    }
-                                    ConnectionAdmission::Denied {
-                                        outcome,
-                                        report_count,
-                                    } => {
-                                        close_unhandled_connection(stream);
-                                        if let Some(rejected_connections) = report_count {
-                                            tracing::warn!(
-                                                connection_type = "c2s",
-                                                listener_id,
-                                                worker_id,
-                                                outcome,
-                                                rejected_connections,
-                                                "c2s connection rejected"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            UnauthenticatedAdmission::Denied { report_count } => {
-                                close_unhandled_connection(stream);
-                                if let Some(rejected_connections) = report_count {
-                                    tracing::warn!(
-                                        connection_type = "c2s",
-                                        listener_id,
-                                        worker_id,
-                                        outcome = "unauthenticated_connection_limit",
-                                        rejected_connections,
-                                        "c2s connection rejected"
-                                    );
-                                }
-                            }
-                        }
+                match admission.reserve(peer.ip()).await {
+                    Ok((ip_permit, unauthenticated_permit)) => {
+                        active.push(
+                            XmppStream::new(
+                                stream,
+                                StreamAdmission::new(
+                                    ip_permit,
+                                    unauthenticated_permit,
+                                    listener_id,
+                                    worker_id,
+                                ),
+                                services.hosts.clone(),
+                                Arc::clone(&services.auth),
+                                services.router.clone(),
+                                settings.clone(),
+                            )
+                            .run(),
+                        );
                     }
-                    Admission::Denied {
+                    Err(AdmissionRejection::PerIp {
                         outcome,
                         report_count,
-                    } => {
+                        unauthenticated_permit,
+                    }) => {
+                        close_unhandled_connection(stream);
+                        if let Some(rejected_connections) = report_count {
+                            tracing::warn!(
+                                connection_type = "c2s",
+                                listener_id,
+                                worker_id,
+                                outcome,
+                                rejected_connections,
+                                "c2s connection rejected"
+                            );
+                        }
+                        drop(unauthenticated_permit);
+                    }
+                    Err(AdmissionRejection::Unauthenticated { report_count }) => {
+                        close_unhandled_connection(stream);
+                        if let Some(rejected_connections) = report_count {
+                            tracing::warn!(
+                                connection_type = "c2s",
+                                listener_id,
+                                worker_id,
+                                outcome = "unauthenticated_connection_limit",
+                                rejected_connections,
+                                "c2s connection rejected"
+                            );
+                        }
+                    }
+                    Err(AdmissionRejection::Attempt {
+                        outcome,
+                        report_count,
+                    }) => {
                         close_unhandled_connection(stream);
                         if let Some(rejected_attempts) = report_count {
                             tracing::warn!(

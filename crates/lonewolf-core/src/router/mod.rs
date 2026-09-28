@@ -138,8 +138,8 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     /// Builds and enqueues one push for each interested resource.
     ///
     /// The builder receives the destination full JID and must not block the
-    /// router worker. Each stanza must use that JID. A failed mailbox retires
-    /// its session because dropping a roster push would leave stale client state.
+    /// router worker. Each stanza must use that JID. Build failures retire all
+    /// interested sessions. Mailbox failures retire the affected session.
     pub async fn route_roster_push(
         &self,
         account: &AccountKey,

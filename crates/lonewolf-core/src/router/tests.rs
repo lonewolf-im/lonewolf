@@ -411,6 +411,52 @@ fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResul
 }
 
 #[test]
+fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
+
+        for (username, fail_at) in [("alice", 0), ("bob", 1)] {
+            let account = account(&format!("{username}@localhost"))?;
+            let desk = handle.register(&account, Some("desk"), limit).await?;
+            let phone = handle.register(&account, Some("phone"), limit).await?;
+            let tablet = handle.register(&account, Some("tablet"), limit).await?;
+            desk.mark_roster_interested().await?;
+            phone.mark_roster_interested().await?;
+            tablet.mark_roster_interested().await?;
+
+            let mut calls = 0;
+            let result = handle
+                .route_roster_push(&account, move |to| {
+                    if calls == fail_at {
+                        return Err(RouterError::Unavailable);
+                    }
+                    calls += 1;
+                    roster_push(to, "push")
+                })
+                .await;
+            assert_eq!(result, Err(RouterError::Unavailable));
+
+            for resource in ["desk", "phone", "tablet"] {
+                let to = format!("{username}@localhost/{resource}");
+                assert_eq!(
+                    handle.route_full(stanza(&to).await?).await,
+                    Err(RouterError::NotFound)
+                );
+            }
+            assert!(desk.recv().await.is_none());
+            assert!(phone.recv().await.is_none());
+            assert!(tablet.recv().await.is_none());
+        }
+
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;

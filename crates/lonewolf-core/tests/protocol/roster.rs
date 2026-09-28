@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::support::{C2sSuite, TestResult};
+use crate::support::{C2sSuite, Client, TestResult};
 use compio::runtime::Runtime;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::redb::RedbRosterRepository;
@@ -12,6 +12,27 @@ use lonewolf_storage::roster::{
 };
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
+
+const ROSTER_NAMESPACE: &str = "jabber:iq:roster";
+
+fn request_roster(client: &mut Client, id: &str, expected: &str) -> TestResult {
+    client.send(&format!(
+        "<iq type='get' id='{id}'><query xmlns='{ROSTER_NAMESPACE}'/></iq>"
+    ))?;
+    client.expect_xml(expected)
+}
+
+fn expect_roster_push(client: &mut Client, to: &str, item: &str) -> TestResult<String> {
+    let push = client.receive()?;
+    push.assert_name("jabber:client", "iq");
+    assert_eq!(push.attribute("type"), Some("set"), "{push:?}");
+    assert_eq!(push.attribute("to"), Some(to), "{push:?}");
+    let id = push.attribute("id").ok_or("roster push has no ID")?.into();
+    let query = push.child(ROSTER_NAMESPACE, "query")?;
+    assert_eq!(query.children.len(), 1, "{push:?}");
+    query.children[0].assert_xml(item)?;
+    Ok(id)
+}
 
 fn seed_roster(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
@@ -102,6 +123,219 @@ fn roster_get_for_another_account_returns_forbidden() -> TestResult {
         "<iq type='get' id='other-roster' to='bob@localhost'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-roster' from='bob@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_adds_an_item_and_pushes_it_to_interested_resources() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut phone = suite.connect("alice", "password", "phone")?;
+    let mut tablet = suite.connect("alice", "password", "tablet")?;
+
+    request_roster(
+        &mut desk,
+        "desk-roster",
+        "<iq xmlns='jabber:client' type='result' id='desk-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    request_roster(
+        &mut phone,
+        "phone-roster",
+        "<iq xmlns='jabber:client' type='result' id='phone-roster' to='alice@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    desk.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob Smith'><group>Friends</group><group>Work</group></item></query></iq>")?;
+    desk.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='add-bob' to='alice@localhost/desk'/>",
+    )?;
+    let item = "<item xmlns='jabber:iq:roster' jid='bob@localhost' name='Bob Smith' subscription='none'><group>Friends</group><group>Work</group></item>";
+    let desk_push = expect_roster_push(&mut desk, "alice@localhost/desk", item)?;
+    let phone_push = expect_roster_push(&mut phone, "alice@localhost/phone", item)?;
+    desk.send(&format!("<iq type='result' id='{desk_push}'/>"))?;
+    phone.send(&format!("<iq type='result' id='{phone_push}'/>"))?;
+
+    request_roster(
+        &mut tablet,
+        "tablet-roster",
+        "<iq xmlns='jabber:client' type='result' id='tablet-roster' to='alice@localhost/tablet'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob Smith' subscription='none'><group>Friends</group><group>Work</group></item></query></iq>",
+    )?;
+
+    desk.close()?;
+    phone.close()?;
+    tablet.close()
+}
+
+#[test]
+fn roster_set_updates_editable_fields_and_preserves_subscription_state() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob Smith' subscription='both' ask='subscribe' approved='true'><group>Friends</group><group>Work</group></item></query></iq>",
+    )?;
+    alice.send("<iq type='set' id='update-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Robert' subscription='from'><group>Family</group></item></query></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='update-bob' to='alice@localhost/desk'/>",
+    )?;
+    let item = "<item xmlns='jabber:iq:roster' jid='bob@localhost' name='Robert' subscription='both' ask='subscribe' approved='true'><group>Family</group></item>";
+    let push = expect_roster_push(&mut alice, "alice@localhost/desk", item)?;
+    alice.send(&format!("<iq type='result' id='{push}'/>"))?;
+    request_roster(
+        &mut alice,
+        "updated-roster",
+        "<iq xmlns='jabber:client' type='result' id='updated-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Robert' subscription='both' ask='subscribe' approved='true'><group>Family</group></item></query></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_multiple_items_returns_bad_request_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send("<iq type='set' id='multiple-items'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/><item jid='carol@localhost'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='multiple-items' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/><item jid='carol@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    request_roster(
+        &mut alice,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_duplicate_groups_returns_bad_request_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send("<iq type='set' id='duplicate-groups'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group>Friends</group><group>Friends</group></item></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='duplicate-groups' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group>Friends</group><group>Friends</group></item></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    request_roster(
+        &mut alice,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_an_empty_group_returns_not_acceptable_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send("<iq type='set' id='empty-group'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group/></item></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='empty-group' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group/></item></query><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    request_roster(
+        &mut alice,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_for_another_account_returns_forbidden_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+
+    request_roster(
+        &mut bob,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send("<iq type='set' id='other-roster' to='bob@localhost'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-roster' from='bob@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    request_roster(
+        &mut bob,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn roster_set_without_an_item_returns_bad_request() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<iq type='set' id='missing-item'><query xmlns='jabber:iq:roster'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-item' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_without_an_item_jid_returns_bad_request() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<iq type='set' id='missing-jid'><query xmlns='jabber:iq:roster'><item name='Bob'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-jid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item name='Bob'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_a_full_jid_returns_bad_request() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<iq type='set' id='full-jid'><query xmlns='jabber:iq:roster'><item jid='bob@localhost/phone'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='full-jid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost/phone'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_does_not_push_to_an_uninterested_initiating_resource() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='add-bob' to='alice@localhost/desk'/>",
+    )?;
+    request_roster(
+        &mut alice,
+        "stored-roster",
+        "<iq xmlns='jabber:client' type='result' id='stored-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='none'/></query></iq>",
+    )?;
 
     alice.close()
 }

@@ -10,7 +10,7 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{PresenceType, StanzaErrorCondition, StanzaRef};
 
 use crate::RegistrationError;
-use crate::roster::RosterPush;
+use crate::roster::{RosterOrder, RosterPush};
 
 /// The direction relative to the local account.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -59,15 +59,24 @@ pub struct PresenceRequest<'a, A: ChunkAllocator> {
     pub stanza: StanzaRef<'a, Arena<A>>,
 }
 
+pub struct AcceptedPresence<'a> {
+    pub direction: PresenceDirection,
+    pub kind: PresenceRequestType,
+    pub sender: JidRef<'a>,
+    pub target: JidRef<'a>,
+}
+
 #[derive(Default)]
 pub enum PresenceEffect {
     #[default]
     None,
-    Route {
-        roster_push: Option<RosterPush>,
+    Route,
+    Deliver(RosterOrder),
+    Replay {
+        order: RosterOrder,
+        pending: Vec<PendingSubscription>,
     },
-    Deliver,
-    Replay(Vec<PendingSubscription>),
+    PushRoster(Option<RosterPush>),
 }
 
 pub type PresenceResult = Result<PresenceEffect, StanzaErrorCondition>;
@@ -78,6 +87,11 @@ pub trait PresenceHandler<A: ChunkAllocator>: Send + Sync {
     /// An error sends a stanza error to the request sender.
     /// The future runs on the connection worker and can be cancelled on shutdown.
     fn handle<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a>;
+
+    /// Applies sender state after the routed request is accepted.
+    fn accepted<'a>(&'a self, _request: AcceptedPresence<'a>) -> PresenceFuture<'a> {
+        Box::pin(async { Ok(PresenceEffect::None) })
+    }
 }
 
 pub struct PresenceRegistration<A: ChunkAllocator> {

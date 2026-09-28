@@ -18,8 +18,8 @@ use crate::iq::{
     IqScope,
 };
 use crate::presence::{
-    PresenceDirection, PresenceEffect, PresenceFuture, PresenceHandler, PresenceRegistration,
-    PresenceRequest, PresenceRequestType, PresenceRoute,
+    AcceptedPresence, PresenceDirection, PresenceEffect, PresenceFuture, PresenceHandler,
+    PresenceRegistration, PresenceRequest, PresenceRequestType, PresenceRoute,
 };
 
 pub const NAME: &str = "roster";
@@ -205,8 +205,6 @@ where
         Box::pin(async move {
             match (request.direction, request.kind) {
                 (PresenceDirection::Outbound, PresenceRequestType::Subscribe) => {
-                    let owner = AccountKey::try_from(request.sender.bare())
-                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
                     let contact_account = AccountKey::try_from(request.target.bare())
                         .map_err(|_| StanzaErrorCondition::BadRequest)?;
                     if self
@@ -218,28 +216,7 @@ where
                     {
                         return Err(StanzaErrorCondition::ServiceUnavailable);
                     }
-                    let contact = RosterJid::from(request.target.bare());
-                    let order = self.order.lock(&owner).await;
-                    let mutation = self
-                        .repository
-                        .update_subscription(&owner, &contact, |mut current| {
-                            if current.pending_out {
-                                return None;
-                            }
-                            current.pending_out = true;
-                            Some(current)
-                        })
-                        .await
-                        .map_err(roster_error)?;
-                    Ok(PresenceEffect::Route {
-                        roster_push: mutation.map(|mutation| {
-                            RosterPush::new(
-                                RosterOrder::new(order),
-                                mutation.value,
-                                mutation.version,
-                            )
-                        }),
-                    })
+                    Ok(PresenceEffect::Route)
                 }
                 (PresenceDirection::Inbound, PresenceRequestType::Subscribe) => {
                     let owner = AccountKey::try_from(request.target.bare())
@@ -253,6 +230,7 @@ where
                     {
                         return Err(StanzaErrorCondition::ServiceUnavailable);
                     }
+                    let order = RosterOrder::new(self.order.lock(&owner).await);
                     let mut stanza = String::new();
                     request
                         .stanza
@@ -268,17 +246,46 @@ where
                         )
                         .await
                         .map_err(roster_error)?;
-                    Ok(PresenceEffect::Deliver)
+                    Ok(PresenceEffect::Deliver(order))
                 }
                 (PresenceDirection::Outbound, PresenceRequestType::Available) => {
                     let owner = AccountKey::try_from(request.sender.bare())
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let order = RosterOrder::new(self.order.lock(&owner).await);
                     let pending = self
                         .repository
                         .pending(&owner)
                         .await
                         .map_err(roster_error)?;
-                    Ok(PresenceEffect::Replay(pending))
+                    Ok(PresenceEffect::Replay { order, pending })
+                }
+                _ => Err(StanzaErrorCondition::ServiceUnavailable),
+            }
+        })
+    }
+
+    fn accepted<'a>(&'a self, request: AcceptedPresence<'a>) -> PresenceFuture<'a> {
+        Box::pin(async move {
+            match (request.direction, request.kind) {
+                (PresenceDirection::Outbound, PresenceRequestType::Subscribe) => {
+                    let owner = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let contact = RosterJid::from(request.target.bare());
+                    let order = self.order.lock(&owner).await;
+                    let mutation = self
+                        .repository
+                        .update_subscription(&owner, &contact, |mut current| {
+                            if current.pending_out {
+                                return None;
+                            }
+                            current.pending_out = true;
+                            Some(current)
+                        })
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(PresenceEffect::PushRoster(mutation.map(|mutation| {
+                        RosterPush::new(RosterOrder::new(order), mutation.value, mutation.version)
+                    })))
                 }
                 _ => Err(StanzaErrorCondition::ServiceUnavailable),
             }

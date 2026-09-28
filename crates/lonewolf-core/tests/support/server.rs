@@ -223,12 +223,16 @@ max_resources_per_account = {resources}
     }
 
     pub fn create_account(&self, username: &str, password: &str) -> TestResult {
+        self.create_account_jid(&format!("{username}@localhost"), password)
+    }
+
+    pub fn create_account_jid(&self, jid: &str, password: &str) -> TestResult {
         let mut stream =
             UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
         let body = serde_json::json!({
-            "jid": format!("{username}@localhost"),
+            "jid": jid,
             "password": password,
         })
         .to_string();

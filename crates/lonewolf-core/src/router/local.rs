@@ -49,8 +49,16 @@ pub struct Registration<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
     _lease: oneshot::Sender<()>,
-    inbound: Receiver<RoutedStanza<A>>,
+    inbound: Receiver<ResourceDelivery<A>>,
     shard: Sender<Command<A>>,
+}
+
+pub(crate) enum ResourceDelivery<A: ChunkAllocator> {
+    Routed(RoutedStanza<A>),
+    Presence {
+        stanzas: Vec<RoutedStanza<A>>,
+        replay_pending: bool,
+    },
 }
 
 enum Command<A: ChunkAllocator> {
@@ -58,8 +66,8 @@ enum Command<A: ChunkAllocator> {
         account: AccountKey,
         requested: Option<Box<str>>,
         limit: NonZeroUsize,
-        outbound: Sender<RoutedStanza<A>>,
-        inbound: Receiver<RoutedStanza<A>>,
+        outbound: Sender<ResourceDelivery<A>>,
+        inbound: Receiver<ResourceDelivery<A>>,
         shard: Sender<Command<A>>,
         reply: oneshot::Sender<Result<Registration<A>, RouterError>>,
     },
@@ -73,13 +81,6 @@ enum Command<A: ChunkAllocator> {
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
     DeliverPresence {
-        stanza: RoutedStanza<A>,
-        reply: oneshot::Sender<Result<(), RouterError>>,
-    },
-    DeliverRegistered {
-        account: AccountKey,
-        resource: Box<str>,
-        token: u64,
         stanza: RoutedStanza<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
@@ -108,7 +109,7 @@ enum Command<A: ChunkAllocator> {
 struct Session<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
-    outbound: Sender<RoutedStanza<A>>,
+    outbound: Sender<ResourceDelivery<A>>,
     priority: Option<i8>,
     roster_interested: bool,
     presence: Option<RoutedStanza<A>>,
@@ -332,26 +333,11 @@ impl<A: ChunkAllocator> Registration<A> {
         format!("{}/{}", self.account.as_str(), self.resource)
     }
 
-    pub async fn recv(&self) -> Option<RoutedStanza<A>> {
+    pub(crate) async fn recv(&self) -> Option<ResourceDelivery<A>> {
         self.inbound.recv().await.ok()
     }
 
-    pub(crate) async fn deliver(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
-        let (reply, result) = oneshot::channel();
-        self.shard
-            .send(Command::DeliverRegistered {
-                account: self.account.clone(),
-                resource: self.resource.clone(),
-                token: self.token,
-                stanza,
-                reply,
-            })
-            .await
-            .map_err(|_| RouterError::Stopped)?;
-        result.await.map_err(|_| RouterError::Stopped)?
-    }
-
-    pub async fn set_presence(
+    pub(crate) async fn set_presence(
         &self,
         priority: Option<i8>,
         stanza: RoutedStanza<A>,
@@ -516,16 +502,6 @@ impl<A: ChunkAllocator> Shard<A> {
                 let result = self.deliver_presence(stanza);
                 let _ = reply.send(result);
             }
-            Command::DeliverRegistered {
-                account,
-                resource,
-                token,
-                stanza,
-                reply,
-            } => {
-                let result = self.deliver_registered(&account, &resource, token, stanza);
-                let _ = reply.send(result);
-            }
             Command::MarkRosterInterested {
                 account,
                 resource,
@@ -564,8 +540,8 @@ impl<A: ChunkAllocator> Shard<A> {
         account: AccountKey,
         requested: Option<Box<str>>,
         limit: NonZeroUsize,
-        outbound: Sender<RoutedStanza<A>>,
-        inbound: Receiver<RoutedStanza<A>>,
+        outbound: Sender<ResourceDelivery<A>>,
+        inbound: Receiver<ResourceDelivery<A>>,
         shard: Sender<Command<A>>,
     ) -> Result<Registration<A>, RouterError> {
         if let Some(sessions) = self.accounts.get(account.as_str()) {
@@ -651,7 +627,7 @@ impl<A: ChunkAllocator> Shard<A> {
             let delivery = if session.alive.load(Ordering::Acquire) {
                 session
                     .outbound
-                    .try_send(stanza.clone())
+                    .try_send(ResourceDelivery::Routed(stanza.clone()))
                     .map_err(mailbox_error)
             } else {
                 Err(RouterError::NotFound)
@@ -699,7 +675,10 @@ impl<A: ChunkAllocator> Shard<A> {
                     })
                     .max_by_key(|session| (session.priority, std::cmp::Reverse(session.token)))
                     .ok_or(RouterError::NotFound)?;
-                recipient.outbound.try_send(stanza).map_err(mailbox_error)
+                recipient
+                    .outbound
+                    .try_send(ResourceDelivery::Routed(stanza))
+                    .map_err(mailbox_error)
             }
             StanzaType::Message(MessageType::Headline) => {
                 let mut delivered = false;
@@ -708,7 +687,10 @@ impl<A: ChunkAllocator> Shard<A> {
                     session.alive.load(Ordering::Acquire)
                         && session.priority.is_some_and(|priority| priority >= 0)
                 }) {
-                    match session.outbound.try_send(stanza.clone()) {
+                    match session
+                        .outbound
+                        .try_send(ResourceDelivery::Routed(stanza.clone()))
+                    {
                         Ok(()) => delivered = true,
                         Err(TrySendError::Full(_)) => busy = true,
                         Err(TrySendError::Closed(_)) => {}
@@ -758,7 +740,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 failed.push((resource.clone(), session.token));
                 continue;
             }
-            match session.outbound.try_send(stanza.clone()) {
+            match session
+                .outbound
+                .try_send(ResourceDelivery::Routed(stanza.clone()))
+            {
                 Ok(()) => delivered = true,
                 Err(TrySendError::Full(_)) => {
                     busy = true;
@@ -861,7 +846,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 };
                 if session.token == token
                     && (!session.alive.load(Ordering::Acquire)
-                        || session.outbound.try_send(stanza).is_err())
+                        || session
+                            .outbound
+                            .try_send(ResourceDelivery::Routed(stanza))
+                            .is_err())
                 {
                     failed.push((resource, token));
                 }
@@ -882,8 +870,7 @@ impl<A: ChunkAllocator> Shard<A> {
         stanza: RoutedStanza<A>,
         unavailable: Option<RoutedStanza<A>>,
     ) -> Result<bool, RouterError> {
-        let became_available;
-        let snapshot_error = {
+        let (became_available, mut stanzas) = {
             let sessions = self
                 .accounts
                 .get(account.as_str())
@@ -892,30 +879,36 @@ impl<A: ChunkAllocator> Shard<A> {
             if source.token != token || !source.alive.load(Ordering::Acquire) {
                 return Err(RouterError::NotFound);
             }
-            became_available = priority.is_some() && source.priority.is_none();
-            if became_available {
+            let became_available = priority.is_some() && source.priority.is_none();
+            let stanzas = if became_available {
                 sessions
                     .values()
                     .filter(|session| session.token != token)
                     .filter_map(|session| session.presence.as_ref())
-                    .find_map(|presence| {
-                        source
-                            .outbound
-                            .try_send(presence.clone())
-                            .map_err(mailbox_error)
-                            .err()
-                    })
+                    .cloned()
+                    .collect()
             } else {
-                None
-            }
+                Vec::new()
+            };
+            (became_available, stanzas)
         };
-        if let Some(error) = snapshot_error {
+
+        stanzas.push(stanza.clone());
+        let delivery = ResourceDelivery::Presence {
+            stanzas,
+            replay_pending: became_available,
+        };
+        let source = self
+            .accounts
+            .get(account.as_str())
+            .and_then(|sessions| sessions.get(resource))
+            .ok_or(RouterError::NotFound)?;
+        if let Err(error) = source.outbound.try_send(delivery).map_err(mailbox_error) {
             self.remove(account.as_str(), resource, token);
             return Err(error);
         }
 
         let mut failed = Vec::new();
-        let mut source_error = None;
         {
             let sessions = self
                 .accounts
@@ -925,16 +918,14 @@ impl<A: ChunkAllocator> Shard<A> {
             source.priority = priority;
             source.unavailable = unavailable;
             for (recipient_resource, session) in sessions.iter() {
-                if session.alive.load(Ordering::Acquire)
-                    && (session.priority.is_some() || session.token == token)
-                    && let Err(error) = session
+                if session.token != token
+                    && session.alive.load(Ordering::Acquire)
+                    && session.priority.is_some()
+                    && session
                         .outbound
-                        .try_send(stanza.clone())
-                        .map_err(mailbox_error)
+                        .try_send(ResourceDelivery::Routed(stanza.clone()))
+                        .is_err()
                 {
-                    if session.token == token {
-                        source_error = Some(error);
-                    }
                     failed.push((recipient_resource.clone(), session.token));
                 }
             }
@@ -945,29 +936,7 @@ impl<A: ChunkAllocator> Shard<A> {
         for (recipient_resource, recipient_token) in failed {
             self.remove(account.as_str(), &recipient_resource, recipient_token);
         }
-        source_error.map_or(Ok(became_available), Err)
-    }
-
-    fn deliver_registered(
-        &mut self,
-        account: &AccountKey,
-        resource: &str,
-        token: u64,
-        stanza: RoutedStanza<A>,
-    ) -> Result<(), RouterError> {
-        let result = self
-            .accounts
-            .get(account.as_str())
-            .and_then(|sessions| sessions.get(resource))
-            .filter(|session| session.token == token && session.alive.load(Ordering::Acquire))
-            .ok_or(RouterError::NotFound)?
-            .outbound
-            .try_send(stanza)
-            .map_err(mailbox_error);
-        if result.is_err() {
-            self.remove(account.as_str(), resource, token);
-        }
-        result
+        Ok(became_available)
     }
 
     fn remove(&mut self, account: &str, resource: &str, token: u64) {
@@ -1002,7 +971,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
                         && recipient.priority.is_some()
-                        && recipient.outbound.try_send(unavailable.clone()).is_err()
+                        && recipient
+                            .outbound
+                            .try_send(ResourceDelivery::Routed(unavailable.clone()))
+                            .is_err()
                     {
                         pending.push((recipient_resource.clone(), recipient.token));
                     }
@@ -1139,13 +1111,21 @@ mod tests {
                 receivers.push(inbound);
             }
             let stanza = routed("<message to='alice@localhost' type='headline'/>").await?;
-            assert!(sessions["full"].outbound.try_send(stanza.clone()).is_ok());
+            assert!(
+                sessions["full"]
+                    .outbound
+                    .try_send(ResourceDelivery::Routed(stanza.clone()))
+                    .is_ok()
+            );
             receivers[2].close();
             shard.accounts.insert(account.as_str().into(), sessions);
 
             assert_eq!(shard.deliver_bare(stanza.clone(), false), Ok(()));
+            let ResourceDelivery::Routed(delivery) = receivers[0].try_recv()? else {
+                return Err("unexpected presence batch".into());
+            };
             assert_eq!(
-                receivers[0].try_recv()?.resolve()?.stanza_type(),
+                delivery.resolve()?.stanza_type(),
                 StanzaType::Message(MessageType::Headline)
             );
             assert_eq!(receivers[1].len(), 1);
@@ -1195,7 +1175,7 @@ mod tests {
                 phone_inbound,
                 command_sender,
             )?;
-            shard.presence(
+            let became_available = shard.presence(
                 &account,
                 "desk",
                 desk.token,
@@ -1203,8 +1183,12 @@ mod tests {
                 routed("<presence from='alice@localhost/desk'/>").await?,
                 Some(routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?),
             )?;
-            desk.recv().await.ok_or("missing own presence")?;
-            shard.presence(
+            assert!(became_available);
+            let Some(ResourceDelivery::Presence { stanzas, .. }) = desk.recv().await else {
+                return Err("missing desk presence batch".into());
+            };
+            assert_eq!(stanzas.len(), 1);
+            let became_available = shard.presence(
                 &account,
                 "phone",
                 phone.token,
@@ -1212,16 +1196,23 @@ mod tests {
                 routed("<presence from='alice@localhost/phone'/>").await?,
                 None,
             )?;
-            phone.recv().await.ok_or("missing snapshot")?;
-            phone.recv().await.ok_or("missing own presence")?;
-            desk.recv().await.ok_or("missing peer presence")?;
+            assert!(became_available);
+            let Some(ResourceDelivery::Presence { stanzas, .. }) = phone.recv().await else {
+                return Err("missing phone presence batch".into());
+            };
+            assert_eq!(stanzas.len(), 2);
+            let Some(ResourceDelivery::Routed(_)) = desk.recv().await else {
+                return Err("missing peer presence".into());
+            };
 
             drop(desk);
             assert_eq!(
                 shard.deliver(routed("<message to='alice@localhost/desk'/>").await?, false),
                 Err(RouterError::NotFound)
             );
-            let unavailable = phone.recv().await.ok_or("missing unavailable")?;
+            let Some(ResourceDelivery::Routed(unavailable)) = phone.recv().await else {
+                return Err("missing unavailable".into());
+            };
             assert_eq!(
                 unavailable.resolve()?.stanza_type(),
                 StanzaType::Presence(PresenceType::Unavailable)

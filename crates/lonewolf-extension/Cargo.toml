@@ -11,3 +11,7 @@ async-lock.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
+tempfile.workspace = true

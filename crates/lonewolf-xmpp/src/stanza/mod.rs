@@ -98,6 +98,7 @@ pub enum IqType {
 pub enum StanzaErrorCondition {
     BadRequest,
     Conflict,
+    Forbidden,
     InternalServerError,
     NotAllowed,
     ResourceConstraint,
@@ -109,6 +110,7 @@ impl StanzaErrorCondition {
         match self {
             Self::BadRequest => "bad-request",
             Self::Conflict => "conflict",
+            Self::Forbidden => "forbidden",
             Self::InternalServerError => "internal-server-error",
             Self::NotAllowed => "not-allowed",
             Self::ResourceConstraint => "resource-constraint",
@@ -120,6 +122,7 @@ impl StanzaErrorCondition {
         match self {
             Self::BadRequest => "modify",
             Self::Conflict | Self::NotAllowed | Self::ServiceUnavailable => "cancel",
+            Self::Forbidden => "auth",
             Self::InternalServerError | Self::ResourceConstraint => "wait",
         }
     }

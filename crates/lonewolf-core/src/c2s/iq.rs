@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::iq::{IqRequest, IqRequestType, IqScope};
+use lonewolf_extension::iq::{IqEffect, IqRequest, IqRequestType, IqScope};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::Parsed;
@@ -13,7 +13,7 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
     registration: &Registration<A>,
     router: &RouterHandle<A>,
     allocator: &A,
-) -> Result<(Stanza, Arena<A>), BuildError> {
+) -> Result<(Stanza, Arena<A>, IqEffect), BuildError> {
     let (request, mut arena) = parsed.into_parts();
     let account = registration.account();
     let sender_jid = Jid::from_trusted_parts_in(
@@ -53,7 +53,7 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
             .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)?
             .to(None)?
             .build()?;
-        return Ok((reply, arena));
+        return Ok((reply, arena, IqEffect::None));
     };
     let mut response = Arena::try_new_in(Default::default(), allocator.clone())?;
     let result = handler
@@ -67,16 +67,17 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
             &mut response,
         )
         .await;
-    let payload = match result {
-        Ok(payload) => payload,
+    let outcome = match result {
+        Ok(response) => response,
         Err(condition) => {
             let reply = request
                 .error_reply_in(&mut arena, condition)?
                 .to(Some(sender_jid))?
                 .build()?;
-            return Ok((reply, arena));
+            return Ok((reply, arena, IqEffect::None));
         }
     };
+    let (payload, effect) = outcome.into_parts();
     let recipient = sender.clone_in(&mut response)?;
     let from = stanza
         .to()?
@@ -94,5 +95,5 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
         builder = builder.child(payload)?;
     }
     let reply = builder.build()?;
-    Ok((reply, response))
+    Ok((reply, response, effect))
 }

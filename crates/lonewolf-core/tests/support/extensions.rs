@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use lonewolf_extension::Extensions;
 use lonewolf_extension::iq::{
-    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqRoute, IqScope,
+    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute, IqScope,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
@@ -91,7 +91,7 @@ impl<A: ChunkAllocator> IqHandler<A> for Deny {
 
 impl<A: ChunkAllocator> IqHandler<A> for Empty {
     fn handle<'a>(&'a self, _: IqRequest<'a, A>, _: &'a mut Arena<A>) -> IqFuture<'a> {
-        Box::pin(async { Ok(None) })
+        Box::pin(async { Ok(IqResponse::new(None)) })
     }
 }
 
@@ -112,7 +112,7 @@ impl<A: ChunkAllocator> IqHandler<A> for Identity {
                 })
                 .and_then(|builder| builder.build());
             result
-                .map(Some)
+                .map(|payload| IqResponse::new(Some(payload)))
                 .map_err(|_| StanzaErrorCondition::InternalServerError)
         })
     }

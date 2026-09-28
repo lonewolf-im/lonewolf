@@ -19,6 +19,7 @@ pub enum RunError {
         host: String,
         source: RegistrationError,
     },
+    ExtensionCatalog(RegistrationError),
     StanzaPool(PoolError),
     Runtime(io::Error),
     WorkerCount(io::Error),
@@ -42,6 +43,10 @@ pub enum RunError {
         store: String,
         source: StorageError,
     },
+    Rosters {
+        store: String,
+        source: StorageError,
+    },
 }
 
 impl fmt::Display for RunError {
@@ -54,6 +59,9 @@ impl fmt::Display for RunError {
                 formatter,
                 "cannot initialize extensions for {host:?}: {source}"
             ),
+            Self::ExtensionCatalog(source) => {
+                write!(formatter, "cannot initialize extension catalog: {source}")
+            }
             Self::StanzaPool(source) => {
                 write!(formatter, "cannot initialize stanza arena pool: {source}")
             }
@@ -82,6 +90,10 @@ impl fmt::Display for RunError {
                 formatter,
                 "cannot initialize account repository in store {store:?}: {source}"
             ),
+            Self::Rosters { store, source } => write!(
+                formatter,
+                "cannot initialize roster repository in store {store:?}: {source}"
+            ),
         }
     }
 }
@@ -93,6 +105,7 @@ impl Error for RunError {
             Self::Config(source) => Some(source),
             Self::Hosts(source) => Some(source),
             Self::Extensions { source, .. } => Some(source),
+            Self::ExtensionCatalog(source) => Some(source),
             Self::StanzaPool(source) => Some(source),
             Self::Runtime(source)
             | Self::WorkerCount(source)
@@ -104,7 +117,9 @@ impl Error for RunError {
             | Self::Admin(source)
             | Self::C2s(source) => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),
-            Self::Storage { source, .. } | Self::Accounts { source, .. } => Some(source),
+            Self::Storage { source, .. }
+            | Self::Accounts { source, .. }
+            | Self::Rosters { source, .. } => Some(source),
             Self::UnknownStore(_) => None,
         }
     }

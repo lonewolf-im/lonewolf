@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -58,6 +59,19 @@ impl C2sSuite {
         Self::with_hosts(&format!("[hosts.localhost]\nextensions = [{extensions}]"))
     }
 
+    pub fn with_extensions_and_setup(
+        extensions: &str,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
+        Self::settings_with_setup(
+            "",
+            "",
+            10,
+            &format!("[hosts.localhost]\nextensions = [{extensions}]"),
+            setup,
+        )
+    }
+
     pub fn with_hosts(hosts: &str) -> TestResult<Self> {
         Self::settings("", "", 10, hosts)
     }
@@ -87,6 +101,16 @@ impl C2sSuite {
     }
 
     fn settings(listener: &str, limits: &str, resources: usize, hosts: &str) -> TestResult<Self> {
+        Self::settings_with_setup(listener, limits, resources, hosts, |_| Ok(()))
+    }
+
+    fn settings_with_setup(
+        listener: &str,
+        limits: &str,
+        resources: usize,
+        hosts: &str,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
         let permit = C2sSuitePermit::acquire();
         let directory = tempfile::tempdir()?;
         let tls = tls::configure(directory.path())?;
@@ -111,6 +135,7 @@ max_resources_per_account = {resources}
 "#
             ),
         )?;
+        setup(directory.path())?;
         let child = Command::new(std::env::current_exe()?)
             .args([
                 "--exact",

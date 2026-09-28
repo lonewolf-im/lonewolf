@@ -28,6 +28,8 @@ const SHARD_QUEUE_CAPACITY: usize = 1_024;
 const RESOURCE_QUEUE_CAPACITY: usize = 64;
 const SHARD_BATCH_SIZE: usize = 64;
 
+type RosterPushFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
+
 /// Owns one account shard on each core worker.
 pub struct LocalRouter<A: ChunkAllocator> {
     handle: LocalRouterHandle<A>,
@@ -70,6 +72,17 @@ enum Command<A: ChunkAllocator> {
         stanza: RoutedStanza<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
+    MarkRosterInterested {
+        account: AccountKey,
+        resource: Box<str>,
+        token: u64,
+        reply: oneshot::Sender<Result<(), RouterError>>,
+    },
+    DeliverRosterPush {
+        account: AccountKey,
+        build: RosterPushFactory<A>,
+        reply: oneshot::Sender<Result<(), RouterError>>,
+    },
     Presence {
         account: AccountKey,
         resource: Box<str>,
@@ -86,6 +99,7 @@ struct Session<A: ChunkAllocator> {
     alive: Arc<AtomicBool>,
     outbound: Sender<RoutedStanza<A>>,
     priority: Option<i8>,
+    roster_interested: bool,
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
 }
@@ -244,6 +258,23 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
+    pub(crate) async fn deliver_roster_push(
+        &self,
+        account: &AccountKey,
+        build: impl FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send + 'static,
+    ) -> Result<(), RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard(account.as_str())
+            .send(Command::DeliverRosterPush {
+                account: account.clone(),
+                build: Box::new(build),
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
     fn shard(&self, bare: &str) -> &Sender<Command<A>> {
         &self.shards[self.shard_index(bare)]
     }
@@ -285,6 +316,21 @@ impl<A: ChunkAllocator> Registration<A> {
                 priority,
                 stanza,
                 unavailable,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
+    /// Marks this bound resource as a roster push recipient.
+    pub async fn mark_roster_interested(&self) -> Result<(), RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard
+            .send(Command::MarkRosterInterested {
+                account: self.account.clone(),
+                resource: self.resource.clone(),
+                token: self.token,
                 reply,
             })
             .await
@@ -416,6 +462,23 @@ impl<A: ChunkAllocator> Shard<A> {
                 let result = self.deliver_bare(stanza, false);
                 let _ = reply.send(result);
             }
+            Command::MarkRosterInterested {
+                account,
+                resource,
+                token,
+                reply,
+            } => {
+                let result = self.mark_roster_interested(&account, &resource, token);
+                let _ = reply.send(result);
+            }
+            Command::DeliverRosterPush {
+                account,
+                mut build,
+                reply,
+            } => {
+                let result = self.deliver_roster_push(&account, &mut build);
+                let _ = reply.send(result);
+            }
             Command::Presence {
                 account,
                 resource,
@@ -491,6 +554,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 alive: Arc::clone(&alive),
                 outbound,
                 priority: None,
+                roster_interested: false,
                 presence: None,
                 unavailable: None,
             },
@@ -596,6 +660,86 @@ impl<A: ChunkAllocator> Shard<A> {
             }
             _ => Err(RouterError::InvalidTarget),
         }
+    }
+
+    fn mark_roster_interested(
+        &mut self,
+        account: &AccountKey,
+        resource: &str,
+        token: u64,
+    ) -> Result<(), RouterError> {
+        let session = self
+            .accounts
+            .get_mut(account.as_str())
+            .and_then(|sessions| sessions.get_mut(resource))
+            .ok_or(RouterError::NotFound)?;
+        if session.token != token || !session.alive.load(Ordering::Acquire) {
+            return Err(RouterError::NotFound);
+        }
+        session.roster_interested = true;
+        Ok(())
+    }
+
+    fn deliver_roster_push(
+        &mut self,
+        account: &AccountKey,
+        build: &mut RosterPushFactory<A>,
+    ) -> Result<(), RouterError> {
+        let Some(sessions) = self.accounts.get(account.as_str()) else {
+            return Ok(());
+        };
+        if sessions.values().all(|session| !session.roster_interested) {
+            return Ok(());
+        }
+        let max_resource_len = sessions
+            .keys()
+            .map(|resource| resource.len())
+            .max()
+            .unwrap_or(0);
+        let mut full_jid = String::with_capacity(account.as_str().len() + 1 + max_resource_len);
+        let mut deliveries = Vec::with_capacity(sessions.len());
+        let mut failed = Vec::new();
+        for (resource, session) in sessions {
+            if !session.roster_interested {
+                continue;
+            }
+            if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
+                failed.push((resource.clone(), session.token));
+                continue;
+            }
+            full_jid.clear();
+            full_jid.push_str(account.as_str());
+            full_jid.push('/');
+            full_jid.push_str(resource);
+            let stanza = build(&full_jid)?;
+            let target = stanza
+                .resolve()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            if target.as_str() != full_jid {
+                return Err(RouterError::InvalidTarget);
+            }
+            deliveries.push((resource.clone(), session.token, stanza));
+        }
+        if let Some(sessions) = self.accounts.get(account.as_str()) {
+            for (resource, token, stanza) in deliveries {
+                let Some(session) = sessions.get(resource.as_ref()) else {
+                    continue;
+                };
+                if session.token == token
+                    && (!session.alive.load(Ordering::Acquire)
+                        || session.outbound.try_send(stanza).is_err())
+                {
+                    failed.push((resource, token));
+                }
+            }
+        }
+        for (resource, token) in failed {
+            self.remove(account.as_str(), &resource, token);
+        }
+        Ok(())
     }
 
     fn presence(
@@ -815,6 +959,7 @@ mod tests {
                         alive: Arc::new(AtomicBool::new(true)),
                         outbound,
                         priority: Some(0),
+                        roster_interested: false,
                         presence: None,
                         unavailable: None,
                     },

@@ -134,6 +134,22 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             self.local.deliver_bare(stanza).await
         }
     }
+
+    /// Builds and enqueues one push for each interested resource.
+    ///
+    /// The builder receives the destination full JID and must not block the
+    /// router worker. Each stanza must use that JID. A failed mailbox retires
+    /// its session because dropping a roster push would leave stale client state.
+    pub async fn route_roster_push(
+        &self,
+        account: &AccountKey,
+        build: impl FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send + 'static,
+    ) -> Result<(), RouterError> {
+        if !self.hosts.is_local_host(account.domain()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        self.local.deliver_roster_push(account, build).await
+    }
 }
 
 impl<A: ChunkAllocator> RoutedStanza<A> {

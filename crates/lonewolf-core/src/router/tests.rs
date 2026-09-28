@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -19,9 +20,10 @@ use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
-use lonewolf_xmpp::stanza::StanzaKind;
+use lonewolf_xmpp::stanza::{Element, IqType, Stanza, StanzaKind, StanzaNamespace, StanzaType};
 
 type TestResult = Result<(), Box<dyn Error>>;
+type TestRosterPush = Result<RoutedStanza<GlobalChunkAllocator>, RouterError>;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 
@@ -87,6 +89,46 @@ async fn unavailable_presence(
         "<presence from='alice@localhost/{resource}' type='unavailable'/>"
     ))
     .await
+}
+
+fn roster_push(to: &str, id: &str) -> TestRosterPush {
+    let mut arena = Arena::try_new(ArenaConfig::default()).map_err(|_| RouterError::Unavailable)?;
+    let item = Element::builder_in("item", "jabber:iq:roster", &mut arena)
+        .map_err(|_| RouterError::Unavailable)?
+        .attribute("jid", "", "bob@localhost")
+        .map_err(|_| RouterError::Unavailable)?
+        .build()
+        .map_err(|_| RouterError::Unavailable)?;
+    let query = Element::builder_in("query", "jabber:iq:roster", &mut arena)
+        .map_err(|_| RouterError::Unavailable)?
+        .child(item)
+        .map_err(|_| RouterError::Unavailable)?
+        .build()
+        .map_err(|_| RouterError::Unavailable)?;
+    let to = Jid::parse_in(to, &mut arena).map_err(|_| RouterError::InvalidTarget)?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Iq(IqType::Set),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .id(Some(id))
+    .map_err(|_| RouterError::Unavailable)?
+    .to(Some(to))
+    .map_err(|_| RouterError::Unavailable)?
+    .child(query)
+    .map_err(|_| RouterError::Unavailable)?
+    .build()
+    .map_err(|_| RouterError::Unavailable)?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
+}
+
+fn roster_pushes() -> impl FnMut(&str) -> TestRosterPush + Send {
+    let mut next_id = 0;
+    move |to| {
+        let id = format!("push-{next_id}");
+        next_id += 1;
+        roster_push(to, &id)
+    }
 }
 
 #[test]
@@ -250,6 +292,147 @@ fn exact_delivery_respects_mailbox_capacity_and_lease() -> TestResult {
             .route_full(stanza("alice@localhost/desk").await?)
             .await?;
         drop(registration);
+        assert!(matches!(
+            handle
+                .route_full(stanza("alice@localhost/desk").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn roster_push_reaches_only_interested_resources() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        let tablet = handle.register(&alice, Some("tablet"), limit).await?;
+        desk.mark_roster_interested().await?;
+        tablet.mark_roster_interested().await?;
+
+        handle.route_roster_push(&alice, roster_pushes()).await?;
+
+        let desk_push = desk.recv().await.ok_or("missing desk push")?;
+        let tablet_push = tablet.recv().await.ok_or("missing tablet push")?;
+        let desk_view = desk_push.resolve()?;
+        let tablet_view = tablet_push.resolve()?;
+        assert_eq!(
+            desk_view.to()?.ok_or("missing desk target")?.as_str(),
+            "alice@localhost/desk"
+        );
+        assert_eq!(
+            tablet_view.to()?.ok_or("missing tablet target")?.as_str(),
+            "alice@localhost/tablet"
+        );
+        assert_ne!(desk_view.id()?, tablet_view.id()?);
+
+        handle
+            .route_full(stanza("alice@localhost/phone").await?)
+            .await?;
+        assert_eq!(
+            phone
+                .recv()
+                .await
+                .ok_or("missing phone message")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Message
+        );
+
+        drop(desk);
+        drop(phone);
+        drop(tablet);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        desk.mark_roster_interested().await?;
+        phone.mark_roster_interested().await?;
+        for _ in 0..64 {
+            handle
+                .route_full(stanza("alice@localhost/phone").await?)
+                .await?;
+        }
+
+        handle.route_roster_push(&alice, roster_pushes()).await?;
+
+        assert_eq!(
+            desk.recv()
+                .await
+                .ok_or("missing desk push")?
+                .resolve()?
+                .kind(),
+            StanzaKind::Iq
+        );
+        assert!(matches!(
+            handle
+                .route_full(stanza("alice@localhost/phone").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+        for _ in 0..64 {
+            assert_eq!(
+                phone
+                    .recv()
+                    .await
+                    .ok_or("missing queued message")?
+                    .resolve()?
+                    .kind(),
+                StanzaKind::Message
+            );
+        }
+        assert!(phone.recv().await.is_none());
+
+        drop(desk);
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.mark_roster_interested().await?;
+        drop(desk);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        handle
+            .route_roster_push(&alice, {
+                let calls = Arc::clone(&calls);
+                move |to| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    roster_push(to, "push")
+                }
+            })
+            .await?;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert!(matches!(
             handle
                 .route_full(stanza("alice@localhost/desk").await?)

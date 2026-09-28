@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 
 use rustls::ClientConfig;
 
-use super::{TIMEOUT, TestResult, tls};
+use super::{Client, PlainClient, TIMEOUT, TestResult, tls};
 
 static ACTIVE_SERVERS: Mutex<usize> = Mutex::new(0);
 static SERVER_SLOT: Condvar = Condvar::new();
 
-struct ServerPermit;
+struct C2sSuitePermit;
 
-impl ServerPermit {
+impl C2sSuitePermit {
     fn acquire() -> Self {
         let active = ACTIVE_SERVERS
             .lock()
@@ -31,7 +31,7 @@ impl ServerPermit {
     }
 }
 
-impl Drop for ServerPermit {
+impl Drop for C2sSuitePermit {
     fn drop(&mut self) {
         let mut active = ACTIVE_SERVERS
             .lock()
@@ -41,20 +41,36 @@ impl Drop for ServerPermit {
     }
 }
 
-pub struct Server {
-    _permit: ServerPermit,
+pub struct C2sSuite {
+    _permit: C2sSuitePermit,
     child: Child,
     directory: tempfile::TempDir,
     pub address: SocketAddr,
     pub tls: Arc<ClientConfig>,
 }
 
-impl Server {
+impl C2sSuite {
     pub fn start() -> TestResult<Self> {
         Self::configured("", "")
     }
 
-    pub fn configured(listener: &str, limits: &str) -> TestResult<Self> {
+    pub fn with_limits(limits: &str) -> TestResult<Self> {
+        Self::configured("", limits)
+    }
+
+    pub fn with_auth_mechanisms(mechanisms: &[&str]) -> TestResult<Self> {
+        let listener = format!(
+            "auth_mechanisms = [{}]",
+            mechanisms
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Self::configured(&listener, "")
+    }
+
+    fn configured(listener: &str, limits: &str) -> TestResult<Self> {
         Self::settings(listener, limits, 10)
     }
 
@@ -63,7 +79,7 @@ impl Server {
     }
 
     fn settings(listener: &str, limits: &str, resources: usize) -> TestResult<Self> {
-        let permit = ServerPermit::acquire();
+        let permit = C2sSuitePermit::acquire();
         let directory = tempfile::tempdir()?;
         let tls = tls::configure(directory.path())?;
         fs::write(
@@ -150,6 +166,26 @@ max_resources_per_account = {resources}
         }
     }
 
+    pub fn tcp_client(&self) -> TestResult<PlainClient> {
+        PlainClient::tcp(self)
+    }
+
+    pub fn tls_client(&self) -> TestResult<Client> {
+        Client::encrypted(self)
+    }
+
+    pub fn unauthenticated_client(&self) -> TestResult<Client> {
+        Client::secure(self)
+    }
+
+    pub fn authenticated_client(&self, username: &str, password: &str) -> TestResult<Client> {
+        Client::authenticated(self, username, password)
+    }
+
+    pub fn connect(&self, username: &str, password: &str, resource: &str) -> TestResult<Client> {
+        Client::connect(self, username, password, resource)
+    }
+
     pub fn create_account(&self, username: &str, password: &str) -> TestResult {
         let mut stream =
             UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
@@ -172,7 +208,7 @@ max_resources_per_account = {resources}
     }
 }
 
-impl Drop for Server {
+impl Drop for C2sSuite {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();

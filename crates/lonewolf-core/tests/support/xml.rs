@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
@@ -47,25 +47,40 @@ impl Element {
         })
     }
 
+    pub fn assert_xml(&self, expected: &str) -> TestResult {
+        let mut stream = XmlStream::new(Cursor::new(expected.as_bytes()));
+        let expected = stream.receive()?;
+        self.assert_same_content(&expected);
+        Ok(())
+    }
+
+    fn assert_same_content(&self, expected: &Self) {
+        self.assert_name(&expected.namespace, &expected.name);
+        assert!(
+            self.content_attributes().eq(expected.content_attributes()),
+            "attributes differ: actual {self:?}, expected {expected:?}"
+        );
+        if self.children.is_empty()
+            || !self.text.trim().is_empty()
+            || !expected.text.trim().is_empty()
+        {
+            assert_eq!(self.text, expected.text, "{self:?}");
+        }
+        assert_eq!(self.children.len(), expected.children.len(), "{self:?}");
+        for (actual, expected) in self.children.iter().zip(&expected.children) {
+            actual.assert_same_content(expected);
+        }
+    }
+
+    fn content_attributes(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.attributes
+            .iter()
+            .filter(|(name, _)| *name != "xmlns" && !name.starts_with("xmlns:"))
+    }
+
     pub fn assert_name(&self, namespace: &str, name: &str) {
         assert_eq!(self.namespace, namespace, "{self:?}");
         assert_eq!(self.name, name, "{self:?}");
-    }
-
-    pub fn assert_stanza_error(
-        &self,
-        name: &str,
-        id: &str,
-        kind: &str,
-        condition: &str,
-    ) -> TestResult {
-        self.assert_name("jabber:client", name);
-        assert_eq!(self.attribute("id"), Some(id), "{self:?}");
-        assert_eq!(self.attribute("type"), Some("error"), "{self:?}");
-        let error = self.child("jabber:client", "error")?;
-        assert_eq!(error.attribute("type"), Some(kind), "{error:?}");
-        error.child("urn:ietf:params:xml:ns:xmpp-stanzas", condition)?;
-        Ok(())
     }
 
     pub fn attribute(&self, name: &str) -> Option<&str> {
@@ -85,7 +100,7 @@ pub struct XmlStream<R> {
     buffer: Vec<u8>,
 }
 
-impl<R: Read + Write> XmlStream<R> {
+impl<R: Read> XmlStream<R> {
     pub fn new(transport: R) -> Self {
         Self::from_buffered(BufReader::new(transport))
     }
@@ -111,23 +126,35 @@ impl<R: Read + Write> XmlStream<R> {
         self.reader.get_mut().get_mut()
     }
 
-    pub fn send(&mut self, xml: &str) -> TestResult {
+    pub fn send(&mut self, xml: &str) -> TestResult
+    where
+        R: Write,
+    {
         self.send_bytes(xml.as_bytes())
     }
 
-    pub fn send_bytes(&mut self, xml: &[u8]) -> TestResult {
+    pub fn send_bytes(&mut self, xml: &[u8]) -> TestResult
+    where
+        R: Write,
+    {
         let transport = self.transport();
         transport.write_all(xml)?;
         transport.flush()?;
         Ok(())
     }
 
-    pub fn open(&mut self) -> TestResult<Element> {
+    pub fn open(&mut self) -> TestResult<Element>
+    where
+        R: Write,
+    {
         self.open_with(super::OPEN)?;
         self.features()
     }
 
-    pub fn open_with(&mut self, opening: &str) -> TestResult<Element> {
+    pub fn open_with(&mut self, opening: &str) -> TestResult<Element>
+    where
+        R: Write,
+    {
         self.send(opening)?;
         loop {
             self.buffer.clear();
@@ -196,6 +223,11 @@ impl<R: Read + Write> XmlStream<R> {
             }
         }
     }
+
+    pub fn expect_xml(&mut self, expected: &str) -> TestResult {
+        self.receive()?.assert_xml(expected)
+    }
+
     pub fn expect_stream_error(&mut self, condition: &str) -> TestResult {
         let error = self.receive()?;
         error.assert_name(STREAM_NAMESPACE, "error");
@@ -204,7 +236,10 @@ impl<R: Read + Write> XmlStream<R> {
         self.expect_end()
     }
 
-    pub fn close(&mut self) -> TestResult {
+    pub fn close(&mut self) -> TestResult
+    where
+        R: Write,
+    {
         self.send("</stream:stream>")?;
         self.expect_end()
     }

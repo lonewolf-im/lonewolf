@@ -13,13 +13,13 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use super::xml::{Element, XmlStream};
-use super::{BIND_NAMESPACE, SASL_NAMESPACE, Server, TIMEOUT, TLS_NAMESPACE, TestResult};
+use super::{BIND_NAMESPACE, C2sSuite, SASL_NAMESPACE, TIMEOUT, TLS_NAMESPACE, TestResult};
 
 pub type Client = XmlStream<StreamOwned<ClientConnection, TcpStream>>;
 pub type PlainClient = XmlStream<TcpStream>;
 
 impl PlainClient {
-    pub fn tcp(server: &Server) -> TestResult<Self> {
+    pub fn tcp(server: &C2sSuite) -> TestResult<Self> {
         let socket = TcpStream::connect_timeout(&server.address, TIMEOUT)?;
         socket.set_read_timeout(Some(TIMEOUT))?;
         socket.set_write_timeout(Some(TIMEOUT))?;
@@ -27,7 +27,7 @@ impl PlainClient {
         Ok(Self::new(socket))
     }
 
-    pub fn start_tls(mut self, server: &Server) -> TestResult<Client> {
+    pub fn start_tls(mut self, server: &C2sSuite) -> TestResult<Client> {
         self.send(&format!("<starttls xmlns='{TLS_NAMESPACE}'/>"))?;
         self.receive()?.assert_name(TLS_NAMESPACE, "proceed");
         let socket = self.into_inner();
@@ -42,7 +42,7 @@ impl PlainClient {
 }
 
 impl Client {
-    pub fn encrypted(server: &Server) -> TestResult<Self> {
+    pub fn encrypted(server: &C2sSuite) -> TestResult<Self> {
         let mut plain = PlainClient::tcp(server)?;
         let features = plain.open()?;
         features
@@ -52,13 +52,13 @@ impl Client {
         plain.start_tls(server)
     }
 
-    pub fn secure(server: &Server) -> TestResult<Self> {
+    pub fn secure(server: &C2sSuite) -> TestResult<Self> {
         let mut client = Self::encrypted(server)?;
         client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
         Ok(client)
     }
 
-    pub fn authenticated(server: &Server, username: &str, password: &str) -> TestResult<Self> {
+    pub fn authenticated(server: &C2sSuite, username: &str, password: &str) -> TestResult<Self> {
         let mut client = Self::secure(server)?;
         client.authenticate(username, password)?;
         let mut client = client.restart();
@@ -69,7 +69,7 @@ impl Client {
     }
 
     pub fn connect(
-        server: &Server,
+        server: &C2sSuite,
         username: &str,
         password: &str,
         resource: &str,
@@ -78,6 +78,26 @@ impl Client {
         let jid = client.bind(Some(resource))?;
         assert_eq!(jid, format!("{username}@localhost/{resource}"));
         Ok(client)
+    }
+
+    pub fn send_sasl_auth(&mut self, mechanism: &str, first: &str) -> TestResult {
+        self.send(&format!(
+            "<auth xmlns='{SASL_NAMESPACE}' mechanism='{mechanism}'>{}</auth>",
+            STANDARD.encode(first)
+        ))
+    }
+
+    pub fn receive_sasl_challenge(&mut self) -> TestResult<String> {
+        let reply = self.receive()?;
+        reply.assert_name(SASL_NAMESPACE, "challenge");
+        Ok(String::from_utf8(STANDARD.decode(reply.text)?)?)
+    }
+
+    pub fn send_sasl_response(&mut self, response: &str) -> TestResult {
+        self.send(&format!(
+            "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
+            STANDARD.encode(response)
+        ))
     }
 
     pub fn authenticate(&mut self, username: &str, password: &str) -> TestResult {
@@ -102,12 +122,6 @@ impl Client {
             .child(BIND_NAMESPACE, "jid")?
             .text
             .clone())
-    }
-
-    pub fn barrier(&mut self) -> TestResult {
-        self.send("<iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
-        self.receive()?
-            .assert_stanza_error("iq", "barrier", "cancel", "service-unavailable")
     }
 }
 

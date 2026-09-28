@@ -6,7 +6,7 @@ mod tls;
 pub mod xml;
 
 pub use client::{Client, PlainClient};
-pub use server::Server;
+pub use server::C2sSuite;
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 

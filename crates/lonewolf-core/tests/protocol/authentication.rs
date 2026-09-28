@@ -1,282 +1,533 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-
 use super::support::xml::STREAM_NAMESPACE;
-use super::support::{
-    BIND_NAMESPACE, Client, OPEN, SASL_NAMESPACE, STREAM_ERRORS, Server, TestResult,
-};
+use super::support::{C2sSuite, OPEN, SASL_NAMESPACE, STREAM_ERRORS, TestResult};
 
-fn auth(client: &mut Client, mechanism: &str, first: &str) -> TestResult {
-    client.send(&format!(
-        "<auth xmlns='{SASL_NAMESPACE}' mechanism='{mechanism}'>{}</auth>",
-        STANDARD.encode(first)
-    ))
-}
+#[test]
+fn scram_sha256_authenticates() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
 
-fn challenge(client: &mut Client) -> TestResult<String> {
-    let reply = client.receive()?;
-    reply.assert_name(SASL_NAMESPACE, "challenge");
-    Ok(String::from_utf8(STANDARD.decode(reply.text)?)?)
-}
+    client
+        .scram("Alice", "pencil", "SCRAM-SHA-256", None)?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
 
-fn response(client: &mut Client, value: &str) -> TestResult {
-    client.send(&format!(
-        "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
-        STANDARD.encode(value)
-    ))
-}
-
-fn failure(client: &mut Client, condition: &str) -> TestResult {
-    let reply = client.receive()?;
-    reply.assert_name(SASL_NAMESPACE, "failure");
-    reply.child(SASL_NAMESPACE, condition)?;
-    Ok(())
+    client.features()?.assert_xml(
+        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
+    </stream:features>",
+    )?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
 }
 
 #[test]
-fn scram_hashes_and_both_channel_bindings_authenticate_and_allow_binding() -> TestResult {
-    let server = Server::start()?;
-    server.create_account("alice", "pencil")?;
-    for hash in ["SCRAM-SHA-256", "SCRAM-SHA-1"] {
-        for binding in [None, Some("tls-exporter"), Some("tls-server-end-point")] {
-            let mechanism = if binding.is_some() {
-                format!("{hash}-PLUS")
-            } else {
-                hash.into()
-            };
-            let mut client = Client::secure(&server)?;
+fn scram_sha256_plus_with_tls_exporter_authenticates() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client
+        .scram(
+            "Alice",
+            "pencil",
+            "SCRAM-SHA-256-PLUS",
+            Some("tls-exporter"),
+        )?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
+
+    client.features()?.assert_xml(
+        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
+    </stream:features>",
+    )?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn scram_sha256_plus_with_tls_server_end_point_authenticates() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client
+        .scram(
+            "Alice",
+            "pencil",
+            "SCRAM-SHA-256-PLUS",
+            Some("tls-server-end-point"),
+        )?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
+
+    client.features()?.assert_xml(
+        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
+    </stream:features>",
+    )?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn scram_sha1_authenticates() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client
+        .scram("Alice", "pencil", "SCRAM-SHA-1", None)?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
+
+    client.features()?.assert_xml(
+        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
+    </stream:features>",
+    )?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn scram_sha1_plus_with_tls_exporter_authenticates() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client
+        .scram("Alice", "pencil", "SCRAM-SHA-1-PLUS", Some("tls-exporter"))?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
+
+    client.features()?.assert_xml(
+        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
+    </stream:features>",
+    )?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn scram_sha1_plus_with_tls_server_end_point_authenticates() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client
+        .scram(
+            "Alice",
+            "pencil",
+            "SCRAM-SHA-1-PLUS",
+            Some("tls-server-end-point"),
+        )?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
+
+    client.features()?.assert_xml(
+        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
+    </stream:features>",
+    )?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn non_plus_listener_rejects_disabled_plus_mechanism() -> TestResult {
+    let suite = C2sSuite::with_auth_mechanisms(&["SCRAM-SHA-256"])?;
+    let mut client = suite.tls_client()?;
+    client.open()?.assert_xml("<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>SCRAM-SHA-256</mechanism></mechanisms>
+    </stream:features>")?;
+
+    client.send_sasl_auth("SCRAM-SHA-256-PLUS", "n,,n=alice,r=nonce")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn plus_only_listener_rejects_non_plus_authentication() -> TestResult {
+    let suite = C2sSuite::with_auth_mechanisms(&["SCRAM-SHA-1-PLUS"])?;
+    let mut client = suite.tls_client()?;
+    client.open()?.assert_xml("<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
+        <sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/><channel-binding type='tls-exporter'/></sasl-channel-binding>
+        <mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>SCRAM-SHA-1-PLUS</mechanism></mechanisms>
+    </stream:features>")?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn non_plus_listener_accepts_the_scram_y_flag() -> TestResult {
+    let suite = C2sSuite::with_auth_mechanisms(&["SCRAM-SHA-256"])?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "y,,n=alice,r=nonce")?;
+    let challenge = client.receive_sasl_challenge()?;
+    assert!(challenge.starts_with("r=nonce"));
+
+    client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    client.close()
+}
+
+#[test]
+fn missing_mechanism_returns_malformed_request() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn unsupported_mechanism_returns_invalid_mechanism() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'/>")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn extra_attribute_returns_malformed_request() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send(
+        "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-256' extra='1'/>",
+    )?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn child_element_returns_malformed_request() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send(
+        "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-256'><child/></auth>",
+    )?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn invalid_base64_returns_incorrect_encoding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send(
+        "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-256'>!</auth>",
+    )?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn abort_without_challenge_returns_aborted() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    client.close()
+}
+
+#[test]
+fn unknown_channel_binding_returns_malformed_request() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=unknown-binding,,n=alice,r=nonce")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn malformed_scram_initial_message_returns_malformed_request() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "invalid")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn wrong_password_closes_after_three_failed_attempts() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..3 {
+        let reply = client.scram("alice", "wrong", "SCRAM-SHA-256", None)?;
+        reply.assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+        )?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn malformed_final_for_known_account_returns_malformed_request() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
+    client.receive_sasl_challenge()?;
+
+    client.send_sasl_response("x=1")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn known_account_uses_normalized_scram_challenge_parameters() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=Alice,r=firstnonce")?;
+    let uppercase = client.receive_sasl_challenge()?;
+    client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=secondnonce")?;
+    let lowercase = client.receive_sasl_challenge()?;
+    assert_eq!(
+        uppercase
+            .split_once(",s=")
+            .ok_or("missing uppercase salt")?
+            .1,
+        lowercase
+            .split_once(",s=")
+            .ok_or("missing lowercase salt")?
+            .1
+    );
+    client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    client.close()
+}
+
+#[test]
+fn unknown_account_closes_after_three_failed_attempts() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..3 {
+        let reply = client.scram("missing", "wrong", "SCRAM-SHA-256", None)?;
+        reply.assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+        )?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn malformed_final_for_unknown_account_returns_malformed_request() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=nonce")?;
+    client.receive_sasl_challenge()?;
+
+    client.send_sasl_response("x=1")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn unknown_account_uses_normalized_scram_challenge_parameters() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=Missing,r=firstnonce")?;
+    let uppercase = client.receive_sasl_challenge()?;
+    client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=secondnonce")?;
+    let lowercase = client.receive_sasl_challenge()?;
+    assert_eq!(
+        uppercase
+            .split_once(",s=")
+            .ok_or("missing uppercase salt")?
+            .1,
+        lowercase
+            .split_once(",s=")
+            .ok_or("missing lowercase salt")?
+            .1
+    );
+    client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    client.close()
+}
+
+#[test]
+fn scram_proof_challenge_counts_aborted_attempts() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..3 {
+        client.send_sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=nonce")?;
+        let challenge = client.receive_sasl_challenge()?;
+        assert!(challenge.starts_with("r=nonce"));
+
+        client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+        client
+            .expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn scram_proof_challenge_counts_incorrect_encoding_attempts() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..3 {
+        client.send_sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=nonce")?;
+        let challenge = client.receive_sasl_challenge()?;
+        assert!(challenge.starts_with("r=nonce"));
+
+        client.send("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>!</response>")?;
+        client.expect_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
+        )?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn replacement_auth_discards_the_scram_proof_challenge() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=discarded,r=first")?;
+    client.receive_sasl_challenge()?;
+
+    for nonce in ["second", "third"] {
+        client.send_sasl_auth("SCRAM-SHA-256", &format!("n,,n=missing,r={nonce}"))?;
+        assert!(
             client
-                .scram("Alice", "pencil", &mechanism, binding)?
-                .assert_name(SASL_NAMESPACE, "success");
-            let mut client = client.restart();
-            let header = client.open_with(OPEN)?;
-            assert_eq!(header.attribute("from"), Some("localhost"));
-            let features = client.features()?;
-            assert_eq!(features.children.len(), 1);
-            features.child(BIND_NAMESPACE, "bind")?;
-            assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
-            client.barrier()?;
-            client.close()?;
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn configured_mechanisms_control_the_offer_and_reject_disabled_mechanisms() -> TestResult {
-    for (mechanism, plus) in [("SCRAM-SHA-256", false), ("SCRAM-SHA-1-PLUS", true)] {
-        let server = Server::configured(&format!("auth_mechanisms = ['{mechanism}']"), "")?;
-        let mut client = Client::encrypted(&server)?;
-        let features = client.open()?;
-        let mechanisms = features.child(SASL_NAMESPACE, "mechanisms")?;
-        assert_eq!(mechanisms.children.len(), 1);
-        assert_eq!(mechanisms.children[0].text, mechanism);
-        assert_eq!(
-            features
-                .children
-                .iter()
-                .any(|child| child.name == "sasl-channel-binding"),
-            plus
+                .receive_sasl_challenge()?
+                .starts_with(&format!("r={nonce}"))
         );
-        auth(
-            &mut client,
-            if plus {
-                "SCRAM-SHA-256"
-            } else {
-                "SCRAM-SHA-256-PLUS"
-            },
-            "n,,n=alice,r=nonce",
+    }
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=fourth")?;
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn empty_initial_challenge_counts_aborted_attempts() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..3 {
+        client.send_sasl_auth("SCRAM-SHA-256", "")?;
+        let challenge = client.receive_sasl_challenge()?;
+        assert!(challenge.is_empty());
+
+        client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+        client
+            .expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn empty_initial_challenge_counts_incorrect_encoding_attempts() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..3 {
+        client.send_sasl_auth("SCRAM-SHA-256", "")?;
+        let challenge = client.receive_sasl_challenge()?;
+        assert!(challenge.is_empty());
+
+        client.send("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>!</response>")?;
+        client.expect_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
         )?;
-        failure(&mut client, "invalid-mechanism")?;
-        if !plus {
-            auth(&mut client, mechanism, "y,,n=alice,r=nonce")?;
-            challenge(&mut client)?;
-            client.send(&format!("<abort xmlns='{SASL_NAMESPACE}'/>"))?;
-            failure(&mut client, "aborted")?;
-        }
-        client.close()?;
     }
-    Ok(())
+    client.expect_stream_error("policy-violation")
 }
 
 #[test]
-fn malformed_sasl_requests_return_standard_conditions() -> TestResult {
-    let server = Server::start()?;
-    for (request, condition) in [
-        (
-            format!("<auth xmlns='{SASL_NAMESPACE}'/>"),
-            "malformed-request",
-        ),
-        (
-            format!("<auth xmlns='{SASL_NAMESPACE}' mechanism='PLAIN'/>"),
-            "invalid-mechanism",
-        ),
-        (
-            format!("<auth xmlns='{SASL_NAMESPACE}' mechanism='SCRAM-SHA-256' extra='1'/>"),
-            "malformed-request",
-        ),
-        (
-            format!("<auth xmlns='{SASL_NAMESPACE}' mechanism='SCRAM-SHA-256'><child/></auth>"),
-            "malformed-request",
-        ),
-        (
-            format!("<auth xmlns='{SASL_NAMESPACE}' mechanism='SCRAM-SHA-256'>!</auth>"),
-            "incorrect-encoding",
-        ),
-        (format!("<abort xmlns='{SASL_NAMESPACE}'/>"), "aborted"),
-    ] {
-        let mut client = Client::secure(&server)?;
-        client.send(&request)?;
-        failure(&mut client, condition)?;
-        client.close()?;
-    }
-    for (mechanism, initial) in [
-        ("SCRAM-SHA-256-PLUS", "p=unknown-binding,,n=alice,r=nonce"),
-        ("SCRAM-SHA-256", "invalid"),
-    ] {
-        let mut client = Client::secure(&server)?;
-        auth(&mut client, mechanism, initial)?;
-        failure(&mut client, "malformed-request")?;
-        client.close()?;
-    }
-    Ok(())
-}
+fn replacement_auth_discards_the_empty_initial_challenge() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
 
-#[test]
-fn wrong_password_and_missing_account_have_the_same_failure_and_attempt_limit() -> TestResult {
-    let server = Server::start()?;
-    server.create_account("alice", "pencil")?;
-    for username in ["alice", "missing"] {
-        let mut client = Client::secure(&server)?;
-        for _ in 0..3 {
-            let reply = client.scram(username, "wrong", "SCRAM-SHA-256", None)?;
-            reply.assert_name(SASL_NAMESPACE, "failure");
-            reply.child(SASL_NAMESPACE, "not-authorized")?;
-        }
-        client.expect_stream_error("policy-violation")?;
-    }
-    Ok(())
-}
+    client.send_sasl_auth("SCRAM-SHA-256", "")?;
+    client.receive_sasl_challenge()?;
 
-#[test]
-fn malformed_final_does_not_disclose_account_existence() -> TestResult {
-    let server = Server::start()?;
-    server.create_account("alice", "pencil")?;
-    for username in ["alice", "missing"] {
-        let mut client = Client::secure(&server)?;
-        auth(
-            &mut client,
-            "SCRAM-SHA-256",
-            &format!("n,,n={username},r=nonce"),
-        )?;
-        challenge(&mut client)?;
-        response(&mut client, "x=1")?;
-        failure(&mut client, "malformed-request")?;
-        client.close()?;
+    for nonce in ["second", "third"] {
+        client.send_sasl_auth("SCRAM-SHA-256", &format!("n,,n=missing,r={nonce}"))?;
+        assert!(
+            client
+                .receive_sasl_challenge()?
+                .starts_with(&format!("r={nonce}"))
+        );
     }
-    Ok(())
-}
-
-#[test]
-fn normalized_identities_have_stable_scram_challenge_parameters() -> TestResult {
-    let server = Server::start()?;
-    server.create_account("alice", "pencil")?;
-    for usernames in [["Alice", "alice"], ["Missing", "missing"]] {
-        let mut client = Client::secure(&server)?;
-        let mut parameters = None;
-        for username in usernames {
-            auth(
-                &mut client,
-                "SCRAM-SHA-256",
-                &format!("n,,n={username},r=nonce"),
-            )?;
-            let challenge = challenge(&mut client)?;
-            let current = challenge
-                .split_once(",s=")
-                .ok_or("missing challenge salt")?
-                .1;
-            if let Some(previous) = parameters.as_deref() {
-                assert_eq!(current, previous);
-            } else {
-                parameters = Some(current.to_owned());
-            }
-            client.send(&format!("<abort xmlns='{SASL_NAMESPACE}'/>"))?;
-            failure(&mut client, "aborted")?;
-        }
-        client.close()?;
-    }
-    Ok(())
-}
-
-#[test]
-fn both_challenge_phases_allow_retries_until_three_failed_attempts() -> TestResult {
-    let server = Server::start()?;
-    for empty_initial in [false, true] {
-        for (request, condition) in [
-            (format!("<abort xmlns='{SASL_NAMESPACE}'/>"), "aborted"),
-            (
-                format!("<response xmlns='{SASL_NAMESPACE}'>!</response>"),
-                "incorrect-encoding",
-            ),
-        ] {
-            let mut client = Client::secure(&server)?;
-            for _ in 0..3 {
-                auth(
-                    &mut client,
-                    "SCRAM-SHA-256",
-                    if empty_initial {
-                        ""
-                    } else {
-                        "n,,n=missing,r=nonce"
-                    },
-                )?;
-                let first = challenge(&mut client)?;
-                assert_eq!(first.is_empty(), empty_initial);
-                client.send(&request)?;
-                failure(&mut client, condition)?;
-            }
-            client.expect_stream_error("policy-violation")?;
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn replacement_auth_discards_both_pending_challenges_and_counts_toward_the_cap() -> TestResult {
-    let server = Server::start()?;
-    for empty_initial in [false, true] {
-        let mut client = Client::secure(&server)?;
-        auth(
-            &mut client,
-            "SCRAM-SHA-256",
-            if empty_initial {
-                ""
-            } else {
-                "n,,n=discarded,r=first"
-            },
-        )?;
-        challenge(&mut client)?;
-        for nonce in ["second", "third"] {
-            auth(
-                &mut client,
-                "SCRAM-SHA-256",
-                &format!("n,,n=missing,r={nonce}"),
-            )?;
-            assert!(challenge(&mut client)?.starts_with(&format!("r={nonce}")));
-        }
-        auth(&mut client, "SCRAM-SHA-256", "n,,n=missing,r=fourth")?;
-        client.expect_stream_error("policy-violation")?;
-    }
-    Ok(())
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=fourth")?;
+    client.expect_stream_error("policy-violation")
 }
 
 #[test]
 fn protected_from_must_match_the_authenticated_account() -> TestResult {
-    let server = Server::start()?;
-    server.create_account("alice", "pencil")?;
-    let mut client = Client::encrypted(&server)?;
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.tls_client()?;
     client.open_with(&OPEN.replace("to='localhost'", "from='bob@localhost' to='localhost'"))?;
     client.features()?;
     let reply = client.scram("alice", "pencil", "SCRAM-SHA-256", None)?;

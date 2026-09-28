@@ -699,6 +699,7 @@ impl<A: ChunkAllocator> Shard<A> {
         let mut full_jid = String::with_capacity(account.as_str().len() + 1 + max_resource_len);
         let mut deliveries = Vec::with_capacity(sessions.len());
         let mut failed = Vec::new();
+        let mut build_error = None;
         for (resource, session) in sessions {
             if !session.roster_interested {
                 continue;
@@ -711,17 +712,28 @@ impl<A: ChunkAllocator> Shard<A> {
             full_jid.push_str(account.as_str());
             full_jid.push('/');
             full_jid.push_str(resource);
-            let stanza = build(&full_jid)?;
-            let target = stanza
-                .resolve()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            if target.as_str() != full_jid {
-                return Err(RouterError::InvalidTarget);
-            }
+            let stanza = match build(&full_jid).and_then(|stanza| {
+                validate_roster_push_target(&stanza, &full_jid)?;
+                Ok(stanza)
+            }) {
+                Ok(stanza) => stanza,
+                Err(error) => {
+                    build_error = Some(error);
+                    break;
+                }
+            };
             deliveries.push((resource.clone(), session.token, stanza));
+        }
+        if let Some(error) = build_error {
+            let failed = sessions
+                .iter()
+                .filter(|(_, session)| session.roster_interested)
+                .map(|(resource, session)| (resource.clone(), session.token))
+                .collect::<Vec<_>>();
+            for (resource, token) in failed {
+                self.remove(account.as_str(), &resource, token);
+            }
+            return Err(error);
         }
         if let Some(sessions) = self.accounts.get(account.as_str()) {
             for (resource, token, stanza) in deliveries {
@@ -854,6 +866,23 @@ impl<A: ChunkAllocator> Shard<A> {
                 }
             }
         }
+    }
+}
+
+fn validate_roster_push_target<A: ChunkAllocator>(
+    stanza: &RoutedStanza<A>,
+    expected: &str,
+) -> Result<(), RouterError> {
+    let target = stanza
+        .resolve()
+        .map_err(|_| RouterError::InvalidTarget)?
+        .to()
+        .map_err(|_| RouterError::InvalidTarget)?
+        .ok_or(RouterError::InvalidTarget)?;
+    if target.as_str() == expected {
+        Ok(())
+    } else {
+        Err(RouterError::InvalidTarget)
     }
 }
 

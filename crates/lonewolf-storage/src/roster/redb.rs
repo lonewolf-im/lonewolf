@@ -392,8 +392,7 @@ fn decode_jid(text: &str) -> Result<RosterJid, StorageError> {
     if jid.as_str() != text {
         return Err(StorageError::new(StorageErrorKind::CorruptData));
     }
-    RosterJid::try_from(jid)
-        .map_err(|error| StorageError::with_source(StorageErrorKind::CorruptData, error))
+    Ok(RosterJid::from(jid))
 }
 
 fn encode_item(item: &RosterItem) -> Result<Vec<u8>, RosterError> {

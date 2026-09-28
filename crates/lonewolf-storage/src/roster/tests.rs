@@ -10,8 +10,8 @@ use redb::backends::InMemoryBackend;
 
 use super::redb::RedbRosterRepository;
 use super::{
-    PendingSubscription, RosterItemUpdate, RosterJid, RosterJidError, RosterRepository,
-    RosterSubscription, RosterVersion, SubscriptionState,
+    PendingSubscription, RosterItemUpdate, RosterJid, RosterRepository, RosterSubscription,
+    RosterVersion, SubscriptionState,
 };
 use crate::RedbDatabase;
 use crate::account::AccountKey;
@@ -27,7 +27,7 @@ fn owner(input: &str) -> TestResult<AccountKey> {
 fn jid(input: &str) -> TestResult<RosterJid> {
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let jid = Jid::parse_in(input, &mut arena)?;
-    Ok(RosterJid::try_from(jid.resolve(&arena)?)?)
+    Ok(RosterJid::from(jid.resolve(&arena)?))
 }
 
 fn repository() -> TestResult<RedbRosterRepository> {
@@ -236,7 +236,7 @@ fn roster_and_pending_requests_survive_reopening() -> TestResult {
 }
 
 #[test]
-fn roster_jids_are_owned_normalized_bare_addresses() -> TestResult {
+fn roster_jids_are_owned_normalized_addresses() -> TestResult {
     let normalized = jid("É@BÜCHER.EXAMPLE")?;
     assert_eq!(normalized, jid("E\u{301}@xn--bcher-kva.example")?);
     assert_eq!(normalized.as_str(), "é@bücher.example");
@@ -245,8 +245,8 @@ fn roster_jids_are_owned_normalized_bare_addresses() -> TestResult {
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let full = Jid::parse_in("alice@example.com/desktop", &mut arena)?;
     assert_eq!(
-        RosterJid::try_from(full.resolve(&arena)?),
-        Err(RosterJidError::ResourceNotAllowed)
+        RosterJid::from(full.resolve(&arena)?).as_str(),
+        "alice@example.com/desktop"
     );
     assert_eq!(jid("example.com")?.as_str(), "example.com");
     Ok(())

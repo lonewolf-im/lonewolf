@@ -11,7 +11,7 @@ use crate::account::AccountKey;
 
 mod key;
 
-pub use key::{RosterJid, RosterJidError};
+pub use key::RosterJid;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SubscriptionState {
@@ -33,7 +33,12 @@ pub struct RosterSubscription {
 pub struct RosterVersion(u64);
 
 impl RosterVersion {
-    pub fn get(self) -> u64 {
+    /// Creates a version token for a repository implementation.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
         self.0
     }
 }

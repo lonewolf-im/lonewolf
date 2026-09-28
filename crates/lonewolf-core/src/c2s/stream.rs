@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::net::Shutdown;
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
@@ -302,87 +303,75 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         } = admission;
         let accepted_at = lifecycle.accepted_at;
         let close_control = transport.clone();
-        let established = timeout(
-            accepted_at
-                .checked_add(settings.establishment_timeout)
-                .map_or(Duration::ZERO, |deadline| {
-                    deadline.saturating_duration_since(Instant::now())
-                }),
-            establish(transport, &hosts, &settings),
-        )
-        .await;
         let mut unauthenticated_permit = Some(unauthenticated_permit);
-        let outcome = match established {
-            Ok(Ok(mut established)) => {
-                lifecycle.established(&established.host);
-                lifecycle.stream_phase = "authenticating";
-                let authentication_remaining = established
-                    .auth_started_at
-                    .checked_add(settings.authentication_timeout)
-                    .map_or(Duration::ZERO, |deadline| {
-                        deadline.saturating_duration_since(Instant::now())
-                    });
-                match timeout(
-                    authentication_remaining,
-                    authenticate(&mut established, &hosts, &auth, settings.auth_mechanisms),
-                )
-                .await
-                {
-                    Ok(Ok((account, mechanism))) => {
-                        lifecycle.authenticated(
-                            &established.host,
-                            mechanism,
-                            established.auth_started_at,
-                        );
-                        lifecycle.stream_phase = "binding";
-                        unauthenticated_permit.take();
-                        let binding_started_at = Instant::now();
-                        let binding_remaining = binding_started_at
-                            .checked_add(settings.binding_timeout)
-                            .map_or(Duration::ZERO, |deadline| {
-                                deadline.saturating_duration_since(Instant::now())
-                            });
-                        match timeout(
-                            binding_remaining,
-                            bind_resource(
-                                established,
-                                &hosts,
-                                &account,
-                                &router,
-                                settings.max_resources_per_account,
-                                settings.allocator.clone(),
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(Ok(bound)) => {
-                                lifecycle.bound(bound.resource_requested, binding_started_at);
-                                bound_stream(bound).await
-                            }
-                            Ok(Err(outcome)) => outcome,
-                            Err(_) => {
-                                let _ = SockRef::from(&close_control).shutdown(Shutdown::Both);
-                                CloseOutcome::BindingTimeout
-                            }
-                        }
-                    }
-                    Ok(Err(outcome)) => outcome,
-                    Err(_) => {
-                        let _ = SockRef::from(&close_control).shutdown(Shutdown::Both);
-                        CloseOutcome::AuthenticationTimeout
-                    }
-                }
-            }
-            Ok(Err(outcome)) => outcome,
-            Err(_) => {
-                let _ = SockRef::from(&close_control).shutdown(Shutdown::Both);
-                CloseOutcome::EstablishmentTimeout
-            }
+        let phases = async {
+            let mut established = run_phase(
+                &close_control,
+                phase_remaining(accepted_at, settings.establishment_timeout),
+                CloseOutcome::EstablishmentTimeout,
+                establish(transport, &hosts, &settings),
+            )
+            .await?;
+            lifecycle.established(&established.host);
+            lifecycle.stream_phase = "authenticating";
+            let (account, mechanism) = run_phase(
+                &close_control,
+                phase_remaining(established.auth_started_at, settings.authentication_timeout),
+                CloseOutcome::AuthenticationTimeout,
+                authenticate(&mut established, &hosts, &auth, settings.auth_mechanisms),
+            )
+            .await?;
+            lifecycle.authenticated(&established.host, mechanism, established.auth_started_at);
+            lifecycle.stream_phase = "binding";
+            unauthenticated_permit.take();
+            let binding_started_at = Instant::now();
+            let bound = run_phase(
+                &close_control,
+                phase_remaining(binding_started_at, settings.binding_timeout),
+                CloseOutcome::BindingTimeout,
+                bind_resource(
+                    established,
+                    &hosts,
+                    &account,
+                    &router,
+                    settings.max_resources_per_account,
+                    settings.allocator.clone(),
+                ),
+            )
+            .await?;
+            lifecycle.bound(bound.resource_requested, binding_started_at);
+            Ok(bound_stream(bound).await)
+        };
+        let outcome = match phases.await {
+            Ok(outcome) | Err(outcome) => outcome,
         };
         drop(unauthenticated_permit);
         drop(ip_permit);
         lifecycle.outcome = Some(outcome);
         outcome
+    }
+}
+
+fn phase_remaining(started_at: Instant, duration: Duration) -> Duration {
+    started_at
+        .checked_add(duration)
+        .map_or(Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        })
+}
+
+async fn run_phase<T>(
+    close_control: &TcpStream,
+    remaining: Duration,
+    timeout_outcome: CloseOutcome,
+    phase: impl Future<Output = Result<T, CloseOutcome>>,
+) -> Result<T, CloseOutcome> {
+    match timeout(remaining, phase).await {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = SockRef::from(close_control).shutdown(Shutdown::Both);
+            Err(timeout_outcome)
+        }
     }
 }
 
@@ -574,7 +563,7 @@ async fn authenticate<A: ChunkAllocator + Clone>(
         return Err(CloseOutcome::InternalError);
     };
     let mut replacement_auth = None;
-    for attempt in 0..MAX_AUTH_ATTEMPTS {
+    for _ in 0..MAX_AUTH_ATTEMPTS {
         let (mechanism, initial) = if let Some(auth) = replacement_auth.take() {
             auth
         } else {
@@ -596,27 +585,15 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                 StreamEvent::Element(element) => match parse_sasl_message(&element) {
                     Ok(SaslMessage::Auth { mechanism, payload }) => (mechanism, payload),
                     Ok(SaslMessage::Abort) => {
-                        if send_sasl_failure(&mut established.writer, "aborted")
+                        send_sasl_failure(&mut established.writer, "aborted")
                             .await
-                            .is_err()
-                        {
-                            return Err(CloseOutcome::TransportError);
-                        }
-                        if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                            break;
-                        }
+                            .map_err(|_| CloseOutcome::TransportError)?;
                         continue;
                     }
                     Err(condition) => {
-                        if send_sasl_failure(&mut established.writer, condition)
+                        send_sasl_failure(&mut established.writer, condition)
                             .await
-                            .is_err()
-                        {
-                            return Err(CloseOutcome::TransportError);
-                        }
-                        if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                            break;
-                        }
+                            .map_err(|_| CloseOutcome::TransportError)?;
                         continue;
                     }
                     _ => {
@@ -640,15 +617,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             }
         };
         let Some(mechanism) = mechanism.filter(|mechanism| mechanisms.allows(*mechanism)) else {
-            if send_sasl_failure(&mut established.writer, "invalid-mechanism")
+            send_sasl_failure(&mut established.writer, "invalid-mechanism")
                 .await
-                .is_err()
-            {
-                return Err(CloseOutcome::TransportError);
-            }
-            if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                break;
-            }
+                .map_err(|_| CloseOutcome::TransportError)?;
             continue;
         };
         let initial = if initial.is_empty() {
@@ -661,31 +632,13 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             {
                 return Err(CloseOutcome::TransportError);
             }
-            match next_sasl_response(established).await {
-                SaslResponse::Data(response) => response,
-                SaslResponse::Auth { mechanism, payload } => {
+            match next_challenge_response(established).await? {
+                ChallengeResponse::Data(response) => response,
+                ChallengeResponse::Auth { mechanism, payload } => {
                     replacement_auth = Some((mechanism, payload));
                     continue;
                 }
-                SaslResponse::Eof => return Err(CloseOutcome::Eof),
-                SaslResponse::StreamEnd => {
-                    return Err(send_footer_tls(&mut established.writer).await);
-                }
-                SaslResponse::StreamError(outcome) => {
-                    return Err(send_stream_error_tls(&mut established.writer, outcome).await);
-                }
-                SaslResponse::Failure(condition) => {
-                    if send_sasl_failure(&mut established.writer, condition)
-                        .await
-                        .is_err()
-                    {
-                        return Err(CloseOutcome::TransportError);
-                    }
-                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                        break;
-                    }
-                    continue;
-                }
+                ChallengeResponse::Retry => continue,
             }
         } else {
             initial
@@ -693,15 +646,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
         let first = match ClientFirst::parse(mechanism, &initial, mechanisms.has_plus()) {
             Ok(first) => first,
             Err(error) => {
-                if send_sasl_failure(&mut established.writer, scram_failure(error))
+                send_sasl_failure(&mut established.writer, scram_failure(error))
                     .await
-                    .is_err()
-                {
-                    return Err(CloseOutcome::TransportError);
-                }
-                if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                    break;
-                }
+                    .map_err(|_| CloseOutcome::TransportError)?;
                 continue;
             }
         };
@@ -714,15 +661,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             Some(key) => match auth.accounts.get_scram(key, mechanism.hash()).await {
                 Ok(verifier) => verifier,
                 Err(_) => {
-                    if send_sasl_failure(&mut established.writer, "temporary-auth-failure")
+                    send_sasl_failure(&mut established.writer, "temporary-auth-failure")
                         .await
-                        .is_err()
-                    {
-                        return Err(CloseOutcome::TransportError);
-                    }
-                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                        break;
-                    }
+                        .map_err(|_| CloseOutcome::TransportError)?;
                     continue;
                 }
             },
@@ -771,29 +712,13 @@ async fn authenticate<A: ChunkAllocator + Clone>(
         {
             return Err(CloseOutcome::TransportError);
         }
-        let response = match next_sasl_response(established).await {
-            SaslResponse::Data(response) => response,
-            SaslResponse::Auth { mechanism, payload } => {
+        let response = match next_challenge_response(established).await? {
+            ChallengeResponse::Data(response) => response,
+            ChallengeResponse::Auth { mechanism, payload } => {
                 replacement_auth = Some((mechanism, payload));
                 continue;
             }
-            SaslResponse::Eof => return Err(CloseOutcome::Eof),
-            SaslResponse::StreamEnd => return Err(send_footer_tls(&mut established.writer).await),
-            SaslResponse::StreamError(outcome) => {
-                return Err(send_stream_error_tls(&mut established.writer, outcome).await);
-            }
-            SaslResponse::Failure(condition) => {
-                if send_sasl_failure(&mut established.writer, condition)
-                    .await
-                    .is_err()
-                {
-                    return Err(CloseOutcome::TransportError);
-                }
-                if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                    break;
-                }
-                continue;
-            }
+            ChallengeResponse::Retry => continue,
         };
         let binding_data: &[u8] = match binding_kind {
             Some(BindingType::TlsExporter) => &established.binding.exporter,
@@ -805,15 +730,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             Ok(message) if known => Some(message),
             Ok(_) | Err(ServerError::InvalidProof | ServerError::ChannelBindingMismatch) => None,
             Err(error) => {
-                if send_sasl_failure(&mut established.writer, scram_failure(error))
+                send_sasl_failure(&mut established.writer, scram_failure(error))
                     .await
-                    .is_err()
-                {
-                    return Err(CloseOutcome::TransportError);
-                }
-                if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                    break;
-                }
+                    .map_err(|_| CloseOutcome::TransportError)?;
                 continue;
             }
         };
@@ -824,15 +743,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
             let current = match auth.accounts.get_scram(account_key, mechanism.hash()).await {
                 Ok(current) => current,
                 Err(_) => {
-                    if send_sasl_failure(&mut established.writer, "temporary-auth-failure")
+                    send_sasl_failure(&mut established.writer, "temporary-auth-failure")
                         .await
-                        .is_err()
-                    {
-                        return Err(CloseOutcome::TransportError);
-                    }
-                    if attempt + 1 == MAX_AUTH_ATTEMPTS {
-                        break;
-                    }
+                        .map_err(|_| CloseOutcome::TransportError)?;
                     continue;
                 }
             };
@@ -862,15 +775,9 @@ async fn authenticate<A: ChunkAllocator + Clone>(
                     .ok_or(CloseOutcome::InternalError);
             }
         }
-        if send_sasl_failure(&mut established.writer, "not-authorized")
+        send_sasl_failure(&mut established.writer, "not-authorized")
             .await
-            .is_err()
-        {
-            return Err(CloseOutcome::TransportError);
-        }
-        if attempt + 1 == MAX_AUTH_ATTEMPTS {
-            break;
-        }
+            .map_err(|_| CloseOutcome::TransportError)?;
     }
     Err(send_stream_error_tls(
         &mut established.writer,
@@ -1304,11 +1211,11 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                     (Some(priority), routed, Some(unavailable))
                 }
                 Some(Err(condition)) => {
-                    let routed = stamp_client_stanza(parsed, registration, true)?;
+                    let routed = stamp_client_stanza(parsed, registration)?;
                     send_stanza_error(writer, &routed, allocator, condition).await?;
                     return Ok(());
                 }
-                None => (None, stamp_client_stanza(parsed, registration, true)?, None),
+                None => (None, stamp_client_stanza(parsed, registration)?, None),
             };
             registration
                 .set_presence(priority, routed, unavailable)
@@ -1316,7 +1223,7 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                 .map_err(|_| CloseOutcome::InternalError)
         }
         StanzaType::Message(kind) => {
-            let routed = stamp_client_stanza(parsed, registration, true)?;
+            let routed = stamp_client_stanza(parsed, registration)?;
             let bare = routed
                 .resolve()
                 .map_err(|_| CloseOutcome::InternalError)?
@@ -1422,32 +1329,40 @@ fn presence_priority<R: ArenaRead>(stanza: &StanzaRef<'_, R>) -> Result<i8, Stan
 fn stamp_client_stanza<A: ChunkAllocator>(
     parsed: Parsed<Stanza, A>,
     registration: &Registration<A>,
-    default_to_self: bool,
 ) -> Result<RoutedStanza<A>, CloseOutcome> {
     let (stanza, mut arena) = parsed.into_parts();
-    let needs_to = default_to_self
-        && stanza
-            .resolve(&arena)
-            .map_err(|_| CloseOutcome::InternalError)?
-            .to()
-            .map_err(|_| CloseOutcome::InternalError)?
-            .is_none();
+    let needs_to = stanza
+        .resolve(&arena)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .to()
+        .map_err(|_| CloseOutcome::InternalError)?
+        .is_none();
+    let (stanza, _, _) = stamp_client_stanza_in(stanza, &mut arena, registration, needs_to)?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
+}
+
+fn stamp_client_stanza_in<A: ChunkAllocator>(
+    stanza: Stanza,
+    arena: &mut Arena<A>,
+    registration: &Registration<A>,
+    needs_to: bool,
+) -> Result<(Stanza, Jid, Option<Jid>), CloseOutcome> {
     let account = registration.account();
     let from = Jid::from_trusted_parts_in(
         Some(account.username()),
         account.domain(),
         Some(registration.resource()),
-        &mut arena,
+        arena,
     )
     .map_err(|_| CloseOutcome::InternalError)?;
     let to = needs_to
         .then(|| {
-            Jid::from_trusted_parts_in(Some(account.username()), account.domain(), None, &mut arena)
+            Jid::from_trusted_parts_in(Some(account.username()), account.domain(), None, arena)
         })
         .transpose()
         .map_err(|_| CloseOutcome::InternalError)?;
     let mut builder = stanza
-        .derive_in(&mut arena)
+        .derive_in(arena)
         .map_err(|_| CloseOutcome::InternalError)?
         .from(Some(from))
         .map_err(|_| CloseOutcome::InternalError)?;
@@ -1457,7 +1372,7 @@ fn stamp_client_stanza<A: ChunkAllocator>(
             .map_err(|_| CloseOutcome::InternalError)?;
     }
     let stanza = builder.build().map_err(|_| CloseOutcome::InternalError)?;
-    Ok(RoutedStanza::from_parts(stanza, arena))
+    Ok((stanza, from, to))
 }
 
 fn stamp_available_presence<A: ChunkAllocator>(
@@ -1465,26 +1380,7 @@ fn stamp_available_presence<A: ChunkAllocator>(
     registration: &Registration<A>,
 ) -> Result<(RoutedStanza<A>, RoutedStanza<A>), CloseOutcome> {
     let (stanza, mut arena) = parsed.into_parts();
-    let account = registration.account();
-    let from = Jid::from_trusted_parts_in(
-        Some(account.username()),
-        account.domain(),
-        Some(registration.resource()),
-        &mut arena,
-    )
-    .map_err(|_| CloseOutcome::InternalError)?;
-    let to =
-        Jid::from_trusted_parts_in(Some(account.username()), account.domain(), None, &mut arena)
-            .map_err(|_| CloseOutcome::InternalError)?;
-    let available = stanza
-        .derive_in(&mut arena)
-        .map_err(|_| CloseOutcome::InternalError)?
-        .from(Some(from))
-        .map_err(|_| CloseOutcome::InternalError)?
-        .to(Some(to))
-        .map_err(|_| CloseOutcome::InternalError)?
-        .build()
-        .map_err(|_| CloseOutcome::InternalError)?;
+    let (available, from, to) = stamp_client_stanza_in(stanza, &mut arena, registration, true)?;
     let unavailable = Stanza::builder_in(
         StanzaType::Presence(PresenceType::Unavailable),
         StanzaNamespace::Client,
@@ -1492,7 +1388,7 @@ fn stamp_available_presence<A: ChunkAllocator>(
     )
     .from(Some(from))
     .map_err(|_| CloseOutcome::InternalError)?
-    .to(Some(to))
+    .to(to)
     .map_err(|_| CloseOutcome::InternalError)?
     .build()
     .map_err(|_| CloseOutcome::InternalError)?;
@@ -1663,6 +1559,37 @@ enum SaslResponse {
     StreamEnd,
     Eof,
     StreamError(CloseOutcome),
+}
+
+enum ChallengeResponse {
+    Data(Vec<u8>),
+    Auth {
+        mechanism: Option<Mechanism>,
+        payload: Vec<u8>,
+    },
+    Retry,
+}
+
+async fn next_challenge_response<A: ChunkAllocator + Clone>(
+    established: &mut Established<A>,
+) -> Result<ChallengeResponse, CloseOutcome> {
+    match next_sasl_response(established).await {
+        SaslResponse::Data(response) => Ok(ChallengeResponse::Data(response)),
+        SaslResponse::Auth { mechanism, payload } => {
+            Ok(ChallengeResponse::Auth { mechanism, payload })
+        }
+        SaslResponse::Eof => Err(CloseOutcome::Eof),
+        SaslResponse::StreamEnd => Err(send_footer_tls(&mut established.writer).await),
+        SaslResponse::StreamError(outcome) => {
+            Err(send_stream_error_tls(&mut established.writer, outcome).await)
+        }
+        SaslResponse::Failure(condition) => {
+            send_sasl_failure(&mut established.writer, condition)
+                .await
+                .map_err(|_| CloseOutcome::TransportError)?;
+            Ok(ChallengeResponse::Retry)
+        }
+    }
 }
 
 async fn next_sasl_response<A: ChunkAllocator + Clone>(

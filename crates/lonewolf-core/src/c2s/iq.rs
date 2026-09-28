@@ -144,14 +144,23 @@ async fn apply_effect<A: ChunkAllocator + Clone>(
         IqEffect::None => Ok(()),
         IqEffect::MarkRosterInterested(_order) => registration.mark_roster_interested().await,
         IqEffect::PushRoster(push) => {
-            let allocator = allocator.clone();
-            router
-                .route_roster_push(registration.account(), move |to| {
-                    build_roster_push(to, &push, &allocator)
-                })
-                .await
+            route_roster_push(push, registration, router, allocator).await
         }
     }
+}
+
+pub(super) async fn route_roster_push<A: ChunkAllocator + Clone>(
+    push: RosterPush,
+    registration: &Registration<A>,
+    router: &RouterHandle<A>,
+    allocator: &A,
+) -> Result<(), RouterError> {
+    let allocator = allocator.clone();
+    router
+        .route_roster_push(registration.account(), move |to| {
+            build_roster_push(to, &push, &allocator)
+        })
+        .await
 }
 
 fn build_roster_push<A: ChunkAllocator + Clone>(

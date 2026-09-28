@@ -123,11 +123,13 @@ pub fn run_with_extensions(
                         .any(|name| name == lonewolf_extension::roster::NAME)
                 }) {
                     let rosters = stores.rosters(account_store)?;
+                    let registrations =
+                        lonewolf_extension::roster::registrations(rosters, accounts.clone());
                     extensions
                         .register(
                             lonewolf_extension::roster::NAME,
-                            lonewolf_extension::roster::registrations(rosters),
-                            [],
+                            registrations.iq,
+                            registrations.presence,
                         )
                         .map_err(RunError::ExtensionCatalog)?;
                 }

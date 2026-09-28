@@ -144,6 +144,24 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         }
     }
 
+    pub(crate) async fn route_presence(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        if !matches!(view.stanza_type(), StanzaType::Presence(_)) {
+            return Err(RouterError::InvalidTarget);
+        }
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !self.hosts.is_local_host(to.domainpart()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        if to.localpart().is_none() || to.resourcepart().is_some() {
+            return Err(RouterError::InvalidTarget);
+        }
+        self.local.deliver_presence(stanza).await
+    }
+
     /// Builds and enqueues one push for each interested resource.
     ///
     /// The builder receives the destination full JID and must not block the

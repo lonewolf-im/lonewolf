@@ -8,8 +8,8 @@ use super::iq::{
     IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute, IqScope,
 };
 use super::presence::{
-    PresenceDirection, PresenceFuture, PresenceHandler, PresenceRegistration, PresenceRequest,
-    PresenceRequestType, PresenceRoute,
+    PresenceDirection, PresenceEffect, PresenceFuture, PresenceHandler, PresenceRegistration,
+    PresenceRequest, PresenceRequestType, PresenceRoute,
 };
 use super::{Extensions, RegistrationError};
 
@@ -49,7 +49,7 @@ fn presence_handler(route: PresenceRoute) -> PresenceRegistration<GlobalChunkAll
 
 impl PresenceHandler<GlobalChunkAllocator> for EmptyPresence {
     fn handle<'a>(&'a self, _: PresenceRequest<'a, GlobalChunkAllocator>) -> PresenceFuture<'a> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(PresenceEffect::None) })
     }
 }
 

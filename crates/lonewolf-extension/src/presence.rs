@@ -4,11 +4,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lonewolf_storage::roster::PendingSubscription;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{PresenceType, StanzaErrorCondition, StanzaRef};
 
 use crate::RegistrationError;
+use crate::roster::RosterPush;
 
 /// The direction relative to the local account.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -19,6 +21,7 @@ pub enum PresenceDirection {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PresenceRequestType {
+    Available,
     Subscribe,
     Subscribed,
     Unsubscribe,
@@ -26,7 +29,7 @@ pub enum PresenceRequestType {
 }
 
 impl PresenceRequestType {
-    pub const fn from_stanza(value: PresenceType) -> Option<Self> {
+    pub const fn from_subscription_stanza(value: PresenceType) -> Option<Self> {
         match value {
             PresenceType::Subscribe => Some(Self::Subscribe),
             PresenceType::Subscribed => Some(Self::Subscribed),
@@ -56,11 +59,22 @@ pub struct PresenceRequest<'a, A: ChunkAllocator> {
     pub stanza: StanzaRef<'a, Arena<A>>,
 }
 
-pub type PresenceResult = Result<(), StanzaErrorCondition>;
+#[derive(Default)]
+pub enum PresenceEffect {
+    #[default]
+    None,
+    Route {
+        roster_push: Option<RosterPush>,
+    },
+    Deliver,
+    Replay(Vec<PendingSubscription>),
+}
+
+pub type PresenceResult = Result<PresenceEffect, StanzaErrorCondition>;
 pub type PresenceFuture<'a> = Pin<Box<dyn Future<Output = PresenceResult> + 'a>>;
 
 pub trait PresenceHandler<A: ChunkAllocator>: Send + Sync {
-    /// A successful result consumes the request without a reply.
+    /// A successful result applies the returned effect without a reply.
     /// An error sends a stanza error to the request sender.
     /// The future runs on the connection worker and can be cancelled on shutdown.
     fn handle<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a>;

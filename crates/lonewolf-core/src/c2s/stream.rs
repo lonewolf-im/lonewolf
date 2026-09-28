@@ -24,8 +24,11 @@ use futures_util::io::{
 };
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
-use lonewolf_extension::presence::{PresenceDirection, PresenceRequest, PresenceRequestType};
+use lonewolf_extension::presence::{
+    PresenceDirection, PresenceEffect, PresenceHandler, PresenceRequest, PresenceRequestType,
+};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
+use lonewolf_storage::roster::PendingSubscription;
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::jid::Jid;
@@ -62,6 +65,8 @@ const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
 const BIND_FEATURES: &str =
     "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
+const STORED_STANZA_STREAM_HEADER: &[u8] =
+    b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 const MAX_AUTH_ATTEMPTS: usize = 3;
 const MAX_BIND_FAILURES: usize = 6;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -1201,39 +1206,21 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                 .map_err(|_| CloseOutcome::InternalError)?
                 .is_some();
             if directed {
-                if let Some(kind) = PresenceRequestType::from_stanza(kind)
+                if let Some(kind) = PresenceRequestType::from_subscription_stanza(kind)
                     && let Some(handler) = router
                         .presence_handlers(registration.account().domain())
                         .and_then(|handlers| handlers.find(PresenceDirection::Outbound, kind))
                 {
-                    let (source, mut arena) = parsed.into_parts();
-                    let (source, sender, _) =
-                        stamp_client_stanza_in(source, &mut arena, registration, false)?;
-                    let result = {
-                        let stanza = source
-                            .resolve(&arena)
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                        let sender = sender
-                            .resolve(&arena)
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                        let target = stanza
-                            .to()
-                            .map_err(|_| CloseOutcome::InternalError)?
-                            .ok_or(CloseOutcome::InternalError)?;
-                        handler
-                            .handle(PresenceRequest {
-                                direction: PresenceDirection::Outbound,
-                                kind,
-                                sender,
-                                target,
-                                stanza,
-                            })
-                            .await
-                    };
-                    if let Err(condition) = result {
-                        let source = RoutedStanza::from_parts(source, arena);
-                        send_stanza_error(writer, &source, allocator, condition).await?;
-                    }
+                    return handle_directed_presence(
+                        parsed,
+                        kind,
+                        handler,
+                        registration,
+                        router,
+                        writer,
+                        allocator,
+                    )
+                    .await;
                 }
                 return Ok(());
             }
@@ -1245,22 +1232,72 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
             } else {
                 None
             };
-            let (priority, routed, unavailable) = match priority {
+            let (priority, routed, unavailable, replay) = match priority {
                 Some(Ok(priority)) => {
-                    let (routed, unavailable) = stamp_available_presence(parsed, registration)?;
-                    (Some(priority), routed, Some(unavailable))
+                    let (available, unavailable, arena) =
+                        stamp_available_presence(parsed, registration)?;
+                    let effect = if let Some(handler) = router
+                        .presence_handlers(registration.account().domain())
+                        .and_then(|handlers| {
+                            handlers
+                                .find(PresenceDirection::Outbound, PresenceRequestType::Available)
+                        }) {
+                        let result = {
+                            let stanza = available
+                                .resolve(&arena)
+                                .map_err(|_| CloseOutcome::InternalError)?;
+                            let sender = stanza
+                                .from()
+                                .map_err(|_| CloseOutcome::InternalError)?
+                                .ok_or(CloseOutcome::InternalError)?;
+                            let target = stanza
+                                .to()
+                                .map_err(|_| CloseOutcome::InternalError)?
+                                .ok_or(CloseOutcome::InternalError)?;
+                            handler
+                                .handle(PresenceRequest {
+                                    direction: PresenceDirection::Outbound,
+                                    kind: PresenceRequestType::Available,
+                                    sender,
+                                    target,
+                                    stanza,
+                                })
+                                .await
+                        };
+                        match result {
+                            Ok(PresenceEffect::None) => None,
+                            Ok(PresenceEffect::Replay(pending)) => Some(pending),
+                            Ok(PresenceEffect::Route { .. } | PresenceEffect::Deliver) => {
+                                return Err(CloseOutcome::InternalError);
+                            }
+                            Err(condition) => {
+                                let source = RoutedStanza::from_parts(available, arena);
+                                send_stanza_error(writer, &source, allocator, condition).await?;
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let (routed, unavailable) =
+                        RoutedStanza::from_parts_pair(available, unavailable, arena);
+                    (Some(priority), routed, Some(unavailable), effect)
                 }
                 Some(Err(condition)) => {
                     let routed = stamp_client_stanza(parsed, registration)?;
                     send_stanza_error(writer, &routed, allocator, condition).await?;
                     return Ok(());
                 }
-                None => (None, stamp_client_stanza(parsed, registration)?, None),
+                None => (None, stamp_client_stanza(parsed, registration)?, None, None),
             };
-            registration
+            let became_available = registration
                 .set_presence(priority, routed, unavailable)
                 .await
-                .map_err(|_| CloseOutcome::InternalError)
+                .map_err(|_| CloseOutcome::InternalError)?;
+            if became_available && let Some(pending) = replay {
+                replay_pending_subscriptions(pending, registration, allocator).await?;
+            }
+            Ok(())
         }
         StanzaType::Message(kind) => {
             let routed = stamp_client_stanza(parsed, registration)?;
@@ -1308,6 +1345,125 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                 send_stanza_error(writer, &routed, allocator, condition).await?;
             }
             Ok(())
+        }
+    }
+}
+
+async fn handle_directed_presence<A: ChunkAllocator + Clone>(
+    parsed: Parsed<Stanza, A>,
+    kind: PresenceRequestType,
+    outbound: &dyn PresenceHandler<A>,
+    registration: &Registration<A>,
+    router: &RouterHandle<A>,
+    writer: &mut FuturesBufWriter<TlsWriter>,
+    allocator: &A,
+) -> Result<(), CloseOutcome> {
+    let (source, mut arena) = parsed.into_parts();
+    let (source, sender, _) = stamp_client_stanza_in(source, &mut arena, registration, false)?;
+    let result = {
+        let stanza = source
+            .resolve(&arena)
+            .map_err(|_| CloseOutcome::InternalError)?;
+        let sender = sender
+            .resolve(&arena)
+            .map_err(|_| CloseOutcome::InternalError)?;
+        let target = stanza
+            .to()
+            .map_err(|_| CloseOutcome::InternalError)?
+            .ok_or(CloseOutcome::InternalError)?;
+        outbound
+            .handle(PresenceRequest {
+                direction: PresenceDirection::Outbound,
+                kind,
+                sender,
+                target,
+                stanza,
+            })
+            .await
+    };
+    let roster_push = match result {
+        Err(condition) => {
+            let source = RoutedStanza::from_parts(source, arena);
+            send_stanza_error(writer, &source, allocator, condition).await?;
+            return Ok(());
+        }
+        Ok(PresenceEffect::None) => return Ok(()),
+        Ok(PresenceEffect::Route { roster_push }) => roster_push,
+        Ok(PresenceEffect::Deliver | PresenceEffect::Replay(_)) => {
+            return Err(CloseOutcome::InternalError);
+        }
+    };
+    let routed = source
+        .derive_in(&mut arena)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .from(Some(sender.bare()))
+        .map_err(|_| CloseOutcome::InternalError)?
+        .bare_to()
+        .build()
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let inbound = {
+        let stanza = routed
+            .resolve(&arena)
+            .map_err(|_| CloseOutcome::InternalError)?;
+        let sender = stanza
+            .from()
+            .map_err(|_| CloseOutcome::InternalError)?
+            .ok_or(CloseOutcome::InternalError)?;
+        let target = stanza
+            .to()
+            .map_err(|_| CloseOutcome::InternalError)?
+            .ok_or(CloseOutcome::InternalError)?;
+        match router
+            .presence_handlers(target.domainpart())
+            .and_then(|handlers| handlers.find(PresenceDirection::Inbound, kind))
+        {
+            Some(handler) => {
+                handler
+                    .handle(PresenceRequest {
+                        direction: PresenceDirection::Inbound,
+                        kind,
+                        sender,
+                        target,
+                        stanza,
+                    })
+                    .await
+            }
+            None => Err(StanzaErrorCondition::ServiceUnavailable),
+        }
+    };
+    match inbound {
+        Err(condition) => {
+            let source = RoutedStanza::from_parts(source, arena);
+            send_stanza_error(writer, &source, allocator, condition).await
+        }
+        Ok(PresenceEffect::Deliver) => {
+            let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
+            match router.route_presence(routed).await {
+                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {
+                    if let Some(push) = roster_push {
+                        super::iq::route_roster_push(push, registration, router, allocator)
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    let condition = match error {
+                        RouterError::InvalidTarget | RouterError::InvalidResource => {
+                            StanzaErrorCondition::BadRequest
+                        }
+                        RouterError::RemoteUnsupported => StanzaErrorCondition::ServiceUnavailable,
+                        RouterError::ResourceLimit
+                        | RouterError::Unavailable
+                        | RouterError::Stopped => StanzaErrorCondition::InternalServerError,
+                        RouterError::NotFound | RouterError::Busy => unreachable!(),
+                    };
+                    send_stanza_error(writer, &source, allocator, condition).await
+                }
+            }
+        }
+        Ok(PresenceEffect::None | PresenceEffect::Route { .. } | PresenceEffect::Replay(_)) => {
+            Err(CloseOutcome::InternalError)
         }
     }
 }
@@ -1418,7 +1574,7 @@ fn stamp_client_stanza_in<A: ChunkAllocator>(
 fn stamp_available_presence<A: ChunkAllocator>(
     parsed: Parsed<Stanza, A>,
     registration: &Registration<A>,
-) -> Result<(RoutedStanza<A>, RoutedStanza<A>), CloseOutcome> {
+) -> Result<(Stanza, Stanza, Arena<A>), CloseOutcome> {
     let (stanza, mut arena) = parsed.into_parts();
     let (available, from, to) = stamp_client_stanza_in(stanza, &mut arena, registration, true)?;
     let unavailable = Stanza::builder_in(
@@ -1432,7 +1588,62 @@ fn stamp_available_presence<A: ChunkAllocator>(
     .map_err(|_| CloseOutcome::InternalError)?
     .build()
     .map_err(|_| CloseOutcome::InternalError)?;
-    Ok(RoutedStanza::from_parts_pair(available, unavailable, arena))
+    Ok((available, unavailable, arena))
+}
+
+async fn replay_pending_subscriptions<A: ChunkAllocator + Clone>(
+    pending: Vec<PendingSubscription>,
+    registration: &Registration<A>,
+    allocator: &A,
+) -> Result<(), CloseOutcome> {
+    for subscription in pending {
+        let stanza_bytes = subscription.stanza.as_ref();
+        let max_stanza_bytes =
+            NonZeroUsize::new(stanza_bytes.len()).ok_or(CloseOutcome::InternalError)?;
+        let input = tokio::io::AsyncReadExt::chain(STORED_STANZA_STREAM_HEADER, stanza_bytes);
+        let mut parser = XmppParser::new(
+            BufReader::new(input),
+            ParserConfig {
+                max_stanza_bytes,
+                arena: ArenaConfig::default(),
+            },
+            allocator.clone(),
+        );
+        if !matches!(
+            parser.next_event().await,
+            Ok(Some(StreamEvent::StreamStart { .. }))
+        ) {
+            return Err(CloseOutcome::InternalError);
+        }
+        let parsed = match parser.next_event().await {
+            Ok(Some(StreamEvent::Stanza(parsed))) => parsed,
+            _ => return Err(CloseOutcome::InternalError),
+        };
+        let (stanza, arena) = parsed.into_parts();
+        {
+            let stanza = stanza
+                .resolve(&arena)
+                .map_err(|_| CloseOutcome::InternalError)?;
+            if stanza.namespace() != StanzaNamespace::Client
+                || stanza.stanza_type() != StanzaType::Presence(PresenceType::Subscribe)
+                || stanza
+                    .from()
+                    .map_err(|_| CloseOutcome::InternalError)?
+                    .is_none_or(|sender| sender.as_str() != subscription.sender.as_str())
+                || stanza
+                    .to()
+                    .map_err(|_| CloseOutcome::InternalError)?
+                    .is_none_or(|target| target.as_str() != registration.account().as_str())
+            {
+                return Err(CloseOutcome::InternalError);
+            }
+        }
+        registration
+            .deliver(RoutedStanza::from_parts(stanza, arena))
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+    }
+    Ok(())
 }
 
 async fn write_stanza<R: ArenaRead>(

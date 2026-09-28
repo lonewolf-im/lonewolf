@@ -39,12 +39,42 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
-pub type IqResult = Result<Option<Element>, StanzaErrorCondition>;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IqEffect {
+    #[default]
+    None,
+    MarkRosterInterested,
+}
+
+pub struct IqResponse {
+    payload: Option<Element>,
+    effect: IqEffect,
+}
+
+impl IqResponse {
+    pub fn new(payload: Option<Element>) -> Self {
+        Self {
+            payload,
+            effect: IqEffect::None,
+        }
+    }
+
+    pub fn with_effect(mut self, effect: IqEffect) -> Self {
+        self.effect = effect;
+        self
+    }
+
+    pub fn into_parts(self) -> (Option<Element>, IqEffect) {
+        (self.payload, self.effect)
+    }
+}
+
+pub type IqResult = Result<IqResponse, StanzaErrorCondition>;
 pub type IqFuture<'a> = Pin<Box<dyn Future<Output = IqResult> + 'a>>;
 
 pub trait IqHandler<A: ChunkAllocator>: Send + Sync {
     /// Authorize access to `request.target` using `request.sender`.
-    /// Return a payload allocated in `response`, or `None` for an empty result.
+    /// Allocate response payloads in `response`.
     /// The future runs on the connection's worker and can be cancelled on shutdown.
     fn handle<'a>(&'a self, request: IqRequest<'a, A>, response: &'a mut Arena<A>) -> IqFuture<'a>;
 }

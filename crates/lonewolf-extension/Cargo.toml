@@ -7,5 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true

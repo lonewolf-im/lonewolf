@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::Extensions;
 use super::iq::{
-    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqRoute, IqScope,
+    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute, IqScope,
     RegistrationError,
 };
 
@@ -24,7 +24,7 @@ impl IqHandler<GlobalChunkAllocator> for Empty {
         _: IqRequest<'a, GlobalChunkAllocator>,
         _: &'a mut Arena<GlobalChunkAllocator>,
     ) -> IqFuture<'a> {
-        Box::pin(async { Ok(None) })
+        Box::pin(async { Ok(IqResponse::new(None)) })
     }
 }
 

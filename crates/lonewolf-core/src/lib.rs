@@ -71,24 +71,11 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
 pub fn run_with_extensions(
     config_path: Option<&Path>,
     build: BuildInfo,
-    extensions: Extensions<Arc<PooledChunkAllocator>>,
+    mut extensions: Extensions<Arc<PooledChunkAllocator>>,
 ) -> Result<(), RunError> {
     panic::init(&build);
 
     let config = Config::load(config_path).map_err(RunError::Config)?;
-    let extensions = config
-        .hosts
-        .iter()
-        .map(|(domain, host)| {
-            extensions
-                .enable(host.extensions.iter().map(String::as_str))
-                .map(|registry| (domain.clone(), registry))
-                .map_err(|source| RunError::Extensions {
-                    host: domain.clone(),
-                    source,
-                })
-        })
-        .collect::<Result<_, _>>()?;
     let hosts =
         Hosts::new(&config.hosts, config.xmpp.default_host.as_deref()).map_err(RunError::Hosts)?;
     let worker_count = worker_count().map_err(RunError::WorkerCount)?;
@@ -130,6 +117,32 @@ pub fn run_with_extensions(
             let mut router = None;
             let result = async {
                 let accounts = stores.accounts(account_store)?;
+                if config.hosts.values().any(|host| {
+                    host.extensions
+                        .iter()
+                        .any(|name| name == lonewolf_extension::roster::NAME)
+                }) {
+                    let rosters = stores.rosters(account_store)?;
+                    extensions
+                        .register(
+                            lonewolf_extension::roster::NAME,
+                            lonewolf_extension::roster::registrations(rosters),
+                        )
+                        .map_err(RunError::ExtensionCatalog)?;
+                }
+                let enabled_extensions = config
+                    .hosts
+                    .iter()
+                    .map(|(domain, host)| {
+                        extensions
+                            .enable(host.extensions.iter().map(String::as_str))
+                            .map(|registry| (domain.clone(), registry))
+                            .map_err(|source| RunError::Extensions {
+                                host: domain.clone(),
+                                source,
+                            })
+                    })
+                    .collect::<Result<_, _>>()?;
                 let admin = if config.admin.enabled {
                     Some(
                         lonewolf_admin::Server::bind(&config.admin.socket_path, accounts.clone())
@@ -142,7 +155,7 @@ pub fn run_with_extensions(
                     .await
                     .map_err(RunError::Router)?;
                 let router_handle = router
-                    .insert(Router::new(hosts.clone(), local).with_extensions(extensions))
+                    .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions))
                     .handle();
                 let listeners = listeners.insert(
                     c2s::Listeners::start(

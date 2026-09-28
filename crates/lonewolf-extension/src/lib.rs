@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use lonewolf_util::arena::ChunkAllocator;
 
 pub mod iq;
+pub mod roster;
 
 use iq::{IqRegistration, IqRegistry, RegistrationError};
 

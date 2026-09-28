@@ -24,6 +24,7 @@ use futures_util::io::{
 };
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
+use lonewolf_extension::iq::IqEffect;
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
@@ -1185,9 +1186,16 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
     }
     match stanza.stanza_type() {
         StanzaType::Iq(IqType::Get | IqType::Set) => {
-            let (reply, arena) = super::iq::reply(parsed, registration, router, allocator)
+            let (reply, arena, effect) = super::iq::reply(parsed, registration, router, allocator)
                 .await
                 .map_err(|_| CloseOutcome::InternalError)?;
+            match effect {
+                IqEffect::None => {}
+                IqEffect::MarkRosterInterested => registration
+                    .mark_roster_interested()
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?,
+            }
             let reply = reply
                 .resolve(&arena)
                 .map_err(|_| CloseOutcome::InternalError)?;

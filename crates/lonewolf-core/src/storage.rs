@@ -6,6 +6,7 @@ use std::os::unix::fs::DirBuilderExt;
 
 use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::redb::RedbAccountRepository;
+use lonewolf_storage::roster::redb::RedbRosterRepository;
 
 use crate::RunError;
 use crate::config::{StorageConfig, StoreConfig};
@@ -31,6 +32,14 @@ impl<'config> StoreRegistry<'config> {
                 store: name.into(),
                 source,
             }
+        })
+    }
+
+    pub(crate) fn rosters(&mut self, name: &str) -> Result<RedbRosterRepository, RunError> {
+        let database = self.database(name)?;
+        RedbRosterRepository::from_database(database.clone()).map_err(|source| RunError::Rosters {
+            store: name.into(),
+            source,
         })
     }
 

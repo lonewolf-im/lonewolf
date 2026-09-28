@@ -631,6 +631,11 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
+    pub fn bare_to(mut self) -> Self {
+        self.header.to = self.header.to.map(|jid| jid.bare());
+        self
+    }
+
     /// Copies the ID into the arena; `None` clears it.
     ///
     /// # Errors

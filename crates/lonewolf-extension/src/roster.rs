@@ -4,10 +4,10 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 
 use async_lock::{Mutex, MutexGuardArc};
-use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
-    RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterRepository, RosterSnapshot,
-    RosterVersion, SubscriptionState,
+    PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterRepository,
+    RosterSnapshot, RosterVersion, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -16,6 +16,10 @@ use lonewolf_xmpp::stanza::{BuildError, Element, ElementRef, NodeRef, StanzaErro
 use crate::iq::{
     IqEffect, IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute,
     IqScope,
+};
+use crate::presence::{
+    AcceptedPresence, PresenceDirection, PresenceEffect, PresenceFuture, PresenceHandler,
+    PresenceRegistration, PresenceRequest, PresenceRequestType, PresenceRoute,
 };
 
 pub const NAME: &str = "roster";
@@ -56,39 +60,74 @@ impl RosterPush {
     }
 }
 
-pub fn registrations<A, R>(repository: R) -> [IqRegistration<A>; 2]
+pub struct RosterRegistrations<A: ChunkAllocator> {
+    pub iq: [IqRegistration<A>; 2],
+    pub presence: [PresenceRegistration<A>; 3],
+}
+
+pub fn registrations<A, R, C>(repository: R, accounts: C) -> RosterRegistrations<A>
 where
     A: ChunkAllocator,
     R: RosterRepository + 'static,
+    C: AccountRepository + 'static,
 {
-    let handler: Arc<dyn IqHandler<A>> = Arc::new(Roster {
+    let roster = Arc::new(Roster {
         repository,
+        accounts,
         order: RosterSequencer::new(),
     });
-    [
-        IqRegistration::new(
-            IqRoute {
-                scope: IqScope::Account,
-                kind: IqRequestType::Get,
-                namespace: NAMESPACE,
-                name: "query",
-            },
-            Arc::clone(&handler),
-        ),
-        IqRegistration::new(
-            IqRoute {
-                scope: IqScope::Account,
-                kind: IqRequestType::Set,
-                namespace: NAMESPACE,
-                name: "query",
-            },
-            handler,
-        ),
-    ]
+    let iq: Arc<dyn IqHandler<A>> = roster.clone();
+    let presence: Arc<dyn PresenceHandler<A>> = roster;
+    RosterRegistrations {
+        iq: [
+            IqRegistration::new(
+                IqRoute {
+                    scope: IqScope::Account,
+                    kind: IqRequestType::Get,
+                    namespace: NAMESPACE,
+                    name: "query",
+                },
+                Arc::clone(&iq),
+            ),
+            IqRegistration::new(
+                IqRoute {
+                    scope: IqScope::Account,
+                    kind: IqRequestType::Set,
+                    namespace: NAMESPACE,
+                    name: "query",
+                },
+                iq,
+            ),
+        ],
+        presence: [
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Outbound,
+                    kind: PresenceRequestType::Subscribe,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Inbound,
+                    kind: PresenceRequestType::Subscribe,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Outbound,
+                    kind: PresenceRequestType::Available,
+                },
+                presence,
+            ),
+        ],
+    }
 }
 
-struct Roster<R> {
+struct Roster<R, C> {
     repository: R,
+    accounts: C,
     order: RosterSequencer,
 }
 
@@ -111,10 +150,11 @@ impl RosterSequencer {
     }
 }
 
-impl<A, R> IqHandler<A> for Roster<R>
+impl<A, R, C> IqHandler<A> for Roster<R, C>
 where
     A: ChunkAllocator,
     R: RosterRepository,
+    C: AccountRepository,
 {
     fn handle<'a>(&'a self, request: IqRequest<'a, A>, response: &'a mut Arena<A>) -> IqFuture<'a> {
         Box::pin(async move {
@@ -150,6 +190,104 @@ where
                         ))),
                     )
                 }
+            }
+        })
+    }
+}
+
+impl<A, R, C> PresenceHandler<A> for Roster<R, C>
+where
+    A: ChunkAllocator,
+    R: RosterRepository,
+    C: AccountRepository,
+{
+    fn handle<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a> {
+        Box::pin(async move {
+            match (request.direction, request.kind) {
+                (PresenceDirection::Outbound, PresenceRequestType::Subscribe) => {
+                    let contact_account = AccountKey::try_from(request.target.bare())
+                        .map_err(|_| StanzaErrorCondition::BadRequest)?;
+                    if self
+                        .accounts
+                        .get(&contact_account)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .is_none()
+                    {
+                        return Err(StanzaErrorCondition::ServiceUnavailable);
+                    }
+                    Ok(PresenceEffect::Route)
+                }
+                (PresenceDirection::Inbound, PresenceRequestType::Subscribe) => {
+                    let owner = AccountKey::try_from(request.target.bare())
+                        .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
+                    if self
+                        .accounts
+                        .get(&owner)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .is_none()
+                    {
+                        return Err(StanzaErrorCondition::ServiceUnavailable);
+                    }
+                    let order = RosterOrder::new(self.order.lock(&owner).await);
+                    let mut stanza = String::new();
+                    request
+                        .stanza
+                        .write_xml(&mut stanza)
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    self.repository
+                        .put_pending(
+                            &owner,
+                            PendingSubscription {
+                                sender: RosterJid::from(request.sender.bare()),
+                                stanza: stanza.into_bytes().into_boxed_slice(),
+                            },
+                        )
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(PresenceEffect::Deliver(order))
+                }
+                (PresenceDirection::Outbound, PresenceRequestType::Available) => {
+                    let owner = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let order = RosterOrder::new(self.order.lock(&owner).await);
+                    let pending = self
+                        .repository
+                        .pending(&owner)
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(PresenceEffect::Replay { order, pending })
+                }
+                _ => Err(StanzaErrorCondition::ServiceUnavailable),
+            }
+        })
+    }
+
+    fn accepted<'a>(&'a self, request: AcceptedPresence<'a>) -> PresenceFuture<'a> {
+        Box::pin(async move {
+            match (request.direction, request.kind) {
+                (PresenceDirection::Outbound, PresenceRequestType::Subscribe) => {
+                    let owner = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let contact = RosterJid::from(request.target.bare());
+                    let order = self.order.lock(&owner).await;
+                    let mutation = self
+                        .repository
+                        .update_subscription(&owner, &contact, |mut current| {
+                            if current.pending_out {
+                                return None;
+                            }
+                            current.pending_out = true;
+                            Some(current)
+                        })
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(PresenceEffect::PushRoster(mutation.map(|mutation| {
+                        RosterPush::new(RosterOrder::new(order), mutation.value, mutation.version)
+                    })))
+                }
+                _ => Err(StanzaErrorCondition::ServiceUnavailable),
             }
         })
     }

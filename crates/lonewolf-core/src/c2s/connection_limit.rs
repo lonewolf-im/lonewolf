@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use async_lock::Mutex;
 
+use super::rejection_report::RejectionReport;
+
 const MAX_TRACKED_SOURCES: usize = 16_384;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -31,8 +33,7 @@ pub(super) struct ConnectionPermit {
 struct State {
     sources: HashMap<IpAddr, Arc<AtomicUsize>>,
     next_cleanup: Instant,
-    last_report_at: Option<Instant>,
-    unreported_rejections: u64,
+    report: RejectionReport,
 }
 
 impl ConnectionLimiter {
@@ -42,8 +43,7 @@ impl ConnectionLimiter {
             state: Mutex::new(State {
                 sources: HashMap::new(),
                 next_cleanup: Instant::now(),
-                last_report_at: None,
-                unreported_rejections: 0,
+                report: RejectionReport::default(),
             }),
         }
     }
@@ -77,19 +77,9 @@ impl ConnectionLimiter {
 
 impl State {
     fn deny(&mut self, now: Instant, outcome: &'static str) -> ConnectionAdmission {
-        self.unreported_rejections = self.unreported_rejections.saturating_add(1);
-        let report_count = if self
-            .last_report_at
-            .is_none_or(|last| now.saturating_duration_since(last) >= CLEANUP_INTERVAL)
-        {
-            self.last_report_at = Some(now);
-            Some(std::mem::take(&mut self.unreported_rejections))
-        } else {
-            None
-        };
         ConnectionAdmission::Denied {
             outcome,
-            report_count,
+            report_count: self.report.record(now),
         }
     }
 }

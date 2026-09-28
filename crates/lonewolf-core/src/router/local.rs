@@ -37,6 +37,7 @@ pub struct LocalRouter<A: ChunkAllocator> {
 pub(super) struct LocalRouterHandle<A: ChunkAllocator> {
     shards: Arc<[Sender<Command<A>>]>,
     hash_state: RandomState,
+    allocator: A,
 }
 
 /// Keeps a bound resource registered until this value is dropped.
@@ -104,13 +105,13 @@ impl<A: ChunkAllocator> Drop for Inbox<A> {
     }
 }
 
-impl<A: ChunkAllocator> LocalRouter<A> {
+impl<A: ChunkAllocator + Clone> LocalRouter<A> {
     /// Starts one shard actor per dispatcher worker.
     ///
     /// # Errors
     ///
     /// Returns a dispatcher error if a worker cannot accept its actor.
-    pub async fn start(dispatcher: &DispatchHandle) -> io::Result<Self> {
+    pub async fn start(dispatcher: &DispatchHandle, allocator: A) -> io::Result<Self> {
         let count = dispatcher.worker_count();
         let mut senders = Vec::with_capacity(count);
         let mut tasks = Vec::with_capacity(count);
@@ -127,6 +128,7 @@ impl<A: ChunkAllocator> LocalRouter<A> {
             handle: LocalRouterHandle {
                 shards: senders.into(),
                 hash_state: RandomState::new(),
+                allocator,
             },
             tasks,
         })
@@ -148,16 +150,17 @@ impl<A: ChunkAllocator> LocalRouter<A> {
     }
 }
 
-impl<A: ChunkAllocator> Clone for LocalRouterHandle<A> {
+impl<A: ChunkAllocator + Clone> Clone for LocalRouterHandle<A> {
     fn clone(&self) -> Self {
         Self {
             shards: Arc::clone(&self.shards),
             hash_state: self.hash_state.clone(),
+            allocator: self.allocator.clone(),
         }
     }
 }
 
-impl<A: ChunkAllocator> LocalRouterHandle<A> {
+impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     pub(crate) async fn register(
         &self,
         account: &AccountKey,
@@ -165,7 +168,7 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
         limit: NonZeroUsize,
     ) -> Result<Registration<A>, RouterError> {
         let requested = requested
-            .map(|resource| validate_resource(account, resource))
+            .map(|resource| validate_resource(account, resource, self.allocator.clone()))
             .transpose()?;
         let (reply, result) = oneshot::channel();
         let (outbound, inbound) = async_channel::bounded(RESOURCE_QUEUE_CAPACITY);
@@ -296,8 +299,13 @@ impl<A: ChunkAllocator> Drop for Registration<A> {
     }
 }
 
-fn validate_resource(account: &AccountKey, input: &str) -> Result<Box<str>, RouterError> {
-    let mut arena = Arena::try_new(Default::default()).map_err(|_| RouterError::Unavailable)?;
+fn validate_resource<A: ChunkAllocator>(
+    account: &AccountKey,
+    input: &str,
+    allocator: A,
+) -> Result<Box<str>, RouterError> {
+    let mut arena =
+        Arena::try_new_in(Default::default(), allocator).map_err(|_| RouterError::Unavailable)?;
     let jid = lonewolf_xmpp::jid::Jid::from_parts_in(
         Some(account.username()),
         account.domain(),

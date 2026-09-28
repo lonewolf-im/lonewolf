@@ -105,7 +105,7 @@ async fn test_router(
     hosts: &Hosts,
 ) -> std::io::Result<(Router<GlobalChunkAllocator>, CoreDispatcher)> {
     let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
-    let local = LocalRouter::start(&dispatcher.handle()).await?;
+    let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
     Ok((Router::new(hosts.clone(), local), dispatcher))
 }
 

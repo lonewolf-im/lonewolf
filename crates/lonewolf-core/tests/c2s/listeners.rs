@@ -47,7 +47,7 @@ async fn router(
     dispatcher: &DispatchHandle,
     hosts: &Hosts,
 ) -> io::Result<Router<GlobalChunkAllocator>> {
-    let local = LocalRouter::start(dispatcher).await?;
+    let local = LocalRouter::start(dispatcher, GlobalChunkAllocator).await?;
     Ok(Router::new(hosts.clone(), local))
 }
 

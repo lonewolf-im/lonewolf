@@ -1179,6 +1179,7 @@ dependencies = [
  "hmac",
  "lonewolf-admin",
  "lonewolf-auth",
+ "lonewolf-extension",
  "lonewolf-storage",
  "lonewolf-util",
  "lonewolf-xmpp",
@@ -1205,6 +1206,14 @@ dependencies = [
  "tracing-subscriber",
  "x509-cert",
  "zeroize",
+]
+
+[[package]]
+name = "lonewolf-extension"
+version = "0.1.0"
+dependencies = [
+ "lonewolf-util",
+ "lonewolf-xmpp",
 ]
 
 [[package]]

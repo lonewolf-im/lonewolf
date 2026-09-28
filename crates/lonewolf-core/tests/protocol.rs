@@ -2,6 +2,9 @@
 
 mod support;
 
+#[path = "protocol/extensions.rs"]
+mod extensions;
+
 #[path = "protocol/stream.rs"]
 mod stream;
 

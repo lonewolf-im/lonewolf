@@ -177,6 +177,7 @@ fn default_hosts() -> BTreeMap<String, HostConfig> {
 #[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     pub tls: Option<HostTlsConfig>,
+    pub extensions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

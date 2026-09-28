@@ -566,6 +566,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
                 certificate_chain_path: PathBuf::from("./certs/example.com.crt"),
                 private_key_path: PathBuf::from("./certs/example.com.key"),
             }),
+            ..HostConfig::default()
         },
     );
     expected.xmpp.default_host = Some("localhost".into());

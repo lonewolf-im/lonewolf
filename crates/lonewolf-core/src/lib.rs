@@ -16,6 +16,7 @@ use std::time::Duration;
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
+use lonewolf_extension::Extensions;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
@@ -54,20 +55,40 @@ pub struct BuildInfo {
 ///
 /// # Errors
 ///
-/// Returns [`RunError::Config`] for invalid configuration or
-/// [`RunError::WorkerCount`] if worker count selection fails. Startup failures
-/// identify logging, hosts, stanza pool, runtime, dispatcher, storage, router, admin, or c2s
-/// initialization in [`RunError`]. Signal and worker shutdown failures also
-/// return [`RunError`]. If service execution and worker shutdown both fail, the
-/// service error wins.
+/// Returns [`RunError`] for invalid configuration, startup, service, or shutdown
+/// failures. If service execution and worker shutdown both fail, the service
+/// error wins.
 ///
 /// # Panics
 ///
 /// Panics if called from a panicking thread while installing the panic hook.
 pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError> {
+    run_with_extensions(config_path, build, Extensions::default())
+}
+
+/// Uses the lifecycle and process-wide side effects of [`run`].
+/// Enabled extensions must exist in the supplied catalog and have disjoint IQ routes.
+pub fn run_with_extensions(
+    config_path: Option<&Path>,
+    build: BuildInfo,
+    extensions: Extensions<Arc<PooledChunkAllocator>>,
+) -> Result<(), RunError> {
     panic::init(&build);
 
     let config = Config::load(config_path).map_err(RunError::Config)?;
+    let extensions = config
+        .hosts
+        .iter()
+        .map(|(domain, host)| {
+            extensions
+                .enable(host.extensions.iter().map(String::as_str))
+                .map(|registry| (domain.clone(), registry))
+                .map_err(|source| RunError::Extensions {
+                    host: domain.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<_, _>>()?;
     let hosts =
         Hosts::new(&config.hosts, config.xmpp.default_host.as_deref()).map_err(RunError::Hosts)?;
     let worker_count = worker_count().map_err(RunError::WorkerCount)?;
@@ -120,7 +141,9 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
                 let local = LocalRouter::start(&dispatcher.handle(), Arc::clone(&stanza_pool))
                     .await
                     .map_err(RunError::Router)?;
-                let router_handle = router.insert(Router::new(hosts.clone(), local)).handle();
+                let router_handle = router
+                    .insert(Router::new(hosts.clone(), local).with_extensions(extensions))
+                    .handle();
                 let listeners = listeners.insert(
                     c2s::Listeners::start(
                         &config.c2s,

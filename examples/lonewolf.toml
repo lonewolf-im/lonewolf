@@ -1,15 +1,11 @@
 # Copy this file to lonewolf.toml and uncomment the settings you want to change.
 # The values shown are the defaults unless a comment identifies an example.
 
-# ------------------------------------ Logging --------------------------------------------------
-
 # [logging]
 
 # Choose how much detail Lonewolf writes to standard error.
 # Use "off", "error", "warn", "info", "debug", or "trace".
 # level = "info"
-
-# ------------------------------------ XMPP -----------------------------------------------------
 
 # [xmpp]
 
@@ -22,12 +18,14 @@
 # memory when the pool is exhausted.
 # stanza_pool_size_mib = 256
 
-# ------------------------------------ Hosts ----------------------------------------------------
-
 # Add one section for each XMPP domain served by Lonewolf.
 # Defining hosts replaces the built-in host map.
 # Use lowercase ASCII names or Punycode for internationalized domains.
 # [hosts.localhost]
+
+# Choose the extensions enabled for this host when the server starts.
+# Names must identify extensions included in the server build.
+# extensions = []
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
@@ -41,8 +39,6 @@
 # [hosts."example.com".tls]
 # certificate_chain_path = "./certs/example.com.crt"
 # private_key_path = "./certs/example.com.key"
-
-# ------------------------------------ Limits ---------------------------------------------------
 
 # All numeric limits are positive integers.
 # [limits.c2s]
@@ -106,8 +102,6 @@
 # [limits.c2s.profiles.internal]
 # max_stanza_bytes = 524_288
 
-# ------------------------------------ C2S ------------------------------------------------------
-
 # Add one section per TCP endpoint. These sections replace the default endpoint.
 # Lonewolf requires at least one client endpoint.
 # [[c2s.listeners]]
@@ -131,8 +125,6 @@
 # address = "127.0.0.1:5223"
 # limits = "internal"
 
-# ------------------------------------ Storage --------------------------------------------------
-
 # [storage]
 
 # Choose the store Lonewolf uses by default.
@@ -144,14 +136,12 @@
 # Defining a store replaces that built-in store.
 # [storage.stores.primary]
 
-# Choose the database engine for this store. Lonewolf currently supports Redb.
+# Choose the database engine for this store. Lonewolf supports Redb.
 # backend = "redb"
 
 # Choose where Redb keeps this database. Relative paths start from the directory
 # where Lonewolf was launched.
 # path = "./data/lonewolf.dat"
-
-# ------------------------------------ Admin ----------------------------------------------------
 
 # [admin]
 
@@ -164,8 +154,6 @@
 # Lonewolf will not replace an existing file at this path. The parent directory
 # must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
-
-# ------------------------------------ Account --------------------------------------------------
 
 # [account]
 

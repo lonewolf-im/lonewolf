@@ -1185,7 +1185,9 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
     }
     match stanza.stanza_type() {
         StanzaType::Iq(IqType::Get | IqType::Set) => {
-            let (reply, arena) = unsupported_iq_reply(parsed)?;
+            let (reply, arena) = super::iq::reply(parsed, registration, router, allocator)
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?;
             let reply = reply
                 .resolve(&arena)
                 .map_err(|_| CloseOutcome::InternalError)?;
@@ -1441,20 +1443,6 @@ async fn send_stanza_error<A: ChunkAllocator + Clone>(
         .resolve(&arena)
         .map_err(|_| CloseOutcome::InternalError)?;
     write_stanza(writer, &reply).await
-}
-
-fn unsupported_iq_reply<A: ChunkAllocator>(
-    parsed: Parsed<Stanza, A>,
-) -> Result<(Stanza, Arena<A>), CloseOutcome> {
-    let (request, mut arena) = parsed.into_parts();
-    let reply = request
-        .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)
-        .map_err(|_| CloseOutcome::InternalError)?
-        .to(None)
-        .map_err(|_| CloseOutcome::InternalError)?
-        .build()
-        .map_err(|_| CloseOutcome::InternalError)?;
-    Ok((reply, arena))
 }
 
 fn account_key(username: &str, host: &str) -> Option<AccountKey> {

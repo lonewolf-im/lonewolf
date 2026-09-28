@@ -254,6 +254,13 @@ fn connection_establishment_has_one_deadline_from_accept() -> Result<(), Box<dyn
 }
 
 #[test]
+fn elapsed_and_overflowed_phase_deadlines_have_no_remaining_time() {
+    let now = Instant::now();
+    assert_eq!(phase_remaining(now, Duration::ZERO), Duration::ZERO);
+    assert_eq!(phase_remaining(now, Duration::MAX), Duration::ZERO);
+}
+
+#[test]
 fn stream_footer_closes_without_tcp_eof() -> Result<(), Box<dyn Error>> {
     let input = format!("{OPEN}{CLOSE}");
     let (outcome, _, response) = run_case_with_rate(
@@ -1141,6 +1148,50 @@ fn replacement_auth_counts_toward_attempt_cap() -> Result<(), Box<dyn Error + Se
         Ok(())
     })?;
     assert_eq!(outcome, CloseOutcome::AuthenticationAttemptsExceeded);
+    Ok(())
+}
+
+#[test]
+fn both_scram_challenges_allow_failure_retries_until_the_attempt_cap()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    for empty_initial in [false, true] {
+        for (response, condition) in [
+            (
+                "<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>",
+                "aborted",
+            ),
+            (
+                "<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>!</response>",
+                "incorrect-encoding",
+            ),
+        ] {
+            let outcome = run_sasl_case(PSI_OPEN, false, move |tls| {
+                for _ in 0..MAX_AUTH_ATTEMPTS {
+                    if empty_initial {
+                        tls.write_all(
+                            b"<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-256'/>",
+                        )?;
+                        let challenge = String::from_utf8(read_through(tls, b"/>")?)?;
+                        assert!(challenge.contains("<challenge"));
+                    } else {
+                        tls.write_all(
+                            sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=nonce").as_bytes(),
+                        )?;
+                        sasl_challenge(tls)?;
+                    }
+                    tls.write_all(response.as_bytes())?;
+                    let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
+                    assert!(failure.contains(&format!("<{condition}/>")), "{failure}");
+                }
+                let mut rest = String::new();
+                tls.read_to_string(&mut rest)?;
+                assert!(rest.contains("<policy-violation"), "{rest}");
+                assert!(rest.ends_with(STREAM_FOOTER));
+                Ok(())
+            })?;
+            assert_eq!(outcome, CloseOutcome::AuthenticationAttemptsExceeded);
+        }
+    }
     Ok(())
 }
 

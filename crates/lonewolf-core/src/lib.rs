@@ -67,7 +67,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
 }
 
 /// Uses the lifecycle and process-wide side effects of [`run`].
-/// Enabled extensions must exist in the supplied catalog and have disjoint IQ routes.
+/// Enabled extensions must exist in the supplied catalog and have disjoint stanza routes.
 pub fn run_with_extensions(
     config_path: Option<&Path>,
     build: BuildInfo,
@@ -127,6 +127,7 @@ pub fn run_with_extensions(
                         .register(
                             lonewolf_extension::roster::NAME,
                             lonewolf_extension::roster::registrations(rosters),
+                            [],
                         )
                         .map_err(RunError::ExtensionCatalog)?;
                 }

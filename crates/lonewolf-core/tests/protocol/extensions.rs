@@ -28,6 +28,18 @@ fn conflicting_enabled_handlers_prevent_server_startup() -> TestResult {
 }
 
 #[test]
+fn conflicting_presence_handlers_prevent_server_startup() -> TestResult {
+    let error = C2sSuite::with_extensions("'test-presence', 'test-conflicting-presence'")
+        .err()
+        .ok_or("server started with conflicting presence handlers")?;
+    assert!(
+        error.to_string().contains("conflicting presence route"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn requests_to_another_local_host_use_its_enabled_handlers() -> TestResult {
     let suite = C2sSuite::with_hosts(
         r#"
@@ -52,6 +64,69 @@ fn enabled_account_handler_receives_an_iq_request() -> TestResult {
     let mut alice = suite.connect("alice", "password", "desk")?;
     alice.send("<iq type='get' id='extension-1'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='extension-1' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='alice@localhost'/></iq>")?;
+    alice.close()
+}
+
+#[test]
+fn subscription_presence_handlers_receive_authenticated_directed_requests() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-presence'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+        alice.send(&format!("<presence type='{kind}' id='{kind}' from='mallory@localhost/spy' to='bob@localhost'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick></presence>"))?;
+        alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='{kind}' from='bob@localhost' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+    }
+
+    alice.close()
+}
+
+#[test]
+fn outbound_presence_uses_the_sender_hosts_extensions() -> TestResult {
+    let suite = C2sSuite::with_hosts(
+        r#"
+[hosts.localhost]
+extensions = ["test-presence"]
+[hosts."other.localhost".tls]
+certificate_chain_path = "certificate.pem"
+private_key_path = "private-key.pem"
+"#,
+    )?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<presence type='subscribe' id='other-host' to='bob@other.localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='other-host' from='bob@other.localhost' to='alice@localhost/desk'><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+
+    alice.close()
+}
+
+#[test]
+fn undirected_subscription_presence_does_not_enter_handlers() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-presence'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<presence type='subscribe' id='undirected'/>")?;
+    alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
+
+    alice.close()
+}
+
+#[test]
+fn presence_extensions_do_not_intercept_availability() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-presence'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    alice.send("<presence type='unavailable'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost' type='unavailable'/>")?;
+
     alice.close()
 }
 

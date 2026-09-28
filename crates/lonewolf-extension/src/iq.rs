@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::error::Error;
-use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,6 +8,7 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
 
+pub use crate::RegistrationError;
 use crate::roster::{RosterOrder, RosterPush};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -150,28 +149,3 @@ impl<A: ChunkAllocator> IqRegistry<A> {
         &self.handlers
     }
 }
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum RegistrationError {
-    InvalidExtensionName,
-    DuplicateExtension(&'static str),
-    UnknownExtension(String),
-    DuplicateRoute(IqRoute),
-}
-
-impl fmt::Display for RegistrationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidExtensionName => {
-                formatter.write_str("extension name must be nonempty and trimmed")
-            }
-            Self::DuplicateExtension(name) => {
-                write!(formatter, "extension {name:?} appears more than once")
-            }
-            Self::UnknownExtension(name) => write!(formatter, "unknown extension {name:?}"),
-            Self::DuplicateRoute(route) => write!(formatter, "conflicting IQ route {route:?}"),
-        }
-    }
-}
-
-impl Error for RegistrationError {}

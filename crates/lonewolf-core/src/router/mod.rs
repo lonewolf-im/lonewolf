@@ -6,7 +6,9 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::iq::IqRegistry;
+use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
 use lonewolf_xmpp::parser::Parsed;
@@ -27,7 +29,7 @@ pub struct Router<A: ChunkAllocator> {
 pub struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
     local: LocalRouterHandle<A>,
-    extensions: Arc<BTreeMap<String, IqRegistry<A>>>,
+    extensions: Arc<BTreeMap<String, ExtensionRegistry<A>>>,
 }
 
 /// Retains the parsed stanza and its immutable arena across workers.
@@ -62,7 +64,10 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         self.handle.clone()
     }
 
-    pub(crate) fn with_extensions(mut self, extensions: BTreeMap<String, IqRegistry<A>>) -> Self {
+    pub(crate) fn with_extensions(
+        mut self,
+        extensions: BTreeMap<String, ExtensionRegistry<A>>,
+    ) -> Self {
         self.handle.extensions = Arc::new(extensions);
         self
     }
@@ -84,7 +89,11 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
 
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A>> {
-        self.extensions.get(domain)
+        self.extensions.get(domain).map(ExtensionRegistry::iq)
+    }
+
+    pub(crate) fn presence_handlers(&self, domain: &str) -> Option<&PresenceRegistry<A>> {
+        self.extensions.get(domain).map(ExtensionRegistry::presence)
     }
 
     /// Applies the incoming listener's limit to resources on all listeners.

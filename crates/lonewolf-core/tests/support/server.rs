@@ -140,6 +140,7 @@ max_resources_per_account = {resources}
         loop {
             let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
             if self.child.try_wait()?.is_some() {
+                let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 return Err(format!("server exited before readiness: {logs}").into());
             }
             if logs.contains("waiting for stop signal") {

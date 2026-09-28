@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::{fmt, io};
 
-use lonewolf_extension::iq::RegistrationError;
+use lonewolf_extension::RegistrationError;
 use lonewolf_storage::StorageError;
 use lonewolf_util::pool::PoolError;
 

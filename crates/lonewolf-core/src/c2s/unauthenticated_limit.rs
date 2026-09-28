@@ -3,11 +3,11 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_lock::Mutex;
 
-const REPORT_INTERVAL: Duration = Duration::from_secs(1);
+use super::rejection_report::RejectionReport;
 
 pub(super) struct UnauthenticatedLimiter {
     max: usize,
@@ -24,20 +24,12 @@ pub(super) struct UnauthenticatedPermit {
     limiter: Arc<UnauthenticatedLimiter>,
 }
 
-struct RejectionReport {
-    last_report_at: Option<Instant>,
-    unreported_rejections: u64,
-}
-
 impl UnauthenticatedLimiter {
     pub(super) fn new(max: NonZeroUsize) -> Self {
         Self {
             max: max.get(),
             active: AtomicUsize::new(0),
-            report: Mutex::new(RejectionReport {
-                last_report_at: None,
-                unreported_rejections: 0,
-            }),
+            report: Mutex::new(RejectionReport::default()),
         }
     }
 
@@ -58,16 +50,7 @@ impl UnauthenticatedLimiter {
             });
         }
         let mut report = self.report.lock().await;
-        report.unreported_rejections = report.unreported_rejections.saturating_add(1);
-        let report_count = if report
-            .last_report_at
-            .is_none_or(|last| now.saturating_duration_since(last) >= REPORT_INTERVAL)
-        {
-            report.last_report_at = Some(now);
-            Some(std::mem::take(&mut report.unreported_rejections))
-        } else {
-            None
-        };
+        let report_count = report.record(now);
         Admission::Denied { report_count }
     }
 

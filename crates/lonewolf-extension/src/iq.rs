@@ -10,6 +10,8 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
 
+use crate::roster::{RosterOrder, RosterPush};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IqScope {
     Server,
@@ -39,11 +41,12 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Default)]
 pub enum IqEffect {
     #[default]
     None,
-    MarkRosterInterested,
+    MarkRosterInterested(RosterOrder),
+    PushRoster(RosterPush),
 }
 
 pub struct IqResponse {

@@ -11,7 +11,7 @@ mod stream;
 #[path = "protocol/routing.rs"]
 mod routing;
 
-#[path = "protocol/roster.rs"]
+#[path = "protocol/roster/mod.rs"]
 mod roster;
 
 #[path = "protocol/authentication.rs"]

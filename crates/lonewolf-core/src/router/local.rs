@@ -521,11 +521,10 @@ impl<A: ChunkAllocator> Shard<A> {
             .and_then(|sessions| sessions.get(resource));
         let result = recipient.map(|session| {
             let delivery = if session.alive.load(Ordering::Acquire) {
-                match session.outbound.try_send(stanza.clone()) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(_)) => Err(RouterError::Busy),
-                    Err(TrySendError::Closed(_)) => Err(RouterError::NotFound),
-                }
+                session
+                    .outbound
+                    .try_send(stanza.clone())
+                    .map_err(mailbox_error)
             } else {
                 Err(RouterError::NotFound)
             };
@@ -572,11 +571,7 @@ impl<A: ChunkAllocator> Shard<A> {
                     })
                     .max_by_key(|session| (session.priority, std::cmp::Reverse(session.token)))
                     .ok_or(RouterError::NotFound)?;
-                match recipient.outbound.try_send(stanza) {
-                    Ok(()) => Ok(()),
-                    Err(TrySendError::Full(_)) => Err(RouterError::Busy),
-                    Err(TrySendError::Closed(_)) => Err(RouterError::NotFound),
-                }
+                recipient.outbound.try_send(stanza).map_err(mailbox_error)
             }
             StanzaType::Message(MessageType::Headline) => {
                 let mut delivered = false;
@@ -626,13 +621,13 @@ impl<A: ChunkAllocator> Shard<A> {
                     .values()
                     .filter(|session| session.token != token)
                     .filter_map(|session| session.presence.as_ref())
-                    .find_map(
-                        |presence| match source.outbound.try_send(presence.clone()) {
-                            Ok(()) => None,
-                            Err(TrySendError::Full(_)) => Some(RouterError::Busy),
-                            Err(TrySendError::Closed(_)) => Some(RouterError::NotFound),
-                        },
-                    )
+                    .find_map(|presence| {
+                        source
+                            .outbound
+                            .try_send(presence.clone())
+                            .map_err(mailbox_error)
+                            .err()
+                    })
             } else {
                 None
             }
@@ -655,18 +650,15 @@ impl<A: ChunkAllocator> Shard<A> {
             for (recipient_resource, session) in sessions.iter() {
                 if session.alive.load(Ordering::Acquire)
                     && (session.priority.is_some() || session.token == token)
+                    && let Err(error) = session
+                        .outbound
+                        .try_send(stanza.clone())
+                        .map_err(mailbox_error)
                 {
-                    let error = match session.outbound.try_send(stanza.clone()) {
-                        Ok(()) => None,
-                        Err(TrySendError::Full(_)) => Some(RouterError::Busy),
-                        Err(TrySendError::Closed(_)) => Some(RouterError::NotFound),
-                    };
-                    if let Some(error) = error {
-                        if session.token == token {
-                            source_error = Some(error);
-                        }
-                        failed.push((recipient_resource.clone(), session.token));
+                    if session.token == token {
+                        source_error = Some(error);
                     }
+                    failed.push((recipient_resource.clone(), session.token));
                 }
             }
             if let Some(source) = sessions.get_mut(resource) {
@@ -718,6 +710,13 @@ impl<A: ChunkAllocator> Shard<A> {
                 }
             }
         }
+    }
+}
+
+fn mailbox_error<T>(error: TrySendError<T>) -> RouterError {
+    match error {
+        TrySendError::Full(_) => RouterError::Busy,
+        TrySendError::Closed(_) => RouterError::NotFound,
     }
 }
 
@@ -797,6 +796,61 @@ mod tests {
             Some(StreamEvent::Stanza(parsed)) => Ok(RoutedStanza::from_parsed(parsed)),
             _ => Err("expected a stanza".into()),
         }
+    }
+
+    #[test]
+    fn headline_prefers_success_then_busy_and_keeps_closed_sessions() -> Result<(), Box<dyn Error>>
+    {
+        Runtime::new()?.block_on(async {
+            let account = account()?;
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let mut sessions = HashMap::new();
+            let mut receivers = Vec::new();
+            for (token, resource) in [(1, "ready"), (2, "full"), (3, "closed")] {
+                let (outbound, inbound) = async_channel::bounded(1);
+                sessions.insert(
+                    resource.into(),
+                    Session {
+                        token,
+                        alive: Arc::new(AtomicBool::new(true)),
+                        outbound,
+                        priority: Some(0),
+                        presence: None,
+                        unavailable: None,
+                    },
+                );
+                receivers.push(inbound);
+            }
+            let stanza = routed("<message to='alice@localhost' type='headline'/>").await?;
+            assert!(sessions["full"].outbound.try_send(stanza.clone()).is_ok());
+            receivers[2].close();
+            shard.accounts.insert(account.as_str().into(), sessions);
+
+            assert_eq!(shard.deliver_bare(stanza.clone(), false), Ok(()));
+            assert_eq!(
+                receivers[0].try_recv()?.resolve()?.stanza_type(),
+                StanzaType::Message(MessageType::Headline)
+            );
+            assert_eq!(receivers[1].len(), 1);
+            receivers[0].close();
+            assert_eq!(
+                shard.deliver_bare(stanza.clone(), false),
+                Err(RouterError::Busy)
+            );
+            receivers[1].close();
+            assert_eq!(
+                shard.deliver_bare(stanza, false),
+                Err(RouterError::NotFound)
+            );
+            let sessions = &shard.accounts[account.as_str()];
+            assert_eq!(sessions.len(), 3);
+            assert!(
+                sessions
+                    .values()
+                    .all(|session| session.alive.load(Ordering::Acquire))
+            );
+            Ok(())
+        })
     }
 
     #[test]

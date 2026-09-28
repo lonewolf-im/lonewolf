@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::error::Error;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+use compio::runtime::Runtime;
+use lonewolf_storage::RedbDatabase;
+use lonewolf_storage::account::redb::RedbAccountRepository;
+
+use super::Server;
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn socket_permissions_and_existing_paths_are_preserved() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let database = RedbDatabase::open(directory.path().join("accounts.redb"))?;
+    let accounts = || RedbAccountRepository::from_database(database.clone());
+    Runtime::new()?.block_on(async {
+        let path = directory.path().join("private/admin.sock");
+        let server = Server::bind(&path, accounts()?)?;
+        assert_eq!(
+            fs::metadata(path.parent().ok_or("missing parent")?)?.mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o600);
+        assert!(Server::bind(&path, accounts()?).is_err());
+        drop(server);
+        assert!(!path.exists());
+
+        let stale = std::os::unix::net::UnixListener::bind(&path)?;
+        drop(stale);
+        assert!(Server::bind(&path, accounts()?).is_err());
+        assert!(path.exists());
+        fs::remove_file(&path)?;
+
+        fs::write(&path, "keep")?;
+        assert!(Server::bind(&path, accounts()?).is_err());
+        assert_eq!(fs::read_to_string(&path)?, "keep");
+        fs::remove_file(&path)?;
+        let target = directory.path().join("target");
+        symlink(&target, &path)?;
+        let error = Server::bind(&path, accounts()?)
+            .err()
+            .ok_or("accepted an existing symlink")?;
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(fs::read_link(&path)?, target);
+        assert!(!target.try_exists()?);
+        fs::remove_file(&path)?;
+
+        let server = Server::bind(&path, accounts()?)?;
+        fs::remove_file(&path)?;
+        fs::write(&path, "replacement")?;
+        drop(server);
+        assert_eq!(fs::read_to_string(&path)?, "replacement");
+
+        let public = directory.path().join("public");
+        fs::create_dir(&public)?;
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o755))?;
+        assert!(Server::bind(&public.join("admin.sock"), accounts()?).is_err());
+        Ok(())
+    })
+}

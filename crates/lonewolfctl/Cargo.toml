@@ -24,3 +24,7 @@ futures-channel.workspace = true
 lonewolf-admin.workspace = true
 lonewolf-storage.workspace = true
 tempfile.workspace = true
+
+[[test]]
+name = "cli"
+path = "../lonewolf-core/tests/admin/cli.rs"

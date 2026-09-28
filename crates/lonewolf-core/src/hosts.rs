@@ -398,3 +398,6 @@ impl Error for HostsError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

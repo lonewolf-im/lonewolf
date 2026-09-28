@@ -435,3 +435,6 @@ fn take<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N], StorageError> {
     *bytes = remaining;
     Ok(*value)
 }
+
+#[cfg(test)]
+mod tests;

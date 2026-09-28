@@ -24,8 +24,43 @@ mod tests {
     use std::path::Path;
 
     use clap::Parser;
+    use lonewolf_core::config::DEFAULT_CONFIG_PATH;
 
     use super::Cli;
+
+    #[test]
+    fn help_and_version_succeed_without_loading_configuration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for flag in ["--help", "--version"] {
+            let error = Cli::try_parse_from(["lonewolf", "--config", "missing.conf", flag])
+                .err()
+                .ok_or("help or version was not handled")?;
+            assert_eq!(error.exit_code(), 0);
+            assert!(!error.use_stderr());
+            let output = error.to_string();
+            assert!(output.contains("lonewolf"));
+            if flag == "--help" {
+                assert!(output.contains("--config <PATH>"));
+                assert!(output.contains("TOML configuration file"));
+                assert!(output.contains(DEFAULT_CONFIG_PATH));
+                assert!(output.starts_with("A modern and highly efficient XMPP server\n"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_arguments_return_usage_errors() -> Result<(), Box<dyn std::error::Error>> {
+        for argument in ["--config", "--unknown", "unexpected"] {
+            let error = Cli::try_parse_from(["lonewolf", argument])
+                .err()
+                .ok_or("invalid arguments were accepted")?;
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.use_stderr());
+            assert!(!error.to_string().is_empty());
+        }
+        Ok(())
+    }
 
     #[test]
     fn config_paths_preserve_non_utf8_bytes() -> Result<(), clap::Error> {

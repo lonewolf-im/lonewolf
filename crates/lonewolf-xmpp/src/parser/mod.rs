@@ -546,3 +546,6 @@ impl std::error::Error for ParseError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

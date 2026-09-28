@@ -178,3 +178,6 @@ impl fmt::Display for RouterError {
 }
 
 impl std::error::Error for RouterError {}
+
+#[cfg(test)]
+mod tests;

@@ -652,3 +652,6 @@ impl Write for SliceWriter<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

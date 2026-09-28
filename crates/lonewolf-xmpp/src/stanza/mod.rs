@@ -930,3 +930,6 @@ impl std::error::Error for AsyncWriteError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

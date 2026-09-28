@@ -535,19 +535,4 @@ impl Error for ConfigError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::error::Error;
-    use std::num::NonZeroUsize;
-
-    use super::XmppConfig;
-
-    #[test]
-    fn stanza_pool_shard_count_matches_worker_count() -> Result<(), Box<dyn Error>> {
-        let worker_count = NonZeroUsize::new(3).ok_or("worker count must be nonzero")?;
-
-        let config = XmppConfig::default().stanza_pool_config(worker_count)?;
-
-        assert_eq!(config.shards_per_bucket, worker_count);
-        Ok(())
-    }
-}
+mod tests;

@@ -129,3 +129,6 @@ impl From<StorageError> for AccountError {
         Self::Storage(error)
     }
 }
+
+#[cfg(test)]
+mod tests;

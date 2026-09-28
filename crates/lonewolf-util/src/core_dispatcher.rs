@@ -441,5 +441,4 @@ fn create_runtime(worker: WorkerInfo) -> io::Result<Runtime> {
 }
 
 #[cfg(test)]
-#[path = "../tests/core_dispatcher/lifecycle.rs"]
 mod tests;

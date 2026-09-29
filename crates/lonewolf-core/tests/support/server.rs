@@ -246,6 +246,21 @@ max_resources_per_account = {resources}
         assert!(response.starts_with("HTTP/1.1 201 "), "{response}");
         Ok(())
     }
+
+    pub fn delete_account(&self, username: &str) -> TestResult {
+        let mut stream =
+            UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        stream.set_write_timeout(Some(TIMEOUT))?;
+        write!(
+            stream,
+            "DELETE /v1/accounts/{username}%40localhost HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        assert!(response.starts_with("HTTP/1.1 204 "), "{response}");
+        Ok(())
+    }
 }
 
 impl Drop for C2sSuite {

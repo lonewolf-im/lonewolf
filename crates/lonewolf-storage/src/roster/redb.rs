@@ -152,26 +152,19 @@ impl RosterRepository for RedbRosterRepository {
         &self,
         grantor: &AccountKey,
         contact: &RosterJid,
-        subscriber: &AccountKey,
-        grantor_jid: &RosterJid,
+        subscriber: Option<(&AccountKey, &RosterJid)>,
     ) -> Result<SubscriptionCancellation, RosterError> {
         let grantor = Box::<str>::from(grantor.as_str());
-        let subscriber = Box::<str>::from(subscriber.as_str());
         let grantor_key = item_key_text(&grantor, contact);
-        let subscriber_key = item_key_text(&subscriber, grantor_jid);
         let contact = contact.clone();
-        let grantor_jid = grantor_jid.clone();
+        let subscriber = subscriber.map(|(account, jid)| {
+            let account = Box::<str>::from(account.as_str());
+            let key = item_key_text(&account, jid);
+            (account, key, jid.clone())
+        });
         self.database
             .write(move |database| {
-                cancel_subscription(
-                    database,
-                    &grantor,
-                    grantor_key,
-                    contact,
-                    &subscriber,
-                    subscriber_key,
-                    grantor_jid,
-                )
+                cancel_subscription(database, &grantor, grantor_key, contact, subscriber)
             })
             .await
     }
@@ -473,9 +466,7 @@ fn cancel_subscription(
     grantor: &str,
     grantor_key: Box<str>,
     contact: RosterJid,
-    subscriber: &str,
-    subscriber_key: Box<str>,
-    grantor_jid: RosterJid,
+    subscriber: Option<(Box<str>, Box<str>, RosterJid)>,
 ) -> Result<SubscriptionCancellation, RosterError> {
     let transaction = begin_write(database)?;
     let pending = transaction
@@ -492,13 +483,14 @@ fn cancel_subscription(
         .map(|record| decode_item(contact.clone(), record.value()))
         .transpose()?
         .map(|item| item.subscription);
-    let send_unavailable = grantor_state.is_some_and(|subscription| {
+    let granted = grantor_state.is_some_and(|subscription| {
         matches!(
             subscription.state,
             SubscriptionState::From | SubscriptionState::Both
         )
     });
-    let route = pending || send_unavailable;
+    let route = subscriber.is_some() && (pending || granted);
+    let send_unavailable = route && granted;
     let grantor_mutation = update_existing_subscription(
         &transaction,
         grantor,
@@ -514,10 +506,12 @@ fn cancel_subscription(
             (Some(subscription) != grantor_state).then_some(subscription)
         },
     )?;
-    let subscriber_mutation = if route {
+    let subscriber_mutation = if let Some((subscriber, subscriber_key, grantor_jid)) = subscriber
+        && route
+    {
         update_existing_subscription(
             &transaction,
-            subscriber,
+            &subscriber,
             subscriber_key.as_ref(),
             grantor_jid,
             |mut subscription| {

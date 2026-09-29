@@ -183,13 +183,12 @@ pub trait RosterRepository: Send + Sync {
         request: PendingSubscription,
     ) -> impl Future<Output = Result<SubscriptionRequestOutcome, RosterError>> + Send;
 
-    /// Updates both rosters and removes the pending request in one write.
+    /// Updates both present rosters and removes the pending request in one write.
     fn cancel_subscription(
         &self,
         grantor: &AccountKey,
         contact: &RosterJid,
-        subscriber: &AccountKey,
-        grantor_jid: &RosterJid,
+        subscriber: Option<(&AccountKey, &RosterJid)>,
     ) -> impl Future<Output = Result<SubscriptionCancellation, RosterError>> + Send;
 
     /// Removes an item and returns `None` without advancing the version if absent.

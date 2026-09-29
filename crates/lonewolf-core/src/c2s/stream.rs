@@ -1528,13 +1528,21 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
                     .route_presence_to_interested(approval)
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
-                super::iq::route_roster_push(push, registration.account(), router, allocator)
+                push.with_mutation(|mutation| async {
+                    super::iq::route_roster_mutation(
+                        mutation,
+                        registration.account(),
+                        router,
+                        allocator,
+                    )
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
-                router
-                    .route_current_presence(&recipient, registration.account())
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
+                    router
+                        .route_current_presence(&recipient, registration.account())
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)
+                })
+                .await?;
             }
             Ok(())
         }
@@ -1681,16 +1689,24 @@ async fn apply_accepted_presence<A: ChunkAllocator + Clone>(
         Err(condition) => send_stanza_error(writer, source, allocator, condition).await,
         Ok(PresenceEffect::None | PresenceEffect::PushRoster(None)) => Ok(()),
         Ok(PresenceEffect::PushRoster(Some(push))) => {
-            super::iq::route_roster_push(push, registration.account(), router, allocator)
+            push.with_mutation(|mutation| async {
+                super::iq::route_roster_mutation(
+                    mutation,
+                    registration.account(),
+                    router,
+                    allocator,
+                )
                 .await
                 .map_err(|_| CloseOutcome::InternalError)?;
-            if kind == PresenceRequestType::Subscribed {
-                router
-                    .route_current_presence(registration.account(), &target)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            Ok(())
+                if kind == PresenceRequestType::Subscribed {
+                    router
+                        .route_current_presence(registration.account(), &target)
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                }
+                Ok(())
+            })
+            .await
         }
         Ok(
             PresenceEffect::Route

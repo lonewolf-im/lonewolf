@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 
@@ -110,6 +111,17 @@ impl RosterPush {
                 value: self.item,
             },
         )
+    }
+
+    pub async fn with_mutation<T, F, O>(self, operation: O) -> T
+    where
+        F: Future<Output = T>,
+        O: FnOnce(RosterMutation<RosterItem>) -> F,
+    {
+        let (order, mutation) = self.into_parts();
+        let result = operation(mutation).await;
+        drop(order);
+        result
     }
 }
 
@@ -407,23 +419,22 @@ where
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
                     let subscriber = AccountKey::try_from(request.target.bare())
                         .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
-                    if self
+                    let subscriber_exists = self
                         .accounts
                         .get(&subscriber)
                         .await
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                        .is_none()
-                    {
-                        return Ok(PresenceEffect::None);
-                    }
+                        .is_some();
                     let order = self.order.lock_pair(&grantor, &subscriber).await;
+                    let contact = RosterJid::from(request.target.bare());
+                    let grantor_jid =
+                        subscriber_exists.then(|| RosterJid::from(request.sender.bare()));
                     let outcome = self
                         .repository
                         .cancel_subscription(
                             &grantor,
-                            &RosterJid::from(request.target.bare()),
-                            &subscriber,
-                            &RosterJid::from(request.sender.bare()),
+                            &contact,
+                            grantor_jid.as_ref().map(|jid| (&subscriber, jid)),
                         )
                         .await
                         .map_err(roster_error)?;

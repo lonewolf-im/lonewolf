@@ -7,14 +7,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lonewolf_extension::ExtensionRegistry;
+use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
-use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
+use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
-use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaNamespace, StanzaRef, StanzaType};
+use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaNamespace, StanzaType};
 
 use crate::hosts::Hosts;
 
@@ -22,6 +22,7 @@ pub mod local;
 
 pub use local::Registration;
 use local::{LocalRouter, LocalRouterHandle};
+pub use lonewolf_xmpp::stanza::RoutedStanza;
 
 pub struct Router<A: ChunkAllocator> {
     local: LocalRouter<A>,
@@ -32,12 +33,6 @@ pub struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
     local: LocalRouterHandle<A>,
     extensions: Arc<BTreeMap<String, ExtensionRegistry<A>>>,
-}
-
-/// Retains the parsed stanza and its immutable arena across workers.
-pub struct RoutedStanza<A: ChunkAllocator> {
-    stanza: Stanza,
-    arena: SharedArena<A>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -164,20 +159,13 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.deliver_presence(stanza).await
     }
 
-    pub(crate) async fn route_presence_to_interested(
+    pub(crate) async fn route_presence_to_tagged(
         &self,
+        tag: SessionTag,
         stanza: RoutedStanza<A>,
     ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
-        if !matches!(
-            view.stanza_type(),
-            StanzaType::Presence(
-                PresenceType::Subscribe
-                    | PresenceType::Subscribed
-                    | PresenceType::Unsubscribe
-                    | PresenceType::Unsubscribed
-            )
-        ) {
+        if !matches!(view.stanza_type(), StanzaType::Presence(_)) {
             return Err(RouterError::InvalidTarget);
         }
         let to = view
@@ -190,7 +178,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         if to.localpart().is_none() || to.resourcepart().is_some() {
             return Err(RouterError::InvalidTarget);
         }
-        self.local.deliver_presence_to_interested(stanza).await
+        self.local.deliver_presence_to_tagged(tag, stanza).await
     }
 
     pub(crate) async fn route_current_presence(
@@ -316,61 +304,21 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
-    /// Builds and enqueues one push for each interested resource.
+    /// Builds and enqueues one stanza for each resource carrying `tag`.
     ///
     /// The builder receives the destination full JID and must not block the
     /// router worker. Each stanza must use that JID. Build failures retire all
-    /// interested sessions. Mailbox failures retire the affected session.
-    pub async fn route_roster_push(
+    /// tagged sessions. Mailbox failures retire the affected session.
+    pub async fn route_to_tagged(
         &self,
         account: &AccountKey,
+        tag: SessionTag,
         build: impl FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send + 'static,
     ) -> Result<(), RouterError> {
         if !self.hosts.is_local_host(account.domain()) {
             return Err(RouterError::RemoteUnsupported);
         }
-        self.local.deliver_roster_push(account, build).await
-    }
-}
-
-impl<A: ChunkAllocator> RoutedStanza<A> {
-    pub fn from_parsed(parsed: Parsed<Stanza, A>) -> Self {
-        let (stanza, arena) = parsed.into_parts();
-        Self::from_parts(stanza, arena)
-    }
-
-    pub(crate) fn from_parts(stanza: Stanza, arena: Arena<A>) -> Self {
-        Self {
-            stanza,
-            arena: arena.freeze(),
-        }
-    }
-
-    pub(crate) fn from_parts_pair(first: Stanza, second: Stanza, arena: Arena<A>) -> (Self, Self) {
-        let arena = arena.freeze();
-        (
-            Self {
-                stanza: first,
-                arena: arena.clone(),
-            },
-            Self {
-                stanza: second,
-                arena,
-            },
-        )
-    }
-
-    pub fn resolve(&self) -> Result<StanzaRef<'_, SharedArena<A>>, HandleError> {
-        self.stanza.resolve(&self.arena)
-    }
-}
-
-impl<A: ChunkAllocator> Clone for RoutedStanza<A> {
-    fn clone(&self) -> Self {
-        Self {
-            stanza: self.stanza,
-            arena: self.arena.clone(),
-        }
+        self.local.deliver_to_tagged(account, tag, build).await
     }
 }
 

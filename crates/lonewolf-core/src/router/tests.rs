@@ -14,6 +14,7 @@ use crate::router::local::{LocalRouter, ResourceDelivery};
 use crate::router::{Registration, RoutedStanza, Router, RouterError};
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use lonewolf_extension::delivery::SessionTag;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
@@ -348,10 +349,12 @@ fn roster_push_reaches_only_interested_resources() -> TestResult {
         let desk = handle.register(&alice, Some("desk"), limit).await?;
         let phone = handle.register(&alice, Some("phone"), limit).await?;
         let tablet = handle.register(&alice, Some("tablet"), limit).await?;
-        desk.mark_roster_interested().await?;
-        tablet.mark_roster_interested().await?;
+        desk.tag(SessionTag::Interested).await?;
+        tablet.tag(SessionTag::Interested).await?;
 
-        handle.route_roster_push(&alice, roster_pushes()).await?;
+        handle
+            .route_to_tagged(&alice, SessionTag::Interested, roster_pushes())
+            .await?;
 
         let desk_push = receive_routed(&desk).await?;
         let tablet_push = receive_routed(&tablet).await?;
@@ -393,15 +396,17 @@ fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResul
         let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
         let desk = handle.register(&alice, Some("desk"), limit).await?;
         let phone = handle.register(&alice, Some("phone"), limit).await?;
-        desk.mark_roster_interested().await?;
-        phone.mark_roster_interested().await?;
+        desk.tag(SessionTag::Interested).await?;
+        phone.tag(SessionTag::Interested).await?;
         for _ in 0..64 {
             handle
                 .route_full(stanza("alice@localhost/phone").await?)
                 .await?;
         }
 
-        handle.route_roster_push(&alice, roster_pushes()).await?;
+        handle
+            .route_to_tagged(&alice, SessionTag::Interested, roster_pushes())
+            .await?;
 
         assert_eq!(
             receive_routed(&desk).await?.resolve()?.kind(),
@@ -441,13 +446,13 @@ fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
             let desk = handle.register(&account, Some("desk"), limit).await?;
             let phone = handle.register(&account, Some("phone"), limit).await?;
             let tablet = handle.register(&account, Some("tablet"), limit).await?;
-            desk.mark_roster_interested().await?;
-            phone.mark_roster_interested().await?;
-            tablet.mark_roster_interested().await?;
+            desk.tag(SessionTag::Interested).await?;
+            phone.tag(SessionTag::Interested).await?;
+            tablet.tag(SessionTag::Interested).await?;
 
             let mut calls = 0;
             let result = handle
-                .route_roster_push(&account, move |to| {
+                .route_to_tagged(&account, SessionTag::Interested, move |to| {
                     if calls == fail_at {
                         return Err(RouterError::Unavailable);
                     }
@@ -484,12 +489,12 @@ fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResul
         let desk = handle
             .register(&alice, Some("desk"), NonZeroUsize::MIN)
             .await?;
-        desk.mark_roster_interested().await?;
+        desk.tag(SessionTag::Interested).await?;
         drop(desk);
 
         let calls = Arc::new(AtomicUsize::new(0));
         handle
-            .route_roster_push(&alice, {
+            .route_to_tagged(&alice, SessionTag::Interested, {
                 let calls = Arc::clone(&calls);
                 move |to| {
                     calls.fetch_add(1, Ordering::Relaxed);

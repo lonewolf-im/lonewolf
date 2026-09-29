@@ -14,10 +14,12 @@ use crate::jid::{Jid, JidError, JidRef};
 
 mod element;
 pub(crate) mod incoming;
+mod routed;
 mod storage;
 pub(crate) mod xml;
 
 pub use element::{AttributeRef, Element, ElementBuilder, ElementRef, NodeRef};
+pub use routed::RoutedStanza;
 
 use element::{Attribute, AttributesBuilder};
 use storage::{SliceBuilder, StoredSlice};

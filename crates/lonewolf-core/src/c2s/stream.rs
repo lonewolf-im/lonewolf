@@ -26,15 +26,13 @@ use futures_util::io::{
 };
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
-use lonewolf_extension::presence::{
-    Party, PresenceRequest, PresenceRequestType, PresenceUpdate, SubscriptionEffect,
-    SubscriptionStep,
-};
+use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::presence::{PresenceRequest, PresenceRequestType, PresenceUpdate};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::PendingSubscription;
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
-use lonewolf_xmpp::jid::Jid;
+use lonewolf_xmpp::jid::{Jid, JidRef};
 use lonewolf_xmpp::parser::{
     ParseError, Parsed, ParserConfig, StreamEvent, XmppParser, compio_reader,
 };
@@ -51,6 +49,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use super::AuthService;
 use super::connection_limit::ConnectionPermit;
+use super::delivery::StreamDelivery;
 use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::AuthMechanisms;
 use crate::config::limits::ByteRate;
@@ -1220,7 +1219,7 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
     let handler = router
         .presence_handlers(registration.account().domain())
         .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
-    let broadcast = match handler {
+    let audience = match handler {
         None => None,
         Some(handler) => {
             let result = {
@@ -1232,14 +1231,14 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
                     .map_err(|_| CloseOutcome::InternalError)?
                     .ok_or(CloseOutcome::InternalError)?;
                 handler
-                    .update(PresenceUpdate {
+                    .audience(PresenceUpdate {
                         sender,
                         available: false,
                     })
                     .await
             };
             match result {
-                Ok(broadcast) => broadcast,
+                Ok(audience) => audience,
                 Err(_) => {
                     let _ = registration.finish_presence().await;
                     return Err(CloseOutcome::InternalError);
@@ -1247,13 +1246,13 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
             }
         }
     };
-    let result = match &broadcast {
+    let result = match &audience {
         None => Ok(()),
-        // The broadcast holds the roster order, which blocks replacement updates until delivery ends.
-        Some(broadcast) => match registration.replacement_is_available().await {
+        // The audience holds an ordering guard that blocks replacement updates until delivery ends.
+        Some(audience) => match registration.replacement_is_available().await {
             Ok(true) => Ok(()),
             Ok(false) => router
-                .broadcast_presence(unavailable, &broadcast.subscribers)
+                .broadcast_presence(unavailable, &audience.subscribers)
                 .await
                 .map_err(|_| CloseOutcome::InternalError),
             Err(_) => Err(CloseOutcome::InternalError),
@@ -1263,7 +1262,7 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
         .finish_presence()
         .await
         .map_err(|_| CloseOutcome::InternalError);
-    drop(broadcast);
+    drop(audience);
     result.and(finished)
 }
 
@@ -1468,11 +1467,11 @@ async fn handle_presence_update<A: ChunkAllocator + Clone>(
             let sender = from
                 .resolve(&arena)
                 .map_err(|_| CloseOutcome::InternalError)?;
-            handler.update(PresenceUpdate { sender, available }).await
+            handler.audience(PresenceUpdate { sender, available }).await
         }
     };
-    let mut broadcast = match result {
-        Ok(broadcast) => broadcast,
+    let mut audience = match result {
+        Ok(audience) => audience,
         Err(condition) => {
             let routed = RoutedStanza::from_parts(stamped, arena);
             return send_stanza_error(writer, &routed, allocator, condition).await;
@@ -1485,9 +1484,9 @@ async fn handle_presence_update<A: ChunkAllocator + Clone>(
         }
         None => (RoutedStanza::from_parts(stamped, arena), None),
     };
-    let broadcast_stanza = broadcast
+    let broadcast_stanza = audience
         .as_ref()
-        .is_some_and(|broadcast| !broadcast.subscribers.is_empty())
+        .is_some_and(|audience| !audience.subscribers.is_empty())
         .then(|| routed.clone());
     let change = registration
         .set_presence(priority, routed, unavailable)
@@ -1495,18 +1494,18 @@ async fn handle_presence_update<A: ChunkAllocator + Clone>(
         .map_err(|_| CloseOutcome::InternalError)?;
     if change.became_available {
         pending_replays.push_back(
-            broadcast
+            audience
                 .as_mut()
-                .map(|broadcast| mem::take(&mut broadcast.pending))
+                .map(|audience| mem::take(&mut audience.pending))
                 .unwrap_or_default(),
         );
     }
-    if let Some(broadcast) = broadcast
+    if let Some(audience) = audience
         && (available || change.became_unavailable)
         && let Some(stanza) = broadcast_stanza
     {
         router
-            .broadcast_presence(&stanza, &broadcast.subscribers)
+            .broadcast_presence(&stanza, &audience.subscribers)
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
     }
@@ -1529,30 +1528,6 @@ async fn handle_subscription_presence<A: ChunkAllocator + Clone>(
     };
     let (source, mut arena) = parsed.into_parts();
     let (source, sender, _) = stamp_client_stanza_in(source, &mut arena, registration, false)?;
-    let authorized = {
-        let stanza = source
-            .resolve(&arena)
-            .map_err(|_| CloseOutcome::InternalError)?;
-        let sender = sender
-            .resolve(&arena)
-            .map_err(|_| CloseOutcome::InternalError)?;
-        let target = stanza
-            .to()
-            .map_err(|_| CloseOutcome::InternalError)?
-            .ok_or(CloseOutcome::InternalError)?;
-        sender_host
-            .authorize(PresenceRequest {
-                kind,
-                sender,
-                target,
-                stanza,
-            })
-            .await
-    };
-    if let Err(condition) = authorized {
-        let source = RoutedStanza::from_parts(source, arena);
-        return send_stanza_error(writer, &source, allocator, condition).await;
-    }
     let routed = source
         .derive_in(&mut arena)
         .map_err(|_| CloseOutcome::InternalError)?
@@ -1561,137 +1536,72 @@ async fn handle_subscription_presence<A: ChunkAllocator + Clone>(
         .bare_to()
         .build()
         .map_err(|_| CloseOutcome::InternalError)?;
+    let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
+    let authorized = {
+        let (sender, target) = presence_addresses(&source)?;
+        sender_host
+            .authorize(PresenceRequest {
+                kind,
+                sender,
+                target,
+                stanza: &source,
+            })
+            .await
+    };
+    if let Err(condition) = authorized {
+        return send_stanza_error(writer, &source, allocator, condition).await;
+    }
     let received = {
-        let stanza = routed
-            .resolve(&arena)
-            .map_err(|_| CloseOutcome::InternalError)?;
-        let sender = stanza
-            .from()
-            .map_err(|_| CloseOutcome::InternalError)?
-            .ok_or(CloseOutcome::InternalError)?;
-        let target = stanza
-            .to()
-            .map_err(|_| CloseOutcome::InternalError)?
-            .ok_or(CloseOutcome::InternalError)?;
+        let (sender, target) = presence_addresses(&routed)?;
         match router
             .presence_handlers(target.domainpart())
             .and_then(|handlers| handlers.find(kind))
         {
             Some(target_host) => {
+                let delivery = StreamDelivery {
+                    router,
+                    registration,
+                    allocator,
+                };
                 target_host
-                    .receive(PresenceRequest {
-                        kind,
-                        sender,
-                        target,
-                        stanza,
-                    })
+                    .receive(
+                        PresenceRequest {
+                            kind,
+                            sender,
+                            target,
+                            stanza: &routed,
+                        },
+                        &delivery,
+                    )
                     .await
             }
-            None => Err(StanzaErrorCondition::ServiceUnavailable),
+            None => Err(HandlerError::Stanza(
+                StanzaErrorCondition::ServiceUnavailable,
+            )),
         }
     };
-    let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
     match received {
-        Err(condition) => send_stanza_error(writer, &source, allocator, condition).await,
-        Ok(effect) => {
-            apply_subscription_effect(effect, &routed, registration, router, allocator).await
+        Ok(()) => Ok(()),
+        Err(HandlerError::Stanza(condition)) => {
+            send_stanza_error(writer, &source, allocator, condition).await
         }
+        Err(HandlerError::Delivery(_)) => Err(CloseOutcome::InternalError),
     }
 }
 
-async fn apply_subscription_effect<A: ChunkAllocator + Clone>(
-    effect: SubscriptionEffect,
-    routed: &RoutedStanza<A>,
-    registration: &Registration<A>,
-    router: &RouterHandle<A>,
-    allocator: &A,
-) -> Result<(), CloseOutcome> {
-    let (_order, steps) = effect.into_parts();
-    if steps.is_empty() {
-        return Ok(());
-    }
-    let target = {
-        let view = routed.resolve().map_err(|_| CloseOutcome::InternalError)?;
-        let target = view
-            .to()
-            .map_err(|_| CloseOutcome::InternalError)?
-            .ok_or(CloseOutcome::InternalError)?;
-        AccountKey::try_from(target.bare()).map_err(|_| CloseOutcome::InternalError)?
-    };
-    let account = |party| match party {
-        Party::Sender => registration.account(),
-        Party::Target => &target,
-    };
-    for step in steps {
-        let delivered = match step {
-            SubscriptionStep::DeliverToAvailable => {
-                match router.route_presence(routed.clone()).await {
-                    Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
-                    Err(error) => Err(error),
-                }
-            }
-            SubscriptionStep::DeliverToInterested => {
-                router.route_presence_to_interested(routed.clone()).await
-            }
-            SubscriptionStep::ApproveSender => {
-                let approval = subscription_approval(routed, allocator)?;
-                router.route_presence_to_interested(approval).await
-            }
-            SubscriptionStep::PushRoster(party, mutation) => {
-                super::iq::route_roster_push(mutation, account(party), router, allocator).await
-            }
-            SubscriptionStep::DeliverCurrentPresence { from, to } => {
-                router
-                    .route_current_presence(account(from), account(to))
-                    .await
-            }
-            SubscriptionStep::DeliverUnavailablePresence { from, to } => {
-                router
-                    .route_unavailable_presence(account(from), account(to))
-                    .await
-            }
-        };
-        delivered.map_err(|_| CloseOutcome::InternalError)?;
-    }
-    Ok(())
-}
-
-/// Builds the `subscribed` reply the server sends on behalf of the request target.
-fn subscription_approval<A: ChunkAllocator + Clone>(
-    request: &RoutedStanza<A>,
-    allocator: &A,
-) -> Result<RoutedStanza<A>, CloseOutcome> {
-    let mut arena = Arena::try_new_in(Default::default(), allocator.clone())
-        .map_err(|_| CloseOutcome::InternalError)?;
-    let view = request.resolve().map_err(|_| CloseOutcome::InternalError)?;
-    let from = view
-        .to()
-        .map_err(|_| CloseOutcome::InternalError)?
-        .ok_or(CloseOutcome::InternalError)?
-        .clone_in(&mut arena)
-        .map_err(|_| CloseOutcome::InternalError)?;
-    let to = view
+fn presence_addresses<A: ChunkAllocator>(
+    stanza: &RoutedStanza<A>,
+) -> Result<(JidRef<'_>, JidRef<'_>), CloseOutcome> {
+    let view = stanza.resolve().map_err(|_| CloseOutcome::InternalError)?;
+    let sender = view
         .from()
         .map_err(|_| CloseOutcome::InternalError)?
-        .ok_or(CloseOutcome::InternalError)?
-        .clone_in(&mut arena)
-        .map_err(|_| CloseOutcome::InternalError)?;
-    let approval = Stanza::builder_in(
-        StanzaType::Presence(PresenceType::Subscribed),
-        StanzaNamespace::Client,
-        &mut arena,
-    )
-    .id(view.id().map_err(|_| CloseOutcome::InternalError)?)
-    .map_err(|_| CloseOutcome::InternalError)?
-    .lang(view.lang().map_err(|_| CloseOutcome::InternalError)?)
-    .map_err(|_| CloseOutcome::InternalError)?
-    .from(Some(from))
-    .map_err(|_| CloseOutcome::InternalError)?
-    .to(Some(to))
-    .map_err(|_| CloseOutcome::InternalError)?
-    .build()
-    .map_err(|_| CloseOutcome::InternalError)?;
-    Ok(RoutedStanza::from_parts(approval, arena))
+        .ok_or(CloseOutcome::InternalError)?;
+    let target = view
+        .to()
+        .map_err(|_| CloseOutcome::InternalError)?
+        .ok_or(CloseOutcome::InternalError)?;
+    Ok((sender, target))
 }
 
 fn c2s_namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Option<CloseOutcome> {

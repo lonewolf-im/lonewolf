@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use lonewolf_util::arena::{Arena, GlobalChunkAllocator};
 
-use super::iq::{
-    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute, IqScope,
-};
+use super::delivery::Delivery;
+use super::iq::{IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqRoute, IqScope};
 use super::presence::{PresenceHandler, PresenceRegistration, PresenceRequestType};
 use super::{Extensions, RegistrationError};
 
@@ -26,8 +25,9 @@ impl IqHandler<GlobalChunkAllocator> for Empty {
         &'a self,
         _: IqRequest<'a, GlobalChunkAllocator>,
         _: &'a mut Arena<GlobalChunkAllocator>,
+        _: &'a dyn Delivery<GlobalChunkAllocator>,
     ) -> IqFuture<'a> {
-        Box::pin(async { Ok(IqResponse::new(None)) })
+        Box::pin(async { Ok(None) })
     }
 }
 

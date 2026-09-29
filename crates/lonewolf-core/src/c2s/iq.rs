@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::iq::{IqEffect, IqRequest, IqRequestType, IqScope};
-use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::{RosterItem, RosterMutation};
+use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::iq::{IqRequest, IqRequestType, IqScope};
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{
-    BuildError, IqType, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaType,
-};
+use lonewolf_xmpp::stanza::{BuildError, IqType, Stanza, StanzaErrorCondition, StanzaType};
 
-use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
+use super::delivery::StreamDelivery;
+use crate::router::{Registration, RouterError, RouterHandle};
 
 pub(super) struct ReplyError;
 
@@ -92,6 +90,11 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
         return Ok((reply, arena));
     };
     let mut response = Arena::try_new_in(Default::default(), allocator.clone())?;
+    let delivery = StreamDelivery {
+        router,
+        registration,
+        allocator,
+    };
     let result = handler
         .handle(
             IqRequest {
@@ -101,20 +104,20 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
                 payload,
             },
             &mut response,
+            &delivery,
         )
         .await;
-    let outcome = match result {
-        Ok(response) => response,
-        Err(condition) => {
+    let payload = match result {
+        Ok(payload) => payload,
+        Err(HandlerError::Stanza(condition)) => {
             let reply = request
                 .error_reply_in(&mut arena, condition)?
                 .to(Some(sender_jid))?
                 .build()?;
             return Ok((reply, arena));
         }
+        Err(HandlerError::Delivery(_)) => return Err(ReplyError),
     };
-    let (payload, effect) = outcome.into_parts();
-    apply_effect(effect, registration, router, allocator).await?;
     let recipient = sender.clone_in(&mut response)?;
     let from = stanza
         .to()?
@@ -133,70 +136,4 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
     }
     let reply = builder.build()?;
     Ok((reply, response))
-}
-
-async fn apply_effect<A: ChunkAllocator + Clone>(
-    effect: IqEffect,
-    registration: &Registration<A>,
-    router: &RouterHandle<A>,
-    allocator: &A,
-) -> Result<(), RouterError> {
-    match effect {
-        IqEffect::None => Ok(()),
-        IqEffect::MarkRosterInterested(_order) => registration.mark_roster_interested().await,
-        IqEffect::PushRoster(_order, mutation) => {
-            route_roster_push(mutation, registration.account(), router, allocator).await
-        }
-    }
-}
-
-pub(super) async fn route_roster_push<A: ChunkAllocator + Clone>(
-    mutation: RosterMutation<RosterItem>,
-    account: &AccountKey,
-    router: &RouterHandle<A>,
-    allocator: &A,
-) -> Result<(), RouterError> {
-    let allocator = allocator.clone();
-    router
-        .route_roster_push(account, move |to| {
-            build_roster_push(to, &mutation, &allocator)
-        })
-        .await
-}
-
-fn build_roster_push<A: ChunkAllocator + Clone>(
-    to: &str,
-    mutation: &RosterMutation<RosterItem>,
-    allocator: &A,
-) -> Result<RoutedStanza<A>, RouterError> {
-    let mut arena = Arena::try_new_in(Default::default(), allocator.clone())
-        .map_err(|_| RouterError::Unavailable)?;
-    let item = lonewolf_extension::roster::build_item_in(&mutation.value, &mut arena)
-        .map_err(|_| RouterError::Unavailable)?;
-    let query = lonewolf_xmpp::stanza::Element::builder_in(
-        "query",
-        lonewolf_extension::roster::NAMESPACE,
-        &mut arena,
-    )
-    .map_err(|_| RouterError::Unavailable)?
-    .child(item)
-    .map_err(|_| RouterError::Unavailable)?
-    .build()
-    .map_err(|_| RouterError::Unavailable)?;
-    let to = Jid::parse_in(to, &mut arena).map_err(|_| RouterError::InvalidTarget)?;
-    let id = format!("roster-{}", mutation.version.get());
-    let stanza = Stanza::builder_in(
-        StanzaType::Iq(IqType::Set),
-        StanzaNamespace::Client,
-        &mut arena,
-    )
-    .id(Some(&id))
-    .map_err(|_| RouterError::Unavailable)?
-    .to(Some(to))
-    .map_err(|_| RouterError::Unavailable)?
-    .child(query)
-    .map_err(|_| RouterError::Unavailable)?
-    .build()
-    .map_err(|_| RouterError::Unavailable)?;
-    Ok(RoutedStanza::from_parts(stanza, arena))
 }

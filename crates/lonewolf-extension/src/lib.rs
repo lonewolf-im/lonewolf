@@ -3,12 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 use lonewolf_util::arena::ChunkAllocator;
 
+pub mod delivery;
 pub mod iq;
 pub mod presence;
 pub mod roster;
+
+pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use iq::{IqRegistration, IqRegistry, IqRoute};
 use presence::{PresenceRegistration, PresenceRegistry, PresenceRequestType};

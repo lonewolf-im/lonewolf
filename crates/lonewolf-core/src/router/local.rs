@@ -55,10 +55,26 @@ pub struct Registration<A: ChunkAllocator> {
 
 pub(crate) enum ResourceDelivery<A: ChunkAllocator> {
     Routed(RoutedStanza<A>),
+    StagedPresence {
+        stanza: RoutedStanza<A>,
+        ready: oneshot::Receiver<()>,
+    },
     Presence {
         stanzas: Vec<RoutedStanza<A>>,
         replay_pending: bool,
     },
+}
+
+pub(crate) struct StagedPresenceDelivery {
+    releases: Vec<oneshot::Sender<()>>,
+}
+
+impl StagedPresenceDelivery {
+    pub(crate) fn deliver(self) {
+        for release in self.releases {
+            let _ = release.send(());
+        }
+    }
 }
 
 enum Command<A: ChunkAllocator> {
@@ -83,6 +99,10 @@ enum Command<A: ChunkAllocator> {
     DeliverPresence {
         stanza: RoutedStanza<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
+    },
+    StagePresence {
+        stanza: RoutedStanza<A>,
+        reply: oneshot::Sender<Result<StagedPresenceDelivery, RouterError>>,
     },
     DeliverPresenceToInterested {
         stanza: RoutedStanza<A>,
@@ -301,6 +321,30 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         let (reply, result) = oneshot::channel();
         self.shards[shard]
             .send(Command::DeliverPresence { stanza, reply })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
+    pub(crate) async fn stage_presence(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<StagedPresenceDelivery, RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            let to = view
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            to.localpart().ok_or(RouterError::InvalidTarget)?;
+            if to.resourcepart().is_some() {
+                return Err(RouterError::InvalidTarget);
+            }
+            self.shard_index(to.as_str())
+        };
+        let (reply, result) = oneshot::channel();
+        self.shards[shard]
+            .send(Command::StagePresence { stanza, reply })
             .await
             .map_err(|_| RouterError::Stopped)?;
         result.await.map_err(|_| RouterError::Stopped)?
@@ -553,6 +597,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 let result = self.deliver_presence(stanza);
                 let _ = reply.send(result);
             }
+            Command::StagePresence { stanza, reply } => {
+                let result = self.stage_presence(stanza);
+                let _ = reply.send(result);
+            }
             Command::DeliverPresenceToInterested { stanza, reply } => {
                 let result = self.deliver_presence_to_interested(stanza);
                 let _ = reply.send(result);
@@ -787,6 +835,69 @@ impl<A: ChunkAllocator> Shard<A> {
             return Err(RouterError::InvalidTarget);
         }
         self.deliver_presence_where(stanza, |session| session.priority.is_some())
+    }
+
+    fn stage_presence(
+        &mut self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<StagedPresenceDelivery, RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if to.resourcepart().is_some()
+            || !matches!(
+                view.stanza_type(),
+                StanzaType::Presence(
+                    PresenceType::Available
+                        | PresenceType::Subscribe
+                        | PresenceType::Subscribed
+                        | PresenceType::Unsubscribe
+                        | PresenceType::Unsubscribed
+                )
+            )
+        {
+            return Err(RouterError::InvalidTarget);
+        }
+        let account = to.as_str();
+        let sessions = self.accounts.get(account).ok_or(RouterError::NotFound)?;
+        let mut releases = Vec::with_capacity(sessions.len());
+        let mut busy = false;
+        let mut failed = Vec::new();
+        for (resource, session) in sessions {
+            if session.priority.is_none() {
+                continue;
+            }
+            if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
+                failed.push((resource.clone(), session.token));
+                continue;
+            }
+            let (release, ready) = oneshot::channel();
+            match session.outbound.try_send(ResourceDelivery::StagedPresence {
+                stanza: stanza.clone(),
+                ready,
+            }) {
+                Ok(()) => releases.push(release),
+                Err(TrySendError::Full(_)) => {
+                    busy = true;
+                    failed.push((resource.clone(), session.token));
+                }
+                Err(TrySendError::Closed(_)) => {
+                    failed.push((resource.clone(), session.token));
+                }
+            }
+        }
+        for (resource, token) in failed {
+            self.remove(account, &resource, token);
+        }
+        if !releases.is_empty() {
+            Ok(StagedPresenceDelivery { releases })
+        } else if busy {
+            Err(RouterError::Busy)
+        } else {
+            Err(RouterError::NotFound)
+        }
     }
 
     fn deliver_presence_to_interested(

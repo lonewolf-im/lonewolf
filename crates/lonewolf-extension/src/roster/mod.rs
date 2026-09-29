@@ -284,7 +284,7 @@ where
                         .update_subscription(&owner, &contact, approve_inbound_subscription)
                         .await
                         .map_err(roster_error)?;
-                    Ok(mutation.map_or(PresenceEffect::None, |mutation| {
+                    Ok(mutation.map_or(PresenceEffect::Accept, |mutation| {
                         PresenceEffect::DeliverThenPushRoster(RosterPush::new(
                             order,
                             mutation.value,

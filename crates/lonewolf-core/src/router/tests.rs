@@ -106,6 +106,10 @@ async fn receive_routed(
 ) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
     match registration.recv().await {
         Some(ResourceDelivery::Routed(stanza)) => Ok(stanza),
+        Some(ResourceDelivery::StagedPresence { stanza, ready }) => {
+            ready.await?;
+            Ok(stanza)
+        }
         Some(ResourceDelivery::Presence { .. }) => Err("unexpected presence batch".into()),
         None => Err("closed resource mailbox".into()),
     }
@@ -119,9 +123,68 @@ async fn receive_presence(
             stanzas,
             replay_pending,
         }) => Ok((stanzas, replay_pending)),
-        Some(ResourceDelivery::Routed(_)) => Err("unexpected routed stanza".into()),
+        Some(ResourceDelivery::Routed(_) | ResourceDelivery::StagedPresence { .. }) => {
+            Err("unexpected routed stanza".into())
+        }
         None => Err("closed resource mailbox".into()),
     }
+}
+
+#[test]
+fn staged_presence_waits_for_release() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let bob = account("bob@localhost")?;
+        let phone = handle
+            .register(&bob, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        assert!(
+            phone
+                .set_presence(
+                    Some(0),
+                    parse_stanza("<presence from='bob@localhost/phone' to='bob@localhost'/>")
+                        .await?,
+                    None,
+                )
+                .await?
+        );
+        let _ = receive_presence(&phone).await?;
+
+        let staged = handle
+            .stage_presence(
+                parse_stanza(
+                    "<presence type='subscribe' from='alice@localhost' to='bob@localhost'/>",
+                )
+                .await?,
+            )
+            .await?;
+        let delivery = phone.recv().await.ok_or("closed resource mailbox")?;
+        let ResourceDelivery::StagedPresence { ready, .. } = delivery else {
+            return Err("expected staged presence".into());
+        };
+        assert!(timeout(Duration::from_millis(10), ready).await.is_err());
+        drop(staged);
+
+        let staged = handle
+            .stage_presence(
+                parse_stanza(
+                    "<presence type='subscribe' from='alice@localhost' to='bob@localhost'/>",
+                )
+                .await?,
+            )
+            .await?;
+        staged.deliver();
+        assert_eq!(
+            receive_routed(&phone).await?.resolve()?.kind(),
+            StanzaKind::Presence
+        );
+
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
 }
 
 fn roster_push(to: &str, id: &str) -> TestRosterPush {

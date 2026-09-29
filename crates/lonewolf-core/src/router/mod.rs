@@ -20,7 +20,7 @@ use crate::hosts::Hosts;
 pub mod local;
 
 pub use local::Registration;
-use local::{LocalRouter, LocalRouterHandle};
+use local::{LocalRouter, LocalRouterHandle, StagedPresenceDelivery};
 
 pub struct Router<A: ChunkAllocator> {
     local: LocalRouter<A>,
@@ -145,7 +145,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         }
     }
 
-    pub(crate) async fn route_presence(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+    pub(crate) async fn stage_presence(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<StagedPresenceDelivery, RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if !matches!(view.stanza_type(), StanzaType::Presence(_)) {
             return Err(RouterError::InvalidTarget);
@@ -160,7 +163,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         if to.localpart().is_none() || to.resourcepart().is_some() {
             return Err(RouterError::InvalidTarget);
         }
-        self.local.deliver_presence(stanza).await
+        self.local.stage_presence(stanza).await
     }
 
     pub(crate) async fn route_presence_to_interested(

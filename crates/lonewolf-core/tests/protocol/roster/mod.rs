@@ -96,6 +96,42 @@ fn seed_pending_subscriptions(directory: &Path) -> TestResult {
     Ok(())
 }
 
+fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice = Jid::parse_in("alice@localhost", &mut arena)?;
+    let bob = Jid::parse_in("bob@localhost", &mut arena)?;
+    let alice_account = AccountKey::try_from(alice.resolve(&arena)?)?;
+    let bob_account = AccountKey::try_from(bob.resolve(&arena)?)?;
+    let alice_contact = RosterJid::from(alice.resolve(&arena)?);
+    let bob_contact = RosterJid::from(bob.resolve(&arena)?);
+    Runtime::new()?.block_on(async {
+        repository
+            .update_subscription(&alice_account, &bob_contact, |_| {
+                Some(RosterSubscription {
+                    state: SubscriptionState::To,
+                    pending_out: false,
+                    approved: false,
+                })
+            })
+            .await?;
+        repository
+            .put_pending(
+                &bob_account,
+                PendingSubscription {
+                    sender: alice_contact,
+                    stanza: b"<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>"
+                        .to_vec()
+                        .into_boxed_slice(),
+                },
+            )
+            .await?;
+        Ok::<_, lonewolf_storage::roster::RosterError>(())
+    })?;
+    Ok(())
+}
+
 #[test]
 fn subscription_request_reaches_an_available_contact_and_updates_the_roster() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
@@ -177,6 +213,7 @@ fn subscription_approval_updates_both_rosters_and_delivers_current_presence() ->
 
     alice.send("<presence type='subscribe' id='request' to='bob@localhost'/>")?;
     bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='request' from='alice@localhost' to='bob@localhost'/>")?;
+    bob.send("<presence type='subscribed' id='approval' from='mallory@localhost/spy' to='alice@localhost/ignored'/>")?;
     let alice_pending = expect_roster_push(
         &mut alice,
         "alice@localhost/desk",
@@ -184,7 +221,6 @@ fn subscription_approval_updates_both_rosters_and_delivers_current_presence() ->
     )?;
     alice.send(&format!("<iq type='result' id='{alice_pending}'/>"))?;
 
-    bob.send("<presence type='subscribed' id='approval' from='mallory@localhost/spy' to='alice@localhost/ignored'/>")?;
     alice.expect_xml("<presence xmlns='jabber:client' type='subscribed' id='approval' from='bob@localhost' to='alice@localhost'/>")?;
     let alice_approved = expect_roster_push(
         &mut alice,
@@ -199,6 +235,10 @@ fn subscription_approval_updates_both_rosters_and_delivers_current_presence() ->
         "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='from'/>",
     )?;
     bob.send(&format!("<iq type='result' id='{bob_approved}'/>"))?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
 
     request_roster(
         &mut alice,
@@ -250,6 +290,49 @@ fn unsolicited_subscription_approval_is_silently_ignored() -> TestResult {
         &mut bob,
         "unchanged-bob-roster",
         "<iq xmlns='jabber:client' type='result' id='unchanged-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn subscription_approval_retry_completes_an_interrupted_transition() -> TestResult {
+    let suite =
+        C2sSuite::with_extensions_and_setup("'roster'", seed_interrupted_subscription_approval)?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+
+    request_roster(
+        &mut alice,
+        "partial-alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='partial-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='to'/></query></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "partial-bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='partial-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    bob.send("<presence type='subscribed' id='retry' to='alice@localhost'/>")?;
+    let bob_approved = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='from'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{bob_approved}'/>"))?;
+
+    request_roster(
+        &mut alice,
+        "unchanged-alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='to'/></query></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "completed-bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='completed-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='from'/></query></iq>",
     )?;
 
     alice.close()?;

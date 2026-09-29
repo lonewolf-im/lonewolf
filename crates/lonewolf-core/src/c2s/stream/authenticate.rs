@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
-use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
+use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ScramServer, ServerError};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
@@ -15,12 +15,13 @@ use lonewolf_xmpp::stanza::{Element, NodeRef, XML_NAMESPACE};
 
 use super::establish::Established;
 use super::outcome::CloseOutcome;
-use super::session::{Session, Writer, namespace_error};
+use super::session::{Session, namespace_error};
 use crate::c2s::AuthService;
 use crate::config::AuthMechanisms;
 use crate::hosts::Hosts;
 
 pub(super) const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
+const EMPTY_CHALLENGE: &str = "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>";
 const MAX_AUTH_ATTEMPTS: usize = 3;
 
 pub(super) fn sasl_features(mechanisms: AuthMechanisms) -> String {
@@ -46,87 +47,173 @@ pub(super) fn sasl_features(mechanisms: AuthMechanisms) -> String {
     features
 }
 
+/// Runs SASL SCRAM until the client authenticates or exhausts its attempts.
+/// A rejected request, an aborted exchange and a replaced request each cost one attempt.
 pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
     established: &mut Established<A>,
     hosts: &Hosts,
     auth: &AuthService,
     mechanisms: AuthMechanisms,
 ) -> Result<(AccountKey, Mechanism), CloseOutcome> {
-    let Some(endpoint) = hosts.tls_server_end_point(established.session.host()) else {
+    let Established {
+        session,
+        client_from,
+        binding,
+        auth_started_at: _,
+    } = established;
+    let host = session.host().to_owned();
+    let Some(endpoint) = hosts.tls_server_end_point(&host) else {
         return Err(CloseOutcome::InternalError);
     };
-    let session = &mut established.session;
-    let host = session.host().to_owned();
-    let mut replacement_auth = None;
+    let mut authentication = Authentication {
+        session,
+        host: &host,
+        client_from: client_from.as_deref(),
+        exporter: &binding.exporter,
+        endpoint,
+        auth,
+        mechanisms,
+    };
+    let mut replacement = None;
     for _ in 0..MAX_AUTH_ATTEMPTS {
-        let (mechanism, initial) = if let Some(auth) = replacement_auth.take() {
-            auth
-        } else {
-            let Some(event) = session.next_event().await? else {
-                return Err(CloseOutcome::Eof);
-            };
-            if let Some(outcome) = namespace_error(&event) {
-                return Err(session.writer.fail(outcome).await);
-            }
-            match event {
-                StreamEvent::Element(element) => match parse_sasl_message(&element) {
-                    Ok(SaslMessage::Auth { mechanism, payload }) => (mechanism, payload),
-                    Ok(SaslMessage::Abort) => {
-                        send_sasl_failure(&mut session.writer, "aborted").await?;
-                        continue;
-                    }
-                    Err(condition) => {
-                        send_sasl_failure(&mut session.writer, condition).await?;
-                        continue;
-                    }
-                    _ => {
-                        return Err(session.writer.fail(CloseOutcome::UnsupportedInput).await);
-                    }
-                },
-                StreamEvent::StreamEnd => return Err(session.writer.close().await),
-                _ => {
-                    return Err(session.writer.fail(CloseOutcome::UnsupportedInput).await);
+        let request = match replacement.take() {
+            Some(request) => request,
+            None => match authentication.read_request().await? {
+                Some(request) => request,
+                None => continue,
+            },
+        };
+        match authentication.attempt(request).await? {
+            Attempt::Authenticated(account, mechanism) => return Ok((account, mechanism)),
+            Attempt::Rejected => {}
+            Attempt::Replaced(request) => replacement = Some(request),
+        }
+    }
+    Err(authentication
+        .session
+        .writer
+        .fail(CloseOutcome::AuthenticationAttemptsExceeded)
+        .await)
+}
+
+struct Authentication<'a, A: ChunkAllocator> {
+    session: &'a mut Session<A>,
+    host: &'a str,
+    client_from: Option<&'a str>,
+    exporter: &'a [u8; 32],
+    endpoint: &'a [u8],
+    auth: &'a AuthService,
+    mechanisms: AuthMechanisms,
+}
+
+struct AuthRequest {
+    mechanism: Option<Mechanism>,
+    initial: Vec<u8>,
+}
+
+enum Attempt {
+    Authenticated(AccountKey, Mechanism),
+    /// A SASL failure was sent and the client may try again.
+    Rejected,
+    /// The client opened a new exchange instead of answering the challenge.
+    Replaced(AuthRequest),
+}
+
+enum Response {
+    Data(Vec<u8>),
+    Request(AuthRequest),
+    Rejected,
+}
+
+/// The account a first message names, and whether its stored credential may authenticate it.
+struct Identity {
+    account: Option<AccountKey>,
+    known: bool,
+}
+
+impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
+    /// Reads the next `<auth/>`; a malformed or aborted request is rejected and yields `None`.
+    async fn read_request(&mut self) -> Result<Option<AuthRequest>, CloseOutcome> {
+        let failure = match self.next_element().await? {
+            StreamEvent::Element(element) => match parse_sasl_message(&element) {
+                Ok(SaslMessage::Auth(request)) => return Ok(Some(request)),
+                Ok(SaslMessage::Abort) => "aborted",
+                Ok(SaslMessage::Response(_)) => {
+                    return Err(self
+                        .session
+                        .writer
+                        .fail(CloseOutcome::UnsupportedInput)
+                        .await);
                 }
+                Err(condition) => condition,
+            },
+            _ => {
+                return Err(self
+                    .session
+                    .writer
+                    .fail(CloseOutcome::UnsupportedInput)
+                    .await);
             }
         };
-        let Some(mechanism) = mechanism.filter(|mechanism| mechanisms.allows(*mechanism)) else {
-            send_sasl_failure(&mut session.writer, "invalid-mechanism").await?;
-            continue;
+        self.reject(failure).await?;
+        Ok(None)
+    }
+
+    async fn attempt(&mut self, request: AuthRequest) -> Result<Attempt, CloseOutcome> {
+        let Some(mechanism) = request
+            .mechanism
+            .filter(|mechanism| self.mechanisms.allows(*mechanism))
+        else {
+            self.reject("invalid-mechanism").await?;
+            return Ok(Attempt::Rejected);
         };
-        let initial = if initial.is_empty() {
-            session
-                .writer
-                .send("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")
-                .await?;
-            match next_challenge_response(session).await? {
-                ChallengeResponse::Data(response) => response,
-                ChallengeResponse::Auth { mechanism, payload } => {
-                    replacement_auth = Some((mechanism, payload));
-                    continue;
-                }
-                ChallengeResponse::Retry => continue,
+        let initial = if request.initial.is_empty() {
+            self.session.writer.send(EMPTY_CHALLENGE).await?;
+            match self.read_response().await? {
+                Response::Data(initial) => initial,
+                Response::Request(request) => return Ok(Attempt::Replaced(request)),
+                Response::Rejected => return Ok(Attempt::Rejected),
             }
         } else {
-            initial
+            request.initial
         };
-        let first = match ClientFirst::parse(mechanism, &initial, mechanisms.has_plus()) {
+        let first = match ClientFirst::parse(mechanism, &initial, self.mechanisms.has_plus()) {
             Ok(first) => first,
             Err(error) => {
-                send_sasl_failure(&mut session.writer, scram_failure(error)).await?;
-                continue;
+                self.reject(scram_failure(error)).await?;
+                return Ok(Attempt::Rejected);
             }
         };
-        let binding_kind = first.binding();
-        let account = account_key(first.username(), &host);
+        let Some((identity, server, challenge)) = self.challenge(mechanism, first).await? else {
+            return Ok(Attempt::Rejected);
+        };
+        self.send_sasl("challenge", &challenge).await?;
+        let response = match self.read_response().await? {
+            Response::Data(response) => response,
+            Response::Request(request) => return Ok(Attempt::Replaced(request)),
+            Response::Rejected => return Ok(Attempt::Rejected),
+        };
+        self.verify(mechanism, identity, &server, &response).await
+    }
+
+    /// Issues the server challenge for the account's verifier.
+    /// Unknown accounts, stale credentials and authorization identity mismatches get a
+    /// decoy verifier so the exchange takes the same path and fails only at the proof.
+    async fn challenge(
+        &mut self,
+        mechanism: Mechanism,
+        first: ClientFirst,
+    ) -> Result<Option<(Identity, ScramServer, String)>, CloseOutcome> {
+        let account = account_key(first.username(), self.host);
         let authzid_matches = first
             .authzid()
             .is_none_or(|authzid| account_key_from_jid(authzid).as_ref() == account.as_ref());
         let verifier = match account.as_ref() {
-            Some(key) => match auth.accounts.get_scram(key, mechanism.hash()).await {
+            Some(key) => match self.auth.accounts.get_scram(key, mechanism.hash()).await {
                 Ok(verifier) => verifier,
                 Err(_) => {
-                    send_sasl_failure(&mut session.writer, "temporary-auth-failure").await?;
-                    continue;
+                    self.reject("temporary-auth-failure").await?;
+                    return Ok(None);
                 }
             },
             None => None,
@@ -135,80 +222,129 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         let known = verifier.is_some() && authzid_matches;
         let verifier = match verifier {
             Some(verifier) => verifier,
-            None => match auth.decoy.verifier(
+            None => match self.auth.decoy.verifier(
                 mechanism.hash(),
-                &decoy_identity(account.as_ref(), first.username(), &host),
+                &decoy_identity(account.as_ref(), first.username(), self.host),
             ) {
                 Ok(verifier) => verifier,
-                Err(_) => return Err(session.writer.fail(CloseOutcome::InternalError).await),
+                Err(_) => {
+                    return Err(self.session.writer.fail(CloseOutcome::InternalError).await);
+                }
             },
         };
         let mut server_nonce = [0_u8; 24];
         if graviola::random::fill(&mut server_nonce).is_err() {
-            return Err(session.writer.fail(CloseOutcome::InternalError).await);
+            return Err(self.session.writer.fail(CloseOutcome::InternalError).await);
         }
         let nonce = STANDARD.encode(server_nonce);
-        let (server, challenge) = match first.start(verifier, &nonce) {
-            Ok(value) => value,
-            Err(_) => return Err(session.writer.fail(CloseOutcome::InternalError).await),
-        };
-        send_sasl_data(&mut session.writer, "challenge", &challenge).await?;
-        let response = match next_challenge_response(session).await? {
-            ChallengeResponse::Data(response) => response,
-            ChallengeResponse::Auth { mechanism, payload } => {
-                replacement_auth = Some((mechanism, payload));
-                continue;
-            }
-            ChallengeResponse::Retry => continue,
-        };
-        let binding_data: &[u8] = match binding_kind {
-            Some(BindingType::TlsExporter) => &established.binding.exporter,
-            Some(BindingType::TlsServerEndPoint) => endpoint,
+        match first.start(verifier, &nonce) {
+            Ok((server, challenge)) => Ok(Some((Identity { account, known }, server, challenge))),
+            Err(_) => Err(self.session.writer.fail(CloseOutcome::InternalError).await),
+        }
+    }
+
+    /// Checks the client proof and, for a known account, that its credential is still current.
+    async fn verify(
+        &mut self,
+        mechanism: Mechanism,
+        identity: Identity,
+        server: &ScramServer,
+        response: &[u8],
+    ) -> Result<Attempt, CloseOutcome> {
+        let binding_data: &[u8] = match server.binding() {
+            Some(BindingType::TlsExporter) => self.exporter,
+            Some(BindingType::TlsServerEndPoint) => self.endpoint,
             None => &[],
         };
-        let final_message = server.finish(&response, binding_data);
-        let authenticated = match final_message {
-            Ok(message) if known => Some(message),
+        let final_message = match server.finish(response, binding_data) {
+            Ok(message) if identity.known => Some(message),
             Ok(_) | Err(ServerError::InvalidProof | ServerError::ChannelBindingMismatch) => None,
             Err(error) => {
-                send_sasl_failure(&mut session.writer, scram_failure(error)).await?;
-                continue;
+                self.reject(scram_failure(error)).await?;
+                return Ok(Attempt::Rejected);
             }
         };
-        if let Some(final_message) = authenticated {
-            let Some(account_key) = account.as_ref() else {
+        if let Some(final_message) = final_message {
+            let Some(account) = identity.account else {
                 return Err(CloseOutcome::InternalError);
             };
-            let current = match auth.accounts.get_scram(account_key, mechanism.hash()).await {
+            let current = match self
+                .auth
+                .accounts
+                .get_scram(&account, mechanism.hash())
+                .await
+            {
                 Ok(current) => current,
                 Err(_) => {
-                    send_sasl_failure(&mut session.writer, "temporary-auth-failure").await?;
-                    continue;
+                    self.reject("temporary-auth-failure").await?;
+                    return Ok(Attempt::Rejected);
                 }
             };
             if current
                 .as_ref()
                 .is_some_and(|current| server.credential_is_current(current))
             {
-                if established
+                if self
                     .client_from
-                    .as_deref()
-                    .is_some_and(|from| from != account_key.as_str())
+                    .is_some_and(|from| from != account.as_str())
                 {
-                    return Err(session.writer.fail(CloseOutcome::InvalidFrom).await);
+                    return Err(self.session.writer.fail(CloseOutcome::InvalidFrom).await);
                 }
-                send_sasl_data(&mut session.writer, "success", &final_message).await?;
-                return account
-                    .map(|account| (account, mechanism))
-                    .ok_or(CloseOutcome::InternalError);
+                self.send_sasl("success", &final_message).await?;
+                return Ok(Attempt::Authenticated(account, mechanism));
             }
         }
-        send_sasl_failure(&mut session.writer, "not-authorized").await?;
+        self.reject("not-authorized").await?;
+        Ok(Attempt::Rejected)
     }
-    Err(session
-        .writer
-        .fail(CloseOutcome::AuthenticationAttemptsExceeded)
-        .await)
+
+    /// Reads the client's answer to a challenge; a malformed answer is rejected.
+    async fn read_response(&mut self) -> Result<Response, CloseOutcome> {
+        let failure = match self.next_element().await? {
+            StreamEvent::Element(element) => match parse_sasl_message(&element) {
+                Ok(SaslMessage::Response(response)) => return Ok(Response::Data(response)),
+                Ok(SaslMessage::Auth(request)) => return Ok(Response::Request(request)),
+                Ok(SaslMessage::Abort) => "aborted",
+                Err(condition) => condition,
+            },
+            _ => "malformed-request",
+        };
+        self.reject(failure).await?;
+        Ok(Response::Rejected)
+    }
+
+    /// Reads the next event, ending the stream on the client's footer.
+    async fn next_element(&mut self) -> Result<StreamEvent<A>, CloseOutcome> {
+        let Some(event) = self.session.next_event().await? else {
+            return Err(CloseOutcome::Eof);
+        };
+        if let Some(outcome) = namespace_error(&event) {
+            return Err(self.session.writer.fail(outcome).await);
+        }
+        if matches!(event, StreamEvent::StreamEnd) {
+            return Err(self.session.writer.close().await);
+        }
+        Ok(event)
+    }
+
+    async fn reject(&mut self, condition: &'static str) -> Result<(), CloseOutcome> {
+        let mut xml = String::with_capacity(SASL_NAMESPACE.len() + condition.len() + 48);
+        write!(
+            xml,
+            "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
+        )
+        .map_err(|_| CloseOutcome::InternalError)?;
+        self.session.writer.send(&xml).await
+    }
+
+    async fn send_sasl(&mut self, kind: &'static str, message: &str) -> Result<(), CloseOutcome> {
+        let mut xml = String::with_capacity(message.len() * 4 / 3 + 96);
+        write!(xml, "<{kind} xmlns='{SASL_NAMESPACE}'>")
+            .map_err(|_| CloseOutcome::InternalError)?;
+        STANDARD.encode_string(message, &mut xml);
+        write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
+        self.session.writer.send(&xml).await
+    }
 }
 
 pub(super) fn account_key(username: &str, host: &str) -> Option<AccountKey> {
@@ -244,10 +380,7 @@ fn scram_failure(error: ServerError) -> &'static str {
 }
 
 enum SaslMessage {
-    Auth {
-        mechanism: Option<Mechanism>,
-        payload: Vec<u8>,
-    },
+    Auth(AuthRequest),
     Response(Vec<u8>),
     Abort,
 }
@@ -285,10 +418,10 @@ fn parse_sasl_message<A: ChunkAllocator>(
     match view.name() {
         "auth" if attribute_count == 1 => {
             let mechanism = mechanism.ok_or("malformed-request")?;
-            Ok(SaslMessage::Auth {
+            Ok(SaslMessage::Auth(AuthRequest {
                 mechanism: Mechanism::from_name(mechanism),
-                payload: decode_sasl_text(content)?,
-            })
+                initial: decode_sasl_text(content)?,
+            }))
         }
         "response" if attribute_count == 0 => Ok(SaslMessage::Response(decode_sasl_text(content)?)),
         "abort" if attribute_count == 0 && content.is_none() => Ok(SaslMessage::Abort),
@@ -305,64 +438,4 @@ fn decode_sasl_text(text: Option<&str>) -> Result<Vec<u8>, &'static str> {
         return Err("malformed-request");
     }
     STANDARD.decode(text).map_err(|_| "incorrect-encoding")
-}
-
-enum ChallengeResponse {
-    Data(Vec<u8>),
-    Auth {
-        mechanism: Option<Mechanism>,
-        payload: Vec<u8>,
-    },
-    Retry,
-}
-
-/// Reads the client's answer to a challenge; a malformed answer is rejected and retried.
-async fn next_challenge_response<A: ChunkAllocator + Clone>(
-    session: &mut Session<A>,
-) -> Result<ChallengeResponse, CloseOutcome> {
-    let Some(event) = session.next_event().await? else {
-        return Err(CloseOutcome::Eof);
-    };
-    if let Some(outcome) = namespace_error(&event) {
-        return Err(session.writer.fail(outcome).await);
-    }
-    let failure = match event {
-        StreamEvent::Element(element) => match parse_sasl_message(&element) {
-            Ok(SaslMessage::Response(response)) => return Ok(ChallengeResponse::Data(response)),
-            Ok(SaslMessage::Auth { mechanism, payload }) => {
-                return Ok(ChallengeResponse::Auth { mechanism, payload });
-            }
-            Ok(SaslMessage::Abort) => "aborted",
-            Err(condition) => condition,
-        },
-        StreamEvent::StreamEnd => return Err(session.writer.close().await),
-        _ => "malformed-request",
-    };
-    send_sasl_failure(&mut session.writer, failure).await?;
-    Ok(ChallengeResponse::Retry)
-}
-
-async fn send_sasl_failure(
-    writer: &mut Writer,
-    condition: &'static str,
-) -> Result<(), CloseOutcome> {
-    let mut xml = String::with_capacity(SASL_NAMESPACE.len() + condition.len() + 48);
-    write!(
-        xml,
-        "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
-    )
-    .map_err(|_| CloseOutcome::InternalError)?;
-    writer.send(&xml).await
-}
-
-async fn send_sasl_data(
-    writer: &mut Writer,
-    kind: &'static str,
-    message: &str,
-) -> Result<(), CloseOutcome> {
-    let mut xml = String::with_capacity(message.len() * 4 / 3 + 96);
-    write!(xml, "<{kind} xmlns='{SASL_NAMESPACE}'>").map_err(|_| CloseOutcome::InternalError)?;
-    STANDARD.encode_string(message, &mut xml);
-    write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
-    writer.send(&xml).await
 }

@@ -796,3 +796,115 @@ fn subscription_update_reads_and_changes_state_in_one_write() -> TestResult {
     assert_eq!(block_on(repository.snapshot(&owner))?.version.get(), 2);
     Ok(())
 }
+
+#[test]
+fn item_removal_clears_the_contact_and_both_pending_requests() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    block_on(repository.update_subscription(&alice, &bob_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: false,
+        })
+    }))?;
+    block_on(repository.update_subscription(&bob, &alice_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: true,
+        })
+    }))?;
+    block_on(repository.put_pending(
+        &alice,
+        PendingSubscription {
+            sender: bob_jid.clone(),
+            stanza: b"<presence type='subscribe'/>".as_slice().into(),
+        },
+    ))?;
+    block_on(repository.put_pending(
+        &bob,
+        PendingSubscription {
+            sender: alice_jid.clone(),
+            stanza: b"<presence type='subscribe'/>".as_slice().into(),
+        },
+    ))?;
+
+    let removal = block_on(repository.remove_item(&alice, &bob_jid, Some((&bob, &alice_jid))))?
+        .ok_or("missing removal")?;
+    assert_eq!(removal.version.get(), 2);
+    assert_eq!(removal.subscription.state, SubscriptionState::Both);
+    assert_eq!(
+        removal.contact_before,
+        Some(RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: true,
+        })
+    );
+    assert!(removal.pending_request);
+    let contact = removal.contact.ok_or("missing contact change")?;
+    assert_eq!(contact.version.get(), 2);
+    assert_eq!(
+        contact.value.subscription,
+        RosterSubscription {
+            state: SubscriptionState::None,
+            pending_out: false,
+            approved: true,
+        }
+    );
+    assert!(block_on(repository.snapshot(&alice))?.items.is_empty());
+    assert!(block_on(repository.pending(&alice))?.is_empty());
+    assert!(block_on(repository.pending(&bob))?.is_empty());
+    assert_eq!(
+        block_on(repository.get(&bob, &alice_jid))?
+            .ok_or("missing contact item")?
+            .subscription
+            .state,
+        SubscriptionState::None
+    );
+    Ok(())
+}
+
+#[test]
+fn item_removal_without_a_local_contact_changes_only_the_owner() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    block_on(repository.update_subscription(&alice, &bob_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::None,
+            pending_out: true,
+            approved: false,
+        })
+    }))?;
+
+    let removal =
+        block_on(repository.remove_item(&alice, &bob_jid, None))?.ok_or("missing removal")?;
+    assert_eq!(removal.version.get(), 2);
+    assert!(removal.subscription.pending_out);
+    assert!(removal.contact_before.is_none());
+    assert!(!removal.pending_request);
+    assert!(removal.contact.is_none());
+    assert!(block_on(repository.snapshot(&alice))?.items.is_empty());
+    Ok(())
+}
+
+#[test]
+fn removing_a_missing_item_writes_nothing() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+
+    assert!(
+        block_on(repository.remove_item(&alice, &bob_jid, Some((&bob, &alice_jid))))?.is_none()
+    );
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 0);
+    assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 0);
+    Ok(())
+}

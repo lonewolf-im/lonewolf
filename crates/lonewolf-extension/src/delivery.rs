@@ -111,6 +111,9 @@ pub trait Delivery<A: ChunkAllocator> {
     /// Allocates an arena for stanzas the handler builds.
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;
 
+    /// Whether this server hosts `domain`, so its accounts can be reached locally.
+    fn is_local_host(&self, domain: &str) -> bool;
+
     /// Attaches `tag` to the requesting resource.
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a>;
 

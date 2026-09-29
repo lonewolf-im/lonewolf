@@ -85,6 +85,10 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
 }
 
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
+    pub(crate) fn is_local_host(&self, domain: &str) -> bool {
+        self.hosts.is_local_host(domain)
+    }
+
     pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A>> {
         self.extensions.get(domain).map(ExtensionRegistry::iq)
     }

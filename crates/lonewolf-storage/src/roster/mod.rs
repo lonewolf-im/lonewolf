@@ -128,6 +128,20 @@ pub struct SubscriptionWithdrawal {
     pub contact: Option<RosterMutation<RosterItem>>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct ItemRemoval {
+    /// The owner's roster version after the removal.
+    pub version: RosterVersion,
+    /// The removed item's subscription, the owner's own grant to the contact.
+    pub subscription: RosterSubscription,
+    /// Whether the contact had a subscription request pending with the owner.
+    pub pending_request: bool,
+    /// The contact's subscription to the owner before the removal, when it held an item.
+    pub contact_before: Option<RosterSubscription>,
+    /// The contact's item after losing every subscription to the owner.
+    pub contact: Option<RosterMutation<RosterItem>>,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PendingSubscription {
     pub sender: RosterJid,
@@ -210,6 +224,16 @@ pub trait RosterRepository: Send + Sync {
         owner: &AccountKey,
         jid: &RosterJid,
     ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send;
+
+    /// Removes the owner's item, drops pending requests in both directions, and clears
+    /// the local contact's subscription to the owner in one write.
+    /// Returns `None` without writing if the item is absent.
+    fn remove_item(
+        &self,
+        owner: &AccountKey,
+        contact: &RosterJid,
+        contact_account: Option<(&AccountKey, &RosterJid)>,
+    ) -> impl Future<Output = Result<Option<ItemRemoval>, RosterError>> + Send;
 
     /// Replaces any pending request from the same sender.
     fn put_pending(

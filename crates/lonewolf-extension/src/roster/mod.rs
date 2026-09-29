@@ -6,7 +6,7 @@ mod xml;
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
     RosterError, RosterItem, RosterJid, RosterMutation, RosterRepository, RosterSnapshot,
-    SubscriptionState,
+    RosterVersion, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
@@ -139,13 +139,20 @@ where
                     delivery.tag_session(SessionTag::Interested).await?;
                     Ok(Some(payload))
                 }
-                IqRequestType::Set => {
-                    let update = xml::parse_update(request.payload, response)?;
-                    let _order = self.order.lock(&owner).await;
-                    let mutation = self.repository.upsert(&owner, update).await?;
-                    push_roster(&owner, mutation, delivery).await?;
-                    Ok(None)
-                }
+                IqRequestType::Set => match xml::parse_set(request.payload, response)? {
+                    xml::RosterSet::Update(update) => {
+                        let _order = self.order.lock(&owner).await;
+                        let mutation = self.repository.upsert(&owner, update).await?;
+                        push_roster(&owner, mutation, delivery).await?;
+                        Ok(None)
+                    }
+                    xml::RosterSet::Remove(contact) => {
+                        let owner_jid = RosterJid::from(request.sender.bare());
+                        self.remove_item(owner, contact, owner_jid, delivery)
+                            .await?;
+                        Ok(None)
+                    }
+                },
             }
         })
     }
@@ -249,7 +256,28 @@ async fn push_roster<A: ChunkAllocator>(
         .push_to_tagged(
             owner,
             SessionTag::Interested,
-            Box::new(move |to, arena| xml::build_push(to, &mutation, arena)),
+            Box::new(move |to, arena| {
+                let item = xml::build_item(&mutation.value, arena)?;
+                xml::build_push(to, item, mutation.version, arena)
+            }),
+        )
+        .await
+}
+
+async fn push_removal<A: ChunkAllocator>(
+    owner: &AccountKey,
+    contact: RosterJid,
+    version: RosterVersion,
+    delivery: &dyn Delivery<A>,
+) -> Result<(), DeliveryError> {
+    delivery
+        .push_to_tagged(
+            owner,
+            SessionTag::Interested,
+            Box::new(move |to, arena| {
+                let item = xml::build_removed_item(&contact, arena)?;
+                xml::build_push(to, item, version, arena)
+            }),
         )
         .await
 }

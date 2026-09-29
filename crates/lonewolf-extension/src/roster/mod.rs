@@ -7,7 +7,7 @@ use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
     PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterMutation,
-    RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
+    RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion, SubscriptionCancellation,
     SubscriptionRequestOutcome, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -64,6 +64,21 @@ impl RosterDelivery {
     }
 }
 
+pub struct RosterCancellation {
+    order: RosterOrder,
+    outcome: SubscriptionCancellation,
+}
+
+impl RosterCancellation {
+    fn new(order: RosterOrder, outcome: SubscriptionCancellation) -> Self {
+        Self { order, outcome }
+    }
+
+    pub fn into_parts(self) -> (RosterOrder, SubscriptionCancellation) {
+        (self.order, self.outcome)
+    }
+}
+
 pub struct RosterPush {
     _order: RosterOrder,
     item: RosterItem,
@@ -86,11 +101,21 @@ impl RosterPush {
     pub fn version(&self) -> RosterVersion {
         self.version
     }
+
+    pub fn into_parts(self) -> (RosterOrder, RosterMutation<RosterItem>) {
+        (
+            self._order,
+            RosterMutation {
+                version: self.version,
+                value: self.item,
+            },
+        )
+    }
 }
 
 pub struct RosterRegistrations<A: ChunkAllocator> {
     pub iq: [IqRegistration<A>; 2],
-    pub presence: [PresenceRegistration<A>; 5],
+    pub presence: [PresenceRegistration<A>; 7],
 }
 
 pub fn registrations<A, R, C>(repository: R, accounts: C) -> RosterRegistrations<A>
@@ -153,6 +178,20 @@ where
                 PresenceRoute {
                     direction: PresenceDirection::Inbound,
                     kind: PresenceRequestType::Subscribed,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Outbound,
+                    kind: PresenceRequestType::Unsubscribed,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Inbound,
+                    kind: PresenceRequestType::Unsubscribed,
                 },
                 Arc::clone(&presence),
             ),
@@ -280,9 +319,10 @@ where
                     }
                     Ok(PresenceEffect::Route)
                 }
-                (PresenceDirection::Outbound, PresenceRequestType::Subscribed) => {
-                    Ok(PresenceEffect::Route)
-                }
+                (
+                    PresenceDirection::Outbound,
+                    PresenceRequestType::Subscribed | PresenceRequestType::Unsubscribed,
+                ) => Ok(PresenceEffect::Route),
                 (PresenceDirection::Inbound, PresenceRequestType::Subscribe) => {
                     let recipient = AccountKey::try_from(request.target.bare())
                         .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
@@ -361,6 +401,35 @@ where
                             mutation.version,
                         ))
                     }))
+                }
+                (PresenceDirection::Inbound, PresenceRequestType::Unsubscribed) => {
+                    let grantor = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let subscriber = AccountKey::try_from(request.target.bare())
+                        .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
+                    if self
+                        .accounts
+                        .get(&subscriber)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .is_none()
+                    {
+                        return Ok(PresenceEffect::None);
+                    }
+                    let order = self.order.lock_pair(&grantor, &subscriber).await;
+                    let outcome = self
+                        .repository
+                        .cancel_subscription(
+                            &grantor,
+                            &RosterJid::from(request.target.bare()),
+                            &subscriber,
+                            &RosterJid::from(request.sender.bare()),
+                        )
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(PresenceEffect::CancelSubscription(RosterCancellation::new(
+                        order, outcome,
+                    )))
                 }
                 (PresenceDirection::Outbound, PresenceRequestType::Available) => {
                     let owner = AccountKey::try_from(request.sender.bare())

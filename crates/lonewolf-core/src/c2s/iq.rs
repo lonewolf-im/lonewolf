@@ -3,6 +3,7 @@
 use lonewolf_extension::iq::{IqEffect, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::roster::RosterPush;
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::roster::{RosterItem, RosterMutation};
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::parser::Parsed;
@@ -156,20 +157,32 @@ pub(super) async fn route_roster_push<A: ChunkAllocator + Clone>(
     router: &RouterHandle<A>,
     allocator: &A,
 ) -> Result<(), RouterError> {
+    let (_order, mutation) = push.into_parts();
+    route_roster_mutation(mutation, account, router, allocator).await
+}
+
+pub(super) async fn route_roster_mutation<A: ChunkAllocator + Clone>(
+    mutation: RosterMutation<RosterItem>,
+    account: &AccountKey,
+    router: &RouterHandle<A>,
+    allocator: &A,
+) -> Result<(), RouterError> {
     let allocator = allocator.clone();
     router
-        .route_roster_push(account, move |to| build_roster_push(to, &push, &allocator))
+        .route_roster_push(account, move |to| {
+            build_roster_push(to, &mutation, &allocator)
+        })
         .await
 }
 
 fn build_roster_push<A: ChunkAllocator + Clone>(
     to: &str,
-    push: &RosterPush,
+    mutation: &RosterMutation<RosterItem>,
     allocator: &A,
 ) -> Result<RoutedStanza<A>, RouterError> {
     let mut arena = Arena::try_new_in(Default::default(), allocator.clone())
         .map_err(|_| RouterError::Unavailable)?;
-    let item = lonewolf_extension::roster::build_item_in(push.item(), &mut arena)
+    let item = lonewolf_extension::roster::build_item_in(&mutation.value, &mut arena)
         .map_err(|_| RouterError::Unavailable)?;
     let query = lonewolf_xmpp::stanza::Element::builder_in(
         "query",
@@ -182,7 +195,7 @@ fn build_roster_push<A: ChunkAllocator + Clone>(
     .build()
     .map_err(|_| RouterError::Unavailable)?;
     let to = Jid::parse_in(to, &mut arena).map_err(|_| RouterError::InvalidTarget)?;
-    let id = format!("roster-{}", push.version().get());
+    let id = format!("roster-{}", mutation.version.get());
     let stanza = Stanza::builder_in(
         StanzaType::Iq(IqType::Set),
         StanzaNamespace::Client,

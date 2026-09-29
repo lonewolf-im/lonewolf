@@ -777,6 +777,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 view.stanza_type(),
                 StanzaType::Presence(
                     PresenceType::Available
+                        | PresenceType::Unavailable
                         | PresenceType::Subscribe
                         | PresenceType::Subscribed
                         | PresenceType::Unsubscribe

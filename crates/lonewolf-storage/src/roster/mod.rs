@@ -114,6 +114,14 @@ pub enum SubscriptionRequestOutcome {
     },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct SubscriptionCancellation {
+    pub route: bool,
+    pub send_unavailable: bool,
+    pub grantor: Option<RosterMutation<RosterItem>>,
+    pub subscriber: Option<RosterMutation<RosterItem>>,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PendingSubscription {
     pub sender: RosterJid,
@@ -174,6 +182,15 @@ pub trait RosterRepository: Send + Sync {
         recipient: &AccountKey,
         request: PendingSubscription,
     ) -> impl Future<Output = Result<SubscriptionRequestOutcome, RosterError>> + Send;
+
+    /// Updates both rosters and removes the pending request in one write.
+    fn cancel_subscription(
+        &self,
+        grantor: &AccountKey,
+        contact: &RosterJid,
+        subscriber: &AccountKey,
+        grantor_jid: &RosterJid,
+    ) -> impl Future<Output = Result<SubscriptionCancellation, RosterError>> + Send;
 
     /// Removes an item and returns `None` without advancing the version if absent.
     fn remove(

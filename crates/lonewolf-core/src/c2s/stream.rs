@@ -1320,6 +1320,7 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                             Ok(
                                 PresenceEffect::Route
                                 | PresenceEffect::Accept
+                                | PresenceEffect::CancelSubscription(_)
                                 | PresenceEffect::AutoApproveSubscription(_)
                                 | PresenceEffect::DeliverThenPushSenderRoster(_)
                                 | PresenceEffect::DeliverThenPushRoster(_)
@@ -1450,6 +1451,7 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
         Ok(PresenceEffect::Route) => {}
         Ok(
             PresenceEffect::Accept
+            | PresenceEffect::CancelSubscription(_)
             | PresenceEffect::AutoApproveSubscription(_)
             | PresenceEffect::DeliverThenPushSenderRoster(_)
             | PresenceEffect::DeliverThenPushRoster(_)
@@ -1582,6 +1584,58 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             apply_accepted_presence(&source, outbound, registration, router, writer, allocator)
                 .await
         }
+        Ok(PresenceEffect::CancelSubscription(cancellation)) => {
+            let (_order, outcome) = cancellation.into_parts();
+            if !outcome.route {
+                if let Some(mutation) = outcome.grantor {
+                    super::iq::route_roster_mutation(
+                        mutation,
+                        registration.account(),
+                        router,
+                        allocator,
+                    )
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                }
+                return Ok(());
+            }
+            let subscriber = {
+                let stanza = routed
+                    .resolve(&arena)
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                let target = stanza
+                    .to()
+                    .map_err(|_| CloseOutcome::InternalError)?
+                    .ok_or(CloseOutcome::InternalError)?;
+                AccountKey::try_from(target.bare()).map_err(|_| CloseOutcome::InternalError)?
+            };
+            if outcome.send_unavailable {
+                router
+                    .route_unavailable_presence(registration.account(), &subscriber)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+            }
+            router
+                .route_presence_to_interested(RoutedStanza::from_parts(routed, arena))
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?;
+            if let Some(mutation) = outcome.subscriber {
+                super::iq::route_roster_mutation(mutation, &subscriber, router, allocator)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+            }
+            if let Some(mutation) = outcome.grantor {
+                super::iq::route_roster_mutation(
+                    mutation,
+                    registration.account(),
+                    router,
+                    allocator,
+                )
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?;
+            }
+            Ok(())
+        }
         Ok(
             PresenceEffect::Route | PresenceEffect::Replay { .. } | PresenceEffect::PushRoster(_),
         ) => Err(CloseOutcome::InternalError),
@@ -1641,6 +1695,7 @@ async fn apply_accepted_presence<A: ChunkAllocator + Clone>(
         Ok(
             PresenceEffect::Route
             | PresenceEffect::Accept
+            | PresenceEffect::CancelSubscription(_)
             | PresenceEffect::AutoApproveSubscription(_)
             | PresenceEffect::DeliverThenPushSenderRoster(_)
             | PresenceEffect::DeliverThenPushRoster(_)

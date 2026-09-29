@@ -333,6 +333,166 @@ fn automatic_approval_resolves_an_outstanding_request_in_one_write() -> TestResu
 }
 
 #[test]
+fn denying_a_pending_request_clears_both_sides_without_changing_the_grantor_roster() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    block_on(repository.request_subscription(
+        &alice,
+        &bob_jid,
+        &bob,
+        PendingSubscription {
+            sender: alice_jid.clone(),
+            stanza: b"<presence type='subscribe'/>".as_slice().into(),
+        },
+    ))?;
+
+    let cancellation =
+        block_on(repository.cancel_subscription(&bob, &alice_jid, &alice, &bob_jid))?;
+    assert!(cancellation.route);
+    assert!(!cancellation.send_unavailable);
+    assert!(cancellation.grantor.is_none());
+    let cleared = cancellation.subscriber.ok_or("missing roster change")?;
+    assert_eq!(cleared.version.get(), 2);
+    assert_eq!(cleared.value.subscription.state, SubscriptionState::None);
+    assert!(!cleared.value.subscription.pending_out);
+    assert!(block_on(repository.pending(&bob))?.is_empty());
+    assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 0);
+    assert!(!block_on(repository.cancel_subscription(&bob, &alice_jid, &alice, &bob_jid))?.route);
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
+    Ok(())
+}
+
+#[test]
+fn revoking_a_mutual_subscription_keeps_the_reverse_grant() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    for (owner, contact) in [(&alice, &bob_jid), (&bob, &alice_jid)] {
+        block_on(repository.update_subscription(owner, contact, |_| {
+            Some(RosterSubscription {
+                state: SubscriptionState::Both,
+                pending_out: false,
+                approved: false,
+            })
+        }))?;
+    }
+
+    let cancellation =
+        block_on(repository.cancel_subscription(&bob, &alice_jid, &alice, &bob_jid))?;
+    assert!(cancellation.route);
+    assert!(cancellation.send_unavailable);
+    assert_eq!(
+        cancellation
+            .grantor
+            .ok_or("missing grantor change")?
+            .value
+            .subscription
+            .state,
+        SubscriptionState::To
+    );
+    assert_eq!(
+        cancellation
+            .subscriber
+            .ok_or("missing subscriber change")?
+            .value
+            .subscription
+            .state,
+        SubscriptionState::From
+    );
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
+    assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 2);
+    Ok(())
+}
+
+#[test]
+fn denying_a_crossed_request_keeps_the_reverse_subscription() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    block_on(repository.update_subscription(&alice, &bob_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::From,
+            pending_out: true,
+            approved: false,
+        })
+    }))?;
+    block_on(repository.update_subscription(&bob, &alice_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::To,
+            pending_out: false,
+            approved: false,
+        })
+    }))?;
+    block_on(repository.put_pending(
+        &bob,
+        PendingSubscription {
+            sender: alice_jid.clone(),
+            stanza: b"<presence type='subscribe'/>".as_slice().into(),
+        },
+    ))?;
+
+    let cancellation =
+        block_on(repository.cancel_subscription(&bob, &alice_jid, &alice, &bob_jid))?;
+    assert!(cancellation.route);
+    assert!(!cancellation.send_unavailable);
+    assert!(cancellation.grantor.is_none());
+    assert_eq!(
+        cancellation
+            .subscriber
+            .ok_or("missing sender change")?
+            .value
+            .subscription,
+        RosterSubscription {
+            state: SubscriptionState::From,
+            pending_out: false,
+            approved: false,
+        }
+    );
+    assert!(block_on(repository.pending(&bob))?.is_empty());
+    assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 1);
+    Ok(())
+}
+
+#[test]
+fn clearing_preapproval_does_not_notify_the_contact() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    block_on(repository.update_subscription(&bob, &alice_jid, |_| {
+        Some(RosterSubscription {
+            approved: true,
+            ..RosterSubscription::default()
+        })
+    }))?;
+
+    let cancellation =
+        block_on(repository.cancel_subscription(&bob, &alice_jid, &alice, &bob_jid))?;
+    assert!(!cancellation.route);
+    assert!(!cancellation.send_unavailable);
+    assert!(cancellation.subscriber.is_none());
+    assert!(
+        !cancellation
+            .grantor
+            .ok_or("missing grantor change")?
+            .value
+            .subscription
+            .approved
+    );
+    assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 2);
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 0);
+    Ok(())
+}
+
+#[test]
 fn delete_all_removes_one_owners_roster_version_and_pending_requests() -> TestResult {
     let repository = repository()?;
     let alice = owner("alice@example.com")?;

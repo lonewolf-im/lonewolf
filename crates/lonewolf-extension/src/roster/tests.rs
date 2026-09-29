@@ -2,6 +2,8 @@
 
 use std::hash::BuildHasher;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
 
 use async_lock::Mutex;
 use futures_executor::block_on;
@@ -9,12 +11,14 @@ use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::roster::redb::RedbRosterRepository;
-use lonewolf_storage::roster::{RosterSnapshot, RosterVersion};
+use lonewolf_storage::roster::{
+    RosterItem, RosterJid, RosterSnapshot, RosterSubscription, RosterVersion,
+};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaNamespace, StanzaType};
 
-use super::{Roster, RosterOrder, RosterSequencer, build_response};
+use super::{Roster, RosterOrder, RosterPush, RosterSequencer, build_response};
 use crate::iq::IqEffect;
 use crate::presence::{
     PresenceDirection, PresenceEffect, PresenceHandler, PresenceRequest, PresenceRequestType,
@@ -110,4 +114,46 @@ fn availability_replay_holds_recipient_order_until_the_transition_finishes() {
             .try_lock_arc()
             .is_some()
     );
+}
+
+#[test]
+fn approval_push_holds_order_through_followup_delivery() {
+    let lock = Arc::new(Mutex::new(()));
+    let guard = Arc::clone(&lock)
+        .try_lock_arc()
+        .unwrap_or_else(|| panic!("cannot lock roster order"));
+    let mut arena =
+        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+    let jid =
+        Jid::parse_in("bob@example.com", &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let jid = RosterJid::from(
+        jid.resolve(&arena)
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+    let push = RosterPush::new(
+        RosterOrder::new(guard),
+        RosterItem {
+            jid,
+            name: None,
+            groups: Vec::new(),
+            subscription: RosterSubscription::default(),
+        },
+        RosterVersion::new(1),
+    );
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    let (finish_tx, finish_rx) = mpsc::sync_channel(0);
+    let work = thread::spawn(move || {
+        block_on(push.with_mutation(|_| async move {
+            started_tx
+                .send(())
+                .unwrap_or_else(|error| panic!("{error}"));
+            finish_rx.recv().unwrap_or_else(|error| panic!("{error}"));
+        }));
+    });
+    started_rx.recv().unwrap_or_else(|error| panic!("{error}"));
+    assert!(Arc::clone(&lock).try_lock_arc().is_none());
+    finish_tx.send(()).unwrap_or_else(|error| panic!("{error}"));
+    work.join()
+        .unwrap_or_else(|_| panic!("approval work panicked"));
+    assert!(Arc::clone(&lock).try_lock_arc().is_some());
 }

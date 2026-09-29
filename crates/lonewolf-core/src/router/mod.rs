@@ -13,7 +13,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaRef, StanzaType};
+use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaNamespace, StanzaRef, StanzaType};
 
 use crate::hosts::Hosts;
 
@@ -215,6 +215,51 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
                 .map_err(|_| RouterError::Unavailable)?
                 .build()
                 .map_err(|_| RouterError::Unavailable)?;
+            match self
+                .local
+                .deliver_presence(RoutedStanza::from_parts(stanza, arena))
+                .await
+            {
+                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn route_unavailable_presence(
+        &self,
+        source: &AccountKey,
+        target: &AccountKey,
+    ) -> Result<(), RouterError> {
+        if !self.hosts.is_local_host(source.domain()) || !self.hosts.is_local_host(target.domain())
+        {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        for stanza in self.local.presence_snapshot(source).await? {
+            let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
+                .map_err(|_| RouterError::Unavailable)?;
+            let from = stanza
+                .resolve()
+                .map_err(|_| RouterError::Unavailable)?
+                .from()
+                .map_err(|_| RouterError::Unavailable)?
+                .ok_or(RouterError::Unavailable)?;
+            let from =
+                Jid::parse_in(from.as_str(), &mut arena).map_err(|_| RouterError::Unavailable)?;
+            let target = Jid::parse_in(target.as_str(), &mut arena)
+                .map_err(|_| RouterError::InvalidTarget)?;
+            let stanza = Stanza::builder_in(
+                StanzaType::Presence(PresenceType::Unavailable),
+                StanzaNamespace::Client,
+                &mut arena,
+            )
+            .from(Some(from))
+            .map_err(|_| RouterError::Unavailable)?
+            .to(Some(target))
+            .map_err(|_| RouterError::Unavailable)?
+            .build()
+            .map_err(|_| RouterError::Unavailable)?;
             match self
                 .local
                 .deliver_presence(RoutedStanza::from_parts(stanza, arena))

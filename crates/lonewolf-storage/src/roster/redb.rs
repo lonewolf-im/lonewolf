@@ -9,7 +9,7 @@ use lonewolf_xmpp::jid::{Jid, JidError, MAX_JID_LEN};
 use super::{
     PendingResolution, PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid,
     RosterMutation, RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
-    SubscriptionRequestOutcome, SubscriptionState,
+    SubscriptionCancellation, SubscriptionRequestOutcome, SubscriptionState,
 };
 use crate::account::AccountKey;
 use crate::redb::{begin_write, commit_error, storage_error};
@@ -144,6 +144,27 @@ impl RosterRepository for RedbRosterRepository {
                     pending_key,
                     request,
                 )
+            })
+            .await
+    }
+
+    async fn cancel_subscription(
+        &self,
+        grantor: &AccountKey,
+        contact: &RosterJid,
+        subscriber: Option<(&AccountKey, &RosterJid)>,
+    ) -> Result<SubscriptionCancellation, RosterError> {
+        let grantor = Box::<str>::from(grantor.as_str());
+        let grantor_key = item_key_text(&grantor, contact);
+        let contact = contact.clone();
+        let subscriber = subscriber.map(|(account, jid)| {
+            let account = Box::<str>::from(account.as_str());
+            let key = item_key_text(&account, jid);
+            (account, key, jid.clone())
+        });
+        self.database
+            .write(move |database| {
+                cancel_subscription(database, &grantor, grantor_key, contact, subscriber)
             })
             .await
     }
@@ -438,6 +459,129 @@ fn request_subscription(
     };
     transaction.commit().map_err(commit_error)?;
     Ok(SubscriptionRequestOutcome::Pending { mutation })
+}
+
+fn cancel_subscription(
+    database: &::redb::Database,
+    grantor: &str,
+    grantor_key: Box<str>,
+    contact: RosterJid,
+    subscriber: Option<(Box<str>, Box<str>, RosterJid)>,
+) -> Result<SubscriptionCancellation, RosterError> {
+    let transaction = begin_write(database)?;
+    let pending = transaction
+        .open_table(PENDING)
+        .map_err(storage_error)?
+        .remove(grantor_key.as_ref())
+        .map_err(storage_error)?
+        .is_some();
+    let grantor_state = transaction
+        .open_table(ITEMS)
+        .map_err(storage_error)?
+        .get(grantor_key.as_ref())
+        .map_err(storage_error)?
+        .map(|record| decode_item(contact.clone(), record.value()))
+        .transpose()?
+        .map(|item| item.subscription);
+    let granted = grantor_state.is_some_and(|subscription| {
+        matches!(
+            subscription.state,
+            SubscriptionState::From | SubscriptionState::Both
+        )
+    });
+    let route = subscriber.is_some() && (pending || granted);
+    let send_unavailable = route && granted;
+    let same_item = subscriber
+        .as_ref()
+        .is_some_and(|(_, key, _)| key.as_ref() == grantor_key.as_ref());
+    let grantor_mutation = update_existing_subscription(
+        &transaction,
+        grantor,
+        grantor_key.as_ref(),
+        contact,
+        |mut subscription| {
+            let old = subscription;
+            subscription.state = match subscription.state {
+                SubscriptionState::From => SubscriptionState::None,
+                SubscriptionState::Both => SubscriptionState::To,
+                state => state,
+            };
+            subscription.approved = false;
+            if same_item && route {
+                subscription.state = match subscription.state {
+                    SubscriptionState::To => SubscriptionState::None,
+                    SubscriptionState::Both => SubscriptionState::From,
+                    state => state,
+                };
+                subscription.pending_out = false;
+            }
+            (subscription != old).then_some(subscription)
+        },
+    )?;
+    let subscriber_mutation = if let Some((subscriber, subscriber_key, grantor_jid)) = subscriber
+        && route
+        && !same_item
+    {
+        update_existing_subscription(
+            &transaction,
+            &subscriber,
+            subscriber_key.as_ref(),
+            grantor_jid,
+            |mut subscription| {
+                let old = subscription;
+                subscription.state = match subscription.state {
+                    SubscriptionState::To => SubscriptionState::None,
+                    SubscriptionState::Both => SubscriptionState::From,
+                    state => state,
+                };
+                subscription.pending_out = false;
+                (subscription != old).then_some(subscription)
+            },
+        )?
+    } else {
+        None
+    };
+    if pending || grantor_mutation.is_some() || subscriber_mutation.is_some() {
+        transaction.commit().map_err(commit_error)?;
+    }
+    Ok(SubscriptionCancellation {
+        route,
+        send_unavailable,
+        grantor: grantor_mutation,
+        subscriber: subscriber_mutation,
+    })
+}
+
+fn update_existing_subscription(
+    transaction: &WriteTransaction,
+    owner: &str,
+    key: &str,
+    jid: RosterJid,
+    update: impl FnOnce(RosterSubscription) -> Option<RosterSubscription>,
+) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
+    let item = {
+        let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
+        let mut item = {
+            let Some(record) = table.get(key).map_err(storage_error)? else {
+                return Ok(None);
+            };
+            decode_item(jid, record.value())?
+        };
+        let Some(subscription) = update(item.subscription) else {
+            return Ok(None);
+        };
+        item.subscription = subscription;
+        let encoded = encode_item(&item)?;
+        table
+            .insert(key, encoded.as_slice())
+            .map_err(storage_error)?;
+        item
+    };
+    let version = advance_version(transaction, owner)?;
+    Ok(Some(RosterMutation {
+        version,
+        value: item,
+    }))
 }
 
 fn resolve_pending<F>(

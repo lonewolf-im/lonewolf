@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::jid::JidRef;
@@ -65,9 +66,12 @@ pub struct PresenceRequest<'a, A: ChunkAllocator> {
 /// The recipients of an availability change.
 pub struct PresenceAudience {
     _order: Option<OrderGuard>,
+    /// Bare JIDs that receive the resource's availability.
     pub subscribers: Vec<RosterJid>,
     /// Stored subscription requests to replay once the resource becomes available.
     pub pending: Vec<PendingSubscription>,
+    /// Accounts whose current presence a newly available resource receives.
+    pub contacts: Vec<AccountKey>,
 }
 
 impl PresenceAudience {
@@ -76,11 +80,13 @@ impl PresenceAudience {
         order: Option<OrderGuard>,
         subscribers: Vec<RosterJid>,
         pending: Vec<PendingSubscription>,
+        contacts: Vec<AccountKey>,
     ) -> Self {
         Self {
             _order: order,
             subscribers,
             pending,
+            contacts,
         }
     }
 }

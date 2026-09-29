@@ -4,6 +4,8 @@ use std::fmt;
 
 use lonewolf_xmpp::jid::JidRef;
 
+use crate::roster::RosterJid;
+
 /// Owns a canonical bare JID with a username, independent of its source arena.
 ///
 /// Ordering uses the canonical JID text. [`Debug`](fmt::Debug) omits the JID.
@@ -46,6 +48,23 @@ impl TryFrom<JidRef<'_>> for AccountKey {
         Ok(Self {
             text: Box::from(jid.as_str()),
             username_len: username.len(),
+        })
+    }
+}
+
+impl TryFrom<&RosterJid> for AccountKey {
+    type Error = AccountKeyError;
+
+    /// A roster JID is a canonical bare JID, so its username ends at the first `@`.
+    fn try_from(jid: &RosterJid) -> Result<Self, Self::Error> {
+        let text = jid.as_str();
+        let username_len = text
+            .find('@')
+            .filter(|len| *len > 0)
+            .ok_or(AccountKeyError::MissingUsername)?;
+        Ok(Self {
+            text: Box::from(text),
+            username_len,
         })
     }
 }

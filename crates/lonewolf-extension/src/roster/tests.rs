@@ -188,6 +188,7 @@ fn availability_audience_holds_the_owner_order_until_dropped() {
     .unwrap_or_else(|| panic!("expected an audience"));
     assert!(audience.pending.is_empty());
     assert!(audience.subscribers.is_empty());
+    assert!(audience.contacts.is_empty());
     assert!(roster.order.is_locked(&owner));
     drop(audience);
     assert!(!roster.order.is_locked(&owner));

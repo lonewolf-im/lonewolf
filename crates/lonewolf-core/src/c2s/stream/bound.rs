@@ -8,6 +8,7 @@ use std::pin::pin;
 use futures_util::future::{Either, select};
 use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::presence::{PresenceRequest, PresenceRequestType, PresenceUpdate};
+use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::PendingSubscription;
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
@@ -36,8 +37,16 @@ struct BoundSession<A: ChunkAllocator> {
     registration: Registration<A>,
     router: RouterHandle<A>,
     allocator: A,
-    /// Stored subscription requests to write after the next availability delivery.
-    pending_replays: VecDeque<Vec<PendingSubscription>>,
+    pending_replays: VecDeque<Replay>,
+}
+
+/// What a resource receives right after its own availability echo.
+#[derive(Default)]
+struct Replay {
+    /// Contacts whose current presence answers the resource's implicit probes.
+    contacts: Vec<AccountKey>,
+    /// Subscription requests stored while no resource was available.
+    requests: Vec<PendingSubscription>,
 }
 
 pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcome {
@@ -181,11 +190,21 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     self.writer.send_routed(&stanza).await?;
                 }
                 if replay_pending {
-                    let pending = self
+                    let replay = self
                         .pending_replays
                         .pop_front()
                         .ok_or(CloseOutcome::InternalError)?;
-                    for subscription in pending {
+                    for contact in &replay.contacts {
+                        let stanzas = self
+                            .router
+                            .current_presence(contact, self.registration.account())
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                        for stanza in &stanzas {
+                            self.writer.send_routed(stanza).await?;
+                        }
+                    }
+                    for subscription in replay.requests {
                         let stanza = self.parse_pending_subscription(subscription).await?;
                         self.writer.send_routed(&stanza).await?;
                     }
@@ -363,7 +382,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             self.pending_replays.push_back(
                 audience
                     .as_mut()
-                    .map(|audience| mem::take(&mut audience.pending))
+                    .map(|audience| Replay {
+                        contacts: mem::take(&mut audience.contacts),
+                        requests: mem::take(&mut audience.pending),
+                    })
                     .unwrap_or_default(),
             );
         }

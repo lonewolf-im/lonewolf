@@ -61,6 +61,36 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             .map(|account| account.is_some())
             .map_err(|_| StanzaErrorCondition::InternalServerError)
     }
+
+    /// Keeps only the contacts whose own roster grants `owner` their presence, so a
+    /// one-sided `to` item cannot expose a contact that never approved.
+    async fn granting_contacts(
+        &self,
+        owner: RosterJid,
+        watched: Vec<RosterJid>,
+    ) -> Result<Vec<AccountKey>, StanzaErrorCondition> {
+        let mut contacts = Vec::with_capacity(watched.len());
+        for contact in &watched {
+            let Ok(account) = AccountKey::try_from(contact) else {
+                continue;
+            };
+            let granted = self
+                .repository
+                .get(&account, &owner)
+                .await
+                .map_err(roster_error)?
+                .is_some_and(|item| {
+                    matches!(
+                        item.subscription.state,
+                        SubscriptionState::From | SubscriptionState::Both
+                    )
+                });
+            if granted {
+                contacts.push(account);
+            }
+        }
+        Ok(contacts)
+    }
 }
 
 impl<A, R, C> Extension<A> for Roster<R, C>
@@ -140,18 +170,25 @@ where
                 .snapshot(&owner)
                 .await
                 .map_err(roster_error)?;
-            let pending = if update.available {
-                self.repository
+            let (subscribers, watched) = split_subscriptions(snapshot, &owner);
+            let (pending, contacts) = if update.available {
+                let pending = self
+                    .repository
                     .pending(&owner)
                     .await
-                    .map_err(roster_error)?
+                    .map_err(roster_error)?;
+                let contacts = self
+                    .granting_contacts(RosterJid::from(update.sender.bare()), watched)
+                    .await?;
+                (pending, contacts)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             Ok(Some(PresenceAudience::new(
                 Some(order),
-                presence_subscribers(snapshot, &owner),
+                subscribers,
                 pending,
+                contacts,
             )))
         })
     }
@@ -217,18 +254,28 @@ async fn push_roster<A: ChunkAllocator>(
         .await
 }
 
-fn presence_subscribers(snapshot: RosterSnapshot, owner: &AccountKey) -> Vec<RosterJid> {
-    snapshot
-        .items
-        .into_iter()
-        .filter(|item| {
-            matches!(
-                item.subscription.state,
-                SubscriptionState::From | SubscriptionState::Both
-            ) && item.jid.as_str() != owner.as_str()
-        })
-        .map(|item| item.jid)
-        .collect()
+/// Splits the roster into the contacts that see the owner and the contacts the owner sees.
+fn split_subscriptions(
+    snapshot: RosterSnapshot,
+    owner: &AccountKey,
+) -> (Vec<RosterJid>, Vec<RosterJid>) {
+    let mut subscribers = Vec::new();
+    let mut watched = Vec::new();
+    for item in snapshot.items {
+        if item.jid.as_str() == owner.as_str() {
+            continue;
+        }
+        match item.subscription.state {
+            SubscriptionState::From => subscribers.push(item.jid),
+            SubscriptionState::To => watched.push(item.jid),
+            SubscriptionState::Both => {
+                subscribers.push(item.jid.clone());
+                watched.push(item.jid);
+            }
+            SubscriptionState::None => {}
+        }
+    }
+    (subscribers, watched)
 }
 
 fn roster_error(error: RosterError) -> StanzaErrorCondition {

@@ -27,6 +27,10 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
+use super::authenticate::{SASL_NAMESPACE, account_key, decoy_identity};
+use super::establish::{STARTTLS_FEATURES, STARTTLS_NAMESPACE, STARTTLS_PROCEED};
+use super::header::STREAM_FOOTER;
+use super::session::send_stream_error;
 use super::*;
 use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
 use crate::c2s::unauthenticated_limit::{
@@ -710,7 +714,7 @@ fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
 fn internal_failure_sends_a_stream_error_before_closing() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
         let mut output = Vec::new();
-        assert_eq!(send_stream_error_tls(&mut output, CloseOutcome::InternalError).await, CloseOutcome::InternalError);
+        assert_eq!(send_stream_error(&mut output, CloseOutcome::InternalError).await, CloseOutcome::InternalError);
         assert_eq!(std::str::from_utf8(&output)?, "<stream:error><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
         Ok(())
     })

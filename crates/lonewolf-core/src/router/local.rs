@@ -445,8 +445,12 @@ impl<A: ChunkAllocator> Registration<A> {
         self.inbound.recv().await.ok()
     }
 
-    pub(crate) async fn wait_retired(&self) -> Result<Option<RoutedStanza<A>>, RouterError> {
-        self.retired.clone().await.map_err(|_| RouterError::Stopped)
+    /// The returned future does not borrow the registration.
+    pub(crate) fn wait_retired(
+        &self,
+    ) -> impl Future<Output = Result<Option<RoutedStanza<A>>, RouterError>> + use<A> {
+        let retired = self.retired.clone();
+        async move { retired.await.map_err(|_| RouterError::Stopped) }
     }
 
     pub(crate) async fn set_presence(

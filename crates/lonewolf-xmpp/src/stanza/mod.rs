@@ -102,6 +102,7 @@ pub enum StanzaErrorCondition {
     Conflict,
     Forbidden,
     InternalServerError,
+    ItemNotFound,
     NotAcceptable,
     NotAllowed,
     ResourceConstraint,
@@ -115,6 +116,7 @@ impl StanzaErrorCondition {
             Self::Conflict => "conflict",
             Self::Forbidden => "forbidden",
             Self::InternalServerError => "internal-server-error",
+            Self::ItemNotFound => "item-not-found",
             Self::NotAcceptable => "not-acceptable",
             Self::NotAllowed => "not-allowed",
             Self::ResourceConstraint => "resource-constraint",
@@ -125,7 +127,9 @@ impl StanzaErrorCondition {
     pub const fn error_type(self) -> &'static str {
         match self {
             Self::BadRequest | Self::NotAcceptable => "modify",
-            Self::Conflict | Self::NotAllowed | Self::ServiceUnavailable => "cancel",
+            Self::Conflict | Self::ItemNotFound | Self::NotAllowed | Self::ServiceUnavailable => {
+                "cancel"
+            }
             Self::Forbidden => "auth",
             Self::InternalServerError | Self::ResourceConstraint => "wait",
         }

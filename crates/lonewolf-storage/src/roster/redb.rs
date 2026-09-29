@@ -7,8 +7,8 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_JID_LEN};
 
 use super::{
-    PendingResolution, PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid,
-    RosterMutation, RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
+    ItemRemoval, PendingResolution, PendingSubscription, RosterError, RosterItem, RosterItemUpdate,
+    RosterJid, RosterMutation, RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
     SubscriptionCancellation, SubscriptionRequestOutcome, SubscriptionState,
     SubscriptionWithdrawal,
 };
@@ -204,6 +204,25 @@ impl RosterRepository for RedbRosterRepository {
             .await
     }
 
+    async fn remove_item(
+        &self,
+        owner: &AccountKey,
+        contact: &RosterJid,
+        contact_account: Option<(&AccountKey, &RosterJid)>,
+    ) -> Result<Option<ItemRemoval>, RosterError> {
+        let owner = Box::<str>::from(owner.as_str());
+        let owner_key = item_key_text(&owner, contact);
+        let contact = contact.clone();
+        let contact_side = contact_account.map(|(account, owner_jid)| {
+            let account = Box::<str>::from(account.as_str());
+            let key = item_key_text(&account, owner_jid);
+            (account, key, owner_jid.clone())
+        });
+        self.database
+            .write(move |database| remove_item(database, &owner, owner_key, contact, contact_side))
+            .await
+    }
+
     async fn put_pending(
         &self,
         owner: &AccountKey,
@@ -335,6 +354,51 @@ fn remove(
     Ok(Some(RosterMutation {
         version,
         value: item,
+    }))
+}
+
+fn remove_item(
+    database: &::redb::Database,
+    owner: &str,
+    owner_key: Box<str>,
+    contact: RosterJid,
+    contact_side: Option<(Box<str>, Box<str>, RosterJid)>,
+) -> Result<Option<ItemRemoval>, RosterError> {
+    let transaction = begin_write(database)?;
+    let removed = {
+        let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
+        let Some(record) = table.remove(owner_key.as_ref()).map_err(storage_error)? else {
+            return Ok(None);
+        };
+        decode_item(contact, record.value())?
+    };
+    let pending_request = transaction
+        .open_table(PENDING)
+        .map_err(storage_error)?
+        .remove(owner_key.as_ref())
+        .map_err(storage_error)?
+        .is_some();
+    let version = advance_version(&transaction, owner)?;
+    let contact_mutation = match contact_side {
+        Some((account, key, owner_jid)) if key.as_ref() != owner_key.as_ref() => {
+            transaction
+                .open_table(PENDING)
+                .map_err(storage_error)?
+                .remove(key.as_ref())
+                .map_err(storage_error)?;
+            update_existing_subscription(&transaction, &account, key.as_ref(), owner_jid, |old| {
+                let cleared = RosterSubscription::default();
+                (old != cleared).then_some(cleared)
+            })?
+        }
+        _ => None,
+    };
+    transaction.commit().map_err(commit_error)?;
+    Ok(Some(ItemRemoval {
+        version,
+        subscription: removed.subscription,
+        pending_request,
+        contact: contact_mutation,
     }))
 }
 

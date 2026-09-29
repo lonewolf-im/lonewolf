@@ -8,7 +8,7 @@ use lonewolf_storage::roster::{
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
-use super::{Roster, push_roster, xml};
+use super::{Roster, push_removal, push_roster, xml};
 use crate::delivery::{Delivery, HandlerError, SessionTag};
 use crate::presence::PresenceRequest;
 
@@ -210,4 +210,78 @@ fn approve_outbound_subscription(
         SubscriptionState::From | SubscriptionState::Both => return None,
     };
     Some(subscription)
+}
+
+impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
+    /// Removes an item and, for a local contact, withdraws the owner's subscription and
+    /// cancels the contact's in the same order the separate presence flows would use.
+    pub(super) async fn remove_item<A: ChunkAllocator>(
+        &self,
+        owner: AccountKey,
+        contact: RosterJid,
+        owner_jid: RosterJid,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
+        let contact_account = match AccountKey::try_from(&contact) {
+            Ok(account) if self.account_exists(&account).await? => Some(account),
+            _ => None,
+        };
+        let _order = match &contact_account {
+            Some(account) => self.order.lock_pair(&owner, account).await,
+            None => self.order.lock(&owner).await,
+        };
+        let removal = self
+            .repository
+            .remove_item(
+                &owner,
+                &contact,
+                contact_account
+                    .as_ref()
+                    .map(|account| (account, &owner_jid)),
+            )
+            .await?
+            .ok_or(StanzaErrorCondition::ItemNotFound)?;
+        push_removal(&owner, contact, removal.version, delivery).await?;
+        let Some(contact_account) = contact_account else {
+            return Ok(());
+        };
+        let granted = matches!(
+            removal.subscription.state,
+            SubscriptionState::From | SubscriptionState::Both
+        );
+        let subscribed = matches!(
+            removal.subscription.state,
+            SubscriptionState::To | SubscriptionState::Both
+        );
+        let unsubscribe = subscribed || removal.subscription.pending_out;
+        let unsubscribed = granted || removal.pending_request;
+        if granted {
+            delivery
+                .unavailable_presence(&owner, &contact_account)
+                .await?;
+        }
+        if unsubscribe || unsubscribed {
+            let (withdrawal, cancellation) =
+                xml::subscription_withdrawals(&owner, &contact_account, delivery.arena()?)?;
+            if unsubscribe {
+                delivery
+                    .to_tagged(SessionTag::Interested, withdrawal)
+                    .await?;
+            }
+            if unsubscribed {
+                delivery
+                    .to_tagged(SessionTag::Interested, cancellation)
+                    .await?;
+            }
+        }
+        if let Some(mutation) = removal.contact {
+            push_roster(&contact_account, mutation, delivery).await?;
+        }
+        if subscribed {
+            delivery
+                .unavailable_presence(&contact_account, &owner)
+                .await?;
+        }
+        Ok(())
+    }
 }

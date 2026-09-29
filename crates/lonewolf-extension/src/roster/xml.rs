@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{
-    RosterItem, RosterItemUpdate, RosterJid, RosterMutation, RosterSnapshot, SubscriptionState,
+    RosterItem, RosterItemUpdate, RosterJid, RosterSnapshot, RosterVersion, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -12,6 +13,11 @@ use lonewolf_xmpp::stanza::{
 
 use super::NAMESPACE;
 use crate::delivery::DeliveryError;
+
+pub(super) enum RosterSet {
+    Update(RosterItemUpdate),
+    Remove(RosterJid),
+}
 
 pub(super) fn validate_get<A: ChunkAllocator>(
     payload: ElementRef<'_, Arena<A>>,
@@ -31,10 +37,10 @@ pub(super) fn validate_get<A: ChunkAllocator>(
     Ok(())
 }
 
-pub(super) fn parse_update<A: ChunkAllocator>(
+pub(super) fn parse_set<A: ChunkAllocator>(
     payload: ElementRef<'_, Arena<A>>,
     response: &mut Arena<A>,
-) -> Result<RosterItemUpdate, StanzaErrorCondition> {
+) -> Result<RosterSet, StanzaErrorCondition> {
     let mut item = None;
     for child in payload
         .children()
@@ -52,13 +58,6 @@ pub(super) fn parse_update<A: ChunkAllocator>(
         }
     }
     let item = item.ok_or(StanzaErrorCondition::BadRequest)?;
-    if item
-        .attribute("subscription", "")
-        .map_err(|_| StanzaErrorCondition::InternalServerError)?
-        == Some("remove")
-    {
-        return Err(StanzaErrorCondition::NotAllowed);
-    }
     let jid = item
         .attribute("jid", "")
         .map_err(|_| StanzaErrorCondition::InternalServerError)?
@@ -71,6 +70,13 @@ pub(super) fn parse_update<A: ChunkAllocator>(
         jid.resolve(response)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?,
     );
+    if item
+        .attribute("subscription", "")
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+        == Some("remove")
+    {
+        return Ok(RosterSet::Remove(jid));
+    }
     let name = item
         .attribute("name", "")
         .map_err(|_| StanzaErrorCondition::InternalServerError)?
@@ -99,7 +105,7 @@ pub(super) fn parse_update<A: ChunkAllocator>(
         }
         groups.push(Box::from(group));
     }
-    Ok(RosterItemUpdate { jid, name, groups })
+    Ok(RosterSet::Update(RosterItemUpdate { jid, name, groups }))
 }
 
 pub(super) fn build_response<A: ChunkAllocator>(
@@ -124,22 +130,64 @@ pub(super) fn build_response<A: ChunkAllocator>(
         .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
+/// Wraps one roster item in the push addressed to `to`.
 pub(super) fn build_push<A: ChunkAllocator>(
     to: Jid,
-    mutation: &RosterMutation<RosterItem>,
+    item: Element,
+    version: RosterVersion,
     arena: &mut Arena<A>,
 ) -> Result<Stanza, DeliveryError> {
-    let item = build_item(&mutation.value, arena)?;
     let query = Element::builder_in("query", NAMESPACE, arena)?
         .child(item)?
         .build()?;
-    let id = format!("roster-{}", mutation.version.get());
+    let id = format!("roster-{}", version.get());
     let push = Stanza::builder_in(StanzaType::Iq(IqType::Set), StanzaNamespace::Client, arena)
         .id(Some(&id))?
         .to(Some(to))?
         .child(query)?
         .build()?;
     Ok(push)
+}
+
+pub(super) fn build_removed_item<A: ChunkAllocator>(
+    contact: &RosterJid,
+    arena: &mut Arena<A>,
+) -> Result<Element, BuildError> {
+    Element::builder_in("item", NAMESPACE, arena)?
+        .attribute("jid", "", contact.as_str())?
+        .attribute("subscription", "", "remove")?
+        .build()
+}
+
+/// Builds the `unsubscribe` and `unsubscribed` presence from `owner` to `contact`.
+pub(super) fn subscription_withdrawals<A: ChunkAllocator>(
+    owner: &AccountKey,
+    contact: &AccountKey,
+    mut arena: Arena<A>,
+) -> Result<(RoutedStanza<A>, RoutedStanza<A>), DeliveryError> {
+    let from = Jid::parse_in(owner.as_str(), &mut arena)?;
+    let to = Jid::parse_in(contact.as_str(), &mut arena)?;
+    let withdrawal = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Unsubscribe),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .build()?;
+    let cancellation = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Unsubscribed),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .build()?;
+    Ok(RoutedStanza::from_parts_pair(
+        withdrawal,
+        cancellation,
+        arena,
+    ))
 }
 
 /// Builds the `subscribed` reply the server sends on behalf of the request target.
@@ -163,7 +211,7 @@ pub(super) fn approval_reply<A: ChunkAllocator>(
     Ok(RoutedStanza::from_parts(approval, arena))
 }
 
-fn build_item<A: ChunkAllocator>(
+pub(super) fn build_item<A: ChunkAllocator>(
     item: &RosterItem,
     arena: &mut Arena<A>,
 ) -> Result<Element, BuildError> {

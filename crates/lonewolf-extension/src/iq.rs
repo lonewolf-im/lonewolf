@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
-use lonewolf_xmpp::stanza::{Element, ElementRef};
+use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
 
 use crate::delivery::{Delivery, HandlerError};
-pub use crate::{ExtensionFuture, RegistrationError};
+use crate::{ExtensionFuture, RegistrationError};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IqScope {
@@ -46,36 +46,19 @@ pub trait IqHandler<A: ChunkAllocator>: Send + Sync {
     /// Allocate the response payload in `response` and perform side effects
     /// through `delivery` before returning.
     /// The future runs on the connection's worker and can be cancelled on shutdown.
+    /// The default answers `service-unavailable` for extensions without IQ routes.
     fn handle<'a>(
         &'a self,
-        request: IqRequest<'a, A>,
-        response: &'a mut Arena<A>,
-        delivery: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a>;
-}
-
-pub struct IqRegistration<A: ChunkAllocator> {
-    route: IqRoute,
-    handler: Arc<dyn IqHandler<A>>,
-}
-
-impl<A: ChunkAllocator> IqRegistration<A> {
-    pub fn new(route: IqRoute, handler: Arc<dyn IqHandler<A>>) -> Self {
-        Self { route, handler }
-    }
-}
-
-impl<A: ChunkAllocator> Clone for IqRegistration<A> {
-    fn clone(&self) -> Self {
-        Self {
-            route: self.route,
-            handler: Arc::clone(&self.handler),
-        }
+        _request: IqRequest<'a, A>,
+        _response: &'a mut Arena<A>,
+        _delivery: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a> {
+        Box::pin(async { Err(StanzaErrorCondition::ServiceUnavailable.into()) })
     }
 }
 
 pub struct IqRegistry<A: ChunkAllocator> {
-    handlers: Vec<IqRegistration<A>>,
+    handlers: Vec<(IqRoute, Arc<dyn IqHandler<A>>)>,
 }
 
 impl<A: ChunkAllocator> Default for IqRegistry<A> {
@@ -87,14 +70,18 @@ impl<A: ChunkAllocator> Default for IqRegistry<A> {
 }
 
 impl<A: ChunkAllocator> IqRegistry<A> {
-    pub fn register(&mut self, handler: IqRegistration<A>) -> Result<(), RegistrationError> {
+    pub(crate) fn register(
+        &mut self,
+        route: IqRoute,
+        handler: Arc<dyn IqHandler<A>>,
+    ) -> Result<(), RegistrationError> {
         match self
             .handlers
-            .binary_search_by_key(&handler.route, |entry| entry.route)
+            .binary_search_by_key(&route, |(entry, _)| *entry)
         {
-            Ok(_) => Err(RegistrationError::DuplicateRoute(handler.route)),
+            Ok(_) => Err(RegistrationError::DuplicateRoute(route)),
             Err(index) => {
-                self.handlers.insert(index, handler);
+                self.handlers.insert(index, (route, handler));
                 Ok(())
             }
         }
@@ -109,16 +96,19 @@ impl<A: ChunkAllocator> IqRegistry<A> {
     ) -> Option<&dyn IqHandler<A>> {
         let index = self
             .handlers
-            .binary_search_by(|entry| {
-                let route = entry.route;
+            .binary_search_by(|(route, _)| {
                 (route.scope, route.kind, route.namespace, route.name)
                     .cmp(&(scope, kind, namespace, name))
             })
             .ok()?;
-        Some(self.handlers[index].handler.as_ref())
+        Some(self.handlers[index].1.as_ref())
     }
 
-    pub(crate) fn registrations(&self) -> &[IqRegistration<A>] {
-        &self.handlers
+    pub(crate) fn registrations(
+        &self,
+    ) -> impl Iterator<Item = (IqRoute, Arc<dyn IqHandler<A>>)> + '_ {
+        self.handlers
+            .iter()
+            .map(|(route, handler)| (*route, Arc::clone(handler)))
     }
 }

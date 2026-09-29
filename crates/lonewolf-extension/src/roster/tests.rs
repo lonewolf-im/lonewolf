@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::RefCell;
-use std::hash::BuildHasher;
-use std::sync::Arc;
 
 use futures_executor::block_on;
 use lonewolf_storage::RedbDatabase;
@@ -13,7 +11,7 @@ use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{Element, RoutedStanza};
 
-use super::{NAMESPACE, Roster, RosterSequencer};
+use super::{NAMESPACE, Roster};
 use crate::delivery::{Delivery, DeliveryError, DeliveryFuture, SessionTag, StanzaFactory};
 use crate::iq::{IqHandler, IqRequest, IqRequestType};
 use crate::presence::{PresenceHandler, PresenceUpdate};
@@ -91,12 +89,7 @@ fn roster() -> (tempfile::TempDir, TestRoster) {
         .unwrap_or_else(|error| panic!("{error}"));
     let accounts =
         RedbAccountRepository::from_database(database).unwrap_or_else(|error| panic!("{error}"));
-    let roster = Roster {
-        repository,
-        accounts,
-        order: RosterSequencer::new(),
-    };
-    (directory, roster)
+    (directory, Roster::new(repository, accounts))
 }
 
 fn handle_iq(
@@ -195,16 +188,7 @@ fn availability_audience_holds_the_owner_order_until_dropped() {
     .unwrap_or_else(|| panic!("expected an audience"));
     assert!(audience.pending.is_empty());
     assert!(audience.subscribers.is_empty());
-    let index = (roster.order.hash_state.hash_one(&owner) as usize) % roster.order.shards.len();
-    assert!(
-        Arc::clone(&roster.order.shards[index])
-            .try_lock_arc()
-            .is_none()
-    );
+    assert!(roster.order.is_locked(&owner));
     drop(audience);
-    assert!(
-        Arc::clone(&roster.order.shards[index])
-            .try_lock_arc()
-            .is_some()
-    );
+    assert!(!roster.order.is_locked(&owner));
 }

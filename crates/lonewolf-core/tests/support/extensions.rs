@@ -2,165 +2,91 @@
 
 use std::sync::Arc;
 
-use lonewolf_extension::Extensions;
 use lonewolf_extension::delivery::Delivery;
 use lonewolf_extension::iq::{
-    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqRoute, IqScope,
+    IqFuture, IqHandler, IqRequest, IqRequestType, IqResult, IqRoute, IqScope,
 };
 use lonewolf_extension::presence::{
-    PresenceFuture, PresenceHandler, PresenceRegistration, PresenceRequest, PresenceRequestType,
+    PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
 };
+use lonewolf_extension::{Extension, Extensions};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
 use lonewolf_xmpp::stanza::{Element, PresenceType, StanzaErrorCondition, StanzaType};
 
 use super::TestResult;
 
+const NAMESPACE: &str = "urn:lonewolf:test:iq";
+
+const ACCOUNT_GET: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Get,
+    namespace: NAMESPACE,
+    name: "query",
+};
+
+const ACCOUNT_SET: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: NAMESPACE,
+    name: "query",
+};
+
+const SERVER_GET: IqRoute = IqRoute {
+    scope: IqScope::Server,
+    kind: IqRequestType::Get,
+    namespace: NAMESPACE,
+    name: "query",
+};
+
+const ACCOUNT_DENY: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: NAMESPACE,
+    name: "deny",
+};
+
+const SUBSCRIPTION_KINDS: [PresenceRequestType; 4] = [
+    PresenceRequestType::Subscribe,
+    PresenceRequestType::Subscribed,
+    PresenceRequestType::Unsubscribe,
+    PresenceRequestType::Unsubscribed,
+];
+
 pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>>> {
     let mut extensions = Extensions::default();
-    let identity: Arc<dyn IqHandler<Arc<PooledChunkAllocator>>> = Arc::new(Identity);
-    extensions.register(
-        "test-conflicting-iq",
-        [IqRegistration::new(
-            IqRoute {
-                scope: IqScope::Account,
-                kind: IqRequestType::Get,
-                namespace: "urn:lonewolf:test:iq",
-                name: "query",
-            },
-            Arc::new(Empty),
-        )],
-        [],
-    )?;
-    extensions.register(
-        "test-iq",
-        [
-            IqRegistration::new(
-                IqRoute {
-                    scope: IqScope::Account,
-                    kind: IqRequestType::Get,
-                    namespace: "urn:lonewolf:test:iq",
-                    name: "query",
-                },
-                Arc::clone(&identity),
-            ),
-            IqRegistration::new(
-                IqRoute {
-                    scope: IqScope::Account,
-                    kind: IqRequestType::Set,
-                    namespace: "urn:lonewolf:test:iq",
-                    name: "query",
-                },
-                Arc::new(Empty),
-            ),
-        ],
-        [],
-    )?;
-    extensions.register(
-        "test-server-iq",
-        [IqRegistration::new(
-            IqRoute {
-                scope: IqScope::Server,
-                kind: IqRequestType::Get,
-                namespace: "urn:lonewolf:test:iq",
-                name: "query",
-            },
-            Arc::clone(&identity),
-        )],
-        [],
-    )?;
-    extensions.register(
-        "test-error-iq",
-        [IqRegistration::new(
-            IqRoute {
-                scope: IqScope::Account,
-                kind: IqRequestType::Set,
-                namespace: "urn:lonewolf:test:iq",
-                name: "deny",
-            },
-            Arc::new(Deny),
-        )],
-        [],
-    )?;
-    extensions.register(
-        "test-presence",
-        [],
-        [
-            PresenceRequestType::Subscribe,
-            PresenceRequestType::Subscribed,
-            PresenceRequestType::Unsubscribe,
-            PresenceRequestType::Unsubscribed,
-        ]
-        .map(|kind| PresenceRegistration::new(kind, Arc::new(VerifyPresence))),
-    )?;
-    extensions.register(
-        "test-conflicting-presence",
-        [],
-        [PresenceRegistration::new(
-            PresenceRequestType::Subscribe,
-            Arc::new(VerifyPresence),
-        )],
-    )?;
+    extensions.register(Arc::new(ConflictingIq))?;
+    extensions.register(Arc::new(TestIq))?;
+    extensions.register(Arc::new(ServerIq))?;
+    extensions.register(Arc::new(ErrorIq))?;
+    extensions.register(Arc::new(TestPresence))?;
+    extensions.register(Arc::new(ConflictingPresence))?;
     Ok(extensions)
 }
 
-struct Identity;
+struct ConflictingIq;
 
-struct Empty;
+struct TestIq;
 
-struct Deny;
+struct ServerIq;
 
-struct VerifyPresence;
+struct ErrorIq;
 
-impl<A: ChunkAllocator> PresenceHandler<A> for VerifyPresence {
-    fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
-        Box::pin(async move {
-            compio::time::sleep(std::time::Duration::from_millis(1)).await;
-            let stanza = request
-                .stanza
-                .resolve()
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            let stanza_sender = stanza
-                .from()
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                .ok_or(StanzaErrorCondition::InternalServerError)?;
-            let stanza_target = stanza
-                .to()
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                .ok_or(StanzaErrorCondition::InternalServerError)?;
-            let stanza_kind = match request.kind {
-                PresenceRequestType::Available => PresenceType::Available,
-                PresenceRequestType::Unavailable => PresenceType::Unavailable,
-                PresenceRequestType::Subscribe => PresenceType::Subscribe,
-                PresenceRequestType::Subscribed => PresenceType::Subscribed,
-                PresenceRequestType::Unsubscribe => PresenceType::Unsubscribe,
-                PresenceRequestType::Unsubscribed => PresenceType::Unsubscribed,
-            };
-            if request.sender.as_str() == "alice@localhost/desk"
-                && stanza_sender == request.sender
-                && stanza_target == request.target
-                && stanza.stanza_type() == StanzaType::Presence(stanza_kind)
-            {
-                Err(StanzaErrorCondition::NotAllowed)
-            } else {
-                Err(StanzaErrorCondition::InternalServerError)
-            }
-        })
+struct TestPresence;
+
+struct ConflictingPresence;
+
+impl<A: ChunkAllocator> Extension<A> for ConflictingIq {
+    fn name(&self) -> &'static str {
+        "test-conflicting-iq"
+    }
+
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[ACCOUNT_GET]
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for Deny {
-    fn handle<'a>(
-        &'a self,
-        _: IqRequest<'a, A>,
-        _: &'a mut Arena<A>,
-        _: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a> {
-        Box::pin(async { Err(StanzaErrorCondition::NotAllowed.into()) })
-    }
-}
-
-impl<A: ChunkAllocator> IqHandler<A> for Empty {
+impl<A: ChunkAllocator> IqHandler<A> for ConflictingIq {
     fn handle<'a>(
         &'a self,
         _: IqRequest<'a, A>,
@@ -171,7 +97,19 @@ impl<A: ChunkAllocator> IqHandler<A> for Empty {
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for Identity {
+impl<A: ChunkAllocator> PresenceHandler<A> for ConflictingIq {}
+
+impl<A: ChunkAllocator> Extension<A> for TestIq {
+    fn name(&self) -> &'static str {
+        "test-iq"
+    }
+
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[ACCOUNT_GET, ACCOUNT_SET]
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A> for TestIq {
     fn handle<'a>(
         &'a self,
         request: IqRequest<'a, A>,
@@ -179,22 +117,150 @@ impl<A: ChunkAllocator> IqHandler<A> for Identity {
         _: &'a dyn Delivery<A>,
     ) -> IqFuture<'a> {
         Box::pin(async move {
-            compio::time::sleep(std::time::Duration::from_millis(1)).await;
-            let value = request
-                .payload
-                .attribute("value", "")
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            let result = Element::builder_in("query", "urn:lonewolf:test:iq", response)
-                .and_then(|builder| builder.attribute("sender", "", request.sender.as_str()))
-                .and_then(|builder| builder.attribute("target", "", request.target.as_str()))
-                .and_then(|builder| match value {
-                    Some(value) => builder.attribute("value", "", value),
-                    None => Ok(builder),
-                })
-                .and_then(|builder| builder.build());
-            result
-                .map(Some)
-                .map_err(|_| StanzaErrorCondition::InternalServerError.into())
+            match request.kind {
+                IqRequestType::Get => identity(&request, response).await,
+                IqRequestType::Set => Ok(None),
+            }
         })
+    }
+}
+
+impl<A: ChunkAllocator> PresenceHandler<A> for TestIq {}
+
+impl<A: ChunkAllocator> Extension<A> for ServerIq {
+    fn name(&self) -> &'static str {
+        "test-server-iq"
+    }
+
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[SERVER_GET]
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A> for ServerIq {
+    fn handle<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        response: &'a mut Arena<A>,
+        _: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a> {
+        Box::pin(async move { identity(&request, response).await })
+    }
+}
+
+impl<A: ChunkAllocator> PresenceHandler<A> for ServerIq {}
+
+impl<A: ChunkAllocator> Extension<A> for ErrorIq {
+    fn name(&self) -> &'static str {
+        "test-error-iq"
+    }
+
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[ACCOUNT_DENY]
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A> for ErrorIq {
+    fn handle<'a>(
+        &'a self,
+        _: IqRequest<'a, A>,
+        _: &'a mut Arena<A>,
+        _: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a> {
+        Box::pin(async { Err(StanzaErrorCondition::NotAllowed.into()) })
+    }
+}
+
+impl<A: ChunkAllocator> PresenceHandler<A> for ErrorIq {}
+
+impl<A: ChunkAllocator> Extension<A> for TestPresence {
+    fn name(&self) -> &'static str {
+        "test-presence"
+    }
+
+    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
+        &SUBSCRIPTION_KINDS
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A> for TestPresence {}
+
+impl<A: ChunkAllocator> PresenceHandler<A> for TestPresence {
+    fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
+        Box::pin(async move { verify_authorization(&request).await })
+    }
+}
+
+impl<A: ChunkAllocator> Extension<A> for ConflictingPresence {
+    fn name(&self) -> &'static str {
+        "test-conflicting-presence"
+    }
+
+    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
+        &[PresenceRequestType::Subscribe]
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A> for ConflictingPresence {}
+
+impl<A: ChunkAllocator> PresenceHandler<A> for ConflictingPresence {
+    fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
+        Box::pin(async move { verify_authorization(&request).await })
+    }
+}
+
+async fn identity<A: ChunkAllocator>(
+    request: &IqRequest<'_, A>,
+    response: &mut Arena<A>,
+) -> IqResult {
+    compio::time::sleep(std::time::Duration::from_millis(1)).await;
+    let value = request
+        .payload
+        .attribute("value", "")
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    Element::builder_in("query", NAMESPACE, response)
+        .and_then(|builder| builder.attribute("sender", "", request.sender.as_str()))
+        .and_then(|builder| builder.attribute("target", "", request.target.as_str()))
+        .and_then(|builder| match value {
+            Some(value) => builder.attribute("value", "", value),
+            None => Ok(builder),
+        })
+        .and_then(|builder| builder.build())
+        .map(Some)
+        .map_err(|_| StanzaErrorCondition::InternalServerError.into())
+}
+
+async fn verify_authorization<A: ChunkAllocator>(
+    request: &PresenceRequest<'_, A>,
+) -> Result<(), StanzaErrorCondition> {
+    compio::time::sleep(std::time::Duration::from_millis(1)).await;
+    let stanza = request
+        .stanza
+        .resolve()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    let stanza_sender = stanza
+        .from()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+        .ok_or(StanzaErrorCondition::InternalServerError)?;
+    let stanza_target = stanza
+        .to()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+        .ok_or(StanzaErrorCondition::InternalServerError)?;
+    let stanza_kind = match request.kind {
+        PresenceRequestType::Available => PresenceType::Available,
+        PresenceRequestType::Unavailable => PresenceType::Unavailable,
+        PresenceRequestType::Subscribe => PresenceType::Subscribe,
+        PresenceRequestType::Subscribed => PresenceType::Subscribed,
+        PresenceRequestType::Unsubscribe => PresenceType::Unsubscribe,
+        PresenceRequestType::Unsubscribed => PresenceType::Unsubscribed,
+    };
+    if request.sender.as_str() == "alice@localhost/desk"
+        && stanza_sender == request.sender
+        && stanza_target == request.target
+        && stanza.stanza_type() == StanzaType::Presence(stanza_kind)
+    {
+        Err(StanzaErrorCondition::NotAllowed)
+    } else {
+        Err(StanzaErrorCondition::InternalServerError)
     }
 }

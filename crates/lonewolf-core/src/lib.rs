@@ -3,6 +3,7 @@
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 
+use std::collections::BTreeSet;
 use std::env;
 use std::future::pending;
 use std::io;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
-use lonewolf_extension::Extensions;
+use lonewolf_extension::{Extension, Extensions};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
@@ -117,20 +118,23 @@ pub fn run_with_extensions(
             let mut router = None;
             let result = async {
                 let accounts = stores.accounts(account_store)?;
-                if config.hosts.values().any(|host| {
-                    host.extensions
-                        .iter()
-                        .any(|name| name == lonewolf_extension::roster::NAME)
-                }) {
-                    let rosters = stores.rosters(account_store)?;
-                    let registrations =
-                        lonewolf_extension::roster::registrations(rosters, accounts.clone());
+                let referenced = config
+                    .hosts
+                    .values()
+                    .flat_map(|host| host.extensions.iter().map(String::as_str))
+                    .collect::<BTreeSet<_>>();
+                for name in referenced {
+                    let extension: Arc<dyn Extension<Arc<PooledChunkAllocator>>> = match name {
+                        lonewolf_extension::roster::NAME => {
+                            Arc::new(lonewolf_extension::roster::Roster::new(
+                                stores.rosters(account_store)?,
+                                accounts.clone(),
+                            ))
+                        }
+                        _ => continue,
+                    };
                     extensions
-                        .register(
-                            lonewolf_extension::roster::NAME,
-                            registrations.iq,
-                            registrations.presence,
-                        )
+                        .register(extension)
                         .map_err(RunError::ExtensionCatalog)?;
                 }
                 let enabled_extensions = config

@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use lonewolf_util::arena::{Arena, GlobalChunkAllocator};
+use lonewolf_util::arena::GlobalChunkAllocator;
 
-use super::delivery::Delivery;
-use super::iq::{IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqRoute, IqScope};
-use super::presence::{PresenceHandler, PresenceRegistration, PresenceRequestType};
-use super::{Extensions, RegistrationError};
+use super::iq::{IqHandler, IqRequestType, IqRoute, IqScope};
+use super::presence::{PresenceHandler, PresenceRequestType};
+use super::{Extension, Extensions, RegistrationError};
 
 const ROUTE: IqRoute = IqRoute {
     scope: IqScope::Account,
@@ -16,36 +15,43 @@ const ROUTE: IqRoute = IqRoute {
     name: "query",
 };
 
-struct Empty;
+struct Fake {
+    name: &'static str,
+    iq: &'static [IqRoute],
+    presence: &'static [PresenceRequestType],
+}
 
-struct EmptyPresence;
+impl IqHandler<GlobalChunkAllocator> for Fake {}
 
-impl IqHandler<GlobalChunkAllocator> for Empty {
-    fn handle<'a>(
-        &'a self,
-        _: IqRequest<'a, GlobalChunkAllocator>,
-        _: &'a mut Arena<GlobalChunkAllocator>,
-        _: &'a dyn Delivery<GlobalChunkAllocator>,
-    ) -> IqFuture<'a> {
-        Box::pin(async { Ok(None) })
+impl PresenceHandler<GlobalChunkAllocator> for Fake {}
+
+impl Extension<GlobalChunkAllocator> for Fake {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        self.iq
+    }
+
+    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
+        self.presence
     }
 }
 
-fn handler() -> IqRegistration<GlobalChunkAllocator> {
-    IqRegistration::new(ROUTE, Arc::new(Empty))
+fn extension(
+    name: &'static str,
+    iq: &'static [IqRoute],
+    presence: &'static [PresenceRequestType],
+) -> Arc<dyn Extension<GlobalChunkAllocator>> {
+    Arc::new(Fake { name, iq, presence })
 }
-
-fn presence_handler(kind: PresenceRequestType) -> PresenceRegistration<GlobalChunkAllocator> {
-    PresenceRegistration::new(kind, Arc::new(EmptyPresence))
-}
-
-impl PresenceHandler<GlobalChunkAllocator> for EmptyPresence {}
 
 #[test]
 fn conflicting_extensions_cannot_be_enabled_together() -> Result<(), RegistrationError> {
     let mut extensions = Extensions::default();
-    extensions.register("first", [handler()], [])?;
-    extensions.register("second", [handler()], [])?;
+    extensions.register(extension("first", &[ROUTE], &[]))?;
+    extensions.register(extension("second", &[ROUTE], &[]))?;
     assert!(extensions.enable(["first"]).is_ok());
     assert!(extensions.enable(["second"]).is_ok());
     assert!(matches!(
@@ -63,10 +69,10 @@ fn conflicting_extensions_cannot_be_enabled_together() -> Result<(), Registratio
 fn failed_registration_does_not_reserve_an_extension_name() -> Result<(), RegistrationError> {
     let mut extensions = Extensions::default();
     assert_eq!(
-        extensions.register("example", [handler(), handler()], []),
+        extensions.register(extension("example", &[ROUTE, ROUTE], &[])),
         Err(RegistrationError::DuplicateRoute(ROUTE))
     );
-    extensions.register("example", [handler()], [])?;
+    extensions.register(extension("example", &[ROUTE], &[]))?;
     assert!(extensions.enable(["example"]).is_ok());
     Ok(())
 }
@@ -74,9 +80,9 @@ fn failed_registration_does_not_reserve_an_extension_name() -> Result<(), Regist
 #[test]
 fn duplicate_extension_names_cannot_replace_handlers() -> Result<(), RegistrationError> {
     let mut extensions = Extensions::default();
-    extensions.register("example", [handler()], [])?;
+    extensions.register(extension("example", &[ROUTE], &[]))?;
     assert_eq!(
-        extensions.register("example", [], []),
+        extensions.register(extension("example", &[], &[])),
         Err(RegistrationError::DuplicateExtension("example"))
     );
     let enabled = extensions.enable(["example"])?;
@@ -99,10 +105,10 @@ fn unknown_enabled_names_are_rejected() {
 
 #[test]
 fn extension_names_must_be_nonempty_and_trimmed() {
-    let mut extensions = Extensions::<GlobalChunkAllocator>::default();
+    let mut extensions = Extensions::default();
     for name in ["", " ", " leading", "trailing "] {
         assert_eq!(
-            extensions.register(name, [], []),
+            extensions.register(extension(name, &[], &[])),
             Err(RegistrationError::InvalidExtensionName)
         );
     }
@@ -110,8 +116,8 @@ fn extension_names_must_be_nonempty_and_trimmed() {
 
 #[test]
 fn repeated_activation_is_rejected_even_without_iq_handlers() -> Result<(), RegistrationError> {
-    let mut extensions = Extensions::<GlobalChunkAllocator>::default();
-    extensions.register("example", [], [])?;
+    let mut extensions = Extensions::default();
+    extensions.register(extension("example", &[], &[]))?;
     assert!(matches!(
         extensions.enable(["example", "example"]),
         Err(RegistrationError::DuplicateExtension("example"))
@@ -122,16 +128,8 @@ fn repeated_activation_is_rejected_even_without_iq_handlers() -> Result<(), Regi
 #[test]
 fn conflicting_presence_extensions_cannot_be_enabled_together() -> Result<(), RegistrationError> {
     let mut extensions = Extensions::default();
-    extensions.register(
-        "first",
-        [],
-        [presence_handler(PresenceRequestType::Subscribe)],
-    )?;
-    extensions.register(
-        "second",
-        [],
-        [presence_handler(PresenceRequestType::Subscribe)],
-    )?;
+    extensions.register(extension("first", &[], &[PresenceRequestType::Subscribe]))?;
+    extensions.register(extension("second", &[], &[PresenceRequestType::Subscribe]))?;
     assert!(matches!(
         extensions.enable(["first", "second"]),
         Err(RegistrationError::DuplicatePresenceRoute(
@@ -150,14 +148,14 @@ fn conflicting_presence_extensions_cannot_be_enabled_together() -> Result<(), Re
 #[test]
 fn presence_kinds_select_distinct_handlers() -> Result<(), RegistrationError> {
     let mut extensions = Extensions::default();
-    extensions.register(
+    extensions.register(extension(
         "example",
-        [],
-        [
-            presence_handler(PresenceRequestType::Subscribe),
-            presence_handler(PresenceRequestType::Subscribed),
+        &[],
+        &[
+            PresenceRequestType::Subscribe,
+            PresenceRequestType::Subscribed,
         ],
-    )?;
+    ))?;
     let enabled = extensions.enable(["example"])?;
     assert!(
         enabled

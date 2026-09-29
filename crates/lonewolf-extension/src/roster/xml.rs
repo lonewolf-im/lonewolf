@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use lonewolf_storage::roster::{
+    RosterItem, RosterItemUpdate, RosterJid, RosterMutation, RosterSnapshot, SubscriptionState,
+};
+use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_xmpp::jid::{Jid, JidError};
+use lonewolf_xmpp::stanza::{
+    BuildError, Element, ElementRef, IqType, NodeRef, PresenceType, RoutedStanza, Stanza,
+    StanzaErrorCondition, StanzaNamespace, StanzaType,
+};
+
+use super::NAMESPACE;
+use crate::delivery::DeliveryError;
+
+pub(super) fn validate_get<A: ChunkAllocator>(
+    payload: ElementRef<'_, Arena<A>>,
+) -> Result<(), StanzaErrorCondition> {
+    for child in payload
+        .children()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+    {
+        if let NodeRef::Element(child) =
+            child.map_err(|_| StanzaErrorCondition::InternalServerError)?
+            && child.name() == "item"
+            && child.namespace() == NAMESPACE
+        {
+            return Err(StanzaErrorCondition::BadRequest);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn parse_update<A: ChunkAllocator>(
+    payload: ElementRef<'_, Arena<A>>,
+    response: &mut Arena<A>,
+) -> Result<RosterItemUpdate, StanzaErrorCondition> {
+    let mut item = None;
+    for child in payload
+        .children()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+    {
+        if let NodeRef::Element(child) =
+            child.map_err(|_| StanzaErrorCondition::InternalServerError)?
+            && child.name() == "item"
+            && child.namespace() == NAMESPACE
+        {
+            if item.is_some() {
+                return Err(StanzaErrorCondition::BadRequest);
+            }
+            item = Some(child);
+        }
+    }
+    let item = item.ok_or(StanzaErrorCondition::BadRequest)?;
+    if item
+        .attribute("subscription", "")
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+        == Some("remove")
+    {
+        return Err(StanzaErrorCondition::NotAllowed);
+    }
+    let jid = item
+        .attribute("jid", "")
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+        .ok_or(StanzaErrorCondition::BadRequest)?;
+    let jid = Jid::parse_in(jid, response).map_err(jid_error)?;
+    if jid.is_full() {
+        return Err(StanzaErrorCondition::BadRequest);
+    }
+    let jid = RosterJid::from(
+        jid.resolve(response)
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?,
+    );
+    let name = item
+        .attribute("name", "")
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+        .filter(|name| !name.is_empty())
+        .map(Box::from);
+    let mut groups: Vec<Box<str>> = Vec::new();
+    for child in item
+        .children()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+    {
+        let NodeRef::Element(group) =
+            child.map_err(|_| StanzaErrorCondition::InternalServerError)?
+        else {
+            continue;
+        };
+        if group.name() != "group" || group.namespace() != NAMESPACE {
+            continue;
+        }
+        let group = group
+            .text()
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?
+            .filter(|group| !group.is_empty())
+            .ok_or(StanzaErrorCondition::NotAcceptable)?;
+        if groups.iter().any(|existing| existing.as_ref() == group) {
+            return Err(StanzaErrorCondition::BadRequest);
+        }
+        groups.push(Box::from(group));
+    }
+    Ok(RosterItemUpdate { jid, name, groups })
+}
+
+pub(super) fn build_response<A: ChunkAllocator>(
+    snapshot: RosterSnapshot,
+    response: &mut Arena<A>,
+) -> Result<Element, StanzaErrorCondition> {
+    let mut items = Vec::with_capacity(snapshot.items.len());
+    for item in snapshot.items {
+        items.push(
+            build_item(&item, response).map_err(|_| StanzaErrorCondition::InternalServerError)?,
+        );
+    }
+    let mut query = Element::builder_in("query", NAMESPACE, response)
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    for item in items {
+        query = query
+            .child(item)
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    }
+    query
+        .build()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)
+}
+
+pub(super) fn build_push<A: ChunkAllocator>(
+    to: Jid,
+    mutation: &RosterMutation<RosterItem>,
+    arena: &mut Arena<A>,
+) -> Result<Stanza, DeliveryError> {
+    let item = build_item(&mutation.value, arena)?;
+    let query = Element::builder_in("query", NAMESPACE, arena)?
+        .child(item)?
+        .build()?;
+    let id = format!("roster-{}", mutation.version.get());
+    let push = Stanza::builder_in(StanzaType::Iq(IqType::Set), StanzaNamespace::Client, arena)
+        .id(Some(&id))?
+        .to(Some(to))?
+        .child(query)?
+        .build()?;
+    Ok(push)
+}
+
+/// Builds the `subscribed` reply the server sends on behalf of the request target.
+pub(super) fn approval_reply<A: ChunkAllocator>(
+    request: &RoutedStanza<A>,
+    mut arena: Arena<A>,
+) -> Result<RoutedStanza<A>, DeliveryError> {
+    let view = request.resolve()?;
+    let from = view.to()?.ok_or(DeliveryError)?.clone_in(&mut arena)?;
+    let to = view.from()?.ok_or(DeliveryError)?.clone_in(&mut arena)?;
+    let approval = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Subscribed),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .id(view.id()?)?
+    .lang(view.lang()?)?
+    .from(Some(from))?
+    .to(Some(to))?
+    .build()?;
+    Ok(RoutedStanza::from_parts(approval, arena))
+}
+
+fn build_item<A: ChunkAllocator>(
+    item: &RosterItem,
+    arena: &mut Arena<A>,
+) -> Result<Element, BuildError> {
+    let mut groups = Vec::with_capacity(item.groups.len());
+    for group in &item.groups {
+        groups.push(
+            Element::builder_in("group", NAMESPACE, arena)
+                .and_then(|builder| builder.text(group))
+                .and_then(|builder| builder.build())?,
+        );
+    }
+    let mut builder = Element::builder_in("item", NAMESPACE, arena)
+        .and_then(|builder| builder.attribute("jid", "", item.jid.as_str()))
+        .and_then(|builder| match item.name.as_deref() {
+            Some(name) => builder.attribute("name", "", name),
+            None => Ok(builder),
+        })
+        .and_then(|builder| {
+            builder.attribute(
+                "subscription",
+                "",
+                subscription_name(item.subscription.state),
+            )
+        })?;
+    if item.subscription.pending_out {
+        builder = builder.attribute("ask", "", "subscribe")?;
+    }
+    if item.subscription.approved {
+        builder = builder.attribute("approved", "", "true")?;
+    }
+    for group in groups {
+        builder = builder.child(group)?;
+    }
+    builder.build()
+}
+
+const fn subscription_name(state: SubscriptionState) -> &'static str {
+    match state {
+        SubscriptionState::None => "none",
+        SubscriptionState::To => "to",
+        SubscriptionState::From => "from",
+        SubscriptionState::Both => "both",
+    }
+}
+
+const fn jid_error(error: JidError) -> StanzaErrorCondition {
+    match error {
+        JidError::AllocationFailed(_) | JidError::AccessFailed(_) => {
+            StanzaErrorCondition::InternalServerError
+        }
+        JidError::EmptyPart(_) | JidError::PartTooLong(_) | JidError::InvalidPart(_) => {
+            StanzaErrorCondition::BadRequest
+        }
+    }
+}

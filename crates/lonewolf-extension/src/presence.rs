@@ -8,7 +8,7 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{PresenceType, RoutedStanza, StanzaErrorCondition};
 
 use crate::delivery::{Delivery, HandlerError};
-use crate::roster::RosterOrder;
+use crate::order::OrderGuard;
 use crate::{ExtensionFuture, RegistrationError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,7 +64,7 @@ pub struct PresenceRequest<'a, A: ChunkAllocator> {
 
 /// The recipients of an availability change.
 pub struct PresenceAudience {
-    _order: Option<RosterOrder>,
+    _order: Option<OrderGuard>,
     pub subscribers: Vec<RosterJid>,
     /// Stored subscription requests to replay once the resource becomes available.
     pub pending: Vec<PendingSubscription>,
@@ -73,7 +73,7 @@ pub struct PresenceAudience {
 impl PresenceAudience {
     /// The order guard is released when the audience is dropped, after the server broadcast.
     pub fn new(
-        order: Option<RosterOrder>,
+        order: Option<OrderGuard>,
         subscribers: Vec<RosterJid>,
         pending: Vec<PendingSubscription>,
     ) -> Self {
@@ -114,17 +114,6 @@ pub trait PresenceHandler<A: ChunkAllocator>: Send + Sync {
     }
 }
 
-pub struct PresenceRegistration<A: ChunkAllocator> {
-    kind: PresenceRequestType,
-    handler: Arc<dyn PresenceHandler<A>>,
-}
-
-impl<A: ChunkAllocator> PresenceRegistration<A> {
-    pub fn new(kind: PresenceRequestType, handler: Arc<dyn PresenceHandler<A>>) -> Self {
-        Self { kind, handler }
-    }
-}
-
 pub struct PresenceRegistry<A: ChunkAllocator> {
     handlers: [Option<Arc<dyn PresenceHandler<A>>>; PresenceRequestType::ALL.len()],
 }
@@ -138,15 +127,16 @@ impl<A: ChunkAllocator> Default for PresenceRegistry<A> {
 }
 
 impl<A: ChunkAllocator> PresenceRegistry<A> {
-    pub fn register(
+    pub(crate) fn register(
         &mut self,
-        registration: PresenceRegistration<A>,
+        kind: PresenceRequestType,
+        handler: Arc<dyn PresenceHandler<A>>,
     ) -> Result<(), RegistrationError> {
-        let slot = &mut self.handlers[registration.kind as usize];
+        let slot = &mut self.handlers[kind as usize];
         if slot.is_some() {
-            return Err(RegistrationError::DuplicatePresenceRoute(registration.kind));
+            return Err(RegistrationError::DuplicatePresenceRoute(kind));
         }
-        *slot = Some(registration.handler);
+        *slot = Some(handler);
         Ok(())
     }
 
@@ -154,14 +144,14 @@ impl<A: ChunkAllocator> PresenceRegistry<A> {
         self.handlers[kind as usize].as_deref()
     }
 
-    pub(crate) fn registrations(&self) -> impl Iterator<Item = PresenceRegistration<A>> + '_ {
+    pub(crate) fn registrations(
+        &self,
+    ) -> impl Iterator<Item = (PresenceRequestType, Arc<dyn PresenceHandler<A>>)> + '_ {
         PresenceRequestType::ALL
             .into_iter()
             .zip(&self.handlers)
             .filter_map(|(kind, handler)| {
-                handler
-                    .as_ref()
-                    .map(|handler| PresenceRegistration::new(kind, Arc::clone(handler)))
+                handler.as_ref().map(|handler| (kind, Arc::clone(handler)))
             })
     }
 }

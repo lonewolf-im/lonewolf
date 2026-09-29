@@ -7,7 +7,8 @@ use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
     PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterMutation,
-    RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion, SubscriptionState,
+    RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
+    SubscriptionRequestOutcome, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -304,7 +305,7 @@ where
                         .stanza
                         .write_xml(&mut stanza)
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                    let mutation = self
+                    let outcome = self
                         .repository
                         .request_subscription(
                             &subscriber,
@@ -317,9 +318,16 @@ where
                         )
                         .await
                         .map_err(roster_error)?;
-                    Ok(PresenceEffect::DeliverThenPushSenderRoster(
-                        RosterDelivery::new(order, mutation),
-                    ))
+                    Ok(match outcome {
+                        SubscriptionRequestOutcome::Pending { mutation } => {
+                            PresenceEffect::DeliverThenPushSenderRoster(RosterDelivery::new(
+                                order, mutation,
+                            ))
+                        }
+                        SubscriptionRequestOutcome::AutoApprove => {
+                            PresenceEffect::AutoApproveSubscription(order)
+                        }
+                    })
                 }
                 (PresenceDirection::Inbound, PresenceRequestType::Subscribed) => {
                     let owner = AccountKey::try_from(request.target.bare())

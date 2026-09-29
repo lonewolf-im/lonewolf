@@ -9,6 +9,7 @@ use lonewolf_xmpp::jid::{Jid, JidError, MAX_JID_LEN};
 use super::{
     PendingResolution, PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid,
     RosterMutation, RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
+    SubscriptionRequestOutcome, SubscriptionState,
 };
 use crate::account::AccountKey;
 use crate::redb::{begin_write, commit_error, storage_error};
@@ -128,7 +129,7 @@ impl RosterRepository for RedbRosterRepository {
         contact: &RosterJid,
         recipient: &AccountKey,
         request: PendingSubscription,
-    ) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
+    ) -> Result<SubscriptionRequestOutcome, RosterError> {
         let subscriber = Box::<str>::from(subscriber.as_str());
         let roster_key = item_key_text(&subscriber, contact);
         let contact = contact.clone();
@@ -343,8 +344,24 @@ fn request_subscription(
     contact: RosterJid,
     pending_key: Box<str>,
     request: PendingSubscription,
-) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
+) -> Result<SubscriptionRequestOutcome, RosterError> {
     let transaction = begin_write(database)?;
+    let auto_approve = transaction
+        .open_table(ITEMS)
+        .map_err(storage_error)?
+        .get(pending_key.as_ref())
+        .map_err(storage_error)?
+        .map(|record| decode_item(request.sender.clone(), record.value()))
+        .transpose()?
+        .is_some_and(|item| {
+            matches!(
+                item.subscription.state,
+                SubscriptionState::From | SubscriptionState::Both
+            )
+        });
+    if auto_approve {
+        return Ok(SubscriptionRequestOutcome::AutoApprove);
+    }
     transaction
         .open_table(PENDING)
         .map_err(storage_error)?
@@ -363,7 +380,12 @@ fn request_subscription(
                 groups: Vec::new(),
                 subscription: RosterSubscription::default(),
             });
-        if item.subscription.pending_out {
+        if item.subscription.pending_out
+            || matches!(
+                item.subscription.state,
+                SubscriptionState::To | SubscriptionState::Both
+            )
+        {
             None
         } else {
             item.subscription.pending_out = true;
@@ -382,7 +404,7 @@ fn request_subscription(
         None => None,
     };
     transaction.commit().map_err(commit_error)?;
-    Ok(mutation)
+    Ok(SubscriptionRequestOutcome::Pending { mutation })
 }
 
 fn resolve_pending<F>(

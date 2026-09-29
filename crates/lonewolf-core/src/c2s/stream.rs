@@ -1320,6 +1320,7 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                             Ok(
                                 PresenceEffect::Route
                                 | PresenceEffect::Accept
+                                | PresenceEffect::AutoApproveSubscription(_)
                                 | PresenceEffect::DeliverThenPushSenderRoster(_)
                                 | PresenceEffect::DeliverThenPushRoster(_)
                                 | PresenceEffect::PushRoster(_),
@@ -1449,6 +1450,7 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
         Ok(PresenceEffect::Route) => {}
         Ok(
             PresenceEffect::Accept
+            | PresenceEffect::AutoApproveSubscription(_)
             | PresenceEffect::DeliverThenPushSenderRoster(_)
             | PresenceEffect::DeliverThenPushRoster(_)
             | PresenceEffect::Replay { .. }
@@ -1505,6 +1507,16 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             let source = RoutedStanza::from_parts(source, arena);
             apply_accepted_presence(&source, outbound, registration, router, writer, allocator)
                 .await
+        }
+        Ok(PresenceEffect::AutoApproveSubscription(order)) => {
+            let approval = automatic_subscription_approval(routed, &mut arena)?;
+            let approval = RoutedStanza::from_parts(approval, arena);
+            router
+                .route_presence_to_interested(approval)
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?;
+            drop(order);
+            Ok(())
         }
         Ok(PresenceEffect::DeliverThenPushSenderRoster(delivery)) => {
             let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
@@ -1611,11 +1623,27 @@ async fn apply_accepted_presence<A: ChunkAllocator + Clone>(
         Ok(
             PresenceEffect::Route
             | PresenceEffect::Accept
+            | PresenceEffect::AutoApproveSubscription(_)
             | PresenceEffect::DeliverThenPushSenderRoster(_)
             | PresenceEffect::DeliverThenPushRoster(_)
             | PresenceEffect::Replay { .. },
         ) => Err(CloseOutcome::InternalError),
     }
+}
+
+fn automatic_subscription_approval<A: ChunkAllocator>(
+    request: Stanza,
+    arena: &mut Arena<A>,
+) -> Result<Stanza, CloseOutcome> {
+    request
+        .derive_in(arena)
+        .map_err(|_| CloseOutcome::InternalError)?
+        .stanza_type(StanzaType::Presence(PresenceType::Subscribed))
+        .swap_addresses()
+        .clear_attributes()
+        .clear_children()
+        .build()
+        .map_err(|_| CloseOutcome::InternalError)
 }
 
 fn c2s_namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Option<CloseOutcome> {

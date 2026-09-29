@@ -89,6 +89,14 @@ pub struct PendingResolution {
     pub mutation: Option<RosterMutation<RosterItem>>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum SubscriptionRequestOutcome {
+    Pending {
+        mutation: Option<RosterMutation<RosterItem>>,
+    },
+    AutoApprove,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PendingSubscription {
     pub sender: RosterJid,
@@ -140,14 +148,15 @@ pub trait RosterRepository: Send + Sync {
     where
         F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static;
 
-    /// Stores both sides of a subscription request in one write.
+    /// Stores both sides in one write when approval is required.
+    /// Returns `AutoApprove` for an established subscription.
     fn request_subscription(
         &self,
         subscriber: &AccountKey,
         contact: &RosterJid,
         recipient: &AccountKey,
         request: PendingSubscription,
-    ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send;
+    ) -> impl Future<Output = Result<SubscriptionRequestOutcome, RosterError>> + Send;
 
     /// Removes an item and returns `None` without advancing the version if absent.
     fn remove(

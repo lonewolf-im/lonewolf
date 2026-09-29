@@ -631,6 +631,11 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
+    pub fn swap_addresses(mut self) -> Self {
+        std::mem::swap(&mut self.header.from, &mut self.header.to);
+        self
+    }
+
     pub fn bare_to(mut self) -> Self {
         self.header.to = self.header.to.map(|jid| jid.bare());
         self
@@ -699,6 +704,11 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         }
         self.attributes.remove(name, namespace, self.arena)?;
         Ok(self)
+    }
+
+    pub fn clear_attributes(mut self) -> Self {
+        self.attributes = AttributesBuilder::new();
+        self
     }
 
     /// Shares the child's storage; the child must belong to this arena.

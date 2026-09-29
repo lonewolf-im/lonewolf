@@ -142,7 +142,7 @@ impl RosterPush {
 
 pub struct RosterRegistrations<A: ChunkAllocator> {
     pub iq: [IqRegistration<A>; 2],
-    pub presence: [PresenceRegistration<A>; 9],
+    pub presence: [PresenceRegistration<A>; 10],
 }
 
 pub fn registrations<A, R, C>(repository: R, accounts: C) -> RosterRegistrations<A>
@@ -241,6 +241,13 @@ where
                     direction: PresenceDirection::Outbound,
                     kind: PresenceRequestType::Available,
                 },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Outbound,
+                    kind: PresenceRequestType::Unavailable,
+                },
                 presence,
             ),
         ],
@@ -251,6 +258,23 @@ struct Roster<R, C> {
     repository: R,
     accounts: C,
     order: RosterSequencer,
+}
+
+impl<R: RosterRepository, C> Roster<R, C> {
+    async fn subscriber_snapshot(
+        &self,
+        owner: &AccountKey,
+    ) -> Result<(RosterOrder, Vec<RosterJid>), StanzaErrorCondition> {
+        let order = RosterOrder::new(self.order.lock(owner).await);
+        let subscribers = presence_subscribers(
+            self.repository
+                .snapshot(owner)
+                .await
+                .map_err(roster_error)?,
+            owner,
+        );
+        Ok((order, subscribers))
+    }
 }
 
 struct RosterSequencer {
@@ -505,13 +529,23 @@ where
                 (PresenceDirection::Outbound, PresenceRequestType::Available) => {
                     let owner = AccountKey::try_from(request.sender.bare())
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                    let order = RosterOrder::new(self.order.lock(&owner).await);
+                    let (order, subscribers) = self.subscriber_snapshot(&owner).await?;
                     let pending = self
                         .repository
                         .pending(&owner)
                         .await
                         .map_err(roster_error)?;
-                    Ok(PresenceEffect::Replay { order, pending })
+                    Ok(PresenceEffect::Replay {
+                        order,
+                        pending,
+                        subscribers,
+                    })
+                }
+                (PresenceDirection::Outbound, PresenceRequestType::Unavailable) => {
+                    let owner = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let (order, subscribers) = self.subscriber_snapshot(&owner).await?;
+                    Ok(PresenceEffect::Broadcast { order, subscribers })
                 }
                 _ => Err(StanzaErrorCondition::ServiceUnavailable),
             }
@@ -521,6 +555,12 @@ where
     fn accepted<'a>(&'a self, request: AcceptedPresence<'a>) -> PresenceFuture<'a> {
         Box::pin(async move {
             match (request.direction, request.kind) {
+                (PresenceDirection::Outbound, PresenceRequestType::Unavailable) => {
+                    let owner = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let (order, subscribers) = self.subscriber_snapshot(&owner).await?;
+                    Ok(PresenceEffect::Broadcast { order, subscribers })
+                }
                 (PresenceDirection::Outbound, PresenceRequestType::Subscribed) => {
                     let owner = AccountKey::try_from(request.sender.bare())
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
@@ -558,6 +598,20 @@ fn approve_outbound_subscription(
         SubscriptionState::From | SubscriptionState::Both => return None,
     };
     Some(subscription)
+}
+
+fn presence_subscribers(snapshot: RosterSnapshot, owner: &AccountKey) -> Vec<RosterJid> {
+    snapshot
+        .items
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item.subscription.state,
+                SubscriptionState::From | SubscriptionState::Both
+            ) && item.jid.as_str() != owner.as_str()
+        })
+        .map(|item| item.jid)
+        .collect()
 }
 
 fn validate_get<A: ChunkAllocator>(

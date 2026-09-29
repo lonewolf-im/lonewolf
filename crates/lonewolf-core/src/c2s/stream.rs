@@ -1126,71 +1126,156 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
     let mut writer = FuturesBufWriter::with_capacity(IO_BUFFER_BYTES, writer);
     let mut pending_replays = VecDeque::new();
     let mut prefer_outbound = true;
-    let outcome = 'stream: loop {
-        // Cancelling an in-progress parser read can lose buffered XML.
-        let mut next = pin!(parser.next_event());
-        let event = loop {
-            let receive = pin!(registration.recv());
-            let selected = if prefer_outbound {
-                match select(receive, next.as_mut()).await {
-                    Either::Left((stanza, _)) => Either::Right(stanza),
-                    Either::Right((event, _)) => Either::Left(event),
-                }
-            } else {
-                match select(next.as_mut(), receive).await {
-                    Either::Left((event, _)) => Either::Left(event),
-                    Either::Right((stanza, _)) => Either::Right(stanza),
+    let stream = async {
+        'stream: loop {
+            // Cancelling an in-progress parser read can lose buffered XML.
+            let mut next = pin!(parser.next_event());
+            let event = loop {
+                let receive = pin!(registration.recv());
+                let selected = if prefer_outbound {
+                    match select(receive, next.as_mut()).await {
+                        Either::Left((stanza, _)) => Either::Right(stanza),
+                        Either::Right((event, _)) => Either::Left(event),
+                    }
+                } else {
+                    match select(next.as_mut(), receive).await {
+                        Either::Left((event, _)) => Either::Left(event),
+                        Either::Right((stanza, _)) => Either::Right(stanza),
+                    }
+                };
+                prefer_outbound = !prefer_outbound;
+                match selected {
+                    Either::Left(event) => break event,
+                    Either::Right(Some(delivery)) => {
+                        if let Err(outcome) = write_resource_delivery(
+                            &mut writer,
+                            delivery,
+                            &mut pending_replays,
+                            &registration,
+                            &allocator,
+                        )
+                        .await
+                        {
+                            break 'stream outcome;
+                        }
+                    }
+                    Either::Right(None) => break 'stream CloseOutcome::InternalError,
                 }
             };
-            prefer_outbound = !prefer_outbound;
-            match selected {
-                Either::Left(event) => break event,
-                Either::Right(Some(delivery)) => {
-                    if let Err(outcome) = write_resource_delivery(
+            match event {
+                Ok(Some(StreamEvent::StreamEnd) | None) => {
+                    break send_footer_tls(&mut writer).await;
+                }
+                Ok(Some(StreamEvent::Stanza(parsed))) => {
+                    if let Err(outcome) = handle_bound_stanza(
+                        parsed,
                         &mut writer,
-                        delivery,
-                        &mut pending_replays,
                         &registration,
+                        &router,
                         &allocator,
+                        &mut pending_replays,
                     )
                     .await
                     {
-                        break 'stream outcome;
+                        break send_stream_error_tls(&mut writer, outcome).await;
                     }
                 }
-                Either::Right(None) => break 'stream CloseOutcome::InternalError,
-            }
-        };
-        match event {
-            Ok(Some(StreamEvent::StreamEnd) | None) => break send_footer_tls(&mut writer).await,
-            Ok(Some(StreamEvent::Stanza(parsed))) => {
-                if let Err(outcome) = handle_bound_stanza(
-                    parsed,
-                    &mut writer,
-                    &registration,
-                    &router,
-                    &allocator,
-                    &mut pending_replays,
-                )
-                .await
-                {
+                Err(ParseError::UnexpectedEof) => break CloseOutcome::Eof,
+                Err(error) => {
+                    break send_stream_error_tls(
+                        &mut writer,
+                        CloseOutcome::from_parse_error(&error),
+                    )
+                    .await;
+                }
+                Ok(Some(event)) => {
+                    let outcome =
+                        c2s_namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
                     break send_stream_error_tls(&mut writer, outcome).await;
                 }
             }
-            Err(ParseError::UnexpectedEof) => break CloseOutcome::Eof,
-            Err(error) => {
-                break send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error))
-                    .await;
-            }
-            Ok(Some(event)) => {
-                let outcome =
-                    c2s_namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
-                break send_stream_error_tls(&mut writer, outcome).await;
-            }
         }
     };
+    let outcome = match select(pin!(registration.wait_retired()), pin!(stream)).await {
+        Either::Left(_) => CloseOutcome::InternalError,
+        Either::Right((outcome, _)) => outcome,
+    };
+    let end = match registration.end_presence().await {
+        Ok(Some(unavailable)) => {
+            broadcast_ended_presence(&unavailable, &registration, &router).await
+        }
+        Ok(None) | Err(RouterError::NotFound) => Ok(()),
+        Err(_) => Err(CloseOutcome::InternalError),
+    };
     drop(registration);
-    outcome
+    end.map_or(CloseOutcome::InternalError, |()| outcome)
+}
+
+async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
+    unavailable: &RoutedStanza<A>,
+    registration: &Registration<A>,
+    router: &RouterHandle<A>,
+) -> Result<(), CloseOutcome> {
+    let Some(handler) = router
+        .presence_handlers(registration.account().domain())
+        .and_then(|handlers| {
+            handlers.find(
+                PresenceDirection::Outbound,
+                PresenceRequestType::Unavailable,
+            )
+        })
+    else {
+        return registration
+            .finish_presence()
+            .await
+            .map_err(|_| CloseOutcome::InternalError);
+    };
+    let view = unavailable
+        .resolve()
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let sender = view
+        .from()
+        .map_err(|_| CloseOutcome::InternalError)?
+        .ok_or(CloseOutcome::InternalError)?;
+    let target = view
+        .to()
+        .map_err(|_| CloseOutcome::InternalError)?
+        .ok_or(CloseOutcome::InternalError)?;
+    match handler
+        .accepted(AcceptedPresence {
+            direction: PresenceDirection::Outbound,
+            kind: PresenceRequestType::Unavailable,
+            sender,
+            target,
+        })
+        .await
+    {
+        Ok(PresenceEffect::None) => registration
+            .finish_presence()
+            .await
+            .map_err(|_| CloseOutcome::InternalError),
+        Ok(PresenceEffect::Broadcast { order, subscribers }) => {
+            // The roster order guard blocks replacement updates until this delivery ends.
+            let result = match registration.replacement_is_available().await {
+                Ok(true) => Ok(()),
+                Ok(false) => router
+                    .broadcast_presence(unavailable, &subscribers)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError),
+                Err(_) => Err(CloseOutcome::InternalError),
+            };
+            let finished = registration
+                .finish_presence()
+                .await
+                .map_err(|_| CloseOutcome::InternalError);
+            drop(order);
+            result.and(finished)
+        }
+        Ok(_) | Err(_) => {
+            let _ = registration.finish_presence().await;
+            Err(CloseOutcome::InternalError)
+        }
+    }
 }
 
 async fn write_resource_delivery<A: ChunkAllocator + Clone>(
@@ -1282,7 +1367,7 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
             } else {
                 None
             };
-            let (priority, routed, unavailable, replay) = match priority {
+            let (priority, routed, unavailable, effect) = match priority {
                 Some(Ok(priority)) => {
                     let (available, unavailable, arena) =
                         stamp_available_presence(parsed, registration)?;
@@ -1316,7 +1401,7 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                         };
                         match result {
                             Ok(PresenceEffect::None) => None,
-                            Ok(PresenceEffect::Replay { order, pending }) => Some((order, pending)),
+                            Ok(effect @ PresenceEffect::Replay { .. }) => Some(effect),
                             Ok(
                                 PresenceEffect::Route
                                 | PresenceEffect::Accept
@@ -1325,6 +1410,7 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                                 | PresenceEffect::AutoApproveSubscription(_)
                                 | PresenceEffect::DeliverThenPushSenderRoster(_)
                                 | PresenceEffect::DeliverThenPushRoster(_)
+                                | PresenceEffect::Broadcast { .. }
                                 | PresenceEffect::PushRoster(_),
                             ) => return Err(CloseOutcome::InternalError),
                             Err(condition) => {
@@ -1345,18 +1431,103 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                     send_stanza_error(writer, &routed, allocator, condition).await?;
                     return Ok(());
                 }
-                None => (None, stamp_client_stanza(parsed, registration)?, None, None),
+                None => {
+                    let (source, mut arena) = parsed.into_parts();
+                    let (stamped, _, _) =
+                        stamp_client_stanza_in(source, &mut arena, registration, true)?;
+                    let effect = if let Some(handler) = router
+                        .presence_handlers(registration.account().domain())
+                        .and_then(|handlers| {
+                            handlers.find(
+                                PresenceDirection::Outbound,
+                                PresenceRequestType::Unavailable,
+                            )
+                        }) {
+                        let result = {
+                            let stanza = stamped
+                                .resolve(&arena)
+                                .map_err(|_| CloseOutcome::InternalError)?;
+                            let sender = stanza
+                                .from()
+                                .map_err(|_| CloseOutcome::InternalError)?
+                                .ok_or(CloseOutcome::InternalError)?;
+                            let target = stanza
+                                .to()
+                                .map_err(|_| CloseOutcome::InternalError)?
+                                .ok_or(CloseOutcome::InternalError)?;
+                            handler
+                                .handle(PresenceRequest {
+                                    direction: PresenceDirection::Outbound,
+                                    kind: PresenceRequestType::Unavailable,
+                                    sender,
+                                    target,
+                                    stanza,
+                                })
+                                .await
+                        };
+                        match result {
+                            Ok(PresenceEffect::None) => None,
+                            Ok(effect @ PresenceEffect::Broadcast { .. }) => Some(effect),
+                            Ok(_) => return Err(CloseOutcome::InternalError),
+                            Err(condition) => {
+                                let routed = RoutedStanza::from_parts(stamped, arena);
+                                send_stanza_error(writer, &routed, allocator, condition).await?;
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let routed = RoutedStanza::from_parts(stamped, arena);
+                    (None, routed, None, effect)
+                }
             };
-            let became_available = registration
+            let broadcast_stanza = effect
+                .as_ref()
+                .is_some_and(|effect| match effect {
+                    PresenceEffect::Replay { subscribers, .. }
+                    | PresenceEffect::Broadcast { subscribers, .. } => !subscribers.is_empty(),
+                    _ => false,
+                })
+                .then(|| routed.clone());
+            let change = registration
                 .set_presence(priority, routed, unavailable)
                 .await
                 .map_err(|_| CloseOutcome::InternalError)?;
-            let pending = replay.map_or_else(Vec::new, |(order, pending)| {
-                drop(order);
-                pending
-            });
-            if became_available {
-                pending_replays.push_back(pending);
+            match effect {
+                Some(PresenceEffect::Replay {
+                    order,
+                    pending,
+                    subscribers,
+                }) => {
+                    if change.became_available {
+                        pending_replays.push_back(pending);
+                    }
+                    if let Some(stanza) = broadcast_stanza {
+                        router
+                            .broadcast_presence(&stanza, &subscribers)
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                    }
+                    drop(order);
+                }
+                Some(PresenceEffect::Broadcast { order, subscribers }) => {
+                    if change.became_unavailable
+                        && let Some(stanza) = broadcast_stanza
+                    {
+                        router
+                            .broadcast_presence(&stanza, &subscribers)
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                    }
+                    drop(order);
+                }
+                None => {
+                    if change.became_available {
+                        pending_replays.push_back(Vec::new());
+                    }
+                }
+                Some(_) => return Err(CloseOutcome::InternalError),
             }
             Ok(())
         }
@@ -1458,6 +1629,7 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             | PresenceEffect::DeliverThenPushSenderRoster(_)
             | PresenceEffect::DeliverThenPushRoster(_)
             | PresenceEffect::Replay { .. }
+            | PresenceEffect::Broadcast { .. }
             | PresenceEffect::PushRoster(_),
         ) => {
             return Err(CloseOutcome::InternalError);
@@ -1688,7 +1860,10 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             Ok(())
         }
         Ok(
-            PresenceEffect::Route | PresenceEffect::Replay { .. } | PresenceEffect::PushRoster(_),
+            PresenceEffect::Route
+            | PresenceEffect::Replay { .. }
+            | PresenceEffect::Broadcast { .. }
+            | PresenceEffect::PushRoster(_),
         ) => Err(CloseOutcome::InternalError),
     }
 }
@@ -1759,7 +1934,8 @@ async fn apply_accepted_presence<A: ChunkAllocator + Clone>(
             | PresenceEffect::AutoApproveSubscription(_)
             | PresenceEffect::DeliverThenPushSenderRoster(_)
             | PresenceEffect::DeliverThenPushRoster(_)
-            | PresenceEffect::Replay { .. },
+            | PresenceEffect::Replay { .. }
+            | PresenceEffect::Broadcast { .. },
         ) => Err(CloseOutcome::InternalError),
     }
 }

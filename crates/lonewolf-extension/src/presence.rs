@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use lonewolf_storage::roster::PendingSubscription;
+use lonewolf_storage::roster::{PendingSubscription, RosterJid};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{PresenceType, StanzaErrorCondition, StanzaRef};
@@ -24,6 +24,7 @@ pub enum PresenceDirection {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PresenceRequestType {
     Available,
+    Unavailable,
     Subscribe,
     Subscribed,
     Unsubscribe,
@@ -82,6 +83,11 @@ pub enum PresenceEffect {
     Replay {
         order: RosterOrder,
         pending: Vec<PendingSubscription>,
+        subscribers: Vec<RosterJid>,
+    },
+    Broadcast {
+        order: RosterOrder,
+        subscribers: Vec<RosterJid>,
     },
     PushRoster(Option<RosterPush>),
 }
@@ -95,7 +101,7 @@ pub trait PresenceHandler<A: ChunkAllocator>: Send + Sync {
     /// The future runs on the connection worker and can be cancelled on shutdown.
     fn handle<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a>;
 
-    /// Applies sender state after the routed request is accepted.
+    /// Handles an accepted presence transition without the source stanza.
     fn accepted<'a>(&'a self, _request: AcceptedPresence<'a>) -> PresenceFuture<'a> {
         Box::pin(async { Ok(PresenceEffect::None) })
     }

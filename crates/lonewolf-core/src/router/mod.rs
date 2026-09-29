@@ -10,6 +10,7 @@ use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::Parsed;
@@ -236,7 +237,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         {
             return Err(RouterError::RemoteUnsupported);
         }
-        for stanza in self.local.presence_snapshot(source).await? {
+        for stanza in self.local.withdrawal_snapshot(source).await? {
             let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
                 .map_err(|_| RouterError::Unavailable)?;
             let from = stanza
@@ -263,6 +264,49 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             match self
                 .local
                 .deliver_presence(RoutedStanza::from_parts(stanza, arena))
+                .await
+            {
+                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn broadcast_presence(
+        &self,
+        source: &RoutedStanza<A>,
+        subscribers: &[RosterJid],
+    ) -> Result<(), RouterError> {
+        let view = source.resolve().map_err(|_| RouterError::Unavailable)?;
+        if !matches!(
+            view.stanza_type(),
+            StanzaType::Presence(PresenceType::Available | PresenceType::Unavailable)
+        ) {
+            return Err(RouterError::InvalidTarget);
+        }
+        for subscriber in subscribers {
+            let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
+                .map_err(|_| RouterError::Unavailable)?;
+            let target = Jid::parse_in(subscriber.as_str(), &mut arena)
+                .map_err(|_| RouterError::InvalidTarget)?;
+            if !self.hosts.is_local_host(
+                target
+                    .resolve(&arena)
+                    .map_err(|_| RouterError::Unavailable)?
+                    .domainpart(),
+            ) {
+                continue;
+            }
+            let stanza = view
+                .to_builder_in(&mut arena)
+                .map_err(|_| RouterError::Unavailable)?
+                .to(Some(target))
+                .map_err(|_| RouterError::Unavailable)?
+                .build()
+                .map_err(|_| RouterError::Unavailable)?;
+            match self
+                .route_presence(RoutedStanza::from_parts(stanza, arena))
                 .await
             {
                 Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}

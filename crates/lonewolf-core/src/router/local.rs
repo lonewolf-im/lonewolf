@@ -14,7 +14,7 @@ use std::time::Instant;
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use futures_util::future::{BoxFuture, Either, poll_fn, select};
+use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -29,6 +29,7 @@ const RESOURCE_QUEUE_CAPACITY: usize = 64;
 const SHARD_BATCH_SIZE: usize = 64;
 
 type RosterPushFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
+type Retirement<A> = Shared<oneshot::Receiver<Option<RoutedStanza<A>>>>;
 
 /// Owns one account shard on each core worker.
 pub struct LocalRouter<A: ChunkAllocator> {
@@ -49,6 +50,7 @@ pub struct Registration<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
     _lease: oneshot::Sender<()>,
+    retired: Retirement<A>,
     inbound: Receiver<ResourceDelivery<A>>,
     shard: Sender<Command<A>>,
 }
@@ -59,6 +61,11 @@ pub(crate) enum ResourceDelivery<A: ChunkAllocator> {
         stanzas: Vec<RoutedStanza<A>>,
         replay_pending: bool,
     },
+}
+
+pub(crate) struct PresenceChange {
+    pub became_available: bool,
+    pub became_unavailable: bool,
 }
 
 enum Command<A: ChunkAllocator> {
@@ -92,6 +99,10 @@ enum Command<A: ChunkAllocator> {
         account: AccountKey,
         reply: oneshot::Sender<Vec<RoutedStanza<A>>>,
     },
+    WithdrawalSnapshot {
+        account: AccountKey,
+        reply: oneshot::Sender<Vec<RoutedStanza<A>>>,
+    },
     MarkRosterInterested {
         account: AccountKey,
         resource: Box<str>,
@@ -110,8 +121,30 @@ enum Command<A: ChunkAllocator> {
         priority: Option<i8>,
         stanza: RoutedStanza<A>,
         unavailable: Option<RoutedStanza<A>>,
-        reply: oneshot::Sender<Result<bool, RouterError>>,
+        reply: oneshot::Sender<Result<PresenceChange, RouterError>>,
     },
+    EndPresence {
+        account: AccountKey,
+        resource: Box<str>,
+        token: u64,
+        reply: oneshot::Sender<Result<Option<RoutedStanza<A>>, RouterError>>,
+    },
+    ReplacementAvailable {
+        account: AccountKey,
+        resource: Box<str>,
+        token: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    FinishPresence {
+        account: AccountKey,
+        token: u64,
+        reply: oneshot::Sender<()>,
+    },
+}
+
+struct RetiredPresence<A: ChunkAllocator> {
+    resource: Box<str>,
+    stanza: RoutedStanza<A>,
 }
 
 struct Session<A: ChunkAllocator> {
@@ -122,10 +155,12 @@ struct Session<A: ChunkAllocator> {
     roster_interested: bool,
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
+    retired: oneshot::Sender<Option<RoutedStanza<A>>>,
 }
 
 struct Shard<A: ChunkAllocator> {
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
+    retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
     next_token: u64,
     cleanups: FuturesUnordered<BoxFuture<'static, (AccountKey, Box<str>, u64)>>,
 }
@@ -345,6 +380,21 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)
     }
 
+    pub(crate) async fn withdrawal_snapshot(
+        &self,
+        account: &AccountKey,
+    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard(account.as_str())
+            .send(Command::WithdrawalSnapshot {
+                account: account.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)
+    }
+
     pub(crate) async fn deliver_roster_push(
         &self,
         account: &AccountKey,
@@ -388,12 +438,16 @@ impl<A: ChunkAllocator> Registration<A> {
         self.inbound.recv().await.ok()
     }
 
+    pub(crate) async fn wait_retired(&self) -> Result<Option<RoutedStanza<A>>, RouterError> {
+        self.retired.clone().await.map_err(|_| RouterError::Stopped)
+    }
+
     pub(crate) async fn set_presence(
         &self,
         priority: Option<i8>,
         stanza: RoutedStanza<A>,
         unavailable: Option<RoutedStanza<A>>,
-    ) -> Result<bool, RouterError> {
+    ) -> Result<PresenceChange, RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard
             .send(Command::Presence {
@@ -408,6 +462,51 @@ impl<A: ChunkAllocator> Registration<A> {
             .await
             .map_err(|_| RouterError::Stopped)?;
         result.await.map_err(|_| RouterError::Stopped)?
+    }
+
+    pub(crate) async fn end_presence(&self) -> Result<Option<RoutedStanza<A>>, RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard
+            .send(Command::EndPresence {
+                account: self.account.clone(),
+                resource: self.resource.clone(),
+                token: self.token,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        match result.await.map_err(|_| RouterError::Stopped)? {
+            Ok(unavailable) => Ok(unavailable),
+            Err(RouterError::NotFound) => self.wait_retired().await,
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn replacement_is_available(&self) -> Result<bool, RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard
+            .send(Command::ReplacementAvailable {
+                account: self.account.clone(),
+                resource: self.resource.clone(),
+                token: self.token,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)
+    }
+
+    pub(crate) async fn finish_presence(&self) -> Result<(), RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard
+            .send(Command::FinishPresence {
+                account: self.account.clone(),
+                token: self.token,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)
     }
 
     /// Marks this bound resource as a roster push recipient.
@@ -460,6 +559,7 @@ impl<A: ChunkAllocator> Shard<A> {
     fn new() -> Self {
         Self {
             accounts: HashMap::new(),
+            retiring: HashMap::new(),
             next_token: 0,
             cleanups: FuturesUnordered::new(),
         }
@@ -476,6 +576,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 Some(Either::Left(command)) => self.command(command),
                 Some(Either::Right((account, resource, token))) => {
                     self.remove(account.as_str(), &resource, token);
+                    self.finish_presence(&account, token);
                 }
                 None => break,
             }
@@ -560,6 +661,9 @@ impl<A: ChunkAllocator> Shard<A> {
             Command::PresenceSnapshot { account, reply } => {
                 let _ = reply.send(self.presence_snapshot(&account));
             }
+            Command::WithdrawalSnapshot { account, reply } => {
+                let _ = reply.send(self.withdrawal_snapshot(&account));
+            }
             Command::MarkRosterInterested {
                 account,
                 resource,
@@ -589,6 +693,32 @@ impl<A: ChunkAllocator> Shard<A> {
                 let result =
                     self.presence(&account, &resource, token, priority, stanza, unavailable);
                 let _ = reply.send(result);
+            }
+            Command::EndPresence {
+                account,
+                resource,
+                token,
+                reply,
+            } => {
+                let result = self.end_presence(&account, &resource, token);
+                let _ = reply.send(result);
+            }
+            Command::ReplacementAvailable {
+                account,
+                resource,
+                token,
+                reply,
+            } => {
+                let result = self.replacement_is_available(&account, &resource, token);
+                let _ = reply.send(result);
+            }
+            Command::FinishPresence {
+                account,
+                token,
+                reply,
+            } => {
+                self.finish_presence(&account, token);
+                let _ = reply.send(());
             }
         }
     }
@@ -635,6 +765,7 @@ impl<A: ChunkAllocator> Shard<A> {
             },
         };
         let (lease, closed) = oneshot::channel();
+        let (retired, retired_reply) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let cleanup_account = account.clone();
         let cleanup_resource = resource.clone();
@@ -655,6 +786,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 roster_interested: false,
                 presence: None,
                 unavailable: None,
+                retired,
             },
         );
         Ok(Registration {
@@ -663,6 +795,7 @@ impl<A: ChunkAllocator> Shard<A> {
             token,
             alive,
             _lease: lease,
+            retired: retired_reply.shared(),
             inbound,
             shard,
         })
@@ -877,6 +1010,27 @@ impl<A: ChunkAllocator> Shard<A> {
             .collect()
     }
 
+    fn withdrawal_snapshot(&self, account: &AccountKey) -> Vec<RoutedStanza<A>> {
+        let mut snapshot = self.presence_snapshot(account);
+        if let Some(retiring) = self.retiring.get(account.as_str()) {
+            for (token, presence) in retiring {
+                let replaced = self
+                    .accounts
+                    .get(account.as_str())
+                    .and_then(|sessions| sessions.get(presence.resource.as_ref()))
+                    .is_some_and(|session| {
+                        session.token != *token
+                            && session.alive.load(Ordering::Acquire)
+                            && session.presence.is_some()
+                    });
+                if !replaced {
+                    snapshot.push(presence.stanza.clone());
+                }
+            }
+        }
+        snapshot
+    }
+
     fn mark_roster_interested(
         &mut self,
         account: &AccountKey,
@@ -980,8 +1134,8 @@ impl<A: ChunkAllocator> Shard<A> {
         priority: Option<i8>,
         stanza: RoutedStanza<A>,
         unavailable: Option<RoutedStanza<A>>,
-    ) -> Result<bool, RouterError> {
-        let (became_available, mut stanzas) = {
+    ) -> Result<PresenceChange, RouterError> {
+        let (change, mut stanzas) = {
             let sessions = self
                 .accounts
                 .get(account.as_str())
@@ -990,8 +1144,11 @@ impl<A: ChunkAllocator> Shard<A> {
             if source.token != token || !source.alive.load(Ordering::Acquire) {
                 return Err(RouterError::NotFound);
             }
-            let became_available = priority.is_some() && source.priority.is_none();
-            let stanzas = if became_available {
+            let change = PresenceChange {
+                became_available: priority.is_some() && source.priority.is_none(),
+                became_unavailable: priority.is_none() && source.priority.is_some(),
+            };
+            let stanzas = if change.became_available {
                 sessions
                     .values()
                     .filter(|session| session.token != token)
@@ -1001,13 +1158,13 @@ impl<A: ChunkAllocator> Shard<A> {
             } else {
                 Vec::new()
             };
-            (became_available, stanzas)
+            (change, stanzas)
         };
 
         stanzas.push(stanza.clone());
         let delivery = ResourceDelivery::Presence {
             stanzas,
-            replay_pending: became_available,
+            replay_pending: change.became_available,
         };
         let source = self
             .accounts
@@ -1047,19 +1204,98 @@ impl<A: ChunkAllocator> Shard<A> {
         for (recipient_resource, recipient_token) in failed {
             self.remove(account.as_str(), &recipient_resource, recipient_token);
         }
-        Ok(became_available)
+        Ok(change)
+    }
+
+    fn end_presence(
+        &mut self,
+        account: &AccountKey,
+        resource: &str,
+        token: u64,
+    ) -> Result<Option<RoutedStanza<A>>, RouterError> {
+        let sessions = self
+            .accounts
+            .get_mut(account.as_str())
+            .ok_or(RouterError::NotFound)?;
+        let source = sessions.get_mut(resource).ok_or(RouterError::NotFound)?;
+        if source.token != token || !source.alive.load(Ordering::Acquire) {
+            return Err(RouterError::NotFound);
+        }
+        source.alive.store(false, Ordering::Release);
+        source.outbound.close();
+        source.priority = None;
+        let presence = source.presence.take();
+        let unavailable = source.unavailable.take();
+        if let Some(stanza) = unavailable.as_ref() {
+            let mut failed = Vec::new();
+            for (recipient_resource, recipient) in sessions.iter() {
+                if recipient.token != token
+                    && recipient.alive.load(Ordering::Acquire)
+                    && recipient.priority.is_some()
+                    && recipient
+                        .outbound
+                        .try_send(ResourceDelivery::Routed(stanza.clone()))
+                        .is_err()
+                {
+                    failed.push((recipient_resource.clone(), recipient.token));
+                }
+            }
+            for (recipient_resource, recipient_token) in failed {
+                self.remove(account.as_str(), &recipient_resource, recipient_token);
+            }
+        }
+        if let (Some(stanza), Some(_)) = (presence, unavailable.as_ref()) {
+            self.retiring
+                .entry(account.as_str().into())
+                .or_default()
+                .insert(
+                    token,
+                    RetiredPresence {
+                        resource: resource.into(),
+                        stanza,
+                    },
+                );
+        }
+        Ok(unavailable)
+    }
+
+    fn finish_presence(&mut self, account: &AccountKey, token: u64) {
+        if let Some(retiring) = self.retiring.get_mut(account.as_str()) {
+            retiring.remove(&token);
+            if retiring.is_empty() {
+                self.retiring.remove(account.as_str());
+            }
+        }
+    }
+
+    fn replacement_is_available(&self, account: &AccountKey, resource: &str, token: u64) -> bool {
+        self.accounts
+            .get(account.as_str())
+            .and_then(|sessions| sessions.get(resource))
+            .is_some_and(|session| {
+                session.token != token
+                    && session.alive.load(Ordering::Acquire)
+                    && session.priority.is_some()
+            })
     }
 
     fn remove(&mut self, account: &str, resource: &str, token: u64) {
+        let mut retiring = Vec::new();
         if let Some(sessions) = self.accounts.get_mut(account) {
             let mut pending = Vec::new();
-            Self::remove_session(sessions, resource, token, &mut pending);
+            Self::remove_session(sessions, resource, token, &mut pending, &mut retiring);
             while let Some((resource, token)) = pending.pop() {
-                Self::remove_session(sessions, &resource, token, &mut pending);
+                Self::remove_session(sessions, &resource, token, &mut pending, &mut retiring);
             }
             if sessions.is_empty() {
                 self.accounts.remove(account);
             }
+        }
+        for (token, presence) in retiring {
+            self.retiring
+                .entry(account.into())
+                .or_default()
+                .insert(token, presence);
         }
     }
 
@@ -1068,6 +1304,7 @@ impl<A: ChunkAllocator> Shard<A> {
         resource: &str,
         token: u64,
         pending: &mut Vec<(Box<str>, u64)>,
+        retiring: &mut Vec<(u64, RetiredPresence<A>)>,
     ) {
         if sessions
             .get(resource)
@@ -1078,7 +1315,7 @@ impl<A: ChunkAllocator> Shard<A> {
         if let Some(session) = sessions.remove(resource) {
             session.alive.store(false, Ordering::Release);
             session.outbound.close();
-            if let Some(unavailable) = session.unavailable {
+            if let Some(unavailable) = session.unavailable.as_ref() {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
                         && recipient.priority.is_some()
@@ -1091,6 +1328,16 @@ impl<A: ChunkAllocator> Shard<A> {
                     }
                 }
             }
+            if let (Some(stanza), Some(_)) = (session.presence, session.unavailable.as_ref()) {
+                retiring.push((
+                    token,
+                    RetiredPresence {
+                        resource: resource.into(),
+                        stanza,
+                    },
+                ));
+            }
+            let _ = session.retired.send(session.unavailable);
         }
     }
 }
@@ -1207,6 +1454,7 @@ mod tests {
             let mut receivers = Vec::new();
             for (token, resource) in [(1, "ready"), (2, "full"), (3, "closed")] {
                 let (outbound, inbound) = async_channel::bounded(1);
+                let (retired, _) = oneshot::channel();
                 sessions.insert(
                     resource.into(),
                     Session {
@@ -1217,6 +1465,7 @@ mod tests {
                         roster_interested: false,
                         presence: None,
                         unavailable: None,
+                        retired,
                     },
                 );
                 receivers.push(inbound);
@@ -1294,7 +1543,7 @@ mod tests {
                 routed("<presence from='alice@localhost/desk'/>").await?,
                 Some(routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?),
             )?;
-            assert!(became_available);
+            assert!(became_available.became_available);
             let Some(ResourceDelivery::Presence { stanzas, .. }) = desk.recv().await else {
                 return Err("missing desk presence batch".into());
             };
@@ -1307,7 +1556,7 @@ mod tests {
                 routed("<presence from='alice@localhost/phone'/>").await?,
                 None,
             )?;
-            assert!(became_available);
+            assert!(became_available.became_available);
             let Some(ResourceDelivery::Presence { stanzas, .. }) = phone.recv().await else {
                 return Err("missing phone presence batch".into());
             };

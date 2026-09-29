@@ -269,10 +269,15 @@ fn subscription_approval_updates_both_rosters_and_delivers_current_presence() ->
         "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='from'/>",
     )?;
     bob.send(&format!("<iq type='result' id='{bob_approved}'/>"))?;
-    bob.send("<presence/>")?;
-    bob.expect_xml(
-        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
-    )?;
+    bob.send("<presence id='update'><show>dnd</show><status>Busy</status></presence>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' id='update' from='bob@localhost/phone' to='bob@localhost'><show>dnd</show><status>Busy</status></presence>")?;
+    alice_tablet.expect_xml("<presence xmlns='jabber:client' id='update' from='bob@localhost/phone' to='alice@localhost'><show>dnd</show><status>Busy</status></presence>")?;
+    bob.send("<presence type='unavailable' id='gone'><status>Bye</status></presence>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' id='gone' from='bob@localhost/phone' to='bob@localhost'><status>Bye</status></presence>")?;
+    alice_tablet.expect_xml("<presence xmlns='jabber:client' type='unavailable' id='gone' from='bob@localhost/phone' to='alice@localhost'><status>Bye</status></presence>")?;
+    bob.send("<presence id='again'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' id='again' from='bob@localhost/phone' to='bob@localhost'/>")?;
+    alice_tablet.expect_xml("<presence xmlns='jabber:client' id='again' from='bob@localhost/phone' to='alice@localhost'/>")?;
 
     request_roster(
         &mut alice,
@@ -290,8 +295,95 @@ fn subscription_approval_updates_both_rosters_and_delivers_current_presence() ->
         "<iq xmlns='jabber:client' type='result' id='approved-tablet-roster' to='alice@localhost/tablet'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='to'/></query></iq>",
     )?;
 
+    bob.send("<presence type='unavailable' id='final'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' id='final' from='bob@localhost/phone' to='bob@localhost'/>")?;
+    alice_tablet.expect_xml("<presence xmlns='jabber:client' type='unavailable' id='final' from='bob@localhost/phone' to='alice@localhost'/>")?;
+    bob.close()?;
+    alice.send("<message to='alice@localhost/tablet' id='sentinel'/>")?;
+    alice_tablet.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/tablet' id='sentinel'/>")?;
     alice.close()?;
-    alice_tablet.close()?;
+    alice_tablet.close()
+}
+
+#[test]
+fn authorized_resources_receive_presence_and_abrupt_unavailable() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    suite.create_account("charlie", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut alice_phone = suite.connect("alice", "password", "phone")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut bob_phone = suite.connect("bob", "password", "phone")?;
+    let mut charlie = suite.connect("charlie", "password", "desk")?;
+
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost'/>",
+    )?;
+    bob_phone.send("<presence/>")?;
+    bob_phone.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost'/>",
+    )?;
+    bob_phone.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    charlie.send("<presence/>")?;
+    charlie.expect_xml(
+        "<presence xmlns='jabber:client' from='charlie@localhost/desk' to='charlie@localhost'/>",
+    )?;
+
+    alice.send("<presence id='first'><show>away</show></presence>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' id='first' from='alice@localhost/desk' to='alice@localhost'><show>away</show></presence>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' id='first' from='alice@localhost/desk' to='bob@localhost'><show>away</show></presence>")?;
+    bob_phone.expect_xml("<presence xmlns='jabber:client' id='first' from='alice@localhost/desk' to='bob@localhost'><show>away</show></presence>")?;
+    alice.send("<message to='charlie@localhost/desk' id='sentinel'/>")?;
+    charlie.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='charlie@localhost/desk' id='sentinel'/>")?;
+
+    alice_phone.send("<presence id='second'/>")?;
+    alice_phone.expect_xml("<presence xmlns='jabber:client' id='first' from='alice@localhost/desk' to='alice@localhost'><show>away</show></presence>")?;
+    alice_phone.expect_xml("<presence xmlns='jabber:client' id='second' from='alice@localhost/phone' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' id='second' from='alice@localhost/phone' to='alice@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' id='second' from='alice@localhost/phone' to='bob@localhost'/>")?;
+    bob_phone.expect_xml("<presence xmlns='jabber:client' id='second' from='alice@localhost/phone' to='bob@localhost'/>")?;
+
+    drop(alice_phone);
+    alice.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost' type='unavailable'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='bob@localhost' type='unavailable'/>")?;
+    bob_phone.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='bob@localhost' type='unavailable'/>")?;
+    alice.send("<message to='bob@localhost/desk' id='after-close'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' id='after-close'/>")?;
+
+    charlie.close()?;
+    alice.close()?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='unavailable'/>")?;
+    bob_phone.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='unavailable'/>")?;
+    bob.close()?;
+    bob_phone.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost' type='unavailable'/>")?;
+    bob_phone.close()
+}
+
+#[test]
+fn disabled_roster_does_not_broadcast_stored_subscriptions() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("", seed_roster)?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    alice.send("<presence id='online'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' id='online' from='alice@localhost/desk' to='alice@localhost'/>")?;
+    alice.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' id='sentinel'/>")?;
+
+    alice.close()?;
     bob.close()
 }
 
@@ -863,6 +955,7 @@ fn unsubscribe_from_a_mutual_subscription_keeps_the_reverse_grant() -> TestResul
         "<iq xmlns='jabber:client' type='result' id='final-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='to'/></query></iq>",
     )?;
     alice.close()?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='unavailable'/>")?;
     bob.close()
 }
 

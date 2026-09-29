@@ -139,6 +139,7 @@ impl<A: ChunkAllocator> PresenceHandler<A> for VerifyPresence {
                 .ok_or(StanzaErrorCondition::InternalServerError)?;
             let stanza_kind = match request.kind {
                 PresenceRequestType::Available => PresenceType::Available,
+                PresenceRequestType::Unavailable => PresenceType::Unavailable,
                 PresenceRequestType::Subscribe => PresenceType::Subscribe,
                 PresenceRequestType::Subscribed => PresenceType::Subscribed,
                 PresenceRequestType::Unsubscribe => PresenceType::Unsubscribe,

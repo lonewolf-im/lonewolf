@@ -10,7 +10,7 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{PresenceType, StanzaErrorCondition, StanzaRef};
 
 use crate::RegistrationError;
-use crate::roster::{RosterOrder, RosterPush};
+use crate::roster::{RosterDelivery, RosterOrder, RosterPush};
 
 /// The direction relative to the local account.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -72,7 +72,7 @@ pub enum PresenceEffect {
     None,
     Route,
     Accept,
-    Deliver(RosterOrder),
+    DeliverThenPushSenderRoster(RosterDelivery),
     DeliverThenPushRoster(RosterPush),
     Replay {
         order: RosterOrder,

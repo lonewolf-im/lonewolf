@@ -171,6 +171,54 @@ fn pending_subscription_is_deduplicated_by_sender_and_can_be_removed() -> TestRe
 }
 
 #[test]
+fn subscription_request_updates_the_sender_and_recipient_in_one_write() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+
+    let mutation = block_on(repository.request_subscription(
+        &alice,
+        &bob_jid,
+        &bob,
+        PendingSubscription {
+            sender: alice_jid.clone(),
+            stanza: b"<presence id='first'/>".as_slice().into(),
+        },
+    ))?
+    .ok_or("subscription was not changed")?;
+
+    assert_eq!(mutation.version.get(), 1);
+    assert!(mutation.value.subscription.pending_out);
+    assert_eq!(
+        block_on(repository.get(&alice, &bob_jid))?,
+        Some(mutation.value)
+    );
+    let pending = block_on(repository.pending(&bob))?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].sender, alice_jid);
+    assert_eq!(pending[0].stanza.as_ref(), b"<presence id='first'/>");
+
+    let repeated = block_on(repository.request_subscription(
+        &alice,
+        &bob_jid,
+        &bob,
+        PendingSubscription {
+            sender: alice_jid,
+            stanza: b"<presence id='last'/>".as_slice().into(),
+        },
+    ))?;
+    assert!(repeated.is_none());
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 1);
+    assert_eq!(
+        block_on(repository.pending(&bob))?[0].stanza.as_ref(),
+        b"<presence id='last'/>"
+    );
+    Ok(())
+}
+
+#[test]
 fn delete_all_removes_one_owners_roster_version_and_pending_requests() -> TestResult {
     let repository = repository()?;
     let alice = owner("alice@example.com")?;

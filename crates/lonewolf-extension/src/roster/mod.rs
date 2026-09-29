@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
-    PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterRepository,
-    RosterSnapshot, RosterSubscription, RosterVersion, SubscriptionState,
+    PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterMutation,
+    RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -27,12 +27,39 @@ pub const NAMESPACE: &str = "jabber:iq:roster";
 const ORDER_SHARDS: usize = 64;
 
 pub struct RosterOrder {
-    _guard: MutexGuardArc<()>,
+    _first: MutexGuardArc<()>,
+    _second: Option<MutexGuardArc<()>>,
 }
 
 impl RosterOrder {
     fn new(guard: MutexGuardArc<()>) -> Self {
-        Self { _guard: guard }
+        Self {
+            _first: guard,
+            _second: None,
+        }
+    }
+
+    fn pair(first: MutexGuardArc<()>, second: MutexGuardArc<()>) -> Self {
+        Self {
+            _first: first,
+            _second: Some(second),
+        }
+    }
+}
+
+pub struct RosterDelivery {
+    order: RosterOrder,
+    mutation: Option<RosterMutation<RosterItem>>,
+}
+
+impl RosterDelivery {
+    fn new(order: RosterOrder, mutation: Option<RosterMutation<RosterItem>>) -> Self {
+        Self { order, mutation }
+    }
+
+    pub fn into_push(self) -> Option<RosterPush> {
+        self.mutation
+            .map(|mutation| RosterPush::new(self.order, mutation.value, mutation.version))
     }
 }
 
@@ -159,8 +186,28 @@ impl RosterSequencer {
     }
 
     async fn lock(&self, owner: &AccountKey) -> MutexGuardArc<()> {
-        let index = (self.hash_state.hash_one(owner) as usize) % self.shards.len();
+        let index = self.shard_index(owner);
         Arc::clone(&self.shards[index]).lock_arc().await
+    }
+
+    async fn lock_pair(&self, first: &AccountKey, second: &AccountKey) -> RosterOrder {
+        let first_index = self.shard_index(first);
+        let second_index = self.shard_index(second);
+        if first_index == second_index {
+            return RosterOrder::new(Arc::clone(&self.shards[first_index]).lock_arc().await);
+        }
+        let (first_index, second_index) = if first_index < second_index {
+            (first_index, second_index)
+        } else {
+            (second_index, first_index)
+        };
+        let first = Arc::clone(&self.shards[first_index]).lock_arc().await;
+        let second = Arc::clone(&self.shards[second_index]).lock_arc().await;
+        RosterOrder::pair(first, second)
+    }
+
+    fn shard_index(&self, owner: &AccountKey) -> usize {
+        (self.hash_state.hash_one(owner) as usize) % self.shards.len()
     }
 }
 
@@ -236,34 +283,43 @@ where
                     Ok(PresenceEffect::Route)
                 }
                 (PresenceDirection::Inbound, PresenceRequestType::Subscribe) => {
-                    let owner = AccountKey::try_from(request.target.bare())
+                    let recipient = AccountKey::try_from(request.target.bare())
                         .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
                     if self
                         .accounts
-                        .get(&owner)
+                        .get(&recipient)
                         .await
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?
                         .is_none()
                     {
                         return Err(StanzaErrorCondition::ServiceUnavailable);
                     }
-                    let order = RosterOrder::new(self.order.lock(&owner).await);
+                    let subscriber = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let contact = RosterJid::from(request.target.bare());
+                    let sender = RosterJid::from(request.sender.bare());
+                    let order = self.order.lock_pair(&subscriber, &recipient).await;
                     let mut stanza = String::new();
                     request
                         .stanza
                         .write_xml(&mut stanza)
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                    self.repository
-                        .put_pending(
-                            &owner,
+                    let mutation = self
+                        .repository
+                        .request_subscription(
+                            &subscriber,
+                            &contact,
+                            &recipient,
                             PendingSubscription {
-                                sender: RosterJid::from(request.sender.bare()),
+                                sender,
                                 stanza: stanza.into_bytes().into_boxed_slice(),
                             },
                         )
                         .await
                         .map_err(roster_error)?;
-                    Ok(PresenceEffect::Deliver(order))
+                    Ok(PresenceEffect::DeliverThenPushSenderRoster(
+                        RosterDelivery::new(order, mutation),
+                    ))
                 }
                 (PresenceDirection::Inbound, PresenceRequestType::Subscribed) => {
                     let owner = AccountKey::try_from(request.target.bare())
@@ -311,26 +367,6 @@ where
     fn accepted<'a>(&'a self, request: AcceptedPresence<'a>) -> PresenceFuture<'a> {
         Box::pin(async move {
             match (request.direction, request.kind) {
-                (PresenceDirection::Outbound, PresenceRequestType::Subscribe) => {
-                    let owner = AccountKey::try_from(request.sender.bare())
-                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                    let contact = RosterJid::from(request.target.bare());
-                    let order = self.order.lock(&owner).await;
-                    let mutation = self
-                        .repository
-                        .update_subscription(&owner, &contact, |mut current| {
-                            if current.pending_out {
-                                return None;
-                            }
-                            current.pending_out = true;
-                            Some(current)
-                        })
-                        .await
-                        .map_err(roster_error)?;
-                    Ok(PresenceEffect::PushRoster(mutation.map(|mutation| {
-                        RosterPush::new(RosterOrder::new(order), mutation.value, mutation.version)
-                    })))
-                }
                 (PresenceDirection::Outbound, PresenceRequestType::Subscribed) => {
                     let owner = AccountKey::try_from(request.sender.bare())
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;

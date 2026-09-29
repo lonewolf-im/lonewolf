@@ -140,6 +140,15 @@ pub trait RosterRepository: Send + Sync {
     where
         F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static;
 
+    /// Stores both sides of a subscription request in one write.
+    fn request_subscription(
+        &self,
+        subscriber: &AccountKey,
+        contact: &RosterJid,
+        recipient: &AccountKey,
+        request: PendingSubscription,
+    ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send;
+
     /// Removes an item and returns `None` without advancing the version if absent.
     fn remove(
         &self,

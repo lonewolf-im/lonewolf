@@ -122,6 +122,31 @@ impl RosterRepository for RedbRosterRepository {
             .await
     }
 
+    async fn request_subscription(
+        &self,
+        subscriber: &AccountKey,
+        contact: &RosterJid,
+        recipient: &AccountKey,
+        request: PendingSubscription,
+    ) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
+        let subscriber = Box::<str>::from(subscriber.as_str());
+        let roster_key = item_key_text(&subscriber, contact);
+        let contact = contact.clone();
+        let pending_key = item_key(recipient, &request.sender);
+        self.database
+            .write(move |database| {
+                request_subscription(
+                    database,
+                    &subscriber,
+                    roster_key,
+                    contact,
+                    pending_key,
+                    request,
+                )
+            })
+            .await
+    }
+
     async fn remove(
         &self,
         owner: &AccountKey,
@@ -309,6 +334,55 @@ where
         version,
         value: item,
     }))
+}
+
+fn request_subscription(
+    database: &::redb::Database,
+    subscriber: &str,
+    roster_key: Box<str>,
+    contact: RosterJid,
+    pending_key: Box<str>,
+    request: PendingSubscription,
+) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
+    let transaction = begin_write(database)?;
+    transaction
+        .open_table(PENDING)
+        .map_err(storage_error)?
+        .insert(pending_key.as_ref(), request.stanza.as_ref())
+        .map_err(storage_error)?;
+    let item = {
+        let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
+        let mut item = table
+            .get(roster_key.as_ref())
+            .map_err(storage_error)?
+            .map(|record| decode_item(contact.clone(), record.value()))
+            .transpose()?
+            .unwrap_or(RosterItem {
+                jid: contact,
+                name: None,
+                groups: Vec::new(),
+                subscription: RosterSubscription::default(),
+            });
+        if item.subscription.pending_out {
+            None
+        } else {
+            item.subscription.pending_out = true;
+            let encoded = encode_item(&item)?;
+            table
+                .insert(roster_key.as_ref(), encoded.as_slice())
+                .map_err(storage_error)?;
+            Some(item)
+        }
+    };
+    let mutation = match item {
+        Some(value) => Some(RosterMutation {
+            version: advance_version(&transaction, subscriber)?,
+            value,
+        }),
+        None => None,
+    };
+    transaction.commit().map_err(commit_error)?;
+    Ok(mutation)
 }
 
 fn resolve_pending<F>(

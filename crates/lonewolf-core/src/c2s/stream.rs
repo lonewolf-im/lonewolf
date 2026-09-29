@@ -1225,7 +1225,10 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
             )
         })
     else {
-        return Ok(());
+        return registration
+            .finish_presence()
+            .await
+            .map_err(|_| CloseOutcome::InternalError);
     };
     let view = unavailable
         .resolve()
@@ -1247,25 +1250,31 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
         })
         .await
     {
-        Ok(PresenceEffect::None) => Ok(()),
+        Ok(PresenceEffect::None) => registration
+            .finish_presence()
+            .await
+            .map_err(|_| CloseOutcome::InternalError),
         Ok(PresenceEffect::Broadcast { order, subscribers }) => {
             // The roster order guard blocks replacement updates until this delivery ends.
-            let result = if registration
-                .replacement_is_available()
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?
-            {
-                Ok(())
-            } else {
-                router
+            let result = match registration.replacement_is_available().await {
+                Ok(true) => Ok(()),
+                Ok(false) => router
                     .broadcast_presence(unavailable, &subscribers)
                     .await
-                    .map_err(|_| CloseOutcome::InternalError)
+                    .map_err(|_| CloseOutcome::InternalError),
+                Err(_) => Err(CloseOutcome::InternalError),
             };
+            let finished = registration
+                .finish_presence()
+                .await
+                .map_err(|_| CloseOutcome::InternalError);
             drop(order);
-            result
+            result.and(finished)
         }
-        Ok(_) | Err(_) => Err(CloseOutcome::InternalError),
+        Ok(_) | Err(_) => {
+            let _ = registration.finish_presence().await;
+            Err(CloseOutcome::InternalError)
+        }
     }
 }
 

@@ -609,6 +609,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
         }
         assert!(phone.recv().await.is_none());
         assert!(phone.wait_retired().await?.is_some());
+        assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 2);
         let unavailable = phone
             .end_presence()
             .await?
@@ -635,10 +636,73 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
             )
             .await?;
         assert!(phone.replacement_is_available().await?);
+        assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 2);
+        phone.finish_presence().await?;
+        assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 2);
 
         drop(desk);
         drop(phone);
         drop(replacement);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let bob_account = account("bob@localhost")?;
+        let alice_desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let bob = handle
+            .register(&bob_account, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        alice_desk
+            .set_presence(
+                Some(0),
+                presence("desk").await?,
+                Some(unavailable_presence("desk").await?),
+            )
+            .await?;
+        receive_presence(&alice_desk).await?;
+        bob.set_presence(
+            Some(0),
+            parse_stanza("<presence from='bob@localhost/phone' to='bob@localhost'/>").await?,
+            Some(
+                parse_stanza(
+                    "<presence from='bob@localhost/phone' to='bob@localhost' type='unavailable'/>",
+                )
+                .await?,
+            ),
+        )
+        .await?;
+        receive_presence(&bob).await?;
+
+        assert!(alice_desk.end_presence().await?.is_some());
+        assert!(handle.local.presence_snapshot(&alice).await?.is_empty());
+        handle
+            .route_unavailable_presence(&alice, &bob_account)
+            .await?;
+        let unavailable = receive_routed(&bob).await?;
+        let view = unavailable.resolve()?;
+        assert_eq!(
+            view.from()?.ok_or("missing sender")?.as_str(),
+            "alice@localhost/desk"
+        );
+        assert_eq!(
+            view.to()?.ok_or("missing target")?.as_str(),
+            "bob@localhost"
+        );
+        alice_desk.finish_presence().await?;
+        assert!(handle.local.withdrawal_snapshot(&alice).await?.is_empty());
+
+        drop(alice_desk);
+        drop(bob);
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())

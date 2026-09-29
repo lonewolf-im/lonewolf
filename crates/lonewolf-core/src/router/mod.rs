@@ -237,7 +237,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         {
             return Err(RouterError::RemoteUnsupported);
         }
-        for stanza in self.local.presence_snapshot(source).await? {
+        for stanza in self.local.withdrawal_snapshot(source).await? {
             let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
                 .map_err(|_| RouterError::Unavailable)?;
             let from = stanza

@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use lonewolf_extension::Extensions;
+use lonewolf_extension::delivery::Delivery;
 use lonewolf_extension::iq::{
-    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute, IqScope,
+    IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqRoute, IqScope,
 };
 use lonewolf_extension::presence::{
     PresenceFuture, PresenceHandler, PresenceRegistration, PresenceRequest, PresenceRequestType,
@@ -115,13 +116,15 @@ impl<A: ChunkAllocator> PresenceHandler<A> for VerifyPresence {
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
         Box::pin(async move {
             compio::time::sleep(std::time::Duration::from_millis(1)).await;
-            let stanza_sender = request
+            let stanza = request
                 .stanza
+                .resolve()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            let stanza_sender = stanza
                 .from()
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?
                 .ok_or(StanzaErrorCondition::InternalServerError)?;
-            let stanza_target = request
-                .stanza
+            let stanza_target = stanza
                 .to()
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?
                 .ok_or(StanzaErrorCondition::InternalServerError)?;
@@ -136,7 +139,7 @@ impl<A: ChunkAllocator> PresenceHandler<A> for VerifyPresence {
             if request.sender.as_str() == "alice@localhost/desk"
                 && stanza_sender == request.sender
                 && stanza_target == request.target
-                && request.stanza.stanza_type() == StanzaType::Presence(stanza_kind)
+                && stanza.stanza_type() == StanzaType::Presence(stanza_kind)
             {
                 Err(StanzaErrorCondition::NotAllowed)
             } else {
@@ -147,19 +150,34 @@ impl<A: ChunkAllocator> PresenceHandler<A> for VerifyPresence {
 }
 
 impl<A: ChunkAllocator> IqHandler<A> for Deny {
-    fn handle<'a>(&'a self, _: IqRequest<'a, A>, _: &'a mut Arena<A>) -> IqFuture<'a> {
-        Box::pin(async { Err(StanzaErrorCondition::NotAllowed) })
+    fn handle<'a>(
+        &'a self,
+        _: IqRequest<'a, A>,
+        _: &'a mut Arena<A>,
+        _: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a> {
+        Box::pin(async { Err(StanzaErrorCondition::NotAllowed.into()) })
     }
 }
 
 impl<A: ChunkAllocator> IqHandler<A> for Empty {
-    fn handle<'a>(&'a self, _: IqRequest<'a, A>, _: &'a mut Arena<A>) -> IqFuture<'a> {
-        Box::pin(async { Ok(IqResponse::new(None)) })
+    fn handle<'a>(
+        &'a self,
+        _: IqRequest<'a, A>,
+        _: &'a mut Arena<A>,
+        _: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a> {
+        Box::pin(async { Ok(None) })
     }
 }
 
 impl<A: ChunkAllocator> IqHandler<A> for Identity {
-    fn handle<'a>(&'a self, request: IqRequest<'a, A>, response: &'a mut Arena<A>) -> IqFuture<'a> {
+    fn handle<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        response: &'a mut Arena<A>,
+        _: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a> {
         Box::pin(async move {
             compio::time::sleep(std::time::Duration::from_millis(1)).await;
             let value = request
@@ -175,8 +193,8 @@ impl<A: ChunkAllocator> IqHandler<A> for Identity {
                 })
                 .and_then(|builder| builder.build());
             result
-                .map(|payload| IqResponse::new(Some(payload)))
-                .map_err(|_| StanzaErrorCondition::InternalServerError)
+                .map(Some)
+                .map_err(|_| StanzaErrorCondition::InternalServerError.into())
         })
     }
 }

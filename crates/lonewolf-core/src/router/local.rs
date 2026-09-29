@@ -16,6 +16,7 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use lonewolf_extension::delivery::{SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
@@ -28,7 +29,7 @@ const SHARD_QUEUE_CAPACITY: usize = 1_024;
 const RESOURCE_QUEUE_CAPACITY: usize = 64;
 const SHARD_BATCH_SIZE: usize = 64;
 
-type RosterPushFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
+type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
 type Retirement<A> = Shared<oneshot::Receiver<Option<RoutedStanza<A>>>>;
 
 /// Owns one account shard on each core worker.
@@ -91,7 +92,8 @@ enum Command<A: ChunkAllocator> {
         stanza: RoutedStanza<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
-    DeliverPresenceToInterested {
+    DeliverPresenceToTagged {
+        tag: SessionTag,
         stanza: RoutedStanza<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
@@ -103,15 +105,17 @@ enum Command<A: ChunkAllocator> {
         account: AccountKey,
         reply: oneshot::Sender<Vec<RoutedStanza<A>>>,
     },
-    MarkRosterInterested {
+    Tag {
         account: AccountKey,
         resource: Box<str>,
         token: u64,
+        tag: SessionTag,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
-    DeliverRosterPush {
+    DeliverToTagged {
         account: AccountKey,
-        build: RosterPushFactory<A>,
+        tag: SessionTag,
+        build: TaggedStanzaFactory<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
     Presence {
@@ -152,7 +156,7 @@ struct Session<A: ChunkAllocator> {
     alive: Arc<AtomicBool>,
     outbound: Sender<ResourceDelivery<A>>,
     priority: Option<i8>,
-    roster_interested: bool,
+    tags: SessionTags,
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
     retired: oneshot::Sender<Option<RoutedStanza<A>>>,
@@ -341,8 +345,9 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
-    pub(crate) async fn deliver_presence_to_interested(
+    pub(crate) async fn deliver_presence_to_tagged(
         &self,
+        tag: SessionTag,
         stanza: RoutedStanza<A>,
     ) -> Result<(), RouterError> {
         let shard = {
@@ -359,7 +364,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
-            .send(Command::DeliverPresenceToInterested { stanza, reply })
+            .send(Command::DeliverPresenceToTagged { tag, stanza, reply })
             .await
             .map_err(|_| RouterError::Stopped)?;
         result.await.map_err(|_| RouterError::Stopped)?
@@ -395,15 +400,17 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)
     }
 
-    pub(crate) async fn deliver_roster_push(
+    pub(crate) async fn deliver_to_tagged(
         &self,
         account: &AccountKey,
+        tag: SessionTag,
         build: impl FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send + 'static,
     ) -> Result<(), RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard(account.as_str())
-            .send(Command::DeliverRosterPush {
+            .send(Command::DeliverToTagged {
                 account: account.clone(),
+                tag,
                 build: Box::new(build),
                 reply,
             })
@@ -509,14 +516,15 @@ impl<A: ChunkAllocator> Registration<A> {
         result.await.map_err(|_| RouterError::Stopped)
     }
 
-    /// Marks this bound resource as a roster push recipient.
-    pub async fn mark_roster_interested(&self) -> Result<(), RouterError> {
+    /// Marks this bound resource as a recipient of deliveries addressed to `tag`.
+    pub async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard
-            .send(Command::MarkRosterInterested {
+            .send(Command::Tag {
                 account: self.account.clone(),
                 resource: self.resource.clone(),
                 token: self.token,
+                tag,
                 reply,
             })
             .await
@@ -654,8 +662,8 @@ impl<A: ChunkAllocator> Shard<A> {
                 let result = self.deliver_presence(stanza);
                 let _ = reply.send(result);
             }
-            Command::DeliverPresenceToInterested { stanza, reply } => {
-                let result = self.deliver_presence_to_interested(stanza);
+            Command::DeliverPresenceToTagged { tag, stanza, reply } => {
+                let result = self.deliver_presence_to_tagged(tag, stanza);
                 let _ = reply.send(result);
             }
             Command::PresenceSnapshot { account, reply } => {
@@ -664,21 +672,23 @@ impl<A: ChunkAllocator> Shard<A> {
             Command::WithdrawalSnapshot { account, reply } => {
                 let _ = reply.send(self.withdrawal_snapshot(&account));
             }
-            Command::MarkRosterInterested {
+            Command::Tag {
                 account,
                 resource,
                 token,
+                tag,
                 reply,
             } => {
-                let result = self.mark_roster_interested(&account, &resource, token);
+                let result = self.tag(&account, &resource, token, tag);
                 let _ = reply.send(result);
             }
-            Command::DeliverRosterPush {
+            Command::DeliverToTagged {
                 account,
+                tag,
                 mut build,
                 reply,
             } => {
-                let result = self.deliver_roster_push(&account, &mut build);
+                let result = self.deliver_to_tagged(&account, tag, &mut build);
                 let _ = reply.send(result);
             }
             Command::Presence {
@@ -783,7 +793,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 alive: Arc::clone(&alive),
                 outbound,
                 priority: None,
-                roster_interested: false,
+                tags: SessionTags::default(),
                 presence: None,
                 unavailable: None,
                 retired,
@@ -923,8 +933,9 @@ impl<A: ChunkAllocator> Shard<A> {
         self.deliver_presence_where(stanza, |session| session.priority.is_some())
     }
 
-    fn deliver_presence_to_interested(
+    fn deliver_presence_to_tagged(
         &mut self,
+        tag: SessionTag,
         stanza: RoutedStanza<A>,
     ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -932,20 +943,10 @@ impl<A: ChunkAllocator> Shard<A> {
             .to()
             .map_err(|_| RouterError::InvalidTarget)?
             .ok_or(RouterError::InvalidTarget)?;
-        if to.resourcepart().is_some()
-            || !matches!(
-                view.stanza_type(),
-                StanzaType::Presence(
-                    PresenceType::Subscribe
-                        | PresenceType::Subscribed
-                        | PresenceType::Unsubscribe
-                        | PresenceType::Unsubscribed
-                )
-            )
-        {
+        if to.resourcepart().is_some() || !matches!(view.stanza_type(), StanzaType::Presence(_)) {
             return Err(RouterError::InvalidTarget);
         }
-        match self.deliver_presence_where(stanza, |session| session.roster_interested) {
+        match self.deliver_presence_where(stanza, |session| session.tags.contains(tag)) {
             Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
             Err(error) => Err(error),
         }
@@ -1031,11 +1032,12 @@ impl<A: ChunkAllocator> Shard<A> {
         snapshot
     }
 
-    fn mark_roster_interested(
+    fn tag(
         &mut self,
         account: &AccountKey,
         resource: &str,
         token: u64,
+        tag: SessionTag,
     ) -> Result<(), RouterError> {
         let session = self
             .accounts
@@ -1045,19 +1047,20 @@ impl<A: ChunkAllocator> Shard<A> {
         if session.token != token || !session.alive.load(Ordering::Acquire) {
             return Err(RouterError::NotFound);
         }
-        session.roster_interested = true;
+        session.tags.insert(tag);
         Ok(())
     }
 
-    fn deliver_roster_push(
+    fn deliver_to_tagged(
         &mut self,
         account: &AccountKey,
-        build: &mut RosterPushFactory<A>,
+        tag: SessionTag,
+        build: &mut TaggedStanzaFactory<A>,
     ) -> Result<(), RouterError> {
         let Some(sessions) = self.accounts.get(account.as_str()) else {
             return Ok(());
         };
-        if sessions.values().all(|session| !session.roster_interested) {
+        if sessions.values().all(|session| !session.tags.contains(tag)) {
             return Ok(());
         }
         let max_resource_len = sessions
@@ -1070,7 +1073,7 @@ impl<A: ChunkAllocator> Shard<A> {
         let mut failed = Vec::new();
         let mut build_error = None;
         for (resource, session) in sessions {
-            if !session.roster_interested {
+            if !session.tags.contains(tag) {
                 continue;
             }
             if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
@@ -1082,7 +1085,7 @@ impl<A: ChunkAllocator> Shard<A> {
             full_jid.push('/');
             full_jid.push_str(resource);
             let stanza = match build(&full_jid).and_then(|stanza| {
-                validate_roster_push_target(&stanza, &full_jid)?;
+                validate_target(&stanza, &full_jid)?;
                 Ok(stanza)
             }) {
                 Ok(stanza) => stanza,
@@ -1096,7 +1099,7 @@ impl<A: ChunkAllocator> Shard<A> {
         if let Some(error) = build_error {
             let failed = sessions
                 .iter()
-                .filter(|(_, session)| session.roster_interested)
+                .filter(|(_, session)| session.tags.contains(tag))
                 .map(|(resource, session)| (resource.clone(), session.token))
                 .collect::<Vec<_>>();
             for (resource, token) in failed {
@@ -1342,7 +1345,7 @@ impl<A: ChunkAllocator> Shard<A> {
     }
 }
 
-fn validate_roster_push_target<A: ChunkAllocator>(
+fn validate_target<A: ChunkAllocator>(
     stanza: &RoutedStanza<A>,
     expected: &str,
 ) -> Result<(), RouterError> {
@@ -1462,7 +1465,7 @@ mod tests {
                         alive: Arc::new(AtomicBool::new(true)),
                         outbound,
                         priority: Some(0),
-                        roster_interested: false,
+                        tags: SessionTags::default(),
                         presence: None,
                         unavailable: None,
                         retired,

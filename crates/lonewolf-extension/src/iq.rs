@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use lonewolf_storage::roster::{RosterItem, RosterMutation};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
-use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
+use lonewolf_xmpp::stanza::{Element, ElementRef};
 
-pub use crate::RegistrationError;
-use crate::roster::RosterOrder;
+use crate::delivery::{Delivery, HandlerError};
+pub use crate::{ExtensionFuture, RegistrationError};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IqScope {
@@ -41,47 +38,20 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
-/// A side effect the server applies after a successful IQ request.
-/// The order guard is released once the effect has been applied.
-#[derive(Default)]
-pub enum IqEffect {
-    #[default]
-    None,
-    MarkRosterInterested(RosterOrder),
-    PushRoster(RosterOrder, RosterMutation<RosterItem>),
-}
-
-pub struct IqResponse {
-    payload: Option<Element>,
-    effect: IqEffect,
-}
-
-impl IqResponse {
-    pub fn new(payload: Option<Element>) -> Self {
-        Self {
-            payload,
-            effect: IqEffect::None,
-        }
-    }
-
-    pub fn with_effect(mut self, effect: IqEffect) -> Self {
-        self.effect = effect;
-        self
-    }
-
-    pub fn into_parts(self) -> (Option<Element>, IqEffect) {
-        (self.payload, self.effect)
-    }
-}
-
-pub type IqResult = Result<IqResponse, StanzaErrorCondition>;
-pub type IqFuture<'a> = Pin<Box<dyn Future<Output = IqResult> + 'a>>;
+pub type IqResult = Result<Option<Element>, HandlerError>;
+pub type IqFuture<'a> = ExtensionFuture<'a, IqResult>;
 
 pub trait IqHandler<A: ChunkAllocator>: Send + Sync {
     /// Authorize access to `request.target` using `request.sender`.
-    /// Allocate response payloads in `response`.
+    /// Allocate the response payload in `response` and perform side effects
+    /// through `delivery` before returning.
     /// The future runs on the connection's worker and can be cancelled on shutdown.
-    fn handle<'a>(&'a self, request: IqRequest<'a, A>, response: &'a mut Arena<A>) -> IqFuture<'a>;
+    fn handle<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        response: &'a mut Arena<A>,
+        delivery: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a>;
 }
 
 pub struct IqRegistration<A: ChunkAllocator> {

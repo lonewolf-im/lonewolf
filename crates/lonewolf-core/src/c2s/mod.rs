@@ -26,6 +26,7 @@ use crate::router::RouterHandle;
 
 mod attempt_limit;
 mod connection_limit;
+mod delivery;
 mod iq;
 mod rejection_report;
 mod stream;

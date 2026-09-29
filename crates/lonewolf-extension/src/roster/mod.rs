@@ -6,23 +6,22 @@ use std::sync::Arc;
 use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
-    PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterRepository,
-    RosterSnapshot, RosterSubscription, SubscriptionRequestOutcome, SubscriptionState,
+    PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterMutation,
+    RosterRepository, RosterSnapshot, RosterSubscription, SubscriptionRequestOutcome,
+    SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::stanza::{
-    BuildError, Element, ElementRef, NodeRef, StanzaErrorCondition, StanzaRef,
+    BuildError, Element, ElementRef, IqType, NodeRef, PresenceType, RoutedStanza, Stanza,
+    StanzaErrorCondition, StanzaNamespace, StanzaType,
 };
 
-use crate::iq::{
-    IqEffect, IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute,
-    IqScope,
-};
+use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
+use crate::iq::{IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqRoute, IqScope};
 use crate::presence::{
-    Party, PresenceBroadcast, PresenceFuture, PresenceHandler, PresenceRegistration,
-    PresenceRequest, PresenceRequestType, PresenceUpdate, SubscriptionEffect, SubscriptionStep,
-    SubscriptionSteps,
+    PresenceAudience, PresenceFuture, PresenceHandler, PresenceRegistration, PresenceRequest,
+    PresenceRequestType, PresenceUpdate, ReceiveFuture,
 };
 
 pub const NAME: &str = "roster";
@@ -134,14 +133,17 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
     async fn request_subscription<A: ChunkAllocator>(
         &self,
         parties: Parties,
-        stanza: StanzaRef<'_, Arena<A>>,
-    ) -> Result<SubscriptionEffect, StanzaErrorCondition> {
+        stanza: &RoutedStanza<A>,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
         if !self.account_exists(&parties.target).await? {
-            return Err(StanzaErrorCondition::ServiceUnavailable);
+            return Err(StanzaErrorCondition::ServiceUnavailable.into());
         }
-        let order = self.order.lock_pair(&parties.sender, &parties.target).await;
+        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
         let mut request = String::new();
         stanza
+            .resolve()
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?
             .write_xml(&mut request)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
         let outcome = self
@@ -157,36 +159,38 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             )
             .await
             .map_err(roster_error)?;
-        let mut steps = SubscriptionSteps::new();
         match outcome {
             SubscriptionRequestOutcome::Pending { mutation } => {
-                steps.push(SubscriptionStep::DeliverToAvailable);
+                delivery.to_available(stanza.clone()).await?;
                 if let Some(mutation) = mutation {
-                    steps.push(SubscriptionStep::PushRoster(Party::Sender, mutation));
+                    push_roster(&parties.sender, mutation, delivery).await?;
                 }
             }
-            SubscriptionRequestOutcome::AutoApprove { mutation } => {
-                if let Some(mutation) = mutation {
-                    steps.push(SubscriptionStep::ApproveSender);
-                    steps.push(SubscriptionStep::PushRoster(Party::Sender, mutation));
-                    steps.push(SubscriptionStep::DeliverCurrentPresence {
-                        from: Party::Target,
-                        to: Party::Sender,
-                    });
-                }
+            SubscriptionRequestOutcome::AutoApprove {
+                mutation: Some(mutation),
+            } => {
+                let approval = approval_reply(stanza, delivery.arena()?)?;
+                delivery.to_tagged(SessionTag::Interested, approval).await?;
+                push_roster(&parties.sender, mutation, delivery).await?;
+                delivery
+                    .current_presence(&parties.target, &parties.sender)
+                    .await?;
             }
+            SubscriptionRequestOutcome::AutoApprove { mutation: None } => {}
         }
-        Ok(SubscriptionEffect::new(Some(order), steps))
+        Ok(())
     }
 
-    async fn approve_subscription(
+    async fn approve_subscription<A: ChunkAllocator>(
         &self,
         parties: Parties,
-    ) -> Result<SubscriptionEffect, StanzaErrorCondition> {
+        stanza: &RoutedStanza<A>,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
         if !self.account_exists(&parties.target).await? {
-            return Ok(SubscriptionEffect::default());
+            return Ok(());
         }
-        let order = self.order.lock_pair(&parties.sender, &parties.target).await;
+        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
         let target = self
             .repository
             .update_subscription(
@@ -206,27 +210,29 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             .await
             .map_err(roster_error)?
             .and_then(|resolution| resolution.mutation);
-        let mut steps = SubscriptionSteps::new();
         if let Some(mutation) = target {
-            steps.push(SubscriptionStep::DeliverToInterested);
-            steps.push(SubscriptionStep::PushRoster(Party::Target, mutation));
+            delivery
+                .to_tagged(SessionTag::Interested, stanza.clone())
+                .await?;
+            push_roster(&parties.target, mutation, delivery).await?;
         }
         if let Some(mutation) = sender {
-            steps.push(SubscriptionStep::PushRoster(Party::Sender, mutation));
-            steps.push(SubscriptionStep::DeliverCurrentPresence {
-                from: Party::Sender,
-                to: Party::Target,
-            });
+            push_roster(&parties.sender, mutation, delivery).await?;
+            delivery
+                .current_presence(&parties.sender, &parties.target)
+                .await?;
         }
-        Ok(SubscriptionEffect::new(Some(order), steps))
+        Ok(())
     }
 
-    async fn cancel_subscription(
+    async fn cancel_subscription<A: ChunkAllocator>(
         &self,
         parties: Parties,
-    ) -> Result<SubscriptionEffect, StanzaErrorCondition> {
+        stanza: &RoutedStanza<A>,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
         let subscriber_exists = self.account_exists(&parties.target).await?;
-        let order = self.order.lock_pair(&parties.sender, &parties.target).await;
+        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
         let outcome = self
             .repository
             .cancel_subscription(
@@ -236,31 +242,33 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             )
             .await
             .map_err(roster_error)?;
-        let mut steps = SubscriptionSteps::new();
         if outcome.send_unavailable {
-            steps.push(SubscriptionStep::DeliverUnavailablePresence {
-                from: Party::Sender,
-                to: Party::Target,
-            });
+            delivery
+                .unavailable_presence(&parties.sender, &parties.target)
+                .await?;
         }
         if outcome.route {
-            steps.push(SubscriptionStep::DeliverToInterested);
+            delivery
+                .to_tagged(SessionTag::Interested, stanza.clone())
+                .await?;
         }
         if let Some(mutation) = outcome.subscriber {
-            steps.push(SubscriptionStep::PushRoster(Party::Target, mutation));
+            push_roster(&parties.target, mutation, delivery).await?;
         }
         if let Some(mutation) = outcome.grantor {
-            steps.push(SubscriptionStep::PushRoster(Party::Sender, mutation));
+            push_roster(&parties.sender, mutation, delivery).await?;
         }
-        Ok(SubscriptionEffect::new(Some(order), steps))
+        Ok(())
     }
 
-    async fn withdraw_subscription(
+    async fn withdraw_subscription<A: ChunkAllocator>(
         &self,
         parties: Parties,
-    ) -> Result<SubscriptionEffect, StanzaErrorCondition> {
+        stanza: &RoutedStanza<A>,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
         let contact_exists = self.account_exists(&parties.target).await?;
-        let order = self.order.lock_pair(&parties.sender, &parties.target).await;
+        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
         let outcome = self
             .repository
             .unsubscribe(
@@ -270,23 +278,23 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             )
             .await
             .map_err(roster_error)?;
-        let mut steps = SubscriptionSteps::new();
         if outcome.notify_contact {
-            steps.push(SubscriptionStep::DeliverToInterested);
+            delivery
+                .to_tagged(SessionTag::Interested, stanza.clone())
+                .await?;
         }
         if let Some(mutation) = outcome.contact {
-            steps.push(SubscriptionStep::PushRoster(Party::Target, mutation));
+            push_roster(&parties.target, mutation, delivery).await?;
         }
         if let Some(mutation) = outcome.subscriber {
-            steps.push(SubscriptionStep::PushRoster(Party::Sender, mutation));
+            push_roster(&parties.sender, mutation, delivery).await?;
         }
         if outcome.notify_contact {
-            steps.push(SubscriptionStep::DeliverUnavailablePresence {
-                from: Party::Target,
-                to: Party::Sender,
-            });
+            delivery
+                .unavailable_presence(&parties.target, &parties.sender)
+                .await?;
         }
-        Ok(SubscriptionEffect::new(Some(order), steps))
+        Ok(())
     }
 }
 
@@ -321,33 +329,41 @@ where
     R: RosterRepository,
     C: AccountRepository,
 {
-    fn handle<'a>(&'a self, request: IqRequest<'a, A>, response: &'a mut Arena<A>) -> IqFuture<'a> {
+    fn handle<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        response: &'a mut Arena<A>,
+        delivery: &'a dyn Delivery<A>,
+    ) -> IqFuture<'a> {
         Box::pin(async move {
             if request.target != request.sender.bare() {
-                return Err(StanzaErrorCondition::Forbidden);
+                return Err(StanzaErrorCondition::Forbidden.into());
             }
             let owner = AccountKey::try_from(request.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             match request.kind {
                 IqRequestType::Get => {
                     validate_get(request.payload)?;
-                    let order = self.order.lock(&owner).await;
+                    let _order = self.order.lock(&owner).await;
                     let snapshot = self
                         .repository
                         .snapshot(&owner)
                         .await
                         .map_err(roster_error)?;
-                    build_response(snapshot, order, response)
+                    let payload = build_response(snapshot, response)?;
+                    delivery.tag_session(SessionTag::Interested).await?;
+                    Ok(Some(payload))
                 }
                 IqRequestType::Set => {
                     let update = parse_update(request.payload, response)?;
-                    let order = self.order.lock(&owner).await;
+                    let _order = self.order.lock(&owner).await;
                     let mutation = self
                         .repository
                         .upsert(&owner, update)
                         .await
                         .map_err(roster_error)?;
-                    Ok(IqResponse::new(None).with_effect(IqEffect::PushRoster(order, mutation)))
+                    push_roster(&owner, mutation, delivery).await?;
+                    Ok(None)
                 }
             }
         })
@@ -360,10 +376,10 @@ where
     R: RosterRepository,
     C: AccountRepository,
 {
-    fn update<'a>(
+    fn audience<'a>(
         &'a self,
         update: PresenceUpdate<'a>,
-    ) -> PresenceFuture<'a, Option<PresenceBroadcast>> {
+    ) -> PresenceFuture<'a, Option<PresenceAudience>> {
         Box::pin(async move {
             let owner = AccountKey::try_from(update.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
@@ -381,7 +397,7 @@ where
             } else {
                 Vec::new()
             };
-            Ok(Some(PresenceBroadcast::new(
+            Ok(Some(PresenceAudience::new(
                 Some(order),
                 presence_subscribers(snapshot, &owner),
                 pending,
@@ -407,22 +423,86 @@ where
     fn receive<'a>(
         &'a self,
         request: PresenceRequest<'a, A>,
-    ) -> PresenceFuture<'a, SubscriptionEffect> {
+        delivery: &'a dyn Delivery<A>,
+    ) -> ReceiveFuture<'a> {
         Box::pin(async move {
             let parties = Parties::new(&request)?;
             match request.kind {
                 PresenceRequestType::Subscribe => {
-                    self.request_subscription(parties, request.stanza).await
+                    self.request_subscription(parties, request.stanza, delivery)
+                        .await
                 }
-                PresenceRequestType::Subscribed => self.approve_subscription(parties).await,
-                PresenceRequestType::Unsubscribed => self.cancel_subscription(parties).await,
-                PresenceRequestType::Unsubscribe => self.withdraw_subscription(parties).await,
+                PresenceRequestType::Subscribed => {
+                    self.approve_subscription(parties, request.stanza, delivery)
+                        .await
+                }
+                PresenceRequestType::Unsubscribed => {
+                    self.cancel_subscription(parties, request.stanza, delivery)
+                        .await
+                }
+                PresenceRequestType::Unsubscribe => {
+                    self.withdraw_subscription(parties, request.stanza, delivery)
+                        .await
+                }
                 PresenceRequestType::Available | PresenceRequestType::Unavailable => {
-                    Err(StanzaErrorCondition::ServiceUnavailable)
+                    Err(StanzaErrorCondition::ServiceUnavailable.into())
                 }
             }
         })
     }
+}
+
+async fn push_roster<A: ChunkAllocator>(
+    owner: &AccountKey,
+    mutation: RosterMutation<RosterItem>,
+    delivery: &dyn Delivery<A>,
+) -> Result<(), DeliveryError> {
+    delivery
+        .push_to_tagged(
+            owner,
+            SessionTag::Interested,
+            Box::new(move |to, arena| build_push(to, &mutation, arena)),
+        )
+        .await
+}
+
+fn build_push<A: ChunkAllocator>(
+    to: Jid,
+    mutation: &RosterMutation<RosterItem>,
+    arena: &mut Arena<A>,
+) -> Result<Stanza, DeliveryError> {
+    let item = build_item_in(&mutation.value, arena)?;
+    let query = Element::builder_in("query", NAMESPACE, arena)?
+        .child(item)?
+        .build()?;
+    let id = format!("roster-{}", mutation.version.get());
+    let push = Stanza::builder_in(StanzaType::Iq(IqType::Set), StanzaNamespace::Client, arena)
+        .id(Some(&id))?
+        .to(Some(to))?
+        .child(query)?
+        .build()?;
+    Ok(push)
+}
+
+/// Builds the `subscribed` reply the server sends on behalf of the request target.
+fn approval_reply<A: ChunkAllocator>(
+    request: &RoutedStanza<A>,
+    mut arena: Arena<A>,
+) -> Result<RoutedStanza<A>, DeliveryError> {
+    let view = request.resolve()?;
+    let from = view.to()?.ok_or(DeliveryError)?.clone_in(&mut arena)?;
+    let to = view.from()?.ok_or(DeliveryError)?.clone_in(&mut arena)?;
+    let approval = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Subscribed),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .id(view.id()?)?
+    .lang(view.lang()?)?
+    .from(Some(from))?
+    .to(Some(to))?
+    .build()?;
+    Ok(RoutedStanza::from_parts(approval, arena))
 }
 
 fn approve_outbound_subscription(
@@ -559,9 +639,8 @@ fn roster_error(error: RosterError) -> StanzaErrorCondition {
 
 fn build_response<A: ChunkAllocator>(
     snapshot: RosterSnapshot,
-    order: RosterOrder,
     response: &mut Arena<A>,
-) -> Result<IqResponse, StanzaErrorCondition> {
+) -> Result<Element, StanzaErrorCondition> {
     let mut items = Vec::with_capacity(snapshot.items.len());
     for item in snapshot.items {
         items.push(
@@ -578,13 +657,10 @@ fn build_response<A: ChunkAllocator>(
     }
     query
         .build()
-        .map(|query| {
-            IqResponse::new(Some(query)).with_effect(IqEffect::MarkRosterInterested(order))
-        })
         .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
-pub fn build_item_in<A: ChunkAllocator>(
+fn build_item_in<A: ChunkAllocator>(
     item: &RosterItem,
     response: &mut Arena<A>,
 ) -> Result<Element, BuildError> {

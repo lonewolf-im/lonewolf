@@ -9,7 +9,7 @@ use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
 use super::{Roster, push_removal, push_roster, xml};
-use crate::delivery::{Delivery, HandlerError, SessionTag};
+use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
 use crate::presence::PresenceRequest;
 
 pub(super) struct Parties {
@@ -252,51 +252,82 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         Ok(())
     }
 
-    /// Clears every trace of a deleted account: its own roster and pending requests,
-    /// and the subscriptions and requests its local contacts held with it.
+    /// Clears every trace of an account about to be deleted: its own roster and
+    /// pending requests, and the subscriptions and requests its local contacts held
+    /// with it. Storage is cleaned even when a notification fails; the first delivery
+    /// failure is returned afterwards.
     pub(super) async fn forget_account<A: ChunkAllocator>(
         &self,
         account: &AccountKey,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
         let account_jid = RosterJid::from(account);
+        let mut failure = None;
         let snapshot = self.repository.snapshot(account).await?;
         for item in snapshot.items {
-            let Some(contact) = self.local_account(&item.jid, delivery).await? else {
-                continue;
-            };
-            let _order = self.order.lock_pair(account, &contact).await;
-            let removal = self
-                .repository
-                .remove_item(account, &item.jid, Some((&contact, &account_jid)))
-                .await?;
-            if let Some(removal) = removal {
-                self.notify_removed_contact(account, &contact, removal, delivery)
-                    .await?;
-            }
+            let result = self
+                .forget_contact(account, &account_jid, &item.jid, delivery)
+                .await;
+            record_delivery_failure(result, &mut failure)?;
         }
         for request in self.repository.pending(account).await? {
-            let Some(sender) = self.local_account(&request.sender, delivery).await? else {
-                continue;
-            };
-            let _order = self.order.lock_pair(account, &sender).await;
-            let outcome = self
-                .repository
-                .cancel_subscription(account, &request.sender, Some((&sender, &account_jid)))
-                .await?;
-            if outcome.route {
-                let (_, cancellation) =
-                    xml::subscription_withdrawals(account, &sender, delivery.arena()?)?;
-                delivery
-                    .to_tagged(SessionTag::Interested, cancellation)
-                    .await?;
-            }
-            if let Some(mutation) = outcome.subscriber {
-                push_roster(&sender, mutation, delivery).await?;
-            }
+            let result = self
+                .forget_requester(account, &account_jid, &request.sender, delivery)
+                .await;
+            record_delivery_failure(result, &mut failure)?;
         }
         let _order = self.order.lock(account).await;
         self.repository.delete_all(account).await?;
+        failure.map_or(Ok(()), |error| Err(HandlerError::Delivery(error)))
+    }
+
+    async fn forget_contact<A: ChunkAllocator>(
+        &self,
+        account: &AccountKey,
+        account_jid: &RosterJid,
+        contact: &RosterJid,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
+        let Some(contact_account) = self.local_account(contact, delivery).await? else {
+            return Ok(());
+        };
+        let _order = self.order.lock_pair(account, &contact_account).await;
+        let removal = self
+            .repository
+            .remove_item(account, contact, Some((&contact_account, account_jid)))
+            .await?;
+        if let Some(removal) = removal {
+            self.notify_removed_contact(account, &contact_account, removal, delivery)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn forget_requester<A: ChunkAllocator>(
+        &self,
+        account: &AccountKey,
+        account_jid: &RosterJid,
+        sender: &RosterJid,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
+        let Some(sender_account) = self.local_account(sender, delivery).await? else {
+            return Ok(());
+        };
+        let _order = self.order.lock_pair(account, &sender_account).await;
+        let outcome = self
+            .repository
+            .cancel_subscription(account, sender, Some((&sender_account, account_jid)))
+            .await?;
+        if outcome.route {
+            let (_, cancellation) =
+                xml::subscription_withdrawals(account, &sender_account, delivery.arena()?)?;
+            delivery
+                .to_tagged(SessionTag::Interested, cancellation)
+                .await?;
+        }
+        if let Some(mutation) = outcome.subscriber {
+            push_roster(&sender_account, mutation, delivery).await?;
+        }
         Ok(())
     }
 
@@ -354,5 +385,20 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             push_roster(contact, mutation, delivery).await?;
         }
         Ok(contact_granted)
+    }
+}
+
+/// Keeps the first delivery failure for later and surfaces every other error at once.
+fn record_delivery_failure(
+    result: Result<(), HandlerError>,
+    failure: &mut Option<DeliveryError>,
+) -> Result<(), HandlerError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(HandlerError::Delivery(error)) => {
+            failure.get_or_insert(error);
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }

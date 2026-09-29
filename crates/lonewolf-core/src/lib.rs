@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use futures_util::future::{Either, select};
+use futures_util::future::{Either, join, select};
 use lonewolf_extension::{Extension, Extensions};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
@@ -226,17 +226,23 @@ async fn run_services(
 ) -> Result<(), RunError> {
     let admin_enabled = admin.is_some();
     let (stop_admin, stopped) = oneshot::channel::<()>();
-    let mut admin = pin!(async move {
-        match admin {
-            Some(server) => server
-                .run(async move {
-                    let _ = stopped.await;
-                    Ok(())
-                })
-                .await
-                .map_err(RunError::Admin),
-            None => pending().await,
-        }
+    // The cleanup worker stays beside the admin service through its drain, since
+    // accepted deletions still need it; it ends once the service drops its sender.
+    let mut services = pin!(async move {
+        let server = async move {
+            match admin {
+                Some(server) => server
+                    .run(async move {
+                        let _ = stopped.await;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(RunError::Admin),
+                None => pending().await,
+            }
+        };
+        let (result, ()) = join(server, cleanups).await;
+        result
     });
     let result = {
         let shutdown = async {
@@ -245,13 +251,7 @@ async fn run_services(
                 Either::Right((error, _)) => Err(RunError::C2s(error)),
             }
         };
-        let admin = async {
-            match select(admin.as_mut(), pin!(cleanups)).await {
-                Either::Left((result, _)) => result,
-                Either::Right(((), admin)) => admin.await,
-            }
-        };
-        match select(pin!(admin), pin!(shutdown)).await {
+        match select(services.as_mut(), pin!(shutdown)).await {
             Either::Left((result, _)) => Either::Right(result),
             Either::Right((result, _)) => Either::Left(result),
         }
@@ -259,7 +259,7 @@ async fn run_services(
     listeners.stop();
     drop(stop_admin);
     match result {
-        Either::Left(result) if admin_enabled => result.and(admin.await),
+        Either::Left(result) if admin_enabled => result.and(services.await),
         Either::Left(result) | Either::Right(result) => result,
     }
 }

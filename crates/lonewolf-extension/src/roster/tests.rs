@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use futures_executor::block_on;
+use lonewolf_auth::scram::{
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
+};
 use lonewolf_storage::RedbDatabase;
-use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::account::redb::RedbAccountRepository;
+use lonewolf_storage::account::{AccountKey, AccountRepository, NewAccount};
 use lonewolf_storage::roster::redb::RedbRosterRepository;
 use lonewolf_storage::roster::{
     RosterJid, RosterRepository, RosterSubscription, SubscriptionState,
@@ -15,7 +18,9 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{Element, RoutedStanza};
 
 use super::{NAMESPACE, Roster};
-use crate::delivery::{Delivery, DeliveryError, DeliveryFuture, SessionTag, StanzaFactory};
+use crate::delivery::{
+    Delivery, DeliveryError, DeliveryFuture, HandlerError, SessionTag, StanzaFactory,
+};
 use crate::iq::{IqHandler, IqRequest, IqRequestType};
 use crate::presence::{PresenceHandler, PresenceTransition, PresenceUpdate};
 
@@ -25,6 +30,8 @@ type TestRoster = Roster<RedbRosterRepository, RedbAccountRepository>;
 struct RecordingDelivery {
     tags: RefCell<Vec<SessionTag>>,
     pushes: RefCell<Vec<String>>,
+    /// How many upcoming tagged deliveries fail.
+    failing_deliveries: Cell<usize>,
 }
 
 impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
@@ -50,6 +57,11 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         _: SessionTag,
         _: RoutedStanza<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
+        let remaining = self.failing_deliveries.get();
+        if remaining > 0 {
+            self.failing_deliveries.set(remaining - 1);
+            return Box::pin(async { Err(DeliveryError) });
+        }
         Box::pin(async { Ok(()) })
     }
 
@@ -256,4 +268,100 @@ fn only_the_initial_transition_collects_granted_contacts() {
         assert_eq!(audience.contacts, expected, "{transition:?}");
         assert!(audience.subscribers.is_empty(), "{transition:?}");
     }
+}
+
+fn create_account(roster: &TestRoster, key: &AccountKey) {
+    let verifier = ScramSha1Verifier::new([11; 16], SCRAM_POLICY_ITERATIONS, [12; 20], [13; 20]);
+    block_on(roster.accounts.create(NewAccount {
+        key: key.clone(),
+        credentials: ScramCredentials::new(ScramVerifier::Sha1(verifier)),
+    }))
+    .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
+    let (_directory, roster) = roster();
+    let mut arena =
+        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+    let accounts = ["alice@example.com", "bob@example.com", "carol@example.com"].map(|jid| {
+        let jid = Jid::parse_in(jid, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+        AccountKey::try_from(
+            jid.resolve(&arena)
+                .unwrap_or_else(|error| panic!("{error}")),
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    });
+    let [alice, bob, carol] = &accounts;
+    for account in &accounts {
+        create_account(&roster, account);
+    }
+    let subscription = |state| {
+        move |_| {
+            Some(RosterSubscription {
+                state,
+                pending_out: false,
+                approved: false,
+            })
+        }
+    };
+    block_on(async {
+        let repository = &roster.repository;
+        repository
+            .update_subscription(
+                alice,
+                &RosterJid::from(bob),
+                subscription(SubscriptionState::To),
+            )
+            .await?;
+        repository
+            .update_subscription(
+                bob,
+                &RosterJid::from(alice),
+                subscription(SubscriptionState::From),
+            )
+            .await?;
+        repository
+            .update_subscription(
+                alice,
+                &RosterJid::from(carol),
+                subscription(SubscriptionState::Both),
+            )
+            .await?;
+        repository
+            .update_subscription(
+                carol,
+                &RosterJid::from(alice),
+                subscription(SubscriptionState::Both),
+            )
+            .await
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+    let delivery = RecordingDelivery {
+        failing_deliveries: Cell::new(1),
+        ..RecordingDelivery::default()
+    };
+
+    let result = block_on(roster.forget_account(alice, &delivery));
+    assert!(
+        matches!(result, Err(HandlerError::Delivery(_))),
+        "{result:?}"
+    );
+
+    let alice_roster =
+        block_on(roster.repository.snapshot(alice)).unwrap_or_else(|error| panic!("{error}"));
+    assert!(alice_roster.items.is_empty());
+    assert_eq!(alice_roster.version.get(), 0);
+    for contact in [bob, carol] {
+        let item = block_on(roster.repository.get(contact, &RosterJid::from(alice)))
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("missing item"));
+        assert_eq!(item.subscription.state, SubscriptionState::None);
+    }
+    let pushes = delivery.pushes.borrow();
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert!(
+        pushes[0].contains(r#"to="carol@example.com/desk""#),
+        "{pushes:?}"
+    );
 }

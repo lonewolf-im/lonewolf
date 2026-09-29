@@ -130,11 +130,14 @@ async fn delete_account<R: AccountRepository>(
     State(api): State<Arc<Api<R>>>,
     AccountPath(key): AccountPath,
 ) -> Result<Response, ApiError> {
-    api.accounts.delete(&key).await?;
-    api.observer.deleted(&key).await.map_err(|error| {
-        tracing::error!(error = %error, "account cleanup failed after deletion");
+    if api.accounts.get(&key).await?.is_none() {
+        return Err(ApiError::not_found());
+    }
+    api.observer.deleting(&key).await.map_err(|error| {
+        tracing::error!(error = %error, "account cleanup failed, deletion aborted");
         ApiError::internal()
     })?;
+    api.accounts.delete(&key).await?;
     Ok(empty())
 }
 

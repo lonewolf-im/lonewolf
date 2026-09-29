@@ -111,7 +111,7 @@ where
         &PresenceRequestType::ALL
     }
 
-    fn account_deleted<'a>(
+    fn account_deleting<'a>(
         &'a self,
         account: &'a AccountKey,
         delivery: &'a dyn Delivery<A>,

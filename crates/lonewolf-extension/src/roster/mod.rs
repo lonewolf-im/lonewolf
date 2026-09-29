@@ -324,8 +324,10 @@ where
                                 order, mutation,
                             ))
                         }
-                        SubscriptionRequestOutcome::AutoApprove => {
-                            PresenceEffect::AutoApproveSubscription(order)
+                        SubscriptionRequestOutcome::AutoApprove { mutation } => {
+                            PresenceEffect::AutoApproveSubscription(RosterDelivery::new(
+                                order, mutation,
+                            ))
                         }
                     })
                 }
@@ -345,7 +347,11 @@ where
                     let order = RosterOrder::new(self.order.lock(&owner).await);
                     let mutation = self
                         .repository
-                        .update_subscription(&owner, &contact, approve_inbound_subscription)
+                        .update_subscription(
+                            &owner,
+                            &contact,
+                            RosterSubscription::approve_pending_out,
+                        )
                         .await
                         .map_err(roster_error)?;
                     Ok(mutation.map_or(PresenceEffect::Accept, |mutation| {
@@ -401,21 +407,6 @@ where
             }
         })
     }
-}
-
-fn approve_inbound_subscription(
-    mut subscription: RosterSubscription,
-) -> Option<RosterSubscription> {
-    if !subscription.pending_out {
-        return None;
-    }
-    subscription.state = match subscription.state {
-        SubscriptionState::None => SubscriptionState::To,
-        SubscriptionState::From => SubscriptionState::Both,
-        SubscriptionState::To | SubscriptionState::Both => return None,
-    };
-    subscription.pending_out = false;
-    Some(subscription)
 }
 
 fn approve_outbound_subscription(

@@ -72,7 +72,7 @@ pub enum PresenceEffect {
     None,
     Route,
     Accept,
-    AutoApproveSubscription(RosterOrder),
+    AutoApproveSubscription(RosterDelivery),
     DeliverThenPushSenderRoster(RosterDelivery),
     DeliverThenPushRoster(RosterPush),
     Replay {

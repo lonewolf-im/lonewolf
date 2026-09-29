@@ -1508,14 +1508,32 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             apply_accepted_presence(&source, outbound, registration, router, writer, allocator)
                 .await
         }
-        Ok(PresenceEffect::AutoApproveSubscription(order)) => {
-            let approval = automatic_subscription_approval(routed, &mut arena)?;
-            let approval = RoutedStanza::from_parts(approval, arena);
-            router
-                .route_presence_to_interested(approval)
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            drop(order);
+        Ok(PresenceEffect::AutoApproveSubscription(delivery)) => {
+            if let Some(push) = delivery.into_push() {
+                let recipient = {
+                    let stanza = routed
+                        .resolve(&arena)
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                    let to = stanza
+                        .to()
+                        .map_err(|_| CloseOutcome::InternalError)?
+                        .ok_or(CloseOutcome::InternalError)?;
+                    AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
+                };
+                let approval = automatic_subscription_approval(routed, &mut arena)?;
+                let approval = RoutedStanza::from_parts(approval, arena);
+                router
+                    .route_presence_to_interested(approval)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                super::iq::route_roster_push(push, registration.account(), router, allocator)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                router
+                    .route_current_presence(&recipient, registration.account())
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+            }
             Ok(())
         }
         Ok(PresenceEffect::DeliverThenPushSenderRoster(delivery)) => {

@@ -360,7 +360,40 @@ fn request_subscription(
             )
         });
     if auto_approve {
-        return Ok(SubscriptionRequestOutcome::AutoApprove);
+        let item = {
+            let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
+            let item = table
+                .get(roster_key.as_ref())
+                .map_err(storage_error)?
+                .map(|record| decode_item(contact, record.value()))
+                .transpose()?;
+            match item {
+                Some(mut item) => {
+                    if let Some(subscription) = item.subscription.approve_pending_out() {
+                        item.subscription = subscription;
+                        let encoded = encode_item(&item)?;
+                        table
+                            .insert(roster_key.as_ref(), encoded.as_slice())
+                            .map_err(storage_error)?;
+                        Some(item)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        let mutation = match item {
+            Some(value) => Some(RosterMutation {
+                version: advance_version(&transaction, subscriber)?,
+                value,
+            }),
+            None => None,
+        };
+        if mutation.is_some() {
+            transaction.commit().map_err(commit_error)?;
+        }
+        return Ok(SubscriptionRequestOutcome::AutoApprove { mutation });
     }
     transaction
         .open_table(PENDING)

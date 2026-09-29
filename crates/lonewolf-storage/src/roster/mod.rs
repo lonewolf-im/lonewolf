@@ -29,6 +29,21 @@ pub struct RosterSubscription {
     pub approved: bool,
 }
 
+impl RosterSubscription {
+    pub fn approve_pending_out(mut self) -> Option<Self> {
+        if !self.pending_out {
+            return None;
+        }
+        self.state = match self.state {
+            SubscriptionState::None => SubscriptionState::To,
+            SubscriptionState::From => SubscriptionState::Both,
+            SubscriptionState::To | SubscriptionState::Both => return None,
+        };
+        self.pending_out = false;
+        Some(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RosterVersion(u64);
 
@@ -94,7 +109,9 @@ pub enum SubscriptionRequestOutcome {
     Pending {
         mutation: Option<RosterMutation<RosterItem>>,
     },
-    AutoApprove,
+    AutoApprove {
+        mutation: Option<RosterMutation<RosterItem>>,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -149,7 +166,7 @@ pub trait RosterRepository: Send + Sync {
         F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static;
 
     /// Stores both sides in one write when approval is required.
-    /// Returns `AutoApprove` for an established subscription.
+    /// Returns `AutoApprove` when the recipient already permits the subscription.
     fn request_subscription(
         &self,
         subscriber: &AccountKey,

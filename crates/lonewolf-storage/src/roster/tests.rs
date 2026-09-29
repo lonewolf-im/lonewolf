@@ -260,12 +260,73 @@ fn established_subscription_requests_are_automatically_approved_without_changes(
             },
         ))?;
 
-        assert_eq!(outcome, SubscriptionRequestOutcome::AutoApprove);
+        assert_eq!(
+            outcome,
+            SubscriptionRequestOutcome::AutoApprove { mutation: None }
+        );
         assert!(block_on(repository.pending(&bob))?.is_empty());
         let alice_roster = block_on(repository.snapshot(&alice))?;
         assert_eq!(alice_roster.version.get(), 1);
         assert_eq!(alice_roster.items[0].subscription.state, subscriber_state);
         assert!(!alice_roster.items[0].subscription.pending_out);
+        assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn automatic_approval_resolves_an_outstanding_request_in_one_write() -> TestResult {
+    for (subscriber_state, recipient_state, approved_state) in [
+        (
+            SubscriptionState::None,
+            SubscriptionState::From,
+            SubscriptionState::To,
+        ),
+        (
+            SubscriptionState::From,
+            SubscriptionState::Both,
+            SubscriptionState::Both,
+        ),
+    ] {
+        let repository = repository()?;
+        let alice = owner("alice@example.com")?;
+        let bob = owner("bob@example.com")?;
+        let alice_jid = jid("alice@example.com")?;
+        let bob_jid = jid("bob@example.com")?;
+        block_on(
+            repository.update_subscription(&alice, &bob_jid, move |mut current| {
+                current.state = subscriber_state;
+                current.pending_out = true;
+                Some(current)
+            }),
+        )?;
+        block_on(
+            repository.update_subscription(&bob, &alice_jid, move |mut current| {
+                current.state = recipient_state;
+                Some(current)
+            }),
+        )?;
+
+        let outcome = block_on(repository.request_subscription(
+            &alice,
+            &bob_jid,
+            &bob,
+            PendingSubscription {
+                sender: alice_jid,
+                stanza: b"<presence id='repeat'/>".as_slice().into(),
+            },
+        ))?;
+        let SubscriptionRequestOutcome::AutoApprove {
+            mutation: Some(mutation),
+        } = outcome
+        else {
+            return Err("outstanding request was not approved".into());
+        };
+        assert_eq!(mutation.version.get(), 2);
+        assert_eq!(mutation.value.subscription.state, approved_state);
+        assert!(!mutation.value.subscription.pending_out);
+        assert!(block_on(repository.pending(&bob))?.is_empty());
+        assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
         assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 1);
     }
     Ok(())

@@ -98,10 +98,16 @@ fn availability_replay_holds_recipient_order_until_the_transition_finishes() {
         stanza,
     }))
     .unwrap_or_else(|error| panic!("{error:?}"));
-    let PresenceEffect::Replay { order, pending } = effect else {
+    let PresenceEffect::Replay {
+        order,
+        pending,
+        subscribers,
+    } = effect
+    else {
         panic!("expected pending replay");
     };
     assert!(pending.is_empty());
+    assert!(subscribers.is_empty());
     let index = (roster.order.hash_state.hash_one(&owner) as usize) % roster.order.shards.len();
     assert!(
         Arc::clone(&roster.order.shards[index])

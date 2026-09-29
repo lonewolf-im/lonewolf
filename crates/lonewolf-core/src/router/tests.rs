@@ -558,7 +558,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 Some(unavailable_presence("desk").await?),
             )
             .await?;
-        assert!(became_available);
+        assert!(became_available.became_available);
         let (delivery, replay_pending) = receive_presence(&desk).await?;
         assert_eq!(delivery.len(), 1);
         assert!(replay_pending);
@@ -569,7 +569,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 Some(unavailable_presence("phone").await?),
             )
             .await?;
-        assert!(became_available);
+        assert!(became_available.became_available);
         let (delivery, replay_pending) = receive_presence(&phone).await?;
         assert_eq!(delivery.len(), 2);
         assert!(replay_pending);
@@ -630,6 +630,7 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
         assert!(
             desk.set_presence(Some(0), presence("desk").await?, None)
                 .await?
+                .became_available
         );
         receive_presence(&desk).await?;
         phone
@@ -644,6 +645,7 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
         assert!(
             desk.set_presence(Some(0), presence("desk").await?, None)
                 .await?
+                .became_available
         );
 
         assert_eq!(receive_routed(&desk).await?.resolve()?.id()?, Some("old"));
@@ -679,12 +681,12 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
                 Some(unavailable_presence("desk").await?),
             )
             .await?;
-        assert!(became_available);
+        assert!(became_available.became_available);
         receive_presence(&desk).await?;
         let became_available = phone
             .set_presence(Some(0), presence("phone").await?, None)
             .await?;
-        assert!(became_available);
+        assert!(became_available.became_available);
         let (delivery, replay_pending) = receive_presence(&phone).await?;
         assert_eq!(delivery.len(), 2);
         assert!(replay_pending);

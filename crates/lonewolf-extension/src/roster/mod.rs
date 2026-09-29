@@ -9,7 +9,7 @@ use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
     PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterMutation,
     RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion, SubscriptionCancellation,
-    SubscriptionRequestOutcome, SubscriptionState,
+    SubscriptionRequestOutcome, SubscriptionState, SubscriptionWithdrawal,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -80,6 +80,21 @@ impl RosterCancellation {
     }
 }
 
+pub struct RosterWithdrawal {
+    order: RosterOrder,
+    outcome: SubscriptionWithdrawal,
+}
+
+impl RosterWithdrawal {
+    fn new(order: RosterOrder, outcome: SubscriptionWithdrawal) -> Self {
+        Self { order, outcome }
+    }
+
+    pub fn into_parts(self) -> (RosterOrder, SubscriptionWithdrawal) {
+        (self.order, self.outcome)
+    }
+}
+
 pub struct RosterPush {
     _order: RosterOrder,
     item: RosterItem,
@@ -127,7 +142,7 @@ impl RosterPush {
 
 pub struct RosterRegistrations<A: ChunkAllocator> {
     pub iq: [IqRegistration<A>; 2],
-    pub presence: [PresenceRegistration<A>; 7],
+    pub presence: [PresenceRegistration<A>; 9],
 }
 
 pub fn registrations<A, R, C>(repository: R, accounts: C) -> RosterRegistrations<A>
@@ -204,6 +219,20 @@ where
                 PresenceRoute {
                     direction: PresenceDirection::Inbound,
                     kind: PresenceRequestType::Unsubscribed,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Outbound,
+                    kind: PresenceRequestType::Unsubscribe,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Inbound,
+                    kind: PresenceRequestType::Unsubscribe,
                 },
                 Arc::clone(&presence),
             ),
@@ -335,6 +364,9 @@ where
                     PresenceDirection::Outbound,
                     PresenceRequestType::Subscribed | PresenceRequestType::Unsubscribed,
                 ) => Ok(PresenceEffect::Route),
+                (PresenceDirection::Outbound, PresenceRequestType::Unsubscribe) => {
+                    Ok(PresenceEffect::Route)
+                }
                 (PresenceDirection::Inbound, PresenceRequestType::Subscribe) => {
                     let recipient = AccountKey::try_from(request.target.bare())
                         .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
@@ -439,6 +471,34 @@ where
                         .await
                         .map_err(roster_error)?;
                     Ok(PresenceEffect::CancelSubscription(RosterCancellation::new(
+                        order, outcome,
+                    )))
+                }
+                (PresenceDirection::Inbound, PresenceRequestType::Unsubscribe) => {
+                    let subscriber = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let recipient = AccountKey::try_from(request.target.bare())
+                        .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
+                    let recipient_exists = self
+                        .accounts
+                        .get(&recipient)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .is_some();
+                    let order = self.order.lock_pair(&subscriber, &recipient).await;
+                    let contact = RosterJid::from(request.target.bare());
+                    let subscriber_jid =
+                        recipient_exists.then(|| RosterJid::from(request.sender.bare()));
+                    let outcome = self
+                        .repository
+                        .unsubscribe(
+                            &subscriber,
+                            &contact,
+                            subscriber_jid.as_ref().map(|jid| (&recipient, jid)),
+                        )
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(PresenceEffect::WithdrawSubscription(RosterWithdrawal::new(
                         order, outcome,
                     )))
                 }

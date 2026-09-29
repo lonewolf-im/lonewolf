@@ -48,7 +48,6 @@ impl RosterSubscription {
 pub struct RosterVersion(u64);
 
 impl RosterVersion {
-    /// Creates a version token for a repository implementation.
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
@@ -122,6 +121,13 @@ pub struct SubscriptionCancellation {
     pub subscriber: Option<RosterMutation<RosterItem>>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct SubscriptionWithdrawal {
+    pub notify_contact: bool,
+    pub subscriber: Option<RosterMutation<RosterItem>>,
+    pub contact: Option<RosterMutation<RosterItem>>,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PendingSubscription {
     pub sender: RosterJid,
@@ -149,7 +155,6 @@ pub trait RosterRepository: Send + Sync {
         owner: &AccountKey,
     ) -> impl Future<Output = Result<RosterSnapshot, RosterError>> + Send;
 
-    /// Returns `None` if the item is absent.
     fn get(
         &self,
         owner: &AccountKey,
@@ -191,6 +196,14 @@ pub trait RosterRepository: Send + Sync {
         subscriber: Option<(&AccountKey, &RosterJid)>,
     ) -> impl Future<Output = Result<SubscriptionCancellation, RosterError>> + Send;
 
+    /// Updates present local rosters and removes the pending request in one write.
+    fn unsubscribe(
+        &self,
+        subscriber: &AccountKey,
+        contact: &RosterJid,
+        recipient: Option<(&AccountKey, &RosterJid)>,
+    ) -> impl Future<Output = Result<SubscriptionWithdrawal, RosterError>> + Send;
+
     /// Removes an item and returns `None` without advancing the version if absent.
     fn remove(
         &self,
@@ -228,7 +241,7 @@ pub trait RosterRepository: Send + Sync {
         sender: &RosterJid,
     ) -> impl Future<Output = Result<bool, RosterError>> + Send;
 
-    /// Removes all roster state for one account.
+    /// Deletes items, pending requests, and the version for one account.
     fn delete_all(
         &self,
         owner: &AccountKey,

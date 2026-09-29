@@ -10,6 +10,7 @@ use super::{
     PendingResolution, PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid,
     RosterMutation, RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
     SubscriptionCancellation, SubscriptionRequestOutcome, SubscriptionState,
+    SubscriptionWithdrawal,
 };
 use crate::account::AccountKey;
 use crate::redb::{begin_write, commit_error, storage_error};
@@ -165,6 +166,27 @@ impl RosterRepository for RedbRosterRepository {
         self.database
             .write(move |database| {
                 cancel_subscription(database, &grantor, grantor_key, contact, subscriber)
+            })
+            .await
+    }
+
+    async fn unsubscribe(
+        &self,
+        subscriber: &AccountKey,
+        contact: &RosterJid,
+        recipient: Option<(&AccountKey, &RosterJid)>,
+    ) -> Result<SubscriptionWithdrawal, RosterError> {
+        let subscriber = Box::<str>::from(subscriber.as_str());
+        let subscriber_key = item_key_text(&subscriber, contact);
+        let contact = contact.clone();
+        let recipient = recipient.map(|(account, jid)| {
+            let account = Box::<str>::from(account.as_str());
+            let key = item_key_text(&account, jid);
+            (account, key, jid.clone())
+        });
+        self.database
+            .write(move |database| {
+                unsubscribe(database, &subscriber, subscriber_key, contact, recipient)
             })
             .await
     }
@@ -549,6 +571,99 @@ fn cancel_subscription(
         send_unavailable,
         grantor: grantor_mutation,
         subscriber: subscriber_mutation,
+    })
+}
+
+fn unsubscribe(
+    database: &::redb::Database,
+    subscriber: &str,
+    subscriber_key: Box<str>,
+    contact: RosterJid,
+    recipient: Option<(Box<str>, Box<str>, RosterJid)>,
+) -> Result<SubscriptionWithdrawal, RosterError> {
+    let transaction = begin_write(database)?;
+    let same_item = recipient
+        .as_ref()
+        .is_some_and(|(_, key, _)| key.as_ref() == subscriber_key.as_ref());
+    let notify_contact = if let Some((_, key, jid)) = recipient.as_ref() {
+        transaction
+            .open_table(ITEMS)
+            .map_err(storage_error)?
+            .get(key.as_ref())
+            .map_err(storage_error)?
+            .map(|record| decode_item(jid.clone(), record.value()))
+            .transpose()?
+            .is_some_and(|item| {
+                matches!(
+                    item.subscription.state,
+                    SubscriptionState::From | SubscriptionState::Both
+                )
+            })
+    } else {
+        false
+    };
+    let pending = if let Some((_, key, _)) = recipient.as_ref() {
+        transaction
+            .open_table(PENDING)
+            .map_err(storage_error)?
+            .remove(key.as_ref())
+            .map_err(storage_error)?
+            .is_some()
+    } else {
+        false
+    };
+    let subscriber_mutation = update_existing_subscription(
+        &transaction,
+        subscriber,
+        subscriber_key.as_ref(),
+        contact,
+        |mut subscription| {
+            let old = subscription;
+            subscription.state = match subscription.state {
+                SubscriptionState::To => SubscriptionState::None,
+                SubscriptionState::Both => SubscriptionState::From,
+                state => state,
+            };
+            subscription.pending_out = false;
+            if same_item && notify_contact {
+                subscription.state = match subscription.state {
+                    SubscriptionState::From => SubscriptionState::None,
+                    SubscriptionState::Both => SubscriptionState::To,
+                    state => state,
+                };
+            }
+            (subscription != old).then_some(subscription)
+        },
+    )?;
+    let contact_mutation = if let Some((owner, key, jid)) = recipient
+        && notify_contact
+        && !same_item
+    {
+        update_existing_subscription(
+            &transaction,
+            &owner,
+            key.as_ref(),
+            jid,
+            |mut subscription| {
+                let old = subscription;
+                subscription.state = match subscription.state {
+                    SubscriptionState::From => SubscriptionState::None,
+                    SubscriptionState::Both => SubscriptionState::To,
+                    state => state,
+                };
+                (subscription != old).then_some(subscription)
+            },
+        )?
+    } else {
+        None
+    };
+    if pending || subscriber_mutation.is_some() || contact_mutation.is_some() {
+        transaction.commit().map_err(commit_error)?;
+    }
+    Ok(SubscriptionWithdrawal {
+        notify_contact,
+        subscriber: subscriber_mutation,
+        contact: contact_mutation,
     })
 }
 

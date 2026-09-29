@@ -17,7 +17,7 @@ use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType, IqRoute, IqScope}
 use crate::order::Sequencer;
 use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
-    PresenceUpdate, ReceiveFuture,
+    PresenceTransition, PresenceUpdate, ReceiveFuture,
 };
 use subscription::Parties;
 
@@ -171,7 +171,7 @@ where
                 .await
                 .map_err(roster_error)?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
-            let (pending, contacts) = if update.available {
+            let (pending, contacts) = if update.transition == PresenceTransition::Initial {
                 let pending = self
                     .repository
                     .pending(&owner)

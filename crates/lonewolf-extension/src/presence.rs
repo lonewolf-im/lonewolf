@@ -46,11 +46,20 @@ impl PresenceRequestType {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresenceTransition {
+    /// The resource becomes available.
+    Initial,
+    /// An available resource changes its presence.
+    Update,
+    Unavailable,
+}
+
 /// An undirected availability change of a bound resource.
 pub struct PresenceUpdate<'a> {
     /// The authenticated full JID, independent of the client's `from` attribute.
     pub sender: JidRef<'a>,
-    pub available: bool,
+    pub transition: PresenceTransition,
 }
 
 /// A subscription presence exchanged between two accounts.

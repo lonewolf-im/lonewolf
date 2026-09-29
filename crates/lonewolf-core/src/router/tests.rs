@@ -608,9 +608,37 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
             receive_routed(&phone).await?;
         }
         assert!(phone.recv().await.is_none());
+        assert!(phone.wait_retired().await?.is_some());
+        let unavailable = phone
+            .end_presence()
+            .await?
+            .ok_or("missing retired presence")?;
+        assert_eq!(
+            unavailable
+                .resolve()?
+                .from()?
+                .ok_or("missing retired sender")?
+                .as_str(),
+            "alice@localhost/phone"
+        );
+
+        let replacement = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        assert_eq!(replacement.resource(), "phone");
+        assert!(!phone.replacement_is_available().await?);
+        replacement
+            .set_presence(
+                Some(0),
+                presence("phone").await?,
+                Some(unavailable_presence("phone").await?),
+            )
+            .await?;
+        assert!(phone.replacement_is_available().await?);
 
         drop(desk);
         drop(phone);
+        drop(replacement);
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())

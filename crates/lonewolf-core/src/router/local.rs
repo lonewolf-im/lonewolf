@@ -14,7 +14,7 @@ use std::time::Instant;
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use futures_util::future::{BoxFuture, Either, poll_fn, select};
+use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -29,6 +29,7 @@ const RESOURCE_QUEUE_CAPACITY: usize = 64;
 const SHARD_BATCH_SIZE: usize = 64;
 
 type RosterPushFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
+type Retirement<A> = Shared<oneshot::Receiver<Option<RoutedStanza<A>>>>;
 
 /// Owns one account shard on each core worker.
 pub struct LocalRouter<A: ChunkAllocator> {
@@ -49,6 +50,7 @@ pub struct Registration<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
     _lease: oneshot::Sender<()>,
+    retired: Retirement<A>,
     inbound: Receiver<ResourceDelivery<A>>,
     shard: Sender<Command<A>>,
 }
@@ -123,6 +125,12 @@ enum Command<A: ChunkAllocator> {
         token: u64,
         reply: oneshot::Sender<Result<Option<RoutedStanza<A>>, RouterError>>,
     },
+    ReplacementAvailable {
+        account: AccountKey,
+        resource: Box<str>,
+        token: u64,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 struct Session<A: ChunkAllocator> {
@@ -133,6 +141,7 @@ struct Session<A: ChunkAllocator> {
     roster_interested: bool,
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
+    retired: oneshot::Sender<Option<RoutedStanza<A>>>,
 }
 
 struct Shard<A: ChunkAllocator> {
@@ -399,6 +408,10 @@ impl<A: ChunkAllocator> Registration<A> {
         self.inbound.recv().await.ok()
     }
 
+    pub(crate) async fn wait_retired(&self) -> Result<Option<RoutedStanza<A>>, RouterError> {
+        self.retired.clone().await.map_err(|_| RouterError::Stopped)
+    }
+
     pub(crate) async fn set_presence(
         &self,
         priority: Option<i8>,
@@ -432,7 +445,25 @@ impl<A: ChunkAllocator> Registration<A> {
             })
             .await
             .map_err(|_| RouterError::Stopped)?;
-        result.await.map_err(|_| RouterError::Stopped)?
+        match result.await.map_err(|_| RouterError::Stopped)? {
+            Ok(unavailable) => Ok(unavailable),
+            Err(RouterError::NotFound) => self.wait_retired().await,
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn replacement_is_available(&self) -> Result<bool, RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard
+            .send(Command::ReplacementAvailable {
+                account: self.account.clone(),
+                resource: self.resource.clone(),
+                token: self.token,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)
     }
 
     /// Marks this bound resource as a roster push recipient.
@@ -624,6 +655,15 @@ impl<A: ChunkAllocator> Shard<A> {
                 let result = self.end_presence(&account, &resource, token);
                 let _ = reply.send(result);
             }
+            Command::ReplacementAvailable {
+                account,
+                resource,
+                token,
+                reply,
+            } => {
+                let result = self.replacement_is_available(&account, &resource, token);
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -669,6 +709,7 @@ impl<A: ChunkAllocator> Shard<A> {
             },
         };
         let (lease, closed) = oneshot::channel();
+        let (retired, retired_reply) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let cleanup_account = account.clone();
         let cleanup_resource = resource.clone();
@@ -689,6 +730,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 roster_interested: false,
                 presence: None,
                 unavailable: None,
+                retired,
             },
         );
         Ok(Registration {
@@ -697,6 +739,7 @@ impl<A: ChunkAllocator> Shard<A> {
             token,
             alive,
             _lease: lease,
+            retired: retired_reply.shared(),
             inbound,
             shard,
         })
@@ -1127,6 +1170,17 @@ impl<A: ChunkAllocator> Shard<A> {
         Ok(unavailable)
     }
 
+    fn replacement_is_available(&self, account: &AccountKey, resource: &str, token: u64) -> bool {
+        self.accounts
+            .get(account.as_str())
+            .and_then(|sessions| sessions.get(resource))
+            .is_some_and(|session| {
+                session.token != token
+                    && session.alive.load(Ordering::Acquire)
+                    && session.priority.is_some()
+            })
+    }
+
     fn remove(&mut self, account: &str, resource: &str, token: u64) {
         if let Some(sessions) = self.accounts.get_mut(account) {
             let mut pending = Vec::new();
@@ -1155,7 +1209,7 @@ impl<A: ChunkAllocator> Shard<A> {
         if let Some(session) = sessions.remove(resource) {
             session.alive.store(false, Ordering::Release);
             session.outbound.close();
-            if let Some(unavailable) = session.unavailable {
+            if let Some(unavailable) = session.unavailable.as_ref() {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
                         && recipient.priority.is_some()
@@ -1168,6 +1222,7 @@ impl<A: ChunkAllocator> Shard<A> {
                     }
                 }
             }
+            let _ = session.retired.send(session.unavailable);
         }
     }
 }
@@ -1284,6 +1339,7 @@ mod tests {
             let mut receivers = Vec::new();
             for (token, resource) in [(1, "ready"), (2, "full"), (3, "closed")] {
                 let (outbound, inbound) = async_channel::bounded(1);
+                let (retired, _) = oneshot::channel();
                 sessions.insert(
                     resource.into(),
                     Session {
@@ -1294,6 +1350,7 @@ mod tests {
                         roster_interested: false,
                         presence: None,
                         unavailable: None,
+                        retired,
                     },
                 );
                 receivers.push(inbound);

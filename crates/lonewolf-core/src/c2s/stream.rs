@@ -1126,68 +1126,79 @@ async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcom
     let mut writer = FuturesBufWriter::with_capacity(IO_BUFFER_BYTES, writer);
     let mut pending_replays = VecDeque::new();
     let mut prefer_outbound = true;
-    let outcome = 'stream: loop {
-        // Cancelling an in-progress parser read can lose buffered XML.
-        let mut next = pin!(parser.next_event());
-        let event = loop {
-            let receive = pin!(registration.recv());
-            let selected = if prefer_outbound {
-                match select(receive, next.as_mut()).await {
-                    Either::Left((stanza, _)) => Either::Right(stanza),
-                    Either::Right((event, _)) => Either::Left(event),
-                }
-            } else {
-                match select(next.as_mut(), receive).await {
-                    Either::Left((event, _)) => Either::Left(event),
-                    Either::Right((stanza, _)) => Either::Right(stanza),
+    let stream = async {
+        'stream: loop {
+            // Cancelling an in-progress parser read can lose buffered XML.
+            let mut next = pin!(parser.next_event());
+            let event = loop {
+                let receive = pin!(registration.recv());
+                let selected = if prefer_outbound {
+                    match select(receive, next.as_mut()).await {
+                        Either::Left((stanza, _)) => Either::Right(stanza),
+                        Either::Right((event, _)) => Either::Left(event),
+                    }
+                } else {
+                    match select(next.as_mut(), receive).await {
+                        Either::Left((event, _)) => Either::Left(event),
+                        Either::Right((stanza, _)) => Either::Right(stanza),
+                    }
+                };
+                prefer_outbound = !prefer_outbound;
+                match selected {
+                    Either::Left(event) => break event,
+                    Either::Right(Some(delivery)) => {
+                        if let Err(outcome) = write_resource_delivery(
+                            &mut writer,
+                            delivery,
+                            &mut pending_replays,
+                            &registration,
+                            &allocator,
+                        )
+                        .await
+                        {
+                            break 'stream outcome;
+                        }
+                    }
+                    Either::Right(None) => break 'stream CloseOutcome::InternalError,
                 }
             };
-            prefer_outbound = !prefer_outbound;
-            match selected {
-                Either::Left(event) => break event,
-                Either::Right(Some(delivery)) => {
-                    if let Err(outcome) = write_resource_delivery(
+            match event {
+                Ok(Some(StreamEvent::StreamEnd) | None) => {
+                    break send_footer_tls(&mut writer).await;
+                }
+                Ok(Some(StreamEvent::Stanza(parsed))) => {
+                    if let Err(outcome) = handle_bound_stanza(
+                        parsed,
                         &mut writer,
-                        delivery,
-                        &mut pending_replays,
                         &registration,
+                        &router,
                         &allocator,
+                        &mut pending_replays,
                     )
                     .await
                     {
-                        break 'stream outcome;
+                        break send_stream_error_tls(&mut writer, outcome).await;
                     }
                 }
-                Either::Right(None) => break 'stream CloseOutcome::InternalError,
-            }
-        };
-        match event {
-            Ok(Some(StreamEvent::StreamEnd) | None) => break send_footer_tls(&mut writer).await,
-            Ok(Some(StreamEvent::Stanza(parsed))) => {
-                if let Err(outcome) = handle_bound_stanza(
-                    parsed,
-                    &mut writer,
-                    &registration,
-                    &router,
-                    &allocator,
-                    &mut pending_replays,
-                )
-                .await
-                {
+                Err(ParseError::UnexpectedEof) => break CloseOutcome::Eof,
+                Err(error) => {
+                    break send_stream_error_tls(
+                        &mut writer,
+                        CloseOutcome::from_parse_error(&error),
+                    )
+                    .await;
+                }
+                Ok(Some(event)) => {
+                    let outcome =
+                        c2s_namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
                     break send_stream_error_tls(&mut writer, outcome).await;
                 }
             }
-            Err(ParseError::UnexpectedEof) => break CloseOutcome::Eof,
-            Err(error) => {
-                break send_stream_error_tls(&mut writer, CloseOutcome::from_parse_error(&error))
-                    .await;
-            }
-            Ok(Some(event)) => {
-                let outcome =
-                    c2s_namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
-                break send_stream_error_tls(&mut writer, outcome).await;
-            }
         }
+    };
+    let outcome = match select(pin!(registration.wait_retired()), pin!(stream)).await {
+        Either::Left(_) => CloseOutcome::InternalError,
+        Either::Right((outcome, _)) => outcome,
     };
     let end = match registration.end_presence().await {
         Ok(Some(unavailable)) => {
@@ -1238,9 +1249,21 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
     {
         Ok(PresenceEffect::None) => Ok(()),
         Ok(PresenceEffect::Broadcast { order, subscribers }) => {
-            let result = router.broadcast_presence(unavailable, &subscribers).await;
+            // The roster order guard blocks replacement updates until this delivery ends.
+            let result = if registration
+                .replacement_is_available()
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?
+            {
+                Ok(())
+            } else {
+                router
+                    .broadcast_presence(unavailable, &subscribers)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)
+            };
             drop(order);
-            result.map_err(|_| CloseOutcome::InternalError)
+            result
         }
         Ok(_) | Err(_) => Err(CloseOutcome::InternalError),
     }

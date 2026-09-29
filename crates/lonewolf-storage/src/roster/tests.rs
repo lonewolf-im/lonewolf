@@ -567,6 +567,89 @@ fn self_subscription_cancellation_writes_one_final_roster_version() -> TestResul
 }
 
 #[test]
+fn unsubscribe_keeps_the_reverse_grant_and_does_not_advance_versions_twice() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    for (owner, contact) in [(&alice, &bob_jid), (&bob, &alice_jid)] {
+        block_on(repository.update_subscription(owner, contact, |_| {
+            Some(RosterSubscription {
+                state: SubscriptionState::Both,
+                pending_out: false,
+                approved: true,
+            })
+        }))?;
+    }
+
+    let withdrawal = block_on(repository.unsubscribe(&alice, &bob_jid, Some((&bob, &alice_jid))))?;
+    assert!(withdrawal.notify_contact);
+    let subscriber = withdrawal.subscriber.ok_or("missing subscriber change")?;
+    assert_eq!(subscriber.version.get(), 2);
+    assert_eq!(subscriber.value.subscription.state, SubscriptionState::From);
+    assert!(subscriber.value.subscription.approved);
+    let contact = withdrawal.contact.ok_or("missing contact change")?;
+    assert_eq!(contact.version.get(), 2);
+    assert_eq!(contact.value.subscription.state, SubscriptionState::To);
+    assert!(contact.value.subscription.approved);
+
+    let repeated = block_on(repository.unsubscribe(&alice, &bob_jid, Some((&bob, &alice_jid))))?;
+    assert!(!repeated.notify_contact);
+    assert!(repeated.subscriber.is_none());
+    assert!(repeated.contact.is_none());
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
+    assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 2);
+    Ok(())
+}
+
+#[test]
+fn unsubscribe_from_self_writes_one_roster_version() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    block_on(repository.update_subscription(&alice, &alice_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: false,
+        })
+    }))?;
+
+    let withdrawal =
+        block_on(repository.unsubscribe(&alice, &alice_jid, Some((&alice, &alice_jid))))?;
+    assert!(withdrawal.notify_contact);
+    assert!(withdrawal.contact.is_none());
+    let subscriber = withdrawal.subscriber.ok_or("missing roster change")?;
+    assert_eq!(subscriber.version.get(), 2);
+    assert_eq!(subscriber.value.subscription.state, SubscriptionState::None);
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
+    Ok(())
+}
+
+#[test]
+fn unsubscribe_clears_a_stale_subscription_after_the_contact_is_deleted() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+    block_on(repository.update_subscription(&alice, &bob_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::To,
+            pending_out: false,
+            approved: false,
+        })
+    }))?;
+
+    let withdrawal = block_on(repository.unsubscribe(&alice, &bob_jid, None))?;
+    assert!(!withdrawal.notify_contact);
+    assert!(withdrawal.contact.is_none());
+    let subscriber = withdrawal.subscriber.ok_or("missing roster change")?;
+    assert_eq!(subscriber.value.subscription.state, SubscriptionState::None);
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
+    Ok(())
+}
+
+#[test]
 fn delete_all_removes_one_owners_roster_version_and_pending_requests() -> TestResult {
     let repository = repository()?;
     let alice = owner("alice@example.com")?;

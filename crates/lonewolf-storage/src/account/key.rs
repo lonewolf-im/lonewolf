@@ -55,17 +55,17 @@ impl TryFrom<JidRef<'_>> for AccountKey {
 impl TryFrom<&RosterJid> for AccountKey {
     type Error = AccountKeyError;
 
-    /// A roster JID is canonical, so its username ends at the first `@` and a `/`
-    /// after that starts a resource.
+    /// A roster JID is canonical, so a `/` anywhere starts a resource and the
+    /// username of a bare JID ends at its only `@`.
     fn try_from(jid: &RosterJid) -> Result<Self, Self::Error> {
         let text = jid.as_str();
+        if text.contains('/') {
+            return Err(AccountKeyError::ResourceNotAllowed);
+        }
         let username_len = text
             .find('@')
             .filter(|len| *len > 0)
             .ok_or(AccountKeyError::MissingUsername)?;
-        if text[username_len + 1..].contains('/') {
-            return Err(AccountKeyError::ResourceNotAllowed);
-        }
         Ok(Self {
             text: Box::from(text),
             username_len,

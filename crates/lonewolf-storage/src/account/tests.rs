@@ -44,6 +44,10 @@ fn roster_jids_convert_to_account_keys_only_when_bare() -> TestResult {
         Err(AccountKeyError::ResourceNotAllowed)
     );
     assert_eq!(
+        AccountKey::try_from(&roster_jid("example.com/desk@work")?),
+        Err(AccountKeyError::ResourceNotAllowed)
+    );
+    assert_eq!(
         AccountKey::try_from(&roster_jid("example.com")?),
         Err(AccountKeyError::MissingUsername)
     );

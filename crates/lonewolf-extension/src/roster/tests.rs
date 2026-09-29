@@ -32,6 +32,10 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         Arena::try_new(ArenaConfig::default()).map_err(|_| DeliveryError)
     }
 
+    fn is_local_host(&self, _: &str) -> bool {
+        true
+    }
+
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
         self.tags.borrow_mut().push(tag);
         Box::pin(async { Ok(()) })

@@ -379,6 +379,7 @@ fn remove_item(
         .map_err(storage_error)?
         .is_some();
     let version = advance_version(&transaction, owner)?;
+    let mut contact_before = None;
     let contact_mutation = match contact_side {
         Some((account, key, owner_jid)) if key.as_ref() != owner_key.as_ref() => {
             transaction
@@ -387,17 +388,24 @@ fn remove_item(
                 .remove(key.as_ref())
                 .map_err(storage_error)?;
             update_existing_subscription(&transaction, &account, key.as_ref(), owner_jid, |old| {
-                let cleared = RosterSubscription::default();
+                contact_before = Some(old);
+                // The pre-approval is the contact's own decision, so only the contact clears it.
+                let cleared = RosterSubscription {
+                    state: SubscriptionState::None,
+                    pending_out: false,
+                    approved: old.approved,
+                };
                 (old != cleared).then_some(cleared)
             })?
         }
         _ => None,
     };
+    drop(removed);
     transaction.commit().map_err(commit_error)?;
     Ok(Some(ItemRemoval {
         version,
-        subscription: removed.subscription,
         pending_request,
+        contact_before,
         contact: contact_mutation,
     }))
 }

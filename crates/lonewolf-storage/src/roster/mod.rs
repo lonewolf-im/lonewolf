@@ -132,10 +132,10 @@ pub struct SubscriptionWithdrawal {
 pub struct ItemRemoval {
     /// The owner's roster version after the removal.
     pub version: RosterVersion,
-    /// The removed item's subscription, which decides the presence the contact receives.
-    pub subscription: RosterSubscription,
     /// Whether the contact had a subscription request pending with the owner.
     pub pending_request: bool,
+    /// The contact's subscription to the owner before the removal, when it held an item.
+    pub contact_before: Option<RosterSubscription>,
     /// The contact's item after losing every subscription to the owner.
     pub contact: Option<RosterMutation<RosterItem>>,
 }

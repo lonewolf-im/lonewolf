@@ -213,8 +213,8 @@ fn approve_outbound_subscription(
 }
 
 impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
-    /// Removes an item and, for a local contact, withdraws the owner's subscription and
-    /// cancels the contact's in the same order the separate presence flows would use.
+    /// Removes an item and, for a local contact, withdraws and cancels the subscriptions
+    /// the contact's roster records, in the order the separate presence flows use.
     pub(super) async fn remove_item<A: ChunkAllocator>(
         &self,
         owner: AccountKey,
@@ -223,7 +223,12 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
         let contact_account = match AccountKey::try_from(&contact) {
-            Ok(account) if self.account_exists(&account).await? => Some(account),
+            Ok(account)
+                if delivery.is_local_host(account.domain())
+                    && self.account_exists(&account).await? =>
+            {
+                Some(account)
+            }
             _ => None,
         };
         let _order = match &contact_account {
@@ -245,30 +250,30 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         let Some(contact_account) = contact_account else {
             return Ok(());
         };
-        let granted = matches!(
-            removal.subscription.state,
+        let before = removal.contact_before.unwrap_or_default();
+        let contact_granted = matches!(
+            before.state,
             SubscriptionState::From | SubscriptionState::Both
         );
-        let subscribed = matches!(
-            removal.subscription.state,
+        let contact_subscribed = matches!(
+            before.state,
             SubscriptionState::To | SubscriptionState::Both
         );
-        let unsubscribe = subscribed || removal.subscription.pending_out;
-        let unsubscribed = granted || removal.pending_request;
-        if granted {
+        let cancel = contact_subscribed || removal.pending_request;
+        if contact_subscribed {
             delivery
                 .unavailable_presence(&owner, &contact_account)
                 .await?;
         }
-        if unsubscribe || unsubscribed {
+        if contact_granted || cancel {
             let (withdrawal, cancellation) =
                 xml::subscription_withdrawals(&owner, &contact_account, delivery.arena()?)?;
-            if unsubscribe {
+            if contact_granted {
                 delivery
                     .to_tagged(SessionTag::Interested, withdrawal)
                     .await?;
             }
-            if unsubscribed {
+            if cancel {
                 delivery
                     .to_tagged(SessionTag::Interested, cancellation)
                     .await?;
@@ -277,7 +282,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         if let Some(mutation) = removal.contact {
             push_roster(&contact_account, mutation, delivery).await?;
         }
-        if subscribed {
+        if contact_granted {
             delivery
                 .unavailable_presence(&contact_account, &owner)
                 .await?;

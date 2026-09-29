@@ -2128,17 +2128,28 @@ fn roster_removal_of_a_mutual_subscription_cancels_both_directions() -> TestResu
 }
 
 #[test]
-fn roster_removal_withdraws_a_stored_subscription_request() -> TestResult {
+fn roster_removal_withdraws_a_pending_subscription_request_silently() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;
     suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
     request_roster(
         &mut alice,
         "alice-roster",
         "<iq xmlns='jabber:client' type='result' id='alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
+    request_roster(
+        &mut bob,
+        "bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
     alice.send("<presence type='subscribe' id='request' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='request' from='alice@localhost' to='bob@localhost'/>")?;
     let pending = expect_roster_push(
         &mut alice,
         "alice@localhost/desk",
@@ -2156,19 +2167,22 @@ fn roster_removal_withdraws_a_stored_subscription_request() -> TestResult {
         "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='remove'/>",
     )?;
     alice.send(&format!("<iq type='result' id='{removed}'/>"))?;
+    bob.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.close()?;
 
     let mut bob = suite.connect("bob", "password", "phone")?;
     request_roster(
         &mut bob,
-        "bob-roster",
-        "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+        "bob-roster-again",
+        "<iq xmlns='jabber:client' type='result' id='bob-roster-again' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
     )?;
-    bob.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
-    bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.send("<message to='bob@localhost/phone' id='after-login'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' id='after-login'/>")?;
     request_roster(
         &mut alice,
         "empty-roster",
@@ -2191,6 +2205,71 @@ fn roster_removal_of_a_missing_item_returns_item_not_found() -> TestResult {
         &mut alice,
         "unchanged-roster",
         "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+fn seed_unhosted_contact(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice = Jid::parse_in("alice@localhost", &mut arena)?;
+    let bob = Jid::parse_in("bob@unhosted.localhost", &mut arena)?;
+    let alice_account = AccountKey::try_from(alice.resolve(&arena)?)?;
+    let bob_account = AccountKey::try_from(bob.resolve(&arena)?)?;
+    let alice_contact = RosterJid::from(alice.resolve(&arena)?);
+    let bob_contact = RosterJid::from(bob.resolve(&arena)?);
+    Runtime::new()?.block_on(async {
+        repository
+            .update_subscription(&alice_account, &bob_contact, |_| {
+                Some(RosterSubscription {
+                    state: SubscriptionState::Both,
+                    pending_out: false,
+                    approved: false,
+                })
+            })
+            .await?;
+        repository
+            .update_subscription(&bob_account, &alice_contact, |_| {
+                Some(RosterSubscription {
+                    state: SubscriptionState::Both,
+                    pending_out: false,
+                    approved: false,
+                })
+            })
+            .await?;
+        Ok::<_, lonewolf_storage::roster::RosterError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn roster_removal_of_a_contact_on_an_unhosted_domain_changes_only_the_owner() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_unhosted_contact)?;
+    suite.create_account("alice", "password")?;
+    suite.create_account_jid("bob@unhosted.localhost", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    request_roster(
+        &mut alice,
+        "alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@unhosted.localhost' subscription='both'/></query></iq>",
+    )?;
+
+    alice.send("<iq type='set' id='remove-bob'><query xmlns='jabber:iq:roster'><item jid='bob@unhosted.localhost' subscription='remove'/></query></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='remove-bob' to='alice@localhost/desk'/>",
+    )?;
+    let removed = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@unhosted.localhost' subscription='remove'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{removed}'/>"))?;
+    request_roster(
+        &mut alice,
+        "empty-roster",
+        "<iq xmlns='jabber:client' type='result' id='empty-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
 
     alice.close()

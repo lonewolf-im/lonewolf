@@ -804,15 +804,20 @@ fn item_removal_clears_the_contact_and_both_pending_requests() -> TestResult {
     let bob = owner("bob@example.com")?;
     let alice_jid = jid("alice@example.com")?;
     let bob_jid = jid("bob@example.com")?;
-    let mutual = |_| {
+    block_on(repository.update_subscription(&alice, &bob_jid, |_| {
         Some(RosterSubscription {
             state: SubscriptionState::Both,
             pending_out: false,
             approved: false,
         })
-    };
-    block_on(repository.update_subscription(&alice, &bob_jid, mutual))?;
-    block_on(repository.update_subscription(&bob, &alice_jid, mutual))?;
+    }))?;
+    block_on(repository.update_subscription(&bob, &alice_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: true,
+        })
+    }))?;
     block_on(repository.put_pending(
         &alice,
         PendingSubscription {
@@ -831,11 +836,25 @@ fn item_removal_clears_the_contact_and_both_pending_requests() -> TestResult {
     let removal = block_on(repository.remove_item(&alice, &bob_jid, Some((&bob, &alice_jid))))?
         .ok_or("missing removal")?;
     assert_eq!(removal.version.get(), 2);
-    assert_eq!(removal.subscription.state, SubscriptionState::Both);
+    assert_eq!(
+        removal.contact_before,
+        Some(RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: true,
+        })
+    );
     assert!(removal.pending_request);
     let contact = removal.contact.ok_or("missing contact change")?;
     assert_eq!(contact.version.get(), 2);
-    assert_eq!(contact.value.subscription, RosterSubscription::default());
+    assert_eq!(
+        contact.value.subscription,
+        RosterSubscription {
+            state: SubscriptionState::None,
+            pending_out: false,
+            approved: true,
+        }
+    );
     assert!(block_on(repository.snapshot(&alice))?.items.is_empty());
     assert!(block_on(repository.pending(&alice))?.is_empty());
     assert!(block_on(repository.pending(&bob))?.is_empty());
@@ -865,7 +884,7 @@ fn item_removal_without_a_local_contact_changes_only_the_owner() -> TestResult {
     let removal =
         block_on(repository.remove_item(&alice, &bob_jid, None))?.ok_or("missing removal")?;
     assert_eq!(removal.version.get(), 2);
-    assert!(removal.subscription.pending_out);
+    assert!(removal.contact_before.is_none());
     assert!(!removal.pending_request);
     assert!(removal.contact.is_none());
     assert!(block_on(repository.snapshot(&alice))?.items.is_empty());

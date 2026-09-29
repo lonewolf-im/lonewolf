@@ -21,6 +21,10 @@ impl<A: ChunkAllocator + Clone> Delivery<A> for StreamDelivery<'_, A> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
     }
 
+    fn is_local_host(&self, domain: &str) -> bool {
+        self.router.is_local_host(domain)
+    }
+
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
         Box::pin(async move { self.registration.tag(tag).await.map_err(|_| DeliveryError) })
     }

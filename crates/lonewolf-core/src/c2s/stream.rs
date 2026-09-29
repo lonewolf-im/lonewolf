@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::future::Future;
+use std::mem;
 use std::net::Shutdown;
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
@@ -26,8 +27,8 @@ use futures_util::io::{
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ServerError};
 use lonewolf_extension::presence::{
-    AcceptedPresence, PresenceDirection, PresenceEffect, PresenceHandler, PresenceRequest,
-    PresenceRequestType,
+    Party, PresenceRequest, PresenceRequestType, PresenceUpdate, SubscriptionEffect,
+    SubscriptionStep,
 };
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::PendingSubscription;
@@ -1216,66 +1217,54 @@ async fn broadcast_ended_presence<A: ChunkAllocator + Clone>(
     registration: &Registration<A>,
     router: &RouterHandle<A>,
 ) -> Result<(), CloseOutcome> {
-    let Some(handler) = router
+    let handler = router
         .presence_handlers(registration.account().domain())
-        .and_then(|handlers| {
-            handlers.find(
-                PresenceDirection::Outbound,
-                PresenceRequestType::Unavailable,
-            )
-        })
-    else {
-        return registration
-            .finish_presence()
-            .await
-            .map_err(|_| CloseOutcome::InternalError);
-    };
-    let view = unavailable
-        .resolve()
-        .map_err(|_| CloseOutcome::InternalError)?;
-    let sender = view
-        .from()
-        .map_err(|_| CloseOutcome::InternalError)?
-        .ok_or(CloseOutcome::InternalError)?;
-    let target = view
-        .to()
-        .map_err(|_| CloseOutcome::InternalError)?
-        .ok_or(CloseOutcome::InternalError)?;
-    match handler
-        .accepted(AcceptedPresence {
-            direction: PresenceDirection::Outbound,
-            kind: PresenceRequestType::Unavailable,
-            sender,
-            target,
-        })
-        .await
-    {
-        Ok(PresenceEffect::None) => registration
-            .finish_presence()
-            .await
-            .map_err(|_| CloseOutcome::InternalError),
-        Ok(PresenceEffect::Broadcast { order, subscribers }) => {
-            // The roster order guard blocks replacement updates until this delivery ends.
-            let result = match registration.replacement_is_available().await {
-                Ok(true) => Ok(()),
-                Ok(false) => router
-                    .broadcast_presence(unavailable, &subscribers)
+        .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
+    let broadcast = match handler {
+        None => None,
+        Some(handler) => {
+            let result = {
+                let view = unavailable
+                    .resolve()
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                let sender = view
+                    .from()
+                    .map_err(|_| CloseOutcome::InternalError)?
+                    .ok_or(CloseOutcome::InternalError)?;
+                handler
+                    .update(PresenceUpdate {
+                        sender,
+                        available: false,
+                    })
                     .await
-                    .map_err(|_| CloseOutcome::InternalError),
-                Err(_) => Err(CloseOutcome::InternalError),
             };
-            let finished = registration
-                .finish_presence()
+            match result {
+                Ok(broadcast) => broadcast,
+                Err(_) => {
+                    let _ = registration.finish_presence().await;
+                    return Err(CloseOutcome::InternalError);
+                }
+            }
+        }
+    };
+    let result = match &broadcast {
+        None => Ok(()),
+        // The broadcast holds the roster order, which blocks replacement updates until delivery ends.
+        Some(broadcast) => match registration.replacement_is_available().await {
+            Ok(true) => Ok(()),
+            Ok(false) => router
+                .broadcast_presence(unavailable, &broadcast.subscribers)
                 .await
-                .map_err(|_| CloseOutcome::InternalError);
-            drop(order);
-            result.and(finished)
-        }
-        Ok(_) | Err(_) => {
-            let _ = registration.finish_presence().await;
-            Err(CloseOutcome::InternalError)
-        }
-    }
+                .map_err(|_| CloseOutcome::InternalError),
+            Err(_) => Err(CloseOutcome::InternalError),
+        },
+    };
+    let finished = registration
+        .finish_presence()
+        .await
+        .map_err(|_| CloseOutcome::InternalError);
+    drop(broadcast);
+    result.and(finished)
 }
 
 async fn write_resource_delivery<A: ChunkAllocator + Clone>(
@@ -1341,195 +1330,36 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
                 .map_err(|_| CloseOutcome::InternalError)?
                 .is_some();
             if directed {
-                if let Some(kind) = PresenceRequestType::from_subscription_stanza(kind)
-                    && let Some(handler) = router
-                        .presence_handlers(registration.account().domain())
-                        .and_then(|handlers| handlers.find(PresenceDirection::Outbound, kind))
-                {
-                    return handle_directed_presence(
+                return match PresenceRequestType::from_subscription_stanza(kind) {
+                    Some(kind) => {
+                        handle_subscription_presence(
+                            parsed,
+                            kind,
+                            writer,
+                            registration,
+                            router,
+                            allocator,
+                        )
+                        .await
+                    }
+                    None => Ok(()),
+                };
+            }
+            match kind {
+                PresenceType::Available | PresenceType::Unavailable => {
+                    handle_presence_update(
                         parsed,
-                        kind,
-                        handler,
+                        kind == PresenceType::Available,
+                        writer,
                         registration,
                         router,
-                        writer,
                         allocator,
+                        pending_replays,
                     )
-                    .await;
+                    .await
                 }
-                return Ok(());
+                _ => Ok(()),
             }
-            if !matches!(kind, PresenceType::Available | PresenceType::Unavailable) {
-                return Ok(());
-            }
-            let priority = if kind == PresenceType::Available {
-                Some(presence_priority(&stanza))
-            } else {
-                None
-            };
-            let (priority, routed, unavailable, effect) = match priority {
-                Some(Ok(priority)) => {
-                    let (available, unavailable, arena) =
-                        stamp_available_presence(parsed, registration)?;
-                    let effect = if let Some(handler) = router
-                        .presence_handlers(registration.account().domain())
-                        .and_then(|handlers| {
-                            handlers
-                                .find(PresenceDirection::Outbound, PresenceRequestType::Available)
-                        }) {
-                        let result = {
-                            let stanza = available
-                                .resolve(&arena)
-                                .map_err(|_| CloseOutcome::InternalError)?;
-                            let sender = stanza
-                                .from()
-                                .map_err(|_| CloseOutcome::InternalError)?
-                                .ok_or(CloseOutcome::InternalError)?;
-                            let target = stanza
-                                .to()
-                                .map_err(|_| CloseOutcome::InternalError)?
-                                .ok_or(CloseOutcome::InternalError)?;
-                            handler
-                                .handle(PresenceRequest {
-                                    direction: PresenceDirection::Outbound,
-                                    kind: PresenceRequestType::Available,
-                                    sender,
-                                    target,
-                                    stanza,
-                                })
-                                .await
-                        };
-                        match result {
-                            Ok(PresenceEffect::None) => None,
-                            Ok(effect @ PresenceEffect::Replay { .. }) => Some(effect),
-                            Ok(
-                                PresenceEffect::Route
-                                | PresenceEffect::Accept
-                                | PresenceEffect::CancelSubscription(_)
-                                | PresenceEffect::WithdrawSubscription(_)
-                                | PresenceEffect::AutoApproveSubscription(_)
-                                | PresenceEffect::DeliverThenPushSenderRoster(_)
-                                | PresenceEffect::DeliverThenPushRoster(_)
-                                | PresenceEffect::Broadcast { .. }
-                                | PresenceEffect::PushRoster(_),
-                            ) => return Err(CloseOutcome::InternalError),
-                            Err(condition) => {
-                                let source = RoutedStanza::from_parts(available, arena);
-                                send_stanza_error(writer, &source, allocator, condition).await?;
-                                return Ok(());
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let (routed, unavailable) =
-                        RoutedStanza::from_parts_pair(available, unavailable, arena);
-                    (Some(priority), routed, Some(unavailable), effect)
-                }
-                Some(Err(condition)) => {
-                    let routed = stamp_client_stanza(parsed, registration)?;
-                    send_stanza_error(writer, &routed, allocator, condition).await?;
-                    return Ok(());
-                }
-                None => {
-                    let (source, mut arena) = parsed.into_parts();
-                    let (stamped, _, _) =
-                        stamp_client_stanza_in(source, &mut arena, registration, true)?;
-                    let effect = if let Some(handler) = router
-                        .presence_handlers(registration.account().domain())
-                        .and_then(|handlers| {
-                            handlers.find(
-                                PresenceDirection::Outbound,
-                                PresenceRequestType::Unavailable,
-                            )
-                        }) {
-                        let result = {
-                            let stanza = stamped
-                                .resolve(&arena)
-                                .map_err(|_| CloseOutcome::InternalError)?;
-                            let sender = stanza
-                                .from()
-                                .map_err(|_| CloseOutcome::InternalError)?
-                                .ok_or(CloseOutcome::InternalError)?;
-                            let target = stanza
-                                .to()
-                                .map_err(|_| CloseOutcome::InternalError)?
-                                .ok_or(CloseOutcome::InternalError)?;
-                            handler
-                                .handle(PresenceRequest {
-                                    direction: PresenceDirection::Outbound,
-                                    kind: PresenceRequestType::Unavailable,
-                                    sender,
-                                    target,
-                                    stanza,
-                                })
-                                .await
-                        };
-                        match result {
-                            Ok(PresenceEffect::None) => None,
-                            Ok(effect @ PresenceEffect::Broadcast { .. }) => Some(effect),
-                            Ok(_) => return Err(CloseOutcome::InternalError),
-                            Err(condition) => {
-                                let routed = RoutedStanza::from_parts(stamped, arena);
-                                send_stanza_error(writer, &routed, allocator, condition).await?;
-                                return Ok(());
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let routed = RoutedStanza::from_parts(stamped, arena);
-                    (None, routed, None, effect)
-                }
-            };
-            let broadcast_stanza = effect
-                .as_ref()
-                .is_some_and(|effect| match effect {
-                    PresenceEffect::Replay { subscribers, .. }
-                    | PresenceEffect::Broadcast { subscribers, .. } => !subscribers.is_empty(),
-                    _ => false,
-                })
-                .then(|| routed.clone());
-            let change = registration
-                .set_presence(priority, routed, unavailable)
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            match effect {
-                Some(PresenceEffect::Replay {
-                    order,
-                    pending,
-                    subscribers,
-                }) => {
-                    if change.became_available {
-                        pending_replays.push_back(pending);
-                    }
-                    if let Some(stanza) = broadcast_stanza {
-                        router
-                            .broadcast_presence(&stanza, &subscribers)
-                            .await
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                    }
-                    drop(order);
-                }
-                Some(PresenceEffect::Broadcast { order, subscribers }) => {
-                    if change.became_unavailable
-                        && let Some(stanza) = broadcast_stanza
-                    {
-                        router
-                            .broadcast_presence(&stanza, &subscribers)
-                            .await
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                    }
-                    drop(order);
-                }
-                None => {
-                    if change.became_available {
-                        pending_replays.push_back(Vec::new());
-                    }
-                }
-                Some(_) => return Err(CloseOutcome::InternalError),
-            }
-            Ok(())
         }
         StanzaType::Message(kind) => {
             let routed = stamp_client_stanza(parsed, registration)?;
@@ -1581,18 +1411,125 @@ async fn handle_bound_stanza<A: ChunkAllocator + Clone>(
     }
 }
 
-async fn handle_directed_presence<A: ChunkAllocator + Clone>(
+async fn handle_presence_update<A: ChunkAllocator + Clone>(
     parsed: Parsed<Stanza, A>,
-    kind: PresenceRequestType,
-    outbound: &dyn PresenceHandler<A>,
+    available: bool,
+    writer: &mut FuturesBufWriter<TlsWriter>,
     registration: &Registration<A>,
     router: &RouterHandle<A>,
+    allocator: &A,
+    pending_replays: &mut VecDeque<Vec<PendingSubscription>>,
+) -> Result<(), CloseOutcome> {
+    let priority = if available {
+        let stanza = parsed
+            .value()
+            .resolve(parsed.arena())
+            .map_err(|_| CloseOutcome::InternalError)?;
+        match presence_priority(&stanza) {
+            Ok(priority) => Some(priority),
+            Err(condition) => {
+                let routed = stamp_client_stanza(parsed, registration)?;
+                return send_stanza_error(writer, &routed, allocator, condition).await;
+            }
+        }
+    } else {
+        None
+    };
+    let (source, mut arena) = parsed.into_parts();
+    let (stamped, from, to) = stamp_client_stanza_in(source, &mut arena, registration, true)?;
+    let unavailable = if available {
+        Some(
+            Stanza::builder_in(
+                StanzaType::Presence(PresenceType::Unavailable),
+                StanzaNamespace::Client,
+                &mut arena,
+            )
+            .from(Some(from))
+            .map_err(|_| CloseOutcome::InternalError)?
+            .to(to)
+            .map_err(|_| CloseOutcome::InternalError)?
+            .build()
+            .map_err(|_| CloseOutcome::InternalError)?,
+        )
+    } else {
+        None
+    };
+    let kind = if available {
+        PresenceRequestType::Available
+    } else {
+        PresenceRequestType::Unavailable
+    };
+    let result = match router
+        .presence_handlers(registration.account().domain())
+        .and_then(|handlers| handlers.find(kind))
+    {
+        None => Ok(None),
+        Some(handler) => {
+            let sender = from
+                .resolve(&arena)
+                .map_err(|_| CloseOutcome::InternalError)?;
+            handler.update(PresenceUpdate { sender, available }).await
+        }
+    };
+    let mut broadcast = match result {
+        Ok(broadcast) => broadcast,
+        Err(condition) => {
+            let routed = RoutedStanza::from_parts(stamped, arena);
+            return send_stanza_error(writer, &routed, allocator, condition).await;
+        }
+    };
+    let (routed, unavailable) = match unavailable {
+        Some(unavailable) => {
+            let (routed, unavailable) = RoutedStanza::from_parts_pair(stamped, unavailable, arena);
+            (routed, Some(unavailable))
+        }
+        None => (RoutedStanza::from_parts(stamped, arena), None),
+    };
+    let broadcast_stanza = broadcast
+        .as_ref()
+        .is_some_and(|broadcast| !broadcast.subscribers.is_empty())
+        .then(|| routed.clone());
+    let change = registration
+        .set_presence(priority, routed, unavailable)
+        .await
+        .map_err(|_| CloseOutcome::InternalError)?;
+    if change.became_available {
+        pending_replays.push_back(
+            broadcast
+                .as_mut()
+                .map(|broadcast| mem::take(&mut broadcast.pending))
+                .unwrap_or_default(),
+        );
+    }
+    if let Some(broadcast) = broadcast
+        && (available || change.became_unavailable)
+        && let Some(stanza) = broadcast_stanza
+    {
+        router
+            .broadcast_presence(&stanza, &broadcast.subscribers)
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+    }
+    Ok(())
+}
+
+async fn handle_subscription_presence<A: ChunkAllocator + Clone>(
+    parsed: Parsed<Stanza, A>,
+    kind: PresenceRequestType,
     writer: &mut FuturesBufWriter<TlsWriter>,
+    registration: &Registration<A>,
+    router: &RouterHandle<A>,
     allocator: &A,
 ) -> Result<(), CloseOutcome> {
+    let Some(sender_host) = router
+        .presence_handlers(registration.account().domain())
+        .and_then(|handlers| handlers.find(kind))
+    else {
+        return Ok(());
+    };
     let (source, mut arena) = parsed.into_parts();
     let (source, sender, _) = stamp_client_stanza_in(source, &mut arena, registration, false)?;
-    let result = {
+    let authorized = {
         let stanza = source
             .resolve(&arena)
             .map_err(|_| CloseOutcome::InternalError)?;
@@ -1603,9 +1540,8 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             .to()
             .map_err(|_| CloseOutcome::InternalError)?
             .ok_or(CloseOutcome::InternalError)?;
-        outbound
-            .handle(PresenceRequest {
-                direction: PresenceDirection::Outbound,
+        sender_host
+            .authorize(PresenceRequest {
                 kind,
                 sender,
                 target,
@@ -1613,27 +1549,9 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             })
             .await
     };
-    match result {
-        Err(condition) => {
-            let source = RoutedStanza::from_parts(source, arena);
-            send_stanza_error(writer, &source, allocator, condition).await?;
-            return Ok(());
-        }
-        Ok(PresenceEffect::None) => return Ok(()),
-        Ok(PresenceEffect::Route) => {}
-        Ok(
-            PresenceEffect::Accept
-            | PresenceEffect::CancelSubscription(_)
-            | PresenceEffect::WithdrawSubscription(_)
-            | PresenceEffect::AutoApproveSubscription(_)
-            | PresenceEffect::DeliverThenPushSenderRoster(_)
-            | PresenceEffect::DeliverThenPushRoster(_)
-            | PresenceEffect::Replay { .. }
-            | PresenceEffect::Broadcast { .. }
-            | PresenceEffect::PushRoster(_),
-        ) => {
-            return Err(CloseOutcome::InternalError);
-        }
+    if let Err(condition) = authorized {
+        let source = RoutedStanza::from_parts(source, arena);
+        return send_stanza_error(writer, &source, allocator, condition).await;
     }
     let routed = source
         .derive_in(&mut arena)
@@ -1643,7 +1561,7 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
         .bare_to()
         .build()
         .map_err(|_| CloseOutcome::InternalError)?;
-    let inbound = {
+    let received = {
         let stanza = routed
             .resolve(&arena)
             .map_err(|_| CloseOutcome::InternalError)?;
@@ -1657,12 +1575,11 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             .ok_or(CloseOutcome::InternalError)?;
         match router
             .presence_handlers(target.domainpart())
-            .and_then(|handlers| handlers.find(PresenceDirection::Inbound, kind))
+            .and_then(|handlers| handlers.find(kind))
         {
-            Some(handler) => {
-                handler
-                    .handle(PresenceRequest {
-                        direction: PresenceDirection::Inbound,
+            Some(target_host) => {
+                target_host
+                    .receive(PresenceRequest {
                         kind,
                         sender,
                         target,
@@ -1673,286 +1590,108 @@ async fn handle_directed_presence<A: ChunkAllocator + Clone>(
             None => Err(StanzaErrorCondition::ServiceUnavailable),
         }
     };
-    match inbound {
-        Err(condition) => {
-            let source = RoutedStanza::from_parts(source, arena);
-            send_stanza_error(writer, &source, allocator, condition).await
+    let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
+    match received {
+        Err(condition) => send_stanza_error(writer, &source, allocator, condition).await,
+        Ok(effect) => {
+            apply_subscription_effect(effect, &routed, registration, router, allocator).await
         }
-        Ok(PresenceEffect::None) => Ok(()),
-        Ok(PresenceEffect::Accept) => {
-            let source = RoutedStanza::from_parts(source, arena);
-            apply_accepted_presence(&source, outbound, registration, router, writer, allocator)
-                .await
-        }
-        Ok(PresenceEffect::AutoApproveSubscription(delivery)) => {
-            if let Some(push) = delivery.into_push() {
-                let recipient = {
-                    let stanza = routed
-                        .resolve(&arena)
-                        .map_err(|_| CloseOutcome::InternalError)?;
-                    let to = stanza
-                        .to()
-                        .map_err(|_| CloseOutcome::InternalError)?
-                        .ok_or(CloseOutcome::InternalError)?;
-                    AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
-                };
-                let approval = automatic_subscription_approval(routed, &mut arena)?;
-                let approval = RoutedStanza::from_parts(approval, arena);
-                router
-                    .route_presence_to_interested(approval)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                push.with_mutation(|mutation| async {
-                    super::iq::route_roster_mutation(
-                        mutation,
-                        registration.account(),
-                        router,
-                        allocator,
-                    )
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                    router
-                        .route_current_presence(&recipient, registration.account())
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)
-                })
-                .await?;
-            }
-            Ok(())
-        }
-        Ok(PresenceEffect::DeliverThenPushSenderRoster(delivery)) => {
-            let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
-            match router.route_presence(routed).await {
-                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
-                Err(error) => {
-                    drop(delivery);
-                    let condition = match error {
-                        RouterError::InvalidTarget | RouterError::InvalidResource => {
-                            StanzaErrorCondition::BadRequest
-                        }
-                        RouterError::RemoteUnsupported => StanzaErrorCondition::ServiceUnavailable,
-                        RouterError::ResourceLimit
-                        | RouterError::Unavailable
-                        | RouterError::Stopped => StanzaErrorCondition::InternalServerError,
-                        RouterError::NotFound | RouterError::Busy => unreachable!(),
-                    };
-                    return send_stanza_error(writer, &source, allocator, condition).await;
-                }
-            }
-            if let Some(push) = delivery.into_push() {
-                super::iq::route_roster_push(push, registration.account(), router, allocator)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            Ok(())
-        }
-        Ok(PresenceEffect::DeliverThenPushRoster(push)) => {
-            let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
-            let target = {
-                let stanza = routed.resolve().map_err(|_| CloseOutcome::InternalError)?;
-                let target = stanza
-                    .to()
-                    .map_err(|_| CloseOutcome::InternalError)?
-                    .ok_or(CloseOutcome::InternalError)?;
-                AccountKey::try_from(target.bare()).map_err(|_| CloseOutcome::InternalError)?
-            };
-            router
-                .route_presence_to_interested(routed)
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            super::iq::route_roster_push(push, &target, router, allocator)
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            apply_accepted_presence(&source, outbound, registration, router, writer, allocator)
-                .await
-        }
-        Ok(PresenceEffect::CancelSubscription(cancellation)) => {
-            let (_order, outcome) = cancellation.into_parts();
-            if !outcome.route {
-                if let Some(mutation) = outcome.grantor {
-                    super::iq::route_roster_mutation(
-                        mutation,
-                        registration.account(),
-                        router,
-                        allocator,
-                    )
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                }
-                return Ok(());
-            }
-            let subscriber = {
-                let stanza = routed
-                    .resolve(&arena)
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                let target = stanza
-                    .to()
-                    .map_err(|_| CloseOutcome::InternalError)?
-                    .ok_or(CloseOutcome::InternalError)?;
-                AccountKey::try_from(target.bare()).map_err(|_| CloseOutcome::InternalError)?
-            };
-            if outcome.send_unavailable {
-                router
-                    .route_unavailable_presence(registration.account(), &subscriber)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            router
-                .route_presence_to_interested(RoutedStanza::from_parts(routed, arena))
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            if let Some(mutation) = outcome.subscriber {
-                super::iq::route_roster_mutation(mutation, &subscriber, router, allocator)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            if let Some(mutation) = outcome.grantor {
-                super::iq::route_roster_mutation(
-                    mutation,
-                    registration.account(),
-                    router,
-                    allocator,
-                )
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            Ok(())
-        }
-        Ok(PresenceEffect::WithdrawSubscription(withdrawal)) => {
-            let (_order, outcome) = withdrawal.into_parts();
-            let recipient = {
-                let stanza = routed
-                    .resolve(&arena)
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                let target = stanza
-                    .to()
-                    .map_err(|_| CloseOutcome::InternalError)?
-                    .ok_or(CloseOutcome::InternalError)?;
-                AccountKey::try_from(target.bare()).map_err(|_| CloseOutcome::InternalError)?
-            };
-            if outcome.notify_contact {
-                router
-                    .route_presence_to_interested(RoutedStanza::from_parts(routed, arena))
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            if let Some(mutation) = outcome.contact {
-                super::iq::route_roster_mutation(mutation, &recipient, router, allocator)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            if let Some(mutation) = outcome.subscriber {
-                super::iq::route_roster_mutation(
-                    mutation,
-                    registration.account(),
-                    router,
-                    allocator,
-                )
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            if outcome.notify_contact {
-                router
-                    .route_unavailable_presence(&recipient, registration.account())
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-            }
-            Ok(())
-        }
-        Ok(
-            PresenceEffect::Route
-            | PresenceEffect::Replay { .. }
-            | PresenceEffect::Broadcast { .. }
-            | PresenceEffect::PushRoster(_),
-        ) => Err(CloseOutcome::InternalError),
     }
 }
 
-async fn apply_accepted_presence<A: ChunkAllocator + Clone>(
-    source: &RoutedStanza<A>,
-    outbound: &dyn PresenceHandler<A>,
+async fn apply_subscription_effect<A: ChunkAllocator + Clone>(
+    effect: SubscriptionEffect,
+    routed: &RoutedStanza<A>,
     registration: &Registration<A>,
     router: &RouterHandle<A>,
-    writer: &mut FuturesBufWriter<TlsWriter>,
     allocator: &A,
 ) -> Result<(), CloseOutcome> {
-    let (accepted, target, kind) = {
-        let stanza = source.resolve().map_err(|_| CloseOutcome::InternalError)?;
-        let StanzaType::Presence(presence_type) = stanza.stanza_type() else {
-            return Err(CloseOutcome::InternalError);
-        };
-        let kind = PresenceRequestType::from_subscription_stanza(presence_type)
-            .ok_or(CloseOutcome::InternalError)?;
-        let sender = stanza
-            .from()
-            .map_err(|_| CloseOutcome::InternalError)?
-            .ok_or(CloseOutcome::InternalError)?;
-        let target = stanza
+    let (_order, steps) = effect.into_parts();
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let target = {
+        let view = routed.resolve().map_err(|_| CloseOutcome::InternalError)?;
+        let target = view
             .to()
             .map_err(|_| CloseOutcome::InternalError)?
             .ok_or(CloseOutcome::InternalError)?;
-        let target_account =
-            AccountKey::try_from(target.bare()).map_err(|_| CloseOutcome::InternalError)?;
-        let accepted = outbound
-            .accepted(AcceptedPresence {
-                direction: PresenceDirection::Outbound,
-                kind,
-                sender,
-                target,
-            })
-            .await;
-        (accepted, target_account, kind)
+        AccountKey::try_from(target.bare()).map_err(|_| CloseOutcome::InternalError)?
     };
-    match accepted {
-        Err(condition) => send_stanza_error(writer, source, allocator, condition).await,
-        Ok(PresenceEffect::None | PresenceEffect::PushRoster(None)) => Ok(()),
-        Ok(PresenceEffect::PushRoster(Some(push))) => {
-            push.with_mutation(|mutation| async {
-                super::iq::route_roster_mutation(
-                    mutation,
-                    registration.account(),
-                    router,
-                    allocator,
-                )
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-                if kind == PresenceRequestType::Subscribed {
-                    router
-                        .route_current_presence(registration.account(), &target)
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
+    let account = |party| match party {
+        Party::Sender => registration.account(),
+        Party::Target => &target,
+    };
+    for step in steps {
+        let delivered = match step {
+            SubscriptionStep::DeliverToAvailable => {
+                match router.route_presence(routed.clone()).await {
+                    Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
+                    Err(error) => Err(error),
                 }
-                Ok(())
-            })
-            .await
-        }
-        Ok(
-            PresenceEffect::Route
-            | PresenceEffect::Accept
-            | PresenceEffect::CancelSubscription(_)
-            | PresenceEffect::WithdrawSubscription(_)
-            | PresenceEffect::AutoApproveSubscription(_)
-            | PresenceEffect::DeliverThenPushSenderRoster(_)
-            | PresenceEffect::DeliverThenPushRoster(_)
-            | PresenceEffect::Replay { .. }
-            | PresenceEffect::Broadcast { .. },
-        ) => Err(CloseOutcome::InternalError),
+            }
+            SubscriptionStep::DeliverToInterested => {
+                router.route_presence_to_interested(routed.clone()).await
+            }
+            SubscriptionStep::ApproveSender => {
+                let approval = subscription_approval(routed, allocator)?;
+                router.route_presence_to_interested(approval).await
+            }
+            SubscriptionStep::PushRoster(party, mutation) => {
+                super::iq::route_roster_push(mutation, account(party), router, allocator).await
+            }
+            SubscriptionStep::DeliverCurrentPresence { from, to } => {
+                router
+                    .route_current_presence(account(from), account(to))
+                    .await
+            }
+            SubscriptionStep::DeliverUnavailablePresence { from, to } => {
+                router
+                    .route_unavailable_presence(account(from), account(to))
+                    .await
+            }
+        };
+        delivered.map_err(|_| CloseOutcome::InternalError)?;
     }
+    Ok(())
 }
 
-fn automatic_subscription_approval<A: ChunkAllocator>(
-    request: Stanza,
-    arena: &mut Arena<A>,
-) -> Result<Stanza, CloseOutcome> {
-    request
-        .derive_in(arena)
+/// Builds the `subscribed` reply the server sends on behalf of the request target.
+fn subscription_approval<A: ChunkAllocator + Clone>(
+    request: &RoutedStanza<A>,
+    allocator: &A,
+) -> Result<RoutedStanza<A>, CloseOutcome> {
+    let mut arena = Arena::try_new_in(Default::default(), allocator.clone())
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let view = request.resolve().map_err(|_| CloseOutcome::InternalError)?;
+    let from = view
+        .to()
         .map_err(|_| CloseOutcome::InternalError)?
-        .stanza_type(StanzaType::Presence(PresenceType::Subscribed))
-        .swap_addresses()
-        .clear_attributes()
-        .clear_children()
-        .build()
-        .map_err(|_| CloseOutcome::InternalError)
+        .ok_or(CloseOutcome::InternalError)?
+        .clone_in(&mut arena)
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let to = view
+        .from()
+        .map_err(|_| CloseOutcome::InternalError)?
+        .ok_or(CloseOutcome::InternalError)?
+        .clone_in(&mut arena)
+        .map_err(|_| CloseOutcome::InternalError)?;
+    let approval = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Subscribed),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .id(view.id().map_err(|_| CloseOutcome::InternalError)?)
+    .map_err(|_| CloseOutcome::InternalError)?
+    .lang(view.lang().map_err(|_| CloseOutcome::InternalError)?)
+    .map_err(|_| CloseOutcome::InternalError)?
+    .from(Some(from))
+    .map_err(|_| CloseOutcome::InternalError)?
+    .to(Some(to))
+    .map_err(|_| CloseOutcome::InternalError)?
+    .build()
+    .map_err(|_| CloseOutcome::InternalError)?;
+    Ok(RoutedStanza::from_parts(approval, arena))
 }
 
 fn c2s_namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Option<CloseOutcome> {
@@ -2056,26 +1795,6 @@ fn stamp_client_stanza_in<A: ChunkAllocator>(
     }
     let stanza = builder.build().map_err(|_| CloseOutcome::InternalError)?;
     Ok((stanza, from, to))
-}
-
-fn stamp_available_presence<A: ChunkAllocator>(
-    parsed: Parsed<Stanza, A>,
-    registration: &Registration<A>,
-) -> Result<(Stanza, Stanza, Arena<A>), CloseOutcome> {
-    let (stanza, mut arena) = parsed.into_parts();
-    let (available, from, to) = stamp_client_stanza_in(stanza, &mut arena, registration, true)?;
-    let unavailable = Stanza::builder_in(
-        StanzaType::Presence(PresenceType::Unavailable),
-        StanzaNamespace::Client,
-        &mut arena,
-    )
-    .from(Some(from))
-    .map_err(|_| CloseOutcome::InternalError)?
-    .to(to)
-    .map_err(|_| CloseOutcome::InternalError)?
-    .build()
-    .map_err(|_| CloseOutcome::InternalError)?;
-    Ok((available, unavailable, arena))
 }
 
 async fn parse_pending_subscription<A: ChunkAllocator + Clone>(

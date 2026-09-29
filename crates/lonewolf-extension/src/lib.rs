@@ -11,8 +11,7 @@ pub mod presence;
 pub mod roster;
 
 use iq::{IqRegistration, IqRegistry, IqRoute};
-use presence::PresenceRoute;
-use presence::{PresenceRegistration, PresenceRegistry};
+use presence::{PresenceRegistration, PresenceRegistry, PresenceRequestType};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum RegistrationError {
@@ -20,7 +19,7 @@ pub enum RegistrationError {
     DuplicateExtension(&'static str),
     UnknownExtension(String),
     DuplicateRoute(IqRoute),
-    DuplicatePresenceRoute(PresenceRoute),
+    DuplicatePresenceRoute(PresenceRequestType),
 }
 
 impl fmt::Display for RegistrationError {
@@ -122,7 +121,7 @@ impl<A: ChunkAllocator> Extensions<A> {
                 enabled.iq.register(handler.clone())?;
             }
             for handler in handlers.presence.registrations() {
-                enabled.presence.register(handler.clone())?;
+                enabled.presence.register(handler)?;
             }
         }
         Ok(enabled)

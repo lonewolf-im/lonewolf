@@ -7,8 +7,7 @@ use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute, IqScope,
 };
 use lonewolf_extension::presence::{
-    PresenceDirection, PresenceFuture, PresenceHandler, PresenceRegistration, PresenceRequest,
-    PresenceRequestType, PresenceRoute,
+    PresenceFuture, PresenceHandler, PresenceRegistration, PresenceRequest, PresenceRequestType,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
@@ -91,24 +90,13 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>>> {
             PresenceRequestType::Unsubscribe,
             PresenceRequestType::Unsubscribed,
         ]
-        .map(|kind| {
-            PresenceRegistration::new(
-                PresenceRoute {
-                    direction: PresenceDirection::Outbound,
-                    kind,
-                },
-                Arc::new(VerifyPresence),
-            )
-        }),
+        .map(|kind| PresenceRegistration::new(kind, Arc::new(VerifyPresence))),
     )?;
     extensions.register(
         "test-conflicting-presence",
         [],
         [PresenceRegistration::new(
-            PresenceRoute {
-                direction: PresenceDirection::Outbound,
-                kind: PresenceRequestType::Subscribe,
-            },
+            PresenceRequestType::Subscribe,
             Arc::new(VerifyPresence),
         )],
     )?;
@@ -124,7 +112,7 @@ struct Deny;
 struct VerifyPresence;
 
 impl<A: ChunkAllocator> PresenceHandler<A> for VerifyPresence {
-    fn handle<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a> {
+    fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
         Box::pin(async move {
             compio::time::sleep(std::time::Duration::from_millis(1)).await;
             let stanza_sender = request
@@ -145,8 +133,7 @@ impl<A: ChunkAllocator> PresenceHandler<A> for VerifyPresence {
                 PresenceRequestType::Unsubscribe => PresenceType::Unsubscribe,
                 PresenceRequestType::Unsubscribed => PresenceType::Unsubscribed,
             };
-            if request.direction == PresenceDirection::Outbound
-                && request.sender.as_str() == "alice@localhost/desk"
+            if request.sender.as_str() == "alice@localhost/desk"
                 && stanza_sender == request.sender
                 && stanza_target == request.target
                 && request.stanza.stanza_type() == StanzaType::Presence(stanza_kind)

@@ -4,12 +4,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lonewolf_storage::roster::{RosterItem, RosterMutation};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
 
 pub use crate::RegistrationError;
-use crate::roster::{RosterOrder, RosterPush};
+use crate::roster::RosterOrder;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IqScope {
@@ -40,12 +41,14 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
+/// A side effect the server applies after a successful IQ request.
+/// The order guard is released once the effect has been applied.
 #[derive(Default)]
 pub enum IqEffect {
     #[default]
     None,
     MarkRosterInterested(RosterOrder),
-    PushRoster(RosterPush),
+    PushRoster(RosterOrder, RosterMutation<RosterItem>),
 }
 
 pub struct IqResponse {

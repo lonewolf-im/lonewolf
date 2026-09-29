@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::iq::{IqEffect, IqRequest, IqRequestType, IqScope};
-use lonewolf_extension::roster::RosterPush;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{RosterItem, RosterMutation};
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
@@ -145,23 +144,13 @@ async fn apply_effect<A: ChunkAllocator + Clone>(
     match effect {
         IqEffect::None => Ok(()),
         IqEffect::MarkRosterInterested(_order) => registration.mark_roster_interested().await,
-        IqEffect::PushRoster(push) => {
-            route_roster_push(push, registration.account(), router, allocator).await
+        IqEffect::PushRoster(_order, mutation) => {
+            route_roster_push(mutation, registration.account(), router, allocator).await
         }
     }
 }
 
 pub(super) async fn route_roster_push<A: ChunkAllocator + Clone>(
-    push: RosterPush,
-    account: &AccountKey,
-    router: &RouterHandle<A>,
-    allocator: &A,
-) -> Result<(), RouterError> {
-    let (_order, mutation) = push.into_parts();
-    route_roster_mutation(mutation, account, router, allocator).await
-}
-
-pub(super) async fn route_roster_mutation<A: ChunkAllocator + Clone>(
     mutation: RosterMutation<RosterItem>,
     account: &AccountKey,
     router: &RouterHandle<A>,

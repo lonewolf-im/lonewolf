@@ -7,10 +7,7 @@ use lonewolf_util::arena::{Arena, GlobalChunkAllocator};
 use super::iq::{
     IqFuture, IqHandler, IqRegistration, IqRequest, IqRequestType, IqResponse, IqRoute, IqScope,
 };
-use super::presence::{
-    PresenceDirection, PresenceEffect, PresenceFuture, PresenceHandler, PresenceRegistration,
-    PresenceRequest, PresenceRequestType, PresenceRoute,
-};
+use super::presence::{PresenceHandler, PresenceRegistration, PresenceRequestType};
 use super::{Extensions, RegistrationError};
 
 const ROUTE: IqRoute = IqRoute {
@@ -18,11 +15,6 @@ const ROUTE: IqRoute = IqRoute {
     kind: IqRequestType::Get,
     namespace: "urn:test:iq",
     name: "query",
-};
-
-const PRESENCE_ROUTE: PresenceRoute = PresenceRoute {
-    direction: PresenceDirection::Outbound,
-    kind: PresenceRequestType::Subscribe,
 };
 
 struct Empty;
@@ -43,15 +35,11 @@ fn handler() -> IqRegistration<GlobalChunkAllocator> {
     IqRegistration::new(ROUTE, Arc::new(Empty))
 }
 
-fn presence_handler(route: PresenceRoute) -> PresenceRegistration<GlobalChunkAllocator> {
-    PresenceRegistration::new(route, Arc::new(EmptyPresence))
+fn presence_handler(kind: PresenceRequestType) -> PresenceRegistration<GlobalChunkAllocator> {
+    PresenceRegistration::new(kind, Arc::new(EmptyPresence))
 }
 
-impl PresenceHandler<GlobalChunkAllocator> for EmptyPresence {
-    fn handle<'a>(&'a self, _: PresenceRequest<'a, GlobalChunkAllocator>) -> PresenceFuture<'a> {
-        Box::pin(async { Ok(PresenceEffect::None) })
-    }
-}
+impl PresenceHandler<GlobalChunkAllocator> for EmptyPresence {}
 
 #[test]
 fn conflicting_extensions_cannot_be_enabled_together() -> Result<(), RegistrationError> {
@@ -134,43 +122,60 @@ fn repeated_activation_is_rejected_even_without_iq_handlers() -> Result<(), Regi
 #[test]
 fn conflicting_presence_extensions_cannot_be_enabled_together() -> Result<(), RegistrationError> {
     let mut extensions = Extensions::default();
-    extensions.register("first", [], [presence_handler(PRESENCE_ROUTE)])?;
-    extensions.register("second", [], [presence_handler(PRESENCE_ROUTE)])?;
+    extensions.register(
+        "first",
+        [],
+        [presence_handler(PresenceRequestType::Subscribe)],
+    )?;
+    extensions.register(
+        "second",
+        [],
+        [presence_handler(PresenceRequestType::Subscribe)],
+    )?;
     assert!(matches!(
         extensions.enable(["first", "second"]),
-        Err(RegistrationError::DuplicatePresenceRoute(PRESENCE_ROUTE))
+        Err(RegistrationError::DuplicatePresenceRoute(
+            PresenceRequestType::Subscribe
+        ))
     ));
     assert!(matches!(
         extensions.enable(["second", "first"]),
-        Err(RegistrationError::DuplicatePresenceRoute(PRESENCE_ROUTE))
+        Err(RegistrationError::DuplicatePresenceRoute(
+            PresenceRequestType::Subscribe
+        ))
     ));
     Ok(())
 }
 
 #[test]
-fn presence_direction_selects_a_distinct_handler() -> Result<(), RegistrationError> {
-    let inbound = PresenceRoute {
-        direction: PresenceDirection::Inbound,
-        ..PRESENCE_ROUTE
-    };
+fn presence_kinds_select_distinct_handlers() -> Result<(), RegistrationError> {
     let mut extensions = Extensions::default();
     extensions.register(
         "example",
         [],
-        [presence_handler(PRESENCE_ROUTE), presence_handler(inbound)],
+        [
+            presence_handler(PresenceRequestType::Subscribe),
+            presence_handler(PresenceRequestType::Subscribed),
+        ],
     )?;
     let enabled = extensions.enable(["example"])?;
     assert!(
         enabled
             .presence()
-            .find(PRESENCE_ROUTE.direction, PRESENCE_ROUTE.kind)
+            .find(PresenceRequestType::Subscribe)
             .is_some()
     );
     assert!(
         enabled
             .presence()
-            .find(inbound.direction, inbound.kind)
+            .find(PresenceRequestType::Subscribed)
             .is_some()
+    );
+    assert!(
+        enabled
+            .presence()
+            .find(PresenceRequestType::Unsubscribe)
+            .is_none()
     );
     Ok(())
 }

@@ -1217,6 +1217,7 @@ dependencies = [
  "lonewolf-storage",
  "lonewolf-util",
  "lonewolf-xmpp",
+ "smallvec",
  "tempfile",
 ]
 

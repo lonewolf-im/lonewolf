@@ -169,6 +169,17 @@ fn roster_retrieval_tags_the_requesting_session_as_interested() {
 #[test]
 fn roster_update_pushes_the_item_to_interested_resources() {
     let (_directory, roster) = roster();
+    let mut arena =
+        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+    let alice =
+        Jid::parse_in("alice@example.com", &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let alice = AccountKey::try_from(
+        alice
+            .resolve(&arena)
+            .unwrap_or_else(|error| panic!("{error}")),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    create_account(&roster, &alice);
     let delivery = RecordingDelivery::default();
     handle_iq(&roster, IqRequestType::Set, "bob@example.com", &delivery);
     assert!(delivery.tags.borrow().is_empty());

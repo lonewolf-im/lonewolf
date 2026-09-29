@@ -20,8 +20,8 @@ pub(crate) struct CleanupRequest {
     done: oneshot::Sender<Result<(), ObserverError>>,
 }
 
-/// Forwards pending account deletions from the admin service to the core runtime,
-/// where the extensions can run, and completes the request once they have.
+/// Forwards account deletions from the admin service to the core runtime, where the
+/// extensions can run, and completes the request once they have.
 pub(crate) struct AccountCleanup {
     requests: Sender<CleanupRequest>,
 }
@@ -32,7 +32,7 @@ pub(crate) fn channel() -> (Arc<AccountCleanup>, Receiver<CleanupRequest>) {
 }
 
 impl AccountObserver for AccountCleanup {
-    fn deleting<'a>(
+    fn deleted<'a>(
         &'a self,
         account: &'a AccountKey,
     ) -> Pin<Box<dyn Future<Output = Result<(), ObserverError>> + Send + 'a>> {
@@ -66,10 +66,7 @@ pub(crate) async fn run<A: ChunkAllocator + Clone>(
     while let Ok(request) = requests.recv().await {
         let mut result = Ok(());
         for extension in router.extensions(request.account.domain()) {
-            if let Err(error) = extension
-                .account_deleting(&request.account, &delivery)
-                .await
-            {
+            if let Err(error) = extension.account_deleted(&request.account, &delivery).await {
                 tracing::error!(
                     extension = extension.name(),
                     error = ?error,

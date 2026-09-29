@@ -10,10 +10,11 @@ pub type ObserverError = Box<dyn Error + Send + Sync>;
 
 /// Follows account changes on behalf of subsystems that keep state per account.
 pub trait AccountObserver: Send + Sync {
-    /// Runs before an existing account's record is deleted, while the record still
-    /// blocks a new account with the same JID. An error aborts the deletion and is
-    /// reported as an internal error, so a retry runs this again.
-    fn deleting<'a>(
+    /// Runs after an account's record was deleted, while the service still holds the
+    /// account's lifecycle lock so no account with the same JID can be created until
+    /// it returns. It also runs when the record was already gone, so a retry can
+    /// finish an earlier failure. An error is reported as an internal error.
+    fn deleted<'a>(
         &'a self,
         account: &'a AccountKey,
     ) -> Pin<Box<dyn Future<Output = Result<(), ObserverError>> + Send + 'a>>;
@@ -23,7 +24,7 @@ pub trait AccountObserver: Send + Sync {
 pub struct NoopObserver;
 
 impl AccountObserver for NoopObserver {
-    fn deleting<'a>(
+    fn deleted<'a>(
         &'a self,
         _: &'a AccountKey,
     ) -> Pin<Box<dyn Future<Output = Result<(), ObserverError>> + Send + 'a>> {

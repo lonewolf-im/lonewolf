@@ -252,10 +252,10 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         Ok(())
     }
 
-    /// Clears every trace of an account about to be deleted: its own roster and
-    /// pending requests, and the subscriptions and requests its local contacts held
-    /// with it. Storage is cleaned even when a notification fails; the first delivery
-    /// failure is returned afterwards.
+    /// Clears every trace of a deleted account: its own roster and pending requests,
+    /// and the subscriptions and requests its local contacts held with it. Storage is
+    /// cleaned even when a notification fails; the first delivery failure is returned
+    /// afterwards.
     pub(super) async fn forget_account<A: ChunkAllocator>(
         &self,
         account: &AccountKey,

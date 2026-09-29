@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::borrow::Cow;
+use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_lock::Mutex;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Path, Request, State};
@@ -32,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_BODY: usize = 16 * 1024;
+const LIFECYCLE_SHARDS: usize = 64;
 const MAX_PAGE: usize = 100;
 const DEFAULT_PAGE: usize = 50;
 
@@ -103,6 +106,7 @@ async fn create_account<R: AccountRepository>(
     SensitiveJson(input): SensitiveJson<CreateAccount>,
 ) -> Result<Response, ApiError> {
     let key = account_key(&input.jid)?;
+    let _lifecycle = api.lifecycle(&key).lock().await;
     let response = json(StatusCode::CREATED, &AccountView { jid: key.as_str() })?;
     let credentials = api.credentials(input.password).await?;
     api.accounts.create(NewAccount { key, credentials }).await?;
@@ -130,15 +134,22 @@ async fn delete_account<R: AccountRepository>(
     State(api): State<Arc<Api<R>>>,
     AccountPath(key): AccountPath,
 ) -> Result<Response, ApiError> {
-    if api.accounts.get(&key).await?.is_none() {
-        return Err(ApiError::not_found());
-    }
-    api.observer.deleting(&key).await.map_err(|error| {
-        tracing::error!(error = %error, "account cleanup failed, deletion aborted");
+    let _lifecycle = api.lifecycle(&key).lock().await;
+    let existed = match api.accounts.delete(&key).await {
+        Ok(()) => true,
+        Err(AccountError::NotFound) => false,
+        Err(error) => return Err(error.into()),
+    };
+    // Cleanup also runs for a missing record so a retry can finish an earlier failure.
+    api.observer.deleted(&key).await.map_err(|error| {
+        tracing::error!(error = %error, "account cleanup failed after deletion");
         ApiError::internal()
     })?;
-    api.accounts.delete(&key).await?;
-    Ok(empty())
+    if existed {
+        Ok(empty())
+    } else {
+        Err(ApiError::not_found())
+    }
 }
 
 async fn change_password<R: AccountRepository>(
@@ -190,6 +201,9 @@ struct Api<R> {
     accounts: R,
     observer: Arc<dyn AccountObserver>,
     passwords: BlockingExecutor,
+    /// Serializes creation and deletion of the same account, including its cleanup.
+    lifecycle: [Mutex<()>; LIFECYCLE_SHARDS],
+    hash_state: RandomState,
 }
 
 impl<R: AccountRepository> Api<R> {
@@ -198,7 +212,13 @@ impl<R: AccountRepository> Api<R> {
             accounts,
             observer,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
+            lifecycle: [const { Mutex::new(()) }; LIFECYCLE_SHARDS],
+            hash_state: RandomState::new(),
         }
+    }
+
+    fn lifecycle(&self, key: &AccountKey) -> &Mutex<()> {
+        &self.lifecycle[(self.hash_state.hash_one(key) as usize) % LIFECYCLE_SHARDS]
     }
 
     async fn list(&self, query: Option<&str>) -> Result<Response, ApiError> {

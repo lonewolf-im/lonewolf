@@ -2473,6 +2473,10 @@ fn account_deletion_clears_the_roster_and_notifies_contacts() -> TestResult {
         "charlie-roster-after",
         "<iq xmlns='jabber:client' type='result' id='charlie-roster-after' to='charlie@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='none'/></query></iq>",
     )?;
+    alice.send("<iq type='set' id='ghost-add'><query xmlns='jabber:iq:roster'><item jid='dave@localhost'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='ghost-add' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='dave@localhost'/></query><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.send("<presence type='subscribe' id='ghost-request' to='bob@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='ghost-request' from='bob@localhost' to='alice@localhost/desk'><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
     alice.close()?;
 
     suite.create_account("alice", "password")?;

@@ -111,7 +111,7 @@ where
         &PresenceRequestType::ALL
     }
 
-    fn account_deleting<'a>(
+    fn account_deleted<'a>(
         &'a self,
         account: &'a AccountKey,
         delivery: &'a dyn Delivery<A>,
@@ -138,6 +138,10 @@ where
             }
             let owner = AccountKey::try_from(request.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            // A deleted account's remaining sessions must not repopulate roster state.
+            if request.kind == IqRequestType::Set && !self.account_exists(&owner).await? {
+                return Err(StanzaErrorCondition::Forbidden.into());
+            }
             match request.kind {
                 IqRequestType::Get => {
                     xml::validate_get(request.payload)?;
@@ -210,6 +214,12 @@ where
 
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
         Box::pin(async move {
+            let sender = AccountKey::try_from(request.sender.bare())
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            // A deleted account's remaining sessions must not repopulate roster state.
+            if !self.account_exists(&sender).await? {
+                return Err(StanzaErrorCondition::Forbidden);
+            }
             if request.kind != PresenceRequestType::Subscribe {
                 return Ok(());
             }

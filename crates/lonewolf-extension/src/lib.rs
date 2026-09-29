@@ -38,9 +38,10 @@ pub trait Extension<A: ChunkAllocator>: IqHandler<A> + PresenceHandler<A> {
         &[]
     }
 
-    /// Runs before an account on a host enabling this extension is deleted.
-    /// The deletion proceeds only once every extension has returned successfully.
-    fn account_deleting<'a>(
+    /// Runs after an account on a host enabling this extension was deleted, before any
+    /// account with the same JID can be created. The deletion request completes once
+    /// every extension has returned.
+    fn account_deleted<'a>(
         &'a self,
         _account: &'a AccountKey,
         _delivery: &'a dyn Delivery<A>,

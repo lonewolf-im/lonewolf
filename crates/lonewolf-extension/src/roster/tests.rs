@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::pin::{Pin, pin};
+use std::task::{Context, Poll, Waker};
 
 use futures_executor::block_on;
 use lonewolf_auth::scram::{
@@ -23,9 +26,10 @@ use super::{NAMESPACE, Roster};
 use crate::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HandlerError, SessionTag, StanzaFactory,
 };
-use crate::iq::{IqHandler, IqRequest, IqRequestType};
+use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType};
 use crate::presence::{
     PresenceHandler, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
+    ReceiveFuture,
 };
 
 type TestRoster = Roster<RedbRosterRepository, RedbAccountRepository>;
@@ -43,8 +47,8 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         Arena::try_new(ArenaConfig::default()).map_err(|_| DeliveryError)
     }
 
-    fn is_local_host(&self, _: &str) -> bool {
-        true
+    fn is_local_host(&self, domain: &str) -> bool {
+        domain == "example.com"
     }
 
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
@@ -115,89 +119,160 @@ fn roster() -> (tempfile::TempDir, TestRoster) {
     (directory, Roster::new(repository, accounts))
 }
 
+/// A roster IQ from alice's desk whose borrowed arenas outlive the handler future.
+struct IqCall {
+    request: Arena<GlobalChunkAllocator>,
+    response: Arena<GlobalChunkAllocator>,
+    sender: Jid,
+    query: Element,
+}
+
+impl IqCall {
+    fn new(item_jid: &str) -> Self {
+        let mut request =
+            Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+        let response =
+            Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+        let sender = Jid::parse_in("alice@example.com/desk", &mut request)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let item = (!item_jid.is_empty()).then(|| {
+            Element::builder_in("item", NAMESPACE, &mut request)
+                .and_then(|item| item.attribute("jid", "", item_jid))
+                .and_then(|item| item.build())
+                .unwrap_or_else(|error| panic!("{error:?}"))
+        });
+        let mut query = Element::builder_in("query", NAMESPACE, &mut request)
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        if let Some(item) = item {
+            query = query
+                .child(item)
+                .unwrap_or_else(|error| panic!("{error:?}"));
+        }
+        let query = query.build().unwrap_or_else(|error| panic!("{error:?}"));
+        Self {
+            request,
+            response,
+            sender,
+            query,
+        }
+    }
+
+    fn handle<'a>(
+        &'a mut self,
+        roster: &'a TestRoster,
+        kind: IqRequestType,
+        delivery: &'a RecordingDelivery,
+    ) -> IqFuture<'a> {
+        let sender = self
+            .sender
+            .resolve(&self.request)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let payload = self
+            .query
+            .resolve(&self.request)
+            .unwrap_or_else(|error| panic!("{error}"));
+        IqHandler::<GlobalChunkAllocator>::handle(
+            roster,
+            IqRequest {
+                sender,
+                target: sender.bare(),
+                kind,
+                payload,
+            },
+            &mut self.response,
+            delivery,
+        )
+    }
+}
+
 fn handle_iq(
     roster: &TestRoster,
     kind: IqRequestType,
-    payload: &str,
+    item_jid: &str,
     delivery: &RecordingDelivery,
 ) -> Result<(), HandlerError> {
-    let mut request =
-        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
-    let mut response =
-        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
-    let sender = Jid::parse_in("alice@example.com/desk", &mut request)
-        .unwrap_or_else(|error| panic!("{error}"));
-    let item = (!payload.is_empty()).then(|| {
-        Element::builder_in("item", NAMESPACE, &mut request)
-            .and_then(|item| item.attribute("jid", "", payload))
-            .and_then(|item| item.build())
-            .unwrap_or_else(|error| panic!("{error:?}"))
-    });
-    let mut query = Element::builder_in("query", NAMESPACE, &mut request)
-        .unwrap_or_else(|error| panic!("{error:?}"));
-    if let Some(item) = item {
-        query = query
-            .child(item)
-            .unwrap_or_else(|error| panic!("{error:?}"));
-    }
-    let query = query.build().unwrap_or_else(|error| panic!("{error:?}"));
-    let sender = sender
-        .resolve(&request)
-        .unwrap_or_else(|error| panic!("{error}"));
-    let payload = query
-        .resolve(&request)
-        .unwrap_or_else(|error| panic!("{error}"));
-    block_on(IqHandler::<GlobalChunkAllocator>::handle(
-        roster,
-        IqRequest {
-            sender,
-            target: sender.bare(),
-            kind,
-            payload,
-        },
-        &mut response,
-        delivery,
-    ))
-    .map(|_| ())
+    let mut call = IqCall::new(item_jid);
+    block_on(call.handle(roster, kind, delivery)).map(|_| ())
 }
 
-fn authorize_subscribe(
+/// A subscription request as the target host receives it, with bare addresses.
+struct SubscribeCall {
+    stanza: RoutedStanza<GlobalChunkAllocator>,
+}
+
+impl SubscribeCall {
+    fn new(sender: &str, target: &str) -> Self {
+        let mut arena =
+            Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+        let sender = Jid::parse_in(sender, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+        let target = Jid::parse_in(target, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+        let stanza = Stanza::builder_in(
+            StanzaType::Presence(PresenceType::Subscribe),
+            StanzaNamespace::Client,
+            &mut arena,
+        )
+        .from(Some(sender))
+        .and_then(|stanza| stanza.to(Some(target)))
+        .and_then(|stanza| stanza.build())
+        .unwrap_or_else(|error| panic!("{error:?}"));
+        Self {
+            stanza: RoutedStanza::from_parts(stanza, arena),
+        }
+    }
+
+    fn receive<'a>(
+        &'a self,
+        roster: &'a TestRoster,
+        delivery: &'a RecordingDelivery,
+    ) -> ReceiveFuture<'a> {
+        let view = self
+            .stanza
+            .resolve()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let sender = view
+            .from()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("missing sender"));
+        let target = view
+            .to()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("missing target"));
+        PresenceHandler::<GlobalChunkAllocator>::receive(
+            roster,
+            PresenceRequest {
+                kind: PresenceRequestType::Subscribe,
+                sender,
+                target,
+                stanza: &self.stanza,
+            },
+            delivery,
+        )
+    }
+}
+
+fn receive_subscribe(
     roster: &TestRoster,
     sender: &str,
     target: &str,
-) -> Result<(), StanzaErrorCondition> {
+    delivery: &RecordingDelivery,
+) -> Result<(), HandlerError> {
+    let call = SubscribeCall::new(sender, target);
+    block_on(call.receive(roster, delivery))
+}
+
+fn account(jid: &str) -> AccountKey {
     let mut arena =
         Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
-    let sender = Jid::parse_in(sender, &mut arena).unwrap_or_else(|error| panic!("{error}"));
-    let target = Jid::parse_in(target, &mut arena).unwrap_or_else(|error| panic!("{error}"));
-    let stanza = Stanza::builder_in(
-        StanzaType::Presence(PresenceType::Subscribe),
-        StanzaNamespace::Client,
-        &mut arena,
+    let jid = Jid::parse_in(jid, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    AccountKey::try_from(
+        jid.resolve(&arena)
+            .unwrap_or_else(|error| panic!("{error}")),
     )
-    .from(Some(sender))
-    .and_then(|stanza| stanza.to(Some(target)))
-    .and_then(|stanza| stanza.build())
-    .unwrap_or_else(|error| panic!("{error:?}"));
-    let stanza = RoutedStanza::from_parts(stanza, arena);
-    let view = stanza.resolve().unwrap_or_else(|error| panic!("{error}"));
-    let sender = view
-        .from()
-        .unwrap_or_else(|error| panic!("{error}"))
-        .unwrap_or_else(|| panic!("missing sender"));
-    let target = view
-        .to()
-        .unwrap_or_else(|error| panic!("{error}"))
-        .unwrap_or_else(|| panic!("missing target"));
-    block_on(PresenceHandler::<GlobalChunkAllocator>::authorize(
-        roster,
-        PresenceRequest {
-            kind: PresenceRequestType::Subscribe,
-            sender,
-            target,
-            stanza: &stanza,
-        },
-    ))
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
 #[test]
@@ -261,24 +336,90 @@ fn roster_set_from_a_deleted_account_is_forbidden() {
 #[test]
 fn subscription_request_from_a_deleted_account_is_forbidden() {
     let (_directory, roster) = roster();
-    let mut arena =
-        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
-    let bob =
-        Jid::parse_in("bob@example.com", &mut arena).unwrap_or_else(|error| panic!("{error}"));
-    let bob = AccountKey::try_from(
-        bob.resolve(&arena)
-            .unwrap_or_else(|error| panic!("{error}")),
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let bob = account("bob@example.com");
     create_account(&roster, &bob);
-    assert_eq!(
-        authorize_subscribe(&roster, "alice@example.com/desk", "bob@example.com"),
-        Err(StanzaErrorCondition::Forbidden)
+    let delivery = RecordingDelivery::default();
+    let result = receive_subscribe(&roster, "alice@example.com", "bob@example.com", &delivery);
+    assert!(
+        matches!(
+            result,
+            Err(HandlerError::Stanza(StanzaErrorCondition::Forbidden))
+        ),
+        "{result:?}"
     );
-    assert_eq!(
-        authorize_subscribe(&roster, "bob@example.com/desk", "alice@example.com"),
-        Err(StanzaErrorCondition::ServiceUnavailable)
+    let result = receive_subscribe(&roster, "bob@example.com", "alice@example.com", &delivery);
+    assert!(
+        matches!(
+            result,
+            Err(HandlerError::Stanza(
+                StanzaErrorCondition::ServiceUnavailable
+            ))
+        ),
+        "{result:?}"
     );
+    let bob_roster =
+        block_on(roster.repository.snapshot(&bob)).unwrap_or_else(|error| panic!("{error}"));
+    assert!(bob_roster.items.is_empty());
+    assert!(delivery.pushes.borrow().is_empty());
+}
+
+#[test]
+fn roster_set_checks_the_account_after_acquiring_its_order() {
+    let (_directory, roster) = roster();
+    let alice = account("alice@example.com");
+    create_account(&roster, &alice);
+    let delivery = RecordingDelivery::default();
+    let mut call = IqCall::new("bob@example.com");
+    let order = block_on(roster.order.lock(&alice));
+    let mut set = pin!(call.handle(&roster, IqRequestType::Set, &delivery));
+    assert!(poll_once(set.as_mut()).is_pending());
+    block_on(roster.accounts.delete(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    drop(order);
+    let result = block_on(set);
+    assert!(
+        matches!(
+            result,
+            Err(HandlerError::Stanza(StanzaErrorCondition::Forbidden))
+        ),
+        "{result:?}"
+    );
+    assert!(delivery.pushes.borrow().is_empty());
+    let alice_roster =
+        block_on(roster.repository.snapshot(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    assert!(alice_roster.items.is_empty());
+}
+
+#[test]
+fn subscription_request_checks_the_contact_after_acquiring_the_order() {
+    let (_directory, roster) = roster();
+    let alice = account("alice@example.com");
+    let bob = account("bob@example.com");
+    create_account(&roster, &alice);
+    create_account(&roster, &bob);
+    let delivery = RecordingDelivery::default();
+    let call = SubscribeCall::new("bob@example.com", "alice@example.com");
+    let order = block_on(roster.order.lock(&alice));
+    let mut request = pin!(call.receive(&roster, &delivery));
+    assert!(poll_once(request.as_mut()).is_pending());
+    block_on(roster.accounts.delete(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    drop(order);
+    let result = block_on(request);
+    assert!(
+        matches!(
+            result,
+            Err(HandlerError::Stanza(
+                StanzaErrorCondition::ServiceUnavailable
+            ))
+        ),
+        "{result:?}"
+    );
+    let pending =
+        block_on(roster.repository.pending(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    assert!(pending.is_empty());
+    let bob_roster =
+        block_on(roster.repository.snapshot(&bob)).unwrap_or_else(|error| panic!("{error}"));
+    assert!(bob_roster.items.is_empty());
+    assert!(delivery.pushes.borrow().is_empty());
 }
 
 #[test]
@@ -392,6 +533,11 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
     for account in &accounts {
         create_account(&roster, account);
     }
+    let dave =
+        Jid::parse_in("dave@remote.example", &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let dave = dave
+        .resolve(&arena)
+        .unwrap_or_else(|error| panic!("{error}"));
     let subscription = |state| {
         move |_| {
             Some(RosterSubscription {
@@ -428,6 +574,13 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
             .update_subscription(
                 carol,
                 &RosterJid::from(alice),
+                subscription(SubscriptionState::Both),
+            )
+            .await?;
+        repository
+            .update_subscription(
+                alice,
+                &RosterJid::from(dave),
                 subscription(SubscriptionState::Both),
             )
             .await

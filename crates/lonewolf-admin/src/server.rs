@@ -99,7 +99,8 @@ impl Server {
 
     /// Stops accepting on shutdown, then drains connections within their deadlines.
     ///
-    /// Each connection serves one request with a 30-second deadline.
+    /// Each connection serves one request with a 30-second deadline. An account
+    /// creation or deletion that the deadline abandons still runs to completion.
     /// Up to 32 connections run concurrently on the calling runtime.
     ///
     /// # Errors

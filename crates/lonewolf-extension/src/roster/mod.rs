@@ -62,6 +62,17 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             .map_err(|_| StanzaErrorCondition::InternalServerError)
     }
 
+    /// Refuses a mutation for an account whose record is gone, so a session that
+    /// outlives its account cannot repopulate roster state. Call it under the account's
+    /// order so the writes that follow cannot interleave with the account's cleanup.
+    async fn require_account(&self, account: &AccountKey) -> Result<(), StanzaErrorCondition> {
+        if self.account_exists(account).await? {
+            Ok(())
+        } else {
+            Err(StanzaErrorCondition::Forbidden)
+        }
+    }
+
     /// Keeps only the contacts whose own roster grants `owner` their presence, so a
     /// one-sided `to` item cannot expose a contact that never approved.
     async fn granting_contacts(
@@ -138,10 +149,6 @@ where
             }
             let owner = AccountKey::try_from(request.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            // A deleted account's remaining sessions must not repopulate roster state.
-            if request.kind == IqRequestType::Set && !self.account_exists(&owner).await? {
-                return Err(StanzaErrorCondition::Forbidden.into());
-            }
             match request.kind {
                 IqRequestType::Get => {
                     xml::validate_get(request.payload)?;
@@ -154,6 +161,7 @@ where
                 IqRequestType::Set => match xml::parse_set(request.payload, response)? {
                     xml::RosterSet::Update(update) => {
                         let _order = self.order.lock(&owner).await;
+                        self.require_account(&owner).await?;
                         let mutation = self.repository.upsert(&owner, update).await?;
                         push_roster(&owner, mutation, delivery).await?;
                         Ok(None)
@@ -209,27 +217,6 @@ where
                 pending,
                 contacts,
             )))
-        })
-    }
-
-    fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
-        Box::pin(async move {
-            let sender = AccountKey::try_from(request.sender.bare())
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            // A deleted account's remaining sessions must not repopulate roster state.
-            if !self.account_exists(&sender).await? {
-                return Err(StanzaErrorCondition::Forbidden);
-            }
-            if request.kind != PresenceRequestType::Subscribe {
-                return Ok(());
-            }
-            let contact = AccountKey::try_from(request.target.bare())
-                .map_err(|_| StanzaErrorCondition::BadRequest)?;
-            if self.account_exists(&contact).await? {
-                Ok(())
-            } else {
-                Err(StanzaErrorCondition::ServiceUnavailable)
-            }
         })
     }
 

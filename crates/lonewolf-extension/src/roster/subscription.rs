@@ -10,6 +10,7 @@ use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
 use super::{Roster, push_removal, push_roster, xml};
 use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
+use crate::order::OrderGuard;
 use crate::presence::PresenceRequest;
 
 pub(super) struct Parties {
@@ -38,16 +39,44 @@ impl Parties {
 }
 
 impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
+    /// Orders both parties, refuses a sender whose account is gone, and reports whether
+    /// the target is stored, all under the guard the following writes run under.
+    async fn lock_parties(
+        &self,
+        parties: &Parties,
+    ) -> Result<(OrderGuard, bool), StanzaErrorCondition> {
+        let order = self.order.lock_pair(&parties.sender, &parties.target).await;
+        self.require_account(&parties.sender).await?;
+        let target_exists = self.account_exists(&parties.target).await?;
+        Ok((order, target_exists))
+    }
+
+    /// Orders the owner with the account a contact JID names on this server, if any, and
+    /// resolves that account only while the guard is held.
+    async fn lock_with_contact<A: ChunkAllocator>(
+        &self,
+        owner: &AccountKey,
+        contact: &RosterJid,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(OrderGuard, Option<AccountKey>), StanzaErrorCondition> {
+        let Some(candidate) = local_candidate(contact, delivery) else {
+            return Ok((self.order.lock(owner).await, None));
+        };
+        let order = self.order.lock_pair(owner, &candidate).await;
+        let contact = self.account_exists(&candidate).await?.then_some(candidate);
+        Ok((order, contact))
+    }
+
     pub(super) async fn request_subscription<A: ChunkAllocator>(
         &self,
         parties: Parties,
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        if !self.account_exists(&parties.target).await? {
+        let (_order, target_exists) = self.lock_parties(&parties).await?;
+        if !target_exists {
             return Err(StanzaErrorCondition::ServiceUnavailable.into());
         }
-        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
         let mut request = String::new();
         stanza
             .resolve()
@@ -94,10 +123,10 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        if !self.account_exists(&parties.target).await? {
+        let (_order, target_exists) = self.lock_parties(&parties).await?;
+        if !target_exists {
             return Ok(());
         }
-        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
         let target = self
             .repository
             .update_subscription(
@@ -136,8 +165,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let subscriber_exists = self.account_exists(&parties.target).await?;
-        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
+        let (_order, subscriber_exists) = self.lock_parties(&parties).await?;
         let outcome = self
             .repository
             .cancel_subscription(
@@ -171,8 +199,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let contact_exists = self.account_exists(&parties.target).await?;
-        let _order = self.order.lock_pair(&parties.sender, &parties.target).await;
+        let (_order, contact_exists) = self.lock_parties(&parties).await?;
         let outcome = self
             .repository
             .unsubscribe(
@@ -222,11 +249,8 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         owner_jid: RosterJid,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let contact_account = self.local_account(&contact, delivery).await?;
-        let _order = match &contact_account {
-            Some(account) => self.order.lock_pair(&owner, account).await,
-            None => self.order.lock(&owner).await,
-        };
+        let (_order, contact_account) = self.lock_with_contact(&owner, &contact, delivery).await?;
+        self.require_account(&owner).await?;
         let removal = self
             .repository
             .remove_item(
@@ -263,21 +287,33 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
     ) -> Result<(), HandlerError> {
         let account_jid = RosterJid::from(account);
         let mut failure = None;
-        let snapshot = self.repository.snapshot(account).await?;
-        for item in snapshot.items {
-            let result = self
-                .forget_contact(account, &account_jid, &item.jid, delivery)
-                .await;
-            record_delivery_failure(result, &mut failure)?;
+        // Every mutation checks the account under its order, so a scan under that order
+        // that finds nothing proves no write can still arrive, and each pass removes
+        // what the previous scan found.
+        loop {
+            let (items, requests) = {
+                let _order = self.order.lock(account).await;
+                let items = self.repository.snapshot(account).await?.items;
+                let requests = self.repository.pending(account).await?;
+                if items.is_empty() && requests.is_empty() {
+                    self.repository.delete_all(account).await?;
+                    break;
+                }
+                (items, requests)
+            };
+            for item in items {
+                let result = self
+                    .forget_contact(account, &account_jid, &item.jid, delivery)
+                    .await;
+                record_delivery_failure(result, &mut failure)?;
+            }
+            for request in requests {
+                let result = self
+                    .forget_requester(account, &account_jid, &request.sender, delivery)
+                    .await;
+                record_delivery_failure(result, &mut failure)?;
+            }
         }
-        for request in self.repository.pending(account).await? {
-            let result = self
-                .forget_requester(account, &account_jid, &request.sender, delivery)
-                .await;
-            record_delivery_failure(result, &mut failure)?;
-        }
-        let _order = self.order.lock(account).await;
-        self.repository.delete_all(account).await?;
         failure.map_or(Ok(()), |error| Err(HandlerError::Delivery(error)))
     }
 
@@ -288,15 +324,18 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         contact: &RosterJid,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let Some(contact_account) = self.local_account(contact, delivery).await? else {
-            return Ok(());
-        };
-        let _order = self.order.lock_pair(account, &contact_account).await;
+        let (_order, contact_account) = self.lock_with_contact(account, contact, delivery).await?;
         let removal = self
             .repository
-            .remove_item(account, contact, Some((&contact_account, account_jid)))
+            .remove_item(
+                account,
+                contact,
+                contact_account
+                    .as_ref()
+                    .map(|contact_account| (contact_account, account_jid)),
+            )
             .await?;
-        if let Some(removal) = removal {
+        if let (Some(removal), Some(contact_account)) = (removal, contact_account) {
             self.notify_removed_contact(account, &contact_account, removal, delivery)
                 .await?;
         }
@@ -310,14 +349,20 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         sender: &RosterJid,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let Some(sender_account) = self.local_account(sender, delivery).await? else {
-            return Ok(());
-        };
-        let _order = self.order.lock_pair(account, &sender_account).await;
+        let (_order, sender_account) = self.lock_with_contact(account, sender, delivery).await?;
         let outcome = self
             .repository
-            .cancel_subscription(account, sender, Some((&sender_account, account_jid)))
+            .cancel_subscription(
+                account,
+                sender,
+                sender_account
+                    .as_ref()
+                    .map(|sender_account| (sender_account, account_jid)),
+            )
             .await?;
+        let Some(sender_account) = sender_account else {
+            return Ok(());
+        };
         if outcome.route {
             let (_, cancellation) =
                 xml::subscription_withdrawals(account, &sender_account, delivery.arena()?)?;
@@ -329,20 +374,6 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             push_roster(&sender_account, mutation, delivery).await?;
         }
         Ok(())
-    }
-
-    /// Resolves a roster JID to an account this server hosts and stores.
-    async fn local_account<A: ChunkAllocator>(
-        &self,
-        jid: &RosterJid,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<Option<AccountKey>, StanzaErrorCondition> {
-        match AccountKey::try_from(jid) {
-            Ok(account) if delivery.is_local_host(account.domain()) => {
-                Ok(self.account_exists(&account).await?.then_some(account))
-            }
-            _ => Ok(None),
-        }
     }
 
     /// Sends the contact what losing the owner implies and returns whether the contact
@@ -386,6 +417,16 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         }
         Ok(contact_granted)
     }
+}
+
+/// The account a roster JID would name on this server, whether or not it is stored.
+fn local_candidate<A: ChunkAllocator>(
+    jid: &RosterJid,
+    delivery: &dyn Delivery<A>,
+) -> Option<AccountKey> {
+    AccountKey::try_from(jid)
+        .ok()
+        .filter(|account| delivery.is_local_host(account.domain()))
 }
 
 /// Keeps the first delivery failure for later and surfaces every other error at once.

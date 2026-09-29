@@ -534,6 +534,39 @@ fn cancellation_clears_the_grantor_when_the_subscriber_is_missing() -> TestResul
 }
 
 #[test]
+fn self_subscription_cancellation_writes_one_final_roster_version() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    block_on(repository.update_subscription(&alice, &alice_jid, |_| {
+        Some(RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: false,
+        })
+    }))?;
+    block_on(repository.put_pending(
+        &alice,
+        PendingSubscription {
+            sender: alice_jid.clone(),
+            stanza: b"<presence type='subscribe'/>".as_slice().into(),
+        },
+    ))?;
+
+    let cancellation =
+        block_on(repository.cancel_subscription(&alice, &alice_jid, Some((&alice, &alice_jid))))?;
+    assert!(cancellation.route);
+    assert!(cancellation.send_unavailable);
+    assert!(cancellation.subscriber.is_none());
+    let mutation = cancellation.grantor.ok_or("missing roster change")?;
+    assert_eq!(mutation.version.get(), 2);
+    assert_eq!(mutation.value.subscription, RosterSubscription::default());
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
+    assert!(block_on(repository.pending(&alice))?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn delete_all_removes_one_owners_roster_version_and_pending_requests() -> TestResult {
     let repository = repository()?;
     let alice = owner("alice@example.com")?;

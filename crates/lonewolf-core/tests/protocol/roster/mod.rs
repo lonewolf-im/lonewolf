@@ -644,6 +644,64 @@ fn revocation_clears_the_grant_after_the_subscriber_account_is_deleted() -> Test
 }
 
 #[test]
+fn self_subscription_revocation_sends_one_final_roster_push() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+
+    alice.send("<presence type='subscribe' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='alice@localhost'/>")?;
+    let pending = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none' ask='subscribe'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{pending}'/>"))?;
+    alice.send("<presence type='subscribed' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='subscribed' from='alice@localhost' to='alice@localhost'/>")?;
+    let approved = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='to'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{approved}'/>"))?;
+    let granted = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='both'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{granted}'/>"))?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+
+    alice.send("<presence type='unsubscribed' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost' type='unavailable'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='unsubscribed' from='alice@localhost' to='alice@localhost'/>")?;
+    let revoked = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{revoked}'/>"))?;
+    request_roster(
+        &mut alice,
+        "final-roster",
+        "<iq xmlns='jabber:client' type='result' id='final-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='none'/></query></iq>",
+    )?;
+    alice.close()
+}
+
+#[test]
 fn unsolicited_subscription_approval_is_silently_ignored() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;

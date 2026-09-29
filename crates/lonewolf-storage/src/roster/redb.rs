@@ -491,23 +491,36 @@ fn cancel_subscription(
     });
     let route = subscriber.is_some() && (pending || granted);
     let send_unavailable = route && granted;
+    let same_item = subscriber
+        .as_ref()
+        .is_some_and(|(_, key, _)| key.as_ref() == grantor_key.as_ref());
     let grantor_mutation = update_existing_subscription(
         &transaction,
         grantor,
         grantor_key.as_ref(),
         contact,
         |mut subscription| {
+            let old = subscription;
             subscription.state = match subscription.state {
                 SubscriptionState::From => SubscriptionState::None,
                 SubscriptionState::Both => SubscriptionState::To,
                 state => state,
             };
             subscription.approved = false;
-            (Some(subscription) != grantor_state).then_some(subscription)
+            if same_item && route {
+                subscription.state = match subscription.state {
+                    SubscriptionState::To => SubscriptionState::None,
+                    SubscriptionState::Both => SubscriptionState::From,
+                    state => state,
+                };
+                subscription.pending_out = false;
+            }
+            (subscription != old).then_some(subscription)
         },
     )?;
     let subscriber_mutation = if let Some((subscriber, subscriber_key, grantor_jid)) = subscriber
         && route
+        && !same_item
     {
         update_existing_subscription(
             &transaction,

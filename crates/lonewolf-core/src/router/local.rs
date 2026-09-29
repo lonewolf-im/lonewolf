@@ -30,7 +30,7 @@ const RESOURCE_QUEUE_CAPACITY: usize = 64;
 const SHARD_BATCH_SIZE: usize = 64;
 
 type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
-type Retirement<A> = Shared<oneshot::Receiver<Option<RoutedStanza<A>>>>;
+type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
 
 /// Owns one account shard on each core worker.
 pub struct LocalRouter<A: ChunkAllocator> {
@@ -67,6 +67,29 @@ pub(crate) enum ResourceDelivery<A: ChunkAllocator> {
 pub(crate) struct PresenceChange {
     pub became_available: bool,
     pub became_unavailable: bool,
+}
+
+/// Why the router removed a session before its stream ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetireCause {
+    Evicted,
+    AccountDeleted,
+}
+
+/// What a removed session's stream needs to finish: the cause and the unavailable
+/// presence it still has to broadcast.
+pub(crate) struct Retired<A: ChunkAllocator> {
+    pub(crate) cause: RetireCause,
+    pub(crate) unavailable: Option<RoutedStanza<A>>,
+}
+
+impl<A: ChunkAllocator> Clone for Retired<A> {
+    fn clone(&self) -> Self {
+        Self {
+            cause: self.cause,
+            unavailable: self.unavailable.clone(),
+        }
+    }
 }
 
 enum Command<A: ChunkAllocator> {
@@ -144,6 +167,10 @@ enum Command<A: ChunkAllocator> {
         token: u64,
         reply: oneshot::Sender<()>,
     },
+    RetireAccount {
+        account: AccountKey,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 struct RetiredPresence<A: ChunkAllocator> {
@@ -159,7 +186,7 @@ struct Session<A: ChunkAllocator> {
     tags: SessionTags,
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
-    retired: oneshot::Sender<Option<RoutedStanza<A>>>,
+    retired: oneshot::Sender<Retired<A>>,
 }
 
 struct Shard<A: ChunkAllocator> {
@@ -419,6 +446,19 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
+    /// Removes every session bound to `account`, ending each stream as account deleted.
+    pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard(account.as_str())
+            .send(Command::RetireAccount {
+                account: account.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)
+    }
+
     fn shard(&self, bare: &str) -> &Sender<Command<A>> {
         &self.shards[self.shard_index(bare)]
     }
@@ -448,7 +488,7 @@ impl<A: ChunkAllocator> Registration<A> {
     /// The returned future does not borrow the registration.
     pub(crate) fn wait_retired(
         &self,
-    ) -> impl Future<Output = Result<Option<RoutedStanza<A>>, RouterError>> + use<A> {
+    ) -> impl Future<Output = Result<Retired<A>, RouterError>> + use<A> {
         let retired = self.retired.clone();
         async move { retired.await.map_err(|_| RouterError::Stopped) }
     }
@@ -488,7 +528,9 @@ impl<A: ChunkAllocator> Registration<A> {
             .map_err(|_| RouterError::Stopped)?;
         match result.await.map_err(|_| RouterError::Stopped)? {
             Ok(unavailable) => Ok(unavailable),
-            Err(RouterError::NotFound) => self.wait_retired().await,
+            Err(RouterError::NotFound) => {
+                self.wait_retired().await.map(|retired| retired.unavailable)
+            }
             Err(error) => Err(error),
         }
     }
@@ -587,7 +629,7 @@ impl<A: ChunkAllocator> Shard<A> {
             match event {
                 Some(Either::Left(command)) => self.command(command),
                 Some(Either::Right((account, resource, token))) => {
-                    self.remove(account.as_str(), &resource, token);
+                    self.remove(account.as_str(), &resource, token, RetireCause::Evicted);
                     self.finish_presence(&account, token);
                 }
                 None => break,
@@ -734,6 +776,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 self.finish_presence(&account, token);
                 let _ = reply.send(());
             }
+            Command::RetireAccount { account, reply } => {
+                self.retire_account(&account);
+                let _ = reply.send(());
+            }
         }
     }
 
@@ -755,7 +801,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 .map(|(resource, session)| (resource.clone(), session.token))
                 .collect();
             for (resource, token) in stale {
-                self.remove(account.as_str(), &resource, token);
+                self.remove(account.as_str(), &resource, token, RetireCause::Evicted);
             }
         }
         let sessions = self.accounts.entry(account.as_str().into()).or_default();
@@ -840,7 +886,7 @@ impl<A: ChunkAllocator> Shard<A> {
             (session.token, delivery)
         });
         if let Some((token, Err(RouterError::NotFound))) = result {
-            self.remove(account, resource, token);
+            self.remove(account, resource, token, RetireCause::Evicted);
         }
         match result.map_or(Err(RouterError::NotFound), |(_, result)| result) {
             Err(RouterError::NotFound)
@@ -994,7 +1040,7 @@ impl<A: ChunkAllocator> Shard<A> {
             }
         }
         for (resource, token) in failed {
-            self.remove(account, &resource, token);
+            self.remove(account, &resource, token, RetireCause::Evicted);
         }
         if delivered {
             Ok(())
@@ -1107,7 +1153,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 .map(|(resource, session)| (resource.clone(), session.token))
                 .collect::<Vec<_>>();
             for (resource, token) in failed {
-                self.remove(account.as_str(), &resource, token);
+                self.remove(account.as_str(), &resource, token, RetireCause::Evicted);
             }
             return Err(error);
         }
@@ -1128,7 +1174,7 @@ impl<A: ChunkAllocator> Shard<A> {
             }
         }
         for (resource, token) in failed {
-            self.remove(account.as_str(), &resource, token);
+            self.remove(account.as_str(), &resource, token, RetireCause::Evicted);
         }
         Ok(())
     }
@@ -1179,7 +1225,7 @@ impl<A: ChunkAllocator> Shard<A> {
             .and_then(|sessions| sessions.get(resource))
             .ok_or(RouterError::NotFound)?;
         if let Err(error) = source.outbound.try_send(delivery).map_err(mailbox_error) {
-            self.remove(account.as_str(), resource, token);
+            self.remove(account.as_str(), resource, token, RetireCause::Evicted);
             return Err(error);
         }
 
@@ -1209,7 +1255,12 @@ impl<A: ChunkAllocator> Shard<A> {
             }
         }
         for (recipient_resource, recipient_token) in failed {
-            self.remove(account.as_str(), &recipient_resource, recipient_token);
+            self.remove(
+                account.as_str(),
+                &recipient_resource,
+                recipient_token,
+                RetireCause::Evicted,
+            );
         }
         Ok(change)
     }
@@ -1248,7 +1299,12 @@ impl<A: ChunkAllocator> Shard<A> {
                 }
             }
             for (recipient_resource, recipient_token) in failed {
-                self.remove(account.as_str(), &recipient_resource, recipient_token);
+                self.remove(
+                    account.as_str(),
+                    &recipient_resource,
+                    recipient_token,
+                    RetireCause::Evicted,
+                );
             }
         }
         if let (Some(stanza), Some(_)) = (presence, unavailable.as_ref()) {
@@ -1286,13 +1342,45 @@ impl<A: ChunkAllocator> Shard<A> {
             })
     }
 
-    fn remove(&mut self, account: &str, resource: &str, token: u64) {
+    fn retire_account(&mut self, account: &AccountKey) {
+        let Some(sessions) = self.accounts.get(account.as_str()) else {
+            return;
+        };
+        let bound: Vec<_> = sessions
+            .iter()
+            .map(|(resource, session)| (resource.clone(), session.token))
+            .collect();
+        for (resource, token) in bound {
+            self.remove(
+                account.as_str(),
+                &resource,
+                token,
+                RetireCause::AccountDeleted,
+            );
+        }
+    }
+
+    fn remove(&mut self, account: &str, resource: &str, token: u64, cause: RetireCause) {
         let mut retiring = Vec::new();
         if let Some(sessions) = self.accounts.get_mut(account) {
             let mut pending = Vec::new();
-            Self::remove_session(sessions, resource, token, &mut pending, &mut retiring);
+            Self::remove_session(
+                sessions,
+                resource,
+                token,
+                cause,
+                &mut pending,
+                &mut retiring,
+            );
             while let Some((resource, token)) = pending.pop() {
-                Self::remove_session(sessions, &resource, token, &mut pending, &mut retiring);
+                Self::remove_session(
+                    sessions,
+                    &resource,
+                    token,
+                    cause,
+                    &mut pending,
+                    &mut retiring,
+                );
             }
             if sessions.is_empty() {
                 self.accounts.remove(account);
@@ -1310,6 +1398,7 @@ impl<A: ChunkAllocator> Shard<A> {
         sessions: &mut HashMap<Box<str>, Session<A>>,
         resource: &str,
         token: u64,
+        cause: RetireCause,
         pending: &mut Vec<(Box<str>, u64)>,
         retiring: &mut Vec<(u64, RetiredPresence<A>)>,
     ) {
@@ -1321,7 +1410,6 @@ impl<A: ChunkAllocator> Shard<A> {
         }
         if let Some(session) = sessions.remove(resource) {
             session.alive.store(false, Ordering::Release);
-            session.outbound.close();
             if let Some(unavailable) = session.unavailable.as_ref() {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
@@ -1344,7 +1432,13 @@ impl<A: ChunkAllocator> Shard<A> {
                     },
                 ));
             }
-            let _ = session.retired.send(session.unavailable);
+            // The stream polls its retirement before its mailbox, so signalling first lets
+            // it observe the cause instead of a closed mailbox.
+            let _ = session.retired.send(Retired {
+                cause,
+                unavailable: session.unavailable,
+            });
+            session.outbound.close();
         }
     }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::hosts::Hosts;
-use crate::router::local::{LocalRouter, ResourceDelivery};
+use crate::router::local::{LocalRouter, ResourceDelivery, RetireCause};
 use crate::router::{Registration, RoutedStanza, Router, RouterError};
 use compio::runtime::Runtime;
 use compio::time::timeout;
@@ -204,6 +204,70 @@ fn registration_uses_one_account_shard_across_handles() -> TestResult {
         assert_eq!(reused.resource(), "desk");
         drop(duplicate);
         drop(reused);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn retiring_an_account_ends_every_session_and_frees_its_resources() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let alice = account("alice@localhost")?;
+        let bob = account("bob@localhost")?;
+        let handle = router.handle();
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let bob_desk = handle
+            .register(&bob, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        desk.set_presence(
+            Some(0),
+            presence("desk").await?,
+            Some(unavailable_presence("desk").await?),
+        )
+        .await?;
+        receive_presence(&desk).await?;
+
+        handle.retire_account(&alice).await?;
+        let retired = desk.wait_retired().await?;
+        assert_eq!(retired.cause, RetireCause::AccountDeleted);
+        assert!(retired.unavailable.is_some());
+        let retired = phone.wait_retired().await?;
+        assert_eq!(retired.cause, RetireCause::AccountDeleted);
+        assert!(retired.unavailable.is_none());
+        assert!(desk.recv().await.is_none());
+        assert!(phone.recv().await.is_none());
+        assert!(matches!(
+            handle
+                .route_full(stanza("alice@localhost/desk").await?)
+                .await,
+            Err(RouterError::NotFound)
+        ));
+        assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 1);
+        assert!(desk.end_presence().await?.is_some());
+        desk.finish_presence().await?;
+        assert!(handle.local.withdrawal_snapshot(&alice).await?.is_empty());
+
+        handle
+            .route_full(stanza("bob@localhost/desk").await?)
+            .await?;
+        receive_routed(&bob_desk).await?;
+        let replacement = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        assert_eq!(replacement.resource(), "desk");
+        handle.retire_account(&alice).await?;
+        handle.retire_account(&account("carol@localhost")?).await?;
+        drop(replacement);
+        drop(desk);
+        drop(phone);
+        drop(bob_desk);
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
@@ -613,7 +677,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
             receive_routed(&phone).await?;
         }
         assert!(phone.recv().await.is_none());
-        assert!(phone.wait_retired().await?.is_some());
+        assert!(phone.wait_retired().await?.unavailable.is_some());
         assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 2);
         let unavailable = phone
             .end_presence()

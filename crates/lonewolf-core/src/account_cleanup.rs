@@ -21,7 +21,8 @@ pub(crate) struct CleanupRequest {
 }
 
 /// Forwards account deletions from the admin service to the core runtime, where the
-/// extensions can run, and completes the request once they have.
+/// extensions can run, and completes the request once they have and the account's
+/// sessions are gone.
 pub(crate) struct AccountCleanup {
     requests: Sender<CleanupRequest>,
 }
@@ -76,6 +77,13 @@ pub(crate) async fn run<A: ChunkAllocator + Clone>(
                     "an extension failed to clean up the account",
                 ));
             }
+        }
+        // Sessions end after cleanup so their disconnect broadcasts to an empty audience.
+        if let Err(error) = router.retire_account(&request.account).await {
+            tracing::error!(error = ?error, "account session termination failed");
+            result = result.and(Err(observer_error(
+                "the account's sessions could not be terminated",
+            )));
         }
         let _ = request.done.send(result);
     }

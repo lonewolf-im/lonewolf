@@ -104,6 +104,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .map_or(&[], ExtensionRegistry::extensions)
     }
 
+    /// Removes every session bound to `account` and ends each stream as account deleted.
+    pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
+        self.local.retire_account(account).await
+    }
+
     /// Applies the incoming listener's limit to resources on all listeners.
     pub async fn register(
         &self,

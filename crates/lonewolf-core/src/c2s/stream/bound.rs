@@ -25,7 +25,7 @@ use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
 use crate::delivery::RouterDelivery;
-use crate::router::local::ResourceDelivery;
+use crate::router::local::{ResourceDelivery, RetireCause};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
@@ -76,10 +76,19 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         available: false,
         pending_replays: VecDeque::new(),
     };
-    let retired = pin!(session.registration.wait_retired());
-    let outcome = match select(retired, pin!(session.run(&mut reader))).await {
+    let stopped = {
+        let retired = pin!(session.registration.wait_retired());
+        match select(retired, pin!(session.run(&mut reader))).await {
+            Either::Left((retired, _)) => Either::Left(retired.map(|retired| retired.cause)),
+            Either::Right((outcome, _)) => Either::Right(outcome),
+        }
+    };
+    let outcome = match stopped {
+        Either::Right(outcome) => outcome,
+        Either::Left(Ok(RetireCause::AccountDeleted)) => {
+            session.writer.fail(CloseOutcome::AccountDeleted).await
+        }
         Either::Left(_) => CloseOutcome::InternalError,
-        Either::Right((outcome, _)) => outcome,
     };
     let ended = session.end().await;
     drop(session);

@@ -15,14 +15,18 @@ use lonewolf_storage::roster::{
 };
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
-use lonewolf_xmpp::stanza::{Element, RoutedStanza};
+use lonewolf_xmpp::stanza::{
+    Element, PresenceType, RoutedStanza, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaType,
+};
 
 use super::{NAMESPACE, Roster};
 use crate::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HandlerError, SessionTag, StanzaFactory,
 };
 use crate::iq::{IqHandler, IqRequest, IqRequestType};
-use crate::presence::{PresenceHandler, PresenceTransition, PresenceUpdate};
+use crate::presence::{
+    PresenceHandler, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
+};
 
 type TestRoster = Roster<RedbRosterRepository, RedbAccountRepository>;
 
@@ -116,7 +120,7 @@ fn handle_iq(
     kind: IqRequestType,
     payload: &str,
     delivery: &RecordingDelivery,
-) {
+) -> Result<(), HandlerError> {
     let mut request =
         Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
     let mut response =
@@ -154,14 +158,54 @@ fn handle_iq(
         &mut response,
         delivery,
     ))
+    .map(|_| ())
+}
+
+fn authorize_subscribe(
+    roster: &TestRoster,
+    sender: &str,
+    target: &str,
+) -> Result<(), StanzaErrorCondition> {
+    let mut arena =
+        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+    let sender = Jid::parse_in(sender, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let target = Jid::parse_in(target, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let stanza = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Subscribe),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(sender))
+    .and_then(|stanza| stanza.to(Some(target)))
+    .and_then(|stanza| stanza.build())
     .unwrap_or_else(|error| panic!("{error:?}"));
+    let stanza = RoutedStanza::from_parts(stanza, arena);
+    let view = stanza.resolve().unwrap_or_else(|error| panic!("{error}"));
+    let sender = view
+        .from()
+        .unwrap_or_else(|error| panic!("{error}"))
+        .unwrap_or_else(|| panic!("missing sender"));
+    let target = view
+        .to()
+        .unwrap_or_else(|error| panic!("{error}"))
+        .unwrap_or_else(|| panic!("missing target"));
+    block_on(PresenceHandler::<GlobalChunkAllocator>::authorize(
+        roster,
+        PresenceRequest {
+            kind: PresenceRequestType::Subscribe,
+            sender,
+            target,
+            stanza: &stanza,
+        },
+    ))
 }
 
 #[test]
 fn roster_retrieval_tags_the_requesting_session_as_interested() {
     let (_directory, roster) = roster();
     let delivery = RecordingDelivery::default();
-    handle_iq(&roster, IqRequestType::Get, "", &delivery);
+    handle_iq(&roster, IqRequestType::Get, "", &delivery)
+        .unwrap_or_else(|error| panic!("{error:?}"));
     assert_eq!(*delivery.tags.borrow(), [SessionTag::Interested]);
     assert!(delivery.pushes.borrow().is_empty());
 }
@@ -181,7 +225,8 @@ fn roster_update_pushes_the_item_to_interested_resources() {
     .unwrap_or_else(|error| panic!("{error}"));
     create_account(&roster, &alice);
     let delivery = RecordingDelivery::default();
-    handle_iq(&roster, IqRequestType::Set, "bob@example.com", &delivery);
+    handle_iq(&roster, IqRequestType::Set, "bob@example.com", &delivery)
+        .unwrap_or_else(|error| panic!("{error:?}"));
     assert!(delivery.tags.borrow().is_empty());
     let pushes = delivery.pushes.borrow();
     assert_eq!(pushes.len(), 1, "{pushes:?}");
@@ -193,6 +238,46 @@ fn roster_update_pushes_the_item_to_interested_resources() {
     assert!(
         pushes[0].contains(r#"<item jid="bob@example.com" subscription="none"/>"#),
         "{pushes:?}"
+    );
+}
+
+#[test]
+fn roster_set_from_a_deleted_account_is_forbidden() {
+    let (_directory, roster) = roster();
+    let delivery = RecordingDelivery::default();
+    let result = handle_iq(&roster, IqRequestType::Set, "bob@example.com", &delivery);
+    assert!(
+        matches!(
+            result,
+            Err(HandlerError::Stanza(StanzaErrorCondition::Forbidden))
+        ),
+        "{result:?}"
+    );
+    assert!(delivery.pushes.borrow().is_empty());
+    handle_iq(&roster, IqRequestType::Get, "", &delivery)
+        .unwrap_or_else(|error| panic!("{error:?}"));
+}
+
+#[test]
+fn subscription_request_from_a_deleted_account_is_forbidden() {
+    let (_directory, roster) = roster();
+    let mut arena =
+        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+    let bob =
+        Jid::parse_in("bob@example.com", &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let bob = AccountKey::try_from(
+        bob.resolve(&arena)
+            .unwrap_or_else(|error| panic!("{error}")),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    create_account(&roster, &bob);
+    assert_eq!(
+        authorize_subscribe(&roster, "alice@example.com/desk", "bob@example.com"),
+        Err(StanzaErrorCondition::Forbidden)
+    );
+    assert_eq!(
+        authorize_subscribe(&roster, "bob@example.com/desk", "alice@example.com"),
+        Err(StanzaErrorCondition::ServiceUnavailable)
     );
 }
 

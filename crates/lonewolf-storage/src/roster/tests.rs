@@ -11,7 +11,7 @@ use redb::backends::InMemoryBackend;
 use super::redb::RedbRosterRepository;
 use super::{
     PendingSubscription, RosterItemUpdate, RosterJid, RosterRepository, RosterSubscription,
-    RosterVersion, SubscriptionState,
+    RosterVersion, SubscriptionRequestOutcome, SubscriptionState,
 };
 use crate::RedbDatabase;
 use crate::account::AccountKey;
@@ -167,6 +167,168 @@ fn pending_subscription_is_deduplicated_by_sender_and_can_be_removed() -> TestRe
     assert!(block_on(repository.remove_pending(&owner, &sender))?);
     assert!(!block_on(repository.remove_pending(&owner, &sender))?);
     assert!(block_on(repository.pending(&owner))?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn subscription_request_updates_the_sender_and_recipient_in_one_write() -> TestResult {
+    let repository = repository()?;
+    let alice = owner("alice@example.com")?;
+    let bob = owner("bob@example.com")?;
+    let alice_jid = jid("alice@example.com")?;
+    let bob_jid = jid("bob@example.com")?;
+
+    let outcome = block_on(repository.request_subscription(
+        &alice,
+        &bob_jid,
+        &bob,
+        PendingSubscription {
+            sender: alice_jid.clone(),
+            stanza: b"<presence id='first'/>".as_slice().into(),
+        },
+    ))?;
+    let SubscriptionRequestOutcome::Pending {
+        mutation: Some(mutation),
+    } = outcome
+    else {
+        return Err("subscription was not changed".into());
+    };
+
+    assert_eq!(mutation.version.get(), 1);
+    assert!(mutation.value.subscription.pending_out);
+    assert_eq!(
+        block_on(repository.get(&alice, &bob_jid))?,
+        Some(mutation.value)
+    );
+    let pending = block_on(repository.pending(&bob))?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].sender, alice_jid);
+    assert_eq!(pending[0].stanza.as_ref(), b"<presence id='first'/>");
+
+    let repeated = block_on(repository.request_subscription(
+        &alice,
+        &bob_jid,
+        &bob,
+        PendingSubscription {
+            sender: alice_jid,
+            stanza: b"<presence id='last'/>".as_slice().into(),
+        },
+    ))?;
+    assert_eq!(
+        repeated,
+        SubscriptionRequestOutcome::Pending { mutation: None }
+    );
+    assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 1);
+    assert_eq!(
+        block_on(repository.pending(&bob))?[0].stanza.as_ref(),
+        b"<presence id='last'/>"
+    );
+    Ok(())
+}
+
+#[test]
+fn established_subscription_requests_are_automatically_approved_without_changes() -> TestResult {
+    for (subscriber_state, recipient_state) in [
+        (SubscriptionState::To, SubscriptionState::From),
+        (SubscriptionState::Both, SubscriptionState::Both),
+    ] {
+        let repository = repository()?;
+        let alice = owner("alice@example.com")?;
+        let bob = owner("bob@example.com")?;
+        let alice_jid = jid("alice@example.com")?;
+        let bob_jid = jid("bob@example.com")?;
+        block_on(
+            repository.update_subscription(&alice, &bob_jid, move |mut current| {
+                current.state = subscriber_state;
+                Some(current)
+            }),
+        )?;
+        block_on(
+            repository.update_subscription(&bob, &alice_jid, move |mut current| {
+                current.state = recipient_state;
+                Some(current)
+            }),
+        )?;
+
+        let outcome = block_on(repository.request_subscription(
+            &alice,
+            &bob_jid,
+            &bob,
+            PendingSubscription {
+                sender: alice_jid.clone(),
+                stanza: b"<presence id='repeat'/>".as_slice().into(),
+            },
+        ))?;
+
+        assert_eq!(
+            outcome,
+            SubscriptionRequestOutcome::AutoApprove { mutation: None }
+        );
+        assert!(block_on(repository.pending(&bob))?.is_empty());
+        let alice_roster = block_on(repository.snapshot(&alice))?;
+        assert_eq!(alice_roster.version.get(), 1);
+        assert_eq!(alice_roster.items[0].subscription.state, subscriber_state);
+        assert!(!alice_roster.items[0].subscription.pending_out);
+        assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn automatic_approval_resolves_an_outstanding_request_in_one_write() -> TestResult {
+    for (subscriber_state, recipient_state, approved_state) in [
+        (
+            SubscriptionState::None,
+            SubscriptionState::From,
+            SubscriptionState::To,
+        ),
+        (
+            SubscriptionState::From,
+            SubscriptionState::Both,
+            SubscriptionState::Both,
+        ),
+    ] {
+        let repository = repository()?;
+        let alice = owner("alice@example.com")?;
+        let bob = owner("bob@example.com")?;
+        let alice_jid = jid("alice@example.com")?;
+        let bob_jid = jid("bob@example.com")?;
+        block_on(
+            repository.update_subscription(&alice, &bob_jid, move |mut current| {
+                current.state = subscriber_state;
+                current.pending_out = true;
+                Some(current)
+            }),
+        )?;
+        block_on(
+            repository.update_subscription(&bob, &alice_jid, move |mut current| {
+                current.state = recipient_state;
+                Some(current)
+            }),
+        )?;
+
+        let outcome = block_on(repository.request_subscription(
+            &alice,
+            &bob_jid,
+            &bob,
+            PendingSubscription {
+                sender: alice_jid,
+                stanza: b"<presence id='repeat'/>".as_slice().into(),
+            },
+        ))?;
+        let SubscriptionRequestOutcome::AutoApprove {
+            mutation: Some(mutation),
+        } = outcome
+        else {
+            return Err("outstanding request was not approved".into());
+        };
+        assert_eq!(mutation.version.get(), 2);
+        assert_eq!(mutation.value.subscription.state, approved_state);
+        assert!(!mutation.value.subscription.pending_out);
+        assert!(block_on(repository.pending(&bob))?.is_empty());
+        assert_eq!(block_on(repository.snapshot(&alice))?.version.get(), 2);
+        assert_eq!(block_on(repository.snapshot(&bob))?.version.get(), 1);
+    }
     Ok(())
 }
 

@@ -11,8 +11,9 @@ use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator, HandleError, SharedArena};
+use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{Stanza, StanzaRef, StanzaType};
+use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaRef, StanzaType};
 
 use crate::hosts::Hosts;
 
@@ -160,6 +161,70 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             return Err(RouterError::InvalidTarget);
         }
         self.local.deliver_presence(stanza).await
+    }
+
+    pub(crate) async fn route_presence_to_interested(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        if !matches!(
+            view.stanza_type(),
+            StanzaType::Presence(
+                PresenceType::Subscribe
+                    | PresenceType::Subscribed
+                    | PresenceType::Unsubscribe
+                    | PresenceType::Unsubscribed
+            )
+        ) {
+            return Err(RouterError::InvalidTarget);
+        }
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !self.hosts.is_local_host(to.domainpart()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        if to.localpart().is_none() || to.resourcepart().is_some() {
+            return Err(RouterError::InvalidTarget);
+        }
+        self.local.deliver_presence_to_interested(stanza).await
+    }
+
+    pub(crate) async fn route_current_presence(
+        &self,
+        source: &AccountKey,
+        target: &AccountKey,
+    ) -> Result<(), RouterError> {
+        if !self.hosts.is_local_host(source.domain()) || !self.hosts.is_local_host(target.domain())
+        {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        for stanza in self.local.presence_snapshot(source).await? {
+            let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
+                .map_err(|_| RouterError::Unavailable)?;
+            let target = Jid::parse_in(target.as_str(), &mut arena)
+                .map_err(|_| RouterError::InvalidTarget)?;
+            let stanza = stanza
+                .resolve()
+                .map_err(|_| RouterError::Unavailable)?
+                .to_builder_in(&mut arena)
+                .map_err(|_| RouterError::Unavailable)?
+                .to(Some(target))
+                .map_err(|_| RouterError::Unavailable)?
+                .build()
+                .map_err(|_| RouterError::Unavailable)?;
+            match self
+                .local
+                .deliver_presence(RoutedStanza::from_parts(stanza, arena))
+                .await
+            {
+                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Builds and enqueues one push for each interested resource.

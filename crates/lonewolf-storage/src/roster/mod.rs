@@ -29,6 +29,21 @@ pub struct RosterSubscription {
     pub approved: bool,
 }
 
+impl RosterSubscription {
+    pub fn approve_pending_out(mut self) -> Option<Self> {
+        if !self.pending_out {
+            return None;
+        }
+        self.state = match self.state {
+            SubscriptionState::None => SubscriptionState::To,
+            SubscriptionState::From => SubscriptionState::Both,
+            SubscriptionState::To | SubscriptionState::Both => return None,
+        };
+        self.pending_out = false;
+        Some(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RosterVersion(u64);
 
@@ -84,6 +99,21 @@ pub struct RosterMutation<T> {
     pub value: T,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct PendingResolution {
+    pub mutation: Option<RosterMutation<RosterItem>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SubscriptionRequestOutcome {
+    Pending {
+        mutation: Option<RosterMutation<RosterItem>>,
+    },
+    AutoApprove {
+        mutation: Option<RosterMutation<RosterItem>>,
+    },
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PendingSubscription {
     pub sender: RosterJid,
@@ -135,6 +165,16 @@ pub trait RosterRepository: Send + Sync {
     where
         F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static;
 
+    /// Stores both sides in one write when approval is required.
+    /// Returns `AutoApprove` when the recipient already permits the subscription.
+    fn request_subscription(
+        &self,
+        subscriber: &AccountKey,
+        contact: &RosterJid,
+        recipient: &AccountKey,
+        request: PendingSubscription,
+    ) -> impl Future<Output = Result<SubscriptionRequestOutcome, RosterError>> + Send;
+
     /// Removes an item and returns `None` without advancing the version if absent.
     fn remove(
         &self,
@@ -154,6 +194,16 @@ pub trait RosterRepository: Send + Sync {
         &self,
         owner: &AccountKey,
     ) -> impl Future<Output = Result<Vec<PendingSubscription>, RosterError>> + Send;
+
+    /// Removes a pending request and applies its roster transition in one write.
+    fn resolve_pending<F>(
+        &self,
+        owner: &AccountKey,
+        sender: &RosterJid,
+        update: F,
+    ) -> impl Future<Output = Result<Option<PendingResolution>, RosterError>> + Send
+    where
+        F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static;
 
     /// Returns whether a pending request existed.
     fn remove_pending(

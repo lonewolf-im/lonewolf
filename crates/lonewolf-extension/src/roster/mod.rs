@@ -7,7 +7,7 @@ use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
     PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterRepository,
-    RosterSnapshot, RosterVersion, SubscriptionState,
+    RosterSnapshot, RosterSubscription, RosterVersion, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -62,7 +62,7 @@ impl RosterPush {
 
 pub struct RosterRegistrations<A: ChunkAllocator> {
     pub iq: [IqRegistration<A>; 2],
-    pub presence: [PresenceRegistration<A>; 3],
+    pub presence: [PresenceRegistration<A>; 5],
 }
 
 pub fn registrations<A, R, C>(repository: R, accounts: C) -> RosterRegistrations<A>
@@ -111,6 +111,20 @@ where
                 PresenceRoute {
                     direction: PresenceDirection::Inbound,
                     kind: PresenceRequestType::Subscribe,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Outbound,
+                    kind: PresenceRequestType::Subscribed,
+                },
+                Arc::clone(&presence),
+            ),
+            PresenceRegistration::new(
+                PresenceRoute {
+                    direction: PresenceDirection::Inbound,
+                    kind: PresenceRequestType::Subscribed,
                 },
                 Arc::clone(&presence),
             ),
@@ -218,6 +232,9 @@ where
                     }
                     Ok(PresenceEffect::Route)
                 }
+                (PresenceDirection::Outbound, PresenceRequestType::Subscribed) => {
+                    Ok(PresenceEffect::Route)
+                }
                 (PresenceDirection::Inbound, PresenceRequestType::Subscribe) => {
                     let owner = AccountKey::try_from(request.target.bare())
                         .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
@@ -247,6 +264,33 @@ where
                         .await
                         .map_err(roster_error)?;
                     Ok(PresenceEffect::Deliver(order))
+                }
+                (PresenceDirection::Inbound, PresenceRequestType::Subscribed) => {
+                    let owner = AccountKey::try_from(request.target.bare())
+                        .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
+                    if self
+                        .accounts
+                        .get(&owner)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .is_none()
+                    {
+                        return Ok(PresenceEffect::None);
+                    }
+                    let contact = RosterJid::from(request.sender.bare());
+                    let order = RosterOrder::new(self.order.lock(&owner).await);
+                    let mutation = self
+                        .repository
+                        .update_subscription(&owner, &contact, approve_inbound_subscription)
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(mutation.map_or(PresenceEffect::None, |mutation| {
+                        PresenceEffect::DeliverThenPushRoster(RosterPush::new(
+                            order,
+                            mutation.value,
+                            mutation.version,
+                        ))
+                    }))
                 }
                 (PresenceDirection::Outbound, PresenceRequestType::Available) => {
                     let owner = AccountKey::try_from(request.sender.bare())
@@ -287,10 +331,58 @@ where
                         RosterPush::new(RosterOrder::new(order), mutation.value, mutation.version)
                     })))
                 }
+                (PresenceDirection::Outbound, PresenceRequestType::Subscribed) => {
+                    let owner = AccountKey::try_from(request.sender.bare())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let contact = RosterJid::from(request.target.bare());
+                    let order = self.order.lock(&owner).await;
+                    let resolution = self
+                        .repository
+                        .resolve_pending(&owner, &contact, approve_outbound_subscription)
+                        .await
+                        .map_err(roster_error)?;
+                    Ok(PresenceEffect::PushRoster(
+                        resolution
+                            .and_then(|resolution| resolution.mutation)
+                            .map(|mutation| {
+                                RosterPush::new(
+                                    RosterOrder::new(order),
+                                    mutation.value,
+                                    mutation.version,
+                                )
+                            }),
+                    ))
+                }
                 _ => Err(StanzaErrorCondition::ServiceUnavailable),
             }
         })
     }
+}
+
+fn approve_inbound_subscription(
+    mut subscription: RosterSubscription,
+) -> Option<RosterSubscription> {
+    if !subscription.pending_out {
+        return None;
+    }
+    subscription.state = match subscription.state {
+        SubscriptionState::None => SubscriptionState::To,
+        SubscriptionState::From => SubscriptionState::Both,
+        SubscriptionState::To | SubscriptionState::Both => return None,
+    };
+    subscription.pending_out = false;
+    Some(subscription)
+}
+
+fn approve_outbound_subscription(
+    mut subscription: RosterSubscription,
+) -> Option<RosterSubscription> {
+    subscription.state = match subscription.state {
+        SubscriptionState::None => SubscriptionState::From,
+        SubscriptionState::To => SubscriptionState::Both,
+        SubscriptionState::From | SubscriptionState::Both => return None,
+    };
+    Some(subscription)
 }
 
 fn validate_get<A: ChunkAllocator>(

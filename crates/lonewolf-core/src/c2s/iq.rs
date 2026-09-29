@@ -2,6 +2,7 @@
 
 use lonewolf_extension::iq::{IqEffect, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::roster::RosterPush;
+use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::parser::Parsed;
@@ -144,22 +145,20 @@ async fn apply_effect<A: ChunkAllocator + Clone>(
         IqEffect::None => Ok(()),
         IqEffect::MarkRosterInterested(_order) => registration.mark_roster_interested().await,
         IqEffect::PushRoster(push) => {
-            route_roster_push(push, registration, router, allocator).await
+            route_roster_push(push, registration.account(), router, allocator).await
         }
     }
 }
 
 pub(super) async fn route_roster_push<A: ChunkAllocator + Clone>(
     push: RosterPush,
-    registration: &Registration<A>,
+    account: &AccountKey,
     router: &RouterHandle<A>,
     allocator: &A,
 ) -> Result<(), RouterError> {
     let allocator = allocator.clone();
     router
-        .route_roster_push(registration.account(), move |to| {
-            build_roster_push(to, &push, &allocator)
-        })
+        .route_roster_push(account, move |to| build_roster_push(to, &push, &allocator))
         .await
 }
 

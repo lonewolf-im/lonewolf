@@ -72,6 +72,7 @@ pub enum PresenceEffect {
     None,
     Route,
     Deliver(RosterOrder),
+    DeliverThenPushRoster(RosterPush),
     Replay {
         order: RosterOrder,
         pending: Vec<PendingSubscription>,

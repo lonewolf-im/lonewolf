@@ -7,8 +7,8 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_JID_LEN};
 
 use super::{
-    PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid, RosterMutation,
-    RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
+    PendingResolution, PendingSubscription, RosterError, RosterItem, RosterItemUpdate, RosterJid,
+    RosterMutation, RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
 };
 use crate::account::AccountKey;
 use crate::redb::{begin_write, commit_error, storage_error};
@@ -179,6 +179,23 @@ impl RosterRepository for RedbRosterRepository {
             .map_err(Into::into)
     }
 
+    async fn resolve_pending<F>(
+        &self,
+        owner: &AccountKey,
+        sender: &RosterJid,
+        update: F,
+    ) -> Result<Option<PendingResolution>, RosterError>
+    where
+        F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static,
+    {
+        let owner = Box::<str>::from(owner.as_str());
+        let key = item_key_text(&owner, sender);
+        let sender = sender.clone();
+        self.database
+            .write(move |database| resolve_pending(database, &owner, key, sender, update))
+            .await
+    }
+
     async fn remove_pending(
         &self,
         owner: &AccountKey,
@@ -292,6 +309,60 @@ where
         version,
         value: item,
     }))
+}
+
+fn resolve_pending<F>(
+    database: &::redb::Database,
+    owner: &str,
+    key: Box<str>,
+    sender: RosterJid,
+    update: F,
+) -> Result<Option<PendingResolution>, RosterError>
+where
+    F: FnOnce(RosterSubscription) -> Option<RosterSubscription>,
+{
+    let transaction = begin_write(database)?;
+    let existed = transaction
+        .open_table(PENDING)
+        .map_err(storage_error)?
+        .remove(key.as_ref())
+        .map_err(storage_error)?
+        .is_some();
+    if !existed {
+        return Ok(None);
+    }
+    let item = {
+        let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
+        let mut item = match table.get(key.as_ref()).map_err(storage_error)? {
+            Some(record) => decode_item(sender, record.value())?,
+            None => RosterItem {
+                jid: sender,
+                name: None,
+                groups: Vec::new(),
+                subscription: RosterSubscription::default(),
+            },
+        };
+        match update(item.subscription) {
+            Some(subscription) => {
+                item.subscription = subscription;
+                let encoded = encode_item(&item)?;
+                table
+                    .insert(key.as_ref(), encoded.as_slice())
+                    .map_err(storage_error)?;
+                Some(item)
+            }
+            None => None,
+        }
+    };
+    let mutation = match item {
+        Some(value) => Some(RosterMutation {
+            version: advance_version(&transaction, owner)?,
+            value,
+        }),
+        None => None,
+    };
+    transaction.commit().map_err(commit_error)?;
+    Ok(Some(PendingResolution { mutation }))
 }
 
 fn upsert(

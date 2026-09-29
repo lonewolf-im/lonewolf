@@ -84,6 +84,11 @@ pub struct RosterMutation<T> {
     pub value: T,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct PendingResolution {
+    pub mutation: Option<RosterMutation<RosterItem>>,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PendingSubscription {
     pub sender: RosterJid,
@@ -154,6 +159,16 @@ pub trait RosterRepository: Send + Sync {
         &self,
         owner: &AccountKey,
     ) -> impl Future<Output = Result<Vec<PendingSubscription>, RosterError>> + Send;
+
+    /// Removes a pending request and applies its roster transition in one write.
+    fn resolve_pending<F>(
+        &self,
+        owner: &AccountKey,
+        sender: &RosterJid,
+        update: F,
+    ) -> impl Future<Output = Result<Option<PendingResolution>, RosterError>> + Send
+    where
+        F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static;
 
     /// Returns whether a pending request existed.
     fn remove_pending(

@@ -150,6 +150,192 @@ fn subscription_request_reaches_an_available_contact_and_updates_the_roster() ->
 }
 
 #[test]
+fn subscription_approval_updates_both_rosters_and_delivers_current_presence() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut alice_tablet = suite.connect("alice", "password", "tablet")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+
+    request_roster(
+        &mut alice,
+        "alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice_tablet.send("<presence/>")?;
+    alice_tablet.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/tablet' to='alice@localhost'/>",
+    )?;
+    bob.send("<presence><show>away</show></presence>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><show>away</show></presence>")?;
+
+    alice.send("<presence type='subscribe' id='request' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='request' from='alice@localhost' to='bob@localhost'/>")?;
+    let alice_pending = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='none' ask='subscribe'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{alice_pending}'/>"))?;
+
+    bob.send("<presence type='subscribed' id='approval' from='mallory@localhost/spy' to='alice@localhost/ignored'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='subscribed' id='approval' from='bob@localhost' to='alice@localhost'/>")?;
+    let alice_approved = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='to'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{alice_approved}'/>"))?;
+    alice_tablet.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'><show>away</show></presence>")?;
+    let bob_approved = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='from'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{bob_approved}'/>"))?;
+
+    request_roster(
+        &mut alice,
+        "approved-alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='approved-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='to'/></query></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "approved-bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='approved-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='from'/></query></iq>",
+    )?;
+    request_roster(
+        &mut alice_tablet,
+        "approved-tablet-roster",
+        "<iq xmlns='jabber:client' type='result' id='approved-tablet-roster' to='alice@localhost/tablet'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='to'/></query></iq>",
+    )?;
+
+    alice.close()?;
+    alice_tablet.close()?;
+    bob.close()
+}
+
+#[test]
+fn unsolicited_subscription_approval_is_silently_ignored() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+
+    request_roster(
+        &mut alice,
+        "initial-alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "initial-bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    bob.send("<presence type='subscribed' id='unsolicited' to='alice@localhost'/>")?;
+    request_roster(
+        &mut alice,
+        "unchanged-alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "unchanged-bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn crossed_subscription_approvals_create_a_mutual_subscription() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+
+    request_roster(
+        &mut alice,
+        "initial-alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "initial-bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.send("<presence type='subscribe' id='alice-request' to='bob@localhost'/>")?;
+    let alice_pending = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='none' ask='subscribe'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{alice_pending}'/>"))?;
+    bob.send("<presence type='subscribe' id='bob-request' to='alice@localhost'/>")?;
+    let bob_pending = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none' ask='subscribe'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{bob_pending}'/>"))?;
+
+    bob.send("<presence type='subscribed' id='alice-approved' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='subscribed' id='alice-approved' from='bob@localhost' to='alice@localhost'/>")?;
+    let alice_to = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='to'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{alice_to}'/>"))?;
+    let bob_from = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='from' ask='subscribe'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{bob_from}'/>"))?;
+
+    alice.send("<presence type='subscribed' id='bob-approved' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='subscribed' id='bob-approved' from='alice@localhost' to='bob@localhost'/>")?;
+    let bob_both = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='both'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{bob_both}'/>"))?;
+    let alice_both = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='both'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{alice_both}'/>"))?;
+
+    request_roster(
+        &mut alice,
+        "mutual-alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='mutual-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='both'/></query></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "mutual-bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='mutual-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='both'/></query></iq>",
+    )?;
+
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
 fn subscription_request_is_delivered_when_an_offline_contact_becomes_available() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;

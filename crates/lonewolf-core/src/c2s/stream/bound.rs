@@ -7,7 +7,9 @@ use std::pin::pin;
 
 use futures_util::future::{Either, select};
 use lonewolf_extension::delivery::HandlerError;
-use lonewolf_extension::presence::{PresenceRequest, PresenceRequestType, PresenceUpdate};
+use lonewolf_extension::presence::{
+    PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
+};
 use lonewolf_storage::roster::PendingSubscription;
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
@@ -36,8 +38,26 @@ struct BoundSession<A: ChunkAllocator> {
     registration: Registration<A>,
     router: RouterHandle<A>,
     allocator: A,
-    /// Stored subscription requests to write after the next availability delivery.
-    pending_replays: VecDeque<Vec<PendingSubscription>>,
+    /// Whether this resource currently has presence, mirroring the router's view.
+    available: bool,
+    pending_replays: VecDeque<Replay<A>>,
+}
+
+/// What a resource receives right after its own availability echo.
+struct Replay<A: ChunkAllocator> {
+    /// The contacts' current presence, captured while the subscription state was locked.
+    presences: Vec<RoutedStanza<A>>,
+    /// Subscription requests stored while no resource was available.
+    requests: Vec<PendingSubscription>,
+}
+
+impl<A: ChunkAllocator> Default for Replay<A> {
+    fn default() -> Self {
+        Self {
+            presences: Vec::new(),
+            requests: Vec::new(),
+        }
+    }
 }
 
 pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcome {
@@ -53,6 +73,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         registration,
         router,
         allocator,
+        available: false,
         pending_replays: VecDeque::new(),
     };
     let retired = pin!(session.registration.wait_retired());
@@ -135,7 +156,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     handler
                         .audience(PresenceUpdate {
                             sender,
-                            available: false,
+                            transition: PresenceTransition::Unavailable,
                         })
                         .await
                 };
@@ -181,11 +202,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     self.writer.send_routed(&stanza).await?;
                 }
                 if replay_pending {
-                    let pending = self
+                    let replay = self
                         .pending_replays
                         .pop_front()
                         .ok_or(CloseOutcome::InternalError)?;
-                    for subscription in pending {
+                    for stanza in &replay.presences {
+                        self.writer.send_routed(stanza).await?;
+                    }
+                    for subscription in replay.requests {
                         let stanza = self.parse_pending_subscription(subscription).await?;
                         self.writer.send_routed(&stanza).await?;
                     }
@@ -319,10 +343,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         } else {
             None
         };
-        let kind = if available {
-            PresenceRequestType::Available
-        } else {
-            PresenceRequestType::Unavailable
+        let (kind, transition) = match (available, self.available) {
+            (true, false) => (PresenceRequestType::Available, PresenceTransition::Initial),
+            (true, true) => (PresenceRequestType::Available, PresenceTransition::Update),
+            (false, _) => (
+                PresenceRequestType::Unavailable,
+                PresenceTransition::Unavailable,
+            ),
         };
         let result = match self
             .router
@@ -332,7 +359,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             None => Ok(None),
             Some(handler) => {
                 let sender = from.resolve(&arena)?;
-                handler.audience(PresenceUpdate { sender, available }).await
+                handler
+                    .audience(PresenceUpdate { sender, transition })
+                    .await
             }
         };
         let mut audience = match result {
@@ -359,13 +388,23 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             .set_presence(priority, routed, unavailable)
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
+        self.available = priority.is_some();
         if change.became_available {
-            self.pending_replays.push_back(
-                audience
-                    .as_mut()
-                    .map(|audience| mem::take(&mut audience.pending))
-                    .unwrap_or_default(),
-            );
+            // The audience still holds the ordering guard, so a contact captured here
+            // cannot have revoked the subscription before its presence is written.
+            let mut replay = Replay::default();
+            if let Some(audience) = audience.as_mut() {
+                for contact in &audience.contacts {
+                    let presence = self
+                        .router
+                        .current_presence(contact, self.registration.account())
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                    replay.presences.extend(presence);
+                }
+                replay.requests = mem::take(&mut audience.pending);
+            }
+            self.pending_replays.push_back(replay);
         }
         if let Some(audience) = audience
             && (available || change.became_unavailable)

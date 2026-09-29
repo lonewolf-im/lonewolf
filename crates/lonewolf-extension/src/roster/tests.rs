@@ -7,6 +7,9 @@ use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use lonewolf_storage::roster::redb::RedbRosterRepository;
+use lonewolf_storage::roster::{
+    RosterJid, RosterRepository, RosterSubscription, SubscriptionState,
+};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{Element, RoutedStanza};
@@ -14,7 +17,7 @@ use lonewolf_xmpp::stanza::{Element, RoutedStanza};
 use super::{NAMESPACE, Roster};
 use crate::delivery::{Delivery, DeliveryError, DeliveryFuture, SessionTag, StanzaFactory};
 use crate::iq::{IqHandler, IqRequest, IqRequestType};
-use crate::presence::{PresenceHandler, PresenceUpdate};
+use crate::presence::{PresenceHandler, PresenceTransition, PresenceUpdate};
 
 type TestRoster = Roster<RedbRosterRepository, RedbAccountRepository>;
 
@@ -181,14 +184,72 @@ fn availability_audience_holds_the_owner_order_until_dropped() {
         &roster,
         PresenceUpdate {
             sender,
-            available: true,
+            transition: PresenceTransition::Initial,
         },
     ))
     .unwrap_or_else(|error| panic!("{error:?}"))
     .unwrap_or_else(|| panic!("expected an audience"));
     assert!(audience.pending.is_empty());
     assert!(audience.subscribers.is_empty());
+    assert!(audience.contacts.is_empty());
     assert!(roster.order.is_locked(&owner));
     drop(audience);
     assert!(!roster.order.is_locked(&owner));
+}
+
+#[test]
+fn only_the_initial_transition_collects_granted_contacts() {
+    let (_directory, roster) = roster();
+    let mut arena =
+        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+    let alice = Jid::parse_in("alice@example.com/desk", &mut arena)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let bob =
+        Jid::parse_in("bob@example.com", &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let alice = alice
+        .resolve(&arena)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let bob = bob
+        .resolve(&arena)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let alice_account =
+        AccountKey::try_from(alice.bare()).unwrap_or_else(|error| panic!("{error}"));
+    let bob_account = AccountKey::try_from(bob).unwrap_or_else(|error| panic!("{error}"));
+    block_on(async {
+        roster
+            .repository
+            .update_subscription(&alice_account, &RosterJid::from(bob), |mut subscription| {
+                subscription.state = SubscriptionState::To;
+                Some(subscription)
+            })
+            .await?;
+        roster
+            .repository
+            .update_subscription(&bob_account, &RosterJid::from(alice.bare()), |_| {
+                Some(RosterSubscription {
+                    state: SubscriptionState::From,
+                    pending_out: false,
+                    approved: false,
+                })
+            })
+            .await
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+    for (transition, expected) in [
+        (PresenceTransition::Initial, vec![bob_account.clone()]),
+        (PresenceTransition::Update, Vec::new()),
+        (PresenceTransition::Unavailable, Vec::new()),
+    ] {
+        let audience = block_on(PresenceHandler::<GlobalChunkAllocator>::audience(
+            &roster,
+            PresenceUpdate {
+                sender: alice,
+                transition,
+            },
+        ))
+        .unwrap_or_else(|error| panic!("{error:?}"))
+        .unwrap_or_else(|| panic!("expected an audience"));
+        assert_eq!(audience.contacts, expected, "{transition:?}");
+        assert!(audience.subscribers.is_empty(), "{transition:?}");
+    }
 }

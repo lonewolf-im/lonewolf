@@ -190,30 +190,48 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         {
             return Err(RouterError::RemoteUnsupported);
         }
-        for stanza in self.local.presence_snapshot(source).await? {
-            let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
-                .map_err(|_| RouterError::Unavailable)?;
-            let target = Jid::parse_in(target.as_str(), &mut arena)
-                .map_err(|_| RouterError::InvalidTarget)?;
-            let stanza = stanza
-                .resolve()
-                .map_err(|_| RouterError::Unavailable)?
-                .to_builder_in(&mut arena)
-                .map_err(|_| RouterError::Unavailable)?
-                .to(Some(target))
-                .map_err(|_| RouterError::Unavailable)?
-                .build()
-                .map_err(|_| RouterError::Unavailable)?;
-            match self
-                .local
-                .deliver_presence(RoutedStanza::from_parts(stanza, arena))
-                .await
-            {
+        for stanza in self.current_presence(source, target).await? {
+            match self.local.deliver_presence(stanza).await {
                 Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
                 Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    /// Returns the presence of every available resource of `source`, addressed to `target`.
+    pub(crate) async fn current_presence(
+        &self,
+        source: &AccountKey,
+        target: &AccountKey,
+    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+        let snapshot = self.local.presence_snapshot(source).await?;
+        let mut stanzas = Vec::with_capacity(snapshot.len());
+        for stanza in &snapshot {
+            stanzas.push(self.readdress(stanza, target)?);
+        }
+        Ok(stanzas)
+    }
+
+    fn readdress(
+        &self,
+        stanza: &RoutedStanza<A>,
+        target: &AccountKey,
+    ) -> Result<RoutedStanza<A>, RouterError> {
+        let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
+            .map_err(|_| RouterError::Unavailable)?;
+        let target =
+            Jid::parse_in(target.as_str(), &mut arena).map_err(|_| RouterError::InvalidTarget)?;
+        let stanza = stanza
+            .resolve()
+            .map_err(|_| RouterError::Unavailable)?
+            .to_builder_in(&mut arena)
+            .map_err(|_| RouterError::Unavailable)?
+            .to(Some(target))
+            .map_err(|_| RouterError::Unavailable)?
+            .build()
+            .map_err(|_| RouterError::Unavailable)?;
+        Ok(RoutedStanza::from_parts(stanza, arena))
     }
 
     pub(crate) async fn route_unavailable_presence(

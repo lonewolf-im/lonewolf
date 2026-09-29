@@ -5,6 +5,7 @@ use std::error::Error;
 use std::num::NonZeroU32;
 
 use crate::account::{Account, AccountError, AccountKey, AccountKeyError, NewAccount};
+use crate::roster::RosterJid;
 use crate::{StorageError, StorageErrorKind};
 use lonewolf_auth::scram::{ScramCredentials, ScramSha1Verifier, ScramSha256Verifier};
 use lonewolf_util::arena::{Arena, ArenaConfig};
@@ -24,6 +25,33 @@ fn sha1() -> ScramSha1Verifier {
 
 fn sha256() -> ScramSha256Verifier {
     ScramSha256Verifier::new([21; 16], NonZeroU32::MIN, [22; 32], [23; 32])
+}
+
+fn roster_jid(input: &str) -> Result<RosterJid, Box<dyn Error>> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let jid = Jid::parse_in(input, &mut arena)?;
+    Ok(RosterJid::from(jid.resolve(&arena)?))
+}
+
+#[test]
+fn roster_jids_convert_to_account_keys_only_when_bare() -> TestResult {
+    let key = AccountKey::try_from(&roster_jid("alice@example.com")?)?;
+    assert_eq!(key.username(), "alice");
+    assert_eq!(key.domain(), "example.com");
+    assert_eq!(key, self::key("alice@example.com")?);
+    assert_eq!(
+        AccountKey::try_from(&roster_jid("alice@example.com/desktop")?),
+        Err(AccountKeyError::ResourceNotAllowed)
+    );
+    assert_eq!(
+        AccountKey::try_from(&roster_jid("example.com/desk@work")?),
+        Err(AccountKeyError::ResourceNotAllowed)
+    );
+    assert_eq!(
+        AccountKey::try_from(&roster_jid("example.com")?),
+        Err(AccountKeyError::MissingUsername)
+    );
+    Ok(())
 }
 
 #[test]

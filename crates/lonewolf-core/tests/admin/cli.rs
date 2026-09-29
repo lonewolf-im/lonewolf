@@ -6,13 +6,14 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use lonewolf_admin::Server;
+use lonewolf_admin::{NoopObserver, Server};
 use lonewolf_storage::RedbDatabase;
 use lonewolf_storage::account::redb::RedbAccountRepository;
 use serde_json::{Value, json};
@@ -28,7 +29,7 @@ fn with_admin_server(test: impl FnOnce(&Path) -> TestResult) -> TestResult {
     let (ready, readiness) = mpsc::channel();
     let worker = thread::spawn(move || -> io::Result<()> {
         Runtime::new()?.block_on(async {
-            let server = Server::bind(&socket, accounts)?;
+            let server = Server::bind(&socket, accounts, Arc::new(NoopObserver))?;
             ready.send(()).map_err(io::Error::other)?;
             server
                 .run(async move {

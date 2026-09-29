@@ -1079,7 +1079,8 @@ fn unsubscribe_updates_the_contact_roster_while_the_contact_is_offline() -> Test
 }
 
 #[test]
-fn revocation_clears_the_grant_after_the_subscriber_account_is_deleted() -> TestResult {
+fn deleting_a_subscriber_withdraws_its_subscription_and_later_revocation_is_a_no_op() -> TestResult
+{
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;
     suite.create_account("bob", "password")?;
@@ -1124,13 +1125,14 @@ fn revocation_clears_the_grant_after_the_subscriber_account_is_deleted() -> Test
 
     alice.close()?;
     suite.delete_account("alice")?;
-    bob.send("<presence type='unsubscribed' to='alice@localhost'/>")?;
-    let revoked = expect_roster_push(
+    bob.expect_xml("<presence xmlns='jabber:client' type='unsubscribe' from='alice@localhost' to='bob@localhost'/>")?;
+    let withdrawn = expect_roster_push(
         &mut bob,
         "bob@localhost/phone",
         "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
     )?;
-    bob.send(&format!("<iq type='result' id='{revoked}'/>"))?;
+    bob.send(&format!("<iq type='result' id='{withdrawn}'/>"))?;
+    bob.send("<presence type='unsubscribed' to='alice@localhost'/>")?;
     request_roster(
         &mut bob,
         "revoked-roster",
@@ -2349,4 +2351,147 @@ fn roster_removal_does_not_reveal_resources_the_owner_never_granted() -> TestRes
 
     alice.close()?;
     bob.close()
+}
+
+#[test]
+fn account_deletion_clears_the_roster_and_notifies_contacts() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    suite.create_account("charlie", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    let mut charlie = suite.connect("charlie", "password", "desk")?;
+    request_roster(
+        &mut alice,
+        "alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    request_roster(
+        &mut charlie,
+        "charlie-roster",
+        "<iq xmlns='jabber:client' type='result' id='charlie-roster' to='charlie@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+
+    alice.send("<presence type='subscribe' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>")?;
+    let pending = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='none' ask='subscribe'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{pending}'/>"))?;
+    bob.send("<presence type='subscribed' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='subscribed' from='bob@localhost' to='alice@localhost'/>")?;
+    let approved = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='to'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{approved}'/>"))?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
+    )?;
+    let granted = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='from'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{granted}'/>"))?;
+    bob.send("<presence type='subscribe' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='subscribe' from='bob@localhost' to='alice@localhost'/>")?;
+    let pending = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='from' ask='subscribe'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{pending}'/>"))?;
+    alice.send("<presence type='subscribed' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='subscribed' from='alice@localhost' to='bob@localhost'/>")?;
+    let approved = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='both'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{approved}'/>"))?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost'/>",
+    )?;
+    let granted = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='both'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{granted}'/>"))?;
+
+    charlie.send("<presence type='subscribe' id='waiting' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='waiting' from='charlie@localhost' to='alice@localhost'/>")?;
+    let requested = expect_roster_push(
+        &mut charlie,
+        "charlie@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none' ask='subscribe'/>",
+    )?;
+    charlie.send(&format!("<iq type='result' id='{requested}'/>"))?;
+
+    suite.delete_account("alice")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='unavailable'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='unsubscribe' from='alice@localhost' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='unsubscribed' from='alice@localhost' to='bob@localhost'/>")?;
+    let cleared = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{cleared}'/>"))?;
+    charlie.expect_xml("<presence xmlns='jabber:client' type='unsubscribed' from='alice@localhost' to='charlie@localhost'/>")?;
+    let withdrawn = expect_roster_push(
+        &mut charlie,
+        "charlie@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+    )?;
+    charlie.send(&format!("<iq type='result' id='{withdrawn}'/>"))?;
+    request_roster(
+        &mut bob,
+        "bob-roster-after",
+        "<iq xmlns='jabber:client' type='result' id='bob-roster-after' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='none'/></query></iq>",
+    )?;
+    request_roster(
+        &mut charlie,
+        "charlie-roster-after",
+        "<iq xmlns='jabber:client' type='result' id='charlie-roster-after' to='charlie@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='none'/></query></iq>",
+    )?;
+    alice.close()?;
+
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    request_roster(
+        &mut alice,
+        "fresh-roster",
+        "<iq xmlns='jabber:client' type='result' id='fresh-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
+    bob.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' id='sentinel'/>")?;
+
+    alice.close()?;
+    bob.close()?;
+    charlie.close()
 }

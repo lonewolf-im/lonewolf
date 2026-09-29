@@ -22,6 +22,8 @@ use lonewolf_auth::scram::{
 };
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountRepository, NewAccount};
+
+use crate::observer::AccountObserver;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::blocking::BlockingExecutor;
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
@@ -33,7 +35,10 @@ const MAX_BODY: usize = 16 * 1024;
 const MAX_PAGE: usize = 100;
 const DEFAULT_PAGE: usize = 50;
 
-pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
+pub(crate) fn router<R: AccountRepository + 'static>(
+    accounts: R,
+    observer: Arc<dyn AccountObserver>,
+) -> Router {
     Router::new()
         .route(
             "/v1/accounts",
@@ -49,7 +54,7 @@ pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
         .layer(middleware::from_fn(log_request))
-        .with_state(Arc::new(Api::new(accounts)))
+        .with_state(Arc::new(Api::new(accounts, observer)))
 }
 
 async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
@@ -126,6 +131,10 @@ async fn delete_account<R: AccountRepository>(
     AccountPath(key): AccountPath,
 ) -> Result<Response, ApiError> {
     api.accounts.delete(&key).await?;
+    api.observer.deleted(&key).await.map_err(|error| {
+        tracing::error!(error = %error, "account cleanup failed after deletion");
+        ApiError::internal()
+    })?;
     Ok(empty())
 }
 
@@ -176,13 +185,15 @@ where
 
 struct Api<R> {
     accounts: R,
+    observer: Arc<dyn AccountObserver>,
     passwords: BlockingExecutor,
 }
 
 impl<R: AccountRepository> Api<R> {
-    fn new(accounts: R) -> Self {
+    fn new(accounts: R, observer: Arc<dyn AccountObserver>) -> Self {
         Self {
             accounts,
+            observer,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
         }
     }
@@ -452,6 +463,7 @@ impl From<AccountError> for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use crate::observer::NoopObserver;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
@@ -530,11 +542,14 @@ mod tests {
     fn listing_reads_only_the_page_and_lookahead_and_releases_the_stream()
     -> Result<(), Box<dyn std::error::Error>> {
         compio::runtime::Runtime::new()?.block_on(async {
-            let api = Api::new(Repository {
-                reads: AtomicUsize::new(0),
-                active: AtomicBool::new(false),
-                fail_at: Some(3),
-            });
+            let api = Api::new(
+                Repository {
+                    reads: AtomicUsize::new(0),
+                    active: AtomicBool::new(false),
+                    fail_at: Some(3),
+                },
+                Arc::new(NoopObserver),
+            );
             let response = api
                 .list(Some("limit=2"))
                 .await
@@ -553,11 +568,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         compio::runtime::Runtime::new()?.block_on(async {
             for fail_at in [1, 2] {
-                let api = Api::new(Repository {
-                    reads: AtomicUsize::new(0),
-                    active: AtomicBool::new(false),
-                    fail_at: Some(fail_at),
-                });
+                let api = Api::new(
+                    Repository {
+                        reads: AtomicUsize::new(0),
+                        active: AtomicBool::new(false),
+                        fail_at: Some(fail_at),
+                    },
+                    Arc::new(NoopObserver),
+                );
                 let error = match api.list(Some("limit=2")).await {
                     Err(error) => error,
                     Ok(_) => return Err("listing should fail".into()),

@@ -23,8 +23,8 @@ use tokio::io::BufReader;
 use super::bind::Bound;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
-use crate::c2s::delivery::StreamDelivery;
 use crate::c2s::iq;
+use crate::delivery::RouterDelivery;
 use crate::router::local::ResourceDelivery;
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
 
@@ -498,11 +498,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         self.writer.send_stanza(&reply).await
     }
 
-    fn delivery(&self) -> StreamDelivery<'_, A> {
-        StreamDelivery {
+    fn delivery(&self) -> RouterDelivery<'_, A> {
+        RouterDelivery {
             router: &self.router,
-            registration: &self.registration,
             allocator: &self.allocator,
+            session: Some(&self.registration),
         }
     }
 

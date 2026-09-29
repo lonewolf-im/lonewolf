@@ -2,7 +2,7 @@
 
 use lonewolf_storage::account::{AccountKey, AccountRepository};
 use lonewolf_storage::roster::{
-    PendingSubscription, RosterJid, RosterRepository, RosterSubscription,
+    ItemRemoval, PendingSubscription, RosterJid, RosterRepository, RosterSubscription,
     SubscriptionRequestOutcome, SubscriptionState,
 };
 use lonewolf_util::arena::ChunkAllocator;
@@ -214,7 +214,7 @@ fn approve_outbound_subscription(
 
 impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
     /// Removes an item and, for a local contact, withdraws and cancels the subscriptions
-    /// the contact's roster records, in the order the separate presence flows use.
+    /// the two rosters record, in the order the separate presence flows use.
     pub(super) async fn remove_item<A: ChunkAllocator>(
         &self,
         owner: AccountKey,
@@ -222,15 +222,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         owner_jid: RosterJid,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let contact_account = match AccountKey::try_from(&contact) {
-            Ok(account)
-                if delivery.is_local_host(account.domain())
-                    && self.account_exists(&account).await? =>
-            {
-                Some(account)
-            }
-            _ => None,
-        };
+        let contact_account = self.local_account(&contact, delivery).await?;
         let _order = match &contact_account {
             Some(account) => self.order.lock_pair(&owner, account).await,
             None => self.order.lock(&owner).await,
@@ -247,10 +239,91 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             .await?
             .ok_or(StanzaErrorCondition::ItemNotFound)?;
         push_removal(&owner, contact, removal.version, delivery).await?;
-        let Some(contact_account) = contact_account else {
-            return Ok(());
-        };
-        // Each side's resource addresses are only revealed under that side's own grant.
+        if let Some(contact_account) = contact_account {
+            let contact_granted = self
+                .notify_removed_contact(&owner, &contact_account, removal, delivery)
+                .await?;
+            if contact_granted {
+                delivery
+                    .unavailable_presence(&contact_account, &owner)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears every trace of a deleted account: its own roster and pending requests,
+    /// and the subscriptions and requests its local contacts held with it.
+    pub(super) async fn forget_account<A: ChunkAllocator>(
+        &self,
+        account: &AccountKey,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), HandlerError> {
+        let account_jid = RosterJid::from(account);
+        let snapshot = self.repository.snapshot(account).await?;
+        for item in snapshot.items {
+            let Some(contact) = self.local_account(&item.jid, delivery).await? else {
+                continue;
+            };
+            let _order = self.order.lock_pair(account, &contact).await;
+            let removal = self
+                .repository
+                .remove_item(account, &item.jid, Some((&contact, &account_jid)))
+                .await?;
+            if let Some(removal) = removal {
+                self.notify_removed_contact(account, &contact, removal, delivery)
+                    .await?;
+            }
+        }
+        for request in self.repository.pending(account).await? {
+            let Some(sender) = self.local_account(&request.sender, delivery).await? else {
+                continue;
+            };
+            let _order = self.order.lock_pair(account, &sender).await;
+            let outcome = self
+                .repository
+                .cancel_subscription(account, &request.sender, Some((&sender, &account_jid)))
+                .await?;
+            if outcome.route {
+                let (_, cancellation) =
+                    xml::subscription_withdrawals(account, &sender, delivery.arena()?)?;
+                delivery
+                    .to_tagged(SessionTag::Interested, cancellation)
+                    .await?;
+            }
+            if let Some(mutation) = outcome.subscriber {
+                push_roster(&sender, mutation, delivery).await?;
+            }
+        }
+        let _order = self.order.lock(account).await;
+        self.repository.delete_all(account).await?;
+        Ok(())
+    }
+
+    /// Resolves a roster JID to an account this server hosts and stores.
+    async fn local_account<A: ChunkAllocator>(
+        &self,
+        jid: &RosterJid,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<Option<AccountKey>, StanzaErrorCondition> {
+        match AccountKey::try_from(jid) {
+            Ok(account) if delivery.is_local_host(account.domain()) => {
+                Ok(self.account_exists(&account).await?.then_some(account))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Sends the contact what losing the owner implies and returns whether the contact
+    /// had granted the owner its presence.
+    /// Each side's resource addresses are only revealed under that side's own grant.
+    async fn notify_removed_contact<A: ChunkAllocator>(
+        &self,
+        owner: &AccountKey,
+        contact: &AccountKey,
+        removal: ItemRemoval,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<bool, HandlerError> {
         let owner_granted = matches!(
             removal.subscription.state,
             SubscriptionState::From | SubscriptionState::Both
@@ -261,13 +334,11 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         );
         let cancel = owner_granted || removal.pending_request;
         if owner_granted {
-            delivery
-                .unavailable_presence(&owner, &contact_account)
-                .await?;
+            delivery.unavailable_presence(owner, contact).await?;
         }
         if contact_granted || cancel {
             let (withdrawal, cancellation) =
-                xml::subscription_withdrawals(&owner, &contact_account, delivery.arena()?)?;
+                xml::subscription_withdrawals(owner, contact, delivery.arena()?)?;
             if contact_granted {
                 delivery
                     .to_tagged(SessionTag::Interested, withdrawal)
@@ -280,13 +351,8 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             }
         }
         if let Some(mutation) = removal.contact {
-            push_roster(&contact_account, mutation, delivery).await?;
+            push_roster(contact, mutation, delivery).await?;
         }
-        if contact_granted {
-            delivery
-                .unavailable_presence(&contact_account, &owner)
-                .await?;
-        }
-        Ok(())
+        Ok(contact_granted)
     }
 }

@@ -4,6 +4,7 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use compio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +12,7 @@ use compio::net::UnixStream;
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::join;
-use lonewolf_admin::Server;
+use lonewolf_admin::{NoopObserver, Server};
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
 };
@@ -37,6 +38,7 @@ where
         let server = Server::bind(
             &path,
             RedbAccountRepository::from_database(database.clone())?,
+            Arc::new(NoopObserver),
         )?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
@@ -495,7 +497,7 @@ fn shutdown_drains_an_accepted_request_and_removes_the_socket() -> TestResult {
     let accounts = RedbAccountRepository::from_database(database.clone())?;
     let path = directory.path().join("private/admin.sock");
     Runtime::new()?.block_on(async {
-        let server = Server::bind(&path, accounts)?;
+        let server = Server::bind(&path, accounts, Arc::new(NoopObserver))?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
             let body = r#"{"jid":"alice@example.org","password":"password"}"#;

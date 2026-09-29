@@ -7,6 +7,8 @@
 compile_error!("Lonewolf supports Unix targets only.");
 
 mod api;
+mod observer;
 mod server;
 
+pub use observer::{AccountObserver, NoopObserver, ObserverError};
 pub use server::Server;

@@ -6,6 +6,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -21,6 +22,7 @@ use lonewolf_storage::account::AccountRepository;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::api;
+use crate::observer::AccountObserver;
 
 const MAX_CONNECTIONS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,7 +50,11 @@ impl Server {
     /// # Panics
     ///
     /// Panics when attaching the listener outside a compio runtime.
-    pub fn bind(path: &Path, accounts: impl AccountRepository + 'static) -> io::Result<Self> {
+    pub fn bind(
+        path: &Path,
+        accounts: impl AccountRepository + 'static,
+        observer: Arc<dyn AccountObserver>,
+    ) -> io::Result<Self> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -87,7 +93,7 @@ impl Server {
         Ok(Self {
             listener: UnixListener::from_std(listener)?,
             socket,
-            router: api::router(accounts),
+            router: api::router(accounts, observer),
         })
     }
 

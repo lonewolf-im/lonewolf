@@ -6,10 +6,10 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::presence::PresenceRegistry;
+use lonewolf_extension::{Extension, ExtensionRegistry};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -95,6 +95,13 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     pub(crate) fn presence_handlers(&self, domain: &str) -> Option<&PresenceRegistry<A>> {
         self.extensions.get(domain).map(ExtensionRegistry::presence)
+    }
+
+    /// The extensions enabled for `domain`, or none for an unknown host.
+    pub(crate) fn extensions(&self, domain: &str) -> &[Arc<dyn Extension<A>>] {
+        self.extensions
+            .get(domain)
+            .map_or(&[], ExtensionRegistry::extensions)
     }
 
     /// Applies the incoming listener's limit to resources on all listeners.

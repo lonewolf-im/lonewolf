@@ -9,14 +9,16 @@ use lonewolf_xmpp::jid::Jid;
 
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
 
-/// Performs handler deliveries through the router on behalf of one bound resource.
-pub(super) struct StreamDelivery<'a, A: ChunkAllocator> {
-    pub(super) router: &'a RouterHandle<A>,
-    pub(super) registration: &'a Registration<A>,
-    pub(super) allocator: &'a A,
+/// Performs handler deliveries through the router, for a bound resource or for the
+/// server itself when no session is involved.
+pub(crate) struct RouterDelivery<'a, A: ChunkAllocator> {
+    pub(crate) router: &'a RouterHandle<A>,
+    pub(crate) allocator: &'a A,
+    /// The requesting resource; server-initiated work has none and cannot tag a session.
+    pub(crate) session: Option<&'a Registration<A>>,
 }
 
-impl<A: ChunkAllocator + Clone> Delivery<A> for StreamDelivery<'_, A> {
+impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<'_, A> {
     fn arena(&self) -> Result<Arena<A>, DeliveryError> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
     }
@@ -26,7 +28,12 @@ impl<A: ChunkAllocator + Clone> Delivery<A> for StreamDelivery<'_, A> {
     }
 
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
-        Box::pin(async move { self.registration.tag(tag).await.map_err(|_| DeliveryError) })
+        Box::pin(async move {
+            match self.session {
+                Some(session) => session.tag(tag).await.map_err(|_| DeliveryError),
+                None => Err(DeliveryError),
+            }
+        })
     }
 
     fn to_available<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {

@@ -7,7 +7,7 @@ use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::parser::Parsed;
 use lonewolf_xmpp::stanza::{BuildError, IqType, Stanza, StanzaErrorCondition, StanzaType};
 
-use super::delivery::StreamDelivery;
+use crate::delivery::RouterDelivery;
 use crate::router::{Registration, RouterError, RouterHandle};
 
 pub(super) struct ReplyError;
@@ -90,10 +90,10 @@ pub(super) async fn reply<A: ChunkAllocator + Clone>(
         return Ok((reply, arena));
     };
     let mut response = Arena::try_new_in(Default::default(), allocator.clone())?;
-    let delivery = StreamDelivery {
+    let delivery = RouterDelivery {
         router,
-        registration,
         allocator,
+        session: Some(registration),
     };
     let result = handler
         .handle(

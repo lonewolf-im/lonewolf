@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 
 pub mod delivery;
@@ -17,6 +18,7 @@ pub mod roster;
 
 pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+use delivery::{Delivery, HandlerError};
 use iq::{IqHandler, IqRegistry, IqRoute};
 use presence::{PresenceHandler, PresenceRegistry, PresenceRequestType};
 
@@ -34,6 +36,16 @@ pub trait Extension<A: ChunkAllocator>: IqHandler<A> + PresenceHandler<A> {
     /// The presence kinds dispatched to this extension's presence handler.
     fn presence_kinds(&self) -> &'static [PresenceRequestType] {
         &[]
+    }
+
+    /// Runs after an account on a host enabling this extension was deleted.
+    /// The deletion request completes once every extension has returned.
+    fn account_deleted<'a>(
+        &'a self,
+        _account: &'a AccountKey,
+        _delivery: &'a dyn Delivery<A>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -69,6 +81,7 @@ impl Error for RegistrationError {}
 pub struct ExtensionRegistry<A: ChunkAllocator> {
     iq: IqRegistry<A>,
     presence: PresenceRegistry<A>,
+    extensions: Vec<Arc<dyn Extension<A>>>,
 }
 
 impl<A: ChunkAllocator> Default for ExtensionRegistry<A> {
@@ -76,6 +89,7 @@ impl<A: ChunkAllocator> Default for ExtensionRegistry<A> {
         Self {
             iq: IqRegistry::default(),
             presence: PresenceRegistry::default(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -87,6 +101,11 @@ impl<A: ChunkAllocator> ExtensionRegistry<A> {
 
     pub fn presence(&self) -> &PresenceRegistry<A> {
         &self.presence
+    }
+
+    /// The enabled extensions, in the order they were enabled.
+    pub fn extensions(&self) -> &[Arc<dyn Extension<A>>] {
+        &self.extensions
     }
 }
 
@@ -118,10 +137,11 @@ impl<A: ChunkAllocator> Extensions<A> {
         for route in iq_routes {
             registry.iq.register(*route, Arc::clone(&iq))?;
         }
-        let presence: Arc<dyn PresenceHandler<A>> = extension;
+        let presence: Arc<dyn PresenceHandler<A>> = extension.clone();
         for kind in presence_kinds {
             registry.presence.register(*kind, Arc::clone(&presence))?;
         }
+        registry.extensions.push(extension);
         self.available.insert(name, registry);
         Ok(())
     }
@@ -147,6 +167,9 @@ impl<A: ChunkAllocator> Extensions<A> {
             for (kind, handler) in handlers.presence.registrations() {
                 enabled.presence.register(kind, handler)?;
             }
+            enabled
+                .extensions
+                .extend(handlers.extensions.iter().cloned());
         }
         Ok(enabled)
     }

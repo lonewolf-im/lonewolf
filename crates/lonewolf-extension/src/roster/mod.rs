@@ -11,7 +11,6 @@ use lonewolf_storage::roster::{
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
-use crate::Extension;
 use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
 use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType, IqRoute, IqScope};
 use crate::order::Sequencer;
@@ -19,6 +18,7 @@ use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate, ReceiveFuture,
 };
+use crate::{Extension, ExtensionFuture};
 use subscription::Parties;
 
 pub const NAME: &str = "roster";
@@ -109,6 +109,14 @@ where
 
     fn presence_kinds(&self) -> &'static [PresenceRequestType] {
         &PresenceRequestType::ALL
+    }
+
+    fn account_deleted<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        delivery: &'a dyn Delivery<A>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(self.forget_account(account, delivery))
     }
 }
 

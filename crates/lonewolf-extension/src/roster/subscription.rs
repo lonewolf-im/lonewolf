@@ -250,17 +250,17 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         let Some(contact_account) = contact_account else {
             return Ok(());
         };
-        let before = removal.contact_before.unwrap_or_default();
-        let contact_granted = matches!(
-            before.state,
+        // Each side's resource addresses are only revealed under that side's own grant.
+        let owner_granted = matches!(
+            removal.subscription.state,
             SubscriptionState::From | SubscriptionState::Both
         );
-        let contact_subscribed = matches!(
-            before.state,
-            SubscriptionState::To | SubscriptionState::Both
+        let contact_granted = matches!(
+            removal.contact_before.unwrap_or_default().state,
+            SubscriptionState::From | SubscriptionState::Both
         );
-        let cancel = contact_subscribed || removal.pending_request;
-        if contact_subscribed {
+        let cancel = owner_granted || removal.pending_request;
+        if owner_granted {
             delivery
                 .unavailable_presence(&owner, &contact_account)
                 .await?;

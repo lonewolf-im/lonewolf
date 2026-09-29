@@ -2274,3 +2274,79 @@ fn roster_removal_of_a_contact_on_an_unhosted_domain_changes_only_the_owner() ->
 
     alice.close()
 }
+
+fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice = Jid::parse_in("alice@localhost", &mut arena)?;
+    let bob = Jid::parse_in("bob@localhost", &mut arena)?;
+    let alice_account = AccountKey::try_from(alice.resolve(&arena)?)?;
+    let bob_account = AccountKey::try_from(bob.resolve(&arena)?)?;
+    let alice_contact = RosterJid::from(alice.resolve(&arena)?);
+    let bob_contact = RosterJid::from(bob.resolve(&arena)?);
+    Runtime::new()?.block_on(async {
+        repository
+            .update_subscription(&alice_account, &bob_contact, |_| {
+                Some(RosterSubscription::default())
+            })
+            .await?;
+        repository
+            .update_subscription(&bob_account, &alice_contact, |_| {
+                Some(RosterSubscription {
+                    state: SubscriptionState::To,
+                    pending_out: false,
+                    approved: false,
+                })
+            })
+            .await?;
+        Ok::<_, lonewolf_storage::roster::RosterError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn roster_removal_does_not_reveal_resources_the_owner_never_granted() -> TestResult {
+    let suite =
+        C2sSuite::with_extensions_and_setup("'roster'", seed_one_sided_contact_subscription)?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "private-device")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    request_roster(
+        &mut alice,
+        "alice-roster",
+        "<iq xmlns='jabber:client' type='result' id='alice-roster' to='alice@localhost/private-device'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='none'/></query></iq>",
+    )?;
+    request_roster(
+        &mut bob,
+        "bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='to'/></query></iq>",
+    )?;
+    alice.send("<presence/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/private-device' to='alice@localhost'/>")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+
+    alice.send("<iq type='set' id='remove-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='remove'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='remove-bob' to='alice@localhost/private-device'/>")?;
+    let removed = expect_roster_push(
+        &mut alice,
+        "alice@localhost/private-device",
+        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='remove'/>",
+    )?;
+    alice.send(&format!("<iq type='result' id='{removed}'/>"))?;
+    let cleared = expect_roster_push(
+        &mut bob,
+        "bob@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{cleared}'/>"))?;
+    bob.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' id='sentinel'/>")?;
+
+    alice.close()?;
+    bob.close()
+}

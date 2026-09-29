@@ -836,6 +836,7 @@ fn item_removal_clears_the_contact_and_both_pending_requests() -> TestResult {
     let removal = block_on(repository.remove_item(&alice, &bob_jid, Some((&bob, &alice_jid))))?
         .ok_or("missing removal")?;
     assert_eq!(removal.version.get(), 2);
+    assert_eq!(removal.subscription.state, SubscriptionState::Both);
     assert_eq!(
         removal.contact_before,
         Some(RosterSubscription {
@@ -884,6 +885,7 @@ fn item_removal_without_a_local_contact_changes_only_the_owner() -> TestResult {
     let removal =
         block_on(repository.remove_item(&alice, &bob_jid, None))?.ok_or("missing removal")?;
     assert_eq!(removal.version.get(), 2);
+    assert!(removal.subscription.pending_out);
     assert!(removal.contact_before.is_none());
     assert!(!removal.pending_request);
     assert!(removal.contact.is_none());

@@ -400,10 +400,10 @@ fn remove_item(
         }
         _ => None,
     };
-    drop(removed);
     transaction.commit().map_err(commit_error)?;
     Ok(Some(ItemRemoval {
         version,
+        subscription: removed.subscription,
         pending_request,
         contact_before,
         contact: contact_mutation,

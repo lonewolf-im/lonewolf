@@ -129,5 +129,5 @@ async fn delete<A: ChunkAllocator + Clone>(
 }
 
 fn deleter_error(message: &'static str) -> DeleterError {
-    Box::from(message)
+    DeleterError::Other(Box::from(message))
 }

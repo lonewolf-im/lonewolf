@@ -136,7 +136,8 @@ impl Writer {
         self.flush().await
     }
 
-    pub(super) async fn send_stanza<R: ArenaRead>(
+    /// Buffers the stanza without flushing, so a batch reaches the socket in one write.
+    pub(super) async fn write_stanza<R: ArenaRead>(
         &mut self,
         stanza: &StanzaRef<'_, R>,
     ) -> Result<(), CloseOutcome> {
@@ -146,16 +147,15 @@ impl Writer {
             .map_err(|error| match error {
                 AsyncWriteError::Access(_) => CloseOutcome::InternalError,
                 AsyncWriteError::Output(_) => CloseOutcome::TransportError,
-            })?;
-        self.flush().await
+            })
     }
 
-    pub(super) async fn send_routed<A: ChunkAllocator>(
+    pub(super) async fn write_routed<A: ChunkAllocator>(
         &mut self,
         stanza: &RoutedStanza<A>,
     ) -> Result<(), CloseOutcome> {
         let view = stanza.resolve()?;
-        self.send_stanza(&view).await
+        self.write_stanza(&view).await
     }
 
     pub(super) async fn send_header(&mut self, header: &ClientHeader) -> Result<(), CloseOutcome> {
@@ -203,7 +203,7 @@ impl Writer {
         }
     }
 
-    async fn flush(&mut self) -> Result<(), CloseOutcome> {
+    pub(super) async fn flush(&mut self) -> Result<(), CloseOutcome> {
         self.output
             .flush()
             .await

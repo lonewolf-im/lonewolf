@@ -30,7 +30,7 @@ use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
 use crate::delivery::{RouterDelivery, deliver_committed};
-use crate::router::local::{ResourceDelivery, RetireCause};
+use crate::router::local::RetireCause;
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
@@ -46,7 +46,6 @@ struct BoundSession<A: ChunkAllocator> {
     allocator: A,
     /// Whether this resource currently has presence, mirroring the router's view.
     available: bool,
-    pending_replays: VecDeque<Replay<A>>,
     /// Everything the client has yet to receive, in order; only `flush` writes the socket.
     outbox: VecDeque<Output<A>>,
 }
@@ -61,23 +60,6 @@ enum Output<A: ChunkAllocator> {
     /// Stored subscription requests, parsed one at a time as they are written so a large
     /// backlog never sits in memory at once.
     Requests(Vec<PendingSubscription>),
-}
-
-/// What a resource receives right after its own availability echo.
-struct Replay<A: ChunkAllocator> {
-    /// The contacts' current presence, captured while the subscription state was locked.
-    presences: Vec<RoutedStanza<A>>,
-    /// Subscription requests stored while no resource was available.
-    requests: Vec<PendingSubscription>,
-}
-
-impl<A: ChunkAllocator> Default for Replay<A> {
-    fn default() -> Self {
-        Self {
-            presences: Vec::new(),
-            requests: Vec::new(),
-        }
-    }
 }
 
 pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcome {
@@ -96,7 +78,6 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         storage,
         allocator,
         available: false,
-        pending_replays: VecDeque::new(),
         outbox: VecDeque::new(),
     };
     let stopped = {
@@ -242,36 +223,15 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
 
     /// Queues one delivery and everything else the mailbox already holds, then writes
     /// the batch in one go.
-    async fn drain_mailbox(&mut self, first: ResourceDelivery<A>) -> Result<(), CloseOutcome> {
-        self.enqueue_delivery(first)?;
-        for delivery in self.registration.take_queued() {
-            self.enqueue_delivery(delivery)?;
-        }
+    async fn drain_mailbox(&mut self, first: RoutedStanza<A>) -> Result<(), CloseOutcome> {
+        self.outbox.push_back(Output::Routed(first));
+        self.outbox.extend(
+            self.registration
+                .take_queued()
+                .into_iter()
+                .map(Output::Routed),
+        );
         self.flush().await
-    }
-
-    fn enqueue_delivery(&mut self, delivery: ResourceDelivery<A>) -> Result<(), CloseOutcome> {
-        match delivery {
-            ResourceDelivery::Routed(stanza) => self.outbox.push_back(Output::Routed(stanza)),
-            ResourceDelivery::Presence {
-                stanzas,
-                replay_pending,
-            } => {
-                self.outbox.extend(stanzas.into_iter().map(Output::Routed));
-                if replay_pending {
-                    let replay = self
-                        .pending_replays
-                        .pop_front()
-                        .ok_or(CloseOutcome::InternalError)?;
-                    self.outbox
-                        .extend(replay.presences.into_iter().map(Output::Routed));
-                    if !replay.requests.is_empty() {
-                        self.outbox.push_back(Output::Requests(replay.requests));
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Writes everything queued, in order, and flushes the socket once.
@@ -433,9 +393,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 }
             }
         };
-        for delivery in queued {
-            self.enqueue_delivery(delivery)?;
-        }
+        self.outbox.extend(queued.into_iter().map(Output::Routed));
         match handled {
             Err(HandlerError::Stanza(condition)) => {
                 let reply = iq::error_reply(&request, &mut arena, condition, Some(route.sender))?;
@@ -595,6 +553,12 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         if let Some(ticket) = ticket.as_mut() {
             ticket.turn().await;
         }
+        self.outbox.extend(
+            self.registration
+                .take_queued()
+                .into_iter()
+                .map(Output::Routed),
+        );
         let (routed, unavailable) = match unavailable {
             Some(unavailable) => {
                 let (routed, unavailable) =
@@ -609,26 +573,30 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             .then(|| routed.clone());
         let change = self
             .registration
-            .set_presence(priority, routed, unavailable)
+            .set_presence(priority, routed.clone(), unavailable)
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
         self.available = priority.is_some();
-        if change.became_available {
+        self.outbox
+            .extend(change.siblings.into_iter().map(Output::Routed));
+        self.outbox.push_back(Output::Routed(routed));
+        if change.became_available
+            && let Some(audience) = audience.as_mut()
+        {
             // The ticket is still held, so a contact captured here cannot have revoked the
             // subscription before its presence is written.
-            let mut replay = Replay::default();
-            if let Some(audience) = audience.as_mut() {
-                for contact in &audience.contacts {
-                    let presence = self
-                        .router
-                        .current_presence(contact, self.registration.account())
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
-                    replay.presences.extend(presence);
-                }
-                replay.requests = mem::take(&mut audience.pending);
+            for contact in &audience.contacts {
+                let presence = self
+                    .router
+                    .current_presence(contact, self.registration.account())
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                self.outbox.extend(presence.into_iter().map(Output::Routed));
             }
-            self.pending_replays.push_back(replay);
+            let requests = mem::take(&mut audience.pending);
+            if !requests.is_empty() {
+                self.outbox.push_back(Output::Requests(requests));
+            }
         }
         if let Some(audience) = audience
             && (available || change.became_unavailable)
@@ -726,9 +694,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()))
                         .await
                         .map_err(|_| CloseOutcome::InternalError)?;
-                for delivery in queued {
-                    self.enqueue_delivery(delivery)?;
-                }
+                self.outbox.extend(queued.into_iter().map(Output::Routed));
                 Ok(())
             }
             Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition).await,

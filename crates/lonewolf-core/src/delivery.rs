@@ -13,7 +13,7 @@ use lonewolf_xmpp::jid::Jid;
 
 use crate::order::Ticket;
 use crate::router::{
-    Mailbox, Registration, ResourceDelivery, RoutedStanza, RouterError, RouterHandle, SessionHandle,
+    Mailbox, Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle,
 };
 
 /// Performs handler deliveries through the router, for a bound resource or for the
@@ -51,7 +51,7 @@ pub(crate) fn deliver_committed<A: ChunkAllocator + Clone + 'static>(
     deliver: Deliver<A>,
     delivery: RouterDelivery<A>,
     mailbox: Option<Mailbox<A>>,
-) -> impl Future<Output = Result<Vec<ResourceDelivery<A>>, DeliveryError>> {
+) -> impl Future<Output = Result<Vec<RoutedStanza<A>>, DeliveryError>> {
     let (done, completed) = oneshot::channel();
     compio::runtime::spawn(async move {
         ticket.turn().await;

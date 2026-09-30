@@ -58,7 +58,6 @@ fn malformed_item_records_fail_operations_and_stay_unchanged_when_the_transactio
     let storage = storage()?;
     let alice = key("alice@example.com")?;
     let bob = jid("bob@example.com")?;
-    let update = item("bob@example.com", Some("Bob"), &[])?;
     for bytes in [
         &[][..],
         &[4, 0],
@@ -77,14 +76,6 @@ fn malformed_item_records_fail_operations_and_stay_unchanged_when_the_transactio
                 StorageErrorKind::CorruptData,
             );
             assert_storage_error(
-                writer.upsert(&alice, update.clone()).await,
-                StorageErrorKind::CorruptData,
-            );
-            assert_storage_error(
-                writer.update_subscription(&alice, &bob, Some).await,
-                StorageErrorKind::CorruptData,
-            );
-            assert_storage_error(
                 writer.remove_roster_item(&alice, &bob).await,
                 StorageErrorKind::CorruptData,
             );
@@ -100,7 +91,9 @@ fn noncanonical_item_keys_are_rejected_when_reading_a_roster() -> TestResult {
     let storage = storage()?;
     let alice = key("alice@example.com")?;
     let update = item("bob@example.com", None, &[])?;
-    block_on(write(&storage, async |tx| tx.upsert(&alice, update).await))?;
+    block_on(write(&storage, async |tx| {
+        tx.put_roster_item(&alice, &update).await
+    }))?;
     let record = stored_item(&storage, ITEM_KEY)?.ok_or("missing item")?;
     for invalid in [
         "alice@example.com\0",

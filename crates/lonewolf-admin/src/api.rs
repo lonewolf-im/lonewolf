@@ -765,56 +765,13 @@ mod tests {
     }
 
     impl RosterWrites for MemoryTransaction {
-        async fn upsert(
+        async fn put_roster_item(
             &mut self,
             _: &AccountKey,
-            _: roster::RosterItemUpdate,
-        ) -> Result<roster::RosterMutation<roster::RosterItem>, roster::RosterError> {
+            _: &roster::RosterItem,
+        ) -> Result<roster::RosterVersion, roster::RosterError> {
             unreachable!()
         }
-
-        async fn update_subscription<F>(
-            &mut self,
-            _: &AccountKey,
-            _: &roster::RosterJid,
-            _: F,
-        ) -> Result<Option<roster::RosterMutation<roster::RosterItem>>, roster::RosterError>
-        where
-            F: FnOnce(roster::RosterSubscription) -> Option<roster::RosterSubscription>
-                + Send
-                + 'static,
-        {
-            unreachable!()
-        }
-
-        async fn request_subscription(
-            &mut self,
-            _: &AccountKey,
-            _: &roster::RosterJid,
-            _: &AccountKey,
-            _: roster::PendingSubscription,
-        ) -> Result<roster::SubscriptionRequestOutcome, roster::RosterError> {
-            unreachable!()
-        }
-
-        async fn cancel_subscription(
-            &mut self,
-            _: &AccountKey,
-            _: &roster::RosterJid,
-            _: Option<(&AccountKey, &roster::RosterJid)>,
-        ) -> Result<roster::SubscriptionCancellation, roster::RosterError> {
-            unreachable!()
-        }
-
-        async fn unsubscribe(
-            &mut self,
-            _: &AccountKey,
-            _: &roster::RosterJid,
-            _: Option<(&AccountKey, &roster::RosterJid)>,
-        ) -> Result<roster::SubscriptionWithdrawal, roster::RosterError> {
-            unreachable!()
-        }
-
         async fn remove_roster_item(
             &mut self,
             _: &AccountKey,
@@ -823,16 +780,6 @@ mod tests {
         {
             unreachable!()
         }
-
-        async fn remove_item(
-            &mut self,
-            _: &AccountKey,
-            _: &roster::RosterJid,
-            _: Option<(&AccountKey, &roster::RosterJid)>,
-        ) -> Result<Option<roster::ItemRemoval>, roster::RosterError> {
-            unreachable!()
-        }
-
         async fn put_pending_request(
             &mut self,
             _: &AccountKey,
@@ -840,21 +787,6 @@ mod tests {
         ) -> Result<(), roster::RosterError> {
             unreachable!()
         }
-
-        async fn resolve_pending<F>(
-            &mut self,
-            _: &AccountKey,
-            _: &roster::RosterJid,
-            _: F,
-        ) -> Result<Option<roster::PendingResolution>, roster::RosterError>
-        where
-            F: FnOnce(roster::RosterSubscription) -> Option<roster::RosterSubscription>
-                + Send
-                + 'static,
-        {
-            unreachable!()
-        }
-
         async fn remove_pending_request(
             &mut self,
             _: &AccountKey,
@@ -862,7 +794,6 @@ mod tests {
         ) -> Result<bool, roster::RosterError> {
             unreachable!()
         }
-
         async fn clear_roster(&mut self, _: &AccountKey) -> Result<(), roster::RosterError> {
             unreachable!()
         }

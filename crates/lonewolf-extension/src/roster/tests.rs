@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod state;
+
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -136,6 +138,19 @@ fn pending(roster: &TestRoster, owner: &AccountKey) -> Vec<PendingSubscription> 
         transaction.pending_requests(owner).await
     })
     .unwrap_or_else(|error: RosterError| panic!("{error}"))
+}
+
+fn subscribed(jid: RosterJid, state: SubscriptionState) -> RosterItem {
+    RosterItem {
+        jid,
+        name: None,
+        groups: Vec::new(),
+        subscription: RosterSubscription {
+            state,
+            pending_out: false,
+            approved: false,
+        },
+    }
 }
 
 fn delete_account(roster: &TestRoster, key: &AccountKey) {
@@ -495,19 +510,16 @@ fn only_the_initial_transition_collects_granted_contacts() {
     block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
         transaction
-            .update_subscription(&alice_account, &RosterJid::from(bob), |mut subscription| {
-                subscription.state = SubscriptionState::To;
-                Some(subscription)
-            })
+            .put_roster_item(
+                &alice_account,
+                &subscribed(RosterJid::from(bob), SubscriptionState::To),
+            )
             .await?;
         transaction
-            .update_subscription(&bob_account, &RosterJid::from(alice.bare()), |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::From,
-                    pending_out: false,
-                    approved: false,
-                })
-            })
+            .put_roster_item(
+                &bob_account,
+                &subscribed(RosterJid::from(alice.bare()), SubscriptionState::From),
+            )
             .await?;
         transaction.commit().await.map_err(RosterError::from)
     })
@@ -568,50 +580,36 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
     let dave = dave
         .resolve(&arena)
         .unwrap_or_else(|error| panic!("{error}"));
-    let subscription = |state| {
-        move |_| {
-            Some(RosterSubscription {
-                state,
-                pending_out: false,
-                approved: false,
-            })
-        }
-    };
     block_on(async {
         let mut repository = roster.storage.begin_write().await?;
         repository
-            .update_subscription(
+            .put_roster_item(
                 alice,
-                &RosterJid::from(bob),
-                subscription(SubscriptionState::To),
+                &subscribed(RosterJid::from(bob), SubscriptionState::To),
             )
             .await?;
         repository
-            .update_subscription(
+            .put_roster_item(
                 bob,
-                &RosterJid::from(alice),
-                subscription(SubscriptionState::From),
+                &subscribed(RosterJid::from(alice), SubscriptionState::From),
             )
             .await?;
         repository
-            .update_subscription(
+            .put_roster_item(
                 alice,
-                &RosterJid::from(carol),
-                subscription(SubscriptionState::Both),
+                &subscribed(RosterJid::from(carol), SubscriptionState::Both),
             )
             .await?;
         repository
-            .update_subscription(
+            .put_roster_item(
                 carol,
-                &RosterJid::from(alice),
-                subscription(SubscriptionState::Both),
+                &subscribed(RosterJid::from(alice), SubscriptionState::Both),
             )
             .await?;
         repository
-            .update_subscription(
+            .put_roster_item(
                 alice,
-                &RosterJid::from(dave),
-                subscription(SubscriptionState::Both),
+                &subscribed(RosterJid::from(dave), SubscriptionState::Both),
             )
             .await?;
         repository.commit().await.map_err(RosterError::from)

@@ -1,88 +1,195 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use ::redb::{Database, Durability, WriteTransaction};
-
+use ::redb::{
+    Database, Durability, ReadTransaction as RedbReadTransaction, ReadableDatabase,
+    WriteTransaction as RedbWriteTransaction,
+};
+use async_lock::{Mutex, MutexGuardArc};
+use lonewolf_auth::server::ScramDecoy;
 use lonewolf_util::blocking::BlockingExecutor;
 
-use crate::StorageError;
+use crate::storage::{ReadTransaction, Storage, WriteTransaction};
+use crate::{StorageError, StorageErrorKind, account, roster};
 
 mod error;
 
 pub(crate) use error::{commit_error, storage_error};
 
-/// Clones share limits of 32 submitted reads and one submitted write.
+/// A redb database as one transaction domain.
 ///
-/// Each [`Self::new`] call creates independent admission limits.
+/// Clones share the database, its admission limits of 32 submitted reads and one
+/// open write transaction, and the SCRAM decoy secret.
 #[derive(Clone)]
-pub struct RedbDatabase {
-    database: Arc<Database>,
-    reads: BlockingExecutor,
-    writes: BlockingExecutor,
+pub struct RedbStorage {
+    inner: Arc<Inner>,
 }
 
-impl RedbDatabase {
-    pub fn new(database: Database) -> Self {
-        Self {
-            database: Arc::new(database),
-            reads: BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() }),
-            writes: BlockingExecutor::new(NonZeroUsize::MIN),
-        }
+struct Inner {
+    database: Database,
+    reads: BlockingExecutor,
+    writes: BlockingExecutor,
+    /// Admits one write transaction at a time ahead of the writer thread, so that
+    /// thread never blocks inside redb's own writer lock while a handle is open.
+    writer: Arc<Mutex<()>>,
+    decoy: ScramDecoy,
+}
+
+/// One consistent snapshot; every operation runs on the read executor.
+pub struct RedbRead {
+    transaction: Arc<RedbReadTransaction>,
+    reads: BlockingExecutor,
+}
+
+/// The store's open write transaction; operations and the commit run on the writer thread.
+pub struct RedbWrite {
+    transaction: Arc<RedbWriteTransaction>,
+    writes: BlockingExecutor,
+    _writer: MutexGuardArc<()>,
+}
+
+impl RedbStorage {
+    /// Wraps an open database and initializes every table the current code needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageErrorKind::CorruptData`] when the existing tables are
+    /// inconsistent with each other, or the backend's failure otherwise.
+    pub fn new(database: Database) -> Result<Self, StorageError> {
+        let decoy = initialize(&database)?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                database,
+                reads: BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() }),
+                writes: BlockingExecutor::new(NonZeroUsize::MIN),
+                writer: Arc::new(Mutex::new(())),
+                decoy,
+            }),
+        })
     }
 
-    /// Opens or creates the database synchronously.
+    /// Opens or creates the database file synchronously and initializes its tables.
     ///
     /// New files use mode 0600, subject to the process umask. Existing file
     /// permissions are unchanged, and parent directories must exist.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::StorageErrorKind::Unavailable`] if the file cannot be
-    /// opened or is already locked. Invalid databases can return
-    /// [`crate::StorageErrorKind::CorruptData`] or
-    /// [`crate::StorageErrorKind::UnsupportedVersion`]. Other backend failures
-    /// return [`crate::StorageErrorKind::Other`].
+    /// Returns [`StorageErrorKind::Unavailable`] if the file cannot be opened or is
+    /// already locked. Invalid databases can return [`StorageErrorKind::CorruptData`]
+    /// or [`StorageErrorKind::UnsupportedVersion`]. Other backend failures return
+    /// [`StorageErrorKind::Other`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         options.mode(0o600);
         let file = options.open(path).map_err(storage_error)?;
-        Database::builder()
+        let database = Database::builder()
             .create_file(file)
-            .map(Self::new)
-            .map_err(storage_error)
-    }
-
-    pub(crate) async fn read<T: Send + 'static>(
-        &self,
-        operation: impl FnOnce(&Database) -> T + Send + 'static,
-    ) -> T {
-        let database = Arc::clone(&self.database);
-        self.reads.run(move || operation(&database)).await
-    }
-
-    pub(crate) async fn write<T: Send + 'static>(
-        &self,
-        operation: impl FnOnce(&Database) -> T + Send + 'static,
-    ) -> T {
-        let database = Arc::clone(&self.database);
-        self.writes.run(move || operation(&database)).await
+            .map_err(storage_error)?;
+        Self::new(database)
     }
 }
 
-/// Direct database access bypasses admission limits and can block the caller.
-impl AsRef<Database> for RedbDatabase {
+/// Direct database access bypasses the admission limits and can block the caller.
+impl AsRef<Database> for RedbStorage {
     fn as_ref(&self) -> &Database {
-        &self.database
+        &self.inner.database
     }
 }
 
-pub(crate) fn begin_write(database: &Database) -> Result<WriteTransaction, StorageError> {
+fn initialize(database: &Database) -> Result<ScramDecoy, StorageError> {
+    let transaction = begin_write(database)?;
+    let decoy = account::redb::initialize(&transaction)?;
+    roster::redb::initialize(&transaction)?;
+    transaction.commit().map_err(commit_error)?;
+    Ok(decoy)
+}
+
+impl Storage for RedbStorage {
+    type Read = RedbRead;
+    type Write = RedbWrite;
+
+    async fn begin_read(&self) -> Result<RedbRead, StorageError> {
+        let inner = Arc::clone(&self.inner);
+        let transaction = self
+            .inner
+            .reads
+            .run(move || inner.database.begin_read().map_err(storage_error))
+            .await?;
+        Ok(RedbRead {
+            transaction: Arc::new(transaction),
+            reads: self.inner.reads.clone(),
+        })
+    }
+
+    async fn begin_write(&self) -> Result<RedbWrite, StorageError> {
+        let writer = Arc::clone(&self.inner.writer).lock_arc().await;
+        let inner = Arc::clone(&self.inner);
+        let transaction = self
+            .inner
+            .writes
+            .run(move || begin_write(&inner.database))
+            .await?;
+        Ok(RedbWrite {
+            transaction: Arc::new(transaction),
+            writes: self.inner.writes.clone(),
+            _writer: writer,
+        })
+    }
+
+    fn scram_decoy(&self) -> &ScramDecoy {
+        &self.inner.decoy
+    }
+}
+
+impl RedbRead {
+    pub(crate) fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&RedbReadTransaction) -> T + Send + 'static,
+    ) -> impl Future<Output = T> + Send {
+        let transaction = Arc::clone(&self.transaction);
+        self.reads.run(move || operation(&transaction))
+    }
+}
+
+impl RedbWrite {
+    pub(crate) fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&RedbWriteTransaction) -> T + Send + 'static,
+    ) -> impl Future<Output = T> + Send {
+        let transaction = Arc::clone(&self.transaction);
+        self.writes.run(move || operation(&transaction))
+    }
+}
+
+impl ReadTransaction for RedbRead {}
+impl ReadTransaction for RedbWrite {}
+
+impl WriteTransaction for RedbWrite {
+    async fn commit(self) -> Result<(), StorageError> {
+        let Self {
+            transaction,
+            writes,
+            _writer,
+        } = self;
+        // An operation future dropped before it finished may still hold the
+        // transaction on the writer thread; committing around it is unsafe.
+        let transaction = Arc::into_inner(transaction)
+            .ok_or_else(|| StorageError::new(StorageErrorKind::Other))?;
+        writes
+            .run(move || transaction.commit().map_err(commit_error))
+            .await
+    }
+}
+
+pub(crate) fn begin_write(database: &Database) -> Result<RedbWriteTransaction, StorageError> {
     let mut transaction = database.begin_write().map_err(storage_error)?;
     transaction
         .set_durability(Durability::Immediate)
@@ -91,97 +198,4 @@ pub(crate) fn begin_write(database: &Database) -> Result<WriteTransaction, Stora
 }
 
 #[cfg(test)]
-mod tests {
-    use std::error::Error;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::mpsc;
-    use std::task::{Context, Poll, Waker};
-    use std::time::Duration;
-
-    use ::redb::{Database, backends::InMemoryBackend};
-    use futures_executor::block_on;
-
-    use super::RedbDatabase;
-
-    type TestResult = Result<(), Box<dyn Error>>;
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
-    #[test]
-    fn cloned_databases_share_one_writer_without_blocking_reads() -> TestResult {
-        let database = database()?;
-        let cloned = database.clone();
-        let (entered, started) = mpsc::channel();
-        let (release, gate) = mpsc::channel();
-        let mut first = Box::pin(database.write(move |_| {
-            let _ = entered.send(());
-            gate.recv_timeout(TIMEOUT)
-        }));
-        assert!(poll(first.as_mut()).is_pending());
-        started.recv_timeout(TIMEOUT)?;
-
-        let (entered, started) = mpsc::channel();
-        let mut waiting = Box::pin(cloned.write(move |_| {
-            let _ = entered.send(());
-        }));
-        assert!(poll(waiting.as_mut()).is_pending());
-        assert_eq!(block_on(cloned.read(|_| 42)), 42);
-        drop(waiting);
-        assert!(matches!(
-            started.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
-
-        release.send(())?;
-        block_on(first)?;
-        assert_eq!(block_on(cloned.write(|_| 42)), 42);
-        Ok(())
-    }
-
-    #[test]
-    fn full_read_capacity_does_not_block_a_writer() -> TestResult {
-        let database = database()?;
-        let mut reads = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let (entered, started) = mpsc::channel();
-            let (release, gate) = mpsc::channel();
-            let mut read = Box::pin(database.read(move |_| {
-                let _ = entered.send(());
-                gate.recv_timeout(TIMEOUT)
-            }));
-            assert!(poll(read.as_mut()).is_pending());
-            started.recv_timeout(TIMEOUT)?;
-            reads.push((read, release));
-        }
-
-        let (entered, started) = mpsc::channel();
-        let mut waiting = Box::pin(database.read(move |_| {
-            let _ = entered.send(());
-        }));
-        assert!(poll(waiting.as_mut()).is_pending());
-        assert_eq!(block_on(database.write(|_| 42)), 42);
-        drop(waiting);
-        assert!(matches!(
-            started.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
-
-        for (read, release) in reads {
-            release.send(())?;
-            block_on(read)?;
-        }
-        assert_eq!(block_on(database.read(|_| 42)), 42);
-        Ok(())
-    }
-
-    fn database() -> Result<RedbDatabase, ::redb::DatabaseError> {
-        Database::builder()
-            .set_cache_size(1024 * 1024)
-            .create_with_backend(InMemoryBackend::new())
-            .map(RedbDatabase::new)
-    }
-
-    fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-        future.poll(&mut Context::from_waker(Waker::noop()))
-    }
-}
+pub(crate) mod tests;

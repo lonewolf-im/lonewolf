@@ -4,55 +4,39 @@ use std::collections::{BTreeMap, btree_map::Entry};
 use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
 
-use lonewolf_storage::RedbDatabase;
-use lonewolf_storage::account::redb::RedbAccountRepository;
-use lonewolf_storage::roster::redb::RedbRosterRepository;
+use lonewolf_storage::RedbStorage;
 
 use crate::RunError;
 use crate::config::{StorageConfig, StoreConfig};
 
-/// Opens each selected store once so repositories share its lock and limits.
+/// Opens each selected store once so every consumer shares its lock and limits.
 pub(crate) struct StoreRegistry<'config> {
     config: &'config StorageConfig,
-    databases: BTreeMap<&'config str, RedbDatabase>,
+    stores: BTreeMap<&'config str, RedbStorage>,
 }
 
 impl<'config> StoreRegistry<'config> {
     pub(crate) fn new(config: &'config StorageConfig) -> Self {
         Self {
             config,
-            databases: BTreeMap::new(),
+            stores: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn accounts(&mut self, name: &str) -> Result<RedbAccountRepository, RunError> {
-        let database = self.database(name)?;
-        RedbAccountRepository::from_database(database.clone()).map_err(|source| {
-            RunError::Accounts {
-                store: name.into(),
-                source,
-            }
-        })
+    pub(crate) fn storage(&mut self, name: &str) -> Result<RedbStorage, RunError> {
+        self.store(name).cloned()
     }
 
-    pub(crate) fn rosters(&mut self, name: &str) -> Result<RedbRosterRepository, RunError> {
-        let database = self.database(name)?;
-        RedbRosterRepository::from_database(database.clone()).map_err(|source| RunError::Rosters {
-            store: name.into(),
-            source,
-        })
-    }
-
-    fn database(&mut self, name: &str) -> Result<&RedbDatabase, RunError> {
+    fn store(&mut self, name: &str) -> Result<&RedbStorage, RunError> {
         let (name, config) = self
             .config
             .stores
             .get_key_value(name)
             .ok_or_else(|| RunError::UnknownStore(name.into()))?;
-        match self.databases.entry(name.as_str()) {
+        match self.stores.entry(name.as_str()) {
             Entry::Occupied(entry) => Ok(entry.into_mut()),
             Entry::Vacant(entry) => {
-                let database = match config {
+                let storage = match config {
                     StoreConfig::Redb { path } => {
                         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                             let mut builder = DirBuilder::new();
@@ -65,13 +49,13 @@ impl<'config> StoreRegistry<'config> {
                                 }
                             })?;
                         }
-                        RedbDatabase::open(path).map_err(|source| RunError::Storage {
+                        RedbStorage::open(path).map_err(|source| RunError::Storage {
                             store: name.clone(),
                             source,
                         })?
                     }
                 };
-                Ok(entry.insert(database))
+                Ok(entry.insert(storage))
             }
         }
     }
@@ -83,7 +67,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use lonewolf_storage::RedbDatabase;
+    use lonewolf_storage::RedbStorage;
 
     use super::StoreRegistry;
     use crate::RunError;
@@ -109,18 +93,18 @@ mod tests {
             ]),
         };
         let mut stores = StoreRegistry::new(&config);
-        let first = stores.accounts("accounts")?;
-        let second = stores.accounts("accounts")?;
+        let first = stores.storage("accounts")?;
+        let second = stores.storage("accounts")?;
 
         assert!(path.is_file());
         assert!(!unused_path.exists());
         assert!(!directory.path().join("unused").exists());
-        assert!(RedbDatabase::open(&path).is_err());
+        assert!(RedbStorage::open(&path).is_err());
         drop(stores);
         drop(first);
-        assert!(RedbDatabase::open(&path).is_err());
+        assert!(RedbStorage::open(&path).is_err());
         drop(second);
-        let _reopened = RedbDatabase::open(&path)?;
+        let _reopened = RedbStorage::open(&path)?;
         Ok(())
     }
 
@@ -137,7 +121,7 @@ mod tests {
         let mut stores = StoreRegistry::new(&config);
 
         assert!(matches!(
-            stores.accounts("accounts"),
+            stores.storage("accounts"),
             Err(RunError::Storage { store, .. }) if store == "accounts"
         ));
         assert_eq!(fs::read(path)?, contents);

@@ -1,160 +1,149 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::Path;
+use std::future::Future;
 
-use ::redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use ::redb::{ReadableTable, TableDefinition, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_JID_LEN};
 
 use super::{
     ItemRemoval, PendingResolution, PendingSubscription, RosterError, RosterItem, RosterItemUpdate,
-    RosterJid, RosterMutation, RosterRepository, RosterSnapshot, RosterSubscription, RosterVersion,
-    SubscriptionCancellation, SubscriptionRequestOutcome, SubscriptionState,
+    RosterJid, RosterMutation, RosterReads, RosterSnapshot, RosterSubscription, RosterVersion,
+    RosterWrites, SubscriptionCancellation, SubscriptionRequestOutcome, SubscriptionState,
     SubscriptionWithdrawal,
 };
 use crate::account::AccountKey;
-use crate::redb::{begin_write, commit_error, storage_error};
-use crate::{RedbDatabase, StorageError, StorageErrorKind};
+use crate::redb::{RedbRead, RedbWrite, storage_error};
+use crate::{StorageError, StorageErrorKind};
 
-const ITEMS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_roster_items");
-const VERSIONS: TableDefinition<&str, u64> = TableDefinition::new("lonewolf_roster_versions");
-const PENDING: TableDefinition<&str, &[u8]> =
+pub(crate) const ITEMS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("lonewolf_roster_items");
+pub(crate) const VERSIONS: TableDefinition<&str, u64> =
+    TableDefinition::new("lonewolf_roster_versions");
+pub(crate) const PENDING: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lonewolf_roster_pending_subscriptions");
 
-#[derive(Clone)]
-pub struct RedbRosterRepository {
-    database: RedbDatabase,
+/// Creates the roster tables.
+pub(crate) fn initialize(transaction: &WriteTransaction) -> Result<(), StorageError> {
+    transaction.open_table(ITEMS).map_err(storage_error)?;
+    transaction.open_table(VERSIONS).map_err(storage_error)?;
+    transaction.open_table(PENDING).map_err(storage_error)?;
+    Ok(())
 }
 
-impl RedbRosterRepository {
-    /// Opens the database and initializes the roster tables synchronously.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::from_database(RedbDatabase::open(path)?)
-    }
-
-    /// Initializes roster tables and shares the database operation limits.
-    pub fn from_database(database: RedbDatabase) -> Result<Self, StorageError> {
-        let transaction = begin_write(database.as_ref())?;
-        transaction.open_table(ITEMS).map_err(storage_error)?;
-        transaction.open_table(VERSIONS).map_err(storage_error)?;
-        transaction.open_table(PENDING).map_err(storage_error)?;
-        transaction.commit().map_err(commit_error)?;
-        Ok(Self { database })
-    }
-}
-
-impl RosterRepository for RedbRosterRepository {
-    async fn snapshot(&self, owner: &AccountKey) -> Result<RosterSnapshot, RosterError> {
-        let owner = Box::<str>::from(owner.as_str());
-        self.database
-            .read(move |database| {
-                let transaction = database.begin_read().map_err(storage_error)?;
-                let versions = transaction.open_table(VERSIONS).map_err(storage_error)?;
-                let version = versions
-                    .get(owner.as_ref())
-                    .map_err(storage_error)?
-                    .map_or(0, |version| version.value());
-                let items = transaction.open_table(ITEMS).map_err(storage_error)?;
-                let (start, end) = owner_range(&owner);
-                let mut roster = Vec::new();
-                for entry in items
-                    .range(start.as_ref()..end.as_ref())
-                    .map_err(storage_error)?
-                {
-                    let (key, value) = entry.map_err(storage_error)?;
-                    let jid = decode_key(&owner, key.value())?;
-                    roster.push(decode_item(jid, value.value())?);
-                }
-                Ok::<_, StorageError>(RosterSnapshot {
-                    version: RosterVersion(version),
-                    items: roster,
+macro_rules! roster_reads {
+    ($handle:ty) => {
+        impl RosterReads for $handle {
+            fn roster(
+                &self,
+                owner: &AccountKey,
+            ) -> impl Future<Output = Result<RosterSnapshot, RosterError>> + Send {
+                let owner = Box::<str>::from(owner.as_str());
+                self.run(move |transaction| {
+                    let versions = transaction.open_table(VERSIONS).map_err(storage_error)?;
+                    let items = transaction.open_table(ITEMS).map_err(storage_error)?;
+                    snapshot(&versions, &items, &owner)
                 })
-            })
-            .await
-            .map_err(Into::into)
-    }
+            }
 
-    async fn get(
-        &self,
-        owner: &AccountKey,
-        jid: &RosterJid,
-    ) -> Result<Option<RosterItem>, RosterError> {
-        let key = item_key(owner, jid);
-        let jid = jid.clone();
-        self.database
-            .read(move |database| {
-                let transaction = database.begin_read().map_err(storage_error)?;
-                let table = transaction.open_table(ITEMS).map_err(storage_error)?;
-                table
-                    .get(key.as_ref())
-                    .map_err(storage_error)?
-                    .map(|record| decode_item(jid, record.value()))
-                    .transpose()
-            })
-            .await
-            .map_err(Into::into)
-    }
+            fn roster_item(
+                &self,
+                owner: &AccountKey,
+                jid: &RosterJid,
+            ) -> impl Future<Output = Result<Option<RosterItem>, RosterError>> + Send {
+                let key = item_key(owner, jid);
+                let jid = jid.clone();
+                self.run(move |transaction| {
+                    let table = transaction.open_table(ITEMS).map_err(storage_error)?;
+                    read_item(&table, &key, jid)
+                })
+            }
 
-    async fn upsert(
-        &self,
+            fn pending_requests(
+                &self,
+                owner: &AccountKey,
+            ) -> impl Future<Output = Result<Vec<PendingSubscription>, RosterError>> + Send {
+                let owner = Box::<str>::from(owner.as_str());
+                self.run(move |transaction| {
+                    let table = transaction.open_table(PENDING).map_err(storage_error)?;
+                    read_pending_requests(&table, &owner)
+                })
+            }
+
+            fn pending_request(
+                &self,
+                owner: &AccountKey,
+                sender: &RosterJid,
+            ) -> impl Future<Output = Result<Option<PendingSubscription>, RosterError>> + Send {
+                let key = item_key(owner, sender);
+                let sender = sender.clone();
+                self.run(move |transaction| {
+                    let table = transaction.open_table(PENDING).map_err(storage_error)?;
+                    read_pending_request(&table, &key, sender)
+                })
+            }
+        }
+    };
+}
+
+roster_reads!(RedbRead);
+roster_reads!(RedbWrite);
+
+impl RosterWrites for RedbWrite {
+    fn upsert(
+        &mut self,
         owner: &AccountKey,
         item: RosterItemUpdate,
-    ) -> Result<RosterMutation<RosterItem>, RosterError> {
+    ) -> impl Future<Output = Result<RosterMutation<RosterItem>, RosterError>> + Send {
         let owner = Box::<str>::from(owner.as_str());
         let key = item_key_text(&owner, &item.jid);
-        self.database
-            .write(move |database| upsert(database, &owner, key, item))
-            .await
+        self.run(move |transaction| upsert(transaction, &owner, key, item))
     }
 
-    async fn update_subscription<F>(
-        &self,
+    fn update_subscription<F>(
+        &mut self,
         owner: &AccountKey,
         jid: &RosterJid,
         update: F,
-    ) -> Result<Option<RosterMutation<RosterItem>>, RosterError>
+    ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send
     where
         F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static,
     {
         let owner = Box::<str>::from(owner.as_str());
         let key = item_key_text(&owner, jid);
         let jid = jid.clone();
-        self.database
-            .write(move |database| update_subscription(database, &owner, key, jid, update))
-            .await
+        self.run(move |transaction| update_subscription(transaction, &owner, key, jid, update))
     }
 
-    async fn request_subscription(
-        &self,
+    fn request_subscription(
+        &mut self,
         subscriber: &AccountKey,
         contact: &RosterJid,
         recipient: &AccountKey,
         request: PendingSubscription,
-    ) -> Result<SubscriptionRequestOutcome, RosterError> {
+    ) -> impl Future<Output = Result<SubscriptionRequestOutcome, RosterError>> + Send {
         let subscriber = Box::<str>::from(subscriber.as_str());
         let roster_key = item_key_text(&subscriber, contact);
         let contact = contact.clone();
         let pending_key = item_key(recipient, &request.sender);
-        self.database
-            .write(move |database| {
-                request_subscription(
-                    database,
-                    &subscriber,
-                    roster_key,
-                    contact,
-                    pending_key,
-                    request,
-                )
-            })
-            .await
+        self.run(move |transaction| {
+            request_subscription(
+                transaction,
+                &subscriber,
+                roster_key,
+                contact,
+                pending_key,
+                request,
+            )
+        })
     }
 
-    async fn cancel_subscription(
-        &self,
+    fn cancel_subscription(
+        &mut self,
         grantor: &AccountKey,
         contact: &RosterJid,
         subscriber: Option<(&AccountKey, &RosterJid)>,
-    ) -> Result<SubscriptionCancellation, RosterError> {
+    ) -> impl Future<Output = Result<SubscriptionCancellation, RosterError>> + Send {
         let grantor = Box::<str>::from(grantor.as_str());
         let grantor_key = item_key_text(&grantor, contact);
         let contact = contact.clone();
@@ -163,19 +152,17 @@ impl RosterRepository for RedbRosterRepository {
             let key = item_key_text(&account, jid);
             (account, key, jid.clone())
         });
-        self.database
-            .write(move |database| {
-                cancel_subscription(database, &grantor, grantor_key, contact, subscriber)
-            })
-            .await
+        self.run(move |transaction| {
+            cancel_subscription(transaction, &grantor, grantor_key, contact, subscriber)
+        })
     }
 
-    async fn unsubscribe(
-        &self,
+    fn unsubscribe(
+        &mut self,
         subscriber: &AccountKey,
         contact: &RosterJid,
         recipient: Option<(&AccountKey, &RosterJid)>,
-    ) -> Result<SubscriptionWithdrawal, RosterError> {
+    ) -> impl Future<Output = Result<SubscriptionWithdrawal, RosterError>> + Send {
         let subscriber = Box::<str>::from(subscriber.as_str());
         let subscriber_key = item_key_text(&subscriber, contact);
         let contact = contact.clone();
@@ -184,32 +171,28 @@ impl RosterRepository for RedbRosterRepository {
             let key = item_key_text(&account, jid);
             (account, key, jid.clone())
         });
-        self.database
-            .write(move |database| {
-                unsubscribe(database, &subscriber, subscriber_key, contact, recipient)
-            })
-            .await
+        self.run(move |transaction| {
+            unsubscribe(transaction, &subscriber, subscriber_key, contact, recipient)
+        })
     }
 
-    async fn remove(
-        &self,
+    fn remove_roster_item(
+        &mut self,
         owner: &AccountKey,
         jid: &RosterJid,
-    ) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
+    ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send {
         let owner = Box::<str>::from(owner.as_str());
         let key = item_key_text(&owner, jid);
         let jid = jid.clone();
-        self.database
-            .write(move |database| remove(database, &owner, key, jid))
-            .await
+        self.run(move |transaction| remove(transaction, &owner, key, jid))
     }
 
-    async fn remove_item(
-        &self,
+    fn remove_item(
+        &mut self,
         owner: &AccountKey,
         contact: &RosterJid,
         contact_account: Option<(&AccountKey, &RosterJid)>,
-    ) -> Result<Option<ItemRemoval>, RosterError> {
+    ) -> impl Future<Output = Result<Option<ItemRemoval>, RosterError>> + Send {
         let owner = Box::<str>::from(owner.as_str());
         let owner_key = item_key_text(&owner, contact);
         let contact = contact.clone();
@@ -218,130 +201,165 @@ impl RosterRepository for RedbRosterRepository {
             let key = item_key_text(&account, owner_jid);
             (account, key, owner_jid.clone())
         });
-        self.database
-            .write(move |database| remove_item(database, &owner, owner_key, contact, contact_side))
-            .await
+        self.run(move |transaction| {
+            remove_item(transaction, &owner, owner_key, contact, contact_side)
+        })
     }
 
-    async fn put_pending(
-        &self,
+    fn put_pending_request(
+        &mut self,
         owner: &AccountKey,
-        subscription: PendingSubscription,
-    ) -> Result<(), RosterError> {
-        let key = item_key(owner, &subscription.sender);
-        self.database
-            .write(move |database| {
-                let transaction = begin_write(database)?;
-                transaction
-                    .open_table(PENDING)
-                    .map_err(storage_error)?
-                    .insert(key.as_ref(), subscription.stanza.as_ref())
-                    .map_err(storage_error)?;
-                transaction.commit().map_err(commit_error)?;
-                Ok(())
-            })
-            .await
+        request: PendingSubscription,
+    ) -> impl Future<Output = Result<(), RosterError>> + Send {
+        let key = item_key(owner, &request.sender);
+        self.run(move |transaction| {
+            transaction
+                .open_table(PENDING)
+                .map_err(storage_error)?
+                .insert(key.as_ref(), request.stanza.as_ref())
+                .map_err(storage_error)?;
+            Ok(())
+        })
     }
 
-    async fn pending(&self, owner: &AccountKey) -> Result<Vec<PendingSubscription>, RosterError> {
-        let owner = Box::<str>::from(owner.as_str());
-        self.database
-            .read(move |database| {
-                let transaction = database.begin_read().map_err(storage_error)?;
-                let table = transaction.open_table(PENDING).map_err(storage_error)?;
-                let (start, end) = owner_range(&owner);
-                let mut pending = Vec::new();
-                for entry in table
-                    .range(start.as_ref()..end.as_ref())
-                    .map_err(storage_error)?
-                {
-                    let (key, stanza) = entry.map_err(storage_error)?;
-                    pending.push(PendingSubscription {
-                        sender: decode_key(&owner, key.value())?,
-                        stanza: Box::from(stanza.value()),
-                    });
-                }
-                Ok::<_, StorageError>(pending)
-            })
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn resolve_pending<F>(
-        &self,
+    fn resolve_pending<F>(
+        &mut self,
         owner: &AccountKey,
         sender: &RosterJid,
         update: F,
-    ) -> Result<Option<PendingResolution>, RosterError>
+    ) -> impl Future<Output = Result<Option<PendingResolution>, RosterError>> + Send
     where
         F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static,
     {
         let owner = Box::<str>::from(owner.as_str());
         let key = item_key_text(&owner, sender);
         let sender = sender.clone();
-        self.database
-            .write(move |database| resolve_pending(database, &owner, key, sender, update))
-            .await
+        self.run(move |transaction| resolve_pending(transaction, &owner, key, sender, update))
     }
 
-    async fn remove_pending(
-        &self,
+    fn remove_pending_request(
+        &mut self,
         owner: &AccountKey,
         sender: &RosterJid,
-    ) -> Result<bool, RosterError> {
+    ) -> impl Future<Output = Result<bool, RosterError>> + Send {
         let key = item_key(owner, sender);
-        self.database
-            .write(move |database| {
-                let transaction = begin_write(database)?;
-                let removed = transaction
-                    .open_table(PENDING)
-                    .map_err(storage_error)?
-                    .remove(key.as_ref())
-                    .map_err(storage_error)?
-                    .is_some();
-                if removed {
-                    transaction.commit().map_err(commit_error)?;
-                }
-                Ok(removed)
-            })
-            .await
+        self.run(move |transaction| {
+            let removed = transaction
+                .open_table(PENDING)
+                .map_err(storage_error)?
+                .remove(key.as_ref())
+                .map_err(storage_error)?
+                .is_some();
+            Ok(removed)
+        })
     }
 
-    async fn delete_all(&self, owner: &AccountKey) -> Result<(), RosterError> {
+    fn clear_roster(
+        &mut self,
+        owner: &AccountKey,
+    ) -> impl Future<Output = Result<(), RosterError>> + Send {
         let owner = Box::<str>::from(owner.as_str());
-        self.database
-            .write(move |database| {
-                let transaction = begin_write(database)?;
-                let (start, end) = owner_range(&owner);
-                transaction
-                    .open_table(ITEMS)
-                    .map_err(storage_error)?
-                    .retain_in(start.as_ref()..end.as_ref(), |_, _| false)
-                    .map_err(storage_error)?;
-                transaction
-                    .open_table(PENDING)
-                    .map_err(storage_error)?
-                    .retain_in(start.as_ref()..end.as_ref(), |_, _| false)
-                    .map_err(storage_error)?;
-                transaction
-                    .open_table(VERSIONS)
-                    .map_err(storage_error)?
-                    .remove(owner.as_ref())
-                    .map_err(storage_error)?;
-                transaction.commit().map_err(commit_error)?;
-                Ok(())
-            })
-            .await
+        self.run(move |transaction| clear_roster(transaction, &owner))
     }
 }
 
+fn snapshot<V, I>(versions: &V, items: &I, owner: &str) -> Result<RosterSnapshot, RosterError>
+where
+    V: ReadableTable<&'static str, u64>,
+    I: ReadableTable<&'static str, &'static [u8]>,
+{
+    let version = versions
+        .get(owner)
+        .map_err(storage_error)?
+        .map_or(0, |version| version.value());
+    let (start, end) = owner_range(owner);
+    let mut roster = Vec::new();
+    for entry in items
+        .range(start.as_ref()..end.as_ref())
+        .map_err(storage_error)?
+    {
+        let (key, value) = entry.map_err(storage_error)?;
+        let jid = decode_key(owner, key.value())?;
+        roster.push(decode_item(jid, value.value())?);
+    }
+    Ok(RosterSnapshot {
+        version: RosterVersion(version),
+        items: roster,
+    })
+}
+
+fn read_item<T: ReadableTable<&'static str, &'static [u8]>>(
+    table: &T,
+    key: &str,
+    jid: RosterJid,
+) -> Result<Option<RosterItem>, RosterError> {
+    table
+        .get(key)
+        .map_err(storage_error)?
+        .map(|record| decode_item(jid, record.value()))
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn read_pending_requests<T: ReadableTable<&'static str, &'static [u8]>>(
+    table: &T,
+    owner: &str,
+) -> Result<Vec<PendingSubscription>, RosterError> {
+    let (start, end) = owner_range(owner);
+    let mut pending = Vec::new();
+    for entry in table
+        .range(start.as_ref()..end.as_ref())
+        .map_err(storage_error)?
+    {
+        let (key, stanza) = entry.map_err(storage_error)?;
+        pending.push(PendingSubscription {
+            sender: decode_key(owner, key.value())?,
+            stanza: Box::from(stanza.value()),
+        });
+    }
+    Ok(pending)
+}
+
+fn read_pending_request<T: ReadableTable<&'static str, &'static [u8]>>(
+    table: &T,
+    key: &str,
+    sender: RosterJid,
+) -> Result<Option<PendingSubscription>, RosterError> {
+    Ok(table
+        .get(key)
+        .map_err(storage_error)?
+        .map(|stanza| PendingSubscription {
+            sender,
+            stanza: Box::from(stanza.value()),
+        }))
+}
+
+fn clear_roster(transaction: &WriteTransaction, owner: &str) -> Result<(), RosterError> {
+    let (start, end) = owner_range(owner);
+    transaction
+        .open_table(ITEMS)
+        .map_err(storage_error)?
+        .retain_in(start.as_ref()..end.as_ref(), |_, _| false)
+        .map_err(storage_error)?;
+    transaction
+        .open_table(PENDING)
+        .map_err(storage_error)?
+        .retain_in(start.as_ref()..end.as_ref(), |_, _| false)
+        .map_err(storage_error)?;
+    transaction
+        .open_table(VERSIONS)
+        .map_err(storage_error)?
+        .remove(owner)
+        .map_err(storage_error)?;
+    Ok(())
+}
+
 fn remove(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     owner: &str,
     key: Box<str>,
     jid: RosterJid,
 ) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
-    let transaction = begin_write(database)?;
     let item = {
         let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
         let Some(record) = table.remove(key.as_ref()).map_err(storage_error)? else {
@@ -349,8 +367,7 @@ fn remove(
         };
         decode_item(jid, record.value())?
     };
-    let version = advance_version(&transaction, owner)?;
-    transaction.commit().map_err(commit_error)?;
+    let version = advance_version(transaction, owner)?;
     Ok(Some(RosterMutation {
         version,
         value: item,
@@ -358,13 +375,12 @@ fn remove(
 }
 
 fn remove_item(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     owner: &str,
     owner_key: Box<str>,
     contact: RosterJid,
     contact_side: Option<(Box<str>, Box<str>, RosterJid)>,
 ) -> Result<Option<ItemRemoval>, RosterError> {
-    let transaction = begin_write(database)?;
     let removed = {
         let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
         let Some(record) = table.remove(owner_key.as_ref()).map_err(storage_error)? else {
@@ -378,7 +394,7 @@ fn remove_item(
         .remove(owner_key.as_ref())
         .map_err(storage_error)?
         .is_some();
-    let version = advance_version(&transaction, owner)?;
+    let version = advance_version(transaction, owner)?;
     let mut contact_before = None;
     let contact_mutation = match contact_side {
         Some((account, key, owner_jid)) if key.as_ref() != owner_key.as_ref() => {
@@ -387,7 +403,7 @@ fn remove_item(
                 .map_err(storage_error)?
                 .remove(key.as_ref())
                 .map_err(storage_error)?;
-            update_existing_subscription(&transaction, &account, key.as_ref(), owner_jid, |old| {
+            update_existing_subscription(transaction, &account, key.as_ref(), owner_jid, |old| {
                 contact_before = Some(old);
                 // The pre-approval is the contact's own decision, so only the contact clears it.
                 let cleared = RosterSubscription {
@@ -400,7 +416,6 @@ fn remove_item(
         }
         _ => None,
     };
-    transaction.commit().map_err(commit_error)?;
     Ok(Some(ItemRemoval {
         version,
         subscription: removed.subscription,
@@ -411,7 +426,7 @@ fn remove_item(
 }
 
 fn update_subscription<F>(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     owner: &str,
     key: Box<str>,
     jid: RosterJid,
@@ -420,7 +435,6 @@ fn update_subscription<F>(
 where
     F: FnOnce(RosterSubscription) -> Option<RosterSubscription>,
 {
-    let transaction = begin_write(database)?;
     let item = {
         let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
         let mut item = table
@@ -444,8 +458,7 @@ where
             .map_err(storage_error)?;
         item
     };
-    let version = advance_version(&transaction, owner)?;
-    transaction.commit().map_err(commit_error)?;
+    let version = advance_version(transaction, owner)?;
     Ok(Some(RosterMutation {
         version,
         value: item,
@@ -453,14 +466,13 @@ where
 }
 
 fn request_subscription(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     subscriber: &str,
     roster_key: Box<str>,
     contact: RosterJid,
     pending_key: Box<str>,
     request: PendingSubscription,
 ) -> Result<SubscriptionRequestOutcome, RosterError> {
-    let transaction = begin_write(database)?;
     let auto_approve = transaction
         .open_table(ITEMS)
         .map_err(storage_error)?
@@ -500,14 +512,11 @@ fn request_subscription(
         };
         let mutation = match item {
             Some(value) => Some(RosterMutation {
-                version: advance_version(&transaction, subscriber)?,
+                version: advance_version(transaction, subscriber)?,
                 value,
             }),
             None => None,
         };
-        if mutation.is_some() {
-            transaction.commit().map_err(commit_error)?;
-        }
         return Ok(SubscriptionRequestOutcome::AutoApprove { mutation });
     }
     transaction
@@ -546,23 +555,21 @@ fn request_subscription(
     };
     let mutation = match item {
         Some(value) => Some(RosterMutation {
-            version: advance_version(&transaction, subscriber)?,
+            version: advance_version(transaction, subscriber)?,
             value,
         }),
         None => None,
     };
-    transaction.commit().map_err(commit_error)?;
     Ok(SubscriptionRequestOutcome::Pending { mutation })
 }
 
 fn cancel_subscription(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     grantor: &str,
     grantor_key: Box<str>,
     contact: RosterJid,
     subscriber: Option<(Box<str>, Box<str>, RosterJid)>,
 ) -> Result<SubscriptionCancellation, RosterError> {
-    let transaction = begin_write(database)?;
     let pending = transaction
         .open_table(PENDING)
         .map_err(storage_error)?
@@ -589,7 +596,7 @@ fn cancel_subscription(
         .as_ref()
         .is_some_and(|(_, key, _)| key.as_ref() == grantor_key.as_ref());
     let grantor_mutation = update_existing_subscription(
-        &transaction,
+        transaction,
         grantor,
         grantor_key.as_ref(),
         contact,
@@ -617,7 +624,7 @@ fn cancel_subscription(
         && !same_item
     {
         update_existing_subscription(
-            &transaction,
+            transaction,
             &subscriber,
             subscriber_key.as_ref(),
             grantor_jid,
@@ -635,9 +642,6 @@ fn cancel_subscription(
     } else {
         None
     };
-    if pending || grantor_mutation.is_some() || subscriber_mutation.is_some() {
-        transaction.commit().map_err(commit_error)?;
-    }
     Ok(SubscriptionCancellation {
         route,
         send_unavailable,
@@ -647,13 +651,12 @@ fn cancel_subscription(
 }
 
 fn unsubscribe(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     subscriber: &str,
     subscriber_key: Box<str>,
     contact: RosterJid,
     recipient: Option<(Box<str>, Box<str>, RosterJid)>,
 ) -> Result<SubscriptionWithdrawal, RosterError> {
-    let transaction = begin_write(database)?;
     let same_item = recipient
         .as_ref()
         .is_some_and(|(_, key, _)| key.as_ref() == subscriber_key.as_ref());
@@ -674,18 +677,15 @@ fn unsubscribe(
     } else {
         false
     };
-    let pending = if let Some((_, key, _)) = recipient.as_ref() {
+    if let Some((_, key, _)) = recipient.as_ref() {
         transaction
             .open_table(PENDING)
             .map_err(storage_error)?
             .remove(key.as_ref())
-            .map_err(storage_error)?
-            .is_some()
-    } else {
-        false
-    };
+            .map_err(storage_error)?;
+    }
     let subscriber_mutation = update_existing_subscription(
-        &transaction,
+        transaction,
         subscriber,
         subscriber_key.as_ref(),
         contact,
@@ -712,7 +712,7 @@ fn unsubscribe(
         && !same_item
     {
         update_existing_subscription(
-            &transaction,
+            transaction,
             &owner,
             key.as_ref(),
             jid,
@@ -729,9 +729,6 @@ fn unsubscribe(
     } else {
         None
     };
-    if pending || subscriber_mutation.is_some() || contact_mutation.is_some() {
-        transaction.commit().map_err(commit_error)?;
-    }
     Ok(SubscriptionWithdrawal {
         notify_contact,
         subscriber: subscriber_mutation,
@@ -772,7 +769,7 @@ fn update_existing_subscription(
 }
 
 fn resolve_pending<F>(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     owner: &str,
     key: Box<str>,
     sender: RosterJid,
@@ -781,7 +778,6 @@ fn resolve_pending<F>(
 where
     F: FnOnce(RosterSubscription) -> Option<RosterSubscription>,
 {
-    let transaction = begin_write(database)?;
     let existed = transaction
         .open_table(PENDING)
         .map_err(storage_error)?
@@ -816,22 +812,20 @@ where
     };
     let mutation = match item {
         Some(value) => Some(RosterMutation {
-            version: advance_version(&transaction, owner)?,
+            version: advance_version(transaction, owner)?,
             value,
         }),
         None => None,
     };
-    transaction.commit().map_err(commit_error)?;
     Ok(Some(PendingResolution { mutation }))
 }
 
 fn upsert(
-    database: &::redb::Database,
+    transaction: &WriteTransaction,
     owner: &str,
     key: Box<str>,
     update: RosterItemUpdate,
 ) -> Result<RosterMutation<RosterItem>, RosterError> {
-    let transaction = begin_write(database)?;
     let item = {
         let mut table = transaction.open_table(ITEMS).map_err(storage_error)?;
         let subscription = table
@@ -852,8 +846,7 @@ fn upsert(
             .map_err(storage_error)?;
         item
     };
-    let version = advance_version(&transaction, owner)?;
-    transaction.commit().map_err(commit_error)?;
+    let version = advance_version(transaction, owner)?;
     Ok(RosterMutation {
         version,
         value: item,

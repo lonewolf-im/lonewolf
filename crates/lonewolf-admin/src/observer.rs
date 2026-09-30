@@ -10,10 +10,10 @@ pub type ObserverError = Box<dyn Error + Send + Sync>;
 
 /// Follows account changes on behalf of subsystems that keep state per account.
 pub trait AccountObserver: Send + Sync {
-    /// Runs after an account's record was deleted, while the service still holds the
-    /// account's lifecycle lock so no account with the same JID can be created until
-    /// it returns. It also runs when the record was already gone, so a retry can
-    /// finish an earlier failure. An error is reported as an internal error.
+    /// Runs after the deletion of an account's record has committed, while the service
+    /// still holds the account's lifecycle lock so no account with the same JID can be
+    /// created until it returns. It also runs when the record was already gone, so a
+    /// retry can finish an earlier failure. An error is reported as an internal error.
     fn deleted<'a>(
         &'a self,
         account: &'a AccountKey,

@@ -6,11 +6,11 @@ use std::path::Path;
 use crate::support::{C2sSuite, Client, TestResult};
 use compio::runtime::Runtime;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::redb::RedbRosterRepository;
 use lonewolf_storage::roster::{
-    PendingSubscription, RosterItemUpdate, RosterJid, RosterRepository, RosterSubscription,
+    PendingSubscription, RosterItemUpdate, RosterJid, RosterSubscription, RosterWrites,
     SubscriptionState,
 };
+use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 
@@ -37,13 +37,14 @@ fn expect_roster_push(client: &mut Client, to: &str, item: &str) -> TestResult<S
 
 fn seed_roster(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
-    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let owner = Jid::parse_in("alice@localhost", &mut arena)?;
     let contact = Jid::parse_in("bob@localhost", &mut arena)?;
     let owner = AccountKey::try_from(owner.resolve(&arena)?)?;
     let contact = RosterJid::from(contact.resolve(&arena)?);
     Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
         repository
             .upsert(
                 &owner,
@@ -63,6 +64,7 @@ fn seed_roster(directory: &Path) -> TestResult {
                 })
             })
             .await?;
+        repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
     })?;
     Ok(())
@@ -70,7 +72,7 @@ fn seed_roster(directory: &Path) -> TestResult {
 
 fn seed_pending_subscriptions(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
-    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let owner = Jid::parse_in("bob@localhost", &mut arena)?;
     let owner = AccountKey::try_from(owner.resolve(&arena)?)?;
@@ -88,9 +90,11 @@ fn seed_pending_subscriptions(directory: &Path) -> TestResult {
         });
     }
     Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
         for subscription in subscriptions {
-            repository.put_pending(&owner, subscription).await?;
+            repository.put_pending_request(&owner, subscription).await?;
         }
+        repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
     })?;
     Ok(())
@@ -98,7 +102,7 @@ fn seed_pending_subscriptions(directory: &Path) -> TestResult {
 
 fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
-    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let alice = Jid::parse_in("alice@localhost", &mut arena)?;
     let bob = Jid::parse_in("bob@localhost", &mut arena)?;
@@ -107,6 +111,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
     let alice_contact = RosterJid::from(alice.resolve(&arena)?);
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
         repository
             .update_subscription(&alice_account, &bob_contact, |_| {
                 Some(RosterSubscription {
@@ -117,7 +122,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
             })
             .await?;
         repository
-            .put_pending(
+            .put_pending_request(
                 &bob_account,
                 PendingSubscription {
                     sender: alice_contact,
@@ -127,6 +132,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
                 },
             )
             .await?;
+        repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
     })?;
     Ok(())
@@ -134,7 +140,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
 
 fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
-    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let alice = Jid::parse_in("alice@localhost", &mut arena)?;
     let bob = Jid::parse_in("bob@localhost", &mut arena)?;
@@ -143,6 +149,7 @@ fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult
     let alice_contact = RosterJid::from(alice.resolve(&arena)?);
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
         repository
             .update_subscription(&alice_account, &bob_contact, |_| {
                 Some(RosterSubscription {
@@ -161,6 +168,7 @@ fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult
                 })
             })
             .await?;
+        repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
     })?;
     Ok(())
@@ -2214,7 +2222,7 @@ fn roster_removal_of_a_missing_item_returns_item_not_found() -> TestResult {
 
 fn seed_unhosted_contact(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
-    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let alice = Jid::parse_in("alice@localhost", &mut arena)?;
     let bob = Jid::parse_in("bob@unhosted.localhost", &mut arena)?;
@@ -2223,6 +2231,7 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
     let alice_contact = RosterJid::from(alice.resolve(&arena)?);
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
         repository
             .update_subscription(&alice_account, &bob_contact, |_| {
                 Some(RosterSubscription {
@@ -2241,6 +2250,7 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
                 })
             })
             .await?;
+        repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
     })?;
     Ok(())
@@ -2279,7 +2289,7 @@ fn roster_removal_of_a_contact_on_an_unhosted_domain_changes_only_the_owner() ->
 
 fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
-    let repository = RedbRosterRepository::open(directory.join("data/lonewolf.dat"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let alice = Jid::parse_in("alice@localhost", &mut arena)?;
     let bob = Jid::parse_in("bob@localhost", &mut arena)?;
@@ -2288,6 +2298,7 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
     let alice_contact = RosterJid::from(alice.resolve(&arena)?);
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
         repository
             .update_subscription(&alice_account, &bob_contact, |_| {
                 Some(RosterSubscription::default())
@@ -2302,6 +2313,7 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
                 })
             })
             .await?;
+        repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
     })?;
     Ok(())

@@ -16,9 +16,8 @@ use lonewolf_admin::{NoopObserver, Server};
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
 };
-use lonewolf_storage::RedbDatabase;
-use lonewolf_storage::account::redb::RedbAccountRepository;
-use lonewolf_storage::account::{AccountKey, AccountRepository, NewAccount};
+use lonewolf_storage::account::{AccountKey, AccountReads, AccountWrites, NewAccount};
+use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use serde_json::{Value, json};
@@ -27,22 +26,17 @@ type TestResult = Result<(), Box<dyn Error>>;
 
 fn with_server<F, Fut>(test: F) -> TestResult
 where
-    F: FnOnce(PathBuf, RedbAccountRepository) -> Fut,
+    F: FnOnce(PathBuf, RedbStorage) -> Fut,
     Fut: Future<Output = TestResult>,
 {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("private/admin.sock");
-    let database = RedbDatabase::open(directory.path().join("accounts.redb"))?;
-    let accounts = RedbAccountRepository::from_database(database.clone())?;
+    let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
     Runtime::new()?.block_on(async {
-        let server = Server::bind(
-            &path,
-            RedbAccountRepository::from_database(database.clone())?,
-            Arc::new(NoopObserver),
-        )?;
+        let server = Server::bind(&path, storage.clone(), Arc::new(NoopObserver))?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
-            let result = test(path.clone(), accounts).await;
+            let result = test(path.clone(), storage).await;
             let _ = stop.send(());
             result
         };
@@ -113,26 +107,46 @@ fn key(text: &str) -> Result<AccountKey, Box<dyn Error>> {
     Ok(AccountKey::try_from(jid.resolve(&arena)?)?)
 }
 
-async fn seed(accounts: &RedbAccountRepository, text: &str) -> TestResult {
+async fn seed(storage: &RedbStorage, text: &str) -> TestResult {
     let verifier = ScramVerifier::derive(
         ScramHash::Sha256,
         "initial",
         [1; 16],
         ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
     )?;
-    accounts
-        .create(NewAccount {
+    let mut transaction = storage.begin_write().await?;
+    transaction
+        .create_account(NewAccount {
             key: key(text)?,
             credentials: ScramCredentials::new(verifier),
         })
         .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
-async fn assert_password(accounts: &RedbAccountRepository, password: &str) -> TestResult {
+async fn scram(
+    storage: &RedbStorage,
+    key: &AccountKey,
+    hash: ScramHash,
+) -> Result<Option<ScramVerifier>, Box<dyn Error>> {
+    Ok(storage.begin_read().await?.scram(key, hash).await?)
+}
+
+async fn account_exists(storage: &RedbStorage, key: &AccountKey) -> Result<bool, Box<dyn Error>> {
+    Ok(storage.begin_read().await?.account(key).await?.is_some())
+}
+
+async fn delete(storage: &RedbStorage, key: &AccountKey) -> TestResult {
+    let mut transaction = storage.begin_write().await?;
+    transaction.delete_account(key).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn assert_password(storage: &RedbStorage, password: &str) -> TestResult {
     for hash in [ScramHash::Sha1, ScramHash::Sha256] {
-        let verifier = accounts
-            .get_scram(&key("alice@example.org")?, hash)
+        let verifier = scram(storage, &key("alice@example.org")?, hash)
             .await?
             .ok_or("missing credentials")?;
         let (salt, iterations) = match &verifier {
@@ -211,8 +225,7 @@ fn account_lifecycle_uses_canonical_jids_and_never_returns_credentials() -> Test
         );
         for hash in [ScramHash::Sha1, ScramHash::Sha256] {
             assert!(
-                accounts
-                    .get_scram(&key("alice@example.org")?, hash)
+                scram(&accounts, &key("alice@example.org")?, hash)
                     .await?
                     .is_none()
             );
@@ -238,7 +251,7 @@ fn pagination_handles_empty_exact_and_partial_pages_and_deleted_cursors() -> Tes
             reply.body,
             json!({"accounts":[{"jid":"alice@example.org"},{"jid":"bob@example.org"}],"next_cursor":"bob@example.org"})
         );
-        accounts.delete(&key("bob@example.org")?).await?;
+        delete(&accounts, &key("bob@example.org")?).await?;
         let reply = request(
             &path,
             "GET",
@@ -414,11 +427,10 @@ fn mutations_reject_query_parameters_before_changing_accounts() -> TestResult {
         .await?;
         assert_eq!(reply.status, 400);
         let key = key("alice@example.org")?;
-        assert!(accounts.get(&key).await?.is_none());
+        assert!(!account_exists(&accounts, &key).await?);
 
         seed(&accounts, "alice@example.org").await?;
-        let Some(ScramVerifier::Sha256(before)) =
-            accounts.get_scram(&key, ScramHash::Sha256).await?
+        let Some(ScramVerifier::Sha256(before)) = scram(&accounts, &key, ScramHash::Sha256).await?
         else {
             return Err("missing credentials".into());
         };
@@ -430,8 +442,7 @@ fn mutations_reject_query_parameters_before_changing_accounts() -> TestResult {
         )
         .await?;
         assert_eq!(reply.status, 400);
-        let Some(ScramVerifier::Sha256(after)) =
-            accounts.get_scram(&key, ScramHash::Sha256).await?
+        let Some(ScramVerifier::Sha256(after)) = scram(&accounts, &key, ScramHash::Sha256).await?
         else {
             return Err("missing credentials".into());
         };
@@ -448,7 +459,7 @@ fn mutations_reject_query_parameters_before_changing_accounts() -> TestResult {
         )
         .await?;
         assert_eq!(reply.status, 400);
-        assert!(accounts.get(&key).await?.is_some());
+        assert!(account_exists(&accounts, &key).await?);
         Ok(())
     })
 }
@@ -493,11 +504,10 @@ fn slow_client_does_not_block_other_connections() -> TestResult {
 #[test]
 fn shutdown_drains_an_accepted_request_and_removes_the_socket() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let database = RedbDatabase::open(directory.path().join("accounts.redb"))?;
-    let accounts = RedbAccountRepository::from_database(database.clone())?;
+    let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
     let path = directory.path().join("private/admin.sock");
     Runtime::new()?.block_on(async {
-        let server = Server::bind(&path, accounts, Arc::new(NoopObserver))?;
+        let server = Server::bind(&path, storage.clone(), Arc::new(NoopObserver))?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
             let body = r#"{"jid":"alice@example.org","password":"password"}"#;
@@ -515,8 +525,7 @@ fn shutdown_drains_an_accepted_request_and_removes_the_socket() -> TestResult {
         server_result?;
         client_result?;
         assert!(!path.exists());
-        let accounts = RedbAccountRepository::from_database(database)?;
-        assert!(accounts.get(&key("alice@example.org")?).await?.is_some());
+        assert!(account_exists(&storage, &key("alice@example.org")?).await?);
         Ok(())
     })
 }

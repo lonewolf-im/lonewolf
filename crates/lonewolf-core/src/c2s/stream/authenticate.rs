@@ -7,7 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ScramServer, ServerError};
-use lonewolf_storage::account::{AccountKey, AccountRepository};
+use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{Parsed, StreamEvent};
@@ -209,7 +209,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             .authzid()
             .is_none_or(|authzid| account_key_from_jid(authzid).as_ref() == account.as_ref());
         let verifier = match account.as_ref() {
-            Some(key) => match self.auth.accounts.get_scram(key, mechanism.hash()).await {
+            Some(key) => match self.auth.scram(key, mechanism.hash()).await {
                 Ok(verifier) => verifier,
                 Err(_) => {
                     self.reject("temporary-auth-failure").await?;
@@ -222,7 +222,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         let known = verifier.is_some() && authzid_matches;
         let verifier = match verifier {
             Some(verifier) => verifier,
-            None => match self.auth.decoy.verifier(
+            None => match self.auth.decoy().verifier(
                 mechanism.hash(),
                 &decoy_identity(account.as_ref(), first.username(), self.host),
             ) {
@@ -268,12 +268,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             let Some(account) = identity.account else {
                 return Err(CloseOutcome::InternalError);
             };
-            let current = match self
-                .auth
-                .accounts
-                .get_scram(&account, mechanism.hash())
-                .await
-            {
+            let current = match self.auth.scram(&account, mechanism.hash()).await {
                 Ok(current) => current,
                 Err(_) => {
                     self.reject("temporary-auth-failure").await?;

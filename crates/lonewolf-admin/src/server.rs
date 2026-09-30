@@ -18,7 +18,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use lonewolf_storage::account::AccountRepository;
+use lonewolf_storage::Storage;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::api;
@@ -52,7 +52,7 @@ impl Server {
     /// Panics when attaching the listener outside a compio runtime.
     pub fn bind(
         path: &Path,
-        accounts: impl AccountRepository + 'static,
+        storage: impl Storage,
         observer: Arc<dyn AccountObserver>,
     ) -> io::Result<Self> {
         let parent = path
@@ -93,7 +93,7 @@ impl Server {
         Ok(Self {
             listener: UnixListener::from_std(listener)?,
             socket,
-            router: api::router(accounts, observer),
+            router: api::router(storage, observer),
         })
     }
 

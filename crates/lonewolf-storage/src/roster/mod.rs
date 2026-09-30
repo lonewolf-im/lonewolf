@@ -162,29 +162,45 @@ pub enum RosterError {
     Storage(StorageError),
 }
 
-pub trait RosterRepository: Send + Sync {
+/// Roster reads available on any transaction.
+pub trait RosterReads {
     /// Reads one consistent roster version and item set.
-    fn snapshot(
+    fn roster(
         &self,
         owner: &AccountKey,
     ) -> impl Future<Output = Result<RosterSnapshot, RosterError>> + Send;
 
-    fn get(
+    fn roster_item(
         &self,
         owner: &AccountKey,
         jid: &RosterJid,
     ) -> impl Future<Output = Result<Option<RosterItem>, RosterError>> + Send;
 
+    /// Returns pending requests in sender order.
+    fn pending_requests(
+        &self,
+        owner: &AccountKey,
+    ) -> impl Future<Output = Result<Vec<PendingSubscription>, RosterError>> + Send;
+
+    fn pending_request(
+        &self,
+        owner: &AccountKey,
+        sender: &RosterJid,
+    ) -> impl Future<Output = Result<Option<PendingSubscription>, RosterError>> + Send;
+}
+
+/// Roster writes, each taking effect when the transaction commits.
+pub trait RosterWrites {
     /// Replaces user-managed fields while preserving subscription state.
     fn upsert(
-        &self,
+        &mut self,
         owner: &AccountKey,
         item: RosterItemUpdate,
     ) -> impl Future<Output = Result<RosterMutation<RosterItem>, RosterError>> + Send;
 
     /// Applies `update` in one write, or leaves the roster unchanged on `None`.
     fn update_subscription<F>(
-        &self,
+        &mut self,
         owner: &AccountKey,
         jid: &RosterJid,
         update: F,
@@ -195,7 +211,7 @@ pub trait RosterRepository: Send + Sync {
     /// Stores both sides in one write when approval is required.
     /// Returns `AutoApprove` when the recipient already permits the subscription.
     fn request_subscription(
-        &self,
+        &mut self,
         subscriber: &AccountKey,
         contact: &RosterJid,
         recipient: &AccountKey,
@@ -204,7 +220,7 @@ pub trait RosterRepository: Send + Sync {
 
     /// Updates both present rosters and removes the pending request in one write.
     fn cancel_subscription(
-        &self,
+        &mut self,
         grantor: &AccountKey,
         contact: &RosterJid,
         subscriber: Option<(&AccountKey, &RosterJid)>,
@@ -212,15 +228,15 @@ pub trait RosterRepository: Send + Sync {
 
     /// Updates present local rosters and removes the pending request in one write.
     fn unsubscribe(
-        &self,
+        &mut self,
         subscriber: &AccountKey,
         contact: &RosterJid,
         recipient: Option<(&AccountKey, &RosterJid)>,
     ) -> impl Future<Output = Result<SubscriptionWithdrawal, RosterError>> + Send;
 
     /// Removes an item and returns `None` without advancing the version if absent.
-    fn remove(
-        &self,
+    fn remove_roster_item(
+        &mut self,
         owner: &AccountKey,
         jid: &RosterJid,
     ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send;
@@ -229,28 +245,22 @@ pub trait RosterRepository: Send + Sync {
     /// the local contact's subscription to the owner in one write.
     /// Returns `None` without writing if the item is absent.
     fn remove_item(
-        &self,
+        &mut self,
         owner: &AccountKey,
         contact: &RosterJid,
         contact_account: Option<(&AccountKey, &RosterJid)>,
     ) -> impl Future<Output = Result<Option<ItemRemoval>, RosterError>> + Send;
 
     /// Replaces any pending request from the same sender.
-    fn put_pending(
-        &self,
+    fn put_pending_request(
+        &mut self,
         owner: &AccountKey,
-        subscription: PendingSubscription,
+        request: PendingSubscription,
     ) -> impl Future<Output = Result<(), RosterError>> + Send;
-
-    /// Returns pending requests in sender order.
-    fn pending(
-        &self,
-        owner: &AccountKey,
-    ) -> impl Future<Output = Result<Vec<PendingSubscription>, RosterError>> + Send;
 
     /// Removes a pending request and applies its roster transition in one write.
     fn resolve_pending<F>(
-        &self,
+        &mut self,
         owner: &AccountKey,
         sender: &RosterJid,
         update: F,
@@ -259,15 +269,15 @@ pub trait RosterRepository: Send + Sync {
         F: FnOnce(RosterSubscription) -> Option<RosterSubscription> + Send + 'static;
 
     /// Returns whether a pending request existed.
-    fn remove_pending(
-        &self,
+    fn remove_pending_request(
+        &mut self,
         owner: &AccountKey,
         sender: &RosterJid,
     ) -> impl Future<Output = Result<bool, RosterError>> + Send;
 
     /// Deletes items, pending requests, and the version for one account.
-    fn delete_all(
-        &self,
+    fn clear_roster(
+        &mut self,
         owner: &AccountKey,
     ) -> impl Future<Output = Result<(), RosterError>> + Send;
 }

@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_storage::account::{AccountKey, AccountRepository};
+use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{
-    ItemRemoval, PendingSubscription, RosterJid, RosterRepository, RosterSubscription,
-    SubscriptionRequestOutcome, SubscriptionState,
+    ItemRemoval, PendingSubscription, RosterError, RosterJid, RosterReads, RosterSubscription,
+    RosterWrites, SubscriptionRequestOutcome, SubscriptionState,
 };
+use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
-use super::{Roster, push_removal, push_roster, xml};
+use super::{Roster, account_exists, push_removal, push_roster, require_account, xml};
 use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
 use crate::order::OrderGuard;
 use crate::presence::PresenceRequest;
@@ -38,33 +39,40 @@ impl Parties {
     }
 }
 
-impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
-    /// Orders both parties, refuses a sender whose account is gone, and reports whether
-    /// the target is stored, all under the guard the following writes run under.
+impl<S: Storage> Roster<S> {
+    /// Orders both parties, opens the write transaction, refuses a sender whose account
+    /// is gone, and reports whether the target is stored, so the checks and the writes
+    /// that follow share one transaction under one guard.
     async fn lock_parties(
         &self,
         parties: &Parties,
-    ) -> Result<(OrderGuard, bool), StanzaErrorCondition> {
+    ) -> Result<(OrderGuard, S::Write, bool), HandlerError> {
         let order = self.order.lock_pair(&parties.sender, &parties.target).await;
-        self.require_account(&parties.sender).await?;
-        let target_exists = self.account_exists(&parties.target).await?;
-        Ok((order, target_exists))
+        let transaction = self.begin_write().await?;
+        require_account(&transaction, &parties.sender).await?;
+        let target_exists = account_exists(&transaction, &parties.target).await?;
+        Ok((order, transaction, target_exists))
     }
 
-    /// Orders the owner with the account a contact JID names on this server, if any, and
-    /// resolves that account only while the guard is held.
+    /// Orders the owner with the account a contact JID names on this server, if any,
+    /// opens the write transaction, and resolves that account through it.
     async fn lock_with_contact<A: ChunkAllocator>(
         &self,
         owner: &AccountKey,
         contact: &RosterJid,
         delivery: &dyn Delivery<A>,
-    ) -> Result<(OrderGuard, Option<AccountKey>), StanzaErrorCondition> {
-        let Some(candidate) = local_candidate(contact, delivery) else {
-            return Ok((self.order.lock(owner).await, None));
+    ) -> Result<(OrderGuard, S::Write, Option<AccountKey>), HandlerError> {
+        let candidate = local_candidate(contact, delivery);
+        let order = match &candidate {
+            Some(candidate) => self.order.lock_pair(owner, candidate).await,
+            None => self.order.lock(owner).await,
         };
-        let order = self.order.lock_pair(owner, &candidate).await;
-        let contact = self.account_exists(&candidate).await?.then_some(candidate);
-        Ok((order, contact))
+        let transaction = self.begin_write().await?;
+        let contact = match candidate {
+            Some(candidate) if account_exists(&transaction, &candidate).await? => Some(candidate),
+            _ => None,
+        };
+        Ok((order, transaction, contact))
     }
 
     pub(super) async fn request_subscription<A: ChunkAllocator>(
@@ -73,7 +81,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let (_order, target_exists) = self.lock_parties(&parties).await?;
+        let (_order, mut transaction, target_exists) = self.lock_parties(&parties).await?;
         if !target_exists {
             return Err(StanzaErrorCondition::ServiceUnavailable.into());
         }
@@ -83,8 +91,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             .map_err(|_| StanzaErrorCondition::InternalServerError)?
             .write_xml(&mut request)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-        let outcome = self
-            .repository
+        let outcome = transaction
             .request_subscription(
                 &parties.sender,
                 &parties.target_jid,
@@ -95,6 +102,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
                 },
             )
             .await?;
+        transaction.commit().await.map_err(RosterError::from)?;
         match outcome {
             SubscriptionRequestOutcome::Pending { mutation } => {
                 delivery.to_available(stanza.clone()).await?;
@@ -123,20 +131,18 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let (_order, target_exists) = self.lock_parties(&parties).await?;
+        let (_order, mut transaction, target_exists) = self.lock_parties(&parties).await?;
         if !target_exists {
             return Ok(());
         }
-        let target = self
-            .repository
+        let target = transaction
             .update_subscription(
                 &parties.target,
                 &parties.sender_jid,
                 RosterSubscription::approve_pending_out,
             )
             .await?;
-        let sender = self
-            .repository
+        let sender = transaction
             .resolve_pending(
                 &parties.sender,
                 &parties.target_jid,
@@ -144,6 +150,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             )
             .await?
             .and_then(|resolution| resolution.mutation);
+        transaction.commit().await.map_err(RosterError::from)?;
         if let Some(mutation) = target {
             delivery
                 .to_tagged(SessionTag::Interested, stanza.clone())
@@ -165,15 +172,15 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let (_order, subscriber_exists) = self.lock_parties(&parties).await?;
-        let outcome = self
-            .repository
+        let (_order, mut transaction, subscriber_exists) = self.lock_parties(&parties).await?;
+        let outcome = transaction
             .cancel_subscription(
                 &parties.sender,
                 &parties.target_jid,
                 subscriber_exists.then_some((&parties.target, &parties.sender_jid)),
             )
             .await?;
+        transaction.commit().await.map_err(RosterError::from)?;
         if outcome.send_unavailable {
             delivery
                 .unavailable_presence(&parties.sender, &parties.target)
@@ -199,15 +206,15 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         stanza: &RoutedStanza<A>,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let (_order, contact_exists) = self.lock_parties(&parties).await?;
-        let outcome = self
-            .repository
+        let (_order, mut transaction, contact_exists) = self.lock_parties(&parties).await?;
+        let outcome = transaction
             .unsubscribe(
                 &parties.sender,
                 &parties.target_jid,
                 contact_exists.then_some((&parties.target, &parties.sender_jid)),
             )
             .await?;
+        transaction.commit().await.map_err(RosterError::from)?;
         if outcome.notify_contact {
             delivery
                 .to_tagged(SessionTag::Interested, stanza.clone())
@@ -239,7 +246,7 @@ fn approve_outbound_subscription(
     Some(subscription)
 }
 
-impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
+impl<S: Storage> Roster<S> {
     /// Removes an item and, for a local contact, withdraws and cancels the subscriptions
     /// the two rosters record, in the order the separate presence flows use.
     pub(super) async fn remove_item<A: ChunkAllocator>(
@@ -249,10 +256,10 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         owner_jid: RosterJid,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let (_order, contact_account) = self.lock_with_contact(&owner, &contact, delivery).await?;
-        self.require_account(&owner).await?;
-        let removal = self
-            .repository
+        let (_order, mut transaction, contact_account) =
+            self.lock_with_contact(&owner, &contact, delivery).await?;
+        require_account(&transaction, &owner).await?;
+        let removal = transaction
             .remove_item(
                 &owner,
                 &contact,
@@ -262,6 +269,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             )
             .await?
             .ok_or(StanzaErrorCondition::ItemNotFound)?;
+        transaction.commit().await.map_err(RosterError::from)?;
         push_removal(&owner, contact, removal.version, delivery).await?;
         if let Some(contact_account) = contact_account {
             let contact_granted = self
@@ -293,10 +301,12 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         loop {
             let (items, requests) = {
                 let _order = self.order.lock(account).await;
-                let items = self.repository.snapshot(account).await?.items;
-                let requests = self.repository.pending(account).await?;
+                let mut transaction = self.begin_write().await?;
+                let items = transaction.roster(account).await?.items;
+                let requests = transaction.pending_requests(account).await?;
                 if items.is_empty() && requests.is_empty() {
-                    self.repository.delete_all(account).await?;
+                    transaction.clear_roster(account).await?;
+                    transaction.commit().await.map_err(RosterError::from)?;
                     break;
                 }
                 (items, requests)
@@ -324,9 +334,9 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         contact: &RosterJid,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let (_order, contact_account) = self.lock_with_contact(account, contact, delivery).await?;
-        let removal = self
-            .repository
+        let (_order, mut transaction, contact_account) =
+            self.lock_with_contact(account, contact, delivery).await?;
+        let removal = transaction
             .remove_item(
                 account,
                 contact,
@@ -335,6 +345,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
                     .map(|contact_account| (contact_account, account_jid)),
             )
             .await?;
+        transaction.commit().await.map_err(RosterError::from)?;
         if let (Some(removal), Some(contact_account)) = (removal, contact_account) {
             self.notify_removed_contact(account, &contact_account, removal, delivery)
                 .await?;
@@ -349,9 +360,9 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
         sender: &RosterJid,
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
-        let (_order, sender_account) = self.lock_with_contact(account, sender, delivery).await?;
-        let outcome = self
-            .repository
+        let (_order, mut transaction, sender_account) =
+            self.lock_with_contact(account, sender, delivery).await?;
+        let outcome = transaction
             .cancel_subscription(
                 account,
                 sender,
@@ -360,6 +371,7 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
                     .map(|sender_account| (sender_account, account_jid)),
             )
             .await?;
+        transaction.commit().await.map_err(RosterError::from)?;
         let Some(sender_account) = sender_account else {
             return Ok(());
         };

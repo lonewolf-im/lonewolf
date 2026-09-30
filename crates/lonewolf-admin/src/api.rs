@@ -4,7 +4,6 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroUsize;
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,14 +17,15 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use futures_channel::oneshot;
-use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramError, ScramHash, ScramIterations,
     ScramVerifier,
 };
-use lonewolf_storage::StorageErrorKind;
-use lonewolf_storage::account::{AccountError, AccountKey, AccountRepository, NewAccount};
+use lonewolf_storage::account::{
+    AccountError, AccountKey, AccountReads, AccountWrites, NewAccount,
+};
+use lonewolf_storage::{Storage, StorageError, StorageErrorKind, WriteTransaction};
 
 use crate::observer::AccountObserver;
 use lonewolf_util::arena::{Arena, ArenaConfig};
@@ -40,26 +40,23 @@ const LIFECYCLE_SHARDS: usize = 64;
 const MAX_PAGE: usize = 100;
 const DEFAULT_PAGE: usize = 50;
 
-pub(crate) fn router<R: AccountRepository + 'static>(
-    accounts: R,
-    observer: Arc<dyn AccountObserver>,
-) -> Router {
+pub(crate) fn router<S: Storage>(storage: S, observer: Arc<dyn AccountObserver>) -> Router {
     Router::new()
         .route(
             "/v1/accounts",
-            get(list_accounts::<R>).post(create_account::<R>),
+            get(list_accounts::<S>).post(create_account::<S>),
         )
         .route(
             "/v1/accounts/{jid}",
-            get(get_account::<R>).delete(delete_account::<R>),
+            get(get_account::<S>).delete(delete_account::<S>),
         )
-        .route("/v1/accounts/{jid}/password", put(change_password::<R>))
+        .route("/v1/accounts/{jid}/password", put(change_password::<S>))
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
         .layer(middleware::from_fn(log_request))
-        .with_state(Arc::new(Api::new(accounts, observer)))
+        .with_state(Arc::new(Api::new(storage, observer)))
 }
 
 async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
@@ -96,27 +93,29 @@ fn admin_command(method: &Method, route: Option<&MatchedPath>) -> Option<&'stati
     }
 }
 
-async fn list_accounts<R: AccountRepository + 'static>(
-    State(api): State<Arc<Api<R>>>,
+async fn list_accounts<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
     uri: Uri,
 ) -> Result<Response, ApiError> {
     api.list(uri.query()).await
 }
 
-async fn create_account<R: AccountRepository + 'static>(
-    State(api): State<Arc<Api<R>>>,
+async fn create_account<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
     SensitiveJson(input): SensitiveJson<CreateAccount>,
 ) -> Result<Response, ApiError> {
     api.create(account_key(&input.jid)?, input.password).await
 }
 
-async fn get_account<R: AccountRepository + 'static>(
-    State(api): State<Arc<Api<R>>>,
+async fn get_account<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
     AccountPath(key): AccountPath,
 ) -> Result<Response, ApiError> {
     let account = api
-        .accounts
-        .get(&key)
+        .storage
+        .begin_read()
+        .await?
+        .account(&key)
         .await?
         .ok_or_else(ApiError::not_found)?;
     json(
@@ -127,20 +126,22 @@ async fn get_account<R: AccountRepository + 'static>(
     )
 }
 
-async fn delete_account<R: AccountRepository + 'static>(
-    State(api): State<Arc<Api<R>>>,
+async fn delete_account<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
     AccountPath(key): AccountPath,
 ) -> Result<Response, ApiError> {
     api.delete(key).await
 }
 
-async fn change_password<R: AccountRepository + 'static>(
-    State(api): State<Arc<Api<R>>>,
+async fn change_password<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
     AccountPath(key): AccountPath,
     SensitiveJson(input): SensitiveJson<ChangePassword>,
 ) -> Result<Response, ApiError> {
     let credentials = api.credentials(input.password).await?;
-    api.accounts.replace_credentials(&key, credentials).await?;
+    let mut write = api.storage.begin_write().await?;
+    write.replace_credentials(&key, credentials).await?;
+    write.commit().await?;
     Ok(empty())
 }
 
@@ -179,8 +180,8 @@ where
     }
 }
 
-struct Api<R> {
-    accounts: R,
+struct Api<S> {
+    storage: S,
     observer: Arc<dyn AccountObserver>,
     passwords: BlockingExecutor,
     /// Serializes creation and deletion of the same account, including its cleanup.
@@ -188,10 +189,10 @@ struct Api<R> {
     hash_state: RandomState,
 }
 
-impl<R: AccountRepository + 'static> Api<R> {
-    fn new(accounts: R, observer: Arc<dyn AccountObserver>) -> Self {
+impl<S: Storage> Api<S> {
+    fn new(storage: S, observer: Arc<dyn AccountObserver>) -> Self {
         Self {
-            accounts,
+            storage,
             observer,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
             lifecycle: [const { Mutex::new(()) }; LIFECYCLE_SHARDS],
@@ -211,7 +212,11 @@ impl<R: AccountRepository + 'static> Api<R> {
         let response = json(StatusCode::CREATED, &AccountView { jid: key.as_str() })?;
         self.lifecycle_operation(key, move |api, key| async move {
             let credentials = api.credentials(password).await?;
-            api.accounts.create(NewAccount { key, credentials }).await?;
+            let mut write = api.storage.begin_write().await?;
+            write
+                .create_account(NewAccount { key, credentials })
+                .await?;
+            write.commit().await?;
             Ok(())
         })
         .await?;
@@ -221,10 +226,17 @@ impl<R: AccountRepository + 'static> Api<R> {
     async fn delete(self: &Arc<Self>, key: AccountKey) -> Result<Response, ApiError> {
         let existed = self
             .lifecycle_operation(key, |api, key| async move {
-                let existed = match api.accounts.delete(&key).await {
-                    Ok(()) => true,
-                    Err(AccountError::NotFound) => false,
-                    Err(error) => return Err(error.into()),
+                // Cleanup may write to the same store, so the transaction must end before it runs.
+                let existed = {
+                    let mut write = api.storage.begin_write().await?;
+                    match write.delete_account(&key).await {
+                        Ok(()) => {
+                            write.commit().await?;
+                            true
+                        }
+                        Err(AccountError::NotFound) => false,
+                        Err(error) => return Err(error.into()),
+                    }
                 };
                 // Cleanup also runs for a missing record so a retry can finish an earlier failure.
                 api.observer.deleted(&key).await.map_err(|error| {
@@ -268,17 +280,19 @@ impl<R: AccountRepository + 'static> Api<R> {
 
     async fn list(&self, query: Option<&str>) -> Result<Response, ApiError> {
         let (after, limit) = list_parameters(query)?;
-        let mut stream = pin!(self.accounts.list(after));
+        let lookahead = NonZeroUsize::MIN.saturating_add(limit);
+        let mut page = self
+            .storage
+            .begin_read()
+            .await?
+            .accounts_after(after.as_ref(), lookahead)
+            .await?;
+        let has_more = page.len() > limit;
+        page.truncate(limit);
         let mut bytes = Vec::with_capacity(1024);
         bytes.extend_from_slice(b"{\"accounts\":[");
-        let mut last_key = None;
-        let mut count = 0;
-        while count < limit {
-            let Some(account) = stream.next().await else {
-                break;
-            };
-            let account = account?;
-            if count > 0 {
+        for (index, account) in page.iter().enumerate() {
+            if index > 0 {
                 bytes.push(b',');
             }
             serde_json::to_writer(
@@ -288,15 +302,12 @@ impl<R: AccountRepository + 'static> Api<R> {
                 },
             )
             .map_err(|_| ApiError::internal())?;
-            last_key = Some(account.key);
-            count += 1;
         }
-        let has_more = count == limit && stream.next().await.transpose()?.is_some();
         bytes.extend_from_slice(b"],\"next_cursor\":");
-        let cursor = last_key
-            .as_ref()
+        let cursor = page
+            .last()
             .filter(|_| has_more)
-            .map(AccountKey::as_str);
+            .map(|account| account.key.as_str());
         serde_json::to_writer(&mut bytes, &cursor).map_err(|_| ApiError::internal())?;
         bytes.push(b'}');
         Ok(response(StatusCode::OK, bytes.into()))
@@ -529,72 +540,331 @@ impl From<AccountError> for ApiError {
     }
 }
 
+impl From<StorageError> for ApiError {
+    fn from(error: StorageError) -> Self {
+        Self::from(AccountError::Storage(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::observer::{NoopObserver, ObserverError};
-    use std::pin::Pin;
+    use std::collections::BTreeSet;
+    use std::ops::Bound;
+    use std::pin::{Pin, pin};
     use std::sync::PoisonError;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
+    use async_lock::MutexGuardArc;
     use compio::time::timeout;
-    use futures_util::Stream;
-    use lonewolf_storage::StorageError;
+    use lonewolf_auth::server::ScramDecoy;
+    use lonewolf_storage::ReadTransaction;
     use lonewolf_storage::account::Account;
+    use lonewolf_storage::roster::{self, RosterReads, RosterWrites};
+    use serde_json::{Value, json};
 
     use super::*;
+    use crate::observer::{NoopObserver, ObserverError};
 
-    struct MemoryRepository {
-        keys: std::sync::Mutex<Vec<AccountKey>>,
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Keeps accounts in memory with snapshot reads and staged, single-writer commits.
+    #[derive(Clone)]
+    struct MemoryStorage {
+        inner: Arc<MemoryInner>,
     }
 
-    impl MemoryRepository {
-        fn keys(&self) -> std::sync::MutexGuard<'_, Vec<AccountKey>> {
-            self.keys.lock().unwrap_or_else(PoisonError::into_inner)
+    struct MemoryInner {
+        state: std::sync::Mutex<MemoryState>,
+        writer: Arc<Mutex<()>>,
+        decoy: ScramDecoy,
+    }
+
+    #[derive(Default)]
+    struct MemoryState {
+        keys: BTreeSet<AccountKey>,
+        listing_failure: Option<StorageErrorKind>,
+        last_listing: Option<(Option<AccountKey>, NonZeroUsize)>,
+    }
+
+    struct MemoryTransaction {
+        storage: MemoryStorage,
+        keys: BTreeSet<AccountKey>,
+        _writer: Option<MutexGuardArc<()>>,
+    }
+
+    impl MemoryStorage {
+        fn new(keys: impl IntoIterator<Item = AccountKey>) -> Self {
+            Self {
+                inner: Arc::new(MemoryInner {
+                    state: std::sync::Mutex::new(MemoryState {
+                        keys: keys.into_iter().collect(),
+                        ..MemoryState::default()
+                    }),
+                    writer: Arc::new(Mutex::new(())),
+                    decoy: ScramDecoy::from_secret([0; 32]),
+                }),
+            }
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, MemoryState> {
+            self.inner
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn contains(&self, key: &AccountKey) -> bool {
+            self.state().keys.contains(key)
+        }
+
+        fn fail_listing(&self, kind: StorageErrorKind) {
+            self.state().listing_failure = Some(kind);
+        }
+
+        fn last_listing(&self) -> Option<(Option<AccountKey>, NonZeroUsize)> {
+            self.state().last_listing.take()
+        }
+
+        fn transaction(&self, writer: Option<MutexGuardArc<()>>) -> MemoryTransaction {
+            MemoryTransaction {
+                storage: self.clone(),
+                keys: self.state().keys.clone(),
+                _writer: writer,
+            }
         }
     }
 
-    impl AccountRepository for MemoryRepository {
-        async fn create(&self, account: NewAccount) -> Result<(), AccountError> {
-            let mut keys = self.keys();
-            if keys.contains(&account.key) {
-                return Err(AccountError::AlreadyExists);
-            }
-            keys.push(account.key);
+    impl Storage for MemoryStorage {
+        type Read = MemoryTransaction;
+        type Write = MemoryTransaction;
+
+        async fn begin_read(&self) -> Result<MemoryTransaction, StorageError> {
+            Ok(self.transaction(None))
+        }
+
+        async fn begin_write(&self) -> Result<MemoryTransaction, StorageError> {
+            let writer = Arc::clone(&self.inner.writer).lock_arc().await;
+            Ok(self.transaction(Some(writer)))
+        }
+
+        fn scram_decoy(&self) -> &ScramDecoy {
+            &self.inner.decoy
+        }
+    }
+
+    impl ReadTransaction for MemoryTransaction {}
+
+    impl WriteTransaction for MemoryTransaction {
+        async fn commit(self) -> Result<(), StorageError> {
+            self.storage.state().keys = self.keys;
             Ok(())
         }
-        async fn get(&self, key: &AccountKey) -> Result<Option<Account>, AccountError> {
+    }
+
+    impl AccountReads for MemoryTransaction {
+        async fn account(&self, key: &AccountKey) -> Result<Option<Account>, AccountError> {
             Ok(self
-                .keys()
+                .keys
                 .contains(key)
                 .then(|| Account { key: key.clone() }))
         }
-        fn list(&self, _: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>> {
-            futures_util::stream::empty()
-        }
-        async fn delete(&self, key: &AccountKey) -> Result<(), AccountError> {
-            let mut keys = self.keys();
-            let index = keys
-                .iter()
-                .position(|stored| stored == key)
-                .ok_or(AccountError::NotFound)?;
-            keys.remove(index);
-            Ok(())
-        }
-        async fn get_scram(
+
+        async fn scram(
             &self,
             _: &AccountKey,
             _: ScramHash,
         ) -> Result<Option<ScramVerifier>, AccountError> {
             Ok(None)
         }
-        async fn replace_credentials(
+
+        async fn accounts_after(
             &self,
-            _: &AccountKey,
+            after: Option<&AccountKey>,
+            limit: NonZeroUsize,
+        ) -> Result<Vec<Account>, AccountError> {
+            let mut state = self.storage.state();
+            state.last_listing = Some((after.cloned(), limit));
+            if let Some(kind) = state.listing_failure {
+                return Err(StorageError::with_source(
+                    kind,
+                    std::io::Error::other("secret backend details"),
+                )
+                .into());
+            }
+            Ok(self
+                .keys
+                .range((
+                    after.map_or(Bound::Unbounded, Bound::Excluded),
+                    Bound::Unbounded,
+                ))
+                .take(limit.get())
+                .map(|key| Account { key: key.clone() })
+                .collect())
+        }
+    }
+
+    impl AccountWrites for MemoryTransaction {
+        async fn create_account(&mut self, account: NewAccount) -> Result<(), AccountError> {
+            self.keys
+                .insert(account.key)
+                .then_some(())
+                .ok_or(AccountError::AlreadyExists)
+        }
+
+        async fn delete_account(&mut self, key: &AccountKey) -> Result<(), AccountError> {
+            self.keys
+                .remove(key)
+                .then_some(())
+                .ok_or(AccountError::NotFound)
+        }
+
+        async fn replace_credentials(
+            &mut self,
+            key: &AccountKey,
             _: ScramCredentials,
         ) -> Result<(), AccountError> {
-            Ok(())
+            self.keys
+                .contains(key)
+                .then_some(())
+                .ok_or(AccountError::NotFound)
+        }
+    }
+
+    impl RosterReads for MemoryTransaction {
+        async fn roster(
+            &self,
+            _: &AccountKey,
+        ) -> Result<roster::RosterSnapshot, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn roster_item(
+            &self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+        ) -> Result<Option<roster::RosterItem>, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn pending_requests(
+            &self,
+            _: &AccountKey,
+        ) -> Result<Vec<roster::PendingSubscription>, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn pending_request(
+            &self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+        ) -> Result<Option<roster::PendingSubscription>, roster::RosterError> {
+            unreachable!()
+        }
+    }
+
+    impl RosterWrites for MemoryTransaction {
+        async fn upsert(
+            &mut self,
+            _: &AccountKey,
+            _: roster::RosterItemUpdate,
+        ) -> Result<roster::RosterMutation<roster::RosterItem>, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn update_subscription<F>(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+            _: F,
+        ) -> Result<Option<roster::RosterMutation<roster::RosterItem>>, roster::RosterError>
+        where
+            F: FnOnce(roster::RosterSubscription) -> Option<roster::RosterSubscription>
+                + Send
+                + 'static,
+        {
+            unreachable!()
+        }
+
+        async fn request_subscription(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+            _: &AccountKey,
+            _: roster::PendingSubscription,
+        ) -> Result<roster::SubscriptionRequestOutcome, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn cancel_subscription(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+            _: Option<(&AccountKey, &roster::RosterJid)>,
+        ) -> Result<roster::SubscriptionCancellation, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn unsubscribe(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+            _: Option<(&AccountKey, &roster::RosterJid)>,
+        ) -> Result<roster::SubscriptionWithdrawal, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn remove_roster_item(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+        ) -> Result<Option<roster::RosterMutation<roster::RosterItem>>, roster::RosterError>
+        {
+            unreachable!()
+        }
+
+        async fn remove_item(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+            _: Option<(&AccountKey, &roster::RosterJid)>,
+        ) -> Result<Option<roster::ItemRemoval>, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn put_pending_request(
+            &mut self,
+            _: &AccountKey,
+            _: roster::PendingSubscription,
+        ) -> Result<(), roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn resolve_pending<F>(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+            _: F,
+        ) -> Result<Option<roster::PendingResolution>, roster::RosterError>
+        where
+            F: FnOnce(roster::RosterSubscription) -> Option<roster::RosterSubscription>
+                + Send
+                + 'static,
+        {
+            unreachable!()
+        }
+
+        async fn remove_pending_request(
+            &mut self,
+            _: &AccountKey,
+            _: &roster::RosterJid,
+        ) -> Result<bool, roster::RosterError> {
+            unreachable!()
+        }
+
+        async fn clear_roster(&mut self, _: &AccountKey) -> Result<(), roster::RosterError> {
+            unreachable!()
         }
     }
 
@@ -637,9 +907,25 @@ mod tests {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
+    fn user_keys(count: usize) -> Result<Vec<AccountKey>, &'static str> {
+        (0..count)
+            .map(|index| account_key(&format!("user{index:05}@example.org")))
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.code)
+    }
+
+    async fn list_body(
+        api: &Api<MemoryStorage>,
+        query: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let response = api.list(Some(query)).await.map_err(|error| error.code)?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await?.to_bytes();
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     #[test]
-    fn abandoned_deletion_keeps_the_account_locked_until_cleanup_ends()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn abandoned_deletion_keeps_the_account_locked_until_cleanup_ends() -> TestResult {
         compio::runtime::Runtime::new()?.block_on(async {
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
             let (started, cleanup_started) = oneshot::channel();
@@ -649,16 +935,14 @@ mod tests {
                 release: std::sync::Mutex::new(Some(released)),
                 calls: AtomicUsize::new(0),
             });
-            let repository = MemoryRepository {
-                keys: std::sync::Mutex::new(vec![key.clone()]),
-            };
-            let api = Arc::new(Api::new(repository, observer.clone()));
+            let storage = MemoryStorage::new([key.clone()]);
+            let api = Arc::new(Api::new(storage.clone(), observer.clone()));
             {
                 let mut delete = pin!(api.delete(key.clone()));
                 assert!(poll_once(delete.as_mut()).is_pending());
             }
             cleanup_started.await?;
-            assert!(api.accounts.get(&key).await?.is_none());
+            assert!(!storage.contains(&key));
 
             let mut create = pin!(api.create(key.clone(), Password("secret".into())));
             assert!(
@@ -669,123 +953,85 @@ mod tests {
             release.send(()).map_err(|_| "cleanup is not waiting")?;
             let response = create.await.map_err(|error| error.code)?;
             assert_eq!(response.status(), StatusCode::CREATED);
-            assert!(api.accounts.get(&key).await?.is_some());
+            assert!(storage.contains(&key));
             assert_eq!(observer.calls.load(Ordering::Relaxed), 1);
             Ok(())
         })
     }
 
-    struct Repository {
-        reads: AtomicUsize,
-        active: AtomicBool,
-        fail_at: Option<usize>,
-    }
-
-    struct Entries<'a>(&'a Repository);
-
-    impl Stream for Entries<'_> {
-        type Item = Result<Account, AccountError>;
-
-        fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            let index = self.0.reads.fetch_add(1, Ordering::Relaxed);
-            let account = if self.0.fail_at == Some(index) {
-                Err(StorageError::with_source(
-                    StorageErrorKind::CorruptData,
-                    std::io::Error::other("secret backend details"),
-                )
-                .into())
-            } else {
-                account_key(&format!("user{index:05}@example.org"))
-                    .map(|key| Account { key })
-                    .map_err(|_| StorageError::new(StorageErrorKind::Other).into())
-            };
-            Poll::Ready(Some(account))
-        }
-    }
-
-    impl Drop for Entries<'_> {
-        fn drop(&mut self) {
-            self.0.active.store(false, Ordering::Relaxed);
-        }
-    }
-
-    impl AccountRepository for Repository {
-        async fn create(&self, _: NewAccount) -> Result<(), AccountError> {
-            unreachable!()
-        }
-        async fn get(&self, _: &AccountKey) -> Result<Option<Account>, AccountError> {
-            unreachable!()
-        }
-        fn list(&self, _: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>> {
-            self.active.store(true, Ordering::Relaxed);
-            Entries(self)
-        }
-        async fn delete(&self, _: &AccountKey) -> Result<(), AccountError> {
-            unreachable!()
-        }
-        async fn get_scram(
-            &self,
-            _: &AccountKey,
-            _: ScramHash,
-        ) -> Result<Option<ScramVerifier>, AccountError> {
-            unreachable!()
-        }
-        async fn replace_credentials(
-            &self,
-            _: &AccountKey,
-            _: ScramCredentials,
-        ) -> Result<(), AccountError> {
-            unreachable!()
-        }
-    }
-
     #[test]
-    fn listing_reads_only_the_page_and_lookahead_and_releases_the_stream()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn listing_requests_one_extra_entry_to_report_has_more() -> TestResult {
         compio::runtime::Runtime::new()?.block_on(async {
-            let api = Api::new(
-                Repository {
-                    reads: AtomicUsize::new(0),
-                    active: AtomicBool::new(false),
-                    fail_at: Some(3),
-                },
-                Arc::new(NoopObserver),
+            let keys = user_keys(3)?;
+            let lookahead = const { NonZeroUsize::new(3).unwrap() };
+            for (stored, cursor) in [
+                (0, Value::Null),
+                (1, Value::Null),
+                (2, Value::Null),
+                (3, Value::from("user00001@example.org")),
+            ] {
+                let storage = MemoryStorage::new(keys.iter().take(stored).cloned());
+                let api = Api::new(storage.clone(), Arc::new(NoopObserver));
+                let body = list_body(&api, "limit=2").await?;
+                assert_eq!(
+                    storage.last_listing(),
+                    Some((None, lookahead)),
+                    "stored {stored}"
+                );
+                assert_eq!(
+                    body["accounts"].as_array().map(Vec::len),
+                    Some(stored.min(2)),
+                    "stored {stored}"
+                );
+                assert_eq!(body["next_cursor"], cursor, "stored {stored}");
+            }
+
+            let storage = MemoryStorage::new(keys.iter().cloned());
+            let api = Api::new(storage.clone(), Arc::new(NoopObserver));
+            let body = list_body(&api, "after=user00000%40example.org&limit=2").await?;
+            assert_eq!(
+                storage.last_listing(),
+                Some((Some(keys[0].clone()), lookahead))
             );
-            let response = api
-                .list(Some("limit=2"))
-                .await
-                .map_err(|_| "listing failed")?;
-            assert_eq!(api.accounts.reads.load(Ordering::Relaxed), 3);
-            assert!(!api.accounts.active.load(Ordering::Relaxed));
-            let bytes = response.into_body().collect().await?.to_bytes();
-            let body: serde_json::Value = serde_json::from_slice(&bytes)?;
-            assert_eq!(body["next_cursor"], "user00001@example.org");
+            assert_eq!(
+                body["accounts"],
+                json!([{"jid": "user00001@example.org"}, {"jid": "user00002@example.org"}])
+            );
+            assert_eq!(body["next_cursor"], Value::Null);
             Ok(())
         })
     }
 
     #[test]
-    fn listing_errors_discard_partial_results_and_release_the_stream()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn listing_failures_yield_the_mapped_error_without_partial_output() -> TestResult {
         compio::runtime::Runtime::new()?.block_on(async {
-            for fail_at in [1, 2] {
-                let api = Api::new(
-                    Repository {
-                        reads: AtomicUsize::new(0),
-                        active: AtomicBool::new(false),
-                        fail_at: Some(fail_at),
-                    },
-                    Arc::new(NoopObserver),
-                );
+            let keys = user_keys(3)?;
+            for (kind, status, code) in [
+                (
+                    StorageErrorKind::CorruptData,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                ),
+                (
+                    StorageErrorKind::Unavailable,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "storage_unavailable",
+                ),
+            ] {
+                let storage = MemoryStorage::new(keys.iter().cloned());
+                storage.fail_listing(kind);
+                let api = Api::new(storage, Arc::new(NoopObserver));
                 let error = match api.list(Some("limit=2")).await {
                     Err(error) => error,
                     Ok(_) => return Err("listing should fail".into()),
                 };
-                assert!(!api.accounts.active.load(Ordering::Relaxed));
                 let response = error.into_response();
-                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(response.status(), status);
                 let bytes = response.into_body().collect().await?.to_bytes();
-                assert_eq!(&bytes[..], b"{\"error\":{\"code\":\"internal_error\"}}");
+                assert_eq!(
+                    &bytes[..],
+                    format!("{{\"error\":{{\"code\":\"{code}\"}}}}").as_bytes()
+                );
             }
             Ok(())
         })
@@ -793,9 +1039,7 @@ mod tests {
 
     #[test]
     fn unknown_commits_are_distinct_from_unavailable_storage() {
-        let unknown = ApiError::from(AccountError::Storage(StorageError::new(
-            StorageErrorKind::CommitUnknown,
-        )));
+        let unknown = ApiError::from(StorageError::new(StorageErrorKind::CommitUnknown));
         assert_eq!(unknown.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(unknown.code, "commit_unknown");
         let unavailable = ApiError::from(AccountError::Storage(StorageError::new(

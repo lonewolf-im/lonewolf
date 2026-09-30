@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use lonewolf_admin::{NoopObserver, Server};
-use lonewolf_storage::RedbDatabase;
-use lonewolf_storage::account::redb::RedbAccountRepository;
+use lonewolf_storage::RedbStorage;
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -23,13 +22,12 @@ type TestResult = Result<(), Box<dyn Error>>;
 fn with_admin_server(test: impl FnOnce(&Path) -> TestResult) -> TestResult {
     let directory = tempfile::tempdir()?;
     let socket = directory.path().join("run/lonewolf/admin.sock");
-    let database = RedbDatabase::open(directory.path().join("accounts.redb"))?;
-    let accounts = RedbAccountRepository::from_database(database)?;
+    let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
     let (stop, stopped) = oneshot::channel::<()>();
     let (ready, readiness) = mpsc::channel();
     let worker = thread::spawn(move || -> io::Result<()> {
         Runtime::new()?.block_on(async {
-            let server = Server::bind(&socket, accounts, Arc::new(NoopObserver))?;
+            let server = Server::bind(&socket, storage, Arc::new(NoopObserver))?;
             ready.send(()).map_err(io::Error::other)?;
             server
                 .run(async move {

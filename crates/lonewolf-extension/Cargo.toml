@@ -14,4 +14,5 @@ lonewolf-xmpp.workspace = true
 
 [dev-dependencies]
 futures-executor.workspace = true
+lonewolf-auth.workspace = true
 tempfile.workspace = true

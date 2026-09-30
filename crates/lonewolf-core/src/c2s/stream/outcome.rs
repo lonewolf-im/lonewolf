@@ -32,6 +32,7 @@ pub(crate) enum CloseOutcome {
     BindingAttemptsExceeded,
     EstablishmentTimeout,
     AuthenticationAttemptsExceeded,
+    AccountDeleted,
     InternalError,
     TransportError,
 }
@@ -72,6 +73,7 @@ impl CloseOutcome {
             Self::AuthenticationAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
             Self::BindingAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
             Self::UnsupportedStanzaType => Some(StreamErrorCondition::UnsupportedStanzaType),
+            Self::AccountDeleted => Some(StreamErrorCondition::NotAuthorized),
             Self::InternalError => Some(StreamErrorCondition::InternalServerError),
             _ => None,
         }
@@ -102,6 +104,7 @@ impl CloseOutcome {
             Self::BindingAttemptsExceeded => "binding_attempts_exceeded",
             Self::EstablishmentTimeout => "establishment_timeout",
             Self::AuthenticationAttemptsExceeded => "authentication_attempts_exceeded",
+            Self::AccountDeleted => "account_deleted",
             Self::InternalError => "internal_error",
             Self::TransportError => "transport_error",
         }

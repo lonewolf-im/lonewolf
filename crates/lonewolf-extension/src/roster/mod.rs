@@ -11,7 +11,6 @@ use lonewolf_storage::roster::{
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
-use crate::Extension;
 use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
 use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType, IqRoute, IqScope};
 use crate::order::Sequencer;
@@ -19,6 +18,7 @@ use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate, ReceiveFuture,
 };
+use crate::{Extension, ExtensionFuture};
 use subscription::Parties;
 
 pub const NAME: &str = "roster";
@@ -60,6 +60,17 @@ impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
             .await
             .map(|account| account.is_some())
             .map_err(|_| StanzaErrorCondition::InternalServerError)
+    }
+
+    /// Refuses a mutation for an account whose record is gone, so a session that
+    /// outlives its account cannot repopulate roster state. Call it under the account's
+    /// order so the writes that follow cannot interleave with the account's cleanup.
+    async fn require_account(&self, account: &AccountKey) -> Result<(), StanzaErrorCondition> {
+        if self.account_exists(account).await? {
+            Ok(())
+        } else {
+            Err(StanzaErrorCondition::Forbidden)
+        }
     }
 
     /// Keeps only the contacts whose own roster grants `owner` their presence, so a
@@ -110,6 +121,14 @@ where
     fn presence_kinds(&self) -> &'static [PresenceRequestType] {
         &PresenceRequestType::ALL
     }
+
+    fn account_deleted<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        delivery: &'a dyn Delivery<A>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(self.forget_account(account, delivery))
+    }
 }
 
 impl<A, R, C> IqHandler<A> for Roster<R, C>
@@ -142,6 +161,7 @@ where
                 IqRequestType::Set => match xml::parse_set(request.payload, response)? {
                     xml::RosterSet::Update(update) => {
                         let _order = self.order.lock(&owner).await;
+                        self.require_account(&owner).await?;
                         let mutation = self.repository.upsert(&owner, update).await?;
                         push_roster(&owner, mutation, delivery).await?;
                         Ok(None)
@@ -197,21 +217,6 @@ where
                 pending,
                 contacts,
             )))
-        })
-    }
-
-    fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
-        Box::pin(async move {
-            if request.kind != PresenceRequestType::Subscribe {
-                return Ok(());
-            }
-            let contact = AccountKey::try_from(request.target.bare())
-                .map_err(|_| StanzaErrorCondition::BadRequest)?;
-            if self.account_exists(&contact).await? {
-                Ok(())
-            } else {
-                Err(StanzaErrorCondition::ServiceUnavailable)
-            }
         })
     }
 

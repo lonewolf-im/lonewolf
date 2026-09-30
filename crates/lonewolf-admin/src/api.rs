@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::borrow::Cow;
+use std::future::Future;
+use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_lock::Mutex;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Path, Request, State};
@@ -14,6 +17,7 @@ use axum::http::{HeaderValue, Method, StatusCode, Uri, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
+use futures_channel::oneshot;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use lonewolf_auth::scram::{
@@ -22,6 +26,8 @@ use lonewolf_auth::scram::{
 };
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountRepository, NewAccount};
+
+use crate::observer::AccountObserver;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::blocking::BlockingExecutor;
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
@@ -30,10 +36,14 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_BODY: usize = 16 * 1024;
+const LIFECYCLE_SHARDS: usize = 64;
 const MAX_PAGE: usize = 100;
 const DEFAULT_PAGE: usize = 50;
 
-pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
+pub(crate) fn router<R: AccountRepository + 'static>(
+    accounts: R,
+    observer: Arc<dyn AccountObserver>,
+) -> Router {
     Router::new()
         .route(
             "/v1/accounts",
@@ -49,7 +59,7 @@ pub(crate) fn router<R: AccountRepository + 'static>(accounts: R) -> Router {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
         .layer(middleware::from_fn(log_request))
-        .with_state(Arc::new(Api::new(accounts)))
+        .with_state(Arc::new(Api::new(accounts, observer)))
 }
 
 async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
@@ -86,25 +96,21 @@ fn admin_command(method: &Method, route: Option<&MatchedPath>) -> Option<&'stati
     }
 }
 
-async fn list_accounts<R: AccountRepository>(
+async fn list_accounts<R: AccountRepository + 'static>(
     State(api): State<Arc<Api<R>>>,
     uri: Uri,
 ) -> Result<Response, ApiError> {
     api.list(uri.query()).await
 }
 
-async fn create_account<R: AccountRepository>(
+async fn create_account<R: AccountRepository + 'static>(
     State(api): State<Arc<Api<R>>>,
     SensitiveJson(input): SensitiveJson<CreateAccount>,
 ) -> Result<Response, ApiError> {
-    let key = account_key(&input.jid)?;
-    let response = json(StatusCode::CREATED, &AccountView { jid: key.as_str() })?;
-    let credentials = api.credentials(input.password).await?;
-    api.accounts.create(NewAccount { key, credentials }).await?;
-    Ok(response)
+    api.create(account_key(&input.jid)?, input.password).await
 }
 
-async fn get_account<R: AccountRepository>(
+async fn get_account<R: AccountRepository + 'static>(
     State(api): State<Arc<Api<R>>>,
     AccountPath(key): AccountPath,
 ) -> Result<Response, ApiError> {
@@ -121,15 +127,14 @@ async fn get_account<R: AccountRepository>(
     )
 }
 
-async fn delete_account<R: AccountRepository>(
+async fn delete_account<R: AccountRepository + 'static>(
     State(api): State<Arc<Api<R>>>,
     AccountPath(key): AccountPath,
 ) -> Result<Response, ApiError> {
-    api.accounts.delete(&key).await?;
-    Ok(empty())
+    api.delete(key).await
 }
 
-async fn change_password<R: AccountRepository>(
+async fn change_password<R: AccountRepository + 'static>(
     State(api): State<Arc<Api<R>>>,
     AccountPath(key): AccountPath,
     SensitiveJson(input): SensitiveJson<ChangePassword>,
@@ -176,15 +181,89 @@ where
 
 struct Api<R> {
     accounts: R,
+    observer: Arc<dyn AccountObserver>,
     passwords: BlockingExecutor,
+    /// Serializes creation and deletion of the same account, including its cleanup.
+    lifecycle: [Mutex<()>; LIFECYCLE_SHARDS],
+    hash_state: RandomState,
 }
 
-impl<R: AccountRepository> Api<R> {
-    fn new(accounts: R) -> Self {
+impl<R: AccountRepository + 'static> Api<R> {
+    fn new(accounts: R, observer: Arc<dyn AccountObserver>) -> Self {
         Self {
             accounts,
+            observer,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
+            lifecycle: [const { Mutex::new(()) }; LIFECYCLE_SHARDS],
+            hash_state: RandomState::new(),
         }
+    }
+
+    fn lifecycle(&self, key: &AccountKey) -> &Mutex<()> {
+        &self.lifecycle[(self.hash_state.hash_one(key) as usize) % LIFECYCLE_SHARDS]
+    }
+
+    async fn create(
+        self: &Arc<Self>,
+        key: AccountKey,
+        password: Password,
+    ) -> Result<Response, ApiError> {
+        let response = json(StatusCode::CREATED, &AccountView { jid: key.as_str() })?;
+        self.lifecycle_operation(key, move |api, key| async move {
+            let credentials = api.credentials(password).await?;
+            api.accounts.create(NewAccount { key, credentials }).await?;
+            Ok(())
+        })
+        .await?;
+        Ok(response)
+    }
+
+    async fn delete(self: &Arc<Self>, key: AccountKey) -> Result<Response, ApiError> {
+        let existed = self
+            .lifecycle_operation(key, |api, key| async move {
+                let existed = match api.accounts.delete(&key).await {
+                    Ok(()) => true,
+                    Err(AccountError::NotFound) => false,
+                    Err(error) => return Err(error.into()),
+                };
+                // Cleanup also runs for a missing record so a retry can finish an earlier failure.
+                api.observer.deleted(&key).await.map_err(|error| {
+                    tracing::error!(error = %error, "account cleanup failed after deletion");
+                    ApiError::internal()
+                })?;
+                Ok(existed)
+            })
+            .await?;
+        if existed {
+            Ok(empty())
+        } else {
+            Err(ApiError::not_found())
+        }
+    }
+
+    /// Runs a creation or deletion under the account's lifecycle lock in a task of its
+    /// own, so an abandoned request cannot release the lock while its cleanup is still
+    /// running and let the account be recreated underneath it.
+    async fn lifecycle_operation<T, Fut>(
+        self: &Arc<Self>,
+        key: AccountKey,
+        operation: impl FnOnce(Arc<Self>, AccountKey) -> Fut + 'static,
+    ) -> Result<T, ApiError>
+    where
+        Fut: Future<Output = Result<T, ApiError>> + 'static,
+        T: 'static,
+    {
+        let (done, completed) = oneshot::channel();
+        let api = Arc::clone(self);
+        compio::runtime::spawn(async move {
+            let _lifecycle = api.lifecycle(&key).lock().await;
+            let result = operation(Arc::clone(&api), key).await;
+            let _ = done.send(result);
+        })
+        .detach();
+        completed
+            .await
+            .unwrap_or_else(|_| Err(ApiError::internal()))
     }
 
     async fn list(&self, query: Option<&str>) -> Result<Response, ApiError> {
@@ -452,15 +531,149 @@ impl From<AccountError> for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use crate::observer::{NoopObserver, ObserverError};
     use std::pin::Pin;
+    use std::sync::PoisonError;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
 
+    use compio::time::timeout;
     use futures_util::Stream;
     use lonewolf_storage::StorageError;
     use lonewolf_storage::account::Account;
 
     use super::*;
+
+    struct MemoryRepository {
+        keys: std::sync::Mutex<Vec<AccountKey>>,
+    }
+
+    impl MemoryRepository {
+        fn keys(&self) -> std::sync::MutexGuard<'_, Vec<AccountKey>> {
+            self.keys.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    impl AccountRepository for MemoryRepository {
+        async fn create(&self, account: NewAccount) -> Result<(), AccountError> {
+            let mut keys = self.keys();
+            if keys.contains(&account.key) {
+                return Err(AccountError::AlreadyExists);
+            }
+            keys.push(account.key);
+            Ok(())
+        }
+        async fn get(&self, key: &AccountKey) -> Result<Option<Account>, AccountError> {
+            Ok(self
+                .keys()
+                .contains(key)
+                .then(|| Account { key: key.clone() }))
+        }
+        fn list(&self, _: Option<AccountKey>) -> impl Stream<Item = Result<Account, AccountError>> {
+            futures_util::stream::empty()
+        }
+        async fn delete(&self, key: &AccountKey) -> Result<(), AccountError> {
+            let mut keys = self.keys();
+            let index = keys
+                .iter()
+                .position(|stored| stored == key)
+                .ok_or(AccountError::NotFound)?;
+            keys.remove(index);
+            Ok(())
+        }
+        async fn get_scram(
+            &self,
+            _: &AccountKey,
+            _: ScramHash,
+        ) -> Result<Option<ScramVerifier>, AccountError> {
+            Ok(None)
+        }
+        async fn replace_credentials(
+            &self,
+            _: &AccountKey,
+            _: ScramCredentials,
+        ) -> Result<(), AccountError> {
+            Ok(())
+        }
+    }
+
+    /// Reports when cleanup starts and holds it until released.
+    struct GatedObserver {
+        started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        calls: AtomicUsize,
+    }
+
+    impl AccountObserver for GatedObserver {
+        fn deleted<'a>(
+            &'a self,
+            _: &'a AccountKey,
+        ) -> Pin<Box<dyn Future<Output = Result<(), ObserverError>> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let started = self
+                .started
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            Box::pin(async move {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn abandoned_deletion_keeps_the_account_locked_until_cleanup_ends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        compio::runtime::Runtime::new()?.block_on(async {
+            let key = account_key("alice@example.org").map_err(|error| error.code)?;
+            let (started, cleanup_started) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let observer = Arc::new(GatedObserver {
+                started: std::sync::Mutex::new(Some(started)),
+                release: std::sync::Mutex::new(Some(released)),
+                calls: AtomicUsize::new(0),
+            });
+            let repository = MemoryRepository {
+                keys: std::sync::Mutex::new(vec![key.clone()]),
+            };
+            let api = Arc::new(Api::new(repository, observer.clone()));
+            {
+                let mut delete = pin!(api.delete(key.clone()));
+                assert!(poll_once(delete.as_mut()).is_pending());
+            }
+            cleanup_started.await?;
+            assert!(api.accounts.get(&key).await?.is_none());
+
+            let mut create = pin!(api.create(key.clone(), Password("secret".into())));
+            assert!(
+                timeout(Duration::from_millis(200), create.as_mut())
+                    .await
+                    .is_err()
+            );
+            release.send(()).map_err(|_| "cleanup is not waiting")?;
+            let response = create.await.map_err(|error| error.code)?;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert!(api.accounts.get(&key).await?.is_some());
+            assert_eq!(observer.calls.load(Ordering::Relaxed), 1);
+            Ok(())
+        })
+    }
 
     struct Repository {
         reads: AtomicUsize,
@@ -530,11 +743,14 @@ mod tests {
     fn listing_reads_only_the_page_and_lookahead_and_releases_the_stream()
     -> Result<(), Box<dyn std::error::Error>> {
         compio::runtime::Runtime::new()?.block_on(async {
-            let api = Api::new(Repository {
-                reads: AtomicUsize::new(0),
-                active: AtomicBool::new(false),
-                fail_at: Some(3),
-            });
+            let api = Api::new(
+                Repository {
+                    reads: AtomicUsize::new(0),
+                    active: AtomicBool::new(false),
+                    fail_at: Some(3),
+                },
+                Arc::new(NoopObserver),
+            );
             let response = api
                 .list(Some("limit=2"))
                 .await
@@ -553,11 +769,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         compio::runtime::Runtime::new()?.block_on(async {
             for fail_at in [1, 2] {
-                let api = Api::new(Repository {
-                    reads: AtomicUsize::new(0),
-                    active: AtomicBool::new(false),
-                    fail_at: Some(fail_at),
-                });
+                let api = Api::new(
+                    Repository {
+                        reads: AtomicUsize::new(0),
+                        active: AtomicBool::new(false),
+                        fail_at: Some(fail_at),
+                    },
+                    Arc::new(NoopObserver),
+                );
                 let error = match api.list(Some("limit=2")).await {
                     Err(error) => error,
                     Ok(_) => return Err("listing should fail".into()),

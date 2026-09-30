@@ -5,7 +5,7 @@ compile_error!("Lonewolf supports Unix targets only.");
 
 use std::collections::BTreeSet;
 use std::env;
-use std::future::pending;
+use std::future::{Future, pending};
 use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -16,13 +16,15 @@ use std::time::Duration;
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use futures_util::future::{Either, select};
+use futures_util::future::{Either, join, select};
 use lonewolf_extension::{Extension, Extensions};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
+mod account_cleanup;
 mod c2s;
 pub mod config;
+mod delivery;
 mod error;
 pub mod hosts;
 mod logging;
@@ -150,10 +152,15 @@ pub fn run_with_extensions(
                             })
                     })
                     .collect::<Result<_, _>>()?;
+                let (cleanup, cleanups) = account_cleanup::channel();
                 let admin = if config.admin.enabled {
                     Some(
-                        lonewolf_admin::Server::bind(&config.admin.socket_path, accounts.clone())
-                            .map_err(RunError::Admin)?,
+                        lonewolf_admin::Server::bind(
+                            &config.admin.socket_path,
+                            accounts.clone(),
+                            cleanup,
+                        )
+                        .map_err(RunError::Admin)?,
                     )
                 } else {
                     None
@@ -164,6 +171,7 @@ pub fn run_with_extensions(
                 let router_handle = router
                     .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions))
                     .handle();
+                let cleanup_router = router_handle.clone();
                 let listeners = listeners.insert(
                     c2s::Listeners::start(
                         &config.c2s,
@@ -177,7 +185,12 @@ pub fn run_with_extensions(
                     .await
                     .map_err(RunError::C2s)?,
                 );
-                run_services(admin, listeners).await
+                run_services(
+                    admin,
+                    listeners,
+                    account_cleanup::run(cleanups, &cleanup_router, &stanza_pool),
+                )
+                .await
             }
             .await;
             let stopped = dispatcher
@@ -209,20 +222,27 @@ pub fn run_with_extensions(
 async fn run_services(
     admin: Option<lonewolf_admin::Server>,
     listeners: &mut c2s::Listeners,
+    cleanups: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
     let admin_enabled = admin.is_some();
     let (stop_admin, stopped) = oneshot::channel::<()>();
-    let mut admin = pin!(async move {
-        match admin {
-            Some(server) => server
-                .run(async move {
-                    let _ = stopped.await;
-                    Ok(())
-                })
-                .await
-                .map_err(RunError::Admin),
-            None => pending().await,
-        }
+    // The cleanup worker stays beside the admin service through its drain, since
+    // accepted deletions still need it; it ends once the service drops its sender.
+    let mut services = pin!(async move {
+        let server = async move {
+            match admin {
+                Some(server) => server
+                    .run(async move {
+                        let _ = stopped.await;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(RunError::Admin),
+                None => pending().await,
+            }
+        };
+        let (result, ()) = join(server, cleanups).await;
+        result
     });
     let result = {
         let shutdown = async {
@@ -231,7 +251,7 @@ async fn run_services(
                 Either::Right((error, _)) => Err(RunError::C2s(error)),
             }
         };
-        match select(admin.as_mut(), pin!(shutdown)).await {
+        match select(services.as_mut(), pin!(shutdown)).await {
             Either::Left((result, _)) => Either::Right(result),
             Either::Right((result, _)) => Either::Left(result),
         }
@@ -239,7 +259,7 @@ async fn run_services(
     listeners.stop();
     drop(stop_admin);
     match result {
-        Either::Left(result) if admin_enabled => result.and(admin.await),
+        Either::Left(result) if admin_enabled => result.and(services.await),
         Either::Left(result) | Either::Right(result) => result,
     }
 }

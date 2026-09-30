@@ -9,13 +9,12 @@ use futures_executor::block_on;
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
-use lonewolf_storage::RedbDatabase;
-use lonewolf_storage::account::redb::RedbAccountRepository;
-use lonewolf_storage::account::{AccountKey, AccountRepository, NewAccount};
-use lonewolf_storage::roster::redb::RedbRosterRepository;
+use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
 use lonewolf_storage::roster::{
-    RosterJid, RosterRepository, RosterSubscription, SubscriptionState,
+    PendingSubscription, RosterError, RosterItem, RosterJid, RosterReads, RosterSnapshot,
+    RosterSubscription, RosterWrites, SubscriptionState,
 };
+use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
@@ -32,7 +31,7 @@ use crate::presence::{
     ReceiveFuture,
 };
 
-type TestRoster = Roster<RedbRosterRepository, RedbAccountRepository>;
+type TestRoster = Roster<RedbStorage>;
 
 #[derive(Default)]
 struct RecordingDelivery {
@@ -110,13 +109,42 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
 
 fn roster() -> (tempfile::TempDir, TestRoster) {
     let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
-    let database = RedbDatabase::open(directory.path().join("lonewolf.dat"))
+    let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))
         .unwrap_or_else(|error| panic!("{error}"));
-    let repository = RedbRosterRepository::from_database(database.clone())
-        .unwrap_or_else(|error| panic!("{error}"));
-    let accounts =
-        RedbAccountRepository::from_database(database).unwrap_or_else(|error| panic!("{error}"));
-    (directory, Roster::new(repository, accounts))
+    (directory, Roster::new(storage))
+}
+
+fn snapshot(roster: &TestRoster, owner: &AccountKey) -> RosterSnapshot {
+    block_on(async {
+        let transaction = roster.storage.begin_read().await?;
+        transaction.roster(owner).await
+    })
+    .unwrap_or_else(|error: RosterError| panic!("{error}"))
+}
+
+fn item(roster: &TestRoster, owner: &AccountKey, jid: &RosterJid) -> Option<RosterItem> {
+    block_on(async {
+        let transaction = roster.storage.begin_read().await?;
+        transaction.roster_item(owner, jid).await
+    })
+    .unwrap_or_else(|error: RosterError| panic!("{error}"))
+}
+
+fn pending(roster: &TestRoster, owner: &AccountKey) -> Vec<PendingSubscription> {
+    block_on(async {
+        let transaction = roster.storage.begin_read().await?;
+        transaction.pending_requests(owner).await
+    })
+    .unwrap_or_else(|error: RosterError| panic!("{error}"))
+}
+
+fn delete_account(roster: &TestRoster, key: &AccountKey) {
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        transaction.delete_account(key).await?;
+        transaction.commit().await.map_err(Into::into)
+    })
+    .unwrap_or_else(|error: lonewolf_storage::account::AccountError| panic!("{error}"))
 }
 
 /// A roster IQ from alice's desk whose borrowed arenas outlive the handler future.
@@ -357,8 +385,7 @@ fn subscription_request_from_a_deleted_account_is_forbidden() {
         ),
         "{result:?}"
     );
-    let bob_roster =
-        block_on(roster.repository.snapshot(&bob)).unwrap_or_else(|error| panic!("{error}"));
+    let bob_roster = snapshot(&roster, &bob);
     assert!(bob_roster.items.is_empty());
     assert!(delivery.pushes.borrow().is_empty());
 }
@@ -373,7 +400,7 @@ fn roster_set_checks_the_account_after_acquiring_its_order() {
     let order = block_on(roster.order.lock(&alice));
     let mut set = pin!(call.handle(&roster, IqRequestType::Set, &delivery));
     assert!(poll_once(set.as_mut()).is_pending());
-    block_on(roster.accounts.delete(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    delete_account(&roster, &alice);
     drop(order);
     let result = block_on(set);
     assert!(
@@ -384,8 +411,7 @@ fn roster_set_checks_the_account_after_acquiring_its_order() {
         "{result:?}"
     );
     assert!(delivery.pushes.borrow().is_empty());
-    let alice_roster =
-        block_on(roster.repository.snapshot(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    let alice_roster = snapshot(&roster, &alice);
     assert!(alice_roster.items.is_empty());
 }
 
@@ -401,7 +427,7 @@ fn subscription_request_checks_the_contact_after_acquiring_the_order() {
     let order = block_on(roster.order.lock(&alice));
     let mut request = pin!(call.receive(&roster, &delivery));
     assert!(poll_once(request.as_mut()).is_pending());
-    block_on(roster.accounts.delete(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    delete_account(&roster, &alice);
     drop(order);
     let result = block_on(request);
     assert!(
@@ -413,11 +439,9 @@ fn subscription_request_checks_the_contact_after_acquiring_the_order() {
         ),
         "{result:?}"
     );
-    let pending =
-        block_on(roster.repository.pending(&alice)).unwrap_or_else(|error| panic!("{error}"));
+    let pending = pending(&roster, &alice);
     assert!(pending.is_empty());
-    let bob_roster =
-        block_on(roster.repository.snapshot(&bob)).unwrap_or_else(|error| panic!("{error}"));
+    let bob_roster = snapshot(&roster, &bob);
     assert!(bob_roster.items.is_empty());
     assert!(delivery.pushes.borrow().is_empty());
 }
@@ -469,15 +493,14 @@ fn only_the_initial_transition_collects_granted_contacts() {
         AccountKey::try_from(alice.bare()).unwrap_or_else(|error| panic!("{error}"));
     let bob_account = AccountKey::try_from(bob).unwrap_or_else(|error| panic!("{error}"));
     block_on(async {
-        roster
-            .repository
+        let mut transaction = roster.storage.begin_write().await?;
+        transaction
             .update_subscription(&alice_account, &RosterJid::from(bob), |mut subscription| {
                 subscription.state = SubscriptionState::To;
                 Some(subscription)
             })
             .await?;
-        roster
-            .repository
+        transaction
             .update_subscription(&bob_account, &RosterJid::from(alice.bare()), |_| {
                 Some(RosterSubscription {
                     state: SubscriptionState::From,
@@ -485,7 +508,8 @@ fn only_the_initial_transition_collects_granted_contacts() {
                     approved: false,
                 })
             })
-            .await
+            .await?;
+        transaction.commit().await.map_err(RosterError::from)
     })
     .unwrap_or_else(|error| panic!("{error}"));
     for (transition, expected) in [
@@ -509,11 +533,17 @@ fn only_the_initial_transition_collects_granted_contacts() {
 
 fn create_account(roster: &TestRoster, key: &AccountKey) {
     let verifier = ScramSha1Verifier::new([11; 16], SCRAM_POLICY_ITERATIONS, [12; 20], [13; 20]);
-    block_on(roster.accounts.create(NewAccount {
-        key: key.clone(),
-        credentials: ScramCredentials::new(ScramVerifier::Sha1(verifier)),
-    }))
-    .unwrap_or_else(|error| panic!("{error}"));
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        transaction
+            .create_account(NewAccount {
+                key: key.clone(),
+                credentials: ScramCredentials::new(ScramVerifier::Sha1(verifier)),
+            })
+            .await?;
+        transaction.commit().await.map_err(Into::into)
+    })
+    .unwrap_or_else(|error: lonewolf_storage::account::AccountError| panic!("{error}"));
 }
 
 #[test]
@@ -548,7 +578,7 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
         }
     };
     block_on(async {
-        let repository = &roster.repository;
+        let mut repository = roster.storage.begin_write().await?;
         repository
             .update_subscription(
                 alice,
@@ -583,7 +613,8 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
                 &RosterJid::from(dave),
                 subscription(SubscriptionState::Both),
             )
-            .await
+            .await?;
+        repository.commit().await.map_err(RosterError::from)
     })
     .unwrap_or_else(|error| panic!("{error}"));
     let delivery = RecordingDelivery {
@@ -597,13 +628,11 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
         "{result:?}"
     );
 
-    let alice_roster =
-        block_on(roster.repository.snapshot(alice)).unwrap_or_else(|error| panic!("{error}"));
+    let alice_roster = snapshot(&roster, alice);
     assert!(alice_roster.items.is_empty());
     assert_eq!(alice_roster.version.get(), 0);
     for contact in [bob, carol] {
-        let item = block_on(roster.repository.get(contact, &RosterJid::from(alice)))
-            .unwrap_or_else(|error| panic!("{error}"))
+        let item = item(&roster, contact, &RosterJid::from(alice))
             .unwrap_or_else(|| panic!("missing item"));
         assert_eq!(item.subscription.state, SubscriptionState::None);
     }

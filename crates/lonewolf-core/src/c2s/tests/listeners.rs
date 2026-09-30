@@ -12,7 +12,7 @@ use std::thread;
 use compio::io::AsyncRead;
 use compio::runtime::Runtime;
 use compio::time::timeout;
-use lonewolf_storage::account::redb::RedbAccountRepository;
+use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::{CoreDispatcher, DispatchHandle};
 use tracing::instrument::WithSubscriber;
@@ -56,9 +56,8 @@ async fn router(
 
 fn auth() -> Result<(Arc<AuthService>, tempfile::TempDir), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
-    let accounts = RedbAccountRepository::open(directory.path().join("accounts.redb"))?;
-    let decoy = accounts.scram_decoy();
-    Ok((Arc::new(AuthService { accounts, decoy }), directory))
+    let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
+    Ok((Arc::new(AuthService { storage }), directory))
 }
 
 #[derive(Clone)]
@@ -462,7 +461,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
             &config,
             &C2sLimits::default(),
             hosts,
-            auth.accounts.clone(),
+            auth.storage.clone(),
             router.handle(),
             &handle,
             GlobalChunkAllocator,
@@ -514,7 +513,7 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
             &config,
             &C2sLimits::default(),
             hosts,
-            auth.accounts.clone(),
+            auth.storage.clone(),
             router.handle(),
             &dispatcher.handle(),
             GlobalChunkAllocator,

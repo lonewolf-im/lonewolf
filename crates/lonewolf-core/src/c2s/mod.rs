@@ -12,8 +12,10 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use lonewolf_auth::scram::{ScramHash, ScramVerifier};
 use lonewolf_auth::server::ScramDecoy;
-use lonewolf_storage::account::redb::RedbAccountRepository;
+use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
+use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use nix::errno::Errno;
@@ -101,8 +103,21 @@ impl AdmissionLimits {
 }
 
 struct AuthService {
-    accounts: RedbAccountRepository,
-    decoy: Arc<ScramDecoy>,
+    storage: RedbStorage,
+}
+
+impl AuthService {
+    async fn scram(
+        &self,
+        key: &AccountKey,
+        hash: ScramHash,
+    ) -> Result<Option<ScramVerifier>, AccountError> {
+        self.storage.begin_read().await?.scram(key, hash).await
+    }
+
+    fn decoy(&self) -> &ScramDecoy {
+        self.storage.scram_decoy()
+    }
 }
 
 struct StreamServices<A: ChunkAllocator> {
@@ -123,7 +138,7 @@ impl Listeners {
         config: &C2sConfig,
         limits: &C2sLimits,
         hosts: Hosts,
-        accounts: RedbAccountRepository,
+        storage: RedbStorage,
         router: RouterHandle<A>,
         dispatcher: &DispatchHandle,
         allocator: A,
@@ -137,8 +152,7 @@ impl Listeners {
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(
             limits.max_unauthenticated_connections,
         ));
-        let decoy = accounts.scram_decoy();
-        let auth = Arc::new(AuthService { accounts, decoy });
+        let auth = Arc::new(AuthService { storage });
         let listeners = Self {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),

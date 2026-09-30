@@ -5,91 +5,21 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, ThreadId};
-use std::time::Duration;
 
-use crate::account::{AccountError, AccountKey};
-use crate::{RedbDatabase, StorageErrorKind};
-use lonewolf_auth::scram::{
-    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramVerifier, ScramVerifierData,
-};
-use lonewolf_util::arena::{Arena, ArenaConfig};
-use lonewolf_xmpp::jid::Jid;
-use redb::backends::InMemoryBackend;
-use redb::{Database, StorageBackend, TableDefinition};
+use ::redb::StorageBackend;
+use ::redb::backends::InMemoryBackend;
 
-pub type TestResult = Result<(), Box<dyn Error>>;
+use crate::tests::TIMEOUT;
 
-pub const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
-pub const DECOY_SECRET: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_scram_decoy");
-pub const DECOY_SECRET_KEY: &str = "secret";
-pub const METADATA: TableDefinition<&str, u32> = TableDefinition::new("lonewolf_metadata");
-pub const SCHEMA_KEY: &str = "accounts_schema";
-
-pub fn key(input: &str) -> Result<AccountKey, Box<dyn Error>> {
-    let mut arena = Arena::try_new(ArenaConfig::default())?;
-    let jid = Jid::parse_in(input, &mut arena)?;
-    Ok(AccountKey::try_from(jid.resolve(&arena)?)?)
-}
-
-pub fn verifier<const N: usize>(marker: u8) -> ScramVerifierData<N> {
-    ScramVerifierData::new(
-        [marker; 16],
-        SCRAM_POLICY_ITERATIONS,
-        [marker + 1; N],
-        [marker + 2; N],
-    )
-}
-
-pub fn credentials(marker: u8) -> ScramCredentials {
-    ScramCredentials::both(verifier(marker), verifier(marker + 3))
-}
-
-pub fn assert_verifier<const N: usize>(actual: &ScramVerifierData<N>, marker: u8) {
-    assert_eq!(actual.salt(), &[marker; 16]);
-    assert_eq!(actual.iterations(), SCRAM_POLICY_ITERATIONS);
-    assert_eq!(actual.stored_key(), &[marker + 1; N]);
-    assert_eq!(actual.server_key(), &[marker + 2; N]);
-}
-
-pub fn assert_scram(actual: Option<ScramVerifier>, marker: u8) -> TestResult {
-    match actual.ok_or("missing verifier")? {
-        ScramVerifier::Sha1(value) => assert_verifier(&value, marker),
-        ScramVerifier::Sha256(value) => assert_verifier(&value, marker),
-    }
-    Ok(())
-}
-
-pub fn assert_storage_error<T>(result: Result<T, AccountError>, expected: StorageErrorKind) {
-    match result {
-        Err(AccountError::Storage(error)) => assert_eq!(error.kind(), expected),
-        _ => panic!("expected a storage error"),
-    }
-}
-
-pub fn database() -> Result<RedbDatabase, redb::DatabaseError> {
-    Database::builder()
-        .set_cache_size(1024 * 1024)
-        .create_with_backend(InMemoryBackend::new())
-        .map(RedbDatabase::new)
-}
-
-pub fn insert_record(database: &Database, key: &AccountKey, bytes: &[u8]) -> TestResult {
-    let transaction = database.begin_write()?;
-    transaction
-        .open_table(ACCOUNTS)?
-        .insert(key.as_str(), bytes)?;
-    transaction.commit()?;
-    Ok(())
-}
-
+/// Shares its memory between clones, so a database can be reopened over it.
 #[derive(Clone, Debug, Default)]
-pub struct FailingSyncBackend {
+pub(super) struct FailingSyncBackend {
     inner: Arc<InMemoryBackend>,
     fail_next_sync: Arc<AtomicBool>,
 }
 
 impl FailingSyncBackend {
-    pub fn fail_next_sync(&self) {
+    pub(super) fn fail_next_sync(&self) {
         self.fail_next_sync.store(true, Ordering::SeqCst);
     }
 }
@@ -121,8 +51,9 @@ impl StorageBackend for FailingSyncBackend {
     }
 }
 
+/// Records the thread of every backend call and can hold the next sync open.
 #[derive(Clone, Debug, Default)]
-pub struct ObservedBackend {
+pub(super) struct ObservedBackend {
     inner: Arc<InMemoryBackend>,
     threads: Arc<Mutex<Vec<ThreadId>>>,
     sync_gate: Arc<Mutex<Option<SyncGate>>>,
@@ -135,13 +66,14 @@ struct SyncGate {
 }
 
 impl ObservedBackend {
-    pub fn take_threads(&self) -> Result<Vec<ThreadId>, Box<dyn Error>> {
+    pub(super) fn take_threads(&self) -> Result<Vec<ThreadId>, Box<dyn Error>> {
         Ok(std::mem::take(
             &mut *self.threads.lock().map_err(|_| "thread log poisoned")?,
         ))
     }
 
-    pub fn block_next_sync(
+    /// Returns a receiver that fires when the sync starts and a sender that lets it finish.
+    pub(super) fn block_next_sync(
         &self,
     ) -> Result<(mpsc::Receiver<()>, mpsc::Sender<()>), Box<dyn Error>> {
         let (entered, started) = mpsc::channel();
@@ -188,7 +120,7 @@ impl StorageBackend for ObservedBackend {
         if let Some(gate) = gate {
             gate.entered.send(()).map_err(io::Error::other)?;
             gate.release
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(TIMEOUT)
                 .map_err(io::Error::other)?;
         }
         self.inner.sync_data()

@@ -175,4 +175,6 @@
 
 # Choose where Lonewolf stores account records and credentials.
 # Leave this unset to use the default store. The value below is an example.
+# Roster state always lives in this store, so that a change to an account and to
+# its roster can be applied together.
 # storage = "primary"

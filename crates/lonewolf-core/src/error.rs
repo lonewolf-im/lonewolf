@@ -39,14 +39,6 @@ pub enum RunError {
         store: String,
         source: StorageError,
     },
-    Accounts {
-        store: String,
-        source: StorageError,
-    },
-    Rosters {
-        store: String,
-        source: StorageError,
-    },
 }
 
 impl fmt::Display for RunError {
@@ -86,14 +78,6 @@ impl fmt::Display for RunError {
             Self::Storage { store, source } => {
                 write!(formatter, "cannot open store {store:?}: {source}")
             }
-            Self::Accounts { store, source } => write!(
-                formatter,
-                "cannot initialize account repository in store {store:?}: {source}"
-            ),
-            Self::Rosters { store, source } => write!(
-                formatter,
-                "cannot initialize roster repository in store {store:?}: {source}"
-            ),
         }
     }
 }
@@ -117,9 +101,7 @@ impl Error for RunError {
             | Self::Admin(source)
             | Self::C2s(source) => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),
-            Self::Storage { source, .. }
-            | Self::Accounts { source, .. }
-            | Self::Rosters { source, .. } => Some(source),
+            Self::Storage { source, .. } => Some(source),
             Self::UnknownStore(_) => None,
         }
     }

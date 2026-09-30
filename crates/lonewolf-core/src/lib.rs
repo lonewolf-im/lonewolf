@@ -119,7 +119,7 @@ pub fn run_with_extensions(
             let mut listeners = None;
             let mut router = None;
             let result = async {
-                let accounts = stores.accounts(account_store)?;
+                let storage = stores.storage(account_store)?;
                 let referenced = config
                     .hosts
                     .values()
@@ -128,10 +128,7 @@ pub fn run_with_extensions(
                 for name in referenced {
                     let extension: Arc<dyn Extension<Arc<PooledChunkAllocator>>> = match name {
                         lonewolf_extension::roster::NAME => {
-                            Arc::new(lonewolf_extension::roster::Roster::new(
-                                stores.rosters(account_store)?,
-                                accounts.clone(),
-                            ))
+                            Arc::new(lonewolf_extension::roster::Roster::new(storage.clone()))
                         }
                         _ => continue,
                     };
@@ -157,7 +154,7 @@ pub fn run_with_extensions(
                     Some(
                         lonewolf_admin::Server::bind(
                             &config.admin.socket_path,
-                            accounts.clone(),
+                            storage.clone(),
                             cleanup,
                         )
                         .map_err(RunError::Admin)?,
@@ -177,7 +174,7 @@ pub fn run_with_extensions(
                         &config.c2s,
                         &config.limits.c2s,
                         hosts,
-                        accounts,
+                        storage,
                         router_handle,
                         &dispatcher.handle(),
                         Arc::clone(&stanza_pool),

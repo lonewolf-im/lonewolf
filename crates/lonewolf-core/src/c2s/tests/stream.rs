@@ -16,9 +16,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
 };
-use lonewolf_storage::RedbDatabase;
-use lonewolf_storage::account::redb::RedbAccountRepository;
-use lonewolf_storage::account::{AccountRepository, NewAccount};
+use lonewolf_storage::account::{AccountWrites, NewAccount};
+use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use redb::{ReadableTable, TableDefinition};
@@ -113,16 +112,15 @@ fn auth() -> std::io::Result<(Arc<AuthService>, tempfile::TempDir)> {
     Ok((auth, directory))
 }
 
-fn auth_with_database() -> std::io::Result<(Arc<AuthService>, RedbDatabase, tempfile::TempDir)> {
+fn auth_with_database() -> std::io::Result<(Arc<AuthService>, RedbStorage, tempfile::TempDir)> {
     let directory = tempfile::tempdir()?;
-    let database = RedbDatabase::open(directory.path().join("accounts.redb"))
-        .map_err(std::io::Error::other)?;
-    let accounts =
-        RedbAccountRepository::from_database(database.clone()).map_err(std::io::Error::other)?;
-    let decoy = accounts.scram_decoy();
+    let storage =
+        RedbStorage::open(directory.path().join("accounts.redb")).map_err(std::io::Error::other)?;
     Ok((
-        Arc::new(AuthService { accounts, decoy }),
-        database,
+        Arc::new(AuthService {
+            storage: storage.clone(),
+        }),
+        storage,
         directory,
     ))
 }
@@ -440,12 +438,14 @@ where
                 [7; 16],
                 ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
             )?;
-            auth.accounts
-                .create(NewAccount {
+            let mut transaction = auth.storage.begin_write().await?;
+            transaction
+                .create_account(NewAccount {
                     key: key.clone(),
                     credentials: ScramCredentials::new(verifier),
                 })
                 .await?;
+            transaction.commit().await?;
             if stored_iterations != SCRAM_POLICY_ITERATIONS.get() {
                 let transaction = database.as_ref().begin_write()?;
                 {

@@ -3,11 +3,12 @@
 mod subscription;
 mod xml;
 
-use lonewolf_storage::account::{AccountKey, AccountRepository};
+use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::roster::{
-    RosterError, RosterItem, RosterJid, RosterMutation, RosterRepository, RosterSnapshot,
-    RosterVersion, SubscriptionState,
+    RosterError, RosterItem, RosterJid, RosterMutation, RosterReads, RosterSnapshot, RosterVersion,
+    RosterWrites, SubscriptionState,
 };
+use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
@@ -39,76 +40,86 @@ const IQ_ROUTES: [IqRoute; 2] = [
     },
 ];
 
-pub struct Roster<R, C> {
-    repository: R,
-    accounts: C,
+pub struct Roster<S> {
+    storage: S,
     order: Sequencer,
 }
 
-impl<R: RosterRepository, C: AccountRepository> Roster<R, C> {
-    pub fn new(repository: R, accounts: C) -> Self {
+impl<S: Storage> Roster<S> {
+    pub fn new(storage: S) -> Self {
         Self {
-            repository,
-            accounts,
+            storage,
             order: Sequencer::new(),
         }
     }
 
-    async fn account_exists(&self, account: &AccountKey) -> Result<bool, StanzaErrorCondition> {
-        self.accounts
-            .get(account)
-            .await
-            .map(|account| account.is_some())
-            .map_err(|_| StanzaErrorCondition::InternalServerError)
+    async fn begin_read(&self) -> Result<S::Read, RosterError> {
+        self.storage.begin_read().await.map_err(RosterError::from)
     }
 
-    /// Refuses a mutation for an account whose record is gone, so a session that
-    /// outlives its account cannot repopulate roster state. Call it under the account's
-    /// order so the writes that follow cannot interleave with the account's cleanup.
-    async fn require_account(&self, account: &AccountKey) -> Result<(), StanzaErrorCondition> {
-        if self.account_exists(account).await? {
-            Ok(())
-        } else {
-            Err(StanzaErrorCondition::Forbidden)
-        }
-    }
-
-    /// Keeps only the contacts whose own roster grants `owner` their presence, so a
-    /// one-sided `to` item cannot expose a contact that never approved.
-    async fn granting_contacts(
-        &self,
-        owner: RosterJid,
-        watched: Vec<RosterJid>,
-    ) -> Result<Vec<AccountKey>, StanzaErrorCondition> {
-        let mut contacts = Vec::with_capacity(watched.len());
-        for contact in &watched {
-            let Ok(account) = AccountKey::try_from(contact) else {
-                continue;
-            };
-            let granted = self
-                .repository
-                .get(&account, &owner)
-                .await
-                .map_err(roster_error)?
-                .is_some_and(|item| {
-                    matches!(
-                        item.subscription.state,
-                        SubscriptionState::From | SubscriptionState::Both
-                    )
-                });
-            if granted {
-                contacts.push(account);
-            }
-        }
-        Ok(contacts)
+    async fn begin_write(&self) -> Result<S::Write, RosterError> {
+        self.storage.begin_write().await.map_err(RosterError::from)
     }
 }
 
-impl<A, R, C> Extension<A> for Roster<R, C>
+async fn account_exists(
+    transaction: &impl AccountReads,
+    account: &AccountKey,
+) -> Result<bool, StanzaErrorCondition> {
+    transaction
+        .account(account)
+        .await
+        .map(|account| account.is_some())
+        .map_err(|_| StanzaErrorCondition::InternalServerError)
+}
+
+/// Refuses a mutation for an account whose record is gone, so a session that outlives
+/// its account cannot repopulate roster state. Read it through the transaction the
+/// writes run in, under the account's order.
+async fn require_account(
+    transaction: &impl AccountReads,
+    account: &AccountKey,
+) -> Result<(), StanzaErrorCondition> {
+    if account_exists(transaction, account).await? {
+        Ok(())
+    } else {
+        Err(StanzaErrorCondition::Forbidden)
+    }
+}
+
+/// Keeps only the contacts whose own roster grants `owner` their presence, so a
+/// one-sided `to` item cannot expose a contact that never approved.
+async fn granting_contacts(
+    transaction: &impl RosterReads,
+    owner: RosterJid,
+    watched: Vec<RosterJid>,
+) -> Result<Vec<AccountKey>, StanzaErrorCondition> {
+    let mut contacts = Vec::with_capacity(watched.len());
+    for contact in &watched {
+        let Ok(account) = AccountKey::try_from(contact) else {
+            continue;
+        };
+        let granted = transaction
+            .roster_item(&account, &owner)
+            .await
+            .map_err(roster_error)?
+            .is_some_and(|item| {
+                matches!(
+                    item.subscription.state,
+                    SubscriptionState::From | SubscriptionState::Both
+                )
+            });
+        if granted {
+            contacts.push(account);
+        }
+    }
+    Ok(contacts)
+}
+
+impl<A, S> Extension<A> for Roster<S>
 where
     A: ChunkAllocator,
-    R: RosterRepository,
-    C: AccountRepository,
+    S: Storage,
 {
     fn name(&self) -> &'static str {
         NAME
@@ -131,11 +142,10 @@ where
     }
 }
 
-impl<A, R, C> IqHandler<A> for Roster<R, C>
+impl<A, S> IqHandler<A> for Roster<S>
 where
     A: ChunkAllocator,
-    R: RosterRepository,
-    C: AccountRepository,
+    S: Storage,
 {
     fn handle<'a>(
         &'a self,
@@ -153,7 +163,7 @@ where
                 IqRequestType::Get => {
                     xml::validate_get(request.payload)?;
                     let _order = self.order.lock(&owner).await;
-                    let snapshot = self.repository.snapshot(&owner).await?;
+                    let snapshot = self.begin_read().await?.roster(&owner).await?;
                     let payload = xml::build_response(snapshot, response)?;
                     delivery.tag_session(SessionTag::Interested).await?;
                     Ok(Some(payload))
@@ -161,8 +171,10 @@ where
                 IqRequestType::Set => match xml::parse_set(request.payload, response)? {
                     xml::RosterSet::Update(update) => {
                         let _order = self.order.lock(&owner).await;
-                        self.require_account(&owner).await?;
-                        let mutation = self.repository.upsert(&owner, update).await?;
+                        let mut transaction = self.begin_write().await?;
+                        require_account(&transaction, &owner).await?;
+                        let mutation = transaction.upsert(&owner, update).await?;
+                        transaction.commit().await.map_err(RosterError::from)?;
                         push_roster(&owner, mutation, delivery).await?;
                         Ok(None)
                     }
@@ -178,11 +190,10 @@ where
     }
 }
 
-impl<A, R, C> PresenceHandler<A> for Roster<R, C>
+impl<A, S> PresenceHandler<A> for Roster<S>
 where
     A: ChunkAllocator,
-    R: RosterRepository,
-    C: AccountRepository,
+    S: Storage,
 {
     fn audience<'a>(
         &'a self,
@@ -192,21 +203,17 @@ where
             let owner = AccountKey::try_from(update.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             let order = self.order.lock(&owner).await;
-            let snapshot = self
-                .repository
-                .snapshot(&owner)
-                .await
-                .map_err(roster_error)?;
+            let transaction = self.begin_read().await.map_err(roster_error)?;
+            let snapshot = transaction.roster(&owner).await.map_err(roster_error)?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
             let (pending, contacts) = if update.transition == PresenceTransition::Initial {
-                let pending = self
-                    .repository
-                    .pending(&owner)
+                let pending = transaction
+                    .pending_requests(&owner)
                     .await
                     .map_err(roster_error)?;
-                let contacts = self
-                    .granting_contacts(RosterJid::from(update.sender.bare()), watched)
-                    .await?;
+                let contacts =
+                    granting_contacts(&transaction, RosterJid::from(update.sender.bare()), watched)
+                        .await?;
                 (pending, contacts)
             } else {
                 (Vec::new(), Vec::new())

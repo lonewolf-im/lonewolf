@@ -22,7 +22,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
-mod account_cleanup;
+mod account_deletion;
 mod c2s;
 pub mod config;
 mod delivery;
@@ -152,7 +152,7 @@ pub fn run_with_extensions(
                             })
                     })
                     .collect::<Result<_, _>>()?;
-                let (deleter, deletions) = account_cleanup::channel();
+                let (deleter, deletions) = account_deletion::channel();
                 let admin = if config.admin.enabled {
                     Some(
                         lonewolf_admin::Server::bind(
@@ -171,7 +171,7 @@ pub fn run_with_extensions(
                 let router_handle = router
                     .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions))
                     .handle();
-                let cleanup_router = router_handle.clone();
+                let deletion_router = router_handle.clone();
                 let deletion_storage = storage.clone();
                 let listeners = listeners.insert(
                     c2s::Listeners::start(
@@ -189,10 +189,10 @@ pub fn run_with_extensions(
                 run_services(
                     admin,
                     listeners,
-                    account_cleanup::run(
+                    account_deletion::run(
                         deletions,
                         &deletion_storage,
-                        &cleanup_router,
+                        &deletion_router,
                         &stanza_pool,
                     ),
                 )
@@ -228,11 +228,11 @@ pub fn run_with_extensions(
 async fn run_services(
     admin: Option<lonewolf_admin::Server>,
     listeners: &mut c2s::Listeners,
-    cleanups: impl Future<Output = ()>,
+    deletions: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
     let admin_enabled = admin.is_some();
     let (stop_admin, stopped) = oneshot::channel::<()>();
-    // The cleanup worker stays beside the admin service through its drain, since
+    // The deletion worker stays beside the admin service through its drain, since
     // accepted deletions still need it; it ends once the service drops its sender.
     let mut services = pin!(async move {
         let server = async move {
@@ -247,7 +247,7 @@ async fn run_services(
                 None => pending().await,
             }
         };
-        let (result, ()) = join(server, cleanups).await;
+        let (result, ()) = join(server, deletions).await;
         result
     });
     let result = {

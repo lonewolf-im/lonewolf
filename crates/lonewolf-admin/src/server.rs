@@ -22,7 +22,7 @@ use lonewolf_storage::Storage;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::api;
-use crate::observer::AccountDeleter;
+use crate::deleter::AccountDeleter;
 
 const MAX_CONNECTIONS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);

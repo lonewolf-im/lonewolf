@@ -47,6 +47,20 @@ struct BoundSession<A: ChunkAllocator> {
     /// Whether this resource currently has presence, mirroring the router's view.
     available: bool,
     pending_replays: VecDeque<Replay<A>>,
+    /// Everything the client has yet to receive, in order; only `flush` writes the socket.
+    outbox: VecDeque<Output<A>>,
+}
+
+enum Output<A: ChunkAllocator> {
+    Routed(RoutedStanza<A>),
+    /// Stanzas built by this session in one arena, written in order.
+    Owned {
+        stanzas: Vec<Stanza>,
+        arena: Arena<A>,
+    },
+    /// Stored subscription requests, parsed one at a time as they are written so a large
+    /// backlog never sits in memory at once.
+    Requests(Vec<PendingSubscription>),
 }
 
 /// What a resource receives right after its own availability echo.
@@ -83,6 +97,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         allocator,
         available: false,
         pending_replays: VecDeque::new(),
+        outbox: VecDeque::new(),
     };
     let stopped = {
         let retired = pin!(session.registration.wait_retired());
@@ -129,7 +144,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 match selected {
                     Either::Left(event) => break event,
                     Either::Right(Some(delivery)) => {
-                        if let Err(outcome) = self.deliver(delivery).await {
+                        if let Err(outcome) = self.drain_mailbox(delivery).await {
                             break 'stream outcome;
                         }
                     }
@@ -139,7 +154,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             match event {
                 Ok(Some(StreamEvent::StreamEnd) | None) => break self.writer.close().await,
                 Ok(Some(StreamEvent::Stanza(parsed))) => {
-                    if let Err(outcome) = self.handle_stanza(parsed).await {
+                    let handled = self.handle_stanza(parsed).await;
+                    let flushed = self.flush().await;
+                    if let Err(outcome) = handled.and(flushed) {
                         break self.writer.fail(outcome).await;
                     }
                 }
@@ -223,32 +240,63 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         result.and(finished)
     }
 
-    async fn deliver(&mut self, delivery: ResourceDelivery<A>) -> Result<(), CloseOutcome> {
+    /// Queues one delivery and everything else the mailbox already holds, then writes
+    /// the batch in one go.
+    async fn drain_mailbox(&mut self, first: ResourceDelivery<A>) -> Result<(), CloseOutcome> {
+        self.enqueue_delivery(first)?;
+        for delivery in self.registration.take_queued() {
+            self.enqueue_delivery(delivery)?;
+        }
+        self.flush().await
+    }
+
+    fn enqueue_delivery(&mut self, delivery: ResourceDelivery<A>) -> Result<(), CloseOutcome> {
         match delivery {
-            ResourceDelivery::Routed(stanza) => self.writer.send_routed(&stanza).await,
+            ResourceDelivery::Routed(stanza) => self.outbox.push_back(Output::Routed(stanza)),
             ResourceDelivery::Presence {
                 stanzas,
                 replay_pending,
             } => {
-                for stanza in stanzas {
-                    self.writer.send_routed(&stanza).await?;
-                }
+                self.outbox.extend(stanzas.into_iter().map(Output::Routed));
                 if replay_pending {
                     let replay = self
                         .pending_replays
                         .pop_front()
                         .ok_or(CloseOutcome::InternalError)?;
-                    for stanza in &replay.presences {
-                        self.writer.send_routed(stanza).await?;
-                    }
-                    for subscription in replay.requests {
-                        let stanza = self.parse_pending_subscription(subscription).await?;
-                        self.writer.send_routed(&stanza).await?;
+                    self.outbox
+                        .extend(replay.presences.into_iter().map(Output::Routed));
+                    if !replay.requests.is_empty() {
+                        self.outbox.push_back(Output::Requests(replay.requests));
                     }
                 }
-                Ok(())
             }
         }
+        Ok(())
+    }
+
+    /// Writes everything queued, in order, and flushes the socket once.
+    async fn flush(&mut self) -> Result<(), CloseOutcome> {
+        if self.outbox.is_empty() {
+            return Ok(());
+        }
+        while let Some(output) = self.outbox.pop_front() {
+            match output {
+                Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
+                Output::Owned { stanzas, arena } => {
+                    for stanza in &stanzas {
+                        let stanza = stanza.resolve(&arena)?;
+                        self.writer.write_stanza(&stanza).await?;
+                    }
+                }
+                Output::Requests(requests) => {
+                    for subscription in requests {
+                        let stanza = self.parse_pending_subscription(subscription).await?;
+                        self.writer.write_routed(&stanza).await?;
+                    }
+                }
+            }
+        }
+        self.writer.flush().await
     }
 
     async fn handle_stanza(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
@@ -303,8 +351,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 StanzaErrorCondition::ServiceUnavailable,
                 None,
             )?;
-            let reply = reply.resolve(&arena)?;
-            return self.writer.send_stanza(&reply).await;
+            self.outbox.push_back(Output::Owned {
+                stanzas: vec![reply],
+                arena,
+            });
+            return Ok(());
         };
         let accounts = match route.scope {
             Some(IqScope::Account) => vec![AccountKey::try_from(target.bare())?],
@@ -383,25 +434,28 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         for delivery in queued {
-            self.deliver(delivery).await?;
+            self.enqueue_delivery(delivery)?;
         }
         match handled {
             Err(HandlerError::Stanza(condition)) => {
                 let reply = iq::error_reply(&request, &mut arena, condition, Some(route.sender))?;
-                let reply = reply.resolve(&arena)?;
-                self.writer.send_stanza(&reply).await
+                self.outbox.push_back(Output::Owned {
+                    stanzas: vec![reply],
+                    arena,
+                });
             }
             Ok((payload, followups)) => {
                 let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
-                let reply = reply.resolve(&response)?;
-                self.writer.send_stanza(&reply).await?;
-                for followup in followups {
-                    let followup = followup.resolve(&response)?;
-                    self.writer.send_stanza(&followup).await?;
-                }
-                Ok(())
+                let mut stanzas = Vec::with_capacity(1 + followups.len());
+                stanzas.push(reply);
+                stanzas.extend(followups);
+                self.outbox.push_back(Output::Owned {
+                    stanzas,
+                    arena: response,
+                });
             }
         }
+        Ok(())
     }
 
     /// Directed presence only enters subscription handling; other directed presence is dropped.
@@ -673,7 +727,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         .await
                         .map_err(|_| CloseOutcome::InternalError)?;
                 for delivery in queued {
-                    self.deliver(delivery).await?;
+                    self.enqueue_delivery(delivery)?;
                 }
                 Ok(())
             }
@@ -689,8 +743,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
         let source = source.resolve()?.clone_in(&mut arena)?;
         let reply = source.error_reply_in(&mut arena, condition)?.build()?;
-        let reply = reply.resolve(&arena)?;
-        self.writer.send_stanza(&reply).await
+        self.outbox.push_back(Output::Owned {
+            stanzas: vec![reply],
+            arena,
+        });
+        Ok(())
     }
 
     fn delivery(&self) -> RouterDelivery<A> {

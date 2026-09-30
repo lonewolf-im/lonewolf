@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::future::Future;
+
+use futures_channel::oneshot;
+use lonewolf_extension::Deliver;
 use lonewolf_extension::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionTag, StanzaFactory,
 };
@@ -7,31 +11,65 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 
-use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
+use crate::order::Ticket;
+use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
 /// Performs handler deliveries through the router, for a bound resource or for the
 /// server itself when no session is involved.
-pub(crate) struct RouterDelivery<'a, A: ChunkAllocator> {
-    pub(crate) router: &'a RouterHandle<A>,
-    pub(crate) allocator: &'a A,
+pub(crate) struct RouterDelivery<A: ChunkAllocator> {
+    router: RouterHandle<A>,
+    allocator: A,
     /// The requesting resource; server-initiated work has none and cannot tag a session.
-    pub(crate) session: Option<&'a Registration<A>>,
+    session: Option<SessionHandle<A>>,
 }
 
-impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<'_, A> {
+impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
+    pub(crate) fn new(
+        router: &RouterHandle<A>,
+        allocator: &A,
+        session: Option<&Registration<A>>,
+    ) -> Self {
+        Self {
+            router: router.clone(),
+            allocator: allocator.clone(),
+            session: session.map(Registration::handle),
+        }
+    }
+}
+
+/// Runs `deliver` once `ticket` turns, on a task of its own, so a caller that is
+/// cancelled after its commit cannot lose the deliveries the commit promised. The
+/// returned future reports the outcome and may be dropped without stopping the work.
+pub(crate) fn deliver_committed<A: ChunkAllocator + Clone + 'static>(
+    mut ticket: Ticket,
+    deliver: Deliver<A>,
+    delivery: RouterDelivery<A>,
+) -> impl Future<Output = Result<(), DeliveryError>> {
+    let (done, completed) = oneshot::channel();
+    compio::runtime::spawn(async move {
+        ticket.turn().await;
+        let result = deliver(&delivery).await;
+        drop(ticket);
+        let _ = done.send(result);
+    })
+    .detach();
+    async move { completed.await.unwrap_or(Err(DeliveryError)) }
+}
+
+impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<A> {
     fn is_local_host(&self, domain: &str) -> bool {
         self.router.is_local_host(domain)
     }
 }
 
-impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<'_, A> {
+impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<A> {
     fn arena(&self) -> Result<Arena<A>, DeliveryError> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
     }
 
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
         Box::pin(async move {
-            match self.session {
+            match &self.session {
                 Some(session) => session.tag(tag).await.map_err(|_| DeliveryError),
                 None => Err(DeliveryError),
             }

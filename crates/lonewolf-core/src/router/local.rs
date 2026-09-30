@@ -564,19 +564,64 @@ impl<A: ChunkAllocator> Registration<A> {
 
     /// Marks this bound resource as a recipient of deliveries addressed to `tag`.
     pub async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
-        let (reply, result) = oneshot::channel();
-        self.shard
-            .send(Command::Tag {
-                account: self.account.clone(),
-                resource: self.resource.clone(),
-                token: self.token,
-                tag,
-                reply,
-            })
-            .await
-            .map_err(|_| RouterError::Stopped)?;
-        result.await.map_err(|_| RouterError::Stopped)?
+        tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await
     }
+
+    pub(crate) fn handle(&self) -> SessionHandle<A> {
+        SessionHandle {
+            account: self.account.clone(),
+            resource: self.resource.clone(),
+            token: self.token,
+            shard: self.shard.clone(),
+        }
+    }
+}
+
+/// Names a bound resource for work that outlives the stream's hold on its registration.
+pub(crate) struct SessionHandle<A: ChunkAllocator> {
+    account: AccountKey,
+    resource: Box<str>,
+    token: u64,
+    shard: Sender<Command<A>>,
+}
+
+impl<A: ChunkAllocator> Clone for SessionHandle<A> {
+    fn clone(&self) -> Self {
+        Self {
+            account: self.account.clone(),
+            resource: self.resource.clone(),
+            token: self.token,
+            shard: self.shard.clone(),
+        }
+    }
+}
+
+impl<A: ChunkAllocator> SessionHandle<A> {
+    /// Marks the resource as a recipient of deliveries addressed to `tag`.
+    pub(crate) async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
+        tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await
+    }
+}
+
+async fn tag_resource<A: ChunkAllocator>(
+    shard: &Sender<Command<A>>,
+    account: &AccountKey,
+    resource: &str,
+    token: u64,
+    tag: SessionTag,
+) -> Result<(), RouterError> {
+    let (reply, result) = oneshot::channel();
+    shard
+        .send(Command::Tag {
+            account: account.clone(),
+            resource: resource.into(),
+            token,
+            tag,
+            reply,
+        })
+        .await
+        .map_err(|_| RouterError::Stopped)?;
+    result.await.map_err(|_| RouterError::Stopped)?
 }
 
 impl<A: ChunkAllocator> Drop for Registration<A> {

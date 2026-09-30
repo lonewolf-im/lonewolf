@@ -3,9 +3,6 @@
 mod state;
 
 use std::cell::{Cell, RefCell};
-use std::future::Future;
-use std::pin::{Pin, pin};
-use std::task::{Context, Poll, Waker};
 
 use futures_executor::block_on;
 use lonewolf_auth::scram::{
@@ -24,17 +21,24 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::{NAMESPACE, Roster};
-use crate::Extension;
 use crate::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
 };
-use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType};
+use crate::iq::{IqHandler, IqReply, IqRequest, IqRequestType};
 use crate::presence::{
-    PresenceHandler, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
-    ReceiveFuture,
+    PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceTransition,
+    PresenceUpdate,
 };
+use crate::{Effects, Extension};
 
-type TestRoster = Roster<RedbStorage>;
+type TestIqHandler = dyn IqHandler<GlobalChunkAllocator, RedbStorage>;
+type TestPresenceHandler = dyn PresenceHandler<GlobalChunkAllocator, RedbStorage>;
+type TestExtension = dyn Extension<GlobalChunkAllocator, RedbStorage>;
+
+/// The storage the roster extension acts on in a test.
+struct TestRoster {
+    storage: RedbStorage,
+}
 
 #[derive(Default)]
 struct RecordingDelivery {
@@ -116,7 +120,7 @@ fn roster() -> (tempfile::TempDir, TestRoster) {
     let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
     let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))
         .unwrap_or_else(|error| panic!("{error}"));
-    (directory, Roster::new(storage))
+    (directory, TestRoster { storage })
 }
 
 fn snapshot(roster: &TestRoster, owner: &AccountKey) -> RosterSnapshot {
@@ -154,15 +158,6 @@ fn subscribed(jid: RosterJid, state: SubscriptionState) -> RosterItem {
             approved: false,
         },
     }
-}
-
-fn delete_account(roster: &TestRoster, key: &AccountKey) {
-    block_on(async {
-        let mut transaction = roster.storage.begin_write().await?;
-        transaction.delete_account(key).await?;
-        transaction.commit().await.map_err(Into::into)
-    })
-    .unwrap_or_else(|error: lonewolf_storage::account::AccountError| panic!("{error}"))
 }
 
 /// A roster IQ from alice's desk whose borrowed arenas outlive the handler future.
@@ -203,12 +198,12 @@ impl IqCall {
         }
     }
 
-    fn handle<'a>(
-        &'a mut self,
-        roster: &'a TestRoster,
+    async fn handle(
+        &mut self,
+        roster: &TestRoster,
         kind: IqRequestType,
-        delivery: &'a RecordingDelivery,
-    ) -> IqFuture<'a> {
+        delivery: &RecordingDelivery,
+    ) -> Result<IqReply<GlobalChunkAllocator>, HandlerError> {
         let sender = self
             .sender
             .resolve(&self.request)
@@ -217,17 +212,41 @@ impl IqCall {
             .query
             .resolve(&self.request)
             .unwrap_or_else(|error| panic!("{error}"));
-        IqHandler::<GlobalChunkAllocator>::handle(
-            roster,
-            IqRequest {
-                sender,
-                target: sender.bare(),
-                kind,
-                payload,
-            },
-            &mut self.response,
-            delivery,
-        )
+        let request = IqRequest {
+            sender,
+            target: sender.bare(),
+            payload,
+        };
+        match kind {
+            IqRequestType::Get => {
+                let transaction = roster
+                    .storage
+                    .begin_read()
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                TestIqHandler::get(&Roster, request, &transaction, &mut self.response).await
+            }
+            IqRequestType::Set => {
+                let mut transaction = roster
+                    .storage
+                    .begin_write()
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                let reply = TestIqHandler::set(
+                    &Roster,
+                    request,
+                    &mut transaction,
+                    delivery,
+                    &mut self.response,
+                )
+                .await?;
+                transaction
+                    .commit()
+                    .await
+                    .unwrap_or_else(|error| panic!("{error}"));
+                Ok(reply)
+            }
+        }
     }
 }
 
@@ -236,9 +255,12 @@ fn handle_iq(
     kind: IqRequestType,
     item_jid: &str,
     delivery: &RecordingDelivery,
-) -> Result<(), HandlerError> {
+) -> Result<Vec<AccountKey>, HandlerError> {
     let mut call = IqCall::new(item_jid);
-    block_on(call.handle(roster, kind, delivery)).map(|_| ())
+    let reply = block_on(call.handle(roster, kind, delivery))?;
+    let Effects { accounts, deliver } = reply.effects;
+    block_on(deliver(delivery)).unwrap_or_else(|error| panic!("{error}"));
+    Ok(accounts)
 }
 
 /// A subscription request as the target host receives it, with bare addresses.
@@ -266,11 +288,11 @@ impl SubscribeCall {
         }
     }
 
-    fn receive<'a>(
-        &'a self,
-        roster: &'a TestRoster,
-        delivery: &'a RecordingDelivery,
-    ) -> ReceiveFuture<'a> {
+    async fn receive(
+        &self,
+        roster: &TestRoster,
+        delivery: &RecordingDelivery,
+    ) -> Result<Effects<GlobalChunkAllocator>, HandlerError> {
         let view = self
             .stanza
             .resolve()
@@ -283,16 +305,28 @@ impl SubscribeCall {
             .to()
             .unwrap_or_else(|error| panic!("{error}"))
             .unwrap_or_else(|| panic!("missing target"));
-        PresenceHandler::<GlobalChunkAllocator>::receive(
-            roster,
+        let mut transaction = roster
+            .storage
+            .begin_write()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let effects = TestPresenceHandler::receive(
+            &Roster,
             PresenceRequest {
                 kind: PresenceRequestType::Subscribe,
                 sender,
                 target,
                 stanza: &self.stanza,
             },
+            &mut transaction,
             delivery,
         )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        Ok(effects)
     }
 }
 
@@ -301,9 +335,37 @@ fn receive_subscribe(
     sender: &str,
     target: &str,
     delivery: &RecordingDelivery,
-) -> Result<(), HandlerError> {
+) -> Result<Vec<AccountKey>, HandlerError> {
     let call = SubscribeCall::new(sender, target);
-    block_on(call.receive(roster, delivery))
+    let Effects { accounts, deliver } = block_on(call.receive(roster, delivery))?;
+    block_on(deliver(delivery)).unwrap_or_else(|error| panic!("{error}"));
+    Ok(accounts)
+}
+
+fn audience(roster: &TestRoster, sender: &str, transition: PresenceTransition) -> PresenceAudience {
+    let mut arena =
+        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+    let sender = Jid::parse_in(sender, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+    let sender = sender
+        .resolve(&arena)
+        .unwrap_or_else(|error| panic!("{error}"));
+    block_on(async {
+        let transaction = roster
+            .storage
+            .begin_read()
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        TestPresenceHandler::audience(&Roster, PresenceUpdate { sender, transition }, &transaction)
+            .await
+    })
+    .unwrap_or_else(|error| panic!("{error:?}"))
+    .unwrap_or_else(|| panic!("expected an audience"))
+}
+
+fn names(accounts: &[AccountKey]) -> Vec<&str> {
+    let mut names: Vec<&str> = accounts.iter().map(AccountKey::as_str).collect();
+    names.sort_unstable();
+    names
 }
 
 fn account(jid: &str) -> AccountKey {
@@ -317,16 +379,13 @@ fn account(jid: &str) -> AccountKey {
     .unwrap_or_else(|error| panic!("{error}"))
 }
 
-fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    future.poll(&mut Context::from_waker(Waker::noop()))
-}
-
 #[test]
 fn roster_retrieval_tags_the_requesting_session_as_interested() {
     let (_directory, roster) = roster();
     let delivery = RecordingDelivery::default();
-    handle_iq(&roster, IqRequestType::Get, "", &delivery)
+    let accounts = handle_iq(&roster, IqRequestType::Get, "", &delivery)
         .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(names(&accounts), ["alice@example.com"]);
     assert_eq!(*delivery.tags.borrow(), [SessionTag::Interested]);
     assert!(delivery.pushes.borrow().is_empty());
 }
@@ -346,8 +405,9 @@ fn roster_update_pushes_the_item_to_interested_resources() {
     .unwrap_or_else(|error| panic!("{error}"));
     create_account(&roster, &alice);
     let delivery = RecordingDelivery::default();
-    handle_iq(&roster, IqRequestType::Set, "bob@example.com", &delivery)
+    let accounts = handle_iq(&roster, IqRequestType::Set, "bob@example.com", &delivery)
         .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(names(&accounts), ["alice@example.com"]);
     assert!(delivery.tags.borrow().is_empty());
     let pushes = delivery.pushes.borrow();
     assert_eq!(pushes.len(), 1, "{pushes:?}");
@@ -409,87 +469,21 @@ fn subscription_request_from_a_deleted_account_is_forbidden() {
 }
 
 #[test]
-fn roster_set_checks_the_account_after_acquiring_its_order() {
-    let (_directory, roster) = roster();
-    let alice = account("alice@example.com");
-    create_account(&roster, &alice);
-    let delivery = RecordingDelivery::default();
-    let mut call = IqCall::new("bob@example.com");
-    let order = block_on(roster.order.lock(&alice));
-    let mut set = pin!(call.handle(&roster, IqRequestType::Set, &delivery));
-    assert!(poll_once(set.as_mut()).is_pending());
-    delete_account(&roster, &alice);
-    drop(order);
-    let result = block_on(set);
-    assert!(
-        matches!(
-            result,
-            Err(HandlerError::Stanza(StanzaErrorCondition::Forbidden))
-        ),
-        "{result:?}"
-    );
-    assert!(delivery.pushes.borrow().is_empty());
-    let alice_roster = snapshot(&roster, &alice);
-    assert!(alice_roster.items.is_empty());
-}
-
-#[test]
-fn subscription_request_checks_the_contact_after_acquiring_the_order() {
+fn subscription_request_effects_name_both_local_parties() {
     let (_directory, roster) = roster();
     let alice = account("alice@example.com");
     let bob = account("bob@example.com");
     create_account(&roster, &alice);
     create_account(&roster, &bob);
     let delivery = RecordingDelivery::default();
-    let call = SubscribeCall::new("bob@example.com", "alice@example.com");
-    let order = block_on(roster.order.lock(&alice));
-    let mut request = pin!(call.receive(&roster, &delivery));
-    assert!(poll_once(request.as_mut()).is_pending());
-    delete_account(&roster, &alice);
-    drop(order);
-    let result = block_on(request);
-    assert!(
-        matches!(
-            result,
-            Err(HandlerError::Stanza(
-                StanzaErrorCondition::ServiceUnavailable
-            ))
-        ),
-        "{result:?}"
-    );
-    let pending = pending(&roster, &alice);
-    assert!(pending.is_empty());
-    let bob_roster = snapshot(&roster, &bob);
-    assert!(bob_roster.items.is_empty());
-    assert!(delivery.pushes.borrow().is_empty());
-}
-
-#[test]
-fn availability_audience_holds_the_owner_order_until_dropped() {
-    let (_directory, roster) = roster();
-    let mut arena =
-        Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
-    let sender = Jid::parse_in("bob@example.com/phone", &mut arena)
-        .unwrap_or_else(|error| panic!("{error}"));
-    let sender = sender
-        .resolve(&arena)
-        .unwrap_or_else(|error| panic!("{error}"));
-    let owner = AccountKey::try_from(sender.bare()).unwrap_or_else(|error| panic!("{error}"));
-    let audience = block_on(PresenceHandler::<GlobalChunkAllocator>::audience(
-        &roster,
-        PresenceUpdate {
-            sender,
-            transition: PresenceTransition::Initial,
-        },
-    ))
-    .unwrap_or_else(|error| panic!("{error:?}"))
-    .unwrap_or_else(|| panic!("expected an audience"));
-    assert!(audience.pending.is_empty());
-    assert!(audience.subscribers.is_empty());
-    assert!(audience.contacts.is_empty());
-    assert!(roster.order.is_locked(&owner));
-    drop(audience);
-    assert!(!roster.order.is_locked(&owner));
+    let accounts = receive_subscribe(&roster, "bob@example.com", "alice@example.com", &delivery)
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(names(&accounts), ["alice@example.com", "bob@example.com"]);
+    let requests = pending(&roster, &alice);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let bob_item =
+        item(&roster, &bob, &RosterJid::from(&alice)).unwrap_or_else(|| panic!("missing item"));
+    assert!(bob_item.subscription.pending_out);
 }
 
 #[test]
@@ -534,15 +528,7 @@ fn only_the_initial_transition_collects_granted_contacts() {
         (PresenceTransition::Update, Vec::new()),
         (PresenceTransition::Unavailable, Vec::new()),
     ] {
-        let audience = block_on(PresenceHandler::<GlobalChunkAllocator>::audience(
-            &roster,
-            PresenceUpdate {
-                sender: alice,
-                transition,
-            },
-        ))
-        .unwrap_or_else(|error| panic!("{error:?}"))
-        .unwrap_or_else(|| panic!("expected an audience"));
+        let audience = audience(&roster, "alice@example.com/desk", transition);
         assert_eq!(audience.contacts, expected, "{transition:?}");
         assert!(audience.subscribers.is_empty(), "{transition:?}");
     }
@@ -625,29 +611,22 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
         ..RecordingDelivery::default()
     };
 
-    let hold =
-        block_on(Extension::<GlobalChunkAllocator, RedbStorage>::hold_for_deletion(&roster, alice));
-    let aftermath = block_on(async {
+    let effects = block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
         transaction.delete_account(alice).await?;
-        let aftermath = Extension::<GlobalChunkAllocator, RedbStorage>::forget_account(
-            &roster,
-            &mut transaction,
-            alice,
-            &delivery,
-        )
-        .await
-        .map_err(|error| format!("{error:?}"))?;
+        let effects = TestExtension::forget_account(&Roster, &mut transaction, alice, &delivery)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
         transaction.commit().await?;
-        Ok::<_, Box<dyn std::error::Error>>(aftermath)
+        Ok::<_, Box<dyn std::error::Error>>(effects)
     })
     .unwrap_or_else(|error| panic!("{error}"));
-    let result = block_on(aftermath(&delivery));
-    drop(hold);
-    assert!(
-        matches!(result, Err(HandlerError::Delivery(_))),
-        "{result:?}"
+    assert_eq!(
+        names(&effects.accounts),
+        ["alice@example.com", "bob@example.com", "carol@example.com"]
     );
+    let result = block_on((effects.deliver)(&delivery));
+    assert!(result.is_err(), "{result:?}");
 
     let alice_roster = snapshot(&roster, alice);
     assert!(alice_roster.items.is_empty());

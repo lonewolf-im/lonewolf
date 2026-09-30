@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use lonewolf_extension::delivery::Delivery;
+use lonewolf_extension::delivery::{HandlerError, HostLookup, SessionTag};
 use lonewolf_extension::iq::{
-    IqFuture, IqHandler, IqRequest, IqRequestType, IqResult, IqRoute, IqScope,
+    IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
 use lonewolf_extension::presence::{
     PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
 };
-use lonewolf_extension::{Extension, Extensions};
-use lonewolf_storage::RedbStorage;
+use lonewolf_extension::{Effects, Extension, Extensions};
+use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
-use lonewolf_xmpp::stanza::{Element, PresenceType, StanzaErrorCondition, StanzaType};
+use lonewolf_xmpp::stanza::{
+    Element, IqType, PresenceType, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaType,
+};
 
 use super::TestResult;
 
@@ -31,6 +35,15 @@ const ACCOUNT_SET: IqRoute = IqRoute {
     kind: IqRequestType::Set,
     namespace: NAMESPACE,
     name: "query",
+};
+
+/// A set whose effects push a marker to the account's interested resources and then hold
+/// the account's delivery order for `millis`.
+const ACCOUNT_SLOW: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: NAMESPACE,
+    name: "slow",
 };
 
 const SERVER_GET: IqRoute = IqRoute {
@@ -87,18 +100,18 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for ConflictingIq {
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for ConflictingIq {
-    fn handle<'a>(
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingIq {
+    fn get<'a>(
         &'a self,
         _: IqRequest<'a, A>,
+        _: &'a RedbRead,
         _: &'a mut Arena<A>,
-        _: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a> {
-        Box::pin(async { Ok(None) })
+    ) -> IqFuture<'a, A> {
+        Box::pin(async { Ok(IqReply::new(None, Effects::none())) })
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A> for ConflictingIq {}
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ConflictingIq {}
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
     fn name(&self) -> &'static str {
@@ -106,27 +119,70 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
     }
 
     fn iq_routes(&self) -> &'static [IqRoute] {
-        &[ACCOUNT_GET, ACCOUNT_SET]
+        &[ACCOUNT_GET, ACCOUNT_SET, ACCOUNT_SLOW]
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for TestIq {
-    fn handle<'a>(
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
+    fn get<'a>(
         &'a self,
         request: IqRequest<'a, A>,
+        _: &'a RedbRead,
         response: &'a mut Arena<A>,
-        _: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a> {
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move { identity(&request, response).await })
+    }
+
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn HostLookup,
+        _: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
         Box::pin(async move {
-            match request.kind {
-                IqRequestType::Get => identity(&request, response).await,
-                IqRequestType::Set => Ok(None),
+            if request.payload.name() != ACCOUNT_SLOW.name {
+                return Ok(IqReply::new(None, Effects::none()));
             }
+            let millis = request
+                .payload
+                .attribute("millis", "")
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                .and_then(|value| value.parse().ok())
+                .ok_or(StanzaErrorCondition::BadRequest)?;
+            let account = AccountKey::try_from(request.target.bare())
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            let effects = Effects::new(vec![account.clone()], move |delivery| {
+                Box::pin(async move {
+                    delivery
+                        .push_to_tagged(
+                            &account,
+                            SessionTag::Interested,
+                            Box::new(|to, arena| {
+                                let marker =
+                                    Element::builder_in("slow", NAMESPACE, arena)?.build()?;
+                                Ok(Stanza::builder_in(
+                                    StanzaType::Iq(IqType::Set),
+                                    StanzaNamespace::Client,
+                                    arena,
+                                )
+                                .id(Some("slow"))?
+                                .to(Some(to))?
+                                .child(marker)?
+                                .build()?)
+                            }),
+                        )
+                        .await?;
+                    compio::time::sleep(Duration::from_millis(millis)).await;
+                    Ok(())
+                })
+            });
+            Ok(IqReply::new(None, effects))
         })
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A> for TestIq {}
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for TestIq {}
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for ServerIq {
     fn name(&self) -> &'static str {
@@ -138,18 +194,18 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for ServerIq {
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for ServerIq {
-    fn handle<'a>(
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ServerIq {
+    fn get<'a>(
         &'a self,
         request: IqRequest<'a, A>,
+        _: &'a RedbRead,
         response: &'a mut Arena<A>,
-        _: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a> {
+    ) -> IqFuture<'a, A> {
         Box::pin(async move { identity(&request, response).await })
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A> for ServerIq {}
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ServerIq {}
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for ErrorIq {
     fn name(&self) -> &'static str {
@@ -161,18 +217,19 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for ErrorIq {
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for ErrorIq {
-    fn handle<'a>(
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ErrorIq {
+    fn set<'a>(
         &'a self,
         _: IqRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn HostLookup,
         _: &'a mut Arena<A>,
-        _: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a> {
+    ) -> IqFuture<'a, A> {
         Box::pin(async { Err(StanzaErrorCondition::NotAllowed.into()) })
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A> for ErrorIq {}
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ErrorIq {}
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPresence {
     fn name(&self) -> &'static str {
@@ -184,9 +241,9 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPresence {
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for TestPresence {}
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestPresence {}
 
-impl<A: ChunkAllocator> PresenceHandler<A> for TestPresence {
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for TestPresence {
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
         Box::pin(async move { verify_authorization(&request).await })
     }
@@ -202,9 +259,9 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for ConflictingPresence {
     }
 }
 
-impl<A: ChunkAllocator> IqHandler<A> for ConflictingPresence {}
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingPresence {}
 
-impl<A: ChunkAllocator> PresenceHandler<A> for ConflictingPresence {
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ConflictingPresence {
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
         Box::pin(async move { verify_authorization(&request).await })
     }
@@ -213,7 +270,7 @@ impl<A: ChunkAllocator> PresenceHandler<A> for ConflictingPresence {
 async fn identity<A: ChunkAllocator>(
     request: &IqRequest<'_, A>,
     response: &mut Arena<A>,
-) -> IqResult {
+) -> Result<IqReply<A>, HandlerError> {
     compio::time::sleep(std::time::Duration::from_millis(1)).await;
     let value = request
         .payload
@@ -227,7 +284,7 @@ async fn identity<A: ChunkAllocator>(
             None => Ok(builder),
         })
         .and_then(|builder| builder.build())
-        .map(Some)
+        .map(|payload| IqReply::new(Some(payload), Effects::none()))
         .map_err(|_| StanzaErrorCondition::InternalServerError.into())
 }
 

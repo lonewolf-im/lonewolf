@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::io::{ErrorKind, Read};
 use std::net::TcpStream;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -11,6 +13,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use socket2::SockRef;
 
 use super::xml::{Element, XmlStream};
 use super::{BIND_NAMESPACE, C2sSuite, SASL_NAMESPACE, TIMEOUT, TLS_NAMESPACE, TestResult};
@@ -126,6 +129,33 @@ impl Client {
 }
 
 impl Client {
+    /// Closes the connection with a reset, so the server's next write to it fails.
+    pub fn reset(self) -> TestResult {
+        let stream = self.into_inner().into_inner();
+        SockRef::from(&stream.sock).set_linger(Some(Duration::ZERO))?;
+        Ok(())
+    }
+
+    /// Reads and discards everything the server still sends until it closes the connection.
+    pub fn drain(&mut self) -> TestResult {
+        let mut sink = [0; 4096];
+        loop {
+            match self.transport().read(&mut sink) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     pub fn scram(
         &mut self,
         username: &str,

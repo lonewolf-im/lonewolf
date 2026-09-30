@@ -255,6 +255,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                     &hosts,
                     &account,
                     &router,
+                    auth.storage.clone(),
                     settings.max_resources_per_account,
                     settings.allocator.clone(),
                 ),

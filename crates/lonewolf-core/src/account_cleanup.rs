@@ -68,7 +68,8 @@ pub(crate) async fn run<A: ChunkAllocator + Clone>(
 }
 
 /// Removes the account's record and every extension's state for it in one transaction,
-/// then delivers what the extensions returned and ends the account's sessions.
+/// then delivers what the extensions returned, in order with every other delivery to
+/// the accounts they named, and ends the account's sessions.
 ///
 /// Only the transaction can fail the deletion. Once it committed the account is gone,
 /// so a failed notification or session termination is logged and the deletion still
@@ -80,24 +81,17 @@ async fn delete<A: ChunkAllocator + Clone>(
     allocator: &A,
 ) -> Result<bool, DeleterError> {
     let extensions = router.extensions(account.domain());
-    let mut holds = Vec::with_capacity(extensions.len());
-    for extension in extensions {
-        holds.push(extension.hold_for_deletion(account).await);
-    }
-    let delivery = RouterDelivery {
-        router,
-        allocator,
-        session: None,
-    };
+    let delivery = RouterDelivery::new(router, allocator, None);
     let mut transaction = storage.begin_write().await?;
     let existed = match transaction.delete_account(account).await {
         Ok(()) => true,
         Err(AccountError::NotFound) => false,
         Err(error) => return Err(error.into()),
     };
-    let mut aftermaths = Vec::with_capacity(extensions.len());
+    let mut accounts = vec![account.clone()];
+    let mut deliveries = Vec::with_capacity(extensions.len());
     for extension in extensions {
-        let aftermath = extension
+        let effects = extension
             .forget_account(&mut transaction, account, &delivery)
             .await
             .map_err(|error| {
@@ -108,11 +102,13 @@ async fn delete<A: ChunkAllocator + Clone>(
                 );
                 deleter_error("an extension could not forget the account")
             })?;
-        aftermaths.push((extension.name(), aftermath));
+        accounts.extend(effects.accounts);
+        deliveries.push((extension.name(), effects.deliver));
     }
-    transaction.commit().await?;
-    for (extension, aftermath) in aftermaths {
-        if let Err(error) = aftermath(&delivery).await {
+    let ((), mut ticket) = router.order().fix(accounts, transaction.commit()).await?;
+    ticket.turn().await;
+    for (extension, deliver) in deliveries {
+        if let Err(error) = deliver(&delivery).await {
             tracing::error!(
                 extension,
                 error = ?error,
@@ -124,7 +120,7 @@ async fn delete<A: ChunkAllocator + Clone>(
     if let Err(error) = router.retire_account(account).await {
         tracing::error!(error = ?error, "account session termination failed");
     }
-    drop(holds);
+    drop(ticket);
     Ok(existed)
 }
 

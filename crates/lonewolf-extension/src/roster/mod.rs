@@ -4,23 +4,22 @@ mod state;
 mod subscription;
 mod xml;
 
+use lonewolf_storage::Storage;
 use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::roster::{
     RosterError, RosterItem, RosterJid, RosterMutation, RosterReads, RosterSnapshot,
     RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
 };
-use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
 use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
-use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType, IqRoute, IqScope};
-use crate::order::{OrderGuard, Sequencer};
+use crate::iq::{IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope};
 use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate, ReceiveFuture,
 };
-use crate::{Aftermath, Extension, ExtensionFuture};
+use crate::{Effects, Extension, ExtensionFuture};
 use subscription::Parties;
 
 pub const NAME: &str = "roster";
@@ -41,25 +40,16 @@ const IQ_ROUTES: [IqRoute; 2] = [
     },
 ];
 
-pub struct Roster<S> {
-    storage: S,
-    order: Sequencer,
-}
+/// The RFC 6121 roster and subscription extension.
+///
+/// It keeps no state of its own: every request works on the transaction the server
+/// hands it and returns the deliveries that follow as effects.
+#[derive(Default)]
+pub struct Roster;
 
-impl<S: Storage> Roster<S> {
-    pub fn new(storage: S) -> Self {
-        Self {
-            storage,
-            order: Sequencer::new(),
-        }
-    }
-
-    async fn begin_read(&self) -> Result<S::Read, RosterError> {
-        self.storage.begin_read().await.map_err(RosterError::from)
-    }
-
-    async fn begin_write(&self) -> Result<S::Write, RosterError> {
-        self.storage.begin_write().await.map_err(RosterError::from)
+impl Roster {
+    pub const fn new() -> Self {
+        Self
     }
 }
 
@@ -75,8 +65,7 @@ async fn account_exists(
 }
 
 /// Refuses a mutation for an account whose record is gone, so a session that outlives
-/// its account cannot repopulate roster state. Read it through the transaction the
-/// writes run in, under the account's order.
+/// its account cannot repopulate roster state.
 async fn require_account(
     transaction: &impl AccountReads,
     account: &AccountKey,
@@ -86,6 +75,17 @@ async fn require_account(
     } else {
         Err(StanzaErrorCondition::Forbidden)
     }
+}
+
+/// The account a roster IQ addresses, which must be the sender's own.
+fn owner_of<A: ChunkAllocator>(
+    request: &IqRequest<'_, A>,
+) -> Result<AccountKey, StanzaErrorCondition> {
+    if request.target != request.sender.bare() {
+        return Err(StanzaErrorCondition::Forbidden);
+    }
+    AccountKey::try_from(request.sender.bare())
+        .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
 /// Keeps only the contacts whose own roster grants `owner` their presence, so a
@@ -117,7 +117,7 @@ async fn granting_contacts(
     Ok(contacts)
 }
 
-impl<A, S> Extension<A, S> for Roster<S>
+impl<A, S> Extension<A, S> for Roster
 where
     A: ChunkAllocator,
     S: Storage,
@@ -134,92 +134,84 @@ where
         &PresenceRequestType::ALL
     }
 
-    /// A deletion rewrites the rosters of every local contact, so it serializes with
-    /// every flow; deletions are rare enough for that to cost nothing noticeable.
-    fn hold_for_deletion<'a>(
-        &'a self,
-        _account: &'a AccountKey,
-    ) -> ExtensionFuture<'a, OrderGuard> {
-        Box::pin(self.order.lock_all())
-    }
-
     fn forget_account<'a>(
         &'a self,
         transaction: &'a mut S::Write,
         account: &'a AccountKey,
         hosts: &'a dyn HostLookup,
-    ) -> ExtensionFuture<'a, Result<Aftermath<A>, HandlerError>> {
+    ) -> ExtensionFuture<'a, Result<Effects<A>, HandlerError>> {
         Box::pin(subscription::forget_account(transaction, account, hosts))
     }
 }
 
-impl<A, S> IqHandler<A> for Roster<S>
+impl<A, S> IqHandler<A, S> for Roster
 where
     A: ChunkAllocator,
     S: Storage,
 {
-    fn handle<'a>(
+    fn get<'a>(
         &'a self,
         request: IqRequest<'a, A>,
+        transaction: &'a S::Read,
         response: &'a mut Arena<A>,
-        delivery: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a> {
+    ) -> IqFuture<'a, A> {
         Box::pin(async move {
-            if request.target != request.sender.bare() {
-                return Err(StanzaErrorCondition::Forbidden.into());
-            }
-            let owner = AccountKey::try_from(request.sender.bare())
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            match request.kind {
-                IqRequestType::Get => {
-                    xml::validate_get(request.payload)?;
-                    let _order = self.order.lock(&owner).await;
-                    let snapshot = self.begin_read().await?.roster(&owner).await?;
-                    let payload = xml::build_response(snapshot, response)?;
-                    delivery.tag_session(SessionTag::Interested).await?;
-                    Ok(Some(payload))
+            let owner = owner_of(&request)?;
+            xml::validate_get(request.payload)?;
+            let snapshot = transaction.roster(&owner).await?;
+            let payload = xml::build_response(snapshot, response)?;
+            let effects = Effects::new(vec![owner], |delivery| {
+                delivery.tag_session(SessionTag::Interested)
+            });
+            Ok(IqReply::new(Some(payload), effects))
+        })
+    }
+
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        transaction: &'a mut S::Write,
+        hosts: &'a dyn HostLookup,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let owner = owner_of(&request)?;
+            match xml::parse_set(request.payload, response)? {
+                xml::RosterSet::Update(update) => {
+                    require_account(transaction, &owner).await?;
+                    let subscription = transaction
+                        .roster_item(&owner, &update.jid)
+                        .await?
+                        .map_or_else(RosterSubscription::default, |item| item.subscription);
+                    let item = RosterItem {
+                        jid: update.jid,
+                        name: update.name,
+                        groups: update.groups,
+                        subscription,
+                    };
+                    let version = transaction.put_roster_item(&owner, &item).await?;
+                    let mutation = RosterMutation {
+                        version,
+                        value: item,
+                    };
+                    let effects = Effects::new(vec![owner.clone()], move |delivery| {
+                        Box::pin(async move { push_roster(&owner, mutation, delivery).await })
+                    });
+                    Ok(IqReply::new(None, effects))
                 }
-                IqRequestType::Set => match xml::parse_set(request.payload, response)? {
-                    xml::RosterSet::Update(update) => {
-                        let _order = self.order.lock(&owner).await;
-                        let mut transaction = self.begin_write().await?;
-                        require_account(&transaction, &owner).await?;
-                        let subscription = transaction
-                            .roster_item(&owner, &update.jid)
-                            .await?
-                            .map_or_else(RosterSubscription::default, |item| item.subscription);
-                        let item = RosterItem {
-                            jid: update.jid,
-                            name: update.name,
-                            groups: update.groups,
-                            subscription,
-                        };
-                        let version = transaction.put_roster_item(&owner, &item).await?;
-                        transaction.commit().await.map_err(RosterError::from)?;
-                        push_roster(
-                            &owner,
-                            RosterMutation {
-                                version,
-                                value: item,
-                            },
-                            delivery,
-                        )
-                        .await?;
-                        Ok(None)
-                    }
-                    xml::RosterSet::Remove(contact) => {
-                        let owner_jid = RosterJid::from(request.sender.bare());
-                        self.remove_item(owner, contact, owner_jid, delivery)
+                xml::RosterSet::Remove(contact) => {
+                    let owner_jid = RosterJid::from(request.sender.bare());
+                    let effects =
+                        subscription::remove_item(transaction, owner, contact, owner_jid, hosts)
                             .await?;
-                        Ok(None)
-                    }
-                },
+                    Ok(IqReply::new(None, effects))
+                }
             }
         })
     }
 }
 
-impl<A, S> PresenceHandler<A> for Roster<S>
+impl<A, S> PresenceHandler<A, S> for Roster
 where
     A: ChunkAllocator,
     S: Storage,
@@ -227,12 +219,11 @@ where
     fn audience<'a>(
         &'a self,
         update: PresenceUpdate<'a>,
+        transaction: &'a S::Read,
     ) -> PresenceFuture<'a, Option<PresenceAudience>> {
         Box::pin(async move {
             let owner = AccountKey::try_from(update.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            let order = self.order.lock(&owner).await;
-            let transaction = self.begin_read().await.map_err(roster_error)?;
             let snapshot = transaction.roster(&owner).await.map_err(roster_error)?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
             let (pending, contacts) = if update.transition == PresenceTransition::Initial {
@@ -241,44 +232,40 @@ where
                     .await
                     .map_err(roster_error)?;
                 let contacts =
-                    granting_contacts(&transaction, RosterJid::from(update.sender.bare()), watched)
+                    granting_contacts(transaction, RosterJid::from(update.sender.bare()), watched)
                         .await?;
                 (pending, contacts)
             } else {
                 (Vec::new(), Vec::new())
             };
-            Ok(Some(PresenceAudience::new(
-                Some(order),
+            Ok(Some(PresenceAudience {
                 subscribers,
                 pending,
                 contacts,
-            )))
+            }))
         })
     }
 
     fn receive<'a>(
         &'a self,
         request: PresenceRequest<'a, A>,
-        delivery: &'a dyn Delivery<A>,
-    ) -> ReceiveFuture<'a> {
+        transaction: &'a mut S::Write,
+        _hosts: &'a dyn HostLookup,
+    ) -> ReceiveFuture<'a, A> {
         Box::pin(async move {
             let parties = Parties::new(&request)?;
             match request.kind {
                 PresenceRequestType::Subscribe => {
-                    self.request_subscription(parties, request.stanza, delivery)
-                        .await
+                    subscription::request_subscription(transaction, parties, request.stanza).await
                 }
                 PresenceRequestType::Subscribed => {
-                    self.approve_subscription(parties, request.stanza, delivery)
-                        .await
+                    subscription::approve_subscription(transaction, parties, request.stanza).await
                 }
                 PresenceRequestType::Unsubscribed => {
-                    self.cancel_subscription(parties, request.stanza, delivery)
-                        .await
+                    subscription::cancel_subscription(transaction, parties, request.stanza).await
                 }
                 PresenceRequestType::Unsubscribe => {
-                    self.withdraw_subscription(parties, request.stanza, delivery)
-                        .await
+                    subscription::withdraw_subscription(transaction, parties, request.stanza).await
                 }
                 PresenceRequestType::Available | PresenceRequestType::Unavailable => {
                     Err(StanzaErrorCondition::ServiceUnavailable.into())

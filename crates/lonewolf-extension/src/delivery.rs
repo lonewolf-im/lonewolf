@@ -78,24 +78,16 @@ impl From<WriteError> for DeliveryError {
     }
 }
 
-/// A handler failure and how the server reports it.
+/// A handler failure while its transaction is open, answered to the client as a stanza
+/// error; the transaction aborts.
 #[derive(Debug)]
 pub enum HandlerError {
-    /// Answered to the client as a stanza error.
     Stanza(StanzaErrorCondition),
-    /// Closes the client stream.
-    Delivery(DeliveryError),
 }
 
 impl From<StanzaErrorCondition> for HandlerError {
     fn from(condition: StanzaErrorCondition) -> Self {
         Self::Stanza(condition)
-    }
-}
-
-impl From<DeliveryError> for HandlerError {
-    fn from(error: DeliveryError) -> Self {
-        Self::Delivery(error)
     }
 }
 
@@ -105,14 +97,14 @@ pub type DeliveryFuture<'a> = ExtensionFuture<'a, Result<(), DeliveryError>>;
 pub type StanzaFactory<A> =
     Box<dyn FnMut(Jid, &mut Arena<A>) -> Result<Stanza, DeliveryError> + Send>;
 
-/// Routing and session operations the server performs on behalf of a handler.
-/// Every method runs on the connection worker of the request being handled.
 /// Answers which domains this server hosts.
 pub trait HostLookup {
     /// Whether this server hosts `domain`, so its accounts can be reached locally.
     fn is_local_host(&self, domain: &str) -> bool;
 }
 
+/// Routing and session operations the server performs for a handler's effects.
+/// Every method runs on the connection worker of the request being handled.
 pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// Allocates an arena for stanzas the handler builds.
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;

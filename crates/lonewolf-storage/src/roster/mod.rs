@@ -59,7 +59,10 @@ impl fmt::Debug for RosterItem {
 #[derive(Debug, Eq, PartialEq)]
 pub struct RosterSnapshot {
     pub version: RosterVersion,
-    pub items: Vec<RosterItem>,
+    /// The version that last removed an item, or zero when none was ever removed.
+    pub last_removal: RosterVersion,
+    /// Items in contact order, each with the version that last changed it.
+    pub items: Vec<RosterMutation<RosterItem>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -92,7 +95,8 @@ pub enum RosterError {
 
 /// Roster reads available on any transaction.
 pub trait RosterReads {
-    /// Reads one consistent roster version and item set.
+    /// Reads the roster version, the last removal version, and every item with the
+    /// version that last changed it, all from one consistent view.
     fn roster(
         &self,
         owner: &AccountKey,
@@ -119,16 +123,18 @@ pub trait RosterReads {
 
 /// Roster writes, each taking effect when the transaction commits.
 pub trait RosterWrites {
-    /// Stores the item as given, replacing any item for the same JID, and advances the
-    /// owner's roster version. Fails with [`RosterError::NoAccount`] when the owner has
-    /// no account record, so nothing can be written for a deleted account.
+    /// Stores the item as given, replacing any item for the same JID, advances the
+    /// owner's roster version, and records that version as the item's. Fails with
+    /// [`RosterError::NoAccount`] when the owner has no account record, so nothing can
+    /// be written for a deleted account.
     fn put_roster_item(
         &mut self,
         owner: &AccountKey,
         item: &RosterItem,
     ) -> impl Future<Output = Result<RosterVersion, RosterError>> + Send;
 
-    /// Removes an item and returns `None` without advancing the version if absent.
+    /// Removes an item, advances the version, and records it as the last removal.
+    /// Returns `None` without any change when the item is absent.
     fn remove_roster_item(
         &mut self,
         owner: &AccountKey,

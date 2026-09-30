@@ -11,7 +11,7 @@ use lonewolf_auth::scram::{
 use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
 use lonewolf_storage::roster::{
     PendingSubscription, RosterError, RosterItem, RosterJid, RosterReads, RosterSnapshot,
-    RosterSubscription, RosterWrites, SubscriptionState,
+    RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
 };
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
@@ -81,25 +81,21 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         Box::pin(async { Ok(()) })
     }
 
+    fn push_to_session<'a>(
+        &'a self,
+        build: StanzaFactory<GlobalChunkAllocator>,
+    ) -> DeliveryFuture<'a> {
+        self.record_push("alice@example.com/desk", build);
+        Box::pin(async { Ok(()) })
+    }
+
     fn push_to_tagged<'a>(
         &'a self,
         account: &'a AccountKey,
         _: SessionTag,
-        mut build: StanzaFactory<GlobalChunkAllocator>,
+        build: StanzaFactory<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
-        let full_jid = format!("{}/desk", account.as_str());
-        let mut arena =
-            Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
-        let to = Jid::parse_in(&full_jid, &mut arena).unwrap_or_else(|error| panic!("{error}"));
-        let push = build(to, &mut arena).unwrap_or_else(|error| panic!("{error}"));
-        let mut xml = String::new();
-        push.resolve(&arena)
-            .and_then(|push| {
-                push.write_xml(&mut xml)
-                    .map_err(|_| panic!("cannot write push"))
-            })
-            .unwrap_or_else(|error| panic!("{error}"));
-        self.pushes.borrow_mut().push(xml);
+        self.record_push(&format!("{}/desk", account.as_str()), build);
         Box::pin(async { Ok(()) })
     }
 
@@ -113,6 +109,23 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         _: &'a AccountKey,
     ) -> DeliveryFuture<'a> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+impl RecordingDelivery {
+    fn record_push(&self, to: &str, mut build: StanzaFactory<GlobalChunkAllocator>) {
+        let mut arena =
+            Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
+        let to = Jid::parse_in(to, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+        let push = build(to, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+        let mut xml = String::new();
+        push.resolve(&arena)
+            .and_then(|push| {
+                push.write_xml(&mut xml)
+                    .map_err(|_| panic!("cannot write push"))
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
+        self.pushes.borrow_mut().push(xml);
     }
 }
 
@@ -170,6 +183,14 @@ struct IqCall {
 
 impl IqCall {
     fn new(item_jid: &str) -> Self {
+        Self::build(item_jid, None)
+    }
+
+    fn versioned(ver: &str) -> Self {
+        Self::build("", Some(ver))
+    }
+
+    fn build(item_jid: &str, ver: Option<&str>) -> Self {
         let mut request =
             Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
         let response =
@@ -184,6 +205,11 @@ impl IqCall {
         });
         let mut query = Element::builder_in("query", NAMESPACE, &mut request)
             .unwrap_or_else(|error| panic!("{error:?}"));
+        if let Some(ver) = ver {
+            query = query
+                .attribute("ver", "", ver)
+                .unwrap_or_else(|error| panic!("{error:?}"));
+        }
         if let Some(item) = item {
             query = query
                 .child(item)
@@ -261,6 +287,55 @@ fn handle_iq(
     let Effects { accounts, deliver } = reply.effects;
     block_on(deliver(delivery)).unwrap_or_else(|error| panic!("{error}"));
     Ok(accounts)
+}
+
+/// Answers a roster get from alice's desk and returns the result payload as XML, after
+/// running its effects against `delivery`.
+fn roster_get(
+    roster: &TestRoster,
+    ver: Option<&str>,
+    delivery: &RecordingDelivery,
+) -> Option<String> {
+    let mut call = ver.map_or_else(|| IqCall::new(""), IqCall::versioned);
+    let reply = block_on(call.handle(roster, IqRequestType::Get, delivery))
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    block_on((reply.effects.deliver)(delivery)).unwrap_or_else(|error| panic!("{error}"));
+    reply.payload.map(|payload| {
+        let mut xml = String::new();
+        payload
+            .resolve(&call.response)
+            .and_then(|payload| {
+                payload
+                    .write_xml(&mut xml)
+                    .map_err(|_| panic!("cannot write payload"))
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
+        xml
+    })
+}
+
+fn put_item(roster: &TestRoster, owner: &AccountKey, jid: &str) -> RosterVersion {
+    let item = subscribed(RosterJid::from(&account(jid)), SubscriptionState::None);
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        let version = transaction.put_roster_item(owner, &item).await?;
+        transaction.commit().await?;
+        Ok::<_, RosterError>(version)
+    })
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn remove_item(roster: &TestRoster, owner: &AccountKey, jid: &str) -> RosterVersion {
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        let removed = transaction
+            .remove_roster_item(owner, &RosterJid::from(&account(jid)))
+            .await?
+            .unwrap_or_else(|| panic!("missing item"));
+        transaction.commit().await?;
+        Ok::<_, RosterError>(removed.version)
+    })
+    .unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// A subscription request as the target host receives it, with bare addresses.
@@ -387,6 +462,89 @@ fn roster_retrieval_tags_the_requesting_session_as_interested() {
         .unwrap_or_else(|error| panic!("{error:?}"));
     assert_eq!(names(&accounts), ["alice@example.com"]);
     assert_eq!(*delivery.tags.borrow(), [SessionTag::Interested]);
+    assert!(delivery.pushes.borrow().is_empty());
+}
+
+#[test]
+fn roster_get_without_a_version_returns_the_roster_unstamped() {
+    let (_directory, roster) = roster();
+    let alice = account("alice@example.com");
+    create_account(&roster, &alice);
+    put_item(&roster, &alice, "bob@example.com");
+    let delivery = RecordingDelivery::default();
+    let payload = roster_get(&roster, None, &delivery).unwrap_or_else(|| panic!("no payload"));
+    assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
+    assert!(!payload.contains("ver="), "{payload}");
+    assert!(delivery.pushes.borrow().is_empty());
+}
+
+#[test]
+fn versioned_roster_get_answers_from_the_version_the_client_holds() {
+    let (_directory, roster) = roster();
+    let alice = account("alice@example.com");
+    create_account(&roster, &alice);
+    put_item(&roster, &alice, "bob@example.com");
+    put_item(&roster, &alice, "carol@example.com");
+    let delivery = RecordingDelivery::default();
+
+    for unknown in ["", "abc", "9"] {
+        let payload = roster_get(&roster, Some(unknown), &delivery)
+            .unwrap_or_else(|| panic!("no payload for {unknown:?}"));
+        assert!(payload.contains(r#"ver="2""#), "{payload}");
+        assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
+        assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
+    }
+    assert!(delivery.pushes.borrow().is_empty());
+
+    assert!(roster_get(&roster, Some("2"), &delivery).is_none());
+    assert!(delivery.pushes.borrow().is_empty());
+
+    assert!(roster_get(&roster, Some("1"), &delivery).is_none());
+    {
+        let pushes = delivery.pushes.borrow();
+        assert_eq!(pushes.len(), 1, "{pushes:?}");
+        assert!(
+            pushes[0].contains(r#"jid="carol@example.com""#),
+            "{pushes:?}"
+        );
+        assert!(pushes[0].contains(r#"ver="2""#), "{pushes:?}");
+        assert!(pushes[0].contains(r#"id="roster-2""#), "{pushes:?}");
+        assert!(
+            pushes[0].contains(r#"to="alice@example.com/desk""#),
+            "{pushes:?}"
+        );
+    }
+    delivery.pushes.borrow_mut().clear();
+
+    assert!(roster_get(&roster, Some("0"), &delivery).is_none());
+    let pushes = delivery.pushes.borrow();
+    assert_eq!(pushes.len(), 2, "{pushes:?}");
+    assert!(pushes[0].contains(r#"jid="bob@example.com""#), "{pushes:?}");
+    assert!(pushes[0].contains(r#"ver="1""#), "{pushes:?}");
+    assert!(
+        pushes[1].contains(r#"jid="carol@example.com""#),
+        "{pushes:?}"
+    );
+    assert!(pushes[1].contains(r#"ver="2""#), "{pushes:?}");
+}
+
+#[test]
+fn versioned_roster_get_behind_a_removal_returns_the_whole_roster() {
+    let (_directory, roster) = roster();
+    let alice = account("alice@example.com");
+    create_account(&roster, &alice);
+    put_item(&roster, &alice, "bob@example.com");
+    put_item(&roster, &alice, "carol@example.com");
+    assert_eq!(remove_item(&roster, &alice, "bob@example.com").get(), 3);
+    let delivery = RecordingDelivery::default();
+
+    let payload = roster_get(&roster, Some("2"), &delivery).unwrap_or_else(|| panic!("no payload"));
+    assert!(payload.contains(r#"ver="3""#), "{payload}");
+    assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
+    assert!(!payload.contains(r#"jid="bob@example.com""#), "{payload}");
+    assert!(delivery.pushes.borrow().is_empty());
+
+    assert!(roster_get(&roster, Some("3"), &delivery).is_none());
     assert!(delivery.pushes.borrow().is_empty());
 }
 

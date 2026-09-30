@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 use socket2::SockRef;
 
 use super::xml::{Element, XmlStream};
-use super::{BIND_NAMESPACE, C2sSuite, SASL_NAMESPACE, TIMEOUT, TLS_NAMESPACE, TestResult};
+use super::{
+    BIND_NAMESPACE, C2sSuite, ROSTER_VERSIONING_NAMESPACE, SASL_NAMESPACE, TIMEOUT, TLS_NAMESPACE,
+    TestResult,
+};
 
 pub type Client = XmlStream<StreamOwned<ClientConnection, TcpStream>>;
 pub type PlainClient = XmlStream<TcpStream>;
@@ -62,13 +65,33 @@ impl Client {
     }
 
     pub fn authenticated(server: &C2sSuite, username: &str, password: &str) -> TestResult<Self> {
+        Ok(Self::authenticated_with_features(server, username, password)?.0)
+    }
+
+    /// Authenticates and also returns the features offered to the authenticated stream,
+    /// which must be `bind` plus optional features an extension advertises.
+    pub fn authenticated_with_features(
+        server: &C2sSuite,
+        username: &str,
+        password: &str,
+    ) -> TestResult<(Self, Element)> {
         let mut client = Self::secure(server)?;
         client.authenticate(username, password)?;
         let mut client = client.restart();
         let features = client.open()?;
         features.child(BIND_NAMESPACE, "bind")?;
-        assert_eq!(features.children.len(), 1);
-        Ok(client)
+        for feature in &features.children {
+            assert!(
+                matches!(
+                    (feature.namespace.as_str(), feature.name.as_str()),
+                    (BIND_NAMESPACE, "bind") | (ROSTER_VERSIONING_NAMESPACE, "ver")
+                ),
+                "unexpected feature {}:{}",
+                feature.namespace,
+                feature.name
+            );
+        }
+        Ok((client, features))
     }
 
     pub fn connect(

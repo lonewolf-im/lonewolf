@@ -2,6 +2,7 @@
 
 mod state;
 mod subscription;
+mod versioning;
 mod xml;
 
 use lonewolf_storage::Storage;
@@ -24,6 +25,7 @@ use subscription::Parties;
 
 pub const NAME: &str = "roster";
 pub const NAMESPACE: &str = "jabber:iq:roster";
+pub const VERSIONING_FEATURE: &str = "<ver xmlns='urn:xmpp:features:rosterver'/>";
 
 const IQ_ROUTES: [IqRoute; 2] = [
     IqRoute {
@@ -134,6 +136,10 @@ where
         &PresenceRequestType::ALL
     }
 
+    fn stream_features(&self) -> &'static [&'static str] {
+        &[VERSIONING_FEATURE]
+    }
+
     fn forget_account<'a>(
         &'a self,
         transaction: &'a mut S::Write,
@@ -157,13 +163,34 @@ where
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
             let owner = owner_of(&request)?;
-            xml::validate_get(request.payload)?;
+            let known = xml::parse_get(request.payload)?;
             let snapshot = transaction.roster(&owner).await?;
-            let payload = xml::build_response(snapshot, response)?;
-            let effects = Effects::new(vec![owner], |delivery| {
-                delivery.tag_session(SessionTag::Interested)
+            let (payload, changes) = match versioning::answer(known, &snapshot) {
+                versioning::Answer::Full { stamped } => {
+                    let version = stamped.then_some(snapshot.version);
+                    let payload = xml::build_response(snapshot.items, version, response)?;
+                    (Some(payload), Vec::new())
+                }
+                versioning::Answer::Unchanged => (None, Vec::new()),
+                versioning::Answer::Changes { since } => {
+                    (None, versioning::changes_since(snapshot.items, since))
+                }
+            };
+            let effects = Effects::new(vec![owner], move |delivery| {
+                Box::pin(async move {
+                    delivery.tag_session(SessionTag::Interested).await?;
+                    for entry in changes {
+                        delivery
+                            .push_to_session(Box::new(move |to, arena| {
+                                let item = xml::build_item(&entry.value, arena)?;
+                                xml::build_push(to, item, entry.version, arena)
+                            }))
+                            .await?;
+                    }
+                    Ok(())
+                })
             });
-            Ok(IqReply::new(Some(payload), effects))
+            Ok(IqReply::new(payload, effects))
         })
     }
 
@@ -317,7 +344,8 @@ fn split_subscriptions(
 ) -> (Vec<RosterJid>, Vec<RosterJid>) {
     let mut subscribers = Vec::new();
     let mut watched = Vec::new();
-    for item in snapshot.items {
+    for entry in snapshot.items {
+        let item = entry.value;
         if item.jid.as_str() == owner.as_str() {
             continue;
         }

@@ -2,7 +2,7 @@
 
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{
-    RosterItem, RosterJid, RosterSnapshot, RosterVersion, SubscriptionState,
+    RosterItem, RosterJid, RosterMutation, RosterVersion, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -26,9 +26,10 @@ pub(super) enum RosterSet {
     Remove(RosterJid),
 }
 
-pub(super) fn validate_get<A: ChunkAllocator>(
-    payload: ElementRef<'_, Arena<A>>,
-) -> Result<(), StanzaErrorCondition> {
+/// Checks a roster get and returns the version the client holds, when it sent one.
+pub(super) fn parse_get<'a, A: ChunkAllocator>(
+    payload: ElementRef<'a, Arena<A>>,
+) -> Result<Option<&'a str>, StanzaErrorCondition> {
     for child in payload
         .children()
         .map_err(|_| StanzaErrorCondition::InternalServerError)?
@@ -41,7 +42,9 @@ pub(super) fn validate_get<A: ChunkAllocator>(
             return Err(StanzaErrorCondition::BadRequest);
         }
     }
-    Ok(())
+    payload
+        .attribute("ver", "")
+        .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
 pub(super) fn parse_set<A: ChunkAllocator>(
@@ -115,19 +118,27 @@ pub(super) fn parse_set<A: ChunkAllocator>(
     Ok(RosterSet::Update(RosterItemUpdate { jid, name, groups }))
 }
 
+/// Builds the full roster, stamped with `version` when the client asked for versioning.
 pub(super) fn build_response<A: ChunkAllocator>(
-    snapshot: RosterSnapshot,
+    items: Vec<RosterMutation<RosterItem>>,
+    version: Option<RosterVersion>,
     response: &mut Arena<A>,
 ) -> Result<Element, StanzaErrorCondition> {
-    let mut items = Vec::with_capacity(snapshot.items.len());
-    for item in snapshot.items {
-        items.push(
-            build_item(&item, response).map_err(|_| StanzaErrorCondition::InternalServerError)?,
+    let mut built = Vec::with_capacity(items.len());
+    for entry in items {
+        built.push(
+            build_item(&entry.value, response)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?,
         );
     }
     let mut query = Element::builder_in("query", NAMESPACE, response)
         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-    for item in items {
+    if let Some(version) = version {
+        query = query
+            .attribute("ver", "", &version.get().to_string())
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    }
+    for item in built {
         query = query
             .child(item)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
@@ -137,17 +148,20 @@ pub(super) fn build_response<A: ChunkAllocator>(
         .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
-/// Wraps one roster item in the push addressed to `to`.
+/// Wraps one roster item in the push addressed to `to`, stamped with the version the
+/// change produced.
 pub(super) fn build_push<A: ChunkAllocator>(
     to: Jid,
     item: Element,
     version: RosterVersion,
     arena: &mut Arena<A>,
 ) -> Result<Stanza, DeliveryError> {
+    let version = version.get().to_string();
     let query = Element::builder_in("query", NAMESPACE, arena)?
+        .attribute("ver", "", &version)?
         .child(item)?
         .build()?;
-    let id = format!("roster-{}", version.get());
+    let id = format!("roster-{version}");
     let push = Stanza::builder_in(StanzaType::Iq(IqType::Set), StanzaNamespace::Client, arena)
         .id(Some(&id))?
         .to(Some(to))?

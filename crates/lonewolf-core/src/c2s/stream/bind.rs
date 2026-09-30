@@ -19,6 +19,7 @@ use crate::hosts::Hosts;
 use crate::router::{Registration, RouterError, RouterHandle};
 
 const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
+const BIND_FEATURE: &str = "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>";
 const BIND_FEATURES: &str =
     "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
 const MAX_BIND_FAILURES: usize = 6;
@@ -65,7 +66,14 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
             .await);
     }
     session.writer.send_header(&header).await?;
-    session.writer.send(BIND_FEATURES).await?;
+    let extension_features = router.stream_features(session.host());
+    if extension_features.is_empty() {
+        session.writer.send(BIND_FEATURES).await?;
+    } else {
+        let features =
+            format!("<stream:features>{BIND_FEATURE}{extension_features}</stream:features>");
+        session.writer.send(&features).await?;
+    }
     let mut invalid_attempts = 0;
     loop {
         let parsed = match session.next_event().await? {

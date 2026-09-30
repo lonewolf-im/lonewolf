@@ -72,6 +72,12 @@ pub trait Extension<A: ChunkAllocator, S: Storage>:
         &[]
     }
 
+    /// Stream feature elements, as XML, advertised to authenticated clients of every
+    /// host that enables the extension.
+    fn stream_features(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Clears the extension's state for the account inside the deletion's transaction
     /// and returns what to deliver once it commits.
     fn forget_account<'a>(
@@ -117,6 +123,7 @@ pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     iq: IqRegistry<A, S>,
     presence: PresenceRegistry<A, S>,
     extensions: Vec<Arc<dyn Extension<A, S>>>,
+    stream_features: String,
 }
 
 impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
@@ -125,6 +132,7 @@ impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
             iq: IqRegistry::default(),
             presence: PresenceRegistry::default(),
             extensions: Vec::new(),
+            stream_features: String::new(),
         }
     }
 }
@@ -141,6 +149,11 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
     /// The enabled extensions, in the order they were enabled.
     pub fn extensions(&self) -> &[Arc<dyn Extension<A, S>>] {
         &self.extensions
+    }
+
+    /// The stream feature elements of the enabled extensions, concatenated as XML.
+    pub fn stream_features(&self) -> &str {
+        &self.stream_features
     }
 }
 
@@ -179,6 +192,9 @@ impl<A: ChunkAllocator, S: Storage> Extensions<A, S> {
         for kind in presence_kinds {
             registry.presence.register(*kind, Arc::clone(&presence))?;
         }
+        for feature in extension.stream_features() {
+            registry.stream_features.push_str(feature);
+        }
         registry.extensions.push(extension);
         self.available.insert(name, registry);
         Ok(())
@@ -208,6 +224,7 @@ impl<A: ChunkAllocator, S: Storage> Extensions<A, S> {
             enabled
                 .extensions
                 .extend(handlers.extensions.iter().cloned());
+            enabled.stream_features.push_str(&handlers.stream_features);
         }
         Ok(enabled)
     }

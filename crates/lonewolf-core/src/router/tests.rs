@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::hosts::Hosts;
-use crate::router::local::{LocalRouter, ResourceDelivery, RetireCause};
+use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Registration, RoutedStanza, Router, RouterError};
 use compio::runtime::Runtime;
 use compio::time::timeout;
@@ -105,24 +105,10 @@ async fn unavailable_presence(
 async fn receive_routed(
     registration: &Registration<GlobalChunkAllocator>,
 ) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
-    match registration.recv().await {
-        Some(ResourceDelivery::Routed(stanza)) => Ok(stanza),
-        Some(ResourceDelivery::Presence { .. }) => Err("unexpected presence batch".into()),
-        None => Err("closed resource mailbox".into()),
-    }
-}
-
-async fn receive_presence(
-    registration: &Registration<GlobalChunkAllocator>,
-) -> Result<(Vec<RoutedStanza<GlobalChunkAllocator>>, bool), Box<dyn Error>> {
-    match registration.recv().await {
-        Some(ResourceDelivery::Presence {
-            stanzas,
-            replay_pending,
-        }) => Ok((stanzas, replay_pending)),
-        Some(ResourceDelivery::Routed(_)) => Err("unexpected routed stanza".into()),
-        None => Err("closed resource mailbox".into()),
-    }
+    registration
+        .recv()
+        .await
+        .ok_or_else(|| "closed resource mailbox".into())
 }
 
 fn roster_push(to: &str, id: &str) -> TestRosterPush {
@@ -232,7 +218,6 @@ fn retiring_an_account_ends_every_session_and_frees_its_resources() -> TestResul
             Some(unavailable_presence("desk").await?),
         )
         .await?;
-        receive_presence(&desk).await?;
 
         handle.retire_account(&alice).await?;
         let retired = desk.wait_retired().await?;
@@ -628,9 +613,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
             )
             .await?;
         assert!(became_available.became_available);
-        let (delivery, replay_pending) = receive_presence(&desk).await?;
-        assert_eq!(delivery.len(), 1);
-        assert!(replay_pending);
+        assert!(became_available.siblings.is_empty());
         let became_available = phone
             .set_presence(
                 Some(0),
@@ -639,9 +622,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
             )
             .await?;
         assert!(became_available.became_available);
-        let (delivery, replay_pending) = receive_presence(&phone).await?;
-        assert_eq!(delivery.len(), 2);
-        assert!(replay_pending);
+        assert_eq!(became_available.siblings.len(), 1);
         receive_routed(&desk).await?;
 
         for _ in 0..64 {
@@ -649,15 +630,15 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 .route_full(stanza("alice@localhost/phone").await?)
                 .await?;
         }
-        desk.set_presence(
-            Some(1),
-            presence("desk").await?,
-            Some(unavailable_presence("desk").await?),
-        )
-        .await?;
-        let (delivery, replay_pending) = receive_presence(&desk).await?;
-        assert_eq!(delivery.len(), 1);
-        assert!(!replay_pending);
+        let updated = desk
+            .set_presence(
+                Some(1),
+                presence("desk").await?,
+                Some(unavailable_presence("desk").await?),
+            )
+            .await?;
+        assert!(!updated.became_available);
+        assert!(updated.siblings.is_empty());
         let unavailable = receive_routed(&desk).await?;
         assert_eq!(
             unavailable
@@ -738,7 +719,6 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
                 Some(unavailable_presence("desk").await?),
             )
             .await?;
-        receive_presence(&alice_desk).await?;
         bob.set_presence(
             Some(0),
             parse_stanza("<presence from='bob@localhost/phone' to='bob@localhost'/>").await?,
@@ -750,7 +730,6 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
             ),
         )
         .await?;
-        receive_presence(&bob).await?;
 
         assert!(alice_desk.end_presence().await?.is_some());
         assert!(handle.local.presence_snapshot(&alice).await?.is_empty());
@@ -793,27 +772,27 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
                 .await?
                 .became_available
         );
-        receive_presence(&desk).await?;
         phone
             .set_presence(Some(0), identified_presence("phone", "old").await?, None)
             .await?;
-        receive_presence(&phone).await?;
-        desk.set_presence(None, unavailable_presence("desk").await?, None)
+        let away = desk
+            .set_presence(None, unavailable_presence("desk").await?, None)
             .await?;
+        assert!(away.became_unavailable);
+        assert_eq!(away.preceding.len(), 1);
+        assert_eq!(away.preceding[0].resolve()?.id()?, Some("old"));
         phone
             .set_presence(Some(0), identified_presence("phone", "new").await?, None)
             .await?;
-        assert!(
-            desk.set_presence(Some(0), presence("desk").await?, None)
-                .await?
-                .became_available
-        );
+        let change = desk
+            .set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        assert!(change.became_available);
 
-        assert_eq!(receive_routed(&desk).await?.resolve()?.id()?, Some("old"));
-        receive_presence(&desk).await?;
-        let (snapshot, replay_pending) = receive_presence(&desk).await?;
-        assert!(replay_pending);
-        assert_eq!(snapshot[0].resolve()?.id()?, Some("new"));
+        assert!(change.preceding.is_empty());
+        assert_eq!(change.siblings.len(), 1);
+        assert_eq!(change.siblings[0].resolve()?.id()?, Some("new"));
+        assert!(desk.take_queued().is_empty());
 
         drop(desk);
         drop(phone);
@@ -843,14 +822,11 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
             )
             .await?;
         assert!(became_available.became_available);
-        receive_presence(&desk).await?;
         let became_available = phone
             .set_presence(Some(0), presence("phone").await?, None)
             .await?;
         assert!(became_available.became_available);
-        let (delivery, replay_pending) = receive_presence(&phone).await?;
-        assert_eq!(delivery.len(), 2);
-        assert!(replay_pending);
+        assert_eq!(became_available.siblings.len(), 1);
         receive_routed(&desk).await?;
         for _ in 0..64 {
             handle

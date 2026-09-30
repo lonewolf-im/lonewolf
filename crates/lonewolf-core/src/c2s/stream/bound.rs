@@ -58,6 +58,9 @@ enum Output<A: ChunkAllocator> {
         stanzas: Vec<Stanza>,
         arena: Arena<A>,
     },
+    /// Stored subscription requests, parsed one at a time as they are written so a large
+    /// backlog never sits in memory at once.
+    Requests(Vec<PendingSubscription>),
 }
 
 /// What a resource receives right after its own availability echo.
@@ -240,17 +243,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     /// Queues one delivery and everything else the mailbox already holds, then writes
     /// the batch in one go.
     async fn drain_mailbox(&mut self, first: ResourceDelivery<A>) -> Result<(), CloseOutcome> {
-        self.enqueue_delivery(first).await?;
+        self.enqueue_delivery(first)?;
         for delivery in self.registration.take_queued() {
-            self.enqueue_delivery(delivery).await?;
+            self.enqueue_delivery(delivery)?;
         }
         self.flush().await
     }
 
-    async fn enqueue_delivery(
-        &mut self,
-        delivery: ResourceDelivery<A>,
-    ) -> Result<(), CloseOutcome> {
+    fn enqueue_delivery(&mut self, delivery: ResourceDelivery<A>) -> Result<(), CloseOutcome> {
         match delivery {
             ResourceDelivery::Routed(stanza) => self.outbox.push_back(Output::Routed(stanza)),
             ResourceDelivery::Presence {
@@ -265,9 +265,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         .ok_or(CloseOutcome::InternalError)?;
                     self.outbox
                         .extend(replay.presences.into_iter().map(Output::Routed));
-                    for subscription in replay.requests {
-                        let stanza = self.parse_pending_subscription(subscription).await?;
-                        self.outbox.push_back(Output::Routed(stanza));
+                    if !replay.requests.is_empty() {
+                        self.outbox.push_back(Output::Requests(replay.requests));
                     }
                 }
             }
@@ -287,6 +286,12 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     for stanza in &stanzas {
                         let stanza = stanza.resolve(&arena)?;
                         self.writer.write_stanza(&stanza).await?;
+                    }
+                }
+                Output::Requests(requests) => {
+                    for subscription in requests {
+                        let stanza = self.parse_pending_subscription(subscription).await?;
+                        self.writer.write_routed(&stanza).await?;
                     }
                 }
             }
@@ -429,7 +434,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         for delivery in queued {
-            self.enqueue_delivery(delivery).await?;
+            self.enqueue_delivery(delivery)?;
         }
         match handled {
             Err(HandlerError::Stanza(condition)) => {
@@ -722,7 +727,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         .await
                         .map_err(|_| CloseOutcome::InternalError)?;
                 for delivery in queued {
-                    self.enqueue_delivery(delivery).await?;
+                    self.enqueue_delivery(delivery)?;
                 }
                 Ok(())
             }

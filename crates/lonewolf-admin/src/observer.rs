@@ -12,6 +12,7 @@ use lonewolf_storage::{Storage, StorageError, WriteTransaction};
 /// uncertain commit from every other failure.
 #[derive(Debug)]
 pub enum DeleterError {
+    /// The store failed; the `CommitUnknown` kind means the deletion may have committed.
     Storage(StorageError),
     /// A failure before the deletion committed; nothing changed.
     Other(Box<dyn Error + Send + Sync>),
@@ -54,8 +55,10 @@ impl From<AccountError> for DeleterError {
 /// record and that state go together.
 pub trait AccountDeleter: Send + Sync {
     /// Removes the account's record and every trace the server keeps of it, and
-    /// returns whether a record existed. Nothing changes when it fails, so a retry is
-    /// always safe. An error is logged, so it must not name the account.
+    /// returns whether a record existed. A failure leaves everything unchanged, except
+    /// a storage error of kind `CommitUnknown`, after which the deletion may have
+    /// committed; a retry is safe either way and answers `false` if it had. An error
+    /// is logged, so it must not name the account.
     fn delete<'a>(
         &'a self,
         account: &'a AccountKey,

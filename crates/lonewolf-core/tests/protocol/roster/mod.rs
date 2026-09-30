@@ -1990,17 +1990,28 @@ fn roster_set_from_a_reset_connection_still_pushes_to_interested_resources() -> 
 }
 
 #[test]
-fn committed_roster_push_survives_eviction_of_the_requesting_resource() -> TestResult {
+fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
     let suite =
         C2sSuite::with_extensions_and_setup("'roster', 'test-iq'", seed_mutual_subscription)?;
     let mut desk = suite.connect("alice", "password", "desk")?;
     let mut phone = suite.connect("alice", "password", "phone")?;
     let mut tablet = suite.connect("alice", "password", "tablet")?;
     let mut bob = suite.connect("bob", "password", "phone")?;
+    let roster =
+        "<query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='both'/></query>";
     request_roster(
         &mut phone,
         "phone-roster",
-        "<iq xmlns='jabber:client' type='result' id='phone-roster' to='alice@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='both'/></query></iq>",
+        &format!(
+            "<iq xmlns='jabber:client' type='result' id='phone-roster' to='alice@localhost/phone'>{roster}</iq>"
+        ),
+    )?;
+    request_roster(
+        &mut tablet,
+        "tablet-roster",
+        &format!(
+            "<iq xmlns='jabber:client' type='result' id='tablet-roster' to='alice@localhost/tablet'>{roster}</iq>"
+        ),
     )?;
     tablet.send("<presence/>")?;
     tablet.expect_xml(
@@ -2012,33 +2023,40 @@ fn committed_roster_push_survives_eviction_of_the_requesting_resource() -> TestR
     )?;
 
     desk.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
-    let marker = phone.receive()?;
-    marker.assert_name("jabber:client", "iq");
-    assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
+    for interested in [&mut phone, &mut tablet] {
+        let marker = interested.receive()?;
+        assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
+    }
 
     tablet.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
     // The commit is not observable until its ticket turns, so the flood below waits long
-    // enough for the server to have handled the set before it fills the tablet's mailbox.
+    // enough for the server to have handled the set before it reaches the tablet.
     thread::sleep(Duration::from_millis(300));
     for index in 0..80 {
         bob.send(&format!(
-            "<presence><priority>{}</priority></presence>",
-            index % 100
+            "<presence><priority>{index}</priority></presence>"
         ))?;
     }
-    tablet.expect_eof()?;
+    for index in 0..80 {
+        tablet.expect_xml(&format!(
+            "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'><priority>{index}</priority></presence>"
+        ))?;
+    }
 
-    let push = expect_roster_push(
-        &mut phone,
-        "alice@localhost/phone",
-        "<item xmlns='jabber:iq:roster' jid='carol@localhost' subscription='none'/>",
+    tablet.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='add-carol' to='alice@localhost/tablet'/>",
     )?;
-    phone.send(&format!("<iq type='result' id='{push}'/>"))?;
+    let item = "<item xmlns='jabber:iq:roster' jid='carol@localhost' subscription='none'/>";
+    let tablet_push = expect_roster_push(&mut tablet, "alice@localhost/tablet", item)?;
+    let phone_push = expect_roster_push(&mut phone, "alice@localhost/phone", item)?;
+    tablet.send(&format!("<iq type='result' id='{tablet_push}'/>"))?;
+    phone.send(&format!("<iq type='result' id='{phone_push}'/>"))?;
     desk.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/desk'/>",
     )?;
     desk.close()?;
-    phone.close()
+    phone.close()?;
+    tablet.close()
 }
 
 #[test]

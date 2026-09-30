@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::Future;
-
 use futures_channel::oneshot;
 use lonewolf_extension::Deliver;
 use lonewolf_extension::delivery::{
@@ -39,30 +37,54 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
     }
 }
 
+/// Committed effects running on a task of their own; dropping it does not stop them.
+pub(crate) struct Committed<A: ChunkAllocator> {
+    turned: oneshot::Receiver<()>,
+    done: oneshot::Receiver<Result<Vec<RoutedStanza<A>>, DeliveryError>>,
+}
+
+impl<A: ChunkAllocator> Committed<A> {
+    /// Resolves when the ticket has turned, which is the cut for the caller's mailbox:
+    /// everything delivered before it predates the caller's view of storage.
+    pub(crate) async fn turned(&mut self) {
+        let _ = (&mut self.turned).await;
+    }
+
+    /// The deliveries still queued for the caller when the ticket turned, once the
+    /// effects have run; the caller writes them ahead of its own reply.
+    pub(crate) async fn finished(self) -> Result<Vec<RoutedStanza<A>>, DeliveryError> {
+        self.done.await.unwrap_or(Err(DeliveryError))
+    }
+}
+
 /// Runs `deliver` once `ticket` turns, on a task of its own, so a caller that is
-/// cancelled after its commit cannot lose the deliveries the commit promised. The
-/// returned future reports the outcome and may be dropped without stopping the work.
-///
-/// When the ticket turns, everything already in `mailbox` came from earlier commits
-/// and predates the caller's view of storage. It is taken out before the effects run
-/// and returned, so the caller writes it ahead of its own reply.
-pub(crate) fn deliver_committed<A: ChunkAllocator + Clone + 'static>(
+/// cancelled after its commit cannot lose the deliveries the commit promised.
+pub(crate) fn deliver_committed<A, D>(
     mut ticket: Ticket,
     deliver: Deliver<A>,
-    delivery: RouterDelivery<A>,
+    delivery: D,
     mailbox: Option<Mailbox<A>>,
-) -> impl Future<Output = Result<Vec<RoutedStanza<A>>, DeliveryError>> {
-    let (done, completed) = oneshot::channel();
+) -> Committed<A>
+where
+    A: ChunkAllocator + Clone + 'static,
+    D: Delivery<A> + 'static,
+{
+    let (report_turned, turned) = oneshot::channel();
+    let (report_done, done) = oneshot::channel();
     compio::runtime::spawn(async move {
         ticket.turn().await;
+        let _ = report_turned.send(());
         let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
         let result = deliver(&delivery).await.map(|()| queued);
         drop(ticket);
-        let _ = done.send(result);
+        let _ = report_done.send(result);
     })
     .detach();
-    async move { completed.await.unwrap_or(Err(DeliveryError)) }
+    Committed { turned, done }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<A> {
     fn is_local_host(&self, domain: &str) -> bool {

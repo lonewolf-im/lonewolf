@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
@@ -39,15 +40,22 @@ const STORED_STANZA_STREAM_HEADER: &[u8] =
 /// The bound resource's side of the stream: everything except the parser, which
 /// stays outside so a pending read can be kept while stanzas are handled.
 struct BoundSession<A: ChunkAllocator> {
-    writer: Writer,
     registration: Registration<A>,
     router: RouterHandle<A>,
     storage: RedbStorage,
     allocator: A,
     /// Whether this resource currently has presence, mirroring the router's view.
     available: bool,
-    /// Everything the client has yet to receive, in order; only `flush` writes the socket.
-    outbox: VecDeque<Output<A>>,
+    outbox: Outbox<A>,
+}
+
+/// The session's output path: everything the client has yet to receive, in order, and
+/// the writer that only it uses.
+struct Outbox<A: ChunkAllocator> {
+    queue: VecDeque<Output<A>>,
+    writer: Writer,
+    allocator: A,
+    account: AccountKey,
 }
 
 enum Output<A: ChunkAllocator> {
@@ -71,14 +79,19 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         allocator,
         resource_requested: _,
     } = bound;
-    let mut session = BoundSession {
+    let outbox = Outbox {
+        queue: VecDeque::new(),
         writer,
+        allocator: allocator.clone(),
+        account: registration.account().clone(),
+    };
+    let mut session = BoundSession {
         registration,
         router,
         storage,
         allocator,
         available: false,
-        outbox: VecDeque::new(),
+        outbox,
     };
     let stopped = {
         let retired = pin!(session.registration.wait_retired());
@@ -90,7 +103,11 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
     let outcome = match stopped {
         Either::Right(outcome) => outcome,
         Either::Left(Ok(RetireCause::AccountDeleted)) => {
-            session.writer.fail(CloseOutcome::AccountDeleted).await
+            session
+                .outbox
+                .writer
+                .fail(CloseOutcome::AccountDeleted)
+                .await
         }
         Either::Left(_) => CloseOutcome::InternalError,
     };
@@ -125,7 +142,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 match selected {
                     Either::Left(event) => break event,
                     Either::Right(Some(delivery)) => {
-                        if let Err(outcome) = self.drain_mailbox(delivery).await {
+                        if let Err(outcome) = self
+                            .outbox
+                            .drain_mailbox(&self.registration, delivery)
+                            .await
+                        {
                             break 'stream outcome;
                         }
                     }
@@ -133,20 +154,20 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 }
             };
             match event {
-                Ok(Some(StreamEvent::StreamEnd) | None) => break self.writer.close().await,
+                Ok(Some(StreamEvent::StreamEnd) | None) => break self.outbox.writer.close().await,
                 Ok(Some(StreamEvent::Stanza(parsed))) => {
                     let handled = self.handle_stanza(parsed).await;
-                    let flushed = self.flush().await;
+                    let flushed = self.outbox.flush().await;
                     if let Err(outcome) = handled.and(flushed) {
-                        break self.writer.fail(outcome).await;
+                        break self.outbox.writer.fail(outcome).await;
                     }
                 }
                 Ok(Some(event)) => {
                     let outcome =
                         namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
-                    break self.writer.fail(outcome).await;
+                    break self.outbox.writer.fail(outcome).await;
                 }
-                Err(outcome) => break self.writer.fail(outcome).await,
+                Err(outcome) => break self.outbox.writer.fail(outcome).await,
             }
         }
     }
@@ -221,44 +242,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         result.and(finished)
     }
 
-    /// Queues one delivery and everything else the mailbox already holds, then writes
-    /// the batch in one go.
-    async fn drain_mailbox(&mut self, first: RoutedStanza<A>) -> Result<(), CloseOutcome> {
-        self.outbox.push_back(Output::Routed(first));
-        self.outbox.extend(
-            self.registration
-                .take_queued()
-                .into_iter()
-                .map(Output::Routed),
-        );
-        self.flush().await
-    }
-
-    /// Writes everything queued, in order, and flushes the socket once.
-    async fn flush(&mut self) -> Result<(), CloseOutcome> {
-        if self.outbox.is_empty() {
-            return Ok(());
-        }
-        while let Some(output) = self.outbox.pop_front() {
-            match output {
-                Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
-                Output::Owned { stanzas, arena } => {
-                    for stanza in &stanzas {
-                        let stanza = stanza.resolve(&arena)?;
-                        self.writer.write_stanza(&stanza).await?;
-                    }
-                }
-                Output::Requests(requests) => {
-                    for subscription in requests {
-                        let stanza = self.parse_pending_subscription(subscription).await?;
-                        self.writer.write_routed(&stanza).await?;
-                    }
-                }
-            }
-        }
-        self.writer.flush().await
-    }
-
     async fn handle_stanza(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let stanza = parsed.value().resolve(parsed.arena())?;
         if stanza.namespace() != StanzaNamespace::Client {
@@ -281,8 +264,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     /// them, while a get commits nothing and needs no such care. The reply is written
     /// after the ticket is released, so a socket that stops taking data holds no
     /// account's line, and a reply that fails to write cannot lose committed effects.
-    /// Deliveries queued when the ticket turned predate that view, so they are written
-    /// ahead of the reply, and a get learns of them before it answers.
+    /// Deliveries that arrive while the request waits for its turn, and those still
+    /// queued when it turns, predate that view, so they are written ahead of the reply,
+    /// and a get learns of them before it answers.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -311,7 +295,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 StanzaErrorCondition::ServiceUnavailable,
                 None,
             )?;
-            self.outbox.push_back(Output::Owned {
+            self.outbox.push(Output::Owned {
                 stanzas: vec![reply],
                 arena,
             });
@@ -329,13 +313,16 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     .fix(accounts, self.storage.begin_read())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
-                ticket.turn().await;
+                let ((), drained) = self
+                    .outbox
+                    .drain_until(&self.registration, ticket.turn())
+                    .await?;
                 queued = self.registration.take_queued();
                 let iq_request = IqRequest {
                     sender,
                     target,
                     payload,
-                    preceded: !queued.is_empty(),
+                    preceded: drained || !queued.is_empty(),
                 };
                 let reply = handler.get(iq_request, &transaction, &mut response).await;
                 drop(transaction);
@@ -379,25 +366,30 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                             .fix(accounts, transaction.commit())
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?;
-                        queued = deliver_committed(
+                        let mut committed = deliver_committed(
                             ticket,
                             deliver,
                             delivery,
                             Some(self.registration.mailbox()),
-                        )
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
+                        );
+                        self.outbox
+                            .drain_until(&self.registration, committed.turned())
+                            .await?;
+                        queued = committed
+                            .finished()
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
                         Ok((payload, followups))
                     }
                     Err(error) => Err(error),
                 }
             }
         };
-        self.outbox.extend(queued.into_iter().map(Output::Routed));
+        self.outbox.routed(queued);
         match handled {
             Err(HandlerError::Stanza(condition)) => {
                 let reply = iq::error_reply(&request, &mut arena, condition, Some(route.sender))?;
-                self.outbox.push_back(Output::Owned {
+                self.outbox.push(Output::Owned {
                     stanzas: vec![reply],
                     arena,
                 });
@@ -407,7 +399,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 let mut stanzas = Vec::with_capacity(1 + followups.len());
                 stanzas.push(reply);
                 stanzas.extend(followups);
-                self.outbox.push_back(Output::Owned {
+                self.outbox.push(Output::Owned {
                     stanzas,
                     arena: response,
                 });
@@ -551,7 +543,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         if let Some(ticket) = ticket.as_mut() {
-            ticket.turn().await;
+            self.outbox
+                .drain_until(&self.registration, ticket.turn())
+                .await?;
         }
         let (routed, unavailable) = match unavailable {
             Some(unavailable) => {
@@ -573,11 +567,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         self.available = priority.is_some();
         // The router takes the cut with the update itself, so without a ticket a
         // sibling's earlier update still lands ahead of this echo.
-        self.outbox
-            .extend(change.preceding.into_iter().map(Output::Routed));
-        self.outbox
-            .extend(change.siblings.into_iter().map(Output::Routed));
-        self.outbox.push_back(Output::Routed(routed));
+        self.outbox.routed(change.preceding);
+        self.outbox.routed(change.siblings);
+        self.outbox.push(Output::Routed(routed));
         if change.became_available
             && let Some(audience) = audience.as_mut()
         {
@@ -589,11 +581,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     .current_presence(contact, self.registration.account())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.extend(presence.into_iter().map(Output::Routed));
+                self.outbox.routed(presence);
             }
             let requests = mem::take(&mut audience.pending);
             if !requests.is_empty() {
-                self.outbox.push_back(Output::Requests(requests));
+                self.outbox.push(Output::Requests(requests));
             }
         }
         if let Some(audience) = audience
@@ -688,11 +680,16 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         };
         match received {
             Ok((deliver, ticket, delivery)) => {
-                let queued =
-                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()))
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.extend(queued.into_iter().map(Output::Routed));
+                let mut committed =
+                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
+                self.outbox
+                    .drain_until(&self.registration, committed.turned())
+                    .await?;
+                let queued = committed
+                    .finished()
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                self.outbox.routed(queued);
                 Ok(())
             }
             Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition).await,
@@ -707,7 +704,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
         let source = source.resolve()?.clone_in(&mut arena)?;
         let reply = source.error_reply_in(&mut arena, condition)?.build()?;
-        self.outbox.push_back(Output::Owned {
+        self.outbox.push(Output::Owned {
             stanzas: vec![reply],
             arena,
         });
@@ -750,6 +747,83 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
         Ok((builder.build()?, from, to))
     }
+}
+
+impl<A: ChunkAllocator + Clone> Outbox<A> {
+    fn push(&mut self, output: Output<A>) {
+        self.queue.push_back(output);
+    }
+
+    fn routed(&mut self, stanzas: impl IntoIterator<Item = RoutedStanza<A>>) {
+        self.queue.extend(stanzas.into_iter().map(Output::Routed));
+    }
+
+    /// Queues one delivery and everything else the mailbox already holds, then writes
+    /// the batch in one go.
+    async fn drain_mailbox(
+        &mut self,
+        registration: &Registration<A>,
+        first: RoutedStanza<A>,
+    ) -> Result<(), CloseOutcome> {
+        self.push(Output::Routed(first));
+        self.routed(registration.take_queued());
+        self.flush().await
+    }
+
+    /// Writes deliveries as they arrive until `until` resolves, so a session waiting for
+    /// its turn keeps draining its mailbox instead of overflowing it. `until` is polled
+    /// first, so nothing that arrives after it resolves is taken. Reports whether anything
+    /// was written.
+    async fn drain_until<F: Future>(
+        &mut self,
+        registration: &Registration<A>,
+        until: F,
+    ) -> Result<(F::Output, bool), CloseOutcome> {
+        let mut until = pin!(until);
+        let mut drained = false;
+        loop {
+            let event = {
+                let receive = pin!(registration.recv());
+                match select(until.as_mut(), receive).await {
+                    Either::Left((output, _)) => Either::Left(output),
+                    Either::Right((delivery, _)) => Either::Right(delivery),
+                }
+            };
+            match event {
+                Either::Left(output) => return Ok((output, drained)),
+                Either::Right(Some(delivery)) => {
+                    drained = true;
+                    self.drain_mailbox(registration, delivery).await?;
+                }
+                Either::Right(None) => return Err(CloseOutcome::InternalError),
+            }
+        }
+    }
+
+    /// Writes everything queued, in order, and flushes the socket once.
+    async fn flush(&mut self) -> Result<(), CloseOutcome> {
+        if self.queue.is_empty() {
+            return Ok(());
+        }
+        while let Some(output) = self.queue.pop_front() {
+            match output {
+                Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
+                Output::Owned { stanzas, arena } => {
+                    for stanza in &stanzas {
+                        let stanza = stanza.resolve(&arena)?;
+                        self.writer.write_stanza(&stanza).await?;
+                    }
+                }
+                Output::Requests(requests) => {
+                    for subscription in requests {
+                        let stanza = self.parse_pending_subscription(subscription).await?;
+                        self.writer.write_routed(&stanza).await?;
+                    }
+                }
+            }
+        }
+        self.writer.flush().await
+    }
 
     /// Parses a stored request and checks it still addresses this account from its sender.
     async fn parse_pending_subscription(
@@ -788,7 +862,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     .is_none_or(|sender| sender.as_str() != subscription.sender.as_str())
                 || stanza
                     .to()?
-                    .is_none_or(|target| target.as_str() != self.registration.account().as_str())
+                    .is_none_or(|target| target.as_str() != self.account.as_str())
             {
                 return Err(CloseOutcome::InternalError);
             }

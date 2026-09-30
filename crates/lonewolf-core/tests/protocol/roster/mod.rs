@@ -1821,6 +1821,55 @@ fn versioned_roster_get_preceded_by_queued_pushes_returns_the_full_roster() -> T
 }
 
 #[test]
+fn a_rejected_roster_get_still_delivers_the_pushes_queued_before_it() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut slow = suite.connect("alice", "password", "slow")?;
+    let mut one = suite.connect("alice", "password", "one")?;
+    let mut two = suite.connect("alice", "password", "two")?;
+    request_roster(
+        &mut desk,
+        "desk-roster",
+        "<iq xmlns='jabber:client' type='result' id='desk-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
+    let marker = desk.receive()?;
+    assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
+    one.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
+    two.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
+    // Both sets commit at once but deliver only after the slow effect releases the
+    // account, so the wait keeps the get's view of storage behind both commits.
+    thread::sleep(Duration::from_millis(500));
+    desk.send("<iq type='get' id='invalid'><query xmlns='jabber:iq:roster' ver='0'><item jid='bob@localhost'/></query></iq>")?;
+
+    let first = receive_versioned_push(&mut desk, 1)?;
+    let second = receive_versioned_push(&mut desk, 2)?;
+    let mut contacts = [first.as_str(), second.as_str()];
+    contacts.sort_unstable();
+    assert_eq!(contacts, ["bob@localhost", "carol@localhost"]);
+    desk.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='0'><item jid='bob@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    desk.send("<iq type='get' id='since-2'><query xmlns='jabber:iq:roster' ver='2'/></iq>")?;
+    desk.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='since-2' to='alice@localhost/desk'/>",
+    )?;
+    one.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='add-bob' to='alice@localhost/one'/>",
+    )?;
+    two.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='add-carol' to='alice@localhost/two'/>",
+    )?;
+    slow.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/slow'/>",
+    )?;
+    desk.close()?;
+    one.close()?;
+    two.close()?;
+    slow.close()
+}
+
+#[test]
 fn versioned_roster_get_behind_a_removal_returns_the_full_roster() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;

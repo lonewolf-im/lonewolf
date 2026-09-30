@@ -311,6 +311,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             Some(IqScope::Server) | None => Vec::new(),
         };
         let delivery = self.delivery();
+        let mut queued = Vec::new();
         let handled = match route.kind {
             IqRequestType::Get => {
                 let (transaction, mut ticket) = order
@@ -318,7 +319,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
                 ticket.turn().await;
-                let queued = self.registration.take_queued();
+                queued = self.registration.take_queued();
                 let iq_request = IqRequest {
                     sender,
                     target,
@@ -337,7 +338,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?;
                         drop(ticket);
-                        Ok((payload, followups, queued))
+                        Ok((payload, followups))
                     }
                     Err(error) => Err(error),
                 }
@@ -367,7 +368,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                             .fix(accounts, transaction.commit())
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?;
-                        let queued = deliver_committed(
+                        queued = deliver_committed(
                             ticket,
                             deliver,
                             delivery,
@@ -375,23 +376,23 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         )
                         .await
                         .map_err(|_| CloseOutcome::InternalError)?;
-                        Ok((payload, followups, queued))
+                        Ok((payload, followups))
                     }
                     Err(error) => Err(error),
                 }
             }
         };
+        for delivery in queued {
+            self.deliver(delivery).await?;
+        }
         match handled {
             Err(HandlerError::Stanza(condition)) => {
                 let reply = iq::error_reply(&request, &mut arena, condition, Some(route.sender))?;
                 let reply = reply.resolve(&arena)?;
                 self.writer.send_stanza(&reply).await
             }
-            Ok((payload, followups, queued)) => {
+            Ok((payload, followups)) => {
                 let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
-                for delivery in queued {
-                    self.deliver(delivery).await?;
-                }
                 let reply = reply.resolve(&response)?;
                 self.writer.send_stanza(&reply).await?;
                 for followup in followups {

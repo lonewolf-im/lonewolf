@@ -29,6 +29,7 @@ mod delivery;
 mod error;
 pub mod hosts;
 mod logging;
+mod order;
 mod panic;
 pub mod router;
 mod shutdown;
@@ -130,7 +131,7 @@ pub fn run_with_extensions(
                     let extension: Arc<dyn Extension<Arc<PooledChunkAllocator>, RedbStorage>> =
                         match name {
                             lonewolf_extension::roster::NAME => {
-                                Arc::new(lonewolf_extension::roster::Roster::new(storage.clone()))
+                                Arc::new(lonewolf_extension::roster::Roster::new())
                             }
                             _ => continue,
                         };

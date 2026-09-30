@@ -18,6 +18,7 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaNamespace, StanzaType};
 
 use crate::hosts::Hosts;
+use crate::order::Order;
 
 pub mod local;
 
@@ -34,6 +35,7 @@ pub struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
     local: LocalRouterHandle<A>,
     extensions: Arc<BTreeMap<String, ExtensionRegistry<A, RedbStorage>>>,
+    order: Arc<Order>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +56,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
             hosts,
             local: local.handle(),
             extensions: Arc::default(),
+            order: Order::new(),
         };
         Self { local, handle }
     }
@@ -81,6 +84,7 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
             hosts: self.hosts.clone(),
             local: self.local.clone(),
             extensions: Arc::clone(&self.extensions),
+            order: Arc::clone(&self.order),
         }
     }
 }
@@ -90,12 +94,20 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.hosts.is_local_host(domain)
     }
 
-    pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A>> {
+    pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A, RedbStorage>> {
         self.extensions.get(domain).map(ExtensionRegistry::iq)
     }
 
-    pub(crate) fn presence_handlers(&self, domain: &str) -> Option<&PresenceRegistry<A>> {
+    pub(crate) fn presence_handlers(
+        &self,
+        domain: &str,
+    ) -> Option<&PresenceRegistry<A, RedbStorage>> {
         self.extensions.get(domain).map(ExtensionRegistry::presence)
+    }
+
+    /// The per-account delivery order shared by every handler on this node.
+    pub(crate) fn order(&self) -> &Arc<Order> {
+        &self.order
     }
 
     /// The extensions enabled for `domain`, or none for an unknown host.

@@ -2,6 +2,7 @@
 
 use std::num::NonZeroUsize;
 
+use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::parser::StreamEvent;
@@ -27,6 +28,7 @@ pub(super) struct Bound<A: ChunkAllocator> {
     pub(super) session: Session<A>,
     pub(super) registration: Registration<A>,
     pub(super) router: RouterHandle<A>,
+    pub(super) storage: RedbStorage,
     pub(super) allocator: A,
     pub(super) resource_requested: bool,
 }
@@ -41,6 +43,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     hosts: &Hosts,
     account: &AccountKey,
     router: &RouterHandle<A>,
+    storage: RedbStorage,
     max_resources_per_account: NonZeroUsize,
     allocator: A,
 ) -> Result<Bound<A>, CloseOutcome> {
@@ -143,6 +146,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
             session,
             registration,
             router: router.clone(),
+            storage,
             allocator,
             resource_requested: requested.is_some(),
         });

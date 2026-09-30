@@ -4,13 +4,18 @@ use std::collections::VecDeque;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
+use std::sync::Arc;
 
 use futures_util::future::{Either, select};
+use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::iq::{IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::presence::{
     PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
+use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::PendingSubscription;
+use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
 use lonewolf_xmpp::parser::{Parsed, ParserConfig, StreamEvent, XmppParser};
@@ -37,6 +42,7 @@ struct BoundSession<A: ChunkAllocator> {
     writer: Writer,
     registration: Registration<A>,
     router: RouterHandle<A>,
+    storage: RedbStorage,
     allocator: A,
     /// Whether this resource currently has presence, mirroring the router's view.
     available: bool,
@@ -65,6 +71,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         session: Session { mut reader, writer },
         registration,
         router,
+        storage,
         allocator,
         resource_requested: _,
     } = bound;
@@ -72,6 +79,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         writer,
         registration,
         router,
+        storage,
         allocator,
         available: false,
         pending_replays: VecDeque::new(),
@@ -156,21 +164,32 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             .router
             .presence_handlers(self.registration.account().domain())
             .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
-        let audience = match handler {
-            None => None,
+        let (audience, mut ticket) = match handler {
+            None => (None, None),
             Some(handler) => {
-                let result = {
-                    let view = unavailable.resolve()?;
-                    let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
-                    handler
-                        .audience(PresenceUpdate {
-                            sender,
-                            transition: PresenceTransition::Unavailable,
-                        })
-                        .await
+                let owner = self.registration.account().clone();
+                let fixed = Arc::clone(self.router.order())
+                    .fix(vec![owner], self.storage.begin_read())
+                    .await;
+                let result = match fixed {
+                    Ok((transaction, ticket)) => {
+                        let view = unavailable.resolve()?;
+                        let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
+                        handler
+                            .audience(
+                                PresenceUpdate {
+                                    sender,
+                                    transition: PresenceTransition::Unavailable,
+                                },
+                                &transaction,
+                            )
+                            .await
+                            .map(|audience| (audience, ticket))
+                    }
+                    Err(_) => Err(StanzaErrorCondition::InternalServerError),
                 };
                 match result {
-                    Ok(audience) => audience,
+                    Ok((audience, ticket)) => (audience, Some(ticket)),
                     Err(_) => {
                         let _ = self.registration.finish_presence().await;
                         return Err(CloseOutcome::InternalError);
@@ -178,9 +197,12 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 }
             }
         };
+        if let Some(ticket) = ticket.as_mut() {
+            ticket.turn().await;
+        }
         let result = match &audience {
             None => Ok(()),
-            // The audience holds an ordering guard that blocks replacement updates until delivery ends.
+            // The ticket keeps replacement updates behind this broadcast until it ends.
             Some(audience) => match self.registration.replacement_is_available().await {
                 Ok(true) => Ok(()),
                 Ok(false) => self
@@ -197,6 +219,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             .await
             .map_err(|_| CloseOutcome::InternalError);
         drop(audience);
+        drop(ticket);
         result.and(finished)
     }
 
@@ -244,12 +267,115 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
     }
 
+    /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
+    /// transaction for a set. The reply and the handler's effects run once the ticket taken
+    /// with that view comes up, so a client sees them in the order storage applied them.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
-        let (reply, arena) = iq::reply(parsed, &self.registration, &self.router, &self.allocator)
-            .await
-            .map_err(|_| CloseOutcome::InternalError)?;
-        let reply = reply.resolve(&arena)?;
-        self.writer.send_stanza(&reply).await
+        let (request, mut arena) = parsed.into_parts();
+        let route = iq::route(&request, &mut arena, &self.registration)?;
+        let order = Arc::clone(self.router.order());
+        let mut response = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+        let sender = route.sender.resolve(&arena)?;
+        let stanza = request.resolve(&arena)?;
+        let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+        let payload = stanza
+            .children()?
+            .next()
+            .transpose()?
+            .ok_or(CloseOutcome::InternalError)?;
+        let handler = route.scope.and_then(|scope| {
+            self.router.iq_handlers(target.domainpart())?.find(
+                scope,
+                route.kind,
+                payload.namespace(),
+                payload.name(),
+            )
+        });
+        let Some(handler) = handler else {
+            let reply = iq::error_reply(
+                &request,
+                &mut arena,
+                StanzaErrorCondition::ServiceUnavailable,
+                None,
+            )?;
+            let reply = reply.resolve(&arena)?;
+            return self.writer.send_stanza(&reply).await;
+        };
+        let accounts = match route.scope {
+            Some(IqScope::Account) => vec![AccountKey::try_from(target.bare())?],
+            Some(IqScope::Server) | None => Vec::new(),
+        };
+        let delivery = RouterDelivery {
+            router: &self.router,
+            allocator: &self.allocator,
+            session: Some(&self.registration),
+        };
+        let iq_request = IqRequest {
+            sender,
+            target,
+            payload,
+        };
+        let handled = match route.kind {
+            IqRequestType::Get => {
+                let (transaction, ticket) = order
+                    .fix(accounts, self.storage.begin_read())
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                let reply = handler.get(iq_request, &transaction, &mut response).await;
+                drop(transaction);
+                reply.map(|reply| (reply, ticket))
+            }
+            IqRequestType::Set => {
+                let mut transaction = self
+                    .storage
+                    .begin_write()
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                match handler
+                    .set(iq_request, &mut transaction, &delivery, &mut response)
+                    .await
+                {
+                    Ok(IqReply {
+                        payload,
+                        effects: Effects { accounts, deliver },
+                    }) => {
+                        let ((), ticket) = order
+                            .fix(accounts, transaction.commit())
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                        Ok((
+                            IqReply {
+                                payload,
+                                effects: Effects {
+                                    accounts: Vec::new(),
+                                    deliver,
+                                },
+                            },
+                            ticket,
+                        ))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match handled {
+            Err(HandlerError::Stanza(condition)) => {
+                let reply = iq::error_reply(&request, &mut arena, condition, Some(route.sender))?;
+                let reply = reply.resolve(&arena)?;
+                self.writer.send_stanza(&reply).await
+            }
+            Ok((IqReply { payload, effects }, mut ticket)) => {
+                let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
+                ticket.turn().await;
+                let reply = reply.resolve(&response)?;
+                self.writer.send_stanza(&reply).await?;
+                (effects.deliver)(&delivery)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                drop(ticket);
+                Ok(())
+            }
+        }
     }
 
     /// Directed presence only enters subscription handling; other directed presence is dropped.
@@ -360,17 +486,23 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 PresenceTransition::Unavailable,
             ),
         };
-        let result = match self
+        let (result, mut ticket) = match self
             .router
             .presence_handlers(self.registration.account().domain())
             .and_then(|handlers| handlers.find(kind))
         {
-            None => Ok(None),
+            None => (Ok(None), None),
             Some(handler) => {
-                let sender = from.resolve(&arena)?;
-                handler
-                    .audience(PresenceUpdate { sender, transition })
+                let owner = self.registration.account().clone();
+                let (transaction, ticket) = Arc::clone(self.router.order())
+                    .fix(vec![owner], self.storage.begin_read())
                     .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                let sender = from.resolve(&arena)?;
+                let result = handler
+                    .audience(PresenceUpdate { sender, transition }, &transaction)
+                    .await;
+                (result, Some(ticket))
             }
         };
         let mut audience = match result {
@@ -380,6 +512,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 return self.reply_error(&routed, condition).await;
             }
         };
+        if let Some(ticket) = ticket.as_mut() {
+            ticket.turn().await;
+        }
         let (routed, unavailable) = match unavailable {
             Some(unavailable) => {
                 let (routed, unavailable) =
@@ -399,8 +534,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             .map_err(|_| CloseOutcome::InternalError)?;
         self.available = priority.is_some();
         if change.became_available {
-            // The audience still holds the ordering guard, so a contact captured here
-            // cannot have revoked the subscription before its presence is written.
+            // The ticket is still held, so a contact captured here cannot have revoked the
+            // subscription before its presence is written.
             let mut replay = Replay::default();
             if let Some(audience) = audience.as_mut() {
                 for contact in &audience.contacts {
@@ -462,6 +597,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         if let Err(condition) = authorized {
             return self.reply_error(&source, condition).await;
         }
+        let order = Arc::clone(self.router.order());
         let received = {
             let (sender, target) = presence_addresses(&routed)?;
             match self
@@ -470,8 +606,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 .and_then(|handlers| handlers.find(kind))
             {
                 Some(target_host) => {
+                    let mut transaction = self
+                        .storage
+                        .begin_write()
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
                     let delivery = self.delivery();
-                    target_host
+                    let effects = target_host
                         .receive(
                             PresenceRequest {
                                 kind,
@@ -479,9 +620,20 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                                 target,
                                 stanza: &routed,
                             },
+                            &mut transaction,
                             &delivery,
                         )
-                        .await
+                        .await;
+                    match effects {
+                        Ok(Effects { accounts, deliver }) => {
+                            let ((), ticket) = order
+                                .fix(accounts, transaction.commit())
+                                .await
+                                .map_err(|_| CloseOutcome::InternalError)?;
+                            Ok((deliver, ticket))
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 None => Err(HandlerError::Stanza(
                     StanzaErrorCondition::ServiceUnavailable,
@@ -489,9 +641,16 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         match received {
-            Ok(()) => Ok(()),
+            Ok((deliver, mut ticket)) => {
+                ticket.turn().await;
+                let delivery = self.delivery();
+                deliver(&delivery)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                drop(ticket);
+                Ok(())
+            }
             Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition).await,
-            Err(HandlerError::Delivery(_)) => Err(CloseOutcome::InternalError),
         }
     }
 

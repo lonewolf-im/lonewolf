@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::delivery::HandlerError;
-use lonewolf_extension::iq::{IqRequest, IqRequestType, IqScope};
+use lonewolf_extension::iq::{IqRequestType, IqScope};
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
-use lonewolf_xmpp::jid::{Jid, JidError};
-use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{BuildError, IqType, Stanza, StanzaErrorCondition, StanzaType};
+use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
+use lonewolf_xmpp::stanza::{
+    BuildError, Element, IqType, Stanza, StanzaErrorCondition, StanzaRef, StanzaType,
+};
 
-use crate::delivery::RouterDelivery;
-use crate::router::{Registration, RouterError, RouterHandle};
+use super::stream::CloseOutcome;
+use crate::router::{Registration, RouterError};
 
 pub(super) struct ReplyError;
+
+impl From<ReplyError> for CloseOutcome {
+    fn from(_: ReplyError) -> Self {
+        Self::InternalError
+    }
+}
 
 impl From<BuildError> for ReplyError {
     fn from(_: BuildError) -> Self {
@@ -42,98 +48,81 @@ impl From<JidError> for ReplyError {
     }
 }
 
-pub(super) async fn reply<A: ChunkAllocator + Clone>(
-    parsed: Parsed<Stanza, A>,
+/// What a request's envelope decides before any handler runs.
+pub(super) struct Route {
+    /// The authenticated full JID, allocated in the request's arena.
+    pub(super) sender: Jid,
+    pub(super) kind: IqRequestType,
+    /// `None` when the destination has a resource, which no handler serves.
+    pub(super) scope: Option<IqScope>,
+}
+
+pub(super) fn route<A: ChunkAllocator>(
+    request: &Stanza,
+    arena: &mut Arena<A>,
     registration: &Registration<A>,
-    router: &RouterHandle<A>,
-    allocator: &A,
-) -> Result<(Stanza, Arena<A>), ReplyError> {
-    let (request, mut arena) = parsed.into_parts();
+) -> Result<Route, ReplyError> {
     let account = registration.account();
-    let sender_jid = Jid::from_trusted_parts_in(
+    let sender = Jid::from_trusted_parts_in(
         Some(account.username()),
         account.domain(),
         Some(registration.resource()),
-        &mut arena,
+        arena,
     )?;
-    let sender = sender_jid.resolve(&arena)?;
-    let stanza = request.resolve(&arena)?;
+    let stanza = request.resolve(arena)?;
     let kind = match stanza.stanza_type() {
         StanzaType::Iq(IqType::Get) => IqRequestType::Get,
         StanzaType::Iq(IqType::Set) => IqRequestType::Set,
         _ => return Err(BuildError::NotIqRequest.into()),
     };
-    let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-    let scope = match (target.localpart(), target.resourcepart()) {
-        (None, None) => Some(IqScope::Server),
-        (Some(_), None) => Some(IqScope::Account),
-        (_, Some(_)) => None,
+    let target = stanza.to()?;
+    let scope = match target {
+        None => Some(IqScope::Account),
+        Some(target) => match (target.localpart(), target.resourcepart()) {
+            (None, None) => Some(IqScope::Server),
+            (Some(_), None) => Some(IqScope::Account),
+            (_, Some(_)) => None,
+        },
     };
-    let payload = stanza
-        .children()?
-        .next()
-        .transpose()?
-        .ok_or(BuildError::InvalidIqPayload)?;
-    let handler = scope.and_then(|scope| {
-        router.iq_handlers(target.domainpart())?.find(
-            scope,
-            kind,
-            payload.namespace(),
-            payload.name(),
-        )
-    });
-    let Some(handler) = handler else {
-        let reply = request
-            .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)?
-            .to(None)?
-            .build()?;
-        return Ok((reply, arena));
-    };
-    let mut response = Arena::try_new_in(Default::default(), allocator.clone())?;
-    let delivery = RouterDelivery {
-        router,
-        allocator,
-        session: Some(registration),
-    };
-    let result = handler
-        .handle(
-            IqRequest {
-                sender,
-                target,
-                kind,
-                payload,
-            },
-            &mut response,
-            &delivery,
-        )
-        .await;
-    let payload = match result {
-        Ok(payload) => payload,
-        Err(HandlerError::Stanza(condition)) => {
-            let reply = request
-                .error_reply_in(&mut arena, condition)?
-                .to(Some(sender_jid))?
-                .build()?;
-            return Ok((reply, arena));
-        }
-        Err(HandlerError::Delivery(_)) => return Err(ReplyError),
-    };
-    let recipient = sender.clone_in(&mut response)?;
-    let from = stanza
+    Ok(Route {
+        sender,
+        kind,
+        scope,
+    })
+}
+
+/// Answers the request with `condition`, addressed to `to` when given.
+pub(super) fn error_reply<A: ChunkAllocator>(
+    request: &Stanza,
+    arena: &mut Arena<A>,
+    condition: StanzaErrorCondition,
+    to: Option<Jid>,
+) -> Result<Stanza, ReplyError> {
+    Ok(request.error_reply_in(arena, condition)?.to(to)?.build()?)
+}
+
+/// Builds the result for `request` in `response`, carrying `payload` when given.
+pub(super) fn result_reply<A: ChunkAllocator>(
+    request: &StanzaRef<'_, Arena<A>>,
+    sender: JidRef<'_>,
+    payload: Option<Element>,
+    response: &mut Arena<A>,
+) -> Result<Stanza, ReplyError> {
+    let recipient = sender.clone_in(response)?;
+    let from = request
         .to()?
-        .map(|from| from.clone_in(&mut response))
+        .map(|from| from.clone_in(response))
         .transpose()?;
     let mut builder = Stanza::builder_in(
         StanzaType::Iq(IqType::Result),
-        stanza.namespace(),
-        &mut response,
+        request.namespace(),
+        response,
     )
-    .id(stanza.id()?)?
+    .id(request.id()?)?
     .from(from)?
     .to(Some(recipient))?;
     if let Some(payload) = payload {
         builder = builder.child(payload)?;
     }
-    let reply = builder.build()?;
-    Ok((reply, response))
+    Ok(builder.build()?)
 }

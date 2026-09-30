@@ -24,9 +24,9 @@ struct Fake {
     presence: &'static [PresenceRequestType],
 }
 
-impl IqHandler<GlobalChunkAllocator> for Fake {}
+impl IqHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
 
-impl PresenceHandler<GlobalChunkAllocator> for Fake {}
+impl PresenceHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
 
 impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
     fn name(&self) -> &'static str {

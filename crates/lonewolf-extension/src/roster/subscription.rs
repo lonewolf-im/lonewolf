@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_storage::WriteTransaction;
 use lonewolf_storage::account::{AccountKey, AccountReads};
-use lonewolf_storage::roster::{RosterError, RosterJid};
-use lonewolf_storage::{Storage, WriteTransaction};
+use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
 use super::state::{self, Cancellation, Removal, RequestOutcome, grants};
-use super::{Roster, account_exists, push_removal, push_roster, require_account, xml};
+use super::{account_exists, push_removal, push_roster, require_account, xml};
+use crate::Effects;
 use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
-use crate::order::OrderGuard;
 use crate::presence::PresenceRequest;
-use crate::{Aftermath, aftermath};
 
 pub(super) struct Parties {
     sender: AccountKey,
@@ -36,252 +35,251 @@ impl Parties {
             target_jid: RosterJid::from(target),
         })
     }
+
+    fn accounts(&self) -> Vec<AccountKey> {
+        vec![self.sender.clone(), self.target.clone()]
+    }
 }
 
-impl<S: Storage> Roster<S> {
-    /// Orders both parties, opens the write transaction, refuses a sender whose account
-    /// is gone, and reports whether the target is stored, so the checks and the writes
-    /// that follow share one transaction under one guard.
-    async fn lock_parties(
-        &self,
-        parties: &Parties,
-    ) -> Result<(OrderGuard, S::Write, bool), HandlerError> {
-        let order = self.order.lock_pair(&parties.sender, &parties.target).await;
-        let transaction = self.begin_write().await?;
-        require_account(&transaction, &parties.sender).await?;
-        let target_exists = account_exists(&transaction, &parties.target).await?;
-        Ok((order, transaction, target_exists))
-    }
+/// Refuses a sender whose account is gone and reports whether the target is stored.
+async fn check_parties(
+    transaction: &impl AccountReads,
+    parties: &Parties,
+) -> Result<bool, StanzaErrorCondition> {
+    require_account(transaction, &parties.sender).await?;
+    account_exists(transaction, &parties.target).await
+}
 
-    /// Orders the owner with the account a contact JID names on this server, if any,
-    /// opens the write transaction, and resolves that account through it.
-    async fn lock_with_contact<A: ChunkAllocator>(
-        &self,
-        owner: &AccountKey,
-        contact: &RosterJid,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(OrderGuard, S::Write, Option<AccountKey>), HandlerError> {
-        let candidate = local_candidate(contact, delivery);
-        let order = match &candidate {
-            Some(candidate) => self.order.lock_pair(owner, candidate).await,
-            None => self.order.lock(owner).await,
-        };
-        let transaction = self.begin_write().await?;
-        let contact = match candidate {
-            Some(candidate) if account_exists(&transaction, &candidate).await? => Some(candidate),
-            _ => None,
-        };
-        Ok((order, transaction, contact))
+pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    transaction: &mut W,
+    parties: Parties,
+    stanza: &RoutedStanza<A>,
+) -> Result<Effects<A>, HandlerError> {
+    if !check_parties(transaction, &parties).await? {
+        return Err(StanzaErrorCondition::ServiceUnavailable.into());
     }
-
-    pub(super) async fn request_subscription<A: ChunkAllocator>(
-        &self,
-        parties: Parties,
-        stanza: &RoutedStanza<A>,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let (_order, mut transaction, target_exists) = self.lock_parties(&parties).await?;
-        if !target_exists {
+    let mut request = String::new();
+    stanza
+        .resolve()
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+        .write_xml(&mut request)
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    let accounts = parties.accounts();
+    let Parties {
+        sender,
+        target,
+        sender_jid,
+        target_jid,
+    } = parties;
+    let outcome = match state::request_subscription(
+        transaction,
+        &sender,
+        sender_jid,
+        &target,
+        &target_jid,
+        request.into_bytes().into_boxed_slice(),
+    )
+    .await?
+    {
+        RequestOutcome::ContactMissing => {
             return Err(StanzaErrorCondition::ServiceUnavailable.into());
         }
-        let mut request = String::new();
-        stanza
-            .resolve()
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?
-            .write_xml(&mut request)
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-        let outcome = match state::request_subscription(
-            &mut transaction,
-            &parties.sender,
-            parties.sender_jid,
-            &parties.target,
-            &parties.target_jid,
-            request.into_bytes().into_boxed_slice(),
-        )
-        .await?
-        {
-            RequestOutcome::ContactMissing => {
-                return Err(StanzaErrorCondition::ServiceUnavailable.into());
-            }
-            outcome => outcome,
-        };
-        transaction.commit().await.map_err(RosterError::from)?;
-        match outcome {
-            RequestOutcome::Pending { push } => {
-                delivery.to_available(stanza.clone()).await?;
-                if let Some(mutation) = push {
-                    push_roster(&parties.sender, mutation, delivery).await?;
+        outcome => outcome,
+    };
+    let stanza = stanza.clone();
+    Ok(Effects::new(accounts, move |delivery| {
+        Box::pin(async move {
+            match outcome {
+                RequestOutcome::Pending { push } => {
+                    delivery.to_available(stanza).await?;
+                    if let Some(mutation) = push {
+                        push_roster(&sender, mutation, delivery).await?;
+                    }
+                    Ok(())
                 }
+                RequestOutcome::AutoApproved {
+                    approved: Some(mutation),
+                } => {
+                    let approval = xml::approval_reply(&stanza, delivery.arena()?)?;
+                    delivery.to_tagged(SessionTag::Interested, approval).await?;
+                    push_roster(&sender, mutation, delivery).await?;
+                    delivery.current_presence(&target, &sender).await
+                }
+                RequestOutcome::AutoApproved { approved: None }
+                | RequestOutcome::ContactMissing => Ok(()),
             }
-            RequestOutcome::AutoApproved {
-                approved: Some(mutation),
-            } => {
-                let approval = xml::approval_reply(stanza, delivery.arena()?)?;
-                delivery.to_tagged(SessionTag::Interested, approval).await?;
-                push_roster(&parties.sender, mutation, delivery).await?;
-                delivery
-                    .current_presence(&parties.target, &parties.sender)
-                    .await?;
-            }
-            RequestOutcome::AutoApproved { approved: None } | RequestOutcome::ContactMissing => {}
-        }
-        Ok(())
-    }
-
-    pub(super) async fn approve_subscription<A: ChunkAllocator>(
-        &self,
-        parties: Parties,
-        stanza: &RoutedStanza<A>,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let (_order, mut transaction, target_exists) = self.lock_parties(&parties).await?;
-        if !target_exists {
-            return Ok(());
-        }
-        let target = state::update_subscription(
-            &mut transaction,
-            &parties.target,
-            &parties.sender_jid,
-            state::approve_pending_out,
-        )
-        .await?;
-        let sender = state::resolve_pending(
-            &mut transaction,
-            &parties.sender,
-            &parties.target_jid,
-            state::grant,
-        )
-        .await?;
-        transaction.commit().await.map_err(RosterError::from)?;
-        if let Some(mutation) = target {
-            delivery
-                .to_tagged(SessionTag::Interested, stanza.clone())
-                .await?;
-            push_roster(&parties.target, mutation, delivery).await?;
-        }
-        if let Some(mutation) = sender {
-            push_roster(&parties.sender, mutation, delivery).await?;
-            delivery
-                .current_presence(&parties.sender, &parties.target)
-                .await?;
-        }
-        Ok(())
-    }
-
-    pub(super) async fn cancel_subscription<A: ChunkAllocator>(
-        &self,
-        parties: Parties,
-        stanza: &RoutedStanza<A>,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let (_order, mut transaction, subscriber_exists) = self.lock_parties(&parties).await?;
-        let outcome = state::cancel_subscription(
-            &mut transaction,
-            &parties.sender,
-            &parties.target_jid,
-            subscriber_exists.then_some((&parties.target, &parties.sender_jid)),
-        )
-        .await?;
-        transaction.commit().await.map_err(RosterError::from)?;
-        if outcome.send_unavailable {
-            delivery
-                .unavailable_presence(&parties.sender, &parties.target)
-                .await?;
-        }
-        if outcome.route {
-            delivery
-                .to_tagged(SessionTag::Interested, stanza.clone())
-                .await?;
-        }
-        if let Some(mutation) = outcome.subscriber {
-            push_roster(&parties.target, mutation, delivery).await?;
-        }
-        if let Some(mutation) = outcome.grantor {
-            push_roster(&parties.sender, mutation, delivery).await?;
-        }
-        Ok(())
-    }
-
-    pub(super) async fn withdraw_subscription<A: ChunkAllocator>(
-        &self,
-        parties: Parties,
-        stanza: &RoutedStanza<A>,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let (_order, mut transaction, contact_exists) = self.lock_parties(&parties).await?;
-        let outcome = state::unsubscribe(
-            &mut transaction,
-            &parties.sender,
-            &parties.target_jid,
-            contact_exists.then_some((&parties.target, &parties.sender_jid)),
-        )
-        .await?;
-        transaction.commit().await.map_err(RosterError::from)?;
-        if outcome.notify_contact {
-            delivery
-                .to_tagged(SessionTag::Interested, stanza.clone())
-                .await?;
-        }
-        if let Some(mutation) = outcome.contact {
-            push_roster(&parties.target, mutation, delivery).await?;
-        }
-        if let Some(mutation) = outcome.subscriber {
-            push_roster(&parties.sender, mutation, delivery).await?;
-        }
-        if outcome.notify_contact {
-            delivery
-                .unavailable_presence(&parties.target, &parties.sender)
-                .await?;
-        }
-        Ok(())
-    }
+        })
+    }))
 }
 
-impl<S: Storage> Roster<S> {
-    /// Removes an item and, for a local contact, withdraws and cancels the subscriptions
-    /// the two rosters record, in the order the separate presence flows use.
-    pub(super) async fn remove_item<A: ChunkAllocator>(
-        &self,
-        owner: AccountKey,
-        contact: RosterJid,
-        owner_jid: RosterJid,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let (_order, mut transaction, contact_account) =
-            self.lock_with_contact(&owner, &contact, delivery).await?;
-        require_account(&transaction, &owner).await?;
-        let removal = state::remove_item(
-            &mut transaction,
-            &owner,
-            &owner_jid,
-            &contact,
-            contact_account.as_ref(),
-        )
-        .await?
-        .ok_or(StanzaErrorCondition::ItemNotFound)?;
-        transaction.commit().await.map_err(RosterError::from)?;
-        push_removal(&owner, contact, removal.version, delivery).await?;
-        if let Some(contact_account) = contact_account {
-            let contact_granted =
-                notify_removed_contact(&owner, &contact_account, removal, delivery).await?;
-            if contact_granted {
-                delivery
-                    .unavailable_presence(&contact_account, &owner)
-                    .await?;
-            }
-        }
-        Ok(())
+pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    transaction: &mut W,
+    parties: Parties,
+    stanza: &RoutedStanza<A>,
+) -> Result<Effects<A>, HandlerError> {
+    if !check_parties(transaction, &parties).await? {
+        return Ok(Effects::none());
     }
+    let accounts = parties.accounts();
+    let Parties {
+        sender,
+        target,
+        sender_jid,
+        target_jid,
+    } = parties;
+    let target_mutation = state::update_subscription(
+        transaction,
+        &target,
+        &sender_jid,
+        state::approve_pending_out,
+    )
+    .await?;
+    let sender_mutation =
+        state::resolve_pending(transaction, &sender, &target_jid, state::grant).await?;
+    let stanza = stanza.clone();
+    Ok(Effects::new(accounts, move |delivery| {
+        Box::pin(async move {
+            if let Some(mutation) = target_mutation {
+                delivery.to_tagged(SessionTag::Interested, stanza).await?;
+                push_roster(&target, mutation, delivery).await?;
+            }
+            if let Some(mutation) = sender_mutation {
+                push_roster(&sender, mutation, delivery).await?;
+                delivery.current_presence(&sender, &target).await?;
+            }
+            Ok(())
+        })
+    }))
+}
+
+pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    transaction: &mut W,
+    parties: Parties,
+    stanza: &RoutedStanza<A>,
+) -> Result<Effects<A>, HandlerError> {
+    let subscriber_exists = check_parties(transaction, &parties).await?;
+    let accounts = parties.accounts();
+    let Parties {
+        sender,
+        target,
+        sender_jid,
+        target_jid,
+    } = parties;
+    let outcome = state::cancel_subscription(
+        transaction,
+        &sender,
+        &target_jid,
+        subscriber_exists.then_some((&target, &sender_jid)),
+    )
+    .await?;
+    let stanza = stanza.clone();
+    Ok(Effects::new(accounts, move |delivery| {
+        Box::pin(async move {
+            if outcome.send_unavailable {
+                delivery.unavailable_presence(&sender, &target).await?;
+            }
+            if outcome.route {
+                delivery.to_tagged(SessionTag::Interested, stanza).await?;
+            }
+            if let Some(mutation) = outcome.subscriber {
+                push_roster(&target, mutation, delivery).await?;
+            }
+            if let Some(mutation) = outcome.grantor {
+                push_roster(&sender, mutation, delivery).await?;
+            }
+            Ok(())
+        })
+    }))
+}
+
+pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    transaction: &mut W,
+    parties: Parties,
+    stanza: &RoutedStanza<A>,
+) -> Result<Effects<A>, HandlerError> {
+    let contact_exists = check_parties(transaction, &parties).await?;
+    let accounts = parties.accounts();
+    let Parties {
+        sender,
+        target,
+        sender_jid,
+        target_jid,
+    } = parties;
+    let outcome = state::unsubscribe(
+        transaction,
+        &sender,
+        &target_jid,
+        contact_exists.then_some((&target, &sender_jid)),
+    )
+    .await?;
+    let stanza = stanza.clone();
+    Ok(Effects::new(accounts, move |delivery| {
+        Box::pin(async move {
+            if outcome.notify_contact {
+                delivery.to_tagged(SessionTag::Interested, stanza).await?;
+            }
+            if let Some(mutation) = outcome.contact {
+                push_roster(&target, mutation, delivery).await?;
+            }
+            if let Some(mutation) = outcome.subscriber {
+                push_roster(&sender, mutation, delivery).await?;
+            }
+            if outcome.notify_contact {
+                delivery.unavailable_presence(&target, &sender).await?;
+            }
+            Ok(())
+        })
+    }))
+}
+
+/// Removes an item and, for a local contact, withdraws and cancels the subscriptions
+/// the two rosters record, in the order the separate presence flows use.
+pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
+    transaction: &mut W,
+    owner: AccountKey,
+    contact: RosterJid,
+    owner_jid: RosterJid,
+    hosts: &dyn HostLookup,
+) -> Result<Effects<A>, HandlerError> {
+    require_account(transaction, &owner).await?;
+    let contact_account = stored_local_account(transaction, &contact, hosts).await?;
+    let removal = state::remove_item(
+        transaction,
+        &owner,
+        &owner_jid,
+        &contact,
+        contact_account.as_ref(),
+    )
+    .await?
+    .ok_or(StanzaErrorCondition::ItemNotFound)?;
+    let mut accounts = vec![owner.clone()];
+    accounts.extend(contact_account.clone());
+    Ok(Effects::new(accounts, move |delivery| {
+        Box::pin(async move {
+            push_removal(&owner, contact, removal.version, delivery).await?;
+            if let Some(contact_account) = contact_account {
+                let contact_granted =
+                    notify_removed_contact(&owner, &contact_account, removal, delivery).await?;
+                if contact_granted {
+                    delivery
+                        .unavailable_presence(&contact_account, &owner)
+                        .await?;
+                }
+            }
+            Ok(())
+        })
+    }))
 }
 
 /// Clears every trace of a deleted account inside the deletion's transaction: its own
 /// roster and pending requests, and the subscriptions and requests its local contacts
-/// held with it. Returns what the contacts receive once the deletion commits.
+/// held with it. The effects tell every contact what it lost; a failed delivery does
+/// not stop the others, and the first failure is reported at the end.
 pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
     transaction: &mut W,
     account: &AccountKey,
     hosts: &dyn HostLookup,
-) -> Result<Aftermath<A>, HandlerError> {
+) -> Result<Effects<A>, HandlerError> {
     let account_jid = RosterJid::from(account);
     let items = transaction.roster(account).await?.items;
     let requests = transaction.pending_requests(account).await?;
@@ -315,20 +313,29 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
         }
     }
     transaction.clear_roster(account).await?;
+    let mut accounts = Vec::with_capacity(1 + removals.len() + cancellations.len());
+    accounts.push(account.clone());
+    accounts.extend(removals.iter().map(|(contact, _)| contact.clone()));
+    accounts.extend(cancellations.iter().map(|(sender, _)| sender.clone()));
     let owner = account.clone();
-    Ok(aftermath(move |delivery| {
+    Ok(Effects::new(accounts, move |delivery| {
         Box::pin(async move {
             let mut failure = None;
             for (contact, removal) in removals {
-                let result = notify_removed_contact(&owner, &contact, removal, delivery).await;
-                record_delivery_failure(result.map(|_| ()), &mut failure)?;
+                if let Err(error) =
+                    notify_removed_contact(&owner, &contact, removal, delivery).await
+                {
+                    failure.get_or_insert(error);
+                }
             }
             for (sender, cancellation) in cancellations {
-                let result =
-                    notify_cancelled_requester(&owner, &sender, cancellation, delivery).await;
-                record_delivery_failure(result, &mut failure)?;
+                if let Err(error) =
+                    notify_cancelled_requester(&owner, &sender, cancellation, delivery).await
+                {
+                    failure.get_or_insert(error);
+                }
             }
-            failure.map_or(Ok(()), |error| Err(HandlerError::Delivery(error)))
+            failure.map_or(Ok(()), Err)
         })
     }))
 }
@@ -351,7 +358,7 @@ async fn notify_cancelled_requester<A: ChunkAllocator>(
     sender: &AccountKey,
     cancellation: Cancellation,
     delivery: &dyn Delivery<A>,
-) -> Result<(), HandlerError> {
+) -> Result<(), DeliveryError> {
     if cancellation.route {
         let (_, cancelled) = xml::subscription_withdrawals(owner, sender, delivery.arena()?)?;
         delivery
@@ -372,7 +379,7 @@ async fn notify_removed_contact<A: ChunkAllocator>(
     contact: &AccountKey,
     removal: Removal,
     delivery: &dyn Delivery<A>,
-) -> Result<bool, HandlerError> {
+) -> Result<bool, DeliveryError> {
     let owner_granted = grants(removal.subscription.state);
     let contact_granted = grants(removal.contact_before.unwrap_or_default().state);
     let cancel = owner_granted || removal.pending_request;
@@ -404,19 +411,4 @@ fn local_candidate(jid: &RosterJid, hosts: &dyn HostLookup) -> Option<AccountKey
     AccountKey::try_from(jid)
         .ok()
         .filter(|account| hosts.is_local_host(account.domain()))
-}
-
-/// Keeps the first delivery failure for later and surfaces every other error at once.
-fn record_delivery_failure(
-    result: Result<(), HandlerError>,
-    failure: &mut Option<DeliveryError>,
-) -> Result<(), HandlerError> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(HandlerError::Delivery(error)) => {
-            failure.get_or_insert(error);
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
 }

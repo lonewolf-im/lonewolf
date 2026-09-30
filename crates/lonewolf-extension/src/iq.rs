@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
+use lonewolf_storage::Storage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
 
-use crate::delivery::{Delivery, HandlerError};
-use crate::{ExtensionFuture, RegistrationError};
+use crate::delivery::{HandlerError, HostLookup};
+use crate::{Effects, ExtensionFuture, RegistrationError};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IqScope {
@@ -34,34 +35,55 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub sender: JidRef<'a>,
     /// An omitted destination resolves to the authenticated account's bare JID.
     pub target: JidRef<'a>,
-    pub kind: IqRequestType,
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
-pub type IqResult = Result<Option<Element>, HandlerError>;
-pub type IqFuture<'a> = ExtensionFuture<'a, IqResult>;
+/// The result payload and the deliveries that follow a handled IQ.
+pub struct IqReply<A> {
+    pub payload: Option<Element>,
+    pub effects: Effects<A>,
+}
 
-pub trait IqHandler<A: ChunkAllocator>: Send + Sync {
-    /// Authorize access to `request.target` using `request.sender`.
-    /// Allocate the response payload in `response` and perform side effects
-    /// through `delivery` before returning.
-    /// The future runs on the connection's worker and can be cancelled on shutdown.
-    /// The default answers `service-unavailable` for extensions without IQ routes.
-    fn handle<'a>(
+impl<A: ChunkAllocator> IqReply<A> {
+    pub fn new(payload: Option<Element>, effects: Effects<A>) -> Self {
+        Self { payload, effects }
+    }
+}
+
+pub type IqFuture<'a, A> = ExtensionFuture<'a, Result<IqReply<A>, HandlerError>>;
+
+/// Every future runs on the connection worker and can be cancelled on shutdown.
+/// Handlers authorize `request.target` against `request.sender` themselves. The
+/// defaults answer `service-unavailable` for extensions without IQ routes.
+pub trait IqHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
+    /// Answers a `get` from one consistent snapshot. The result payload is allocated in
+    /// `response`; the effects may address only the target account.
+    fn get<'a>(
         &'a self,
         _request: IqRequest<'a, A>,
+        _transaction: &'a S::Read,
         _response: &'a mut Arena<A>,
-        _delivery: &'a dyn Delivery<A>,
-    ) -> IqFuture<'a> {
+    ) -> IqFuture<'a, A> {
+        Box::pin(async { Err(StanzaErrorCondition::ServiceUnavailable.into()) })
+    }
+
+    /// Applies a `set` inside the transaction; the reply and the effects follow its commit.
+    fn set<'a>(
+        &'a self,
+        _request: IqRequest<'a, A>,
+        _transaction: &'a mut S::Write,
+        _hosts: &'a dyn HostLookup,
+        _response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
         Box::pin(async { Err(StanzaErrorCondition::ServiceUnavailable.into()) })
     }
 }
 
-pub struct IqRegistry<A: ChunkAllocator> {
-    handlers: Vec<(IqRoute, Arc<dyn IqHandler<A>>)>,
+pub struct IqRegistry<A: ChunkAllocator, S: Storage> {
+    handlers: Vec<(IqRoute, Arc<dyn IqHandler<A, S>>)>,
 }
 
-impl<A: ChunkAllocator> Default for IqRegistry<A> {
+impl<A: ChunkAllocator, S: Storage> Default for IqRegistry<A, S> {
     fn default() -> Self {
         Self {
             handlers: Vec::new(),
@@ -69,11 +91,11 @@ impl<A: ChunkAllocator> Default for IqRegistry<A> {
     }
 }
 
-impl<A: ChunkAllocator> IqRegistry<A> {
+impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
     pub(crate) fn register(
         &mut self,
         route: IqRoute,
-        handler: Arc<dyn IqHandler<A>>,
+        handler: Arc<dyn IqHandler<A, S>>,
     ) -> Result<(), RegistrationError> {
         match self
             .handlers
@@ -93,7 +115,7 @@ impl<A: ChunkAllocator> IqRegistry<A> {
         kind: IqRequestType,
         namespace: &str,
         name: &str,
-    ) -> Option<&dyn IqHandler<A>> {
+    ) -> Option<&dyn IqHandler<A, S>> {
         let index = self
             .handlers
             .binary_search_by(|(route, _)| {
@@ -106,7 +128,7 @@ impl<A: ChunkAllocator> IqRegistry<A> {
 
     pub(crate) fn registrations(
         &self,
-    ) -> impl Iterator<Item = (IqRoute, Arc<dyn IqHandler<A>>)> + '_ {
+    ) -> impl Iterator<Item = (IqRoute, Arc<dyn IqHandler<A, S>>)> + '_ {
         self.handlers
             .iter()
             .map(|(route, handler)| (*route, Arc::clone(handler)))

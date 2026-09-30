@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
+use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{PresenceType, RoutedStanza, StanzaErrorCondition};
 
-use crate::delivery::{Delivery, HandlerError};
-use crate::order::OrderGuard;
-use crate::{ExtensionFuture, RegistrationError};
+use crate::delivery::{HandlerError, HostLookup};
+use crate::{Effects, ExtensionFuture, RegistrationError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresenceRequestType {
@@ -74,7 +74,6 @@ pub struct PresenceRequest<'a, A: ChunkAllocator> {
 
 /// The recipients of an availability change.
 pub struct PresenceAudience {
-    _order: Option<OrderGuard>,
     /// Bare JIDs that receive the resource's availability.
     pub subscribers: Vec<RosterJid>,
     /// Stored subscription requests to replay once the resource becomes available.
@@ -83,33 +82,18 @@ pub struct PresenceAudience {
     pub contacts: Vec<AccountKey>,
 }
 
-impl PresenceAudience {
-    /// The order guard is released when the audience is dropped, after the server broadcast.
-    pub fn new(
-        order: Option<OrderGuard>,
-        subscribers: Vec<RosterJid>,
-        pending: Vec<PendingSubscription>,
-        contacts: Vec<AccountKey>,
-    ) -> Self {
-        Self {
-            _order: order,
-            subscribers,
-            pending,
-            contacts,
-        }
-    }
-}
-
 pub type PresenceFuture<'a, T> = ExtensionFuture<'a, Result<T, StanzaErrorCondition>>;
-pub type ReceiveFuture<'a> = ExtensionFuture<'a, Result<(), HandlerError>>;
+pub type ReceiveFuture<'a, A> = ExtensionFuture<'a, Result<Effects<A>, HandlerError>>;
 
 /// Every future runs on the connection worker and can be cancelled on shutdown.
 /// A stanza error condition is answered to the request sender.
-pub trait PresenceHandler<A: ChunkAllocator>: Send + Sync {
-    /// Selects who receives an availability change; the server performs the broadcast.
+pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
+    /// Selects who receives an availability change from one consistent snapshot; the
+    /// server performs the broadcast in order with the sender's other deliveries.
     fn audience<'a>(
         &'a self,
         _update: PresenceUpdate<'a>,
+        _transaction: &'a S::Read,
     ) -> PresenceFuture<'a, Option<PresenceAudience>> {
         Box::pin(async { Ok(None) })
     }
@@ -119,21 +103,23 @@ pub trait PresenceHandler<A: ChunkAllocator>: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Applies a subscription presence on the target's host and performs its deliveries.
+    /// Applies a subscription presence on the target's host inside the transaction and
+    /// returns what to deliver once it commits.
     fn receive<'a>(
         &'a self,
         _request: PresenceRequest<'a, A>,
-        _delivery: &'a dyn Delivery<A>,
-    ) -> ReceiveFuture<'a> {
+        _transaction: &'a mut S::Write,
+        _hosts: &'a dyn HostLookup,
+    ) -> ReceiveFuture<'a, A> {
         Box::pin(async { Err(StanzaErrorCondition::ServiceUnavailable.into()) })
     }
 }
 
-pub struct PresenceRegistry<A: ChunkAllocator> {
-    handlers: [Option<Arc<dyn PresenceHandler<A>>>; PresenceRequestType::ALL.len()],
+pub struct PresenceRegistry<A: ChunkAllocator, S: Storage> {
+    handlers: [Option<Arc<dyn PresenceHandler<A, S>>>; PresenceRequestType::ALL.len()],
 }
 
-impl<A: ChunkAllocator> Default for PresenceRegistry<A> {
+impl<A: ChunkAllocator, S: Storage> Default for PresenceRegistry<A, S> {
     fn default() -> Self {
         Self {
             handlers: [const { None }; PresenceRequestType::ALL.len()],
@@ -141,11 +127,11 @@ impl<A: ChunkAllocator> Default for PresenceRegistry<A> {
     }
 }
 
-impl<A: ChunkAllocator> PresenceRegistry<A> {
+impl<A: ChunkAllocator, S: Storage> PresenceRegistry<A, S> {
     pub(crate) fn register(
         &mut self,
         kind: PresenceRequestType,
-        handler: Arc<dyn PresenceHandler<A>>,
+        handler: Arc<dyn PresenceHandler<A, S>>,
     ) -> Result<(), RegistrationError> {
         let slot = &mut self.handlers[kind as usize];
         if slot.is_some() {
@@ -155,13 +141,13 @@ impl<A: ChunkAllocator> PresenceRegistry<A> {
         Ok(())
     }
 
-    pub fn find(&self, kind: PresenceRequestType) -> Option<&dyn PresenceHandler<A>> {
+    pub fn find(&self, kind: PresenceRequestType) -> Option<&dyn PresenceHandler<A, S>> {
         self.handlers[kind as usize].as_deref()
     }
 
     pub(crate) fn registrations(
         &self,
-    ) -> impl Iterator<Item = (PresenceRequestType, Arc<dyn PresenceHandler<A>>)> + '_ {
+    ) -> impl Iterator<Item = (PresenceRequestType, Arc<dyn PresenceHandler<A, S>>)> + '_ {
         PresenceRequestType::ALL
             .into_iter()
             .zip(&self.handlers)

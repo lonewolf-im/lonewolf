@@ -14,8 +14,10 @@ pub(super) enum Answer {
 }
 
 /// A removal cannot be expressed as a push without a record of what was removed, so a
-/// client whose version predates the last removal receives the whole roster instead.
-pub(super) fn answer(known: Option<&str>, snapshot: &RosterSnapshot) -> Answer {
+/// client whose version predates the last removal receives the whole roster instead. So
+/// does a client with deliveries queued ahead of the reply: a replay would repeat what
+/// those deliveries carry, or send older changes after them.
+pub(super) fn answer(known: Option<&str>, snapshot: &RosterSnapshot, preceded: bool) -> Answer {
     let Some(known) = known else {
         return Answer::Full { stamped: false };
     };
@@ -24,7 +26,7 @@ pub(super) fn answer(known: Option<&str>, snapshot: &RosterSnapshot) -> Answer {
     };
     if known == snapshot.version {
         Answer::Unchanged
-    } else if known < snapshot.version && known >= snapshot.last_removal {
+    } else if known < snapshot.version && known >= snapshot.last_removal && !preceded {
         Answer::Changes { since: known }
     } else {
         Answer::Full { stamped: true }

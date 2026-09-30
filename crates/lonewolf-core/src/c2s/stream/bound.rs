@@ -268,12 +268,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 
     /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. The effects run under the ticket taken with that view, on a
-    /// task that outlives this stream, so retiring the session cannot lose them. The
-    /// reply is written after the ticket is released, so a socket that stops taking data
-    /// holds no account's line, and a reply that fails to write cannot lose committed
-    /// effects. Deliveries queued when the ticket turned predate that view, so they are
-    /// written ahead of the reply.
+    /// transaction for a set. The effects run under the ticket taken with that view; a
+    /// set's run on a task that outlives this stream, so retiring the session cannot lose
+    /// them, while a get commits nothing and needs no such care. The reply is written
+    /// after the ticket is released, so a socket that stops taking data holds no
+    /// account's line, and a reply that fails to write cannot lose committed effects.
+    /// Deliveries queued when the ticket turned predate that view, so they are written
+    /// ahead of the reply, and a get learns of them before it answers.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -310,20 +311,36 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             Some(IqScope::Server) | None => Vec::new(),
         };
         let delivery = self.delivery();
-        let iq_request = IqRequest {
-            sender,
-            target,
-            payload,
-        };
         let handled = match route.kind {
             IqRequestType::Get => {
-                let (transaction, ticket) = order
+                let (transaction, mut ticket) = order
                     .fix(accounts, self.storage.begin_read())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
+                ticket.turn().await;
+                let queued = self.registration.take_queued();
+                let iq_request = IqRequest {
+                    sender,
+                    target,
+                    payload,
+                    preceded: !queued.is_empty(),
+                };
                 let reply = handler.get(iq_request, &transaction, &mut response).await;
                 drop(transaction);
-                reply.map(|reply| (reply, ticket))
+                match reply {
+                    Ok(IqReply {
+                        payload,
+                        followups,
+                        effects,
+                    }) => {
+                        (effects.deliver)(&delivery)
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                        drop(ticket);
+                        Ok((payload, followups, queued))
+                    }
+                    Err(error) => Err(error),
+                }
             }
             IqRequestType::Set => {
                 let mut transaction = self
@@ -331,6 +348,12 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     .begin_write()
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
+                let iq_request = IqRequest {
+                    sender,
+                    target,
+                    payload,
+                    preceded: false,
+                };
                 match handler
                     .set(iq_request, &mut transaction, &delivery, &mut response)
                     .await
@@ -344,17 +367,15 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                             .fix(accounts, transaction.commit())
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?;
-                        Ok((
-                            IqReply {
-                                payload,
-                                followups,
-                                effects: Effects {
-                                    accounts: Vec::new(),
-                                    deliver,
-                                },
-                            },
+                        let queued = deliver_committed(
                             ticket,
-                        ))
+                            deliver,
+                            delivery,
+                            Some(self.registration.mailbox()),
+                        )
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                        Ok((payload, followups, queued))
                     }
                     Err(error) => Err(error),
                 }
@@ -366,23 +387,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 let reply = reply.resolve(&arena)?;
                 self.writer.send_stanza(&reply).await
             }
-            Ok((
-                IqReply {
-                    payload,
-                    followups,
-                    effects,
-                },
-                ticket,
-            )) => {
+            Ok((payload, followups, queued)) => {
                 let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
-                let queued = deliver_committed(
-                    ticket,
-                    effects.deliver,
-                    delivery,
-                    Some(self.registration.mailbox()),
-                )
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
                 for delivery in queued {
                     self.deliver(delivery).await?;
                 }

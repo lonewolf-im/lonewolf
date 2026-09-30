@@ -171,6 +171,7 @@ struct IqCall {
     response: Arena<GlobalChunkAllocator>,
     sender: Jid,
     query: Element,
+    preceded: bool,
 }
 
 impl IqCall {
@@ -213,6 +214,7 @@ impl IqCall {
             response,
             sender,
             query,
+            preceded: false,
         }
     }
 
@@ -234,6 +236,7 @@ impl IqCall {
             sender,
             target: sender.bare(),
             payload,
+            preceded: self.preceded,
         };
         match kind {
             IqRequestType::Get => {
@@ -288,7 +291,17 @@ fn roster_get(
     ver: Option<&str>,
     delivery: &RecordingDelivery,
 ) -> (Option<String>, Vec<String>) {
+    roster_get_after(roster, ver, false, delivery)
+}
+
+fn roster_get_after(
+    roster: &TestRoster,
+    ver: Option<&str>,
+    preceded: bool,
+    delivery: &RecordingDelivery,
+) -> (Option<String>, Vec<String>) {
     let mut call = ver.map_or_else(|| IqCall::new(""), IqCall::versioned);
+    call.preceded = preceded;
     let reply = block_on(call.handle(roster, IqRequestType::Get, delivery))
         .unwrap_or_else(|error| panic!("{error:?}"));
     block_on((reply.effects.deliver)(delivery)).unwrap_or_else(|error| panic!("{error}"));
@@ -536,6 +549,27 @@ fn versioned_roster_get_answers_from_the_version_the_client_holds() {
     );
     assert!(pushes[1].contains(r#"ver="2""#), "{pushes:?}");
     assert!(delivery.pushes.borrow().is_empty());
+}
+
+#[test]
+fn versioned_roster_get_preceded_by_deliveries_returns_the_whole_roster() {
+    let (_directory, roster) = roster();
+    let alice = account("alice@example.com");
+    create_account(&roster, &alice);
+    put_item(&roster, &alice, "bob@example.com");
+    put_item(&roster, &alice, "carol@example.com");
+    let delivery = RecordingDelivery::default();
+
+    let (payload, followups) = roster_get_after(&roster, Some("0"), true, &delivery);
+    let payload = payload.unwrap_or_else(|| panic!("no payload"));
+    assert!(payload.contains(r#"ver="2""#), "{payload}");
+    assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
+    assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
+    assert!(followups.is_empty(), "{followups:?}");
+
+    let (payload, followups) = roster_get_after(&roster, Some("2"), true, &delivery);
+    assert!(payload.is_none(), "{payload:?}");
+    assert!(followups.is_empty(), "{followups:?}");
 }
 
 #[test]

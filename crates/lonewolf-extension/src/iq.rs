@@ -36,6 +36,11 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     /// An omitted destination resolves to the authenticated account's bare JID.
     pub target: JidRef<'a>,
     pub payload: ElementRef<'a, Arena<A>>,
+    /// Whether deliveries addressed to the requesting resource were queued before this
+    /// request's view of storage. They are written ahead of the reply, so a get that
+    /// would summarize changes must send state that supersedes them instead. Always
+    /// false for a set, whose view is fixed only when it commits.
+    pub preceded: bool,
 }
 
 /// The result payload and the deliveries that follow a handled IQ.

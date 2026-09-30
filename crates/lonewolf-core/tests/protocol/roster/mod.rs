@@ -39,7 +39,7 @@ fn expect_roster_push(client: &mut Client, to: &str, item: &str) -> TestResult<S
     Ok(id)
 }
 
-/// Receives a push for bob stamped with `version` and returns the name it carries.
+/// Receives a push stamped with `version` and returns the contact it carries.
 fn receive_versioned_push(client: &mut Client, version: u64) -> TestResult<String> {
     let push = client.receive()?;
     push.assert_name("jabber:client", "iq");
@@ -56,10 +56,9 @@ fn receive_versioned_push(client: &mut Client, version: u64) -> TestResult<Strin
     );
     assert_eq!(query.children.len(), 1, "{push:?}");
     let item = &query.children[0];
-    assert_eq!(item.attribute("jid"), Some("bob@localhost"), "{push:?}");
     Ok(item
-        .attribute("name")
-        .ok_or("push item has no name")?
+        .attribute("jid")
+        .ok_or("push item has no jid")?
         .to_owned())
 }
 
@@ -1772,7 +1771,7 @@ fn versioned_roster_get_replays_more_changes_than_a_mailbox_holds() -> TestResul
 }
 
 #[test]
-fn versioned_roster_replay_follows_pushes_that_were_already_queued() -> TestResult {
+fn versioned_roster_get_preceded_by_queued_pushes_returns_the_full_roster() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
     suite.create_account("alice", "password")?;
     let mut desk = suite.connect("alice", "password", "desk")?;
@@ -1788,29 +1787,29 @@ fn versioned_roster_replay_follows_pushes_that_were_already_queued() -> TestResu
     slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
     let marker = desk.receive()?;
     assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
-    one.send("<iq type='set' id='first'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='First'/></query></iq>")?;
-    two.send("<iq type='set' id='second'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Second'/></query></iq>")?;
+    one.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
+    two.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
     // Both sets commit at once but deliver only after the slow effect releases the
-    // account, so the wait keeps the replay's view of storage behind both commits.
+    // account, so the wait keeps the get's view of storage behind both commits.
     thread::sleep(Duration::from_millis(500));
     desk.send("<iq type='get' id='since-0'><query xmlns='jabber:iq:roster' ver='0'/></iq>")?;
 
-    // The two resources commit in whichever order the server reaches them, so the
-    // expected names follow the observed versions.
+    // The two resources commit in whichever order the server reaches them.
     let first = receive_versioned_push(&mut desk, 1)?;
     let second = receive_versioned_push(&mut desk, 2)?;
-    let mut names = [first.as_str(), second.as_str()];
-    names.sort_unstable();
-    assert_eq!(names, ["First", "Second"]);
+    let mut contacts = [first.as_str(), second.as_str()];
+    contacts.sort_unstable();
+    assert_eq!(contacts, ["bob@localhost", "carol@localhost"]);
+    desk.expect_xml("<iq xmlns='jabber:client' type='result' id='since-0' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='2'><item jid='bob@localhost' subscription='none'/><item jid='carol@localhost' subscription='none'/></query></iq>")?;
+    desk.send("<iq type='get' id='since-2'><query xmlns='jabber:iq:roster' ver='2'/></iq>")?;
     desk.expect_xml(
-        "<iq xmlns='jabber:client' type='result' id='since-0' to='alice@localhost/desk'/>",
+        "<iq xmlns='jabber:client' type='result' id='since-2' to='alice@localhost/desk'/>",
     )?;
-    assert_eq!(receive_versioned_push(&mut desk, 2)?, second);
     one.expect_xml(
-        "<iq xmlns='jabber:client' type='result' id='first' to='alice@localhost/one'/>",
+        "<iq xmlns='jabber:client' type='result' id='add-bob' to='alice@localhost/one'/>",
     )?;
     two.expect_xml(
-        "<iq xmlns='jabber:client' type='result' id='second' to='alice@localhost/two'/>",
+        "<iq xmlns='jabber:client' type='result' id='add-carol' to='alice@localhost/two'/>",
     )?;
     slow.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/slow'/>",

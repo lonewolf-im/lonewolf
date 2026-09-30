@@ -165,7 +165,7 @@ where
             let owner = owner_of(&request)?;
             let known = xml::parse_get(request.payload)?;
             let snapshot = transaction.roster(&owner).await?;
-            let (payload, replay) = match versioning::answer(known, &snapshot) {
+            let (payload, replay) = match versioning::answer(known, &snapshot, request.preceded) {
                 versioning::Answer::Full { stamped } => {
                     let version = stamped.then_some(snapshot.version);
                     let payload = xml::build_response(snapshot.items, version, response)?;

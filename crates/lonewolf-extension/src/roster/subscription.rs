@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::{RosterError, RosterJid, RosterReads, RosterWrites};
+use lonewolf_storage::account::{AccountKey, AccountReads};
+use lonewolf_storage::roster::{RosterError, RosterJid};
 use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
-use super::state::{self, Removal, RequestOutcome, grants};
+use super::state::{self, Cancellation, Removal, RequestOutcome, grants};
 use super::{Roster, account_exists, push_removal, push_roster, require_account, xml};
-use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
+use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
 use crate::order::OrderGuard;
 use crate::presence::PresenceRequest;
+use crate::{Aftermath, aftermath};
 
 pub(super) struct Parties {
     sender: AccountKey,
@@ -89,7 +90,7 @@ impl<S: Storage> Roster<S> {
             .map_err(|_| StanzaErrorCondition::InternalServerError)?
             .write_xml(&mut request)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-        let outcome = state::request_subscription(
+        let outcome = match state::request_subscription(
             &mut transaction,
             &parties.sender,
             parties.sender_jid,
@@ -97,7 +98,13 @@ impl<S: Storage> Roster<S> {
             &parties.target_jid,
             request.into_bytes().into_boxed_slice(),
         )
-        .await?;
+        .await?
+        {
+            RequestOutcome::ContactMissing => {
+                return Err(StanzaErrorCondition::ServiceUnavailable.into());
+            }
+            outcome => outcome,
+        };
         transaction.commit().await.map_err(RosterError::from)?;
         match outcome {
             RequestOutcome::Pending { push } => {
@@ -116,7 +123,7 @@ impl<S: Storage> Roster<S> {
                     .current_presence(&parties.target, &parties.sender)
                     .await?;
             }
-            RequestOutcome::AutoApproved { approved: None } => {}
+            RequestOutcome::AutoApproved { approved: None } | RequestOutcome::ContactMissing => {}
         }
         Ok(())
     }
@@ -255,9 +262,8 @@ impl<S: Storage> Roster<S> {
         transaction.commit().await.map_err(RosterError::from)?;
         push_removal(&owner, contact, removal.version, delivery).await?;
         if let Some(contact_account) = contact_account {
-            let contact_granted = self
-                .notify_removed_contact(&owner, &contact_account, removal, delivery)
-                .await?;
+            let contact_granted =
+                notify_removed_contact(&owner, &contact_account, removal, delivery).await?;
             if contact_granted {
                 delivery
                     .unavailable_presence(&contact_account, &owner)
@@ -266,155 +272,138 @@ impl<S: Storage> Roster<S> {
         }
         Ok(())
     }
+}
 
-    /// Clears every trace of a deleted account: its own roster and pending requests,
-    /// and the subscriptions and requests its local contacts held with it. Storage is
-    /// cleaned even when a notification fails; the first delivery failure is returned
-    /// afterwards.
-    pub(super) async fn forget_account<A: ChunkAllocator>(
-        &self,
-        account: &AccountKey,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let account_jid = RosterJid::from(account);
-        let mut failure = None;
-        // Every mutation checks the account under its order, so a scan under that order
-        // that finds nothing proves no write can still arrive, and each pass removes
-        // what the previous scan found.
-        loop {
-            let (items, requests) = {
-                let _order = self.order.lock(account).await;
-                let mut transaction = self.begin_write().await?;
-                let items = transaction.roster(account).await?.items;
-                let requests = transaction.pending_requests(account).await?;
-                if items.is_empty() && requests.is_empty() {
-                    transaction.clear_roster(account).await?;
-                    transaction.commit().await.map_err(RosterError::from)?;
-                    break;
-                }
-                (items, requests)
-            };
-            for item in items {
-                let result = self
-                    .forget_contact(account, &account_jid, &item.jid, delivery)
-                    .await;
-                record_delivery_failure(result, &mut failure)?;
-            }
-            for request in requests {
-                let result = self
-                    .forget_requester(account, &account_jid, &request.sender, delivery)
-                    .await;
-                record_delivery_failure(result, &mut failure)?;
-            }
-        }
-        failure.map_or(Ok(()), |error| Err(HandlerError::Delivery(error)))
-    }
-
-    async fn forget_contact<A: ChunkAllocator>(
-        &self,
-        account: &AccountKey,
-        account_jid: &RosterJid,
-        contact: &RosterJid,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let (_order, mut transaction, contact_account) =
-            self.lock_with_contact(account, contact, delivery).await?;
+/// Clears every trace of a deleted account inside the deletion's transaction: its own
+/// roster and pending requests, and the subscriptions and requests its local contacts
+/// held with it. Returns what the contacts receive once the deletion commits.
+pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
+    transaction: &mut W,
+    account: &AccountKey,
+    hosts: &dyn HostLookup,
+) -> Result<Aftermath<A>, HandlerError> {
+    let account_jid = RosterJid::from(account);
+    let items = transaction.roster(account).await?.items;
+    let requests = transaction.pending_requests(account).await?;
+    let mut removals = Vec::new();
+    for item in items {
+        let contact = stored_local_account(transaction, &item.jid, hosts).await?;
         let removal = state::remove_item(
-            &mut transaction,
+            transaction,
             account,
-            account_jid,
-            contact,
-            contact_account.as_ref(),
+            &account_jid,
+            &item.jid,
+            contact.as_ref(),
         )
         .await?;
-        transaction.commit().await.map_err(RosterError::from)?;
-        if let (Some(removal), Some(contact_account)) = (removal, contact_account) {
-            self.notify_removed_contact(account, &contact_account, removal, delivery)
+        if let (Some(removal), Some(contact)) = (removal, contact) {
+            removals.push((contact, removal));
+        }
+    }
+    let mut cancellations = Vec::new();
+    for request in requests {
+        let sender = stored_local_account(transaction, &request.sender, hosts).await?;
+        let cancellation = state::cancel_subscription(
+            transaction,
+            account,
+            &request.sender,
+            sender.as_ref().map(|sender| (sender, &account_jid)),
+        )
+        .await?;
+        if let Some(sender) = sender {
+            cancellations.push((sender, cancellation));
+        }
+    }
+    transaction.clear_roster(account).await?;
+    let owner = account.clone();
+    Ok(aftermath(move |delivery| {
+        Box::pin(async move {
+            let mut failure = None;
+            for (contact, removal) in removals {
+                let result = notify_removed_contact(&owner, &contact, removal, delivery).await;
+                record_delivery_failure(result.map(|_| ()), &mut failure)?;
+            }
+            for (sender, cancellation) in cancellations {
+                let result =
+                    notify_cancelled_requester(&owner, &sender, cancellation, delivery).await;
+                record_delivery_failure(result, &mut failure)?;
+            }
+            failure.map_or(Ok(()), |error| Err(HandlerError::Delivery(error)))
+        })
+    }))
+}
+
+/// The stored local account a roster JID names, if any.
+async fn stored_local_account(
+    transaction: &impl AccountReads,
+    jid: &RosterJid,
+    hosts: &dyn HostLookup,
+) -> Result<Option<AccountKey>, StanzaErrorCondition> {
+    match local_candidate(jid, hosts) {
+        Some(candidate) if account_exists(transaction, &candidate).await? => Ok(Some(candidate)),
+        _ => Ok(None),
+    }
+}
+
+/// Tells a requester that its pending request ended with the grantor's deletion.
+async fn notify_cancelled_requester<A: ChunkAllocator>(
+    owner: &AccountKey,
+    sender: &AccountKey,
+    cancellation: Cancellation,
+    delivery: &dyn Delivery<A>,
+) -> Result<(), HandlerError> {
+    if cancellation.route {
+        let (_, cancelled) = xml::subscription_withdrawals(owner, sender, delivery.arena()?)?;
+        delivery
+            .to_tagged(SessionTag::Interested, cancelled)
+            .await?;
+    }
+    if let Some(mutation) = cancellation.subscriber {
+        push_roster(sender, mutation, delivery).await?;
+    }
+    Ok(())
+}
+
+/// Sends the contact what losing the owner implies and returns whether the contact
+/// had granted the owner its presence.
+/// Each side's resource addresses are only revealed under that side's own grant.
+async fn notify_removed_contact<A: ChunkAllocator>(
+    owner: &AccountKey,
+    contact: &AccountKey,
+    removal: Removal,
+    delivery: &dyn Delivery<A>,
+) -> Result<bool, HandlerError> {
+    let owner_granted = grants(removal.subscription.state);
+    let contact_granted = grants(removal.contact_before.unwrap_or_default().state);
+    let cancel = owner_granted || removal.pending_request;
+    if owner_granted {
+        delivery.unavailable_presence(owner, contact).await?;
+    }
+    if contact_granted || cancel {
+        let (withdrawal, cancellation) =
+            xml::subscription_withdrawals(owner, contact, delivery.arena()?)?;
+        if contact_granted {
+            delivery
+                .to_tagged(SessionTag::Interested, withdrawal)
                 .await?;
         }
-        Ok(())
-    }
-
-    async fn forget_requester<A: ChunkAllocator>(
-        &self,
-        account: &AccountKey,
-        account_jid: &RosterJid,
-        sender: &RosterJid,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<(), HandlerError> {
-        let (_order, mut transaction, sender_account) =
-            self.lock_with_contact(account, sender, delivery).await?;
-        let outcome = state::cancel_subscription(
-            &mut transaction,
-            account,
-            sender,
-            sender_account
-                .as_ref()
-                .map(|sender_account| (sender_account, account_jid)),
-        )
-        .await?;
-        transaction.commit().await.map_err(RosterError::from)?;
-        let Some(sender_account) = sender_account else {
-            return Ok(());
-        };
-        if outcome.route {
-            let (_, cancellation) =
-                xml::subscription_withdrawals(account, &sender_account, delivery.arena()?)?;
+        if cancel {
             delivery
                 .to_tagged(SessionTag::Interested, cancellation)
                 .await?;
         }
-        if let Some(mutation) = outcome.subscriber {
-            push_roster(&sender_account, mutation, delivery).await?;
-        }
-        Ok(())
     }
-
-    /// Sends the contact what losing the owner implies and returns whether the contact
-    /// had granted the owner its presence.
-    /// Each side's resource addresses are only revealed under that side's own grant.
-    async fn notify_removed_contact<A: ChunkAllocator>(
-        &self,
-        owner: &AccountKey,
-        contact: &AccountKey,
-        removal: Removal,
-        delivery: &dyn Delivery<A>,
-    ) -> Result<bool, HandlerError> {
-        let owner_granted = grants(removal.subscription.state);
-        let contact_granted = grants(removal.contact_before.unwrap_or_default().state);
-        let cancel = owner_granted || removal.pending_request;
-        if owner_granted {
-            delivery.unavailable_presence(owner, contact).await?;
-        }
-        if contact_granted || cancel {
-            let (withdrawal, cancellation) =
-                xml::subscription_withdrawals(owner, contact, delivery.arena()?)?;
-            if contact_granted {
-                delivery
-                    .to_tagged(SessionTag::Interested, withdrawal)
-                    .await?;
-            }
-            if cancel {
-                delivery
-                    .to_tagged(SessionTag::Interested, cancellation)
-                    .await?;
-            }
-        }
-        if let Some(mutation) = removal.contact {
-            push_roster(contact, mutation, delivery).await?;
-        }
-        Ok(contact_granted)
+    if let Some(mutation) = removal.contact {
+        push_roster(contact, mutation, delivery).await?;
     }
+    Ok(contact_granted)
 }
 
 /// The account a roster JID would name on this server, whether or not it is stored.
-fn local_candidate<A: ChunkAllocator>(
-    jid: &RosterJid,
-    delivery: &dyn Delivery<A>,
-) -> Option<AccountKey> {
+fn local_candidate(jid: &RosterJid, hosts: &dyn HostLookup) -> Option<AccountKey> {
     AccountKey::try_from(jid)
         .ok()
-        .filter(|account| delivery.is_local_host(account.domain()))
+        .filter(|account| hosts.is_local_host(account.domain()))
 }
 
 /// Keeps the first delivery failure for later and surfaces every other error at once.

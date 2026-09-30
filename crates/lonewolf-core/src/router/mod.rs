@@ -10,6 +10,7 @@ use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_extension::{Extension, ExtensionRegistry};
+use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -32,7 +33,7 @@ pub struct Router<A: ChunkAllocator> {
 pub struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
     local: LocalRouterHandle<A>,
-    extensions: Arc<BTreeMap<String, ExtensionRegistry<A>>>,
+    extensions: Arc<BTreeMap<String, ExtensionRegistry<A, RedbStorage>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,7 +64,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
 
     pub(crate) fn with_extensions(
         mut self,
-        extensions: BTreeMap<String, ExtensionRegistry<A>>,
+        extensions: BTreeMap<String, ExtensionRegistry<A, RedbStorage>>,
     ) -> Self {
         self.handle.extensions = Arc::new(extensions);
         self
@@ -98,7 +99,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     }
 
     /// The extensions enabled for `domain`, or none for an unknown host.
-    pub(crate) fn extensions(&self, domain: &str) -> &[Arc<dyn Extension<A>>] {
+    pub(crate) fn extensions(&self, domain: &str) -> &[Arc<dyn Extension<A, RedbStorage>>] {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::extensions)

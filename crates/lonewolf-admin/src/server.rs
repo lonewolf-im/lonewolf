@@ -22,7 +22,7 @@ use lonewolf_storage::Storage;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::api;
-use crate::observer::AccountObserver;
+use crate::observer::AccountDeleter;
 
 const MAX_CONNECTIONS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,7 +53,7 @@ impl Server {
     pub fn bind(
         path: &Path,
         storage: impl Storage,
-        observer: Arc<dyn AccountObserver>,
+        deleter: Arc<dyn AccountDeleter>,
     ) -> io::Result<Self> {
         let parent = path
             .parent()
@@ -93,7 +93,7 @@ impl Server {
         Ok(Self {
             listener: UnixListener::from_std(listener)?,
             socket,
-            router: api::router(storage, observer),
+            router: api::router(storage, deleter),
         })
     }
 

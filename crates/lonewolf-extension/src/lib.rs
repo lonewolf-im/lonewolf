@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 
@@ -18,13 +19,28 @@ pub mod roster;
 
 pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
-use delivery::{Delivery, HandlerError};
+/// The deliveries an extension performs once the deletion that produced them committed.
+pub type Aftermath<A> =
+    Box<dyn for<'d> FnOnce(&'d dyn Delivery<A>) -> ExtensionFuture<'d, Result<(), HandlerError>>>;
+
+use delivery::{Delivery, HandlerError, HostLookup};
 use iq::{IqHandler, IqRegistry, IqRoute};
+use order::OrderGuard;
 use presence::{PresenceHandler, PresenceRegistry, PresenceRequestType};
+
+/// Boxes the deliveries that follow a deletion.
+pub fn aftermath<A, F>(deliver: F) -> Aftermath<A>
+where
+    A: ChunkAllocator,
+    F: for<'d> FnOnce(&'d dyn Delivery<A>) -> ExtensionFuture<'d, Result<(), HandlerError>>
+        + 'static,
+{
+    Box::new(deliver)
+}
 
 /// A server feature that hosts enable by name.
 /// One instance serves every host that enables it.
-pub trait Extension<A: ChunkAllocator>: IqHandler<A> + PresenceHandler<A> {
+pub trait Extension<A: ChunkAllocator, S: Storage>: IqHandler<A> + PresenceHandler<A> {
     /// The name hosts use to enable the extension, nonempty and without surrounding whitespace.
     fn name(&self) -> &'static str;
 
@@ -38,15 +54,25 @@ pub trait Extension<A: ChunkAllocator>: IqHandler<A> + PresenceHandler<A> {
         &[]
     }
 
-    /// Runs after an account on a host enabling this extension was deleted, before any
-    /// account with the same JID can be created. The deletion request completes once
-    /// every extension has returned.
-    fn account_deleted<'a>(
+    /// Takes the ordering the extension needs before an account's deletion opens its
+    /// transaction. The guard lives until the deliveries that follow the commit have run.
+    fn hold_for_deletion<'a>(
         &'a self,
         _account: &'a AccountKey,
-        _delivery: &'a dyn Delivery<A>,
-    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
-        Box::pin(async { Ok(()) })
+    ) -> ExtensionFuture<'a, OrderGuard> {
+        Box::pin(async { OrderGuard::none() })
+    }
+
+    /// Clears the extension's state for the account inside the deletion's transaction
+    /// and returns what to deliver once it commits. Nothing is delivered here: the
+    /// transaction must abort without a trace when a later step fails.
+    fn forget_account<'a>(
+        &'a self,
+        _transaction: &'a mut S::Write,
+        _account: &'a AccountKey,
+        _hosts: &'a dyn HostLookup,
+    ) -> ExtensionFuture<'a, Result<Aftermath<A>, HandlerError>> {
+        Box::pin(async { Ok(aftermath(|_| Box::pin(async { Ok(()) }))) })
     }
 }
 
@@ -79,13 +105,13 @@ impl fmt::Display for RegistrationError {
 
 impl Error for RegistrationError {}
 
-pub struct ExtensionRegistry<A: ChunkAllocator> {
+pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     iq: IqRegistry<A>,
     presence: PresenceRegistry<A>,
-    extensions: Vec<Arc<dyn Extension<A>>>,
+    extensions: Vec<Arc<dyn Extension<A, S>>>,
 }
 
-impl<A: ChunkAllocator> Default for ExtensionRegistry<A> {
+impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
     fn default() -> Self {
         Self {
             iq: IqRegistry::default(),
@@ -95,7 +121,7 @@ impl<A: ChunkAllocator> Default for ExtensionRegistry<A> {
     }
 }
 
-impl<A: ChunkAllocator> ExtensionRegistry<A> {
+impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
     pub fn iq(&self) -> &IqRegistry<A> {
         &self.iq
     }
@@ -105,16 +131,16 @@ impl<A: ChunkAllocator> ExtensionRegistry<A> {
     }
 
     /// The enabled extensions, in the order they were enabled.
-    pub fn extensions(&self) -> &[Arc<dyn Extension<A>>] {
+    pub fn extensions(&self) -> &[Arc<dyn Extension<A, S>>] {
         &self.extensions
     }
 }
 
-pub struct Extensions<A: ChunkAllocator> {
-    available: BTreeMap<&'static str, ExtensionRegistry<A>>,
+pub struct Extensions<A: ChunkAllocator, S: Storage> {
+    available: BTreeMap<&'static str, ExtensionRegistry<A, S>>,
 }
 
-impl<A: ChunkAllocator> Default for Extensions<A> {
+impl<A: ChunkAllocator, S: Storage> Default for Extensions<A, S> {
     fn default() -> Self {
         Self {
             available: BTreeMap::new(),
@@ -122,8 +148,11 @@ impl<A: ChunkAllocator> Default for Extensions<A> {
     }
 }
 
-impl<A: ChunkAllocator> Extensions<A> {
-    pub fn register(&mut self, extension: Arc<dyn Extension<A>>) -> Result<(), RegistrationError> {
+impl<A: ChunkAllocator, S: Storage> Extensions<A, S> {
+    pub fn register(
+        &mut self,
+        extension: Arc<dyn Extension<A, S>>,
+    ) -> Result<(), RegistrationError> {
         let name = extension.name();
         if name.is_empty() || name.trim() != name {
             return Err(RegistrationError::InvalidExtensionName);
@@ -151,7 +180,7 @@ impl<A: ChunkAllocator> Extensions<A> {
     pub fn enable<'a>(
         &self,
         names: impl IntoIterator<Item = &'a str>,
-    ) -> Result<ExtensionRegistry<A>, RegistrationError> {
+    ) -> Result<ExtensionRegistry<A, S>, RegistrationError> {
         let mut enabled = ExtensionRegistry::default();
         let mut selected = BTreeSet::new();
         for name in names {

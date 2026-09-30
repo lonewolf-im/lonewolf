@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use lonewolf_admin::{NoopObserver, Server};
+use lonewolf_admin::{RecordDeleter, Server};
 use lonewolf_storage::RedbStorage;
 use serde_json::{Value, json};
 
@@ -27,7 +27,11 @@ fn with_admin_server(test: impl FnOnce(&Path) -> TestResult) -> TestResult {
     let (ready, readiness) = mpsc::channel();
     let worker = thread::spawn(move || -> io::Result<()> {
         Runtime::new()?.block_on(async {
-            let server = Server::bind(&socket, storage, Arc::new(NoopObserver))?;
+            let server = Server::bind(
+                &socket,
+                storage.clone(),
+                Arc::new(RecordDeleter::new(storage)),
+            )?;
             ready.send(()).map_err(io::Error::other)?;
             server
                 .run(async move {

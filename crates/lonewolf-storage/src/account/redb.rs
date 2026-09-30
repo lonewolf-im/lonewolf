@@ -173,6 +173,19 @@ fn read_scram<T: ReadableTable<&'static str, &'static [u8]>>(
     })
 }
 
+/// Whether `key` has an account record; roster writes use it to refuse deleted owners.
+pub(crate) fn account_exists(
+    transaction: &WriteTransaction,
+    key: &str,
+) -> Result<bool, StorageError> {
+    Ok(transaction
+        .open_table(ACCOUNTS)
+        .map_err(storage_error)?
+        .get(key)
+        .map_err(storage_error)?
+        .is_some())
+}
+
 fn list_accounts<T: ReadableTable<&'static str, &'static [u8]>>(
     table: &T,
     after: Option<&AccountKey>,

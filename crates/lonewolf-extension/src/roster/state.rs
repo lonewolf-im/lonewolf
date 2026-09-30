@@ -19,6 +19,8 @@ pub(super) enum RequestOutcome {
     /// The request waits for the contact; `push` is the requester's item when it newly
     /// records the outstanding request.
     Pending { push: ItemMutation },
+    /// The contact's account is gone, so the request cannot be stored for it.
+    ContactMissing,
 }
 
 /// The effects of a grantor cancelling a contact's subscription.
@@ -174,7 +176,7 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
                 .await?;
         return Ok(RequestOutcome::AutoApproved { approved });
     }
-    transaction
+    let stored = transaction
         .put_pending_request(
             contact,
             PendingSubscription {
@@ -182,7 +184,12 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
                 stanza,
             },
         )
-        .await?;
+        .await;
+    match stored {
+        Ok(()) => {}
+        Err(RosterError::NoAccount) => return Ok(RequestOutcome::ContactMissing),
+        Err(error) => return Err(error),
+    }
     let push = update_subscription(transaction, requester, contact_jid, |mut subscription| {
         if subscription.pending_out || subscribed_to(subscription.state) {
             return None;

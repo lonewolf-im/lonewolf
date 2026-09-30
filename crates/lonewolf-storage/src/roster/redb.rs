@@ -11,6 +11,7 @@ use super::{
     RosterSnapshot, RosterSubscription, RosterVersion, RosterWrites,
 };
 use crate::account::AccountKey;
+use crate::account::redb::account_exists;
 use crate::redb::{RedbRead, RedbWrite, storage_error};
 use crate::{StorageError, StorageErrorKind};
 
@@ -97,6 +98,9 @@ impl RosterWrites for RedbWrite {
         let key = item_key_text(&owner, &item.jid);
         let encoded = encode_item(item);
         self.run(move |transaction| {
+            if !account_exists(transaction, &owner)? {
+                return Err(RosterError::NoAccount);
+            }
             transaction
                 .open_table(ITEMS)
                 .map_err(storage_error)?
@@ -122,8 +126,12 @@ impl RosterWrites for RedbWrite {
         owner: &AccountKey,
         request: PendingSubscription,
     ) -> impl Future<Output = Result<(), RosterError>> + Send {
-        let key = item_key(owner, &request.sender);
+        let owner = Box::<str>::from(owner.as_str());
+        let key = item_key_text(&owner, &request.sender);
         self.run(move |transaction| {
+            if !account_exists(transaction, &owner)? {
+                return Err(RosterError::NoAccount);
+            }
             transaction
                 .open_table(PENDING)
                 .map_err(storage_error)?

@@ -24,8 +24,9 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::{NAMESPACE, Roster};
+use crate::Extension;
 use crate::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, HandlerError, SessionTag, StanzaFactory,
+    Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
 };
 use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType};
 use crate::presence::{
@@ -43,13 +44,15 @@ struct RecordingDelivery {
     failing_deliveries: Cell<usize>,
 }
 
+impl HostLookup for RecordingDelivery {
+    fn is_local_host(&self, domain: &str) -> bool {
+        domain == "example.com"
+    }
+}
+
 impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
     fn arena(&self) -> Result<Arena<GlobalChunkAllocator>, DeliveryError> {
         Arena::try_new(ArenaConfig::default()).map_err(|_| DeliveryError)
-    }
-
-    fn is_local_host(&self, domain: &str) -> bool {
-        domain == "example.com"
     }
 
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
@@ -507,6 +510,8 @@ fn only_the_initial_transition_collects_granted_contacts() {
     let alice_account =
         AccountKey::try_from(alice.bare()).unwrap_or_else(|error| panic!("{error}"));
     let bob_account = AccountKey::try_from(bob).unwrap_or_else(|error| panic!("{error}"));
+    create_account(&roster, &alice_account);
+    create_account(&roster, &bob_account);
     block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
         transaction
@@ -620,7 +625,25 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
         ..RecordingDelivery::default()
     };
 
-    let result = block_on(roster.forget_account(alice, &delivery));
+    let hold =
+        block_on(Extension::<GlobalChunkAllocator, RedbStorage>::hold_for_deletion(&roster, alice));
+    let aftermath = block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        transaction.delete_account(alice).await?;
+        let aftermath = Extension::<GlobalChunkAllocator, RedbStorage>::forget_account(
+            &roster,
+            &mut transaction,
+            alice,
+            &delivery,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        transaction.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(aftermath)
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
+    let result = block_on(aftermath(&delivery));
+    drop(hold);
     assert!(
         matches!(result, Err(HandlerError::Delivery(_))),
         "{result:?}"

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, SessionTag, StanzaFactory,
+    Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionTag, StanzaFactory,
 };
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -18,13 +18,15 @@ pub(crate) struct RouterDelivery<'a, A: ChunkAllocator> {
     pub(crate) session: Option<&'a Registration<A>>,
 }
 
+impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<'_, A> {
+    fn is_local_host(&self, domain: &str) -> bool {
+        self.router.is_local_host(domain)
+    }
+}
+
 impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<'_, A> {
     fn arena(&self) -> Result<Arena<A>, DeliveryError> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
-    }
-
-    fn is_local_host(&self, domain: &str) -> bool {
-        self.router.is_local_host(domain)
     }
 
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {

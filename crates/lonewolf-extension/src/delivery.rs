@@ -107,12 +107,15 @@ pub type StanzaFactory<A> =
 
 /// Routing and session operations the server performs on behalf of a handler.
 /// Every method runs on the connection worker of the request being handled.
-pub trait Delivery<A: ChunkAllocator> {
-    /// Allocates an arena for stanzas the handler builds.
-    fn arena(&self) -> Result<Arena<A>, DeliveryError>;
-
+/// Answers which domains this server hosts.
+pub trait HostLookup {
     /// Whether this server hosts `domain`, so its accounts can be reached locally.
     fn is_local_host(&self, domain: &str) -> bool;
+}
+
+pub trait Delivery<A: ChunkAllocator>: HostLookup {
+    /// Allocates an arena for stanzas the handler builds.
+    fn arena(&self) -> Result<Arena<A>, DeliveryError>;
 
     /// Attaches `tag` to the requesting resource.
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a>;

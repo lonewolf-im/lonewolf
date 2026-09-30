@@ -18,6 +18,7 @@ use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::{Either, join, select};
 use lonewolf_extension::{Extension, Extensions};
+use lonewolf_storage::RedbStorage;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
@@ -74,7 +75,7 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
 pub fn run_with_extensions(
     config_path: Option<&Path>,
     build: BuildInfo,
-    mut extensions: Extensions<Arc<PooledChunkAllocator>>,
+    mut extensions: Extensions<Arc<PooledChunkAllocator>, RedbStorage>,
 ) -> Result<(), RunError> {
     panic::init(&build);
 
@@ -126,12 +127,13 @@ pub fn run_with_extensions(
                     .flat_map(|host| host.extensions.iter().map(String::as_str))
                     .collect::<BTreeSet<_>>();
                 for name in referenced {
-                    let extension: Arc<dyn Extension<Arc<PooledChunkAllocator>>> = match name {
-                        lonewolf_extension::roster::NAME => {
-                            Arc::new(lonewolf_extension::roster::Roster::new(storage.clone()))
-                        }
-                        _ => continue,
-                    };
+                    let extension: Arc<dyn Extension<Arc<PooledChunkAllocator>, RedbStorage>> =
+                        match name {
+                            lonewolf_extension::roster::NAME => {
+                                Arc::new(lonewolf_extension::roster::Roster::new(storage.clone()))
+                            }
+                            _ => continue,
+                        };
                     extensions
                         .register(extension)
                         .map_err(RunError::ExtensionCatalog)?;
@@ -149,13 +151,13 @@ pub fn run_with_extensions(
                             })
                     })
                     .collect::<Result<_, _>>()?;
-                let (cleanup, cleanups) = account_cleanup::channel();
+                let (deleter, deletions) = account_cleanup::channel();
                 let admin = if config.admin.enabled {
                     Some(
                         lonewolf_admin::Server::bind(
                             &config.admin.socket_path,
                             storage.clone(),
-                            cleanup,
+                            deleter,
                         )
                         .map_err(RunError::Admin)?,
                     )
@@ -169,6 +171,7 @@ pub fn run_with_extensions(
                     .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions))
                     .handle();
                 let cleanup_router = router_handle.clone();
+                let deletion_storage = storage.clone();
                 let listeners = listeners.insert(
                     c2s::Listeners::start(
                         &config.c2s,
@@ -185,7 +188,12 @@ pub fn run_with_extensions(
                 run_services(
                     admin,
                     listeners,
-                    account_cleanup::run(cleanups, &cleanup_router, &stanza_pool),
+                    account_cleanup::run(
+                        deletions,
+                        &deletion_storage,
+                        &cleanup_router,
+                        &stanza_pool,
+                    ),
                 )
                 .await
             }

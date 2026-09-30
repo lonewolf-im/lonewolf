@@ -9,8 +9,9 @@ use lonewolf_xmpp::jid::Jid;
 
 use super::redb::ITEMS;
 use super::{RosterJid, RosterReads, RosterWrites};
+use crate::account::AccountWrites;
 use crate::redb::tests::storage;
-use crate::tests::{TestResult, assert_storage_error, item, jid, key, read, write};
+use crate::tests::{TestResult, assert_storage_error, item, jid, key, new_account, read, write};
 use crate::{RedbStorage, Storage, StorageErrorKind};
 
 const ITEM_KEY: &str = "alice@example.com\0bob@example.com";
@@ -90,9 +91,12 @@ fn malformed_item_records_fail_operations_and_stay_unchanged_when_the_transactio
 fn noncanonical_item_keys_are_rejected_when_reading_a_roster() -> TestResult {
     let storage = storage()?;
     let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
     let update = item("bob@example.com", None, &[])?;
     block_on(write(&storage, async |tx| {
-        tx.put_roster_item(&alice, &update).await
+        tx.create_account(account).await?;
+        tx.put_roster_item(&alice, &update).await?;
+        Ok::<(), Box<dyn Error>>(())
     }))?;
     let record = stored_item(&storage, ITEM_KEY)?.ok_or("missing item")?;
     for invalid in [

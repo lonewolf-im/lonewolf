@@ -268,8 +268,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 
     /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. The reply and the handler's effects run once the ticket taken
-    /// with that view comes up, so a client sees them in the order storage applied them.
+    /// transaction for a set. The effects run under the ticket taken with that view. The
+    /// reply is written after the ticket is released, so a socket that stops taking data
+    /// holds no account's line, and a reply that fails to write cannot lose committed
+    /// effects.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -367,13 +369,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             Ok((IqReply { payload, effects }, mut ticket)) => {
                 let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
                 ticket.turn().await;
-                let reply = reply.resolve(&response)?;
-                self.writer.send_stanza(&reply).await?;
-                (effects.deliver)(&delivery)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
+                let delivered = (effects.deliver)(&delivery).await;
                 drop(ticket);
-                Ok(())
+                delivered.map_err(|_| CloseOutcome::InternalError)?;
+                let reply = reply.resolve(&response)?;
+                self.writer.send_stanza(&reply).await
             }
         }
     }

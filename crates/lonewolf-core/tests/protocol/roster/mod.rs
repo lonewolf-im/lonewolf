@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use crate::support::{C2sSuite, Client, TestResult};
 use compio::runtime::Runtime;
@@ -86,6 +88,36 @@ fn seed_roster(directory: &Path) -> TestResult {
                 },
             )
             .await?;
+        repository.commit().await?;
+        TestResult::Ok(())
+    })?;
+    Ok(())
+}
+
+fn seed_large_roster(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let owner = Jid::parse_in("alice@localhost", &mut arena)?;
+    let owner = AccountKey::try_from(owner.resolve(&arena)?)?;
+    let name: Box<str> = "n".repeat(1024).into();
+    Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&owner]).await?;
+        for index in 0..40 {
+            let contact = Jid::parse_in(&format!("contact{index}@localhost"), &mut arena)?;
+            repository
+                .put_roster_item(
+                    &owner,
+                    &RosterItem {
+                        jid: RosterJid::from(contact.resolve(&arena)?),
+                        name: Some(name.clone()),
+                        groups: Vec::new(),
+                        subscription: RosterSubscription::default(),
+                    },
+                )
+                .await?;
+        }
         repository.commit().await?;
         TestResult::Ok(())
     })?;
@@ -1596,6 +1628,51 @@ fn roster_set_adds_an_item_and_pushes_it_to_interested_resources() -> TestResult
     desk.close()?;
     phone.close()?;
     tablet.close()
+}
+
+#[test]
+fn roster_set_from_a_reset_connection_still_pushes_to_interested_resources() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut phone = suite.connect("alice", "password", "phone")?;
+    request_roster(
+        &mut phone,
+        "phone-roster",
+        "<iq xmlns='jabber:client' type='result' id='phone-roster' to='alice@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    desk.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
+    desk.reset()?;
+
+    let item = "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='none'/>";
+    let push = expect_roster_push(&mut phone, "alice@localhost/phone", item)?;
+    phone.send(&format!("<iq type='result' id='{push}'/>"))?;
+    request_roster(
+        &mut phone,
+        "phone-roster-after",
+        "<iq xmlns='jabber:client' type='result' id='phone-roster-after' to='alice@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='none'/></query></iq>",
+    )?;
+    phone.close()
+}
+
+#[test]
+fn a_client_that_stops_reading_does_not_hold_up_account_deletion() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_large_roster)?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut phone = suite.connect("alice", "password", "phone")?;
+    for index in 0..256 {
+        desk.send(&format!(
+            "<iq type='get' id='get-{index}'><query xmlns='{ROSTER_NAMESPACE}'/></iq>"
+        ))?;
+    }
+    // The stalled write is not observable from outside, so the deletion waits long enough
+    // for the server to reach it instead of running against an idle session.
+    thread::sleep(Duration::from_secs(1));
+
+    suite.delete_account("alice")?;
+    phone.expect_stream_error("not-authorized")?;
+    desk.drain()
 }
 
 #[test]

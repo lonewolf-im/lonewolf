@@ -21,10 +21,11 @@ use super::initialize;
 use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY};
 use crate::account::{AccountReads, AccountWrites};
 use crate::roster::redb::{ITEMS, PENDING, VERSIONS};
-use crate::roster::{RosterReads, RosterWrites};
+use crate::roster::{RosterReads, RosterSubscription, RosterWrites, SubscriptionState};
 use crate::tests::{
     TIMEOUT, TestResult, assert_scram, assert_storage_error, assert_verifier, credentials,
-    decoy_salt, item, jid, key, new_account, pending, poll, read, verifier, write,
+    decoy_salt, item, item_with_subscription, jid, key, new_account, pending, poll, read, verifier,
+    write,
 };
 use crate::{RedbStorage, Storage, StorageErrorKind, WriteTransaction};
 
@@ -231,7 +232,17 @@ fn committed_state_survives_reopening() -> TestResult {
     let alice = key("alice@example.com")?;
     let other = key("alice@example.org")?;
     let deleted = key("deleted@example.com")?;
-    let bob = jid("bob@example.com")?;
+    let bob = item_with_subscription(
+        "bob@example.com",
+        Some("Bob"),
+        &["Friends"],
+        RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: true,
+        },
+    )?;
+    let request = pending("bob@example.com", b"<presence/>")?;
     {
         let storage = RedbStorage::open(&path)?;
         block_on(async {
@@ -250,12 +261,8 @@ fn committed_state_survives_reopening() -> TestResult {
                 )
                 .await?;
             writer.delete_account(&deleted).await?;
-            writer
-                .upsert(&alice, item("bob@example.com", Some("Bob"), &["Friends"])?)
-                .await?;
-            writer
-                .put_pending_request(&alice, pending("bob@example.com", b"<presence/>")?)
-                .await?;
+            writer.put_roster_item(&alice, &bob).await?;
+            writer.put_pending_request(&alice, request.clone()).await?;
             writer.commit().await?;
             Ok::<(), Box<dyn Error>>(())
         })?;
@@ -277,8 +284,8 @@ fn committed_state_survives_reopening() -> TestResult {
         }
         let snapshot = reader.roster(&alice).await?;
         assert_eq!(snapshot.version.get(), 1);
-        assert_eq!(snapshot.items[0].name.as_deref(), Some("Bob"));
-        assert_eq!(reader.pending_requests(&alice).await?[0].sender, bob);
+        assert_eq!(snapshot.items, [bob]);
+        assert_eq!(reader.pending_requests(&alice).await?, [request]);
         Ok(())
     })
 }
@@ -389,14 +396,7 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         );
         assert_worker_threads(&backend)?;
         writer
-            .upsert(&alice, item("bob@example.com", None, &[])?)
-            .await?;
-        assert_worker_threads(&backend)?;
-        writer
-            .update_subscription(&alice, &bob, |mut subscription| {
-                subscription.approved = true;
-                Some(subscription)
-            })
+            .put_roster_item(&alice, &item("bob@example.com", None, &[])?)
             .await?;
         assert_worker_threads(&backend)?;
         writer

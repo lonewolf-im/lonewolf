@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod state;
 mod subscription;
 mod xml;
 
 use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::roster::{
-    RosterError, RosterItem, RosterJid, RosterMutation, RosterReads, RosterSnapshot, RosterVersion,
-    RosterWrites, SubscriptionState,
+    RosterError, RosterItem, RosterJid, RosterMutation, RosterReads, RosterSnapshot,
+    RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
 };
 use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -173,9 +174,27 @@ where
                         let _order = self.order.lock(&owner).await;
                         let mut transaction = self.begin_write().await?;
                         require_account(&transaction, &owner).await?;
-                        let mutation = transaction.upsert(&owner, update).await?;
+                        let subscription = transaction
+                            .roster_item(&owner, &update.jid)
+                            .await?
+                            .map_or_else(RosterSubscription::default, |item| item.subscription);
+                        let item = RosterItem {
+                            jid: update.jid,
+                            name: update.name,
+                            groups: update.groups,
+                            subscription,
+                        };
+                        let version = transaction.put_roster_item(&owner, &item).await?;
                         transaction.commit().await.map_err(RosterError::from)?;
-                        push_roster(&owner, mutation, delivery).await?;
+                        push_roster(
+                            &owner,
+                            RosterMutation {
+                                version,
+                                value: item,
+                            },
+                            delivery,
+                        )
+                        .await?;
                         Ok(None)
                     }
                     xml::RosterSet::Remove(contact) => {

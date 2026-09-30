@@ -7,8 +7,7 @@ use crate::support::{C2sSuite, Client, TestResult};
 use compio::runtime::Runtime;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{
-    PendingSubscription, RosterItemUpdate, RosterJid, RosterSubscription, RosterWrites,
-    SubscriptionState,
+    PendingSubscription, RosterItem, RosterJid, RosterSubscription, RosterWrites, SubscriptionState,
 };
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
@@ -46,23 +45,19 @@ fn seed_roster(directory: &Path) -> TestResult {
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
         repository
-            .upsert(
+            .put_roster_item(
                 &owner,
-                RosterItemUpdate {
-                    jid: contact.clone(),
+                &RosterItem {
+                    jid: contact,
                     name: Some("Bob Smith".into()),
                     groups: vec!["Friends".into(), "Work".into()],
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::Both,
+                        pending_out: true,
+                        approved: true,
+                    },
                 },
             )
-            .await?;
-        repository
-            .update_subscription(&owner, &contact, |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::Both,
-                    pending_out: true,
-                    approved: true,
-                })
-            })
             .await?;
         repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
@@ -113,13 +108,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
         repository
-            .update_subscription(&alice_account, &bob_contact, |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::To,
-                    pending_out: false,
-                    approved: false,
-                })
-            })
+            .put_roster_item(&alice_account, &RosterItem { jid: bob_contact.clone(), name: None, groups: Vec::new(), subscription: RosterSubscription { state: SubscriptionState::To, pending_out: false, approved: false, } })
             .await?;
         repository
             .put_pending_request(
@@ -151,22 +140,34 @@ fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
         repository
-            .update_subscription(&alice_account, &bob_contact, |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::None,
-                    pending_out: true,
-                    approved: false,
-                })
-            })
+            .put_roster_item(
+                &alice_account,
+                &RosterItem {
+                    jid: bob_contact.clone(),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::None,
+                        pending_out: true,
+                        approved: false,
+                    },
+                },
+            )
             .await?;
         repository
-            .update_subscription(&bob_account, &alice_contact, |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::From,
-                    pending_out: false,
-                    approved: false,
-                })
-            })
+            .put_roster_item(
+                &bob_account,
+                &RosterItem {
+                    jid: alice_contact.clone(),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::From,
+                        pending_out: false,
+                        approved: false,
+                    },
+                },
+            )
             .await?;
         repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
@@ -2233,22 +2234,34 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
         repository
-            .update_subscription(&alice_account, &bob_contact, |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::Both,
-                    pending_out: false,
-                    approved: false,
-                })
-            })
+            .put_roster_item(
+                &alice_account,
+                &RosterItem {
+                    jid: bob_contact.clone(),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::Both,
+                        pending_out: false,
+                        approved: false,
+                    },
+                },
+            )
             .await?;
         repository
-            .update_subscription(&bob_account, &alice_contact, |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::Both,
-                    pending_out: false,
-                    approved: false,
-                })
-            })
+            .put_roster_item(
+                &bob_account,
+                &RosterItem {
+                    jid: alice_contact.clone(),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::Both,
+                        pending_out: false,
+                        approved: false,
+                    },
+                },
+            )
             .await?;
         repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())
@@ -2300,18 +2313,30 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
         repository
-            .update_subscription(&alice_account, &bob_contact, |_| {
-                Some(RosterSubscription::default())
-            })
+            .put_roster_item(
+                &alice_account,
+                &RosterItem {
+                    jid: bob_contact.clone(),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription::default(),
+                },
+            )
             .await?;
         repository
-            .update_subscription(&bob_account, &alice_contact, |_| {
-                Some(RosterSubscription {
-                    state: SubscriptionState::To,
-                    pending_out: false,
-                    approved: false,
-                })
-            })
+            .put_roster_item(
+                &bob_account,
+                &RosterItem {
+                    jid: alice_contact.clone(),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::To,
+                        pending_out: false,
+                        approved: false,
+                    },
+                },
+            )
             .await?;
         repository.commit().await?;
         Ok::<_, lonewolf_storage::roster::RosterError>(())

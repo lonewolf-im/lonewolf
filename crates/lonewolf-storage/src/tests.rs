@@ -20,7 +20,7 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 
 use crate::account::{AccountKey, NewAccount};
-use crate::roster::{PendingSubscription, RosterItemUpdate, RosterJid};
+use crate::roster::{PendingSubscription, RosterItem, RosterJid, RosterSubscription};
 use crate::{Storage, StorageError, StorageErrorKind, WriteTransaction};
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -59,15 +59,21 @@ pub(crate) fn new_account(input: &str, marker: u8) -> TestResult<NewAccount> {
     })
 }
 
-pub(crate) fn item(
+pub(crate) fn item(contact: &str, name: Option<&str>, groups: &[&str]) -> TestResult<RosterItem> {
+    item_with_subscription(contact, name, groups, RosterSubscription::default())
+}
+
+pub(crate) fn item_with_subscription(
     contact: &str,
     name: Option<&str>,
     groups: &[&str],
-) -> TestResult<RosterItemUpdate> {
-    Ok(RosterItemUpdate {
+    subscription: RosterSubscription,
+) -> TestResult<RosterItem> {
+    Ok(RosterItem {
         jid: jid(contact)?,
         name: name.map(Box::from),
         groups: groups.iter().copied().map(Box::from).collect(),
+        subscription,
     })
 }
 
@@ -176,29 +182,15 @@ macro_rules! storage_contract_tests {
             account::accounts_after_resumes_after_deleted_and_absent_cursor_keys,
             account::accounts_after_reads_the_snapshot_of_its_transaction,
             roster::new_roster_is_empty_at_version_zero,
-            roster::upsert_stores_editable_fields_and_advances_version,
-            roster::editable_and_subscription_updates_preserve_each_other,
-            roster::remove_roster_item_returns_the_old_item_and_only_advances_an_existing_roster,
-            roster::pending_request_is_deduplicated_by_sender_and_can_be_removed,
-            roster::resolving_a_pending_request_removes_it_and_applies_the_transition,
-            roster::subscription_request_updates_the_sender_and_recipient_in_one_transaction,
-            roster::established_subscription_requests_are_automatically_approved_without_changes,
-            roster::automatic_approval_resolves_an_outstanding_request,
-            roster::denying_a_pending_request_clears_both_sides_without_changing_the_grantor_roster,
-            roster::revoking_a_mutual_subscription_keeps_the_reverse_grant,
-            roster::denying_a_crossed_request_keeps_the_reverse_subscription,
-            roster::clearing_preapproval_does_not_notify_the_contact,
-            roster::cancellation_clears_the_grantor_when_the_subscriber_is_missing,
-            roster::self_subscription_cancellation_writes_one_final_roster_version,
-            roster::unsubscribe_keeps_the_reverse_grant_and_does_not_advance_versions_twice,
-            roster::unsubscribe_from_self_writes_one_roster_version,
-            roster::unsubscribe_clears_a_stale_subscription_after_the_contact_is_deleted,
-            roster::clear_roster_removes_one_owners_items_version_and_pending_requests,
+            roster::put_roster_item_stores_every_field_and_advances_the_version,
+            roster::put_roster_item_replaces_the_item_for_the_same_jid_and_advances_again,
             roster::rosters_are_isolated_by_owner_and_sorted_by_contact,
-            roster::subscription_update_reads_and_changes_state_in_one_write,
-            roster::item_removal_clears_the_contact_and_both_pending_requests,
-            roster::item_removal_without_a_local_contact_changes_only_the_owner,
+            roster::roster_item_returns_exactly_the_stored_item_or_none,
+            roster::remove_roster_item_returns_the_old_item_and_only_advances_an_existing_roster,
             roster::removing_a_missing_item_writes_nothing,
+            roster::pending_requests_are_deduplicated_by_sender_and_returned_in_sender_order,
+            roster::remove_pending_request_reports_existence_and_leaves_items_and_versions_untouched,
+            roster::clear_roster_removes_one_owners_items_version_and_pending_requests,
             transaction::uncommitted_writes_are_visible_only_inside_their_transaction,
             transaction::dropping_a_write_transaction_aborts_every_write,
             transaction::commit_persists_account_and_roster_writes_together,

@@ -2,7 +2,7 @@
 
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{
-    RosterItem, RosterItemUpdate, RosterJid, RosterSnapshot, RosterVersion, SubscriptionState,
+    RosterItem, RosterJid, RosterSnapshot, RosterVersion, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -13,6 +13,13 @@ use lonewolf_xmpp::stanza::{
 
 use super::NAMESPACE;
 use crate::delivery::DeliveryError;
+
+/// The user-managed fields of one item, as a roster set carries them.
+pub(super) struct RosterItemUpdate {
+    pub(super) jid: RosterJid,
+    pub(super) name: Option<Box<str>>,
+    pub(super) groups: Vec<Box<str>>,
+}
 
 pub(super) enum RosterSet {
     Update(RosterItemUpdate),

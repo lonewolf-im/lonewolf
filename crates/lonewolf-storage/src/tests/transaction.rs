@@ -20,14 +20,13 @@ pub(crate) fn uncommitted_writes_are_visible_only_inside_their_transaction<S: St
 ) -> TestResult {
     let alice = key("alice@example.com")?;
     let bob = jid("bob@example.com")?;
+    let bob_item = item("bob@example.com", Some("Bob"), &[])?;
     block_on(async {
         let mut writer = storage.begin_write().await?;
         writer
             .create_account(new_account("alice@example.com", 10)?)
             .await?;
-        let mutation = writer
-            .upsert(&alice, item("bob@example.com", Some("Bob"), &[])?)
-            .await?;
+        let version = writer.put_roster_item(&alice, &bob_item).await?;
         writer
             .put_pending_request(&alice, pending("bob@example.com", b"<presence/>")?)
             .await?;
@@ -36,11 +35,8 @@ pub(crate) fn uncommitted_writes_are_visible_only_inside_their_transaction<S: St
             writer.accounts_after(None, NonZeroUsize::MAX).await?.len(),
             1
         );
-        assert_eq!(writer.roster(&alice).await?.version, mutation.version);
-        assert_eq!(
-            writer.roster_item(&alice, &bob).await?,
-            Some(mutation.value)
-        );
+        assert_eq!(writer.roster(&alice).await?.version, version);
+        assert_eq!(writer.roster_item(&alice, &bob).await?, Some(bob_item));
         assert_eq!(writer.pending_requests(&alice).await?.len(), 1);
         assert!(writer.pending_request(&alice, &bob).await?.is_some());
 
@@ -79,7 +75,7 @@ pub(crate) fn dropping_a_write_transaction_aborts_every_write<S: Storage>(
             .create_account(new_account("alice@example.com", 10)?)
             .await?;
         writer
-            .upsert(&alice, item("bob@example.com", None, &[])?)
+            .put_roster_item(&alice, &item("bob@example.com", None, &[])?)
             .await?;
         writer.commit().await?;
 
@@ -90,7 +86,7 @@ pub(crate) fn dropping_a_write_transaction_aborts_every_write<S: Storage>(
             .create_account(new_account("bob@example.com", 20)?)
             .await?;
         writer
-            .upsert(&bob, item("alice@example.com", None, &[])?)
+            .put_roster_item(&bob, &item("alice@example.com", None, &[])?)
             .await?;
         writer
             .put_pending_request(&bob, pending("alice@example.com", b"<presence/>")?)
@@ -120,7 +116,7 @@ pub(crate) fn commit_persists_account_and_roster_writes_together<S: Storage>(
         for owner in ["alice@example.com", "carol@example.com"] {
             writer.create_account(new_account(owner, 10)?).await?;
             writer
-                .upsert(&key(owner)?, item("bob@example.com", None, &[])?)
+                .put_roster_item(&key(owner)?, &item("bob@example.com", None, &[])?)
                 .await?;
             writer
                 .put_pending_request(&key(owner)?, pending("bob@example.com", b"<presence/>")?)
@@ -158,7 +154,7 @@ pub(crate) fn a_read_transaction_keeps_its_snapshot_across_commits<S: Storage>(
 
         let mut writer = storage.begin_write().await?;
         writer.replace_credentials(&alice, credentials(20)).await?;
-        writer.upsert(&alice, update).await?;
+        writer.put_roster_item(&alice, &update).await?;
         writer.commit().await?;
 
         assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 13)?;
@@ -247,11 +243,12 @@ pub(crate) fn transactions_can_be_driven_from_other_threads<S: Storage>(storage:
     assert_send_sync::<S::Read>();
     assert_send_sync::<S::Write>();
     let alice = key("alice@example.com")?;
+    let bob = item("bob@example.com", None, &[])?;
     let mut writer = on_worker(storage.begin_write())??;
     on_worker(writer.create_account(new_account("alice@example.com", 10)?))??;
     on_worker(writer.replace_credentials(&alice, credentials(20)))??;
     assert_scram(on_worker(writer.scram(&alice, ScramHash::Sha256))??, 23)?;
-    on_worker(writer.upsert(&alice, item("bob@example.com", None, &[])?))??;
+    on_worker(writer.put_roster_item(&alice, &bob))??;
     on_worker(writer.commit())??;
 
     let reader = on_worker(storage.begin_read())??;

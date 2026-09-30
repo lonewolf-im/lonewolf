@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::{
-    ItemRemoval, PendingSubscription, RosterError, RosterJid, RosterReads, RosterSubscription,
-    RosterWrites, SubscriptionRequestOutcome, SubscriptionState,
-};
+use lonewolf_storage::roster::{RosterError, RosterJid, RosterReads, RosterWrites};
 use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
+use super::state::{self, Removal, RequestOutcome, grants};
 use super::{Roster, account_exists, push_removal, push_roster, require_account, xml};
 use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
 use crate::order::OrderGuard;
@@ -91,27 +89,25 @@ impl<S: Storage> Roster<S> {
             .map_err(|_| StanzaErrorCondition::InternalServerError)?
             .write_xml(&mut request)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-        let outcome = transaction
-            .request_subscription(
-                &parties.sender,
-                &parties.target_jid,
-                &parties.target,
-                PendingSubscription {
-                    sender: parties.sender_jid,
-                    stanza: request.into_bytes().into_boxed_slice(),
-                },
-            )
-            .await?;
+        let outcome = state::request_subscription(
+            &mut transaction,
+            &parties.sender,
+            parties.sender_jid,
+            &parties.target,
+            &parties.target_jid,
+            request.into_bytes().into_boxed_slice(),
+        )
+        .await?;
         transaction.commit().await.map_err(RosterError::from)?;
         match outcome {
-            SubscriptionRequestOutcome::Pending { mutation } => {
+            RequestOutcome::Pending { push } => {
                 delivery.to_available(stanza.clone()).await?;
-                if let Some(mutation) = mutation {
+                if let Some(mutation) = push {
                     push_roster(&parties.sender, mutation, delivery).await?;
                 }
             }
-            SubscriptionRequestOutcome::AutoApprove {
-                mutation: Some(mutation),
+            RequestOutcome::AutoApproved {
+                approved: Some(mutation),
             } => {
                 let approval = xml::approval_reply(stanza, delivery.arena()?)?;
                 delivery.to_tagged(SessionTag::Interested, approval).await?;
@@ -120,7 +116,7 @@ impl<S: Storage> Roster<S> {
                     .current_presence(&parties.target, &parties.sender)
                     .await?;
             }
-            SubscriptionRequestOutcome::AutoApprove { mutation: None } => {}
+            RequestOutcome::AutoApproved { approved: None } => {}
         }
         Ok(())
     }
@@ -135,21 +131,20 @@ impl<S: Storage> Roster<S> {
         if !target_exists {
             return Ok(());
         }
-        let target = transaction
-            .update_subscription(
-                &parties.target,
-                &parties.sender_jid,
-                RosterSubscription::approve_pending_out,
-            )
-            .await?;
-        let sender = transaction
-            .resolve_pending(
-                &parties.sender,
-                &parties.target_jid,
-                approve_outbound_subscription,
-            )
-            .await?
-            .and_then(|resolution| resolution.mutation);
+        let target = state::update_subscription(
+            &mut transaction,
+            &parties.target,
+            &parties.sender_jid,
+            state::approve_pending_out,
+        )
+        .await?;
+        let sender = state::resolve_pending(
+            &mut transaction,
+            &parties.sender,
+            &parties.target_jid,
+            state::grant,
+        )
+        .await?;
         transaction.commit().await.map_err(RosterError::from)?;
         if let Some(mutation) = target {
             delivery
@@ -173,13 +168,13 @@ impl<S: Storage> Roster<S> {
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
         let (_order, mut transaction, subscriber_exists) = self.lock_parties(&parties).await?;
-        let outcome = transaction
-            .cancel_subscription(
-                &parties.sender,
-                &parties.target_jid,
-                subscriber_exists.then_some((&parties.target, &parties.sender_jid)),
-            )
-            .await?;
+        let outcome = state::cancel_subscription(
+            &mut transaction,
+            &parties.sender,
+            &parties.target_jid,
+            subscriber_exists.then_some((&parties.target, &parties.sender_jid)),
+        )
+        .await?;
         transaction.commit().await.map_err(RosterError::from)?;
         if outcome.send_unavailable {
             delivery
@@ -207,13 +202,13 @@ impl<S: Storage> Roster<S> {
         delivery: &dyn Delivery<A>,
     ) -> Result<(), HandlerError> {
         let (_order, mut transaction, contact_exists) = self.lock_parties(&parties).await?;
-        let outcome = transaction
-            .unsubscribe(
-                &parties.sender,
-                &parties.target_jid,
-                contact_exists.then_some((&parties.target, &parties.sender_jid)),
-            )
-            .await?;
+        let outcome = state::unsubscribe(
+            &mut transaction,
+            &parties.sender,
+            &parties.target_jid,
+            contact_exists.then_some((&parties.target, &parties.sender_jid)),
+        )
+        .await?;
         transaction.commit().await.map_err(RosterError::from)?;
         if outcome.notify_contact {
             delivery
@@ -235,17 +230,6 @@ impl<S: Storage> Roster<S> {
     }
 }
 
-fn approve_outbound_subscription(
-    mut subscription: RosterSubscription,
-) -> Option<RosterSubscription> {
-    subscription.state = match subscription.state {
-        SubscriptionState::None => SubscriptionState::From,
-        SubscriptionState::To => SubscriptionState::Both,
-        SubscriptionState::From | SubscriptionState::Both => return None,
-    };
-    Some(subscription)
-}
-
 impl<S: Storage> Roster<S> {
     /// Removes an item and, for a local contact, withdraws and cancels the subscriptions
     /// the two rosters record, in the order the separate presence flows use.
@@ -259,16 +243,15 @@ impl<S: Storage> Roster<S> {
         let (_order, mut transaction, contact_account) =
             self.lock_with_contact(&owner, &contact, delivery).await?;
         require_account(&transaction, &owner).await?;
-        let removal = transaction
-            .remove_item(
-                &owner,
-                &contact,
-                contact_account
-                    .as_ref()
-                    .map(|account| (account, &owner_jid)),
-            )
-            .await?
-            .ok_or(StanzaErrorCondition::ItemNotFound)?;
+        let removal = state::remove_item(
+            &mut transaction,
+            &owner,
+            &owner_jid,
+            &contact,
+            contact_account.as_ref(),
+        )
+        .await?
+        .ok_or(StanzaErrorCondition::ItemNotFound)?;
         transaction.commit().await.map_err(RosterError::from)?;
         push_removal(&owner, contact, removal.version, delivery).await?;
         if let Some(contact_account) = contact_account {
@@ -336,15 +319,14 @@ impl<S: Storage> Roster<S> {
     ) -> Result<(), HandlerError> {
         let (_order, mut transaction, contact_account) =
             self.lock_with_contact(account, contact, delivery).await?;
-        let removal = transaction
-            .remove_item(
-                account,
-                contact,
-                contact_account
-                    .as_ref()
-                    .map(|contact_account| (contact_account, account_jid)),
-            )
-            .await?;
+        let removal = state::remove_item(
+            &mut transaction,
+            account,
+            account_jid,
+            contact,
+            contact_account.as_ref(),
+        )
+        .await?;
         transaction.commit().await.map_err(RosterError::from)?;
         if let (Some(removal), Some(contact_account)) = (removal, contact_account) {
             self.notify_removed_contact(account, &contact_account, removal, delivery)
@@ -362,15 +344,15 @@ impl<S: Storage> Roster<S> {
     ) -> Result<(), HandlerError> {
         let (_order, mut transaction, sender_account) =
             self.lock_with_contact(account, sender, delivery).await?;
-        let outcome = transaction
-            .cancel_subscription(
-                account,
-                sender,
-                sender_account
-                    .as_ref()
-                    .map(|sender_account| (sender_account, account_jid)),
-            )
-            .await?;
+        let outcome = state::cancel_subscription(
+            &mut transaction,
+            account,
+            sender,
+            sender_account
+                .as_ref()
+                .map(|sender_account| (sender_account, account_jid)),
+        )
+        .await?;
         transaction.commit().await.map_err(RosterError::from)?;
         let Some(sender_account) = sender_account else {
             return Ok(());
@@ -395,17 +377,11 @@ impl<S: Storage> Roster<S> {
         &self,
         owner: &AccountKey,
         contact: &AccountKey,
-        removal: ItemRemoval,
+        removal: Removal,
         delivery: &dyn Delivery<A>,
     ) -> Result<bool, HandlerError> {
-        let owner_granted = matches!(
-            removal.subscription.state,
-            SubscriptionState::From | SubscriptionState::Both
-        );
-        let contact_granted = matches!(
-            removal.contact_before.unwrap_or_default().state,
-            SubscriptionState::From | SubscriptionState::Both
-        );
+        let owner_granted = grants(removal.subscription.state);
+        let contact_granted = grants(removal.contact_before.unwrap_or_default().state);
         let cancel = owner_granted || removal.pending_request;
         if owner_granted {
             delivery.unavailable_presence(owner, contact).await?;

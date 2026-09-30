@@ -23,6 +23,7 @@ use crate::order::Order;
 pub mod local;
 
 pub use local::Registration;
+pub(crate) use local::SessionHandle;
 use local::{LocalRouter, LocalRouterHandle};
 pub use lonewolf_xmpp::stanza::RoutedStanza;
 

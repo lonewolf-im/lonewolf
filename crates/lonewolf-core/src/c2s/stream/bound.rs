@@ -29,7 +29,7 @@ use super::bind::Bound;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
-use crate::delivery::RouterDelivery;
+use crate::delivery::{RouterDelivery, deliver_committed};
 use crate::router::local::{ResourceDelivery, RetireCause};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
 
@@ -268,7 +268,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 
     /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. The effects run under the ticket taken with that view. The
+    /// transaction for a set. The effects run under the ticket taken with that view, on a
+    /// task that outlives this stream, so retiring the session cannot lose them. The
     /// reply is written after the ticket is released, so a socket that stops taking data
     /// holds no account's line, and a reply that fails to write cannot lose committed
     /// effects.
@@ -307,11 +308,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             Some(IqScope::Account) => vec![AccountKey::try_from(target.bare())?],
             Some(IqScope::Server) | None => Vec::new(),
         };
-        let delivery = RouterDelivery {
-            router: &self.router,
-            allocator: &self.allocator,
-            session: Some(&self.registration),
-        };
+        let delivery = self.delivery();
         let iq_request = IqRequest {
             sender,
             target,
@@ -366,12 +363,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 let reply = reply.resolve(&arena)?;
                 self.writer.send_stanza(&reply).await
             }
-            Ok((IqReply { payload, effects }, mut ticket)) => {
+            Ok((IqReply { payload, effects }, ticket)) => {
                 let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
-                ticket.turn().await;
-                let delivered = (effects.deliver)(&delivery).await;
-                drop(ticket);
-                delivered.map_err(|_| CloseOutcome::InternalError)?;
+                deliver_committed(ticket, effects.deliver, delivery)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
                 let reply = reply.resolve(&response)?;
                 self.writer.send_stanza(&reply).await
             }
@@ -630,7 +626,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                                 .fix(accounts, transaction.commit())
                                 .await
                                 .map_err(|_| CloseOutcome::InternalError)?;
-                            Ok((deliver, ticket))
+                            Ok((deliver, ticket, delivery))
                         }
                         Err(error) => Err(error),
                     }
@@ -641,15 +637,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         match received {
-            Ok((deliver, mut ticket)) => {
-                ticket.turn().await;
-                let delivery = self.delivery();
-                deliver(&delivery)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                drop(ticket);
-                Ok(())
-            }
+            Ok((deliver, ticket, delivery)) => deliver_committed(ticket, deliver, delivery)
+                .await
+                .map_err(|_| CloseOutcome::InternalError),
             Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition).await,
         }
     }
@@ -666,12 +656,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         self.writer.send_stanza(&reply).await
     }
 
-    fn delivery(&self) -> RouterDelivery<'_, A> {
-        RouterDelivery {
-            router: &self.router,
-            allocator: &self.allocator,
-            session: Some(&self.registration),
-        }
+    fn delivery(&self) -> RouterDelivery<A> {
+        RouterDelivery::new(&self.router, &self.allocator, Some(&self.registration))
     }
 
     fn stamp(&self, parsed: Parsed<Stanza, A>) -> Result<RoutedStanza<A>, CloseOutcome> {

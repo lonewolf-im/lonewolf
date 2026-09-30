@@ -81,11 +81,7 @@ async fn delete<A: ChunkAllocator + Clone>(
     allocator: &A,
 ) -> Result<bool, DeleterError> {
     let extensions = router.extensions(account.domain());
-    let delivery = RouterDelivery {
-        router,
-        allocator,
-        session: None,
-    };
+    let delivery = RouterDelivery::new(router, allocator, None);
     let mut transaction = storage.begin_write().await?;
     let existed = match transaction.delete_account(account).await {
         Ok(()) => true,

@@ -94,6 +94,40 @@ fn seed_roster(directory: &Path) -> TestResult {
     Ok(())
 }
 
+fn seed_mutual_subscription(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice = Jid::parse_in("alice@localhost", &mut arena)?;
+    let bob = Jid::parse_in("bob@localhost", &mut arena)?;
+    let alice = AccountKey::try_from(alice.resolve(&arena)?)?;
+    let bob = AccountKey::try_from(bob.resolve(&arena)?)?;
+    Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&alice, &bob]).await?;
+        for (owner, contact) in [(&alice, &bob), (&bob, &alice)] {
+            repository
+                .put_roster_item(
+                    owner,
+                    &RosterItem {
+                        jid: RosterJid::from(contact),
+                        name: None,
+                        groups: Vec::new(),
+                        subscription: RosterSubscription {
+                            state: SubscriptionState::Both,
+                            pending_out: false,
+                            approved: false,
+                        },
+                    },
+                )
+                .await?;
+        }
+        repository.commit().await?;
+        TestResult::Ok(())
+    })?;
+    Ok(())
+}
+
 fn seed_large_roster(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
     let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
@@ -1653,6 +1687,58 @@ fn roster_set_from_a_reset_connection_still_pushes_to_interested_resources() -> 
         "phone-roster-after",
         "<iq xmlns='jabber:client' type='result' id='phone-roster-after' to='alice@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='none'/></query></iq>",
     )?;
+    phone.close()
+}
+
+#[test]
+fn committed_roster_push_survives_eviction_of_the_requesting_resource() -> TestResult {
+    let suite =
+        C2sSuite::with_extensions_and_setup("'roster', 'test-iq'", seed_mutual_subscription)?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut phone = suite.connect("alice", "password", "phone")?;
+    let mut tablet = suite.connect("alice", "password", "tablet")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    request_roster(
+        &mut phone,
+        "phone-roster",
+        "<iq xmlns='jabber:client' type='result' id='phone-roster' to='alice@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='both'/></query></iq>",
+    )?;
+    tablet.send("<presence/>")?;
+    tablet.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/tablet' to='alice@localhost'/>",
+    )?;
+    bob.send("<presence/>")?;
+    tablet.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
+    )?;
+
+    desk.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
+    let marker = phone.receive()?;
+    marker.assert_name("jabber:client", "iq");
+    assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
+
+    tablet.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
+    // The commit is not observable until its ticket turns, so the flood below waits long
+    // enough for the server to have handled the set before it fills the tablet's mailbox.
+    thread::sleep(Duration::from_millis(300));
+    for index in 0..80 {
+        bob.send(&format!(
+            "<presence><priority>{}</priority></presence>",
+            index % 100
+        ))?;
+    }
+    tablet.expect_eof()?;
+
+    let push = expect_roster_push(
+        &mut phone,
+        "alice@localhost/phone",
+        "<item xmlns='jabber:iq:roster' jid='carol@localhost' subscription='none'/>",
+    )?;
+    phone.send(&format!("<iq type='result' id='{push}'/>"))?;
+    desk.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/desk'/>",
+    )?;
+    desk.close()?;
     phone.close()
 }
 

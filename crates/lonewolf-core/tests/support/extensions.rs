@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use lonewolf_extension::delivery::{HandlerError, HostLookup};
+use lonewolf_extension::delivery::{HandlerError, HostLookup, SessionTag};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
@@ -10,10 +11,13 @@ use lonewolf_extension::presence::{
     PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
 };
 use lonewolf_extension::{Effects, Extension, Extensions};
+use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
-use lonewolf_xmpp::stanza::{Element, PresenceType, StanzaErrorCondition, StanzaType};
+use lonewolf_xmpp::stanza::{
+    Element, IqType, PresenceType, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaType,
+};
 
 use super::TestResult;
 
@@ -31,6 +35,15 @@ const ACCOUNT_SET: IqRoute = IqRoute {
     kind: IqRequestType::Set,
     namespace: NAMESPACE,
     name: "query",
+};
+
+/// A set whose effects push a marker to the account's interested resources and then hold
+/// the account's delivery order for `millis`.
+const ACCOUNT_SLOW: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: NAMESPACE,
+    name: "slow",
 };
 
 const SERVER_GET: IqRoute = IqRoute {
@@ -106,7 +119,7 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
     }
 
     fn iq_routes(&self) -> &'static [IqRoute] {
-        &[ACCOUNT_GET, ACCOUNT_SET]
+        &[ACCOUNT_GET, ACCOUNT_SET, ACCOUNT_SLOW]
     }
 }
 
@@ -122,12 +135,50 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
 
     fn set<'a>(
         &'a self,
-        _: IqRequest<'a, A>,
+        request: IqRequest<'a, A>,
         _: &'a mut RedbWrite,
         _: &'a dyn HostLookup,
         _: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async { Ok(IqReply::new(None, Effects::none())) })
+        Box::pin(async move {
+            if request.payload.name() != ACCOUNT_SLOW.name {
+                return Ok(IqReply::new(None, Effects::none()));
+            }
+            let millis = request
+                .payload
+                .attribute("millis", "")
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                .and_then(|value| value.parse().ok())
+                .ok_or(StanzaErrorCondition::BadRequest)?;
+            let account = AccountKey::try_from(request.target.bare())
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            let effects = Effects::new(vec![account.clone()], move |delivery| {
+                Box::pin(async move {
+                    delivery
+                        .push_to_tagged(
+                            &account,
+                            SessionTag::Interested,
+                            Box::new(|to, arena| {
+                                let marker =
+                                    Element::builder_in("slow", NAMESPACE, arena)?.build()?;
+                                Ok(Stanza::builder_in(
+                                    StanzaType::Iq(IqType::Set),
+                                    StanzaNamespace::Client,
+                                    arena,
+                                )
+                                .id(Some("slow"))?
+                                .to(Some(to))?
+                                .child(marker)?
+                                .build()?)
+                            }),
+                        )
+                        .await?;
+                    compio::time::sleep(Duration::from_millis(millis)).await;
+                    Ok(())
+                })
+            });
+            Ok(IqReply::new(None, effects))
+        })
     }
 }
 

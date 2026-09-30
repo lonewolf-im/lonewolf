@@ -22,6 +22,7 @@ struct Fake {
     name: &'static str,
     iq: &'static [IqRoute],
     presence: &'static [PresenceRequestType],
+    features: &'static [&'static str],
 }
 
 impl IqHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
@@ -40,6 +41,10 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
     fn presence_kinds(&self) -> &'static [PresenceRequestType] {
         self.presence
     }
+
+    fn stream_features(&self) -> &'static [&'static str] {
+        self.features
+    }
 }
 
 fn extension(
@@ -47,7 +52,42 @@ fn extension(
     iq: &'static [IqRoute],
     presence: &'static [PresenceRequestType],
 ) -> Arc<dyn Extension<GlobalChunkAllocator, RedbStorage>> {
-    Arc::new(Fake { name, iq, presence })
+    Arc::new(Fake {
+        name,
+        iq,
+        presence,
+        features: &[],
+    })
+}
+
+fn featured(
+    name: &'static str,
+    features: &'static [&'static str],
+) -> Arc<dyn Extension<GlobalChunkAllocator, RedbStorage>> {
+    Arc::new(Fake {
+        name,
+        iq: &[],
+        presence: &[],
+        features,
+    })
+}
+
+#[test]
+fn enabled_extensions_contribute_their_stream_features_in_order() -> Result<(), RegistrationError> {
+    let mut extensions = TestExtensions::default();
+    extensions.register(featured("first", &["<a xmlns='urn:test:a'/>"]))?;
+    extensions.register(featured(
+        "second",
+        &["<b xmlns='urn:test:b'/>", "<c xmlns='urn:test:c'/>"],
+    ))?;
+    extensions.register(extension("plain", &[], &[]))?;
+    let enabled = extensions.enable(["second", "plain", "first"])?;
+    assert_eq!(
+        enabled.stream_features(),
+        "<b xmlns='urn:test:b'/><c xmlns='urn:test:c'/><a xmlns='urn:test:a'/>"
+    );
+    assert_eq!(extensions.enable(["plain"])?.stream_features(), "");
+    Ok(())
 }
 
 #[test]

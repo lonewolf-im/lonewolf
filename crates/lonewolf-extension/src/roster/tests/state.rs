@@ -353,8 +353,11 @@ fn established_subscription_requests_are_automatically_approved_without_changes(
         assert!(pending(&roster, &bob).is_empty());
         let alice_roster = snapshot(&roster, &alice);
         assert_eq!(alice_roster.version.get(), 1);
-        assert_eq!(alice_roster.items[0].subscription.state, subscriber_state);
-        assert!(!alice_roster.items[0].subscription.pending_out);
+        assert_eq!(
+            alice_roster.items[0].value.subscription.state,
+            subscriber_state
+        );
+        assert!(!alice_roster.items[0].value.subscription.pending_out);
         assert_eq!(version(&roster, &bob), 1);
     }
     Ok(())

@@ -9,7 +9,8 @@ use super::{
 };
 use crate::account::{AccountReads, AccountWrites};
 use crate::roster::{
-    RosterError, RosterReads, RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
+    RosterError, RosterMutation, RosterReads, RosterSubscription, RosterVersion, RosterWrites,
+    SubscriptionState,
 };
 use crate::{Storage, WriteTransaction};
 
@@ -27,6 +28,7 @@ pub(crate) fn new_roster_is_empty_at_version_zero<S: Storage>(storage: S) -> Tes
     block_on(async {
         let snapshot = read(&storage, async |tx| tx.roster(&alice).await).await?;
         assert_eq!(snapshot.version, RosterVersion::default());
+        assert_eq!(snapshot.last_removal, RosterVersion::default());
         assert!(snapshot.items.is_empty());
         Ok(())
     })
@@ -71,7 +73,14 @@ pub(crate) fn put_roster_item_stores_every_field_and_advances_the_version<S: Sto
         assert_eq!(read_back, stored);
         let snapshot = reader.roster(&owner).await?;
         assert_eq!(snapshot.version, version);
-        assert_eq!(snapshot.items, [stored]);
+        assert_eq!(snapshot.last_removal, RosterVersion::default());
+        assert_eq!(
+            snapshot.items,
+            [RosterMutation {
+                version,
+                value: stored
+            }]
+        );
         Ok(())
     })
 }
@@ -117,9 +126,13 @@ pub(crate) fn put_roster_item_replaces_the_item_for_the_same_jid_and_advances_ag
         let snapshot = reader.roster(&owner).await?;
         assert_eq!(snapshot.version, version);
         assert_eq!(snapshot.items.len(), 1);
-        assert_eq!(snapshot.items[0].name.as_deref(), Some("Robert"));
-        assert_eq!(snapshot.items[0].groups.len(), 2);
-        assert_eq!(snapshot.items[0].subscription, replacement.subscription);
+        assert_eq!(snapshot.items[0].version, version);
+        assert_eq!(snapshot.items[0].value.name.as_deref(), Some("Robert"));
+        assert_eq!(snapshot.items[0].value.groups.len(), 2);
+        assert_eq!(
+            snapshot.items[0].value.subscription,
+            replacement.subscription
+        );
         assert_eq!(
             reader.roster_item(&owner, &contact).await?,
             Some(replacement)
@@ -151,12 +164,14 @@ pub(crate) fn rosters_are_isolated_by_owner_and_sorted_by_contact<S: Storage>(
         let snapshot = reader.roster(&alice).await?;
         assert_eq!(snapshot.version.get(), 2);
         assert_eq!(snapshot.items.len(), 2);
-        assert_eq!(snapshot.items[0].jid.as_str(), "bob@example.com");
-        assert_eq!(snapshot.items[1].jid.as_str(), "zara@example.com");
+        assert_eq!(snapshot.items[0].value.jid.as_str(), "bob@example.com");
+        assert_eq!(snapshot.items[0].version.get(), 2);
+        assert_eq!(snapshot.items[1].value.jid.as_str(), "zara@example.com");
+        assert_eq!(snapshot.items[1].version.get(), 1);
         let snapshot = reader.roster(&carol).await?;
         assert_eq!(snapshot.version.get(), 1);
         assert_eq!(snapshot.items.len(), 1);
-        assert_eq!(snapshot.items[0].jid.as_str(), "dave@example.com");
+        assert_eq!(snapshot.items[0].value.jid.as_str(), "dave@example.com");
         assert!(reader.roster_item(&carol, &bob).await?.is_none());
         Ok(())
     })
@@ -224,12 +239,68 @@ pub(crate) fn remove_roster_item_returns_the_old_item_and_only_advances_an_exist
         assert_eq!(removed.value, stored);
         assert!(writer.roster_item(&owner, &contact).await?.is_none());
         assert!(writer.remove_roster_item(&owner, &contact).await?.is_none());
-        assert_eq!(writer.roster(&owner).await?.version, removed.version);
+        let pending_snapshot = writer.roster(&owner).await?;
+        assert_eq!(pending_snapshot.version, removed.version);
+        assert_eq!(pending_snapshot.last_removal, removed.version);
         writer.commit().await?;
 
         let snapshot = read(&storage, async |tx| tx.roster(&owner).await).await?;
         assert_eq!(snapshot.version.get(), 2);
+        assert_eq!(snapshot.last_removal.get(), 2);
         assert!(snapshot.items.is_empty());
+        Ok(())
+    })
+}
+
+pub(crate) fn every_item_keeps_the_version_that_last_changed_it<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let owner = key("alice@example.com")?;
+    let bob = jid("bob@example.com")?;
+    let bob_item = item("bob@example.com", None, &[])?;
+    let dave_item = item("dave@example.com", None, &[])?;
+    let renamed_bob = item("bob@example.com", Some("Bob"), &[])?;
+    block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
+        let mut writer = storage.begin_write().await?;
+        writer.put_roster_item(&owner, &bob_item).await?;
+        writer.put_roster_item(&owner, &dave_item).await?;
+        writer.remove_roster_item(&owner, &bob).await?;
+        writer.put_roster_item(&owner, &renamed_bob).await?;
+        writer.commit().await?;
+
+        let snapshot = read(&storage, async |tx| tx.roster(&owner).await).await?;
+        assert_eq!(snapshot.version.get(), 4);
+        assert_eq!(snapshot.last_removal.get(), 3);
+        assert_eq!(
+            snapshot.items,
+            [
+                RosterMutation {
+                    version: RosterVersion::new(4),
+                    value: renamed_bob,
+                },
+                RosterMutation {
+                    version: RosterVersion::new(2),
+                    value: dave_item,
+                },
+            ]
+        );
+
+        write(&storage, async |tx| tx.clear_roster(&owner).await).await?;
+        let version = write(&storage, async |tx| {
+            tx.put_roster_item(&owner, &bob_item).await
+        })
+        .await?;
+        let snapshot = read(&storage, async |tx| tx.roster(&owner).await).await?;
+        assert_eq!(version.get(), 1);
+        assert_eq!(snapshot.last_removal, RosterVersion::default());
+        assert_eq!(
+            snapshot.items,
+            [RosterMutation {
+                version,
+                value: bob_item
+            }]
+        );
         Ok(())
     })
 }
@@ -247,6 +318,7 @@ pub(crate) fn removing_a_missing_item_writes_nothing<S: Storage>(storage: S) -> 
         );
         let snapshot = read(&storage, async |tx| tx.roster(&alice).await).await?;
         assert_eq!(snapshot.version, RosterVersion::default());
+        assert_eq!(snapshot.last_removal, RosterVersion::default());
         assert!(snapshot.items.is_empty());
         Ok(())
     })
@@ -324,7 +396,13 @@ pub(crate) fn remove_pending_request_reports_existence_and_leaves_items_and_vers
         assert!(reader.pending_request(&owner, &bob).await?.is_none());
         let snapshot = reader.roster(&owner).await?;
         assert_eq!(snapshot.version.get(), 1);
-        assert_eq!(snapshot.items, [stored]);
+        assert_eq!(
+            snapshot.items,
+            [RosterMutation {
+                version: RosterVersion::new(1),
+                value: stored,
+            }]
+        );
         Ok(())
     })
 }
@@ -356,6 +434,7 @@ pub(crate) fn clear_roster_removes_one_owners_items_version_and_pending_requests
         let reader = storage.begin_read().await?;
         let cleared = reader.roster(&alice).await?;
         assert_eq!(cleared.version, RosterVersion::default());
+        assert_eq!(cleared.last_removal, RosterVersion::default());
         assert!(cleared.items.is_empty());
         assert!(reader.roster_item(&alice, &bob).await?.is_none());
         assert!(reader.pending_requests(&alice).await?.is_empty());
@@ -415,13 +494,17 @@ pub(crate) fn put_roster_item_is_rejected_for_an_owner_without_an_account_record
         let unknown_roster = reader.roster(&unknown).await?;
         assert_eq!(unknown_roster.version, RosterVersion::default());
         assert!(unknown_roster.items.is_empty());
+        let stored = RosterMutation {
+            version: RosterVersion::new(1),
+            value: bob_item,
+        };
         let deleted_roster = reader.roster(&deleted).await?;
         assert_eq!(deleted_roster.version.get(), 1);
-        assert_eq!(deleted_roster.items, slice::from_ref(&bob_item));
+        assert_eq!(deleted_roster.items, slice::from_ref(&stored));
         assert!(reader.account(&deleted).await?.is_none());
         let active_roster = reader.roster(&active).await?;
         assert_eq!(active_roster.version.get(), 1);
-        assert_eq!(active_roster.items, [bob_item]);
+        assert_eq!(active_roster.items, [stored]);
         Ok(())
     })
 }
@@ -512,7 +595,15 @@ pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleted_owner<S: Storag
         assert_eq!(removed.value, bob_item);
         assert!(writer.remove_pending_request(&alice, &bob).await?);
         assert!(!writer.remove_pending_request(&alice, &bob).await?);
-        assert_eq!(writer.roster(&alice).await?.items, [dave_item]);
+        let remaining = writer.roster(&alice).await?;
+        assert_eq!(remaining.last_removal.get(), 3);
+        assert_eq!(
+            remaining.items,
+            [RosterMutation {
+                version: RosterVersion::new(2),
+                value: dave_item,
+            }]
+        );
         assert_eq!(writer.pending_requests(&alice).await?.len(), 1);
         writer.clear_roster(&alice).await?;
         let cleared = writer.roster(&alice).await?;

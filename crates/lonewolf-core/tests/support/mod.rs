@@ -17,4 +17,5 @@ pub const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/st
 pub const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 pub const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 pub const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
+pub const ROSTER_VERSIONING_NAMESPACE: &str = "urn:xmpp:features:rosterver";
 pub const STREAM_ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-streams";

@@ -2,6 +2,7 @@
 
 mod state;
 mod subscription;
+mod versioning;
 mod xml;
 
 use lonewolf_storage::Storage;
@@ -24,6 +25,7 @@ use subscription::Parties;
 
 pub const NAME: &str = "roster";
 pub const NAMESPACE: &str = "jabber:iq:roster";
+pub const VERSIONING_FEATURE: &str = "<ver xmlns='urn:xmpp:features:rosterver'/>";
 
 const IQ_ROUTES: [IqRoute; 2] = [
     IqRoute {
@@ -134,6 +136,10 @@ where
         &PresenceRequestType::ALL
     }
 
+    fn stream_features(&self) -> &'static [&'static str] {
+        &[VERSIONING_FEATURE]
+    }
+
     fn forget_account<'a>(
         &'a self,
         transaction: &'a mut S::Write,
@@ -157,13 +163,28 @@ where
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
             let owner = owner_of(&request)?;
-            xml::validate_get(request.payload)?;
+            let known = xml::parse_get(request.payload)?;
             let snapshot = transaction.roster(&owner).await?;
-            let payload = xml::build_response(snapshot, response)?;
+            let (payload, replay) = match versioning::answer(known, &snapshot, request.preceded) {
+                versioning::Answer::Full { stamped } => {
+                    let version = stamped.then_some(snapshot.version);
+                    let payload = xml::build_response(snapshot.items, version, response)?;
+                    (Some(payload), Vec::new())
+                }
+                versioning::Answer::Unchanged => (None, Vec::new()),
+                versioning::Answer::Changes { since } => {
+                    let to = request
+                        .sender
+                        .clone_in(response)
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let changes = versioning::changes_since(snapshot.items, since);
+                    (None, xml::build_replay(to, changes, response)?)
+                }
+            };
             let effects = Effects::new(vec![owner], |delivery| {
                 delivery.tag_session(SessionTag::Interested)
             });
-            Ok(IqReply::new(Some(payload), effects))
+            Ok(IqReply::new(payload, effects).followed_by(replay))
         })
     }
 
@@ -317,7 +338,8 @@ fn split_subscriptions(
 ) -> (Vec<RosterJid>, Vec<RosterJid>) {
     let mut subscribers = Vec::new();
     let mut watched = Vec::new();
-    for item in snapshot.items {
+    for entry in snapshot.items {
+        let item = entry.value;
         if item.jid.as_str() == owner.as_str() {
             continue;
         }

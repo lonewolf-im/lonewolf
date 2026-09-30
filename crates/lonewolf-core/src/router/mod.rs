@@ -23,8 +23,8 @@ use crate::order::Order;
 pub mod local;
 
 pub use local::Registration;
-pub(crate) use local::SessionHandle;
 use local::{LocalRouter, LocalRouterHandle};
+pub(crate) use local::{Mailbox, ResourceDelivery, SessionHandle};
 pub use lonewolf_xmpp::stanza::RoutedStanza;
 
 pub struct Router<A: ChunkAllocator> {
@@ -104,6 +104,13 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         domain: &str,
     ) -> Option<&PresenceRegistry<A, RedbStorage>> {
         self.extensions.get(domain).map(ExtensionRegistry::presence)
+    }
+
+    /// The stream features of the extensions enabled for `domain`, as XML.
+    pub(crate) fn stream_features(&self, domain: &str) -> &str {
+        self.extensions
+            .get(domain)
+            .map_or("", ExtensionRegistry::stream_features)
     }
 
     /// The per-account delivery order shared by every handler on this node.

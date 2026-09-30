@@ -187,6 +187,7 @@ macro_rules! storage_contract_tests {
             roster::rosters_are_isolated_by_owner_and_sorted_by_contact,
             roster::roster_item_returns_exactly_the_stored_item_or_none,
             roster::remove_roster_item_returns_the_old_item_and_only_advances_an_existing_roster,
+            roster::every_item_keeps_the_version_that_last_changed_it,
             roster::removing_a_missing_item_writes_nothing,
             roster::pending_requests_are_deduplicated_by_sender_and_returned_in_sender_order,
             roster::remove_pending_request_reports_existence_and_leaves_items_and_versions_untouched,

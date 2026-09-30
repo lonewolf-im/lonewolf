@@ -5,11 +5,14 @@ use std::path::Path;
 
 use crate::support::{C2sSuite, Client, TestResult};
 use compio::runtime::Runtime;
-use lonewolf_storage::account::AccountKey;
+use lonewolf_auth::scram::{
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
+};
+use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
 use lonewolf_storage::roster::{
     PendingSubscription, RosterItem, RosterJid, RosterSubscription, RosterWrites, SubscriptionState,
 };
-use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
+use lonewolf_storage::{RedbStorage, RedbWrite, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 
@@ -34,6 +37,29 @@ fn expect_roster_push(client: &mut Client, to: &str, item: &str) -> TestResult<S
     Ok(id)
 }
 
+/// Stores the records the seeded roster state belongs to; every seeded account
+/// authenticates with "password".
+async fn seed_accounts(repository: &mut RedbWrite, accounts: &[&AccountKey]) -> TestResult {
+    for account in accounts {
+        let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?;
+        let sha1 = ScramVerifier::derive(ScramHash::Sha1, "password", [1; 16], iterations)?;
+        let sha256 = ScramVerifier::derive(ScramHash::Sha256, "password", [2; 16], iterations)?;
+        let credentials = match (sha1, sha256) {
+            (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) => {
+                ScramCredentials::both(sha1, sha256)
+            }
+            _ => return Err("unexpected verifier hashes".into()),
+        };
+        repository
+            .create_account(NewAccount {
+                key: (*account).clone(),
+                credentials,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
 fn seed_roster(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
     let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
@@ -44,6 +70,7 @@ fn seed_roster(directory: &Path) -> TestResult {
     let contact = RosterJid::from(contact.resolve(&arena)?);
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&owner]).await?;
         repository
             .put_roster_item(
                 &owner,
@@ -60,7 +87,7 @@ fn seed_roster(directory: &Path) -> TestResult {
             )
             .await?;
         repository.commit().await?;
-        Ok::<_, lonewolf_storage::roster::RosterError>(())
+        TestResult::Ok(())
     })?;
     Ok(())
 }
@@ -86,11 +113,12 @@ fn seed_pending_subscriptions(directory: &Path) -> TestResult {
     }
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&owner]).await?;
         for subscription in subscriptions {
             repository.put_pending_request(&owner, subscription).await?;
         }
         repository.commit().await?;
-        Ok::<_, lonewolf_storage::roster::RosterError>(())
+        TestResult::Ok(())
     })?;
     Ok(())
 }
@@ -107,6 +135,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&alice_account, &bob_account]).await?;
         repository
             .put_roster_item(&alice_account, &RosterItem { jid: bob_contact.clone(), name: None, groups: Vec::new(), subscription: RosterSubscription { state: SubscriptionState::To, pending_out: false, approved: false, } })
             .await?;
@@ -122,7 +151,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
             )
             .await?;
         repository.commit().await?;
-        Ok::<_, lonewolf_storage::roster::RosterError>(())
+        TestResult::Ok(())
     })?;
     Ok(())
 }
@@ -139,6 +168,7 @@ fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&alice_account, &bob_account]).await?;
         repository
             .put_roster_item(
                 &alice_account,
@@ -170,9 +200,76 @@ fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult
             )
             .await?;
         repository.commit().await?;
-        Ok::<_, lonewolf_storage::roster::RosterError>(())
+        TestResult::Ok(())
     })?;
     Ok(())
+}
+
+fn seed_interrupted_account_deletion(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice = Jid::parse_in("alice@localhost", &mut arena)?;
+    let bob = Jid::parse_in("bob@localhost", &mut arena)?;
+    let alice_account = AccountKey::try_from(alice.resolve(&arena)?)?;
+    let bob_account = AccountKey::try_from(bob.resolve(&arena)?)?;
+    let alice_contact = RosterJid::from(alice.resolve(&arena)?);
+    let bob_contact = RosterJid::from(bob.resolve(&arena)?);
+    Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&alice_account, &bob_account]).await?;
+        let both = RosterSubscription {
+            state: SubscriptionState::Both,
+            pending_out: false,
+            approved: false,
+        };
+        repository
+            .put_roster_item(
+                &alice_account,
+                &RosterItem {
+                    jid: bob_contact,
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: both,
+                },
+            )
+            .await?;
+        repository
+            .put_roster_item(
+                &bob_account,
+                &RosterItem {
+                    jid: alice_contact,
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: both,
+                },
+            )
+            .await?;
+        repository.begin_account_deletion(&alice_account).await?;
+        repository.commit().await?;
+        TestResult::Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn startup_finishes_an_interrupted_account_deletion() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_interrupted_account_deletion)?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    request_roster(
+        &mut bob,
+        "bob-roster",
+        "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='none'/></query></iq>",
+    )?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    request_roster(
+        &mut alice,
+        "fresh-roster",
+        "<iq xmlns='jabber:client' type='result' id='fresh-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.close()?;
+    bob.close()
 }
 
 #[test]
@@ -317,7 +414,6 @@ fn subscription_approval_updates_both_rosters_and_delivers_current_presence() ->
 #[test]
 fn authorized_resources_receive_presence_and_abrupt_unavailable() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
-    suite.create_account("alice", "password")?;
     suite.create_account("bob", "password")?;
     suite.create_account("charlie", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
@@ -378,7 +474,6 @@ fn authorized_resources_receive_presence_and_abrupt_unavailable() -> TestResult 
 #[test]
 fn disabled_roster_does_not_broadcast_stored_subscriptions() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("", seed_roster)?;
-    suite.create_account("alice", "password")?;
     suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
     let mut bob = suite.connect("bob", "password", "phone")?;
@@ -464,8 +559,6 @@ fn automatic_approval_completes_an_outstanding_request() -> TestResult {
         "'roster'",
         seed_pending_request_with_existing_permission,
     )?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
     let mut bob = suite.connect("bob", "password", "phone")?;
 
@@ -1247,8 +1340,6 @@ fn unsolicited_subscription_approval_is_silently_ignored() -> TestResult {
 fn subscription_approval_retry_completes_an_interrupted_transition() -> TestResult {
     let suite =
         C2sSuite::with_extensions_and_setup("'roster'", seed_interrupted_subscription_approval)?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
     let mut bob = suite.connect("bob", "password", "phone")?;
 
@@ -1415,7 +1506,6 @@ fn subscription_request_is_delivered_when_an_offline_contact_becomes_available()
 fn all_stored_subscription_requests_are_replayed_beyond_the_resource_mailbox_capacity() -> TestResult
 {
     let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_pending_subscriptions)?;
-    suite.create_account("bob", "password")?;
     let mut bob = suite.connect("bob", "password", "phone")?;
 
     bob.send("<presence/>")?;
@@ -1503,7 +1593,6 @@ fn roster_get_with_an_item_returns_bad_request() -> TestResult {
 #[test]
 fn roster_get_returns_stored_items() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
-    suite.create_account("alice", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
 
     alice.send("<iq type='get' id='stored-roster'><query xmlns='jabber:iq:roster'/></iq>")?;
@@ -1579,7 +1668,6 @@ fn roster_set_adds_an_item_and_pushes_it_to_interested_resources() -> TestResult
 #[test]
 fn roster_set_updates_editable_fields_and_preserves_subscription_state() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
-    suite.create_account("alice", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
 
     request_roster(
@@ -1949,7 +2037,6 @@ fn initial_presence_delivers_contact_presence_before_stored_subscription_request
 #[test]
 fn initial_presence_ignores_a_subscription_the_contact_never_granted() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
-    suite.create_account("alice", "password")?;
     suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
     let mut bob = suite.connect("bob", "password", "phone")?;
@@ -2233,6 +2320,7 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&alice_account, &bob_account]).await?;
         repository
             .put_roster_item(
                 &alice_account,
@@ -2264,7 +2352,7 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
             )
             .await?;
         repository.commit().await?;
-        Ok::<_, lonewolf_storage::roster::RosterError>(())
+        TestResult::Ok(())
     })?;
     Ok(())
 }
@@ -2272,8 +2360,6 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
 #[test]
 fn roster_removal_of_a_contact_on_an_unhosted_domain_changes_only_the_owner() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_unhosted_contact)?;
-    suite.create_account("alice", "password")?;
-    suite.create_account_jid("bob@unhosted.localhost", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
     request_roster(
         &mut alice,
@@ -2312,6 +2398,7 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
     let bob_contact = RosterJid::from(bob.resolve(&arena)?);
     Runtime::new()?.block_on(async {
         let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&alice_account, &bob_account]).await?;
         repository
             .put_roster_item(
                 &alice_account,
@@ -2339,7 +2426,7 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
             )
             .await?;
         repository.commit().await?;
-        Ok::<_, lonewolf_storage::roster::RosterError>(())
+        TestResult::Ok(())
     })?;
     Ok(())
 }
@@ -2348,8 +2435,6 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
 fn roster_removal_does_not_reveal_resources_the_owner_never_granted() -> TestResult {
     let suite =
         C2sSuite::with_extensions_and_setup("'roster'", seed_one_sided_contact_subscription)?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "private-device")?;
     let mut bob = suite.connect("bob", "password", "phone")?;
     request_roster(

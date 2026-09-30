@@ -2,12 +2,10 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::hash::{BuildHasher, RandomState};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_lock::Mutex;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Path, Request, State};
@@ -36,7 +34,6 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_BODY: usize = 16 * 1024;
-const LIFECYCLE_SHARDS: usize = 64;
 const MAX_PAGE: usize = 100;
 const DEFAULT_PAGE: usize = 50;
 
@@ -184,9 +181,6 @@ struct Api<S> {
     storage: S,
     observer: Arc<dyn AccountObserver>,
     passwords: BlockingExecutor,
-    /// Serializes creation and deletion of the same account, including its cleanup.
-    lifecycle: [Mutex<()>; LIFECYCLE_SHARDS],
-    hash_state: RandomState,
 }
 
 impl<S: Storage> Api<S> {
@@ -195,54 +189,39 @@ impl<S: Storage> Api<S> {
             storage,
             observer,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
-            lifecycle: [const { Mutex::new(()) }; LIFECYCLE_SHARDS],
-            hash_state: RandomState::new(),
         }
     }
 
-    fn lifecycle(&self, key: &AccountKey) -> &Mutex<()> {
-        &self.lifecycle[(self.hash_state.hash_one(key) as usize) % LIFECYCLE_SHARDS]
-    }
-
-    async fn create(
-        self: &Arc<Self>,
-        key: AccountKey,
-        password: Password,
-    ) -> Result<Response, ApiError> {
+    async fn create(&self, key: AccountKey, password: Password) -> Result<Response, ApiError> {
         let response = json(StatusCode::CREATED, &AccountView { jid: key.as_str() })?;
-        self.lifecycle_operation(key, move |api, key| async move {
-            let credentials = api.credentials(password).await?;
-            let mut write = api.storage.begin_write().await?;
-            write
-                .create_account(NewAccount { key, credentials })
-                .await?;
-            write.commit().await?;
-            Ok(())
-        })
-        .await?;
+        let credentials = self.credentials(password).await?;
+        let mut write = self.storage.begin_write().await?;
+        write
+            .create_account(NewAccount { key, credentials })
+            .await?;
+        write.commit().await?;
         Ok(response)
     }
 
+    /// Deletes in three steps: the record goes and the key is marked as deleting, the
+    /// observer forgets the account, and the mark is cleared. Creation is refused while
+    /// the mark stands, and a mark left by a failure is finished by a retry or at startup.
     async fn delete(self: &Arc<Self>, key: AccountKey) -> Result<Response, ApiError> {
         let existed = self
-            .lifecycle_operation(key, |api, key| async move {
-                // Cleanup may write to the same store, so the transaction must end before it runs.
+            .run_to_completion(key, |api, key| async move {
                 let existed = {
                     let mut write = api.storage.begin_write().await?;
-                    match write.delete_account(&key).await {
-                        Ok(()) => {
-                            write.commit().await?;
-                            true
-                        }
-                        Err(AccountError::NotFound) => false,
-                        Err(error) => return Err(error.into()),
-                    }
+                    let existed = write.begin_account_deletion(&key).await?;
+                    write.commit().await?;
+                    existed
                 };
-                // Cleanup also runs for a missing record so a retry can finish an earlier failure.
                 api.observer.deleted(&key).await.map_err(|error| {
                     tracing::error!(error = %error, "account cleanup failed after deletion");
                     ApiError::internal()
                 })?;
+                let mut write = api.storage.begin_write().await?;
+                write.finish_account_deletion(&key).await?;
+                write.commit().await?;
                 Ok(existed)
             })
             .await?;
@@ -253,10 +232,9 @@ impl<S: Storage> Api<S> {
         }
     }
 
-    /// Runs a creation or deletion under the account's lifecycle lock in a task of its
-    /// own, so an abandoned request cannot release the lock while its cleanup is still
-    /// running and let the account be recreated underneath it.
-    async fn lifecycle_operation<T, Fut>(
+    /// Runs a deletion in a task of its own, so a request abandoned by the connection
+    /// deadline still reaches the step that clears the deleting mark.
+    async fn run_to_completion<T, Fut>(
         self: &Arc<Self>,
         key: AccountKey,
         operation: impl FnOnce(Arc<Self>, AccountKey) -> Fut + 'static,
@@ -268,8 +246,7 @@ impl<S: Storage> Api<S> {
         let (done, completed) = oneshot::channel();
         let api = Arc::clone(self);
         compio::runtime::spawn(async move {
-            let _lifecycle = api.lifecycle(&key).lock().await;
-            let result = operation(Arc::clone(&api), key).await;
+            let result = operation(api, key).await;
             let _ = done.send(result);
         })
         .detach();
@@ -519,6 +496,7 @@ impl From<AccountError> for ApiError {
     fn from(error: AccountError) -> Self {
         match error {
             AccountError::AlreadyExists => Self::new(StatusCode::CONFLICT, "account_exists"),
+            AccountError::Deleting => Self::new(StatusCode::CONFLICT, "account_deleting"),
             AccountError::NotFound => Self::not_found(),
             AccountError::UnsupportedIterations => {
                 tracing::error!("admin generated unsupported SCRAM iterations");
@@ -556,11 +534,11 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    use async_lock::MutexGuardArc;
-    use compio::time::timeout;
+    use async_lock::{Mutex, MutexGuardArc};
+    use compio::time::{sleep, timeout};
     use lonewolf_auth::server::ScramDecoy;
     use lonewolf_storage::ReadTransaction;
-    use lonewolf_storage::account::Account;
+    use lonewolf_storage::account::{Account, AccountState};
     use lonewolf_storage::roster::{self, RosterReads, RosterWrites};
     use serde_json::{Value, json};
 
@@ -583,14 +561,32 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryState {
-        keys: BTreeSet<AccountKey>,
+        accounts: Accounts,
         listing_failure: Option<StorageErrorKind>,
         last_listing: Option<(Option<AccountKey>, NonZeroUsize)>,
     }
 
+    #[derive(Clone, Default)]
+    struct Accounts {
+        active: BTreeSet<AccountKey>,
+        deleting: BTreeSet<AccountKey>,
+    }
+
+    impl Accounts {
+        fn state(&self, key: &AccountKey) -> AccountState {
+            if self.active.contains(key) {
+                AccountState::Active
+            } else if self.deleting.contains(key) {
+                AccountState::Deleting
+            } else {
+                AccountState::Absent
+            }
+        }
+    }
+
     struct MemoryTransaction {
         storage: MemoryStorage,
-        keys: BTreeSet<AccountKey>,
+        accounts: Accounts,
         _writer: Option<MutexGuardArc<()>>,
     }
 
@@ -599,7 +595,10 @@ mod tests {
             Self {
                 inner: Arc::new(MemoryInner {
                     state: std::sync::Mutex::new(MemoryState {
-                        keys: keys.into_iter().collect(),
+                        accounts: Accounts {
+                            active: keys.into_iter().collect(),
+                            deleting: BTreeSet::new(),
+                        },
                         ..MemoryState::default()
                     }),
                     writer: Arc::new(Mutex::new(())),
@@ -615,10 +614,6 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
         }
 
-        fn contains(&self, key: &AccountKey) -> bool {
-            self.state().keys.contains(key)
-        }
-
         fn fail_listing(&self, kind: StorageErrorKind) {
             self.state().listing_failure = Some(kind);
         }
@@ -630,7 +625,7 @@ mod tests {
         fn transaction(&self, writer: Option<MutexGuardArc<()>>) -> MemoryTransaction {
             MemoryTransaction {
                 storage: self.clone(),
-                keys: self.state().keys.clone(),
+                accounts: self.state().accounts.clone(),
                 _writer: writer,
             }
         }
@@ -658,7 +653,7 @@ mod tests {
 
     impl WriteTransaction for MemoryTransaction {
         async fn commit(self) -> Result<(), StorageError> {
-            self.storage.state().keys = self.keys;
+            self.storage.state().accounts = self.accounts;
             Ok(())
         }
     }
@@ -666,7 +661,8 @@ mod tests {
     impl AccountReads for MemoryTransaction {
         async fn account(&self, key: &AccountKey) -> Result<Option<Account>, AccountError> {
             Ok(self
-                .keys
+                .accounts
+                .active
                 .contains(key)
                 .then(|| Account { key: key.clone() }))
         }
@@ -694,7 +690,8 @@ mod tests {
                 .into());
             }
             Ok(self
-                .keys
+                .accounts
+                .active
                 .range((
                     after.map_or(Bound::Unbounded, Bound::Excluded),
                     Bound::Unbounded,
@@ -703,21 +700,37 @@ mod tests {
                 .map(|key| Account { key: key.clone() })
                 .collect())
         }
+
+        async fn account_state(&self, key: &AccountKey) -> Result<AccountState, AccountError> {
+            Ok(self.accounts.state(key))
+        }
+
+        async fn unfinished_deletions(&self) -> Result<Vec<AccountKey>, AccountError> {
+            Ok(self.accounts.deleting.iter().cloned().collect())
+        }
     }
 
     impl AccountWrites for MemoryTransaction {
         async fn create_account(&mut self, account: NewAccount) -> Result<(), AccountError> {
-            self.keys
-                .insert(account.key)
-                .then_some(())
-                .ok_or(AccountError::AlreadyExists)
+            match self.accounts.state(&account.key) {
+                AccountState::Active => Err(AccountError::AlreadyExists),
+                AccountState::Deleting => Err(AccountError::Deleting),
+                AccountState::Absent => {
+                    self.accounts.active.insert(account.key);
+                    Ok(())
+                }
+            }
         }
 
-        async fn delete_account(&mut self, key: &AccountKey) -> Result<(), AccountError> {
-            self.keys
-                .remove(key)
-                .then_some(())
-                .ok_or(AccountError::NotFound)
+        async fn begin_account_deletion(&mut self, key: &AccountKey) -> Result<bool, AccountError> {
+            let existed = self.accounts.active.remove(key);
+            self.accounts.deleting.insert(key.clone());
+            Ok(existed)
+        }
+
+        async fn finish_account_deletion(&mut self, key: &AccountKey) -> Result<(), AccountError> {
+            self.accounts.deleting.remove(key);
+            Ok(())
         }
 
         async fn replace_credentials(
@@ -725,7 +738,8 @@ mod tests {
             key: &AccountKey,
             _: ScramCredentials,
         ) -> Result<(), AccountError> {
-            self.keys
+            self.accounts
+                .active
                 .contains(key)
                 .then_some(())
                 .ok_or(AccountError::NotFound)
@@ -799,11 +813,50 @@ mod tests {
         }
     }
 
-    /// Reports when cleanup starts and holds it until released.
+    /// Counts cleanups, optionally reports when one starts and holds it until released,
+    /// and fails the first `failures` calls.
     struct GatedObserver {
         started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
         release: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        failures: AtomicUsize,
         calls: AtomicUsize,
+    }
+
+    impl GatedObserver {
+        fn new(
+            started: Option<oneshot::Sender<()>>,
+            release: Option<oneshot::Receiver<()>>,
+            failures: usize,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                started: std::sync::Mutex::new(started),
+                release: std::sync::Mutex::new(release),
+                failures: AtomicUsize::new(failures),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn counting() -> Arc<Self> {
+            Self::new(None, None, 0)
+        }
+
+        fn failing_once() -> Arc<Self> {
+            Self::new(None, None, 1)
+        }
+
+        fn gated() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (started, cleanup_started) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            (
+                Self::new(Some(started), Some(released), 0),
+                cleanup_started,
+                release,
+            )
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
     }
 
     impl AccountObserver for GatedObserver {
@@ -822,12 +875,21 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
+            let fails = self
+                .failures
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
             Box::pin(async move {
                 if let Some(started) = started {
                     let _ = started.send(());
                 }
                 if let Some(release) = release {
                     let _ = release.await;
+                }
+                if fails {
+                    return Err("cleanup failed".into());
                 }
                 Ok(())
             })
@@ -855,17 +917,54 @@ mod tests {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    async fn stored_state(
+        storage: &MemoryStorage,
+        key: &AccountKey,
+    ) -> Result<AccountState, Box<dyn std::error::Error>> {
+        Ok(storage.begin_read().await?.account_state(key).await?)
+    }
+
+    async fn unfinished_deletions(
+        storage: &MemoryStorage,
+    ) -> Result<Vec<AccountKey>, Box<dyn std::error::Error>> {
+        Ok(storage.begin_read().await?.unfinished_deletions().await?)
+    }
+
+    async fn wait_until_absent(storage: &MemoryStorage, key: &AccountKey) -> TestResult {
+        let settled = async {
+            while stored_state(storage, key).await? != AccountState::Absent {
+                sleep(Duration::from_millis(1)).await;
+            }
+            Ok(())
+        };
+        timeout(Duration::from_secs(5), settled)
+            .await
+            .map_err(|_| "the deleting mark was not cleared")?
+    }
+
+    async fn expect_error(
+        result: Result<Response, ApiError>,
+        status: StatusCode,
+        code: &str,
+    ) -> TestResult {
+        let response = match result {
+            Err(error) => error.into_response(),
+            Ok(_) => return Err("request should fail".into()),
+        };
+        assert_eq!(response.status(), status);
+        let bytes = response.into_body().collect().await?.to_bytes();
+        assert_eq!(
+            &bytes[..],
+            format!("{{\"error\":{{\"code\":\"{code}\"}}}}").as_bytes()
+        );
+        Ok(())
+    }
+
     #[test]
-    fn abandoned_deletion_keeps_the_account_locked_until_cleanup_ends() -> TestResult {
+    fn abandoned_deletion_blocks_recreation_until_cleanup_clears_the_mark() -> TestResult {
         compio::runtime::Runtime::new()?.block_on(async {
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
-            let (started, cleanup_started) = oneshot::channel();
-            let (release, released) = oneshot::channel();
-            let observer = Arc::new(GatedObserver {
-                started: std::sync::Mutex::new(Some(started)),
-                release: std::sync::Mutex::new(Some(released)),
-                calls: AtomicUsize::new(0),
-            });
+            let (observer, cleanup_started, release) = GatedObserver::gated();
             let storage = MemoryStorage::new([key.clone()]);
             let api = Arc::new(Api::new(storage.clone(), observer.clone()));
             {
@@ -873,19 +972,93 @@ mod tests {
                 assert!(poll_once(delete.as_mut()).is_pending());
             }
             cleanup_started.await?;
-            assert!(!storage.contains(&key));
+            assert_eq!(storage.begin_read().await?.account(&key).await?, None);
+            assert_eq!(stored_state(&storage, &key).await?, AccountState::Deleting);
 
-            let mut create = pin!(api.create(key.clone(), Password("secret".into())));
-            assert!(
-                timeout(Duration::from_millis(200), create.as_mut())
-                    .await
-                    .is_err()
-            );
+            let create = api.create(key.clone(), Password("secret".into()));
+            let refused = timeout(Duration::from_secs(5), create)
+                .await
+                .map_err(|_| "create waited for cleanup")?;
+            expect_error(refused, StatusCode::CONFLICT, "account_deleting").await?;
+            assert_eq!(stored_state(&storage, &key).await?, AccountState::Deleting);
+
             release.send(()).map_err(|_| "cleanup is not waiting")?;
-            let response = create.await.map_err(|error| error.code)?;
+            wait_until_absent(&storage, &key).await?;
+            let response = api
+                .create(key.clone(), Password("secret".into()))
+                .await
+                .map_err(|error| error.code)?;
             assert_eq!(response.status(), StatusCode::CREATED);
-            assert!(storage.contains(&key));
-            assert_eq!(observer.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(stored_state(&storage, &key).await?, AccountState::Active);
+            assert_eq!(observer.calls(), 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn failed_cleanup_leaves_the_mark_and_a_retry_finishes_it() -> TestResult {
+        compio::runtime::Runtime::new()?.block_on(async {
+            let key = account_key("alice@example.org").map_err(|error| error.code)?;
+            let observer = GatedObserver::failing_once();
+            let storage = MemoryStorage::new([key.clone()]);
+            let api = Arc::new(Api::new(storage.clone(), observer.clone()));
+
+            let failed = api.delete(key.clone()).await;
+            expect_error(failed, StatusCode::INTERNAL_SERVER_ERROR, "internal_error").await?;
+            assert_eq!(observer.calls(), 1);
+            assert_eq!(storage.begin_read().await?.account(&key).await?, None);
+            assert_eq!(stored_state(&storage, &key).await?, AccountState::Deleting);
+            assert_eq!(unfinished_deletions(&storage).await?, vec![key.clone()]);
+
+            let retried = api.delete(key.clone()).await;
+            expect_error(retried, StatusCode::NOT_FOUND, "not_found").await?;
+            assert_eq!(observer.calls(), 2);
+            assert_eq!(stored_state(&storage, &key).await?, AccountState::Absent);
+            assert!(unfinished_deletions(&storage).await?.is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn deleting_an_absent_account_answers_not_found_and_leaves_no_mark() -> TestResult {
+        compio::runtime::Runtime::new()?.block_on(async {
+            let key = account_key("alice@example.org").map_err(|error| error.code)?;
+            let observer = GatedObserver::counting();
+            let storage = MemoryStorage::new([]);
+            let api = Arc::new(Api::new(storage.clone(), observer.clone()));
+
+            let result = api.delete(key.clone()).await;
+            expect_error(result, StatusCode::NOT_FOUND, "not_found").await?;
+            assert_eq!(observer.calls(), 1);
+            assert_eq!(stored_state(&storage, &key).await?, AccountState::Absent);
+            assert!(unfinished_deletions(&storage).await?.is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn deletion_commits_the_record_removal_before_cleanup_runs() -> TestResult {
+        compio::runtime::Runtime::new()?.block_on(async {
+            let key = account_key("alice@example.org").map_err(|error| error.code)?;
+            let (observer, cleanup_started, release) = GatedObserver::gated();
+            let storage = MemoryStorage::new([key.clone()]);
+            let api = Arc::new(Api::new(storage.clone(), observer.clone()));
+
+            let mut delete = pin!(api.delete(key.clone()));
+            assert!(poll_once(delete.as_mut()).is_pending());
+            cleanup_started.await?;
+            let read = storage.begin_read().await?;
+            assert_eq!(read.account(&key).await?, None);
+            assert_eq!(read.account_state(&key).await?, AccountState::Deleting);
+            assert_eq!(read.unfinished_deletions().await?, vec![key.clone()]);
+            drop(read);
+
+            release.send(()).map_err(|_| "cleanup is not waiting")?;
+            let response = delete.await.map_err(|error| error.code)?;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(stored_state(&storage, &key).await?, AccountState::Absent);
+            assert!(unfinished_deletions(&storage).await?.is_empty());
+            assert_eq!(observer.calls(), 1);
             Ok(())
         })
     }

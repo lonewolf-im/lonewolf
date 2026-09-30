@@ -156,7 +156,7 @@ fn subscribed(jid: RosterJid, state: SubscriptionState) -> RosterItem {
 fn delete_account(roster: &TestRoster, key: &AccountKey) {
     block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
-        transaction.delete_account(key).await?;
+        transaction.begin_account_deletion(key).await?;
         transaction.commit().await.map_err(Into::into)
     })
     .unwrap_or_else(|error: lonewolf_storage::account::AccountError| panic!("{error}"))
@@ -507,6 +507,8 @@ fn only_the_initial_transition_collects_granted_contacts() {
     let alice_account =
         AccountKey::try_from(alice.bare()).unwrap_or_else(|error| panic!("{error}"));
     let bob_account = AccountKey::try_from(bob).unwrap_or_else(|error| panic!("{error}"));
+    create_account(&roster, &alice_account);
+    create_account(&roster, &bob_account);
     block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
         transaction

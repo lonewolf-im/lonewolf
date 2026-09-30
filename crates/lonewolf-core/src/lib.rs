@@ -169,6 +169,15 @@ pub fn run_with_extensions(
                     .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions))
                     .handle();
                 let cleanup_router = router_handle.clone();
+                let resumed = account_cleanup::resume(&storage, &router_handle, &stanza_pool)
+                    .await
+                    .map_err(RunError::UnfinishedDeletions)?;
+                if resumed > 0 {
+                    tracing::info!(
+                        count = resumed,
+                        "finished account deletions left by an earlier run"
+                    );
+                }
                 let listeners = listeners.insert(
                     c2s::Listeners::start(
                         &config.c2s,

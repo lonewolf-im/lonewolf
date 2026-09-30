@@ -18,7 +18,9 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
 use zeroize::Zeroizing;
 
-use crate::account::{Account, AccountError, AccountKey, AccountReads, AccountWrites, NewAccount};
+use crate::account::{
+    Account, AccountError, AccountKey, AccountReads, AccountState, AccountWrites, NewAccount,
+};
 use crate::redb::{RedbRead, RedbWrite, storage_error};
 use crate::{StorageError, StorageErrorKind};
 
@@ -26,6 +28,8 @@ pub(crate) const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub(crate) const DECOY_SECRET: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lonewolf_scram_decoy");
 pub(crate) const DECOY_SECRET_KEY: &str = "secret";
+pub(crate) const DELETIONS: TableDefinition<&str, ()> =
+    TableDefinition::new("lonewolf_account_deletions");
 const RECORD_VERSION: u8 = 1;
 const SHA1: u8 = 1;
 const SHA256: u8 = 2;
@@ -49,6 +53,7 @@ pub(crate) fn initialize(transaction: &WriteTransaction) -> Result<ScramDecoy, S
     let fresh = !accounts_table_exists;
     let mut secret = Zeroizing::new([0; 32]);
     transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+    transaction.open_table(DELETIONS).map_err(storage_error)?;
     let mut table = transaction
         .open_table(DECOY_SECRET)
         .map_err(storage_error)?;
@@ -114,6 +119,27 @@ macro_rules! account_reads {
                     list_accounts(&table, after.as_ref(), limit)
                 })
             }
+
+            fn account_state(
+                &self,
+                key: &AccountKey,
+            ) -> impl Future<Output = Result<AccountState, AccountError>> + Send {
+                let key = key.clone();
+                self.run(move |transaction| {
+                    let accounts = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
+                    let deletions = transaction.open_table(DELETIONS).map_err(storage_error)?;
+                    read_state(&accounts, &deletions, key.as_str())
+                })
+            }
+
+            fn unfinished_deletions(
+                &self,
+            ) -> impl Future<Output = Result<Vec<AccountKey>, AccountError>> + Send {
+                self.run(move |transaction| {
+                    let deletions = transaction.open_table(DELETIONS).map_err(storage_error)?;
+                    list_deletions(&deletions)
+                })
+            }
         }
     };
 }
@@ -129,12 +155,27 @@ impl AccountWrites for RedbWrite {
         self.run(move |transaction| create(transaction, account))
     }
 
-    fn delete_account(
+    fn begin_account_deletion(
+        &mut self,
+        key: &AccountKey,
+    ) -> impl Future<Output = Result<bool, AccountError>> + Send {
+        let key = key.clone();
+        self.run(move |transaction| begin_deletion(transaction, &key))
+    }
+
+    fn finish_account_deletion(
         &mut self,
         key: &AccountKey,
     ) -> impl Future<Output = Result<(), AccountError>> + Send {
         let key = key.clone();
-        self.run(move |transaction| delete(transaction, &key))
+        self.run(move |transaction| {
+            transaction
+                .open_table(DELETIONS)
+                .map_err(storage_error)?
+                .remove(key.as_str())
+                .map_err(storage_error)?;
+            Ok(())
+        })
     }
 
     fn replace_credentials(
@@ -171,6 +212,44 @@ fn read_scram<T: ReadableTable<&'static str, &'static [u8]>>(
         ScramHash::Sha1 => credentials.sha1.map(ScramVerifier::Sha1),
         ScramHash::Sha256 => credentials.sha256.map(ScramVerifier::Sha256),
     })
+}
+
+fn read_state<A, D>(accounts: &A, deletions: &D, key: &str) -> Result<AccountState, AccountError>
+where
+    A: ReadableTable<&'static str, &'static [u8]>,
+    D: ReadableTable<&'static str, ()>,
+{
+    if accounts.get(key).map_err(storage_error)?.is_some() {
+        Ok(AccountState::Active)
+    } else if deletions.get(key).map_err(storage_error)?.is_some() {
+        Ok(AccountState::Deleting)
+    } else {
+        Ok(AccountState::Absent)
+    }
+}
+
+fn list_deletions<D: ReadableTable<&'static str, ()>>(
+    deletions: &D,
+) -> Result<Vec<AccountKey>, AccountError> {
+    let mut keys = Vec::new();
+    for entry in deletions.iter().map_err(storage_error)? {
+        let (key, _) = entry.map_err(storage_error)?;
+        keys.push(decode_account_key(key.value())?);
+    }
+    Ok(keys)
+}
+
+/// Whether `key` has an account record; roster writes use it to refuse deleted owners.
+pub(crate) fn account_exists(
+    transaction: &WriteTransaction,
+    key: &str,
+) -> Result<bool, StorageError> {
+    Ok(transaction
+        .open_table(ACCOUNTS)
+        .map_err(storage_error)?
+        .get(key)
+        .map_err(storage_error)?
+        .is_some())
 }
 
 fn list_accounts<T: ReadableTable<&'static str, &'static [u8]>>(
@@ -227,6 +306,15 @@ fn create(transaction: &WriteTransaction, account: NewAccount) -> Result<(), Acc
     {
         return Err(AccountError::AlreadyExists);
     }
+    if transaction
+        .open_table(DELETIONS)
+        .map_err(storage_error)?
+        .get(account.key.as_str())
+        .map_err(storage_error)?
+        .is_some()
+    {
+        return Err(AccountError::Deleting);
+    }
     validate_iterations(&account.credentials)?;
     let record = encode_credentials(&account.credentials);
     table
@@ -235,17 +323,25 @@ fn create(transaction: &WriteTransaction, account: NewAccount) -> Result<(), Acc
     Ok(())
 }
 
-fn delete(transaction: &WriteTransaction, key: &AccountKey) -> Result<(), AccountError> {
+fn begin_deletion(transaction: &WriteTransaction, key: &AccountKey) -> Result<bool, AccountError> {
     let mut table = transaction.open_table(ACCOUNTS).map_err(storage_error)?;
-    {
-        let record = table
-            .get(key.as_str())
-            .map_err(storage_error)?
-            .ok_or(AccountError::NotFound)?;
-        decode_credentials(record.value())?;
+    let existed = match table.get(key.as_str()).map_err(storage_error)? {
+        Some(record) => {
+            decode_credentials(record.value())?;
+            true
+        }
+        None => false,
+    };
+    if existed {
+        table.remove(key.as_str()).map_err(storage_error)?;
     }
-    table.remove(key.as_str()).map_err(storage_error)?;
-    Ok(())
+    drop(table);
+    transaction
+        .open_table(DELETIONS)
+        .map_err(storage_error)?
+        .insert(key.as_str(), ())
+        .map_err(storage_error)?;
+    Ok(existed)
 }
 
 fn replace_credentials(

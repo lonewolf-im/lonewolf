@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::slice;
 use std::sync::Barrier;
 use std::thread;
 
@@ -8,7 +9,7 @@ use futures_executor::block_on;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier, ScramVerifierData};
 
 use super::{TestResult, assert_scram, credentials, key, new_account, read, verifier, write};
-use crate::account::{AccountError, AccountReads, AccountWrites, NewAccount};
+use crate::account::{AccountError, AccountReads, AccountState, AccountWrites, NewAccount};
 use crate::{Storage, WriteTransaction};
 
 const TWO: NonZeroUsize = const { NonZeroUsize::new(2).unwrap() };
@@ -233,20 +234,19 @@ pub(crate) fn deletion_removes_the_account_and_all_its_credentials<S: Storage>(
         writer.commit().await?;
 
         let mut writer = storage.begin_write().await?;
-        writer.delete_account(&normalized).await?;
-        assert!(matches!(
-            writer.delete_account(&alice).await,
-            Err(AccountError::NotFound)
-        ));
+        assert!(writer.begin_account_deletion(&normalized).await?);
+        assert!(!writer.begin_account_deletion(&alice).await?);
         assert!(matches!(
             writer.replace_credentials(&alice, credentials(20)).await,
             Err(AccountError::NotFound)
         ));
         assert!(writer.account(&alice).await?.is_none());
+        writer.finish_account_deletion(&alice).await?;
         writer.commit().await?;
 
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_none());
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Absent);
         for hash in [ScramHash::Sha1, ScramHash::Sha256] {
             assert!(reader.scram(&alice, hash).await?.is_none());
             assert!(reader.scram(&other, hash).await?.is_some());
@@ -264,7 +264,8 @@ pub(crate) fn deleted_accounts_can_be_recreated_with_new_credentials<S: Storage>
     block_on(async {
         write(&storage, async |tx| tx.create_account(account).await).await?;
         let mut writer = storage.begin_write().await?;
-        writer.delete_account(&alice).await?;
+        assert!(writer.begin_account_deletion(&alice).await?);
+        writer.finish_account_deletion(&alice).await?;
         writer.create_account(recreated).await?;
         writer.commit().await?;
         let reader = storage.begin_read().await?;
@@ -317,13 +318,14 @@ pub(crate) fn concurrent_deletion_has_one_successful_removal<S: Storage>(storage
     let account = new_account("alice@example.com", 10)?;
     block_on(write(&storage, async |tx| tx.create_account(account).await))?;
     let barrier = Barrier::new(2);
-    let delete = || -> Result<(), AccountError> {
+    let delete = || -> Result<bool, AccountError> {
         barrier.wait();
         block_on(async {
             let mut writer = storage.begin_write().await?;
-            writer.delete_account(&alice).await?;
+            let existed = writer.begin_account_deletion(&alice).await?;
+            writer.finish_account_deletion(&alice).await?;
             writer.commit().await?;
-            Ok(())
+            Ok(existed)
         })
     };
     let (first, second) = thread::scope(|scope| {
@@ -334,10 +336,14 @@ pub(crate) fn concurrent_deletion_has_one_successful_removal<S: Storage>(storage
     let first = first.map_err(|_| "account deletion thread panicked")?;
     assert!(matches!(
         (first, second),
-        (Ok(()), Err(AccountError::NotFound)) | (Err(AccountError::NotFound), Ok(()))
+        (Ok(true), Ok(false)) | (Ok(false), Ok(true))
     ));
-    assert!(block_on(read(&storage, async |tx| tx.account(&alice).await))?.is_none());
-    Ok(())
+    block_on(async {
+        let reader = storage.begin_read().await?;
+        assert!(reader.account(&alice).await?.is_none());
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Absent);
+        Ok(())
+    })
 }
 
 pub(crate) fn accounts_after_returns_pages_in_canonical_key_order<S: Storage>(
@@ -468,7 +474,8 @@ pub(crate) fn accounts_after_resumes_after_deleted_and_absent_cursor_keys<S: Sto
         let cursor = &first[0].key;
 
         let mut writer = storage.begin_write().await?;
-        writer.delete_account(cursor).await?;
+        assert!(writer.begin_account_deletion(cursor).await?);
+        writer.finish_account_deletion(cursor).await?;
         for input in ["aaron@example.com", "bob@example.com"] {
             writer.create_account(new_account(input, 10)?).await?;
         }
@@ -507,8 +514,10 @@ pub(crate) fn accounts_after_reads_the_snapshot_of_its_transaction<S: Storage>(
 
         let reader = storage.begin_read().await?;
         let mut writer = storage.begin_write().await?;
-        writer.delete_account(&bob).await?;
-        writer.delete_account(&dave).await?;
+        for deleted in [&bob, &dave] {
+            assert!(writer.begin_account_deletion(deleted).await?);
+            writer.finish_account_deletion(deleted).await?;
+        }
         writer
             .create_account(new_account("carol@example.com", 10)?)
             .await?;
@@ -531,6 +540,272 @@ pub(crate) fn accounts_after_reads_the_snapshot_of_its_transaction<S: Storage>(
         .await?;
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].key, carol);
+        Ok(())
+    })
+}
+
+pub(crate) fn begin_account_deletion_removes_the_record_and_marks_the_key_deleting<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    block_on(async {
+        write(&storage, async |tx| tx.create_account(account).await).await?;
+        let mut writer = storage.begin_write().await?;
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Active);
+        assert!(writer.begin_account_deletion(&alice).await?);
+        assert!(writer.account(&alice).await?.is_none());
+        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+            assert!(writer.scram(&alice, hash).await?.is_none());
+        }
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Deleting);
+        writer.commit().await?;
+
+        let reader = storage.begin_read().await?;
+        assert!(reader.account(&alice).await?.is_none());
+        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+            assert!(reader.scram(&alice, hash).await?.is_none());
+        }
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
+        Ok(())
+    })
+}
+
+pub(crate) fn repeated_begin_account_deletion_returns_false_and_keeps_the_key_deleting<
+    S: Storage,
+>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    block_on(async {
+        write(&storage, async |tx| tx.create_account(account).await).await?;
+        let mut writer = storage.begin_write().await?;
+        assert!(writer.begin_account_deletion(&alice).await?);
+        assert!(!writer.begin_account_deletion(&alice).await?);
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Deleting);
+        writer.commit().await?;
+
+        let mut writer = storage.begin_write().await?;
+        assert!(!writer.begin_account_deletion(&alice).await?);
+        writer.commit().await?;
+        let reader = storage.begin_read().await?;
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
+        assert_eq!(reader.unfinished_deletions().await?, [alice]);
+        Ok(())
+    })
+}
+
+pub(crate) fn begin_account_deletion_marks_an_absent_key_deleting_and_returns_false<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    block_on(async {
+        let mut writer = storage.begin_write().await?;
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Absent);
+        assert!(!writer.begin_account_deletion(&alice).await?);
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Deleting);
+        writer.commit().await?;
+
+        let reader = storage.begin_read().await?;
+        assert!(reader.account(&alice).await?.is_none());
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
+        assert_eq!(reader.unfinished_deletions().await?, [alice]);
+        Ok(())
+    })
+}
+
+pub(crate) fn create_account_is_rejected_while_deleting_and_allowed_after_finish<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    let rejected = new_account("alice@example.com", 20)?;
+    let recreated = new_account("alice@example.com", 30)?;
+    block_on(async {
+        write(&storage, async |tx| tx.create_account(account).await).await?;
+        write(&storage, async |tx| tx.begin_account_deletion(&alice).await).await?;
+
+        let mut writer = storage.begin_write().await?;
+        assert!(matches!(
+            writer.create_account(rejected).await,
+            Err(AccountError::Deleting)
+        ));
+        assert!(writer.account(&alice).await?.is_none());
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Deleting);
+        writer.commit().await?;
+        let reader = storage.begin_read().await?;
+        assert!(reader.account(&alice).await?.is_none());
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
+        drop(reader);
+
+        let mut writer = storage.begin_write().await?;
+        writer.finish_account_deletion(&alice).await?;
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Absent);
+        writer.create_account(recreated).await?;
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Active);
+        writer.commit().await?;
+        let reader = storage.begin_read().await?;
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Active);
+        assert_scram(reader.scram(&alice, ScramHash::Sha1).await?, 30)?;
+        assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 33)?;
+        assert!(reader.unfinished_deletions().await?.is_empty());
+        Ok(())
+    })
+}
+
+pub(crate) fn finish_account_deletion_without_a_mark_changes_nothing<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    block_on(async {
+        let mut writer = storage.begin_write().await?;
+        writer.finish_account_deletion(&alice).await?;
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Absent);
+        writer.commit().await?;
+
+        write(&storage, async |tx| tx.create_account(account).await).await?;
+        let mut writer = storage.begin_write().await?;
+        writer.finish_account_deletion(&alice).await?;
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Active);
+        writer.commit().await?;
+
+        let reader = storage.begin_read().await?;
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Active);
+        assert_scram(reader.scram(&alice, ScramHash::Sha1).await?, 10)?;
+        assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 13)?;
+        assert!(reader.unfinished_deletions().await?.is_empty());
+        Ok(())
+    })
+}
+
+pub(crate) fn unfinished_deletions_lists_deleting_keys_in_canonical_order_until_finished<
+    S: Storage,
+>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let bob = key("bob@example.com")?;
+    let dan = key("dan@example.com")?;
+    let e_acute = key("é@bücher.example")?;
+    block_on(async {
+        let mut writer = storage.begin_write().await?;
+        assert!(writer.unfinished_deletions().await?.is_empty());
+        for input in ["bob@example.com", "É@BÜCHER.EXAMPLE", "ALICE@EXAMPLE.COM"] {
+            writer.create_account(new_account(input, 10)?).await?;
+        }
+        writer.commit().await?;
+
+        let mut writer = storage.begin_write().await?;
+        for deleting in [&e_acute, &bob, &alice] {
+            assert!(writer.begin_account_deletion(deleting).await?);
+        }
+        assert!(!writer.begin_account_deletion(&dan).await?);
+        assert_eq!(
+            writer.unfinished_deletions().await?,
+            [alice.clone(), bob.clone(), dan.clone(), e_acute.clone()]
+        );
+        writer.commit().await?;
+        assert_eq!(
+            read(&storage, async |tx| tx.unfinished_deletions().await).await?,
+            [alice.clone(), bob.clone(), dan.clone(), e_acute.clone()]
+        );
+
+        let mut writer = storage.begin_write().await?;
+        writer.finish_account_deletion(&bob).await?;
+        assert_eq!(
+            writer.unfinished_deletions().await?,
+            [alice.clone(), dan.clone(), e_acute.clone()]
+        );
+        writer.commit().await?;
+        assert_eq!(
+            read(&storage, async |tx| tx.unfinished_deletions().await).await?,
+            [alice.clone(), dan.clone(), e_acute.clone()]
+        );
+
+        let mut writer = storage.begin_write().await?;
+        for finished in [&alice, &dan, &e_acute] {
+            writer.finish_account_deletion(finished).await?;
+        }
+        assert!(writer.unfinished_deletions().await?.is_empty());
+        writer.commit().await?;
+        let reader = storage.begin_read().await?;
+        assert!(reader.unfinished_deletions().await?.is_empty());
+        for finished in [&alice, &bob, &dan, &e_acute] {
+            assert_eq!(reader.account_state(finished).await?, AccountState::Absent);
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn begin_account_deletion_marks_the_key_in_the_same_transaction_as_the_removal<
+    S: Storage,
+>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    block_on(async {
+        write(&storage, async |tx| tx.create_account(account).await).await?;
+        let mut writer = storage.begin_write().await?;
+        assert!(writer.begin_account_deletion(&alice).await?);
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Deleting);
+        assert_eq!(
+            writer.unfinished_deletions().await?,
+            slice::from_ref(&alice)
+        );
+        drop(writer);
+
+        let reader = storage.begin_read().await?;
+        assert_eq!(
+            reader.account(&alice).await?.ok_or("missing account")?.key,
+            alice
+        );
+        assert_scram(reader.scram(&alice, ScramHash::Sha1).await?, 10)?;
+        assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 13)?;
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Active);
+        assert!(reader.unfinished_deletions().await?.is_empty());
+        Ok(())
+    })
+}
+
+pub(crate) fn accounts_after_never_lists_a_deleting_account<S: Storage>(storage: S) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let bob = key("bob@example.com")?;
+    let carol = key("carol@example.com")?;
+    let dan = key("dan@example.com")?;
+    block_on(async {
+        let mut writer = storage.begin_write().await?;
+        for input in ["alice@example.com", "bob@example.com", "carol@example.com"] {
+            writer.create_account(new_account(input, 10)?).await?;
+        }
+        writer.commit().await?;
+
+        let mut writer = storage.begin_write().await?;
+        assert!(writer.begin_account_deletion(&bob).await?);
+        assert!(!writer.begin_account_deletion(&dan).await?);
+        let own = writer.accounts_after(None, NonZeroUsize::MAX).await?;
+        assert_eq!(own.len(), 2);
+        assert_eq!(own[0].key, alice);
+        assert_eq!(own[1].key, carol);
+        writer.commit().await?;
+
+        let reader = storage.begin_read().await?;
+        let all = reader.accounts_after(None, NonZeroUsize::MAX).await?;
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].key, alice);
+        assert_eq!(all[1].key, carol);
+        let after_alice = reader.accounts_after(Some(&alice), TWO).await?;
+        assert_eq!(after_alice.len(), 1);
+        assert_eq!(after_alice[0].key, carol);
+        assert!(
+            reader
+                .accounts_after(Some(&carol), NonZeroUsize::MAX)
+                .await?
+                .is_empty()
+        );
+        assert_eq!(reader.unfinished_deletions().await?, [bob, dan]);
         Ok(())
     })
 }

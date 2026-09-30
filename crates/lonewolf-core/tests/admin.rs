@@ -139,7 +139,8 @@ async fn account_exists(storage: &RedbStorage, key: &AccountKey) -> Result<bool,
 
 async fn delete(storage: &RedbStorage, key: &AccountKey) -> TestResult {
     let mut transaction = storage.begin_write().await?;
-    transaction.delete_account(key).await?;
+    transaction.begin_account_deletion(key).await?;
+    transaction.finish_account_deletion(key).await?;
     transaction.commit().await?;
     Ok(())
 }

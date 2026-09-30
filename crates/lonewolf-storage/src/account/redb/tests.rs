@@ -63,9 +63,10 @@ fn malformed_records_fail_operations_and_stay_unchanged_when_the_transaction_is_
                 StorageErrorKind::CorruptData,
             );
             assert_storage_error(
-                writer.delete_account(&alice).await,
+                writer.begin_account_deletion(&alice).await,
                 StorageErrorKind::CorruptData,
             );
+            assert!(writer.unfinished_deletions().await?.is_empty());
             Ok::<(), Box<dyn Error>>(())
         })?;
         assert_eq!(
@@ -100,9 +101,10 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
             StorageErrorKind::UnsupportedVersion,
         );
         assert_storage_error(
-            writer.delete_account(&alice).await,
+            writer.begin_account_deletion(&alice).await,
             StorageErrorKind::UnsupportedVersion,
         );
+        assert!(writer.unfinished_deletions().await?.is_empty());
         Ok::<(), Box<dyn Error>>(())
     })?;
     assert_eq!(

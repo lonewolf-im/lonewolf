@@ -85,6 +85,8 @@ impl fmt::Debug for PendingSubscription {
 #[derive(Debug)]
 pub enum RosterError {
     ValueTooLarge,
+    /// The owner of the written state has no account record.
+    NoAccount,
     Storage(StorageError),
 }
 
@@ -118,7 +120,8 @@ pub trait RosterReads {
 /// Roster writes, each taking effect when the transaction commits.
 pub trait RosterWrites {
     /// Stores the item as given, replacing any item for the same JID, and advances the
-    /// owner's roster version.
+    /// owner's roster version. Fails with [`RosterError::NoAccount`] when the owner has
+    /// no account record, so nothing can be written for a deleted account.
     fn put_roster_item(
         &mut self,
         owner: &AccountKey,
@@ -132,7 +135,8 @@ pub trait RosterWrites {
         jid: &RosterJid,
     ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send;
 
-    /// Replaces any pending request from the same sender.
+    /// Replaces any pending request from the same sender. Fails with
+    /// [`RosterError::NoAccount`] when the owner has no account record.
     fn put_pending_request(
         &mut self,
         owner: &AccountKey,
@@ -157,6 +161,7 @@ impl fmt::Display for RosterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ValueTooLarge => formatter.write_str("roster value is too large"),
+            Self::NoAccount => formatter.write_str("roster owner has no account"),
             Self::Storage(error) => write!(formatter, "roster storage failed: {error}"),
         }
     }
@@ -165,7 +170,7 @@ impl fmt::Display for RosterError {
 impl Error for RosterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ValueTooLarge => None,
+            Self::ValueTooLarge | Self::NoAccount => None,
             Self::Storage(error) => Some(error),
         }
     }

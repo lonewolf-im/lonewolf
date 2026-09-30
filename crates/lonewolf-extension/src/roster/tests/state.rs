@@ -10,10 +10,18 @@ use lonewolf_storage::roster::{
 };
 use lonewolf_storage::{RedbWrite, Storage, WriteTransaction};
 
-use super::{TestRoster, account, item, pending, roster, snapshot};
+use super::{TestRoster, account, create_account, item, pending, roster as empty_roster, snapshot};
 use crate::roster::state::{self, RequestOutcome};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+fn roster() -> (tempfile::TempDir, TestRoster) {
+    let (directory, roster) = empty_roster();
+    for jid in ["alice@example.com", "bob@example.com"] {
+        create_account(&roster, &account(jid));
+    }
+    (directory, roster)
+}
 
 fn jid(input: &str) -> RosterJid {
     RosterJid::from(&account(input))
@@ -320,6 +328,8 @@ fn established_subscription_requests_are_automatically_approved_without_changes(
     {
         let alice = account(&format!("alice{index}@example.com"));
         let bob = account(&format!("bob{index}@example.com"));
+        create_account(&roster, &alice);
+        create_account(&roster, &bob);
         let alice_jid = RosterJid::from(&alice);
         let bob_jid = RosterJid::from(&bob);
         set_subscription(&roster, &alice, &bob_jid, subscription(subscriber_state))?;
@@ -370,6 +380,8 @@ fn automatic_approval_resolves_an_outstanding_request() -> TestResult {
     {
         let alice = account(&format!("alice{index}@example.com"));
         let bob = account(&format!("bob{index}@example.com"));
+        create_account(&roster, &alice);
+        create_account(&roster, &bob);
         let alice_jid = RosterJid::from(&alice);
         let bob_jid = RosterJid::from(&bob);
         set_subscription(

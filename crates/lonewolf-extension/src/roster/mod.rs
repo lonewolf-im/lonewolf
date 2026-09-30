@@ -340,6 +340,7 @@ fn split_subscriptions(
 fn roster_error(error: RosterError) -> StanzaErrorCondition {
     match error {
         RosterError::ValueTooLarge => StanzaErrorCondition::NotAcceptable,
+        RosterError::NoAccount => StanzaErrorCondition::Forbidden,
         RosterError::Storage(_) => StanzaErrorCondition::InternalServerError,
     }
 }

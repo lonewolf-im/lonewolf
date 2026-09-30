@@ -39,6 +39,7 @@ pub enum RunError {
         store: String,
         source: StorageError,
     },
+    UnfinishedDeletions(Box<dyn Error + Send + Sync>),
 }
 
 impl fmt::Display for RunError {
@@ -78,6 +79,10 @@ impl fmt::Display for RunError {
             Self::Storage { store, source } => {
                 write!(formatter, "cannot open store {store:?}: {source}")
             }
+            Self::UnfinishedDeletions(source) => write!(
+                formatter,
+                "cannot finish the account deletions an earlier run left behind: {source}"
+            ),
         }
     }
 }
@@ -102,6 +107,7 @@ impl Error for RunError {
             | Self::C2s(source) => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),
             Self::Storage { source, .. } => Some(source),
+            Self::UnfinishedDeletions(source) => Some(source.as_ref()),
             Self::UnknownStore(_) => None,
         }
     }

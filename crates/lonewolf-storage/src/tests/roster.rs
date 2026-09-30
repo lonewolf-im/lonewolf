@@ -1,12 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::slice;
+
 use futures_executor::block_on;
 
-use super::{TestResult, item, item_with_subscription, jid, key, pending, read, write};
+use super::{
+    TestResult, item, item_with_subscription, jid, key, new_account, pending, read, write,
+};
+use crate::account::{AccountReads, AccountState, AccountWrites};
 use crate::roster::{
-    RosterReads, RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
+    RosterError, RosterReads, RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
 };
 use crate::{Storage, WriteTransaction};
+
+async fn create_owners<S: Storage>(storage: &S, owners: &[&str]) -> TestResult {
+    let mut writer = storage.begin_write().await?;
+    for owner in owners {
+        writer.create_account(new_account(owner, 10)?).await?;
+    }
+    writer.commit().await?;
+    Ok(())
+}
 
 pub(crate) fn new_roster_is_empty_at_version_zero<S: Storage>(storage: S) -> TestResult {
     let alice = key("alice@example.com")?;
@@ -35,6 +49,7 @@ pub(crate) fn put_roster_item_stores_every_field_and_advances_the_version<S: Sto
         subscription,
     )?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
         let version = write(&storage, async |tx| {
             tx.put_roster_item(&owner, &stored).await
         })
@@ -87,6 +102,7 @@ pub(crate) fn put_roster_item_replaces_the_item_for_the_same_jid_and_advances_ag
         },
     )?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
         write(&storage, async |tx| {
             tx.put_roster_item(&owner, &original).await
         })
@@ -119,6 +135,7 @@ pub(crate) fn rosters_are_isolated_by_owner_and_sorted_by_contact<S: Storage>(
     let carol = key("carol@example.com")?;
     let bob = jid("bob@example.com")?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com", "carol@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
         for contact in ["zara@example.com", "bob@example.com"] {
             writer
@@ -162,6 +179,7 @@ pub(crate) fn roster_item_returns_exactly_the_stored_item_or_none<S: Storage>(
         },
     )?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
         write(&storage, async |tx| {
             tx.put_roster_item(&alice, &stored).await
         })
@@ -192,6 +210,7 @@ pub(crate) fn remove_roster_item_returns_the_old_item_and_only_advances_an_exist
         },
     )?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
         write(&storage, async |tx| {
             tx.put_roster_item(&owner, &stored).await
         })
@@ -247,6 +266,7 @@ pub(crate) fn pending_requests_are_deduplicated_by_sender_and_returned_in_sender
     let last = pending("bob@example.com", b"<presence id='last'/>")?;
     let from_zara = pending("zara@example.com", b"<presence id='zara'/>")?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
         writer
             .put_pending_request(&owner, from_zara.clone())
@@ -286,6 +306,7 @@ pub(crate) fn remove_pending_request_reports_existence_and_leaves_items_and_vers
     let bob = jid("bob@example.com")?;
     let stored = item("bob@example.com", Some("Bob"), &[])?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
         writer.put_roster_item(&owner, &stored).await?;
         writer
@@ -316,6 +337,7 @@ pub(crate) fn clear_roster_removes_one_owners_items_version_and_pending_requests
     let bob = jid("bob@example.com")?;
     let restored = item("bob@example.com", None, &[])?;
     block_on(async {
+        create_owners(&storage, &["alice@example.com", "carol@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
         for owner in [&alice, &carol] {
             writer
@@ -349,6 +371,169 @@ pub(crate) fn clear_roster_removes_one_owners_items_version_and_pending_requests
         })
         .await?;
         assert_eq!(version.get(), 1);
+        Ok(())
+    })
+}
+
+pub(crate) fn put_roster_item_is_rejected_for_an_owner_without_an_account_record<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let unknown = key("unknown@example.com")?;
+    let deleting = key("deleting@example.com")?;
+    let active = key("active@example.com")?;
+    let bob = jid("bob@example.com")?;
+    let dave = jid("dave@example.com")?;
+    let bob_item = item("bob@example.com", Some("Bob"), &["Friends"])?;
+    let dave_item = item("dave@example.com", None, &[])?;
+    block_on(async {
+        create_owners(&storage, &["deleting@example.com", "active@example.com"]).await?;
+        let mut writer = storage.begin_write().await?;
+        writer.put_roster_item(&deleting, &bob_item).await?;
+        assert!(writer.begin_account_deletion(&deleting).await?);
+        writer.commit().await?;
+
+        let mut writer = storage.begin_write().await?;
+        assert!(matches!(
+            writer.put_roster_item(&unknown, &bob_item).await,
+            Err(RosterError::NoAccount)
+        ));
+        assert!(matches!(
+            writer.put_roster_item(&deleting, &dave_item).await,
+            Err(RosterError::NoAccount)
+        ));
+        assert_eq!(writer.put_roster_item(&active, &bob_item).await?.get(), 1);
+        assert_eq!(
+            writer.roster(&unknown).await?.version,
+            RosterVersion::default()
+        );
+        assert!(writer.roster_item(&unknown, &bob).await?.is_none());
+        assert_eq!(writer.roster(&deleting).await?.version.get(), 1);
+        assert!(writer.roster_item(&deleting, &dave).await?.is_none());
+        writer.commit().await?;
+
+        let reader = storage.begin_read().await?;
+        let unknown_roster = reader.roster(&unknown).await?;
+        assert_eq!(unknown_roster.version, RosterVersion::default());
+        assert!(unknown_roster.items.is_empty());
+        let deleting_roster = reader.roster(&deleting).await?;
+        assert_eq!(deleting_roster.version.get(), 1);
+        assert_eq!(deleting_roster.items, slice::from_ref(&bob_item));
+        assert_eq!(
+            reader.account_state(&deleting).await?,
+            AccountState::Deleting
+        );
+        let active_roster = reader.roster(&active).await?;
+        assert_eq!(active_roster.version.get(), 1);
+        assert_eq!(active_roster.items, [bob_item]);
+        Ok(())
+    })
+}
+
+pub(crate) fn put_pending_request_is_rejected_for_an_owner_without_an_account_record<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let unknown = key("unknown@example.com")?;
+    let deleting = key("deleting@example.com")?;
+    let active = key("active@example.com")?;
+    let bob = jid("bob@example.com")?;
+    let dave = jid("dave@example.com")?;
+    let from_bob = pending("bob@example.com", b"<presence id='bob'/>")?;
+    let from_dave = pending("dave@example.com", b"<presence id='dave'/>")?;
+    block_on(async {
+        create_owners(&storage, &["deleting@example.com", "active@example.com"]).await?;
+        let mut writer = storage.begin_write().await?;
+        writer
+            .put_pending_request(&deleting, from_bob.clone())
+            .await?;
+        assert!(writer.begin_account_deletion(&deleting).await?);
+        writer.commit().await?;
+
+        let mut writer = storage.begin_write().await?;
+        assert!(matches!(
+            writer.put_pending_request(&unknown, from_bob.clone()).await,
+            Err(RosterError::NoAccount)
+        ));
+        assert!(matches!(
+            writer.put_pending_request(&deleting, from_dave).await,
+            Err(RosterError::NoAccount)
+        ));
+        writer
+            .put_pending_request(&active, from_bob.clone())
+            .await?;
+        assert!(writer.pending_requests(&unknown).await?.is_empty());
+        assert!(writer.pending_request(&deleting, &dave).await?.is_none());
+        writer.commit().await?;
+
+        let reader = storage.begin_read().await?;
+        assert!(reader.pending_requests(&unknown).await?.is_empty());
+        assert!(reader.pending_request(&unknown, &bob).await?.is_none());
+        assert_eq!(
+            reader.pending_requests(&deleting).await?,
+            slice::from_ref(&from_bob)
+        );
+        assert!(reader.pending_request(&deleting, &dave).await?.is_none());
+        assert_eq!(
+            reader.account_state(&deleting).await?,
+            AccountState::Deleting
+        );
+        assert_eq!(reader.pending_requests(&active).await?, [from_bob]);
+        for owner in [&unknown, &deleting, &active] {
+            assert_eq!(
+                reader.roster(owner).await?.version,
+                RosterVersion::default()
+            );
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleting_owner<S: Storage>(
+    storage: S,
+) -> TestResult {
+    let alice = key("alice@example.com")?;
+    let bob = jid("bob@example.com")?;
+    let dave = jid("dave@example.com")?;
+    let bob_item = item("bob@example.com", Some("Bob"), &["Friends"])?;
+    let dave_item = item("dave@example.com", None, &[])?;
+    block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
+        let mut writer = storage.begin_write().await?;
+        writer.put_roster_item(&alice, &bob_item).await?;
+        writer.put_roster_item(&alice, &dave_item).await?;
+        for sender in ["bob@example.com", "dave@example.com"] {
+            writer
+                .put_pending_request(&alice, pending(sender, b"<presence/>")?)
+                .await?;
+        }
+        assert!(writer.begin_account_deletion(&alice).await?);
+        writer.commit().await?;
+
+        let mut writer = storage.begin_write().await?;
+        assert_eq!(writer.account_state(&alice).await?, AccountState::Deleting);
+        let removed = writer
+            .remove_roster_item(&alice, &bob)
+            .await?
+            .ok_or("missing removal")?;
+        assert_eq!(removed.version.get(), 3);
+        assert_eq!(removed.value, bob_item);
+        assert!(writer.remove_pending_request(&alice, &bob).await?);
+        assert!(!writer.remove_pending_request(&alice, &bob).await?);
+        assert_eq!(writer.roster(&alice).await?.items, [dave_item]);
+        assert_eq!(writer.pending_requests(&alice).await?.len(), 1);
+        writer.clear_roster(&alice).await?;
+        let cleared = writer.roster(&alice).await?;
+        assert_eq!(cleared.version, RosterVersion::default());
+        assert!(cleared.items.is_empty());
+        assert!(writer.pending_requests(&alice).await?.is_empty());
+        writer.commit().await?;
+
+        let reader = storage.begin_read().await?;
+        let cleared = reader.roster(&alice).await?;
+        assert_eq!(cleared.version, RosterVersion::default());
+        assert!(cleared.items.is_empty());
+        assert!(reader.roster_item(&alice, &dave).await?.is_none());
+        assert!(reader.pending_requests(&alice).await?.is_empty());
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
         Ok(())
     })
 }

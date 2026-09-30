@@ -7,7 +7,8 @@ use std::sync::Arc;
 use async_channel::{Receiver, Sender};
 use futures_channel::oneshot;
 use lonewolf_admin::{AccountObserver, ObserverError};
-use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::account::{AccountKey, AccountReads, AccountWrites};
+use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 
 use crate::delivery::RouterDelivery;
@@ -59,34 +60,61 @@ pub(crate) async fn run<A: ChunkAllocator + Clone>(
     router: &RouterHandle<A>,
     allocator: &A,
 ) {
+    while let Ok(request) = requests.recv().await {
+        let result = forget(&request.account, router, allocator).await;
+        let _ = request.done.send(result);
+    }
+}
+
+/// Finishes the deletions an earlier run began but did not complete, and returns how
+/// many there were.
+pub(crate) async fn resume<A: ChunkAllocator + Clone, S: Storage>(
+    storage: &S,
+    router: &RouterHandle<A>,
+    allocator: &A,
+) -> Result<usize, ObserverError> {
+    let unfinished = storage.begin_read().await?.unfinished_deletions().await?;
+    for account in &unfinished {
+        forget(account, router, allocator).await?;
+        let mut transaction = storage.begin_write().await?;
+        transaction.finish_account_deletion(account).await?;
+        transaction.commit().await?;
+    }
+    Ok(unfinished.len())
+}
+
+/// Runs every extension's cleanup for the account, then ends its sessions so their
+/// disconnect broadcasts to an empty audience.
+async fn forget<A: ChunkAllocator + Clone>(
+    account: &AccountKey,
+    router: &RouterHandle<A>,
+    allocator: &A,
+) -> Result<(), ObserverError> {
     let delivery = RouterDelivery {
         router,
         allocator,
         session: None,
     };
-    while let Ok(request) = requests.recv().await {
-        let mut result = Ok(());
-        for extension in router.extensions(request.account.domain()) {
-            if let Err(error) = extension.account_deleted(&request.account, &delivery).await {
-                tracing::error!(
-                    extension = extension.name(),
-                    error = ?error,
-                    "account cleanup failed"
-                );
-                result = Err(observer_error(
-                    "an extension failed to clean up the account",
-                ));
-            }
+    let mut result = Ok(());
+    for extension in router.extensions(account.domain()) {
+        if let Err(error) = extension.account_deleted(account, &delivery).await {
+            tracing::error!(
+                extension = extension.name(),
+                error = ?error,
+                "account cleanup failed"
+            );
+            result = Err(observer_error(
+                "an extension failed to clean up the account",
+            ));
         }
-        // Sessions end after cleanup so their disconnect broadcasts to an empty audience.
-        if let Err(error) = router.retire_account(&request.account).await {
-            tracing::error!(error = ?error, "account session termination failed");
-            result = result.and(Err(observer_error(
-                "the account's sessions could not be terminated",
-            )));
-        }
-        let _ = request.done.send(result);
     }
+    if let Err(error) = router.retire_account(account).await {
+        tracing::error!(error = ?error, "account session termination failed");
+        result = result.and(Err(observer_error(
+            "the account's sessions could not be terminated",
+        )));
+    }
+    result
 }
 
 fn observer_error(message: &'static str) -> ObserverError {

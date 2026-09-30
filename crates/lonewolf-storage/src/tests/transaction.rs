@@ -11,7 +11,7 @@ use super::{
     TestResult, assert_scram, credentials, decoy_salt, item, jid, key, new_account, pending, poll,
     read, write,
 };
-use crate::account::{AccountReads, AccountWrites};
+use crate::account::{AccountReads, AccountState, AccountWrites};
 use crate::roster::{RosterReads, RosterWrites};
 use crate::{Storage, WriteTransaction};
 
@@ -80,8 +80,9 @@ pub(crate) fn dropping_a_write_transaction_aborts_every_write<S: Storage>(
         writer.commit().await?;
 
         let mut writer = storage.begin_write().await?;
-        writer.delete_account(&alice).await?;
+        assert!(writer.begin_account_deletion(&alice).await?);
         writer.clear_roster(&alice).await?;
+        writer.finish_account_deletion(&alice).await?;
         writer
             .create_account(new_account("bob@example.com", 20)?)
             .await?;
@@ -125,12 +126,14 @@ pub(crate) fn commit_persists_account_and_roster_writes_together<S: Storage>(
         writer.commit().await?;
 
         let mut writer = storage.begin_write().await?;
-        writer.delete_account(&alice).await?;
+        assert!(writer.begin_account_deletion(&alice).await?);
         writer.clear_roster(&alice).await?;
+        writer.finish_account_deletion(&alice).await?;
         writer.commit().await?;
 
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_none());
+        assert_eq!(reader.account_state(&alice).await?, AccountState::Absent);
         let cleared = reader.roster(&alice).await?;
         assert_eq!(cleared.version.get(), 0);
         assert!(cleared.items.is_empty());
@@ -186,7 +189,8 @@ pub(crate) fn a_second_write_transaction_waits_for_the_first_while_reads_proceed
         first.commit().await?;
         let mut second = second.await?;
         assert!(second.account(&alice).await?.is_some());
-        second.delete_account(&alice).await?;
+        assert!(second.begin_account_deletion(&alice).await?);
+        second.finish_account_deletion(&alice).await?;
         let mut third = Box::pin(storage.begin_write());
         assert!(poll(third.as_mut()).is_pending());
         drop(second);

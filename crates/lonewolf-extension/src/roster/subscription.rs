@@ -89,7 +89,7 @@ impl<S: Storage> Roster<S> {
             .map_err(|_| StanzaErrorCondition::InternalServerError)?
             .write_xml(&mut request)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-        let outcome = state::request_subscription(
+        let outcome = match state::request_subscription(
             &mut transaction,
             &parties.sender,
             parties.sender_jid,
@@ -97,7 +97,13 @@ impl<S: Storage> Roster<S> {
             &parties.target_jid,
             request.into_bytes().into_boxed_slice(),
         )
-        .await?;
+        .await?
+        {
+            RequestOutcome::ContactMissing => {
+                return Err(StanzaErrorCondition::ServiceUnavailable.into());
+            }
+            outcome => outcome,
+        };
         transaction.commit().await.map_err(RosterError::from)?;
         match outcome {
             RequestOutcome::Pending { push } => {
@@ -116,7 +122,7 @@ impl<S: Storage> Roster<S> {
                     .current_presence(&parties.target, &parties.sender)
                     .await?;
             }
-            RequestOutcome::AutoApproved { approved: None } => {}
+            RequestOutcome::AutoApproved { approved: None } | RequestOutcome::ContactMissing => {}
         }
         Ok(())
     }

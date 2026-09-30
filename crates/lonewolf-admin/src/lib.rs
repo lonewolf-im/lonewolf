@@ -10,5 +10,5 @@ mod api;
 mod observer;
 mod server;
 
-pub use observer::{AccountObserver, NoopObserver, ObserverError};
+pub use observer::{AccountDeleter, DeleterError, RecordDeleter};
 pub use server::Server;

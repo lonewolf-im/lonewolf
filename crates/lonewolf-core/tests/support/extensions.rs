@@ -10,6 +10,7 @@ use lonewolf_extension::presence::{
     PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
 };
 use lonewolf_extension::{Extension, Extensions};
+use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
 use lonewolf_xmpp::stanza::{Element, PresenceType, StanzaErrorCondition, StanzaType};
@@ -53,7 +54,7 @@ const SUBSCRIPTION_KINDS: [PresenceRequestType; 4] = [
     PresenceRequestType::Unsubscribed,
 ];
 
-pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>>> {
+pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage>> {
     let mut extensions = Extensions::default();
     extensions.register(Arc::new(ConflictingIq))?;
     extensions.register(Arc::new(TestIq))?;
@@ -76,7 +77,7 @@ struct TestPresence;
 
 struct ConflictingPresence;
 
-impl<A: ChunkAllocator> Extension<A> for ConflictingIq {
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for ConflictingIq {
     fn name(&self) -> &'static str {
         "test-conflicting-iq"
     }
@@ -99,7 +100,7 @@ impl<A: ChunkAllocator> IqHandler<A> for ConflictingIq {
 
 impl<A: ChunkAllocator> PresenceHandler<A> for ConflictingIq {}
 
-impl<A: ChunkAllocator> Extension<A> for TestIq {
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
     fn name(&self) -> &'static str {
         "test-iq"
     }
@@ -127,7 +128,7 @@ impl<A: ChunkAllocator> IqHandler<A> for TestIq {
 
 impl<A: ChunkAllocator> PresenceHandler<A> for TestIq {}
 
-impl<A: ChunkAllocator> Extension<A> for ServerIq {
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for ServerIq {
     fn name(&self) -> &'static str {
         "test-server-iq"
     }
@@ -150,7 +151,7 @@ impl<A: ChunkAllocator> IqHandler<A> for ServerIq {
 
 impl<A: ChunkAllocator> PresenceHandler<A> for ServerIq {}
 
-impl<A: ChunkAllocator> Extension<A> for ErrorIq {
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for ErrorIq {
     fn name(&self) -> &'static str {
         "test-error-iq"
     }
@@ -173,7 +174,7 @@ impl<A: ChunkAllocator> IqHandler<A> for ErrorIq {
 
 impl<A: ChunkAllocator> PresenceHandler<A> for ErrorIq {}
 
-impl<A: ChunkAllocator> Extension<A> for TestPresence {
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPresence {
     fn name(&self) -> &'static str {
         "test-presence"
     }
@@ -191,7 +192,7 @@ impl<A: ChunkAllocator> PresenceHandler<A> for TestPresence {
     }
 }
 
-impl<A: ChunkAllocator> Extension<A> for ConflictingPresence {
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for ConflictingPresence {
     fn name(&self) -> &'static str {
         "test-conflicting-presence"
     }

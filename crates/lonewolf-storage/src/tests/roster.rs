@@ -7,7 +7,7 @@ use futures_executor::block_on;
 use super::{
     TestResult, item, item_with_subscription, jid, key, new_account, pending, read, write,
 };
-use crate::account::{AccountReads, AccountState, AccountWrites};
+use crate::account::{AccountReads, AccountWrites};
 use crate::roster::{
     RosterError, RosterReads, RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
 };
@@ -379,17 +379,17 @@ pub(crate) fn put_roster_item_is_rejected_for_an_owner_without_an_account_record
     storage: S,
 ) -> TestResult {
     let unknown = key("unknown@example.com")?;
-    let deleting = key("deleting@example.com")?;
+    let deleted = key("deleted@example.com")?;
     let active = key("active@example.com")?;
     let bob = jid("bob@example.com")?;
     let dave = jid("dave@example.com")?;
     let bob_item = item("bob@example.com", Some("Bob"), &["Friends"])?;
     let dave_item = item("dave@example.com", None, &[])?;
     block_on(async {
-        create_owners(&storage, &["deleting@example.com", "active@example.com"]).await?;
+        create_owners(&storage, &["deleted@example.com", "active@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
-        writer.put_roster_item(&deleting, &bob_item).await?;
-        assert!(writer.begin_account_deletion(&deleting).await?);
+        writer.put_roster_item(&deleted, &bob_item).await?;
+        writer.delete_account(&deleted).await?;
         writer.commit().await?;
 
         let mut writer = storage.begin_write().await?;
@@ -398,7 +398,7 @@ pub(crate) fn put_roster_item_is_rejected_for_an_owner_without_an_account_record
             Err(RosterError::NoAccount)
         ));
         assert!(matches!(
-            writer.put_roster_item(&deleting, &dave_item).await,
+            writer.put_roster_item(&deleted, &dave_item).await,
             Err(RosterError::NoAccount)
         ));
         assert_eq!(writer.put_roster_item(&active, &bob_item).await?.get(), 1);
@@ -407,21 +407,18 @@ pub(crate) fn put_roster_item_is_rejected_for_an_owner_without_an_account_record
             RosterVersion::default()
         );
         assert!(writer.roster_item(&unknown, &bob).await?.is_none());
-        assert_eq!(writer.roster(&deleting).await?.version.get(), 1);
-        assert!(writer.roster_item(&deleting, &dave).await?.is_none());
+        assert_eq!(writer.roster(&deleted).await?.version.get(), 1);
+        assert!(writer.roster_item(&deleted, &dave).await?.is_none());
         writer.commit().await?;
 
         let reader = storage.begin_read().await?;
         let unknown_roster = reader.roster(&unknown).await?;
         assert_eq!(unknown_roster.version, RosterVersion::default());
         assert!(unknown_roster.items.is_empty());
-        let deleting_roster = reader.roster(&deleting).await?;
-        assert_eq!(deleting_roster.version.get(), 1);
-        assert_eq!(deleting_roster.items, slice::from_ref(&bob_item));
-        assert_eq!(
-            reader.account_state(&deleting).await?,
-            AccountState::Deleting
-        );
+        let deleted_roster = reader.roster(&deleted).await?;
+        assert_eq!(deleted_roster.version.get(), 1);
+        assert_eq!(deleted_roster.items, slice::from_ref(&bob_item));
+        assert!(reader.account(&deleted).await?.is_none());
         let active_roster = reader.roster(&active).await?;
         assert_eq!(active_roster.version.get(), 1);
         assert_eq!(active_roster.items, [bob_item]);
@@ -433,19 +430,19 @@ pub(crate) fn put_pending_request_is_rejected_for_an_owner_without_an_account_re
     storage: S,
 ) -> TestResult {
     let unknown = key("unknown@example.com")?;
-    let deleting = key("deleting@example.com")?;
+    let deleted = key("deleted@example.com")?;
     let active = key("active@example.com")?;
     let bob = jid("bob@example.com")?;
     let dave = jid("dave@example.com")?;
     let from_bob = pending("bob@example.com", b"<presence id='bob'/>")?;
     let from_dave = pending("dave@example.com", b"<presence id='dave'/>")?;
     block_on(async {
-        create_owners(&storage, &["deleting@example.com", "active@example.com"]).await?;
+        create_owners(&storage, &["deleted@example.com", "active@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
         writer
-            .put_pending_request(&deleting, from_bob.clone())
+            .put_pending_request(&deleted, from_bob.clone())
             .await?;
-        assert!(writer.begin_account_deletion(&deleting).await?);
+        writer.delete_account(&deleted).await?;
         writer.commit().await?;
 
         let mut writer = storage.begin_write().await?;
@@ -454,30 +451,27 @@ pub(crate) fn put_pending_request_is_rejected_for_an_owner_without_an_account_re
             Err(RosterError::NoAccount)
         ));
         assert!(matches!(
-            writer.put_pending_request(&deleting, from_dave).await,
+            writer.put_pending_request(&deleted, from_dave).await,
             Err(RosterError::NoAccount)
         ));
         writer
             .put_pending_request(&active, from_bob.clone())
             .await?;
         assert!(writer.pending_requests(&unknown).await?.is_empty());
-        assert!(writer.pending_request(&deleting, &dave).await?.is_none());
+        assert!(writer.pending_request(&deleted, &dave).await?.is_none());
         writer.commit().await?;
 
         let reader = storage.begin_read().await?;
         assert!(reader.pending_requests(&unknown).await?.is_empty());
         assert!(reader.pending_request(&unknown, &bob).await?.is_none());
         assert_eq!(
-            reader.pending_requests(&deleting).await?,
+            reader.pending_requests(&deleted).await?,
             slice::from_ref(&from_bob)
         );
-        assert!(reader.pending_request(&deleting, &dave).await?.is_none());
-        assert_eq!(
-            reader.account_state(&deleting).await?,
-            AccountState::Deleting
-        );
+        assert!(reader.pending_request(&deleted, &dave).await?.is_none());
+        assert!(reader.account(&deleted).await?.is_none());
         assert_eq!(reader.pending_requests(&active).await?, [from_bob]);
-        for owner in [&unknown, &deleting, &active] {
+        for owner in [&unknown, &deleted, &active] {
             assert_eq!(
                 reader.roster(owner).await?.version,
                 RosterVersion::default()
@@ -487,7 +481,7 @@ pub(crate) fn put_pending_request_is_rejected_for_an_owner_without_an_account_re
     })
 }
 
-pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleting_owner<S: Storage>(
+pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleted_owner<S: Storage>(
     storage: S,
 ) -> TestResult {
     let alice = key("alice@example.com")?;
@@ -505,11 +499,11 @@ pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleting_owner<S: Stora
                 .put_pending_request(&alice, pending(sender, b"<presence/>")?)
                 .await?;
         }
-        assert!(writer.begin_account_deletion(&alice).await?);
+        writer.delete_account(&alice).await?;
         writer.commit().await?;
 
         let mut writer = storage.begin_write().await?;
-        assert_eq!(writer.account_state(&alice).await?, AccountState::Deleting);
+        assert!(writer.account(&alice).await?.is_none());
         let removed = writer
             .remove_roster_item(&alice, &bob)
             .await?
@@ -533,7 +527,7 @@ pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleting_owner<S: Stora
         assert!(cleared.items.is_empty());
         assert!(reader.roster_item(&alice, &dave).await?.is_none());
         assert!(reader.pending_requests(&alice).await?.is_empty());
-        assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
+        assert!(reader.account(&alice).await?.is_none());
         Ok(())
     })
 }

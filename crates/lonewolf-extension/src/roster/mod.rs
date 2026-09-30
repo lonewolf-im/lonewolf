@@ -13,14 +13,14 @@ use lonewolf_storage::{Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
-use crate::delivery::{Delivery, DeliveryError, HandlerError, SessionTag};
+use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
 use crate::iq::{IqFuture, IqHandler, IqRequest, IqRequestType, IqRoute, IqScope};
-use crate::order::Sequencer;
+use crate::order::{OrderGuard, Sequencer};
 use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate, ReceiveFuture,
 };
-use crate::{Extension, ExtensionFuture};
+use crate::{Aftermath, Extension, ExtensionFuture};
 use subscription::Parties;
 
 pub const NAME: &str = "roster";
@@ -117,7 +117,7 @@ async fn granting_contacts(
     Ok(contacts)
 }
 
-impl<A, S> Extension<A> for Roster<S>
+impl<A, S> Extension<A, S> for Roster<S>
 where
     A: ChunkAllocator,
     S: Storage,
@@ -134,12 +134,22 @@ where
         &PresenceRequestType::ALL
     }
 
-    fn account_deleted<'a>(
+    /// A deletion rewrites the rosters of every local contact, so it serializes with
+    /// every flow; deletions are rare enough for that to cost nothing noticeable.
+    fn hold_for_deletion<'a>(
         &'a self,
+        _account: &'a AccountKey,
+    ) -> ExtensionFuture<'a, OrderGuard> {
+        Box::pin(self.order.lock_all())
+    }
+
+    fn forget_account<'a>(
+        &'a self,
+        transaction: &'a mut S::Write,
         account: &'a AccountKey,
-        delivery: &'a dyn Delivery<A>,
-    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
-        Box::pin(self.forget_account(account, delivery))
+        hosts: &'a dyn HostLookup,
+    ) -> ExtensionFuture<'a, Result<Aftermath<A>, HandlerError>> {
+        Box::pin(subscription::forget_account(transaction, account, hosts))
     }
 }
 

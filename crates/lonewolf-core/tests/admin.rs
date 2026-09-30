@@ -12,7 +12,7 @@ use compio::net::UnixStream;
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::join;
-use lonewolf_admin::{NoopObserver, Server};
+use lonewolf_admin::{RecordDeleter, Server};
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
 };
@@ -33,7 +33,11 @@ where
     let path = directory.path().join("private/admin.sock");
     let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
     Runtime::new()?.block_on(async {
-        let server = Server::bind(&path, storage.clone(), Arc::new(NoopObserver))?;
+        let server = Server::bind(
+            &path,
+            storage.clone(),
+            Arc::new(RecordDeleter::new(storage.clone())),
+        )?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
             let result = test(path.clone(), storage).await;
@@ -139,8 +143,7 @@ async fn account_exists(storage: &RedbStorage, key: &AccountKey) -> Result<bool,
 
 async fn delete(storage: &RedbStorage, key: &AccountKey) -> TestResult {
     let mut transaction = storage.begin_write().await?;
-    transaction.begin_account_deletion(key).await?;
-    transaction.finish_account_deletion(key).await?;
+    transaction.delete_account(key).await?;
     transaction.commit().await?;
     Ok(())
 }
@@ -508,7 +511,11 @@ fn shutdown_drains_an_accepted_request_and_removes_the_socket() -> TestResult {
     let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
     let path = directory.path().join("private/admin.sock");
     Runtime::new()?.block_on(async {
-        let server = Server::bind(&path, storage.clone(), Arc::new(NoopObserver))?;
+        let server = Server::bind(
+            &path,
+            storage.clone(),
+            Arc::new(RecordDeleter::new(storage.clone())),
+        )?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
             let body = r#"{"jid":"alice@example.org","password":"password"}"#;

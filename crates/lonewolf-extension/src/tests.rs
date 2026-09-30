@@ -2,11 +2,14 @@
 
 use std::sync::Arc;
 
+use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 
 use super::iq::{IqHandler, IqRequestType, IqRoute, IqScope};
 use super::presence::{PresenceHandler, PresenceRequestType};
 use super::{Extension, Extensions, RegistrationError};
+
+type TestExtensions = Extensions<GlobalChunkAllocator, RedbStorage>;
 
 const ROUTE: IqRoute = IqRoute {
     scope: IqScope::Account,
@@ -25,7 +28,7 @@ impl IqHandler<GlobalChunkAllocator> for Fake {}
 
 impl PresenceHandler<GlobalChunkAllocator> for Fake {}
 
-impl Extension<GlobalChunkAllocator> for Fake {
+impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
     fn name(&self) -> &'static str {
         self.name
     }
@@ -43,13 +46,13 @@ fn extension(
     name: &'static str,
     iq: &'static [IqRoute],
     presence: &'static [PresenceRequestType],
-) -> Arc<dyn Extension<GlobalChunkAllocator>> {
+) -> Arc<dyn Extension<GlobalChunkAllocator, RedbStorage>> {
     Arc::new(Fake { name, iq, presence })
 }
 
 #[test]
 fn conflicting_extensions_cannot_be_enabled_together() -> Result<(), RegistrationError> {
-    let mut extensions = Extensions::default();
+    let mut extensions = TestExtensions::default();
     extensions.register(extension("first", &[ROUTE], &[]))?;
     extensions.register(extension("second", &[ROUTE], &[]))?;
     assert!(extensions.enable(["first"]).is_ok());
@@ -67,7 +70,7 @@ fn conflicting_extensions_cannot_be_enabled_together() -> Result<(), Registratio
 
 #[test]
 fn failed_registration_does_not_reserve_an_extension_name() -> Result<(), RegistrationError> {
-    let mut extensions = Extensions::default();
+    let mut extensions = TestExtensions::default();
     assert_eq!(
         extensions.register(extension("example", &[ROUTE, ROUTE], &[])),
         Err(RegistrationError::DuplicateRoute(ROUTE))
@@ -79,7 +82,7 @@ fn failed_registration_does_not_reserve_an_extension_name() -> Result<(), Regist
 
 #[test]
 fn duplicate_extension_names_cannot_replace_handlers() -> Result<(), RegistrationError> {
-    let mut extensions = Extensions::default();
+    let mut extensions = TestExtensions::default();
     extensions.register(extension("example", &[ROUTE], &[]))?;
     assert_eq!(
         extensions.register(extension("example", &[], &[])),
@@ -97,7 +100,7 @@ fn duplicate_extension_names_cannot_replace_handlers() -> Result<(), Registratio
 
 #[test]
 fn unknown_enabled_names_are_rejected() {
-    let extensions = Extensions::<GlobalChunkAllocator>::default();
+    let extensions = TestExtensions::default();
     assert!(
         matches!(extensions.enable(["missing"]), Err(RegistrationError::UnknownExtension(name)) if name == "missing")
     );
@@ -105,7 +108,7 @@ fn unknown_enabled_names_are_rejected() {
 
 #[test]
 fn extension_names_must_be_nonempty_and_trimmed() {
-    let mut extensions = Extensions::default();
+    let mut extensions = TestExtensions::default();
     for name in ["", " ", " leading", "trailing "] {
         assert_eq!(
             extensions.register(extension(name, &[], &[])),
@@ -116,7 +119,7 @@ fn extension_names_must_be_nonempty_and_trimmed() {
 
 #[test]
 fn repeated_activation_is_rejected_even_without_iq_handlers() -> Result<(), RegistrationError> {
-    let mut extensions = Extensions::default();
+    let mut extensions = TestExtensions::default();
     extensions.register(extension("example", &[], &[]))?;
     assert!(matches!(
         extensions.enable(["example", "example"]),
@@ -127,7 +130,7 @@ fn repeated_activation_is_rejected_even_without_iq_handlers() -> Result<(), Regi
 
 #[test]
 fn conflicting_presence_extensions_cannot_be_enabled_together() -> Result<(), RegistrationError> {
-    let mut extensions = Extensions::default();
+    let mut extensions = TestExtensions::default();
     extensions.register(extension("first", &[], &[PresenceRequestType::Subscribe]))?;
     extensions.register(extension("second", &[], &[PresenceRequestType::Subscribe]))?;
     assert!(matches!(
@@ -147,7 +150,7 @@ fn conflicting_presence_extensions_cannot_be_enabled_together() -> Result<(), Re
 
 #[test]
 fn presence_kinds_select_distinct_handlers() -> Result<(), RegistrationError> {
-    let mut extensions = Extensions::default();
+    let mut extensions = TestExtensions::default();
     extensions.register(extension(
         "example",
         &[],

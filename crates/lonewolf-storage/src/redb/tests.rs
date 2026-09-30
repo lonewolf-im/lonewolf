@@ -18,8 +18,8 @@ use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 
 use self::backend::{FailingSyncBackend, ObservedBackend};
 use super::initialize;
-use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY, DELETIONS};
-use crate::account::{AccountError, AccountReads, AccountState, AccountWrites};
+use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY};
+use crate::account::{AccountReads, AccountWrites};
 use crate::roster::redb::{ITEMS, PENDING, VERSIONS};
 use crate::roster::{RosterReads, RosterSubscription, RosterWrites, SubscriptionState};
 use crate::tests::{
@@ -64,11 +64,10 @@ fn fresh_database_initializes_all_tables() -> TestResult {
     let storage = RedbStorage::new(database)?;
     let transaction = storage.as_ref().begin_read()?;
     let tables: Vec<_> = transaction.list_tables()?.collect();
-    assert_eq!(tables.len(), 6);
+    assert_eq!(tables.len(), 5);
     for expected in [
         ACCOUNTS.name(),
         DECOY_SECRET.name(),
-        DELETIONS.name(),
         ITEMS.name(),
         PENDING.name(),
         VERSIONS.name(),
@@ -78,7 +77,6 @@ fn fresh_database_initializes_all_tables() -> TestResult {
             "missing table {expected}"
         );
     }
-    assert!(transaction.open_table(DELETIONS)?.is_empty()?);
     assert_eq!(
         transaction
             .open_table(DECOY_SECRET)?
@@ -104,7 +102,7 @@ fn unknown_tables_are_left_untouched() -> TestResult {
     let reinitialized = initialize(storage.as_ref())?;
     assert_eq!(decoy_salt(&reinitialized)?, before);
     let transaction = storage.as_ref().begin_read()?;
-    assert_eq!(transaction.list_tables()?.count(), 7);
+    assert_eq!(transaction.list_tables()?.count(), 6);
     assert_eq!(
         transaction
             .open_table(METADATA)?
@@ -262,8 +260,7 @@ fn committed_state_survives_reopening() -> TestResult {
                     ScramCredentials::new(ScramVerifier::Sha256(verifier(20))),
                 )
                 .await?;
-            assert!(writer.begin_account_deletion(&deleted).await?);
-            writer.finish_account_deletion(&deleted).await?;
+            writer.delete_account(&deleted).await?;
             writer.put_roster_item(&alice, &bob).await?;
             writer.put_pending_request(&alice, request.clone()).await?;
             writer.commit().await?;
@@ -281,7 +278,6 @@ fn committed_state_survives_reopening() -> TestResult {
         assert!(reader.scram(&alice, ScramHash::Sha1).await?.is_none());
         assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 20)?;
         assert!(reader.account(&deleted).await?.is_none());
-        assert_eq!(reader.account_state(&deleted).await?, AccountState::Absent);
         for hash in [ScramHash::Sha1, ScramHash::Sha256] {
             assert!(reader.scram(&deleted, hash).await?.is_none());
             assert!(reader.scram(&other, hash).await?.is_some());
@@ -344,8 +340,7 @@ fn commit_failure_reports_unknown_outcome_and_recovers_a_complete_record() -> Te
 }
 
 #[test]
-fn failed_deletion_commit_recovers_either_the_complete_account_or_its_deleting_mark() -> TestResult
-{
+fn failed_deletion_commit_recovers_either_the_complete_account_or_its_absence() -> TestResult {
     let backend = FailingSyncBackend::default();
     let alice = key("alice@example.com")?;
     let account = new_account("alice@example.com", 10)?;
@@ -354,7 +349,7 @@ fn failed_deletion_commit_recovers_either_the_complete_account_or_its_deleting_m
         block_on(async {
             write(&storage, async |tx| tx.create_account(account).await).await?;
             let mut writer = storage.begin_write().await?;
-            assert!(writer.begin_account_deletion(&alice).await?);
+            writer.delete_account(&alice).await?;
             backend.fail_next_sync();
             assert_storage_error(writer.commit().await, StorageErrorKind::CommitUnknown);
             Ok::<(), Box<dyn Error>>(())
@@ -367,77 +362,11 @@ fn failed_deletion_commit_recovers_either_the_complete_account_or_its_deleting_m
         if reader.account(&alice).await?.is_some() {
             assert_scram(reader.scram(&alice, ScramHash::Sha1).await?, 10)?;
             assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 13)?;
-            assert_eq!(reader.account_state(&alice).await?, AccountState::Active);
-            assert!(reader.unfinished_deletions().await?.is_empty());
         } else {
             for hash in [ScramHash::Sha1, ScramHash::Sha256] {
                 assert!(reader.scram(&alice, hash).await?.is_none());
             }
-            assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
-            assert_eq!(reader.unfinished_deletions().await?, [alice]);
         }
-        Ok(())
-    })
-}
-
-#[test]
-fn unfinished_deletions_survive_reopening() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("lonewolf.redb");
-    let alice = key("alice@example.com")?;
-    let bob = key("bob@example.com")?;
-    let carol = key("carol@example.com")?;
-    {
-        let storage = RedbStorage::open(&path)?;
-        block_on(async {
-            let mut writer = storage.begin_write().await?;
-            for input in ["alice@example.com", "bob@example.com"] {
-                writer.create_account(new_account(input, 10)?).await?;
-            }
-            assert!(writer.begin_account_deletion(&alice).await?);
-            assert!(writer.begin_account_deletion(&bob).await?);
-            writer.finish_account_deletion(&bob).await?;
-            assert!(!writer.begin_account_deletion(&carol).await?);
-            writer.commit().await?;
-            Ok::<(), Box<dyn Error>>(())
-        })?;
-    }
-
-    {
-        let storage = RedbStorage::open(&path)?;
-        block_on(async {
-            let reader = storage.begin_read().await?;
-            assert_eq!(
-                reader.unfinished_deletions().await?,
-                [alice.clone(), carol.clone()]
-            );
-            assert_eq!(reader.account_state(&alice).await?, AccountState::Deleting);
-            assert_eq!(reader.account_state(&bob).await?, AccountState::Absent);
-            assert_eq!(reader.account_state(&carol).await?, AccountState::Deleting);
-            drop(reader);
-
-            let mut writer = storage.begin_write().await?;
-            assert!(matches!(
-                writer
-                    .create_account(new_account("alice@example.com", 20)?)
-                    .await,
-                Err(AccountError::Deleting)
-            ));
-            writer.finish_account_deletion(&alice).await?;
-            writer
-                .create_account(new_account("alice@example.com", 20)?)
-                .await?;
-            writer.commit().await?;
-            Ok::<(), Box<dyn Error>>(())
-        })?;
-    }
-
-    let storage = RedbStorage::open(&path)?;
-    block_on(async {
-        let reader = storage.begin_read().await?;
-        assert_eq!(reader.unfinished_deletions().await?, [carol]);
-        assert_eq!(reader.account_state(&alice).await?, AccountState::Active);
-        assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 23)?;
         Ok(())
     })
 }
@@ -447,7 +376,6 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
     let backend = ObservedBackend::default();
     let storage = RedbStorage::new(database(backend.clone(), 0)?)?;
     let alice = key("alice@example.com")?;
-    let deleting = key("deleting@example.com")?;
     let bob = jid("bob@example.com")?;
     backend.take_threads()?;
     block_on(async {
@@ -455,8 +383,6 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         writer
             .create_account(new_account("alice@example.com", 10)?)
             .await?;
-        assert_worker_threads(&backend)?;
-        assert!(!writer.begin_account_deletion(&deleting).await?);
         assert_worker_threads(&backend)?;
         assert!(writer.account(&alice).await?.is_some());
         assert_worker_threads(&backend)?;
@@ -468,10 +394,6 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
             writer.accounts_after(None, NonZeroUsize::MAX).await?.len(),
             1
         );
-        assert_worker_threads(&backend)?;
-        assert_eq!(writer.account_state(&alice).await?, AccountState::Active);
-        assert_worker_threads(&backend)?;
-        assert_eq!(writer.unfinished_deletions().await?.len(), 1);
         assert_worker_threads(&backend)?;
         writer
             .put_roster_item(&alice, &item("bob@example.com", None, &[])?)
@@ -502,10 +424,6 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
             1
         );
         assert_worker_threads(&backend)?;
-        assert_eq!(reader.account_state(&alice).await?, AccountState::Active);
-        assert_worker_threads(&backend)?;
-        assert_eq!(reader.unfinished_deletions().await?.len(), 1);
-        assert_worker_threads(&backend)?;
         assert_eq!(reader.roster(&alice).await?.items.len(), 1);
         assert_worker_threads(&backend)?;
         assert!(reader.roster_item(&alice, &bob).await?.is_some());
@@ -523,9 +441,7 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         assert_worker_threads(&backend)?;
         writer.clear_roster(&alice).await?;
         assert_worker_threads(&backend)?;
-        assert!(writer.begin_account_deletion(&alice).await?);
-        assert_worker_threads(&backend)?;
-        writer.finish_account_deletion(&alice).await?;
+        writer.delete_account(&alice).await?;
         assert_worker_threads(&backend)?;
         writer.commit().await?;
         assert_worker_threads(&backend)?;

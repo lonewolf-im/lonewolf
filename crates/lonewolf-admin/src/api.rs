@@ -27,7 +27,7 @@ use lonewolf_storage::account::{
 };
 use lonewolf_storage::{Storage, StorageError, StorageErrorKind, WriteTransaction};
 
-use crate::observer::{AccountDeleter, DeleterError};
+use crate::deleter::{AccountDeleter, DeleterError};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::blocking::BlockingExecutor;
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
@@ -554,7 +554,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::observer::{DeleterError, RecordDeleter};
+    use crate::deleter::{DeleterError, RecordDeleter};
 
     type TestError = Box<dyn std::error::Error + Send + Sync>;
     type TestResult = Result<(), TestError>;

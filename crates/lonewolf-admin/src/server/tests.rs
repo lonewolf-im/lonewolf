@@ -9,7 +9,7 @@ use compio::runtime::Runtime;
 use lonewolf_storage::RedbStorage;
 
 use super::Server;
-use crate::observer::{AccountDeleter, RecordDeleter};
+use crate::deleter::{AccountDeleter, RecordDeleter};
 
 type TestResult = Result<(), Box<dyn Error>>;
 

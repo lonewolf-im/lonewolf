@@ -48,6 +48,7 @@ pub struct RedbRead {
 }
 
 /// The store's open write transaction; operations and the commit run on the writer thread.
+/// Being the only one open keeps everything it reads stable until it commits.
 pub struct RedbWrite {
     transaction: Arc<RedbWriteTransaction>,
     writes: BlockingExecutor,

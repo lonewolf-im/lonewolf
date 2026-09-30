@@ -20,7 +20,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Opens a read transaction over one consistent snapshot.
     fn begin_read(&self) -> impl Future<Output = Result<Self::Read, StorageError>> + Send;
 
-    /// Opens the write transaction; a store admits one at a time.
+    /// Opens a write transaction. A store admits one at a time unless it can keep the
+    /// reads of concurrent write transactions stable, as [`WriteTransaction`] requires.
     fn begin_write(&self) -> impl Future<Output = Result<Self::Write, StorageError>> + Send;
 
     /// The per-store secret that keeps authentication timing equal for absent accounts.
@@ -31,6 +32,12 @@ pub trait Storage: Clone + Send + Sync + 'static {
 pub trait ReadTransaction: AccountReads + RosterReads + Send + Sync {}
 
 /// The operations available inside one atomic write.
+///
+/// Every value read through the transaction stays as read until the transaction
+/// commits or aborts: no other transaction changes it in between, so a flow that reads,
+/// decides, and writes never loses an update. A store meets this by admitting one write
+/// transaction at a time or by locking what a transaction reads. Read-committed
+/// isolation without locks does not meet it.
 ///
 /// Dropping the transaction without committing aborts every write in it.
 pub trait WriteTransaction: ReadTransaction + AccountWrites + RosterWrites {

@@ -553,12 +553,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         if let Some(ticket) = ticket.as_mut() {
             ticket.turn().await;
         }
-        self.outbox.extend(
-            self.registration
-                .take_queued()
-                .into_iter()
-                .map(Output::Routed),
-        );
         let (routed, unavailable) = match unavailable {
             Some(unavailable) => {
                 let (routed, unavailable) =
@@ -577,6 +571,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
         self.available = priority.is_some();
+        // The router takes the cut with the update itself, so without a ticket a
+        // sibling's earlier update still lands ahead of this echo.
+        self.outbox
+            .extend(change.preceding.into_iter().map(Output::Routed));
         self.outbox
             .extend(change.siblings.into_iter().map(Output::Routed));
         self.outbox.push_back(Output::Routed(routed));

@@ -59,6 +59,9 @@ pub struct Registration<A: ChunkAllocator> {
 pub(crate) struct PresenceChange<A: ChunkAllocator> {
     pub became_available: bool,
     pub became_unavailable: bool,
+    /// Deliveries the router handed the resource before this update, taken out of its
+    /// mailbox in the same step, so the caller writes them ahead of its own echo.
+    pub preceding: Vec<RoutedStanza<A>>,
     /// The current presence of the account's other available resources, for a resource
     /// that just became available; empty otherwise.
     pub siblings: Vec<RoutedStanza<A>>,
@@ -177,6 +180,7 @@ struct Session<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
     outbound: Sender<RoutedStanza<A>>,
+    inbound: Receiver<RoutedStanza<A>>,
     priority: Option<i8>,
     tags: SessionTags,
     presence: Option<RoutedStanza<A>>,
@@ -909,6 +913,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 token,
                 alive: Arc::clone(&alive),
                 outbound,
+                inbound: inbound.clone(),
                 priority: None,
                 tags: SessionTags::default(),
                 presence: None,
@@ -1254,6 +1259,7 @@ impl<A: ChunkAllocator> Shard<A> {
             }
             let became_available = priority.is_some() && source.priority.is_none();
             let became_unavailable = priority.is_none() && source.priority.is_some();
+            let preceding = take_queued(&source.inbound);
             let siblings = if became_available {
                 sessions
                     .values()
@@ -1264,7 +1270,7 @@ impl<A: ChunkAllocator> Shard<A> {
             } else {
                 Vec::new()
             };
-            ((became_available, became_unavailable), siblings)
+            ((became_available, became_unavailable, preceding), siblings)
         };
 
         let mut failed = Vec::new();
@@ -1297,10 +1303,11 @@ impl<A: ChunkAllocator> Shard<A> {
                 RetireCause::Evicted,
             );
         }
-        let (became_available, became_unavailable) = change;
+        let (became_available, became_unavailable, preceding) = change;
         Ok(PresenceChange {
             became_available,
             became_unavailable,
+            preceding,
             siblings,
         })
     }
@@ -1596,6 +1603,7 @@ mod tests {
                         token,
                         alive: Arc::new(AtomicBool::new(true)),
                         outbound,
+                        inbound: inbound.clone(),
                         priority: Some(0),
                         tags: SessionTags::default(),
                         presence: None,

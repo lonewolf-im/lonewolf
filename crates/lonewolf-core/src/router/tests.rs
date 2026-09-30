@@ -775,8 +775,12 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
         phone
             .set_presence(Some(0), identified_presence("phone", "old").await?, None)
             .await?;
-        desk.set_presence(None, unavailable_presence("desk").await?, None)
+        let away = desk
+            .set_presence(None, unavailable_presence("desk").await?, None)
             .await?;
+        assert!(away.became_unavailable);
+        assert_eq!(away.preceding.len(), 1);
+        assert_eq!(away.preceding[0].resolve()?.id()?, Some("old"));
         phone
             .set_presence(Some(0), identified_presence("phone", "new").await?, None)
             .await?;
@@ -785,9 +789,10 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
             .await?;
         assert!(change.became_available);
 
-        assert_eq!(receive_routed(&desk).await?.resolve()?.id()?, Some("old"));
+        assert!(change.preceding.is_empty());
         assert_eq!(change.siblings.len(), 1);
         assert_eq!(change.siblings[0].resolve()?.id()?, Some("new"));
+        assert!(desk.take_queued().is_empty());
 
         drop(desk);
         drop(phone);

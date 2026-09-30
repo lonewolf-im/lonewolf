@@ -94,19 +94,6 @@ impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<A> {
         })
     }
 
-    fn push_to_session<'a>(&'a self, mut build: StanzaFactory<A>) -> DeliveryFuture<'a> {
-        Box::pin(async move {
-            let session = self.session.as_ref().ok_or(DeliveryError)?;
-            let mut arena = self.arena()?;
-            let to = session.jid_in(&mut arena)?;
-            let stanza = build(to, &mut arena)?;
-            self.router
-                .route_full(RoutedStanza::from_parts(stanza, arena))
-                .await
-                .map_err(|_| DeliveryError)
-        })
-    }
-
     fn push_to_tagged<'a>(
         &'a self,
         account: &'a AccountKey,

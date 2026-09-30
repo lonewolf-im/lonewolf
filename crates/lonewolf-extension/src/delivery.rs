@@ -119,9 +119,6 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// Delivers a presence to the resources of its bare `to` JID that carry `tag`.
     fn to_tagged<'a>(&'a self, tag: SessionTag, stanza: RoutedStanza<A>) -> DeliveryFuture<'a>;
 
-    /// Builds and delivers one stanza to the requesting resource.
-    fn push_to_session<'a>(&'a self, build: StanzaFactory<A>) -> DeliveryFuture<'a>;
-
     /// Builds and delivers one stanza per resource of `account` that carries `tag`.
     fn push_to_tagged<'a>(
         &'a self,

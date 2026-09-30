@@ -165,7 +165,7 @@ where
             let owner = owner_of(&request)?;
             let known = xml::parse_get(request.payload)?;
             let snapshot = transaction.roster(&owner).await?;
-            let (payload, changes) = match versioning::answer(known, &snapshot) {
+            let (payload, replay) = match versioning::answer(known, &snapshot) {
                 versioning::Answer::Full { stamped } => {
                     let version = stamped.then_some(snapshot.version);
                     let payload = xml::build_response(snapshot.items, version, response)?;
@@ -173,24 +173,18 @@ where
                 }
                 versioning::Answer::Unchanged => (None, Vec::new()),
                 versioning::Answer::Changes { since } => {
-                    (None, versioning::changes_since(snapshot.items, since))
+                    let to = request
+                        .sender
+                        .clone_in(response)
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let changes = versioning::changes_since(snapshot.items, since);
+                    (None, xml::build_replay(to, changes, response)?)
                 }
             };
-            let effects = Effects::new(vec![owner], move |delivery| {
-                Box::pin(async move {
-                    delivery.tag_session(SessionTag::Interested).await?;
-                    for entry in changes {
-                        delivery
-                            .push_to_session(Box::new(move |to, arena| {
-                                let item = xml::build_item(&entry.value, arena)?;
-                                xml::build_push(to, item, entry.version, arena)
-                            }))
-                            .await?;
-                    }
-                    Ok(())
-                })
+            let effects = Effects::new(vec![owner], |delivery| {
+                delivery.tag_session(SessionTag::Interested)
             });
-            Ok(IqReply::new(payload, effects))
+            Ok(IqReply::new(payload, effects).followed_by(replay))
         })
     }
 

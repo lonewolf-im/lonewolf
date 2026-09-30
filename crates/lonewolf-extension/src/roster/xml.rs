@@ -148,6 +148,24 @@ pub(super) fn build_response<A: ChunkAllocator>(
         .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
+/// Builds the pushes that replay `changes` to the requester, one per item in the given
+/// order, each stamped with the version that produced it.
+pub(super) fn build_replay<A: ChunkAllocator>(
+    to: Jid,
+    changes: Vec<RosterMutation<RosterItem>>,
+    response: &mut Arena<A>,
+) -> Result<Vec<Stanza>, StanzaErrorCondition> {
+    let mut pushes = Vec::with_capacity(changes.len());
+    for entry in changes {
+        let item = build_item(&entry.value, response)
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        let push = build_push(to, item, entry.version, response)
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        pushes.push(push);
+    }
+    Ok(pushes)
+}
+
 /// Wraps one roster item in the push addressed to `to`, stamped with the version the
 /// change produced.
 pub(super) fn build_push<A: ChunkAllocator>(

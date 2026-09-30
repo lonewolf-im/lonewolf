@@ -336,6 +336,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 {
                     Ok(IqReply {
                         payload,
+                        followups,
                         effects: Effects { accounts, deliver },
                     }) => {
                         let ((), ticket) = order
@@ -345,6 +346,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         Ok((
                             IqReply {
                                 payload,
+                                followups,
                                 effects: Effects {
                                     accounts: Vec::new(),
                                     deliver,
@@ -363,13 +365,25 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 let reply = reply.resolve(&arena)?;
                 self.writer.send_stanza(&reply).await
             }
-            Ok((IqReply { payload, effects }, ticket)) => {
+            Ok((
+                IqReply {
+                    payload,
+                    followups,
+                    effects,
+                },
+                ticket,
+            )) => {
                 let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
                 deliver_committed(ticket, effects.deliver, delivery)
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
                 let reply = reply.resolve(&response)?;
-                self.writer.send_stanza(&reply).await
+                self.writer.send_stanza(&reply).await?;
+                for followup in followups {
+                    let followup = followup.resolve(&response)?;
+                    self.writer.send_stanza(&followup).await?;
+                }
+                Ok(())
             }
         }
     }

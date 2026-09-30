@@ -81,14 +81,6 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         Box::pin(async { Ok(()) })
     }
 
-    fn push_to_session<'a>(
-        &'a self,
-        build: StanzaFactory<GlobalChunkAllocator>,
-    ) -> DeliveryFuture<'a> {
-        self.record_push("alice@example.com/desk", build);
-        Box::pin(async { Ok(()) })
-    }
-
     fn push_to_tagged<'a>(
         &'a self,
         account: &'a AccountKey,
@@ -289,18 +281,18 @@ fn handle_iq(
     Ok(accounts)
 }
 
-/// Answers a roster get from alice's desk and returns the result payload as XML, after
-/// running its effects against `delivery`.
+/// Answers a roster get from alice's desk and returns the result payload and the
+/// follow-up stanzas as XML, after running its effects against `delivery`.
 fn roster_get(
     roster: &TestRoster,
     ver: Option<&str>,
     delivery: &RecordingDelivery,
-) -> Option<String> {
+) -> (Option<String>, Vec<String>) {
     let mut call = ver.map_or_else(|| IqCall::new(""), IqCall::versioned);
     let reply = block_on(call.handle(roster, IqRequestType::Get, delivery))
         .unwrap_or_else(|error| panic!("{error:?}"));
     block_on((reply.effects.deliver)(delivery)).unwrap_or_else(|error| panic!("{error}"));
-    reply.payload.map(|payload| {
+    let payload = reply.payload.map(|payload| {
         let mut xml = String::new();
         payload
             .resolve(&call.response)
@@ -311,7 +303,24 @@ fn roster_get(
             })
             .unwrap_or_else(|error| panic!("{error}"));
         xml
-    })
+    });
+    let followups = reply
+        .followups
+        .iter()
+        .map(|followup| {
+            let mut xml = String::new();
+            followup
+                .resolve(&call.response)
+                .and_then(|followup| {
+                    followup
+                        .write_xml(&mut xml)
+                        .map_err(|_| panic!("cannot write followup"))
+                })
+                .unwrap_or_else(|error| panic!("{error}"));
+            xml
+        })
+        .collect();
+    (payload, followups)
 }
 
 fn put_item(roster: &TestRoster, owner: &AccountKey, jid: &str) -> RosterVersion {
@@ -472,10 +481,12 @@ fn roster_get_without_a_version_returns_the_roster_unstamped() {
     create_account(&roster, &alice);
     put_item(&roster, &alice, "bob@example.com");
     let delivery = RecordingDelivery::default();
-    let payload = roster_get(&roster, None, &delivery).unwrap_or_else(|| panic!("no payload"));
+    let (payload, followups) = roster_get(&roster, None, &delivery);
+    let payload = payload.unwrap_or_else(|| panic!("no payload"));
     assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
     assert!(!payload.contains("ver="), "{payload}");
-    assert!(delivery.pushes.borrow().is_empty());
+    assert!(followups.is_empty(), "{followups:?}");
+    assert_eq!(*delivery.tags.borrow(), [SessionTag::Interested]);
 }
 
 #[test]
@@ -488,36 +499,34 @@ fn versioned_roster_get_answers_from_the_version_the_client_holds() {
     let delivery = RecordingDelivery::default();
 
     for unknown in ["", "abc", "9"] {
-        let payload = roster_get(&roster, Some(unknown), &delivery)
-            .unwrap_or_else(|| panic!("no payload for {unknown:?}"));
+        let (payload, followups) = roster_get(&roster, Some(unknown), &delivery);
+        let payload = payload.unwrap_or_else(|| panic!("no payload for {unknown:?}"));
         assert!(payload.contains(r#"ver="2""#), "{payload}");
         assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
         assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
+        assert!(followups.is_empty(), "{followups:?}");
     }
-    assert!(delivery.pushes.borrow().is_empty());
 
-    assert!(roster_get(&roster, Some("2"), &delivery).is_none());
-    assert!(delivery.pushes.borrow().is_empty());
+    let (payload, followups) = roster_get(&roster, Some("2"), &delivery);
+    assert!(payload.is_none(), "{payload:?}");
+    assert!(followups.is_empty(), "{followups:?}");
 
-    assert!(roster_get(&roster, Some("1"), &delivery).is_none());
-    {
-        let pushes = delivery.pushes.borrow();
-        assert_eq!(pushes.len(), 1, "{pushes:?}");
-        assert!(
-            pushes[0].contains(r#"jid="carol@example.com""#),
-            "{pushes:?}"
-        );
-        assert!(pushes[0].contains(r#"ver="2""#), "{pushes:?}");
-        assert!(pushes[0].contains(r#"id="roster-2""#), "{pushes:?}");
-        assert!(
-            pushes[0].contains(r#"to="alice@example.com/desk""#),
-            "{pushes:?}"
-        );
-    }
-    delivery.pushes.borrow_mut().clear();
+    let (payload, pushes) = roster_get(&roster, Some("1"), &delivery);
+    assert!(payload.is_none(), "{payload:?}");
+    assert_eq!(pushes.len(), 1, "{pushes:?}");
+    assert!(
+        pushes[0].contains(r#"jid="carol@example.com""#),
+        "{pushes:?}"
+    );
+    assert!(pushes[0].contains(r#"ver="2""#), "{pushes:?}");
+    assert!(pushes[0].contains(r#"id="roster-2""#), "{pushes:?}");
+    assert!(
+        pushes[0].contains(r#"to="alice@example.com/desk""#),
+        "{pushes:?}"
+    );
 
-    assert!(roster_get(&roster, Some("0"), &delivery).is_none());
-    let pushes = delivery.pushes.borrow();
+    let (payload, pushes) = roster_get(&roster, Some("0"), &delivery);
+    assert!(payload.is_none(), "{payload:?}");
     assert_eq!(pushes.len(), 2, "{pushes:?}");
     assert!(pushes[0].contains(r#"jid="bob@example.com""#), "{pushes:?}");
     assert!(pushes[0].contains(r#"ver="1""#), "{pushes:?}");
@@ -526,6 +535,7 @@ fn versioned_roster_get_answers_from_the_version_the_client_holds() {
         "{pushes:?}"
     );
     assert!(pushes[1].contains(r#"ver="2""#), "{pushes:?}");
+    assert!(delivery.pushes.borrow().is_empty());
 }
 
 #[test]
@@ -538,14 +548,16 @@ fn versioned_roster_get_behind_a_removal_returns_the_whole_roster() {
     assert_eq!(remove_item(&roster, &alice, "bob@example.com").get(), 3);
     let delivery = RecordingDelivery::default();
 
-    let payload = roster_get(&roster, Some("2"), &delivery).unwrap_or_else(|| panic!("no payload"));
+    let (payload, followups) = roster_get(&roster, Some("2"), &delivery);
+    let payload = payload.unwrap_or_else(|| panic!("no payload"));
     assert!(payload.contains(r#"ver="3""#), "{payload}");
     assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
     assert!(!payload.contains(r#"jid="bob@example.com""#), "{payload}");
-    assert!(delivery.pushes.borrow().is_empty());
+    assert!(followups.is_empty(), "{followups:?}");
 
-    assert!(roster_get(&roster, Some("3"), &delivery).is_none());
-    assert!(delivery.pushes.borrow().is_empty());
+    let (payload, followups) = roster_get(&roster, Some("3"), &delivery);
+    assert!(payload.is_none(), "{payload:?}");
+    assert!(followups.is_empty(), "{followups:?}");
 }
 
 #[test]

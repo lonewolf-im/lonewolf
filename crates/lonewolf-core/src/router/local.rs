@@ -20,7 +20,7 @@ use lonewolf_extension::delivery::{SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
-use lonewolf_xmpp::jid::{Jid, JidError};
+use lonewolf_xmpp::jid::JidError;
 use lonewolf_xmpp::stanza::{MessageType, PresenceType, StanzaType};
 
 use super::{RoutedStanza, RouterError};
@@ -597,12 +597,6 @@ impl<A: ChunkAllocator> Clone for SessionHandle<A> {
 }
 
 impl<A: ChunkAllocator> SessionHandle<A> {
-    /// The resource's full JID, allocated in `arena`.
-    pub(crate) fn jid_in<B: ChunkAllocator>(&self, arena: &mut Arena<B>) -> Result<Jid, JidError> {
-        let full = format!("{}/{}", self.account.as_str(), self.resource);
-        Jid::parse_in(&full, arena)
-    }
-
     /// Marks the resource as a recipient of deliveries addressed to `tag`.
     pub(crate) async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
         tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await

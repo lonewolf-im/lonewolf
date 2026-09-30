@@ -128,6 +128,35 @@ fn seed_mutual_subscription(directory: &Path) -> TestResult {
     Ok(())
 }
 
+fn seed_many_contacts(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let owner = Jid::parse_in("alice@localhost", &mut arena)?;
+    let owner = AccountKey::try_from(owner.resolve(&arena)?)?;
+    Runtime::new()?.block_on(async {
+        let mut repository = storage.begin_write().await?;
+        seed_accounts(&mut repository, &[&owner]).await?;
+        for index in 0..70 {
+            let contact = Jid::parse_in(&format!("contact{index:02}@localhost"), &mut arena)?;
+            repository
+                .put_roster_item(
+                    &owner,
+                    &RosterItem {
+                        jid: RosterJid::from(contact.resolve(&arena)?),
+                        name: None,
+                        groups: Vec::new(),
+                        subscription: RosterSubscription::default(),
+                    },
+                )
+                .await?;
+        }
+        repository.commit().await?;
+        TestResult::Ok(())
+    })?;
+    Ok(())
+}
+
 fn seed_large_roster(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
     let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
@@ -1695,6 +1724,27 @@ fn versioned_roster_get_with_a_stale_version_pushes_only_the_changed_items() -> 
     )?;
     desk.close()?;
     phone.close()
+}
+
+#[test]
+fn versioned_roster_get_replays_more_changes_than_a_mailbox_holds() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_many_contacts)?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    desk.send("<iq type='get' id='since-0'><query xmlns='jabber:iq:roster' ver='0'/></iq>")?;
+    desk.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='since-0' to='alice@localhost/desk'/>",
+    )?;
+    for index in 0..70 {
+        let version = index + 1;
+        desk.expect_xml(&format!(
+            "<iq xmlns='jabber:client' type='set' id='roster-{version}' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='{version}'><item jid='contact{index:02}@localhost' subscription='none'/></query></iq>"
+        ))?;
+    }
+    desk.send("<iq type='get' id='since-70'><query xmlns='jabber:iq:roster' ver='70'/></iq>")?;
+    desk.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='since-70' to='alice@localhost/desk'/>",
+    )?;
+    desk.close()
 }
 
 #[test]

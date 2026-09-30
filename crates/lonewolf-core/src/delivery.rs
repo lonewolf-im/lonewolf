@@ -12,7 +12,9 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 
 use crate::order::Ticket;
-use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
+use crate::router::{
+    Mailbox, Registration, ResourceDelivery, RoutedStanza, RouterError, RouterHandle, SessionHandle,
+};
 
 /// Performs handler deliveries through the router, for a bound resource or for the
 /// server itself when no session is involved.
@@ -40,15 +42,21 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
 /// Runs `deliver` once `ticket` turns, on a task of its own, so a caller that is
 /// cancelled after its commit cannot lose the deliveries the commit promised. The
 /// returned future reports the outcome and may be dropped without stopping the work.
+///
+/// When the ticket turns, everything already in `mailbox` came from earlier commits
+/// and predates the caller's view of storage. It is taken out before the effects run
+/// and returned, so the caller writes it ahead of its own reply.
 pub(crate) fn deliver_committed<A: ChunkAllocator + Clone + 'static>(
     mut ticket: Ticket,
     deliver: Deliver<A>,
     delivery: RouterDelivery<A>,
-) -> impl Future<Output = Result<(), DeliveryError>> {
+    mailbox: Option<Mailbox<A>>,
+) -> impl Future<Output = Result<Vec<ResourceDelivery<A>>, DeliveryError>> {
     let (done, completed) = oneshot::channel();
     compio::runtime::spawn(async move {
         ticket.turn().await;
-        let result = deliver(&delivery).await;
+        let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
+        let result = deliver(&delivery).await.map(|()| queued);
         drop(ticket);
         let _ = done.send(result);
     })

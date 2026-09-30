@@ -39,6 +39,30 @@ fn expect_roster_push(client: &mut Client, to: &str, item: &str) -> TestResult<S
     Ok(id)
 }
 
+/// Receives a push for bob stamped with `version` and returns the name it carries.
+fn receive_versioned_push(client: &mut Client, version: u64) -> TestResult<String> {
+    let push = client.receive()?;
+    push.assert_name("jabber:client", "iq");
+    assert_eq!(
+        push.attribute("id"),
+        Some(format!("roster-{version}").as_str()),
+        "{push:?}"
+    );
+    let query = push.child(ROSTER_NAMESPACE, "query")?;
+    assert_eq!(
+        query.attribute("ver"),
+        Some(version.to_string().as_str()),
+        "{push:?}"
+    );
+    assert_eq!(query.children.len(), 1, "{push:?}");
+    let item = &query.children[0];
+    assert_eq!(item.attribute("jid"), Some("bob@localhost"), "{push:?}");
+    Ok(item
+        .attribute("name")
+        .ok_or("push item has no name")?
+        .to_owned())
+}
+
 /// Stores the records the seeded roster state belongs to; every seeded account
 /// authenticates with "password".
 async fn seed_accounts(repository: &mut RedbWrite, accounts: &[&AccountKey]) -> TestResult {
@@ -1745,6 +1769,56 @@ fn versioned_roster_get_replays_more_changes_than_a_mailbox_holds() -> TestResul
         "<iq xmlns='jabber:client' type='result' id='since-70' to='alice@localhost/desk'/>",
     )?;
     desk.close()
+}
+
+#[test]
+fn versioned_roster_replay_follows_pushes_that_were_already_queued() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut slow = suite.connect("alice", "password", "slow")?;
+    let mut one = suite.connect("alice", "password", "one")?;
+    let mut two = suite.connect("alice", "password", "two")?;
+    request_roster(
+        &mut desk,
+        "desk-roster",
+        "<iq xmlns='jabber:client' type='result' id='desk-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
+    let marker = desk.receive()?;
+    assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
+    one.send("<iq type='set' id='first'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='First'/></query></iq>")?;
+    two.send("<iq type='set' id='second'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Second'/></query></iq>")?;
+    // Both sets commit at once but deliver only after the slow effect releases the
+    // account, so the wait keeps the replay's view of storage behind both commits.
+    thread::sleep(Duration::from_millis(500));
+    desk.send("<iq type='get' id='since-0'><query xmlns='jabber:iq:roster' ver='0'/></iq>")?;
+
+    // The two resources commit in whichever order the server reaches them, so the
+    // expected names follow the observed versions.
+    let first = receive_versioned_push(&mut desk, 1)?;
+    let second = receive_versioned_push(&mut desk, 2)?;
+    let mut names = [first.as_str(), second.as_str()];
+    names.sort_unstable();
+    assert_eq!(names, ["First", "Second"]);
+    desk.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='since-0' to='alice@localhost/desk'/>",
+    )?;
+    assert_eq!(receive_versioned_push(&mut desk, 2)?, second);
+    one.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='first' to='alice@localhost/one'/>",
+    )?;
+    two.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='second' to='alice@localhost/two'/>",
+    )?;
+    slow.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/slow'/>",
+    )?;
+    desk.close()?;
+    one.close()?;
+    two.close()?;
+    slow.close()
 }
 
 #[test]

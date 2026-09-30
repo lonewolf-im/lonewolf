@@ -272,7 +272,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     /// task that outlives this stream, so retiring the session cannot lose them. The
     /// reply is written after the ticket is released, so a socket that stops taking data
     /// holds no account's line, and a reply that fails to write cannot lose committed
-    /// effects.
+    /// effects. Deliveries queued when the ticket turned predate that view, so they are
+    /// written ahead of the reply.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -374,9 +375,17 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 ticket,
             )) => {
                 let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
-                deliver_committed(ticket, effects.deliver, delivery)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
+                let queued = deliver_committed(
+                    ticket,
+                    effects.deliver,
+                    delivery,
+                    Some(self.registration.mailbox()),
+                )
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?;
+                for delivery in queued {
+                    self.deliver(delivery).await?;
+                }
                 let reply = reply.resolve(&response)?;
                 self.writer.send_stanza(&reply).await?;
                 for followup in followups {
@@ -651,9 +660,16 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         match received {
-            Ok((deliver, ticket, delivery)) => deliver_committed(ticket, deliver, delivery)
-                .await
-                .map_err(|_| CloseOutcome::InternalError),
+            Ok((deliver, ticket, delivery)) => {
+                let queued =
+                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()))
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                for delivery in queued {
+                    self.deliver(delivery).await?;
+                }
+                Ok(())
+            }
             Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition).await,
         }
     }

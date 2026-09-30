@@ -485,6 +485,10 @@ impl<A: ChunkAllocator> Registration<A> {
         self.inbound.recv().await.ok()
     }
 
+    pub(crate) fn mailbox(&self) -> Mailbox<A> {
+        Mailbox(self.inbound.clone())
+    }
+
     /// The returned future does not borrow the registration.
     pub(crate) fn wait_retired(
         &self,
@@ -574,6 +578,20 @@ impl<A: ChunkAllocator> Registration<A> {
             token: self.token,
             shard: self.shard.clone(),
         }
+    }
+}
+
+/// The deliveries waiting for a bound resource, shared with work done on its behalf.
+pub(crate) struct Mailbox<A: ChunkAllocator>(Receiver<ResourceDelivery<A>>);
+
+impl<A: ChunkAllocator> Mailbox<A> {
+    /// Everything delivered so far, in order, without waiting.
+    pub(crate) fn take_queued(&self) -> Vec<ResourceDelivery<A>> {
+        let mut queued = Vec::new();
+        while let Ok(delivery) = self.0.try_recv() {
+            queued.push(delivery);
+        }
+        queued
     }
 }
 

@@ -23,8 +23,8 @@ use crate::order::Order;
 pub mod local;
 
 pub use local::Registration;
-pub(crate) use local::SessionHandle;
 use local::{LocalRouter, LocalRouterHandle};
+pub(crate) use local::{Mailbox, ResourceDelivery, SessionHandle};
 pub use lonewolf_xmpp::stanza::RoutedStanza;
 
 pub struct Router<A: ChunkAllocator> {

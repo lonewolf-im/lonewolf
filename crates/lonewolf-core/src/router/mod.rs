@@ -391,10 +391,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     }
 
     /// Sends `source` to each recipient of directed presence, addressed to it.
-    pub(crate) async fn send_directed(
+    pub(crate) async fn send_directed<'r>(
         &self,
         source: &RoutedStanza<A>,
-        recipients: &[Box<str>],
+        recipients: impl IntoIterator<Item = &'r str>,
     ) -> Result<(), RouterError> {
         let view = source.resolve().map_err(|_| RouterError::Unavailable)?;
         for recipient in recipients {

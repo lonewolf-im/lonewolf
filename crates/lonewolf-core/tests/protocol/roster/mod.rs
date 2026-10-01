@@ -523,6 +523,99 @@ fn authorized_resources_receive_presence_and_abrupt_unavailable() -> TestResult 
 }
 
 #[test]
+fn a_subscriber_addressed_by_directed_presence_receives_one_unavailable() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_mutual_subscription)?;
+    suite.create_account("carol", "password")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost'/>",
+    )?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desk' to='alice@localhost'/>",
+    )?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost'/>",
+    )?;
+
+    alice.send("<presence to='bob@localhost' id='direct'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' id='direct' from='alice@localhost/desk' to='bob@localhost'/>")?;
+    alice.close()?;
+
+    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost'/>")?;
+    carol.send("<message to='bob@localhost/desk' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='carol@localhost/desk' to='bob@localhost/desk' id='sentinel'/>")?;
+    bob.close()?;
+    carol.close()
+}
+
+#[test]
+fn a_subscriber_addressed_by_directed_presence_alone_is_told_when_it_ends() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_mutual_subscription)?;
+    suite.create_account("carol", "password")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost'/>",
+    )?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<presence to='bob@localhost' id='direct'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' id='direct' from='alice@localhost/desk' to='bob@localhost'/>")?;
+    alice.send("<presence type='unavailable' id='gone'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='unavailable' id='gone' from='alice@localhost/desk' to='alice@localhost'/>")?;
+
+    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' id='gone' from='alice@localhost/desk' to='bob@localhost'/>")?;
+    alice.close()?;
+    carol.send("<message to='bob@localhost/desk' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='carol@localhost/desk' to='bob@localhost/desk' id='sentinel'/>")?;
+    bob.close()?;
+    carol.close()
+}
+
+#[test]
+fn a_reset_while_unavailable_presence_waits_for_its_turn_still_tells_directed_recipients()
+-> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut slow = suite.connect("alice", "password", "slow")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    desk.send("<presence to='bob@localhost/desk'/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk'/>",
+    )?;
+
+    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='2000'/></iq>")?;
+    thread::sleep(Duration::from_millis(300));
+    desk.send("<presence type='unavailable'/>")?;
+    thread::sleep(Duration::from_millis(300));
+    desk.reset()?;
+    for index in 0..8 {
+        bob.send(&format!(
+            "<message to='alice@localhost/desk' id='m{index}'/>"
+        ))?;
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost/desk'/>")?;
+    slow.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/slow'/>",
+    )?;
+    slow.close()?;
+    bob.send("</stream:stream>")?;
+    bob.drain()
+}
+
+#[test]
 fn disabled_roster_does_not_broadcast_stored_subscriptions() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("", seed_roster)?;
     suite.create_account("bob", "password")?;

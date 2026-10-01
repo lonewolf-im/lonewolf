@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::future::{Either, select};
 use lonewolf_extension::Effects;
-use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::delivery::{HandlerError, SessionTags};
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
@@ -317,6 +315,16 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
     }
 
+    /// The tags this resource carries. Only its own effects change them, and those
+    /// complete before the next stanza is handled, so a value read before a request's
+    /// turn is still the value at the turn.
+    async fn tags(&self) -> Result<SessionTags, CloseOutcome> {
+        self.registration
+            .tags()
+            .await
+            .map_err(|_| CloseOutcome::InternalError)
+    }
+
     async fn handle_iq_get(
         &mut self,
         request: Stanza,
@@ -326,26 +334,26 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
         accounts: Vec<AccountKey>,
     ) -> Result<(), CloseOutcome> {
+        let tags = self.tags().await?;
         let (transaction, ticket) = Arc::clone(self.router.order())
             .fix(accounts, self.storage.begin_read())
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
-        let wrote = Rc::new(Cell::new(false));
         let work = GetWork {
-            wrote: Rc::clone(&wrote),
             transaction,
             handler,
             arena,
             request,
             sender,
             response,
+            tags,
             delivery: self.delivery(),
         };
         let mut pending = after_turn(ticket, Some(self.registration.mailbox()), move |queued| {
             work.run(queued)
         });
         self.outbox
-            .drain_until(&self.registration, pending.turned(), &wrote)
+            .drain_until(&self.registration, pending.turned())
             .await?;
         let outcome = pending
             .finished()
@@ -369,6 +377,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         mut response: Arena<A>,
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
     ) -> Result<(), CloseOutcome> {
+        let tags = self.tags().await?;
         let mut transaction = self
             .storage
             .begin_write()
@@ -388,7 +397,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 sender,
                 target,
                 payload,
-                preceded: false,
+                tags,
             };
             handler
                 .set(iq_request, &mut transaction, &delivery, &mut response)
@@ -407,7 +416,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 let mut committed =
                     deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
                 self.outbox
-                    .drain_until(&self.registration, committed.turned(), &Cell::new(false))
+                    .drain_until(&self.registration, committed.turned())
                     .await?;
                 let queued = committed
                     .finished()
@@ -615,7 +624,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 let mut pending =
                     after_turn(ticket, None, move |_: Vec<RoutedStanza<A>>| work.run());
                 self.outbox
-                    .drain_until(&self.registration, pending.turned(), &Cell::new(false))
+                    .drain_until(&self.registration, pending.turned())
                     .await?;
                 pending
                     .finished()
@@ -720,7 +729,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 let mut committed =
                     deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
                 self.outbox
-                    .drain_until(&self.registration, committed.turned(), &Cell::new(false))
+                    .drain_until(&self.registration, committed.turned())
                     .await?;
                 let queued = committed
                     .finished()
@@ -812,13 +821,11 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
     /// its turn keeps draining its mailbox. The ticket the request took lives on a task of
     /// its own, so a write that stalls here holds no account's line; a client that stops
     /// reading fills its mailbox and is evicted as usual. `until` is polled first, so
-    /// nothing that arrives after it resolves is taken, and `wrote` records that
-    /// something was written, for a reply that must know deliveries precede it.
+    /// nothing that arrives after it resolves is taken.
     async fn drain_until<F: Future>(
         &mut self,
         registration: &Registration<A>,
         until: F,
-        wrote: &Cell<bool>,
     ) -> Result<F::Output, CloseOutcome> {
         let mut until = pin!(until);
         loop {
@@ -832,7 +839,6 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
             match event {
                 Either::Left(output) => return Ok(output),
                 Either::Right(Some(delivery)) => {
-                    wrote.set(true);
                     self.drain_mailbox(registration, delivery).await?;
                 }
                 Either::Right(None) => return Err(CloseOutcome::InternalError),
@@ -914,14 +920,13 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
 /// A get from the moment its ticket turns: the handler runs on the snapshot, its effects
 /// run, and the reply goes back to the session to write.
 struct GetWork<A: ChunkAllocator> {
-    /// Set by the session when it wrote deliveries while waiting for the turn.
-    wrote: Rc<Cell<bool>>,
     transaction: RedbRead,
     handler: Arc<dyn IqHandler<A, RedbStorage>>,
     arena: Arena<A>,
     request: Stanza,
     sender: Jid,
     response: Arena<A>,
+    tags: SessionTags,
     delivery: RouterDelivery<A>,
 }
 
@@ -936,13 +941,13 @@ struct GetOutcome<A: ChunkAllocator> {
 impl<A: ChunkAllocator + Clone> GetWork<A> {
     async fn run(self, queued: Vec<RoutedStanza<A>>) -> Result<GetOutcome<A>, CloseOutcome> {
         let GetWork {
-            wrote,
             transaction,
             handler,
             arena,
             request,
             sender,
             mut response,
+            tags,
             delivery,
         } = self;
         let reply = {
@@ -958,7 +963,7 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                 sender,
                 target,
                 payload,
-                preceded: wrote.get() || !queued.is_empty(),
+                tags,
             };
             handler.get(iq_request, &transaction, &mut response).await
         };

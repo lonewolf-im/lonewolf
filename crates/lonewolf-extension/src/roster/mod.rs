@@ -165,7 +165,11 @@ where
             let owner = owner_of(&request)?;
             let known = xml::parse_get(request.payload)?;
             let snapshot = transaction.roster(&owner).await?;
-            let (payload, replay) = match versioning::answer(known, &snapshot, request.preceded) {
+            let interested_since = request
+                .tags
+                .since(SessionTag::Interested)
+                .map(RosterVersion::new);
+            let (payload, replay) = match versioning::answer(known, &snapshot, interested_since) {
                 versioning::Answer::Full { stamped } => {
                     let version = stamped.then_some(snapshot.version);
                     let payload = xml::build_response(snapshot.items, version, response)?;
@@ -181,8 +185,9 @@ where
                     (None, xml::build_replay(to, changes, response)?)
                 }
             };
-            let effects = Effects::new(vec![owner], |delivery| {
-                delivery.tag_session(SessionTag::Interested)
+            let since = snapshot.version.get();
+            let effects = Effects::new(vec![owner], move |delivery| {
+                delivery.tag_session(SessionTag::Interested, since)
             });
             Ok(IqReply::new(payload, effects).followed_by(replay))
         })

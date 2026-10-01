@@ -399,8 +399,8 @@ fn roster_push_reaches_only_interested_resources() -> TestResult {
         let desk = handle.register(&alice, Some("desk"), limit).await?;
         let phone = handle.register(&alice, Some("phone"), limit).await?;
         let tablet = handle.register(&alice, Some("tablet"), limit).await?;
-        desk.tag(SessionTag::Interested).await?;
-        tablet.tag(SessionTag::Interested).await?;
+        desk.tag(SessionTag::Interested, 0).await?;
+        tablet.tag(SessionTag::Interested, 0).await?;
 
         handle
             .route_to_tagged(&alice, SessionTag::Interested, roster_pushes())
@@ -438,6 +438,31 @@ fn roster_push_reaches_only_interested_resources() -> TestResult {
 }
 
 #[test]
+fn a_tag_keeps_the_view_it_was_first_attached_under() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        assert!(!desk.tags().await?.contains(SessionTag::Interested));
+
+        desk.tag(SessionTag::Interested, 3).await?;
+        desk.tag(SessionTag::Interested, 7).await?;
+
+        assert_eq!(desk.tags().await?.since(SessionTag::Interested), Some(3));
+        assert!(!phone.tags().await?.contains(SessionTag::Interested));
+
+        drop(desk);
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;
@@ -446,8 +471,8 @@ fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResul
         let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
         let desk = handle.register(&alice, Some("desk"), limit).await?;
         let phone = handle.register(&alice, Some("phone"), limit).await?;
-        desk.tag(SessionTag::Interested).await?;
-        phone.tag(SessionTag::Interested).await?;
+        desk.tag(SessionTag::Interested, 0).await?;
+        phone.tag(SessionTag::Interested, 0).await?;
         for _ in 0..64 {
             handle
                 .route_full(stanza("alice@localhost/phone").await?)
@@ -496,9 +521,9 @@ fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
             let desk = handle.register(&account, Some("desk"), limit).await?;
             let phone = handle.register(&account, Some("phone"), limit).await?;
             let tablet = handle.register(&account, Some("tablet"), limit).await?;
-            desk.tag(SessionTag::Interested).await?;
-            phone.tag(SessionTag::Interested).await?;
-            tablet.tag(SessionTag::Interested).await?;
+            desk.tag(SessionTag::Interested, 0).await?;
+            phone.tag(SessionTag::Interested, 0).await?;
+            tablet.tag(SessionTag::Interested, 0).await?;
 
             let mut calls = 0;
             let result = handle
@@ -539,7 +564,7 @@ fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResul
         let desk = handle
             .register(&alice, Some("desk"), NonZeroUsize::MIN)
             .await?;
-        desk.tag(SessionTag::Interested).await?;
+        desk.tag(SessionTag::Interested, 0).await?;
         drop(desk);
 
         let calls = Arc::new(AtomicUsize::new(0));

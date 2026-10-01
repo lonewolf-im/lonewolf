@@ -33,7 +33,7 @@ impl Delivery<GlobalChunkAllocator> for NoDelivery {
         Arena::try_new(ArenaConfig::default()).map_err(|_| DeliveryError)
     }
 
-    fn tag_session<'a>(&'a self, _: SessionTag) -> DeliveryFuture<'a> {
+    fn tag_session<'a>(&'a self, _: SessionTag, _: u64) -> DeliveryFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 

@@ -119,10 +119,10 @@ impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<A> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
     }
 
-    fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
+    fn tag_session<'a>(&'a self, tag: SessionTag, since: u64) -> DeliveryFuture<'a> {
         Box::pin(async move {
             match &self.session {
-                Some(session) => session.tag(tag).await.map_err(|_| DeliveryError),
+                Some(session) => session.tag(tag, since).await.map_err(|_| DeliveryError),
                 None => Err(DeliveryError),
             }
         })

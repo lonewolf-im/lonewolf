@@ -140,7 +140,14 @@ enum Command<A: ChunkAllocator> {
         resource: Box<str>,
         token: u64,
         tag: SessionTag,
+        since: u64,
         reply: oneshot::Sender<Result<(), RouterError>>,
+    },
+    Tags {
+        account: AccountKey,
+        resource: Box<str>,
+        token: u64,
+        reply: oneshot::Sender<Result<SessionTags, RouterError>>,
     },
     DeliverToTagged {
         account: AccountKey,
@@ -571,16 +578,34 @@ impl<A: ChunkAllocator> Registration<A> {
         result.await.map_err(|_| RouterError::Stopped)
     }
 
-    /// Marks this bound resource as a recipient of deliveries addressed to `tag`.
-    pub async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
+    /// Marks this bound resource as a recipient of deliveries addressed to `tag`, with
+    /// `since` as the view it was tagged under; a tag already carried keeps its view.
+    pub async fn tag(&self, tag: SessionTag, since: u64) -> Result<(), RouterError> {
         tag_resource(
             &self.links.shard,
             &self.account,
             &self.resource,
             self.token,
             tag,
+            since,
         )
         .await
+    }
+
+    /// The tags this bound resource carries.
+    pub async fn tags(&self) -> Result<SessionTags, RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.links
+            .shard
+            .send(Command::Tags {
+                account: self.account.clone(),
+                resource: self.resource.clone(),
+                token: self.token,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
     }
 
     pub(crate) fn handle(&self) -> SessionHandle<A> {
@@ -631,9 +656,18 @@ impl<A: ChunkAllocator> Clone for SessionHandle<A> {
 }
 
 impl<A: ChunkAllocator> SessionHandle<A> {
-    /// Marks the resource as a recipient of deliveries addressed to `tag`.
-    pub(crate) async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
-        tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await
+    /// Marks the resource as a recipient of deliveries addressed to `tag`, with `since`
+    /// as the view it was tagged under; a tag already carried keeps its view.
+    pub(crate) async fn tag(&self, tag: SessionTag, since: u64) -> Result<(), RouterError> {
+        tag_resource(
+            &self.shard,
+            &self.account,
+            &self.resource,
+            self.token,
+            tag,
+            since,
+        )
+        .await
     }
 
     pub(crate) async fn set_presence(
@@ -686,6 +720,7 @@ async fn tag_resource<A: ChunkAllocator>(
     resource: &str,
     token: u64,
     tag: SessionTag,
+    since: u64,
 ) -> Result<(), RouterError> {
     let (reply, result) = oneshot::channel();
     shard
@@ -694,6 +729,7 @@ async fn tag_resource<A: ChunkAllocator>(
             resource: resource.into(),
             token,
             tag,
+            since,
             reply,
         })
         .await
@@ -870,9 +906,19 @@ impl<A: ChunkAllocator> Shard<A> {
                 resource,
                 token,
                 tag,
+                since,
                 reply,
             } => {
-                let result = self.tag(&account, &resource, token, tag);
+                let result = self.tag(&account, &resource, token, tag, since);
+                let _ = reply.send(result);
+            }
+            Command::Tags {
+                account,
+                resource,
+                token,
+                reply,
+            } => {
+                let result = self.tags(&account, &resource, token);
                 let _ = reply.send(result);
             }
             Command::DeliverToTagged {
@@ -1229,17 +1275,30 @@ impl<A: ChunkAllocator> Shard<A> {
         resource: &str,
         token: u64,
         tag: SessionTag,
+        since: u64,
     ) -> Result<(), RouterError> {
         let session = self
             .accounts
             .get_mut(account.as_str())
             .and_then(|sessions| sessions.get_mut(resource))
+            .filter(|session| session.token == token && session.alive.load(Ordering::Acquire))
             .ok_or(RouterError::NotFound)?;
-        if session.token != token || !session.alive.load(Ordering::Acquire) {
-            return Err(RouterError::NotFound);
-        }
-        session.tags.insert(tag);
+        session.tags.insert(tag, since);
         Ok(())
+    }
+
+    fn tags(
+        &self,
+        account: &AccountKey,
+        resource: &str,
+        token: u64,
+    ) -> Result<SessionTags, RouterError> {
+        self.accounts
+            .get(account.as_str())
+            .and_then(|sessions| sessions.get(resource))
+            .filter(|session| session.token == token && session.alive.load(Ordering::Acquire))
+            .map(|session| session.tags)
+            .ok_or(RouterError::NotFound)
     }
 
     fn deliver_to_tagged(

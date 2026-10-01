@@ -34,6 +34,12 @@ use crate::delivery::{RouterDelivery, deliver_committed};
 use crate::router::local::RetireCause;
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
 
+/// How many deliveries a session holds for a request waiting for its turn before it
+/// stops draining its mailbox. A wait ends as soon as the work ahead releases its
+/// ticket, so this only bounds memory during a storm; past it the mailbox fills and a
+/// stalled client is evicted as usual.
+const WAITING_BACKLOG: usize = 1024;
+
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 
@@ -265,8 +271,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     /// after the ticket is released, so a socket that stops taking data holds no
     /// account's line, and a reply that fails to write cannot lose committed effects.
     /// Deliveries that arrive while the request waits for its turn, and those still
-    /// queued when it turns, predate that view, so they are written ahead of the reply,
-    /// and a get learns of them before it answers.
+    /// queued when it turns, predate that view, so they are queued ahead of the reply and
+    /// written with it, and a get learns of them before it answers.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -770,18 +776,22 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
         self.flush().await
     }
 
-    /// Writes deliveries as they arrive until `until` resolves, so a session waiting for
-    /// its turn keeps draining its mailbox instead of overflowing it. `until` is polled
-    /// first, so nothing that arrives after it resolves is taken. Reports whether anything
-    /// was written.
+    /// Queues deliveries as they arrive until `until` resolves, so a session waiting for
+    /// its turn does not overflow its mailbox. Nothing is written while waiting: the
+    /// request may hold a ticket, and a socket write must never keep the account's line
+    /// from moving. `until` is polled first, so nothing that arrives after it resolves is
+    /// taken. Reports whether anything was queued.
     async fn drain_until<F: Future>(
         &mut self,
         registration: &Registration<A>,
         until: F,
     ) -> Result<(F::Output, bool), CloseOutcome> {
         let mut until = pin!(until);
-        let mut drained = false;
+        let mut queued = 0;
         loop {
+            if queued >= WAITING_BACKLOG {
+                return Ok((until.await, true));
+            }
             let event = {
                 let receive = pin!(registration.recv());
                 match select(until.as_mut(), receive).await {
@@ -790,10 +800,12 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
                 }
             };
             match event {
-                Either::Left(output) => return Ok((output, drained)),
+                Either::Left(output) => return Ok((output, queued > 0)),
                 Either::Right(Some(delivery)) => {
-                    drained = true;
-                    self.drain_mailbox(registration, delivery).await?;
+                    self.push(Output::Routed(delivery));
+                    let rest = registration.take_queued();
+                    queued += 1 + rest.len();
+                    self.routed(rest);
                 }
                 Either::Right(None) => return Err(CloseOutcome::InternalError),
             }

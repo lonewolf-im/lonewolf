@@ -865,3 +865,21 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn a_panic_while_holding_router_state_unwinds_instead_of_aborting() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = (router, dispatcher, handle, desk);
+            panic!("deliberate");
+        }));
+        assert!(caught.is_err());
+        Ok(())
+    })
+}

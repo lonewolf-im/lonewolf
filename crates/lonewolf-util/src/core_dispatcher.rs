@@ -197,6 +197,14 @@ impl CoreDispatcher {
 
 impl Drop for CoreDispatcher {
     fn drop(&mut self) {
+        // Signalling a worker while this thread unwinds aborts the process, so a
+        // dispatcher dropped by a panic leaves its workers running instead.
+        if std::thread::panicking() {
+            for worker in &mut self.workers {
+                std::mem::forget(worker.stop.take());
+            }
+            return;
+        }
         self.stop(Instant::now());
     }
 }

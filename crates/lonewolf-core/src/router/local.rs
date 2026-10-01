@@ -4,6 +4,7 @@ use std::collections::{HashMap, hash_map::RandomState};
 use std::future::Future;
 use std::hash::BuildHasher;
 use std::io;
+use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
@@ -50,7 +51,7 @@ pub struct Registration<A: ChunkAllocator> {
     resource: Box<str>,
     token: u64,
     alive: Arc<AtomicBool>,
-    _lease: oneshot::Sender<()>,
+    lease: Option<oneshot::Sender<()>>,
     retired: Retirement<A>,
     inbound: Receiver<RoutedStanza<A>>,
     shard: Sender<Command<A>>,
@@ -246,6 +247,16 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
             task.await.map_err(io::Error::other)?;
         }
         Ok(())
+    }
+}
+
+impl<A: ChunkAllocator> Drop for LocalRouterHandle<A> {
+    fn drop(&mut self) {
+        // Closing the shard channels wakes the shards, and waking another task while this
+        // thread unwinds aborts the process, so a handle dropped by a panic keeps them open.
+        if std::thread::panicking() {
+            mem::forget(mem::replace(&mut self.shards, Arc::from(Vec::new())));
+        }
     }
 }
 
@@ -674,6 +685,11 @@ async fn tag_resource<A: ChunkAllocator>(
 impl<A: ChunkAllocator> Drop for Registration<A> {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
+        // Waking another task while this thread unwinds aborts the process, so a session
+        // ending in a panic leaves its record to be found stale instead of announcing it.
+        if std::thread::panicking() {
+            mem::forget(self.lease.take());
+        }
     }
 }
 
@@ -947,7 +963,7 @@ impl<A: ChunkAllocator> Shard<A> {
             resource,
             token,
             alive,
-            _lease: lease,
+            lease: Some(lease),
             retired: retired_reply.shared(),
             inbound,
             shard,

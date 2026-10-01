@@ -72,6 +72,20 @@ impl C2sSuite {
         )
     }
 
+    pub fn with_extensions_limits_and_setup(
+        extensions: &str,
+        limits: &str,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
+        Self::settings_with_setup(
+            "",
+            limits,
+            10,
+            &format!("[hosts.localhost]\nextensions = [{extensions}]"),
+            setup,
+        )
+    }
+
     pub fn with_hosts(hosts: &str) -> TestResult<Self> {
         Self::settings("", "", 10, hosts)
     }

@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::future::{Either, select};
 use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::HandlerError;
-use lonewolf_extension::iq::{IqReply, IqRequest, IqRequestType, IqScope};
+use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::presence::{
-    PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
+    PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::PendingSubscription;
-use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
+use lonewolf_storage::{RedbRead, RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
 use lonewolf_xmpp::parser::{Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    CLIENT_NAMESPACE, IqType, MessageType, PresenceType, Stanza, StanzaErrorCondition,
+    CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType, Stanza, StanzaErrorCondition,
     StanzaNamespace, StanzaRef, StanzaType,
 };
 use tokio::io::BufReader;
@@ -29,9 +32,9 @@ use super::bind::Bound;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
-use crate::delivery::{RouterDelivery, deliver_committed};
-use crate::router::local::RetireCause;
-use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle};
+use crate::delivery::{RouterDelivery, after_turn, deliver_committed};
+use crate::router::local::{PresenceChange, RetireCause};
+use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
@@ -39,15 +42,22 @@ const STORED_STANZA_STREAM_HEADER: &[u8] =
 /// The bound resource's side of the stream: everything except the parser, which
 /// stays outside so a pending read can be kept while stanzas are handled.
 struct BoundSession<A: ChunkAllocator> {
-    writer: Writer,
     registration: Registration<A>,
     router: RouterHandle<A>,
     storage: RedbStorage,
     allocator: A,
     /// Whether this resource currently has presence, mirroring the router's view.
     available: bool,
-    /// Everything the client has yet to receive, in order; only `flush` writes the socket.
-    outbox: VecDeque<Output<A>>,
+    outbox: Outbox<A>,
+}
+
+/// The session's output path: everything the client has yet to receive, in order, and
+/// the writer that only it uses.
+struct Outbox<A: ChunkAllocator> {
+    queue: VecDeque<Output<A>>,
+    writer: Writer,
+    allocator: A,
+    account: AccountKey,
 }
 
 enum Output<A: ChunkAllocator> {
@@ -71,14 +81,19 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         allocator,
         resource_requested: _,
     } = bound;
-    let mut session = BoundSession {
+    let outbox = Outbox {
+        queue: VecDeque::new(),
         writer,
+        allocator: allocator.clone(),
+        account: registration.account().clone(),
+    };
+    let mut session = BoundSession {
         registration,
         router,
         storage,
         allocator,
         available: false,
-        outbox: VecDeque::new(),
+        outbox,
     };
     let stopped = {
         let retired = pin!(session.registration.wait_retired());
@@ -90,7 +105,11 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
     let outcome = match stopped {
         Either::Right(outcome) => outcome,
         Either::Left(Ok(RetireCause::AccountDeleted)) => {
-            session.writer.fail(CloseOutcome::AccountDeleted).await
+            session
+                .outbox
+                .writer
+                .fail(CloseOutcome::AccountDeleted)
+                .await
         }
         Either::Left(_) => CloseOutcome::InternalError,
     };
@@ -125,7 +144,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 match selected {
                     Either::Left(event) => break event,
                     Either::Right(Some(delivery)) => {
-                        if let Err(outcome) = self.drain_mailbox(delivery).await {
+                        if let Err(outcome) = self
+                            .outbox
+                            .drain_mailbox(&self.registration, delivery)
+                            .await
+                        {
                             break 'stream outcome;
                         }
                     }
@@ -133,20 +156,20 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 }
             };
             match event {
-                Ok(Some(StreamEvent::StreamEnd) | None) => break self.writer.close().await,
+                Ok(Some(StreamEvent::StreamEnd) | None) => break self.outbox.writer.close().await,
                 Ok(Some(StreamEvent::Stanza(parsed))) => {
                     let handled = self.handle_stanza(parsed).await;
-                    let flushed = self.flush().await;
+                    let flushed = self.outbox.flush().await;
                     if let Err(outcome) = handled.and(flushed) {
-                        break self.writer.fail(outcome).await;
+                        break self.outbox.writer.fail(outcome).await;
                     }
                 }
                 Ok(Some(event)) => {
                     let outcome =
                         namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
-                    break self.writer.fail(outcome).await;
+                    break self.outbox.writer.fail(outcome).await;
                 }
-                Err(outcome) => break self.writer.fail(outcome).await,
+                Err(outcome) => break self.outbox.writer.fail(outcome).await,
             }
         }
     }
@@ -221,44 +244,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         result.and(finished)
     }
 
-    /// Queues one delivery and everything else the mailbox already holds, then writes
-    /// the batch in one go.
-    async fn drain_mailbox(&mut self, first: RoutedStanza<A>) -> Result<(), CloseOutcome> {
-        self.outbox.push_back(Output::Routed(first));
-        self.outbox.extend(
-            self.registration
-                .take_queued()
-                .into_iter()
-                .map(Output::Routed),
-        );
-        self.flush().await
-    }
-
-    /// Writes everything queued, in order, and flushes the socket once.
-    async fn flush(&mut self) -> Result<(), CloseOutcome> {
-        if self.outbox.is_empty() {
-            return Ok(());
-        }
-        while let Some(output) = self.outbox.pop_front() {
-            match output {
-                Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
-                Output::Owned { stanzas, arena } => {
-                    for stanza in &stanzas {
-                        let stanza = stanza.resolve(&arena)?;
-                        self.writer.write_stanza(&stanza).await?;
-                    }
-                }
-                Output::Requests(requests) => {
-                    for subscription in requests {
-                        let stanza = self.parse_pending_subscription(subscription).await?;
-                        self.writer.write_routed(&stanza).await?;
-                    }
-                }
-            }
-        }
-        self.writer.flush().await
-    }
-
     async fn handle_stanza(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let stanza = parsed.value().resolve(parsed.arena())?;
         if stanza.namespace() != StanzaNamespace::Client {
@@ -276,34 +261,37 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 
     /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. The effects run under the ticket taken with that view; a
-    /// set's run on a task that outlives this stream, so retiring the session cannot lose
-    /// them, while a get commits nothing and needs no such care. The reply is written
-    /// after the ticket is released, so a socket that stops taking data holds no
-    /// account's line, and a reply that fails to write cannot lose committed effects.
-    /// Deliveries queued when the ticket turned predate that view, so they are written
-    /// ahead of the reply, and a get learns of them before it answers.
+    /// transaction for a set. Once that view has its ticket, everything the ticket orders
+    /// runs on a task of its own, so retiring the session cannot lose it and a stalled
+    /// socket holds no account's line. Meanwhile the session drains its mailbox, and it
+    /// writes the reply afterwards, behind whatever preceded the ticket's turn.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
-        let order = Arc::clone(self.router.order());
-        let mut response = Arena::try_new_in(Default::default(), self.allocator.clone())?;
-        let sender = route.sender.resolve(&arena)?;
-        let stanza = request.resolve(&arena)?;
-        let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-        let payload = stanza
-            .children()?
-            .next()
-            .transpose()?
-            .ok_or(CloseOutcome::InternalError)?;
-        let handler = route.scope.and_then(|scope| {
-            self.router.iq_handlers(target.domainpart())?.find(
-                scope,
-                route.kind,
-                payload.namespace(),
-                payload.name(),
-            )
-        });
+        let response = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+        let (handler, accounts) = {
+            let sender = route.sender.resolve(&arena)?;
+            let stanza = request.resolve(&arena)?;
+            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+            let payload = stanza
+                .children()?
+                .next()
+                .transpose()?
+                .ok_or(CloseOutcome::InternalError)?;
+            let handler = route.scope.and_then(|scope| {
+                self.router.iq_handlers(target.domainpart())?.find(
+                    scope,
+                    route.kind,
+                    payload.namespace(),
+                    payload.name(),
+                )
+            });
+            let accounts = match route.scope {
+                Some(IqScope::Account) => vec![AccountKey::try_from(target.bare())?],
+                Some(IqScope::Server) | None => Vec::new(),
+            };
+            (handler.map(Arc::clone), accounts)
+        };
         let Some(handler) = handler else {
             let reply = iq::error_reply(
                 &request,
@@ -311,103 +299,157 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 StanzaErrorCondition::ServiceUnavailable,
                 None,
             )?;
-            self.outbox.push_back(Output::Owned {
+            self.outbox.push(Output::Owned {
                 stanzas: vec![reply],
                 arena,
             });
             return Ok(());
         };
-        let accounts = match route.scope {
-            Some(IqScope::Account) => vec![AccountKey::try_from(target.bare())?],
-            Some(IqScope::Server) | None => Vec::new(),
-        };
-        let delivery = self.delivery();
-        let mut queued = Vec::new();
-        let handled = match route.kind {
+        match route.kind {
             IqRequestType::Get => {
-                let (transaction, mut ticket) = order
-                    .fix(accounts, self.storage.begin_read())
+                self.handle_iq_get(request, route.sender, arena, response, handler, accounts)
                     .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                ticket.turn().await;
-                queued = self.registration.take_queued();
-                let iq_request = IqRequest {
-                    sender,
-                    target,
-                    payload,
-                    preceded: !queued.is_empty(),
-                };
-                let reply = handler.get(iq_request, &transaction, &mut response).await;
-                drop(transaction);
-                match reply {
-                    Ok(IqReply {
-                        payload,
-                        followups,
-                        effects,
-                    }) => {
-                        (effects.deliver)(&delivery)
-                            .await
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                        drop(ticket);
-                        Ok((payload, followups))
-                    }
-                    Err(error) => Err(error),
-                }
             }
             IqRequestType::Set => {
-                let mut transaction = self
-                    .storage
-                    .begin_write()
+                self.handle_iq_set(request, route.sender, arena, response, handler)
+                    .await
+            }
+        }
+    }
+
+    async fn handle_iq_get(
+        &mut self,
+        request: Stanza,
+        sender: Jid,
+        arena: Arena<A>,
+        response: Arena<A>,
+        handler: Arc<dyn IqHandler<A, RedbStorage>>,
+        accounts: Vec<AccountKey>,
+    ) -> Result<(), CloseOutcome> {
+        let (transaction, ticket) = Arc::clone(self.router.order())
+            .fix(accounts, self.storage.begin_read())
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+        let wrote = Rc::new(Cell::new(false));
+        let work = GetWork {
+            wrote: Rc::clone(&wrote),
+            transaction,
+            handler,
+            arena,
+            request,
+            sender,
+            response,
+            delivery: self.delivery(),
+        };
+        let mut pending = after_turn(ticket, Some(self.registration.mailbox()), move |queued| {
+            work.run(queued)
+        });
+        self.outbox
+            .drain_until(&self.registration, pending.turned(), &wrote)
+            .await?;
+        let outcome = pending
+            .finished()
+            .await
+            .ok_or(CloseOutcome::InternalError)??;
+        self.outbox.routed(outcome.queued);
+        self.queue_iq_reply(
+            request,
+            sender,
+            outcome.arena,
+            outcome.response,
+            outcome.reply,
+        )
+    }
+
+    async fn handle_iq_set(
+        &mut self,
+        request: Stanza,
+        sender: Jid,
+        arena: Arena<A>,
+        mut response: Arena<A>,
+        handler: Arc<dyn IqHandler<A, RedbStorage>>,
+    ) -> Result<(), CloseOutcome> {
+        let mut transaction = self
+            .storage
+            .begin_write()
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+        let delivery = self.delivery();
+        let reply = {
+            let sender = sender.resolve(&arena)?;
+            let stanza = request.resolve(&arena)?;
+            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+            let payload = stanza
+                .children()?
+                .next()
+                .transpose()?
+                .ok_or(CloseOutcome::InternalError)?;
+            let iq_request = IqRequest {
+                sender,
+                target,
+                payload,
+                preceded: false,
+            };
+            handler
+                .set(iq_request, &mut transaction, &delivery, &mut response)
+                .await
+        };
+        let reply = match reply {
+            Ok(IqReply {
+                payload,
+                followups,
+                effects: Effects { accounts, deliver },
+            }) => {
+                let ((), ticket) = Arc::clone(self.router.order())
+                    .fix(accounts, transaction.commit())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
-                let iq_request = IqRequest {
-                    sender,
-                    target,
-                    payload,
-                    preceded: false,
-                };
-                match handler
-                    .set(iq_request, &mut transaction, &delivery, &mut response)
+                let mut committed =
+                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
+                self.outbox
+                    .drain_until(&self.registration, committed.turned(), &Cell::new(false))
+                    .await?;
+                let queued = committed
+                    .finished()
                     .await
-                {
-                    Ok(IqReply {
-                        payload,
-                        followups,
-                        effects: Effects { accounts, deliver },
-                    }) => {
-                        let ((), ticket) = order
-                            .fix(accounts, transaction.commit())
-                            .await
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                        queued = deliver_committed(
-                            ticket,
-                            deliver,
-                            delivery,
-                            Some(self.registration.mailbox()),
-                        )
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
-                        Ok((payload, followups))
-                    }
-                    Err(error) => Err(error),
-                }
+                    .ok_or(CloseOutcome::InternalError)?
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                self.outbox.routed(queued);
+                Ok((payload, followups))
             }
+            Err(error) => Err(error),
         };
-        self.outbox.extend(queued.into_iter().map(Output::Routed));
-        match handled {
+        self.queue_iq_reply(request, sender, arena, response, reply)
+    }
+
+    /// Queues the result with its follow-ups, or the error reply, behind whatever the
+    /// outbox already holds.
+    fn queue_iq_reply(
+        &mut self,
+        request: Stanza,
+        sender: Jid,
+        mut arena: Arena<A>,
+        mut response: Arena<A>,
+        reply: Result<(Option<Element>, Vec<Stanza>), HandlerError>,
+    ) -> Result<(), CloseOutcome> {
+        match reply {
             Err(HandlerError::Stanza(condition)) => {
-                let reply = iq::error_reply(&request, &mut arena, condition, Some(route.sender))?;
-                self.outbox.push_back(Output::Owned {
+                let reply = iq::error_reply(&request, &mut arena, condition, Some(sender))?;
+                self.outbox.push(Output::Owned {
                     stanzas: vec![reply],
                     arena,
                 });
             }
             Ok((payload, followups)) => {
-                let reply = iq::result_reply(&stanza, sender, payload, &mut response)?;
+                let reply = {
+                    let sender = sender.resolve(&arena)?;
+                    let stanza = request.resolve(&arena)?;
+                    iq::result_reply(&stanza, sender, payload, &mut response)?
+                };
                 let mut stanzas = Vec::with_capacity(1 + followups.len());
                 stanzas.push(reply);
                 stanzas.extend(followups);
-                self.outbox.push_back(Output::Owned {
+                self.outbox.push(Output::Owned {
                     stanzas,
                     arena: response,
                 });
@@ -524,7 +566,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 PresenceTransition::Unavailable,
             ),
         };
-        let (result, mut ticket) = match self
+        let (result, ticket) = match self
             .router
             .presence_handlers(self.registration.account().domain())
             .and_then(|handlers| handlers.find(kind))
@@ -543,16 +585,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 (result, Some(ticket))
             }
         };
-        let mut audience = match result {
+        let audience = match result {
             Ok(audience) => audience,
             Err(condition) => {
                 let routed = RoutedStanza::from_parts(stamped, arena);
                 return self.reply_error(&routed, condition).await;
             }
         };
-        if let Some(ticket) = ticket.as_mut() {
-            ticket.turn().await;
-        }
         let (routed, unavailable) = match unavailable {
             Some(unavailable) => {
                 let (routed, unavailable) =
@@ -561,49 +600,39 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
             None => (RoutedStanza::from_parts(stamped, arena), None),
         };
-        let broadcast_stanza = audience
-            .as_ref()
-            .is_some_and(|audience| !audience.subscribers.is_empty())
-            .then(|| routed.clone());
-        let change = self
-            .registration
-            .set_presence(priority, routed.clone(), unavailable)
-            .await
-            .map_err(|_| CloseOutcome::InternalError)?;
+        let work = PresenceWork {
+            session: self.registration.handle(),
+            router: self.router.clone(),
+            account: self.registration.account().clone(),
+            priority,
+            available,
+            routed,
+            unavailable,
+            audience,
+        };
+        let outcome = match ticket {
+            Some(ticket) => {
+                let mut pending =
+                    after_turn(ticket, None, move |_: Vec<RoutedStanza<A>>| work.run());
+                self.outbox
+                    .drain_until(&self.registration, pending.turned(), &Cell::new(false))
+                    .await?;
+                pending
+                    .finished()
+                    .await
+                    .ok_or(CloseOutcome::InternalError)??
+            }
+            None => work.run().await?,
+        };
         self.available = priority.is_some();
         // The router takes the cut with the update itself, so without a ticket a
         // sibling's earlier update still lands ahead of this echo.
-        self.outbox
-            .extend(change.preceding.into_iter().map(Output::Routed));
-        self.outbox
-            .extend(change.siblings.into_iter().map(Output::Routed));
-        self.outbox.push_back(Output::Routed(routed));
-        if change.became_available
-            && let Some(audience) = audience.as_mut()
-        {
-            // The ticket is still held, so a contact captured here cannot have revoked the
-            // subscription before its presence is written.
-            for contact in &audience.contacts {
-                let presence = self
-                    .router
-                    .current_presence(contact, self.registration.account())
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.extend(presence.into_iter().map(Output::Routed));
-            }
-            let requests = mem::take(&mut audience.pending);
-            if !requests.is_empty() {
-                self.outbox.push_back(Output::Requests(requests));
-            }
-        }
-        if let Some(audience) = audience
-            && (available || change.became_unavailable)
-            && let Some(stanza) = broadcast_stanza
-        {
-            self.router
-                .broadcast_presence(&stanza, &audience.subscribers)
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
+        self.outbox.routed(outcome.change.preceding);
+        self.outbox.routed(outcome.change.siblings);
+        self.outbox.push(Output::Routed(outcome.echo));
+        self.outbox.routed(outcome.replay);
+        if !outcome.requests.is_empty() {
+            self.outbox.push(Output::Requests(outcome.requests));
         }
         Ok(())
     }
@@ -688,11 +717,17 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         };
         match received {
             Ok((deliver, ticket, delivery)) => {
-                let queued =
-                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()))
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.extend(queued.into_iter().map(Output::Routed));
+                let mut committed =
+                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
+                self.outbox
+                    .drain_until(&self.registration, committed.turned(), &Cell::new(false))
+                    .await?;
+                let queued = committed
+                    .finished()
+                    .await
+                    .ok_or(CloseOutcome::InternalError)?
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                self.outbox.routed(queued);
                 Ok(())
             }
             Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition).await,
@@ -707,7 +742,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
         let source = source.resolve()?.clone_in(&mut arena)?;
         let reply = source.error_reply_in(&mut arena, condition)?.build()?;
-        self.outbox.push_back(Output::Owned {
+        self.outbox.push(Output::Owned {
             stanzas: vec![reply],
             arena,
         });
@@ -750,6 +785,85 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
         Ok((builder.build()?, from, to))
     }
+}
+
+impl<A: ChunkAllocator + Clone> Outbox<A> {
+    fn push(&mut self, output: Output<A>) {
+        self.queue.push_back(output);
+    }
+
+    fn routed(&mut self, stanzas: impl IntoIterator<Item = RoutedStanza<A>>) {
+        self.queue.extend(stanzas.into_iter().map(Output::Routed));
+    }
+
+    /// Queues one delivery and everything else the mailbox already holds, then writes
+    /// the batch in one go.
+    async fn drain_mailbox(
+        &mut self,
+        registration: &Registration<A>,
+        first: RoutedStanza<A>,
+    ) -> Result<(), CloseOutcome> {
+        self.push(Output::Routed(first));
+        self.routed(registration.take_queued());
+        self.flush().await
+    }
+
+    /// Writes deliveries as they arrive until `until` resolves, so a session waiting for
+    /// its turn keeps draining its mailbox. The ticket the request took lives on a task of
+    /// its own, so a write that stalls here holds no account's line; a client that stops
+    /// reading fills its mailbox and is evicted as usual. `until` is polled first, so
+    /// nothing that arrives after it resolves is taken, and `wrote` records that
+    /// something was written, for a reply that must know deliveries precede it.
+    async fn drain_until<F: Future>(
+        &mut self,
+        registration: &Registration<A>,
+        until: F,
+        wrote: &Cell<bool>,
+    ) -> Result<F::Output, CloseOutcome> {
+        let mut until = pin!(until);
+        loop {
+            let event = {
+                let receive = pin!(registration.recv());
+                match select(until.as_mut(), receive).await {
+                    Either::Left((output, _)) => Either::Left(output),
+                    Either::Right((delivery, _)) => Either::Right(delivery),
+                }
+            };
+            match event {
+                Either::Left(output) => return Ok(output),
+                Either::Right(Some(delivery)) => {
+                    wrote.set(true);
+                    self.drain_mailbox(registration, delivery).await?;
+                }
+                Either::Right(None) => return Err(CloseOutcome::InternalError),
+            }
+        }
+    }
+
+    /// Writes everything queued, in order, and flushes the socket once.
+    async fn flush(&mut self) -> Result<(), CloseOutcome> {
+        if self.queue.is_empty() {
+            return Ok(());
+        }
+        while let Some(output) = self.queue.pop_front() {
+            match output {
+                Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
+                Output::Owned { stanzas, arena } => {
+                    for stanza in &stanzas {
+                        let stanza = stanza.resolve(&arena)?;
+                        self.writer.write_stanza(&stanza).await?;
+                    }
+                }
+                Output::Requests(requests) => {
+                    for subscription in requests {
+                        let stanza = self.parse_pending_subscription(subscription).await?;
+                        self.writer.write_routed(&stanza).await?;
+                    }
+                }
+            }
+        }
+        self.writer.flush().await
+    }
 
     /// Parses a stored request and checks it still addresses this account from its sender.
     async fn parse_pending_subscription(
@@ -788,12 +902,158 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     .is_none_or(|sender| sender.as_str() != subscription.sender.as_str())
                 || stanza
                     .to()?
-                    .is_none_or(|target| target.as_str() != self.registration.account().as_str())
+                    .is_none_or(|target| target.as_str() != self.account.as_str())
             {
                 return Err(CloseOutcome::InternalError);
             }
         }
         Ok(RoutedStanza::from_parts(stanza, arena))
+    }
+}
+
+/// A get from the moment its ticket turns: the handler runs on the snapshot, its effects
+/// run, and the reply goes back to the session to write.
+struct GetWork<A: ChunkAllocator> {
+    /// Set by the session when it wrote deliveries while waiting for the turn.
+    wrote: Rc<Cell<bool>>,
+    transaction: RedbRead,
+    handler: Arc<dyn IqHandler<A, RedbStorage>>,
+    arena: Arena<A>,
+    request: Stanza,
+    sender: Jid,
+    response: Arena<A>,
+    delivery: RouterDelivery<A>,
+}
+
+struct GetOutcome<A: ChunkAllocator> {
+    arena: Arena<A>,
+    response: Arena<A>,
+    reply: Result<(Option<Element>, Vec<Stanza>), HandlerError>,
+    /// Deliveries still queued when the ticket turned, written ahead of the reply.
+    queued: Vec<RoutedStanza<A>>,
+}
+
+impl<A: ChunkAllocator + Clone> GetWork<A> {
+    async fn run(self, queued: Vec<RoutedStanza<A>>) -> Result<GetOutcome<A>, CloseOutcome> {
+        let GetWork {
+            wrote,
+            transaction,
+            handler,
+            arena,
+            request,
+            sender,
+            mut response,
+            delivery,
+        } = self;
+        let reply = {
+            let sender = sender.resolve(&arena)?;
+            let stanza = request.resolve(&arena)?;
+            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+            let payload = stanza
+                .children()?
+                .next()
+                .transpose()?
+                .ok_or(CloseOutcome::InternalError)?;
+            let iq_request = IqRequest {
+                sender,
+                target,
+                payload,
+                preceded: wrote.get() || !queued.is_empty(),
+            };
+            handler.get(iq_request, &transaction, &mut response).await
+        };
+        drop(transaction);
+        let reply = match reply {
+            Ok(IqReply {
+                payload,
+                followups,
+                effects,
+            }) => {
+                (effects.deliver)(&delivery)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                Ok((payload, followups))
+            }
+            Err(error) => Err(error),
+        };
+        Ok(GetOutcome {
+            arena,
+            response,
+            reply,
+            queued,
+        })
+    }
+}
+
+/// A presence update from the moment its ticket turns: the router applies it and takes
+/// the cut, the replay for a newly available resource is gathered, and the subscribers
+/// are told.
+struct PresenceWork<A: ChunkAllocator> {
+    session: SessionHandle<A>,
+    router: RouterHandle<A>,
+    account: AccountKey,
+    priority: Option<i8>,
+    available: bool,
+    routed: RoutedStanza<A>,
+    unavailable: Option<RoutedStanza<A>>,
+    audience: Option<PresenceAudience>,
+}
+
+struct PresenceOutcome<A: ChunkAllocator> {
+    change: PresenceChange<A>,
+    echo: RoutedStanza<A>,
+    /// The contacts' current presence for a resource that just became available.
+    replay: Vec<RoutedStanza<A>>,
+    requests: Vec<PendingSubscription>,
+}
+
+impl<A: ChunkAllocator + Clone> PresenceWork<A> {
+    async fn run(self) -> Result<PresenceOutcome<A>, CloseOutcome> {
+        let PresenceWork {
+            session,
+            router,
+            account,
+            priority,
+            available,
+            routed,
+            unavailable,
+            mut audience,
+        } = self;
+        let change = session
+            .set_presence(priority, routed.clone(), unavailable)
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+        let mut replay = Vec::new();
+        let mut requests = Vec::new();
+        if change.became_available
+            && let Some(audience) = audience.as_mut()
+        {
+            // The ticket is still held, so a contact captured here cannot have revoked the
+            // subscription before its presence is written.
+            for contact in &audience.contacts {
+                let presence = router
+                    .current_presence(contact, &account)
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                replay.extend(presence);
+            }
+            requests = mem::take(&mut audience.pending);
+        }
+        if let Some(audience) = audience
+            && (available || change.became_unavailable)
+            && !audience.subscribers.is_empty()
+        {
+            router
+                .broadcast_presence(&routed, &audience.subscribers)
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?;
+        }
+        Ok(PresenceOutcome {
+            change,
+            echo: routed,
+            replay,
+            requests,
+        })
     }
 }
 

@@ -133,7 +133,7 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
         kind: IqRequestType,
         namespace: &str,
         name: &str,
-    ) -> Option<&dyn IqHandler<A, S>> {
+    ) -> Option<&Arc<dyn IqHandler<A, S>>> {
         let index = self
             .handlers
             .binary_search_by(|(route, _)| {
@@ -141,7 +141,7 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
                     .cmp(&(scope, kind, namespace, name))
             })
             .ok()?;
-        Some(self.handlers[index].1.as_ref())
+        Some(&self.handlers[index].1)
     }
 
     pub(crate) fn registrations(

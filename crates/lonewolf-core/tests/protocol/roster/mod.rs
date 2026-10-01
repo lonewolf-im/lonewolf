@@ -2465,6 +2465,7 @@ fn initial_presence_ignores_a_subscription_the_contact_never_granted() -> TestRe
     alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
 
     alice.close()?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost'/>")?;
     bob.close()
 }
 

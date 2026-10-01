@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::future::Future;
+
 use futures_channel::oneshot;
 use lonewolf_extension::Deliver;
 use lonewolf_extension::delivery::{
@@ -37,37 +39,40 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
     }
 }
 
-/// Committed effects running on a task of their own; dropping it does not stop them.
-pub(crate) struct Committed<A: ChunkAllocator> {
+/// Work that runs on a task of its own once a ticket turns. Dropping the handle does
+/// not stop it, so a session retired meanwhile cannot lose what the ticket ordered.
+pub(crate) struct Pending<T> {
     turned: oneshot::Receiver<()>,
-    done: oneshot::Receiver<Result<Vec<RoutedStanza<A>>, DeliveryError>>,
+    done: oneshot::Receiver<T>,
 }
 
-impl<A: ChunkAllocator> Committed<A> {
+impl<T> Pending<T> {
     /// Resolves when the ticket has turned, which is the cut for the caller's mailbox:
     /// everything delivered before it predates the caller's view of storage.
     pub(crate) async fn turned(&mut self) {
         let _ = (&mut self.turned).await;
     }
 
-    /// The deliveries still queued for the caller when the ticket turned, once the
-    /// effects have run; the caller writes them ahead of its own reply.
-    pub(crate) async fn finished(self) -> Result<Vec<RoutedStanza<A>>, DeliveryError> {
-        self.done.await.unwrap_or(Err(DeliveryError))
+    /// The work's result, or `None` when its task ended without reporting.
+    pub(crate) async fn finished(self) -> Option<T> {
+        self.done.await.ok()
     }
 }
 
-/// Runs `deliver` once `ticket` turns, on a task of its own, so a caller that is
-/// cancelled after its commit cannot lose the deliveries the commit promised.
-pub(crate) fn deliver_committed<A, D>(
+/// Runs `work` on its own task once `ticket` turns, handing it whatever `mailbox` still
+/// holds at that moment, and releases the ticket when the work is done. The caller
+/// never holds the ticket, so nothing it does, including a stalled write, can keep the
+/// account's line from moving.
+pub(crate) fn after_turn<A, T, F, Fut>(
     mut ticket: Ticket,
-    deliver: Deliver<A>,
-    delivery: D,
     mailbox: Option<Mailbox<A>>,
-) -> Committed<A>
+    work: F,
+) -> Pending<T>
 where
-    A: ChunkAllocator + Clone + 'static,
-    D: Delivery<A> + 'static,
+    A: ChunkAllocator,
+    T: 'static,
+    F: FnOnce(Vec<RoutedStanza<A>>) -> Fut + 'static,
+    Fut: Future<Output = T> + 'static,
 {
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
@@ -75,12 +80,29 @@ where
         ticket.turn().await;
         let _ = report_turned.send(());
         let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
-        let result = deliver(&delivery).await.map(|()| queued);
+        let result = work(queued).await;
         drop(ticket);
         let _ = report_done.send(result);
     })
     .detach();
-    Committed { turned, done }
+    Pending { turned, done }
+}
+
+/// Runs committed effects once `ticket` turns and reports the deliveries that were
+/// queued for the caller at that moment, which the caller writes ahead of its reply.
+pub(crate) fn deliver_committed<A, D>(
+    ticket: Ticket,
+    deliver: Deliver<A>,
+    delivery: D,
+    mailbox: Option<Mailbox<A>>,
+) -> Pending<Result<Vec<RoutedStanza<A>>, DeliveryError>>
+where
+    A: ChunkAllocator + Clone + 'static,
+    D: Delivery<A> + 'static,
+{
+    after_turn(ticket, mailbox, move |queued| async move {
+        deliver(&delivery).await.map(|()| queued)
+    })
 }
 
 #[cfg(test)]

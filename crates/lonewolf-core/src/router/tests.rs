@@ -212,12 +212,13 @@ fn retiring_an_account_ends_every_session_and_frees_its_resources() -> TestResul
         let bob_desk = handle
             .register(&bob, Some("desk"), NonZeroUsize::new(2).unwrap())
             .await?;
-        desk.set_presence(
-            Some(0),
-            presence("desk").await?,
-            Some(unavailable_presence("desk").await?),
-        )
-        .await?;
+        desk.handle()
+            .set_presence(
+                Some(0),
+                presence("desk").await?,
+                Some(unavailable_presence("desk").await?),
+            )
+            .await?;
 
         handle.retire_account(&alice).await?;
         let retired = desk.wait_retired().await?;
@@ -606,6 +607,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
             .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
             .await?;
         let became_available = desk
+            .handle()
             .set_presence(
                 Some(0),
                 presence("desk").await?,
@@ -615,6 +617,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
         assert!(became_available.became_available);
         assert!(became_available.siblings.is_empty());
         let became_available = phone
+            .handle()
             .set_presence(
                 Some(0),
                 presence("phone").await?,
@@ -631,6 +634,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 .await?;
         }
         let updated = desk
+            .handle()
             .set_presence(
                 Some(1),
                 presence("desk").await?,
@@ -679,6 +683,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
         assert_eq!(replacement.resource(), "phone");
         assert!(!phone.replacement_is_available().await?);
         replacement
+            .handle()
             .set_presence(
                 Some(0),
                 presence("phone").await?,
@@ -713,13 +718,14 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
             .register(&bob_account, Some("phone"), NonZeroUsize::MIN)
             .await?;
         alice_desk
+            .handle()
             .set_presence(
                 Some(0),
                 presence("desk").await?,
                 Some(unavailable_presence("desk").await?),
             )
             .await?;
-        bob.set_presence(
+        bob.handle().set_presence(
             Some(0),
             parse_stanza("<presence from='bob@localhost/phone' to='bob@localhost'/>").await?,
             Some(
@@ -768,23 +774,28 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
         let phone = handle.register(&alice, Some("phone"), limit).await?;
 
         assert!(
-            desk.set_presence(Some(0), presence("desk").await?, None)
+            desk.handle()
+                .set_presence(Some(0), presence("desk").await?, None)
                 .await?
                 .became_available
         );
         phone
+            .handle()
             .set_presence(Some(0), identified_presence("phone", "old").await?, None)
             .await?;
         let away = desk
+            .handle()
             .set_presence(None, unavailable_presence("desk").await?, None)
             .await?;
         assert!(away.became_unavailable);
         assert_eq!(away.preceding.len(), 1);
         assert_eq!(away.preceding[0].resolve()?.id()?, Some("old"));
         phone
+            .handle()
             .set_presence(Some(0), identified_presence("phone", "new").await?, None)
             .await?;
         let change = desk
+            .handle()
             .set_presence(Some(0), presence("desk").await?, None)
             .await?;
         assert!(change.became_available);
@@ -815,6 +826,7 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
             .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
             .await?;
         let became_available = desk
+            .handle()
             .set_presence(
                 Some(0),
                 presence("desk").await?,
@@ -823,6 +835,7 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
             .await?;
         assert!(became_available.became_available);
         let became_available = phone
+            .handle()
             .set_presence(Some(0), presence("phone").await?, None)
             .await?;
         assert!(became_available.became_available);

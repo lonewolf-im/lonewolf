@@ -501,28 +501,6 @@ impl<A: ChunkAllocator> Registration<A> {
         async move { retired.await.map_err(|_| RouterError::Stopped) }
     }
 
-    pub(crate) async fn set_presence(
-        &self,
-        priority: Option<i8>,
-        stanza: RoutedStanza<A>,
-        unavailable: Option<RoutedStanza<A>>,
-    ) -> Result<PresenceChange<A>, RouterError> {
-        let (reply, result) = oneshot::channel();
-        self.shard
-            .send(Command::Presence {
-                account: self.account.clone(),
-                resource: self.resource.clone(),
-                token: self.token,
-                priority,
-                stanza,
-                unavailable,
-                reply,
-            })
-            .await
-            .map_err(|_| RouterError::Stopped)?;
-        result.await.map_err(|_| RouterError::Stopped)?
-    }
-
     pub(crate) async fn end_presence(&self) -> Result<Option<RoutedStanza<A>>, RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard
@@ -627,6 +605,49 @@ impl<A: ChunkAllocator> SessionHandle<A> {
     pub(crate) async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
         tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await
     }
+
+    pub(crate) async fn set_presence(
+        &self,
+        priority: Option<i8>,
+        stanza: RoutedStanza<A>,
+        unavailable: Option<RoutedStanza<A>>,
+    ) -> Result<PresenceChange<A>, RouterError> {
+        set_presence(
+            &self.shard,
+            &self.account,
+            &self.resource,
+            self.token,
+            priority,
+            stanza,
+            unavailable,
+        )
+        .await
+    }
+}
+
+async fn set_presence<A: ChunkAllocator>(
+    shard: &Sender<Command<A>>,
+    account: &AccountKey,
+    resource: &str,
+    token: u64,
+    priority: Option<i8>,
+    stanza: RoutedStanza<A>,
+    unavailable: Option<RoutedStanza<A>>,
+) -> Result<PresenceChange<A>, RouterError> {
+    let (reply, result) = oneshot::channel();
+    shard
+        .send(Command::Presence {
+            account: account.clone(),
+            resource: resource.into(),
+            token,
+            priority,
+            stanza,
+            unavailable,
+            reply,
+        })
+        .await
+        .map_err(|_| RouterError::Stopped)?;
+    result.await.map_err(|_| RouterError::Stopped)?
 }
 
 async fn tag_resource<A: ChunkAllocator>(

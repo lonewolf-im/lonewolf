@@ -1991,8 +1991,11 @@ fn roster_set_from_a_reset_connection_still_pushes_to_interested_resources() -> 
 
 #[test]
 fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
-    let suite =
-        C2sSuite::with_extensions_and_setup("'roster', 'test-iq'", seed_mutual_subscription)?;
+    let suite = C2sSuite::with_extensions_limits_and_setup(
+        "'roster', 'test-iq'",
+        "incoming_stanzas_per_connection = { per_second = 100_000, burst = 100_000 }",
+        seed_mutual_subscription,
+    )?;
     let mut desk = suite.connect("alice", "password", "desk")?;
     let mut phone = suite.connect("alice", "password", "phone")?;
     let mut tablet = suite.connect("alice", "password", "tablet")?;
@@ -2022,7 +2025,7 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
     )?;
 
-    desk.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
+    desk.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='6000'/></iq>")?;
     for interested in [&mut phone, &mut tablet] {
         let marker = interested.receive()?;
         assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
@@ -2032,14 +2035,18 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
     // The commit is not observable until its ticket turns, so the flood below waits long
     // enough for the server to have handled the set before it reaches the tablet.
     thread::sleep(Duration::from_millis(300));
-    for index in 0..80 {
+    // Far more than any mailbox could hold, so only a session that keeps writing while
+    // it waits can survive it.
+    for index in 0..1200 {
         bob.send(&format!(
-            "<presence><priority>{index}</priority></presence>"
+            "<presence><priority>{}</priority></presence>",
+            index % 128
         ))?;
     }
-    for index in 0..80 {
+    for index in 0..1200 {
         tablet.expect_xml(&format!(
-            "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'><priority>{index}</priority></presence>"
+            "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'><priority>{}</priority></presence>",
+            index % 128
         ))?;
     }
 

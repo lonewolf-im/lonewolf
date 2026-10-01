@@ -858,3 +858,72 @@ fn removing_a_missing_item_writes_nothing() -> TestResult {
     assert_eq!(version(&roster, &bob), 0);
     Ok(())
 }
+
+#[test]
+fn pre_approval_is_noted_only_for_a_contact_the_owner_does_not_grant() {
+    let pre_approved =
+        |state| state::pre_approve(subscription(state)).map(|subscription| subscription.approved);
+    assert_eq!(pre_approved(SubscriptionState::None), Some(true));
+    assert_eq!(pre_approved(SubscriptionState::To), Some(true));
+    assert_eq!(pre_approved(SubscriptionState::From), None);
+    assert_eq!(pre_approved(SubscriptionState::Both), None);
+    let noted = RosterSubscription {
+        approved: true,
+        ..subscription(SubscriptionState::None)
+    };
+    assert_eq!(state::pre_approve(noted), None);
+}
+
+#[test]
+fn a_pre_approved_request_grants_the_requester_and_consumes_the_pre_approval() -> TestResult {
+    let (_directory, roster) = roster();
+    for (index, (grantor_before, grantor_after)) in [
+        (SubscriptionState::None, SubscriptionState::From),
+        (SubscriptionState::To, SubscriptionState::Both),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let alice = account(&format!("alice{index}@example.com"));
+        let bob = account(&format!("bob{index}@example.com"));
+        create_account(&roster, &alice);
+        create_account(&roster, &bob);
+        let alice_jid = RosterJid::from(&alice);
+        let bob_jid = RosterJid::from(&bob);
+        let pre_approval = RosterSubscription {
+            approved: true,
+            ..subscription(grantor_before)
+        };
+        set_subscription(&roster, &bob, &alice_jid, pre_approval)?;
+
+        let outcome = write(&roster, async |tx| {
+            state::request_subscription(
+                tx,
+                &alice,
+                alice_jid.clone(),
+                &bob,
+                &bob_jid,
+                stanza(b"<presence id='request'/>"),
+            )
+            .await
+        })?;
+        let RequestOutcome::PreApproved {
+            grantor: Some(grantor),
+            requester: Some(requester),
+        } = outcome
+        else {
+            return Err("request was not answered from the pre-approval".into());
+        };
+        assert_eq!(grantor.value.subscription, subscription(grantor_after));
+        assert_eq!(
+            requester.value.subscription,
+            subscription(SubscriptionState::To)
+        );
+        assert!(pending(&roster, &bob).is_empty());
+        assert_eq!(
+            snapshot(&roster, &bob).items[0].subscription,
+            subscription(grantor_after)
+        );
+    }
+    Ok(())
+}

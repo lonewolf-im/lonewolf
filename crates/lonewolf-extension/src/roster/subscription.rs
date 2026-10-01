@@ -105,6 +105,17 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
                     push_roster(&sender, mutation, delivery).await?;
                     delivery.current_presence(&target, &sender).await
                 }
+                RequestOutcome::PreApproved { grantor, requester } => {
+                    if let Some(mutation) = grantor {
+                        push_roster(&target, mutation, delivery).await?;
+                    }
+                    let approval = xml::approval_reply(&stanza, delivery.arena()?)?;
+                    delivery.to_tagged(SessionTag::Interested, approval).await?;
+                    if let Some(mutation) = requester {
+                        push_roster(&sender, mutation, delivery).await?;
+                    }
+                    delivery.current_presence(&target, &sender).await
+                }
                 RequestOutcome::AutoApproved { approved: None }
                 | RequestOutcome::ContactMissing => Ok(()),
             }
@@ -136,6 +147,14 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
     .await?;
     let sender_mutation =
         state::resolve_pending(transaction, &sender, &target_jid, state::grant).await?;
+    // An approval with no request to resolve is kept as a pre-approval and never routed.
+    let pre_approval = match sender_mutation {
+        Some(_) => None,
+        None => {
+            state::update_subscription(transaction, &sender, &target_jid, state::pre_approve)
+                .await?
+        }
+    };
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
         Box::pin(async move {
@@ -146,6 +165,9 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
             if let Some(mutation) = sender_mutation {
                 push_roster(&sender, mutation, delivery).await?;
                 delivery.current_presence(&sender, &target).await?;
+            }
+            if let Some(mutation) = pre_approval {
+                push_roster(&sender, mutation, delivery).await?;
             }
             Ok(())
         })

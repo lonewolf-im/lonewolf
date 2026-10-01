@@ -22,8 +22,7 @@ use lonewolf_xmpp::stanza::{
 
 use super::{NAMESPACE, Roster};
 use crate::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, SessionTags,
-    StanzaFactory,
+    Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
 };
 use crate::iq::{IqHandler, IqReply, IqRequest, IqRequestType};
 use crate::presence::{
@@ -43,7 +42,7 @@ struct TestRoster {
 
 #[derive(Default)]
 struct RecordingDelivery {
-    tags: RefCell<Vec<(SessionTag, u64)>>,
+    tags: RefCell<Vec<SessionTag>>,
     pushes: RefCell<Vec<String>>,
     /// How many upcoming tagged deliveries fail.
     failing_deliveries: Cell<usize>,
@@ -60,8 +59,8 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         Arena::try_new(ArenaConfig::default()).map_err(|_| DeliveryError)
     }
 
-    fn tag_session<'a>(&'a self, tag: SessionTag, since: u64) -> DeliveryFuture<'a> {
-        self.tags.borrow_mut().push((tag, since));
+    fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
+        self.tags.borrow_mut().push(tag);
         Box::pin(async { Ok(()) })
     }
 
@@ -172,7 +171,6 @@ struct IqCall {
     response: Arena<GlobalChunkAllocator>,
     sender: Jid,
     query: Element,
-    tags: SessionTags,
 }
 
 impl IqCall {
@@ -215,7 +213,6 @@ impl IqCall {
             response,
             sender,
             query,
-            tags: SessionTags::default(),
         }
     }
 
@@ -237,7 +234,6 @@ impl IqCall {
             sender,
             target: sender.bare(),
             payload,
-            tags: self.tags,
         };
         match kind {
             IqRequestType::Get => {
@@ -285,40 +281,18 @@ fn handle_iq(
     Ok(accounts)
 }
 
-/// Answers a roster get from alice's desk and returns the result payload and the
-/// follow-up stanzas as XML, after running its effects against `delivery`.
+/// Answers a roster get from alice's desk and returns the result payload as XML, after
+/// running its effects against `delivery`.
 fn roster_get(
     roster: &TestRoster,
     ver: Option<&str>,
     delivery: &RecordingDelivery,
-) -> (Option<String>, Vec<String>) {
-    roster_get_with_tags(roster, ver, SessionTags::default(), delivery)
-}
-
-/// Answers a roster get from a desk that has been interested since `since`.
-fn roster_get_while_interested(
-    roster: &TestRoster,
-    ver: &str,
-    since: u64,
-    delivery: &RecordingDelivery,
-) -> (Option<String>, Vec<String>) {
-    let mut tags = SessionTags::default();
-    tags.insert(SessionTag::Interested, since);
-    roster_get_with_tags(roster, Some(ver), tags, delivery)
-}
-
-fn roster_get_with_tags(
-    roster: &TestRoster,
-    ver: Option<&str>,
-    tags: SessionTags,
-    delivery: &RecordingDelivery,
-) -> (Option<String>, Vec<String>) {
+) -> Option<String> {
     let mut call = ver.map_or_else(|| IqCall::new(""), IqCall::versioned);
-    call.tags = tags;
     let reply = block_on(call.handle(roster, IqRequestType::Get, delivery))
         .unwrap_or_else(|error| panic!("{error:?}"));
     block_on((reply.effects.deliver)(delivery)).unwrap_or_else(|error| panic!("{error}"));
-    let payload = reply.payload.map(|payload| {
+    reply.payload.map(|payload| {
         let mut xml = String::new();
         payload
             .resolve(&call.response)
@@ -329,24 +303,7 @@ fn roster_get_with_tags(
             })
             .unwrap_or_else(|error| panic!("{error}"));
         xml
-    });
-    let followups = reply
-        .followups
-        .iter()
-        .map(|followup| {
-            let mut xml = String::new();
-            followup
-                .resolve(&call.response)
-                .and_then(|followup| {
-                    followup
-                        .write_xml(&mut xml)
-                        .map_err(|_| panic!("cannot write followup"))
-                })
-                .unwrap_or_else(|error| panic!("{error}"));
-            xml
-        })
-        .collect();
-    (payload, followups)
+    })
 }
 
 fn put_item(roster: &TestRoster, owner: &AccountKey, jid: &str) -> RosterVersion {
@@ -496,7 +453,7 @@ fn roster_retrieval_tags_the_requesting_session_as_interested() {
     let accounts = handle_iq(&roster, IqRequestType::Get, "", &delivery)
         .unwrap_or_else(|error| panic!("{error:?}"));
     assert_eq!(names(&accounts), ["alice@example.com"]);
-    assert_eq!(*delivery.tags.borrow(), [(SessionTag::Interested, 0)]);
+    assert_eq!(*delivery.tags.borrow(), [SessionTag::Interested]);
     assert!(delivery.pushes.borrow().is_empty());
 }
 
@@ -507,134 +464,32 @@ fn roster_get_without_a_version_returns_the_roster_unstamped() {
     create_account(&roster, &alice);
     put_item(&roster, &alice, "bob@example.com");
     let delivery = RecordingDelivery::default();
-    let (payload, followups) = roster_get(&roster, None, &delivery);
-    let payload = payload.unwrap_or_else(|| panic!("no payload"));
+    let payload = roster_get(&roster, None, &delivery).unwrap_or_else(|| panic!("no payload"));
     assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
     assert!(!payload.contains("ver="), "{payload}");
-    assert!(followups.is_empty(), "{followups:?}");
-    assert_eq!(*delivery.tags.borrow(), [(SessionTag::Interested, 1)]);
+    assert_eq!(*delivery.tags.borrow(), [SessionTag::Interested]);
 }
 
 #[test]
-fn versioned_roster_get_answers_from_the_version_the_client_holds() {
+fn versioned_roster_get_returns_nothing_only_for_the_current_version() {
     let (_directory, roster) = roster();
     let alice = account("alice@example.com");
     create_account(&roster, &alice);
     put_item(&roster, &alice, "bob@example.com");
     put_item(&roster, &alice, "carol@example.com");
+    assert_eq!(remove_item(&roster, &alice, "bob@example.com").get(), 3);
     let delivery = RecordingDelivery::default();
 
-    for unknown in ["", "abc", "9"] {
-        let (payload, followups) = roster_get(&roster, Some(unknown), &delivery);
-        let payload = payload.unwrap_or_else(|| panic!("no payload for {unknown:?}"));
-        assert!(payload.contains(r#"ver="2""#), "{payload}");
-        assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
+    for other in ["", "abc", "0", "2", "9"] {
+        let payload = roster_get(&roster, Some(other), &delivery)
+            .unwrap_or_else(|| panic!("no payload for {other:?}"));
+        assert!(payload.contains(r#"ver="3""#), "{payload}");
         assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
-        assert!(followups.is_empty(), "{followups:?}");
+        assert!(!payload.contains(r#"jid="bob@example.com""#), "{payload}");
     }
-
-    let (payload, followups) = roster_get(&roster, Some("2"), &delivery);
+    let payload = roster_get(&roster, Some("3"), &delivery);
     assert!(payload.is_none(), "{payload:?}");
-    assert!(followups.is_empty(), "{followups:?}");
-
-    let (payload, pushes) = roster_get(&roster, Some("1"), &delivery);
-    assert!(payload.is_none(), "{payload:?}");
-    assert_eq!(pushes.len(), 1, "{pushes:?}");
-    assert!(
-        pushes[0].contains(r#"jid="carol@example.com""#),
-        "{pushes:?}"
-    );
-    assert!(pushes[0].contains(r#"ver="2""#), "{pushes:?}");
-    assert!(pushes[0].contains(r#"id="roster-2""#), "{pushes:?}");
-    assert!(
-        pushes[0].contains(r#"to="alice@example.com/desk""#),
-        "{pushes:?}"
-    );
-
-    let (payload, pushes) = roster_get(&roster, Some("0"), &delivery);
-    assert!(payload.is_none(), "{payload:?}");
-    assert_eq!(pushes.len(), 2, "{pushes:?}");
-    assert!(pushes[0].contains(r#"jid="bob@example.com""#), "{pushes:?}");
-    assert!(pushes[0].contains(r#"ver="1""#), "{pushes:?}");
-    assert!(
-        pushes[1].contains(r#"jid="carol@example.com""#),
-        "{pushes:?}"
-    );
-    assert!(pushes[1].contains(r#"ver="2""#), "{pushes:?}");
     assert!(delivery.pushes.borrow().is_empty());
-}
-
-#[test]
-fn versioned_roster_get_from_an_interested_resource_sends_nothing_it_was_pushed() {
-    let (_directory, roster) = roster();
-    let alice = account("alice@example.com");
-    create_account(&roster, &alice);
-    put_item(&roster, &alice, "bob@example.com");
-    put_item(&roster, &alice, "carol@example.com");
-    assert_eq!(remove_item(&roster, &alice, "bob@example.com").get(), 3);
-    let delivery = RecordingDelivery::default();
-
-    for known in ["0", "1", "2", "3"] {
-        let (payload, followups) = roster_get_while_interested(&roster, known, 0, &delivery);
-        assert!(payload.is_none(), "{known}: {payload:?}");
-        assert!(followups.is_empty(), "{known}: {followups:?}");
-    }
-    let (payload, followups) = roster_get_while_interested(&roster, "2", 2, &delivery);
-    assert!(payload.is_none(), "{payload:?}");
-    assert!(followups.is_empty(), "{followups:?}");
-    assert!(
-        delivery
-            .tags
-            .borrow()
-            .iter()
-            .all(|tag| *tag == (SessionTag::Interested, 3)),
-        "{:?}",
-        delivery.tags.borrow()
-    );
-}
-
-#[test]
-fn versioned_roster_get_behind_the_resources_interest_point_returns_the_whole_roster() {
-    let (_directory, roster) = roster();
-    let alice = account("alice@example.com");
-    create_account(&roster, &alice);
-    put_item(&roster, &alice, "bob@example.com");
-    put_item(&roster, &alice, "carol@example.com");
-    let delivery = RecordingDelivery::default();
-
-    let (payload, followups) = roster_get_while_interested(&roster, "0", 1, &delivery);
-    let payload = payload.unwrap_or_else(|| panic!("no payload"));
-    assert!(payload.contains(r#"ver="2""#), "{payload}");
-    assert!(payload.contains(r#"jid="bob@example.com""#), "{payload}");
-    assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
-    assert!(followups.is_empty(), "{followups:?}");
-
-    let (payload, followups) = roster_get_while_interested(&roster, "9", 1, &delivery);
-    let payload = payload.unwrap_or_else(|| panic!("no payload"));
-    assert!(payload.contains(r#"ver="2""#), "{payload}");
-    assert!(followups.is_empty(), "{followups:?}");
-}
-
-#[test]
-fn versioned_roster_get_behind_a_removal_returns_the_whole_roster() {
-    let (_directory, roster) = roster();
-    let alice = account("alice@example.com");
-    create_account(&roster, &alice);
-    put_item(&roster, &alice, "bob@example.com");
-    put_item(&roster, &alice, "carol@example.com");
-    assert_eq!(remove_item(&roster, &alice, "bob@example.com").get(), 3);
-    let delivery = RecordingDelivery::default();
-
-    let (payload, followups) = roster_get(&roster, Some("2"), &delivery);
-    let payload = payload.unwrap_or_else(|| panic!("no payload"));
-    assert!(payload.contains(r#"ver="3""#), "{payload}");
-    assert!(payload.contains(r#"jid="carol@example.com""#), "{payload}");
-    assert!(!payload.contains(r#"jid="bob@example.com""#), "{payload}");
-    assert!(followups.is_empty(), "{followups:?}");
-
-    let (payload, followups) = roster_get(&roster, Some("3"), &delivery);
-    assert!(payload.is_none(), "{payload:?}");
-    assert!(followups.is_empty(), "{followups:?}");
 }
 
 #[test]

@@ -26,9 +26,7 @@ use presence::{PresenceHandler, PresenceRegistry, PresenceRequestType};
 ///
 /// The server runs the deliveries after the transaction committed, and for each
 /// account named in `accounts` in the order the handlers' storage views were fixed, so
-/// a client never sees an older change after a newer one. Should the deliveries fail
-/// partway, every session of those accounts is evicted, so no client keeps a view that
-/// may have missed a change.
+/// a client never sees an older change after a newer one.
 pub struct Effects<A> {
     /// The accounts whose clients the deliveries address.
     pub accounts: Vec<AccountKey>,

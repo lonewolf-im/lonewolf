@@ -23,7 +23,7 @@ use crate::order::Order;
 pub mod local;
 
 pub use local::Registration;
-use local::{LocalRouter, LocalRouterHandle, RetireCause};
+use local::{LocalRouter, LocalRouterHandle};
 pub(crate) use local::{Mailbox, SessionHandle, release_deferred};
 pub use lonewolf_xmpp::stanza::RoutedStanza;
 
@@ -127,17 +127,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     /// Removes every session bound to `account` and ends each stream as account deleted.
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
-        self.local
-            .retire_account(account, RetireCause::AccountDeleted)
-            .await
-    }
-
-    /// Removes every session bound to `account` and ends each stream as evicted, for
-    /// clients whose view of the account may have missed a change.
-    pub(crate) async fn evict_account(&self, account: &AccountKey) -> Result<(), RouterError> {
-        self.local
-            .retire_account(account, RetireCause::Evicted)
-            .await
+        self.local.retire_account(account).await
     }
 
     /// Applies the incoming listener's limit to resources on all listeners.

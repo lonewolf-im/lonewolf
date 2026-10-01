@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use futures_util::future::{Either, select};
 use lonewolf_extension::Effects;
-use lonewolf_extension::delivery::{HandlerError, SessionTags};
+use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
@@ -30,7 +30,7 @@ use super::bind::Bound;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
-use crate::delivery::{RouterDelivery, after_turn, commit_and_deliver};
+use crate::delivery::{RouterDelivery, after_turn, deliver_committed};
 use crate::router::local::{PresenceChange, RetireCause};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
@@ -259,11 +259,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 
     /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. Everything a ticket orders runs on a task of its own, and
-    /// so does a set's commit with the ticket's admission, so retiring the session cannot
-    /// lose a committed change and a stalled socket holds no account's line. Meanwhile
-    /// the session drains its mailbox, and it writes the reply afterwards, behind
-    /// whatever preceded the ticket's turn.
+    /// transaction for a set. Once that view has its ticket, everything the ticket orders
+    /// runs on a task of its own, so retiring the session cannot lose it and a stalled
+    /// socket holds no account's line. Meanwhile the session drains its mailbox, and it
+    /// writes the reply afterwards, behind whatever preceded the ticket's turn.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -316,16 +315,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
     }
 
-    /// The tags this resource carries. Only its own effects change them, and those
-    /// complete before the next stanza is handled, so a value read before a request's
-    /// turn is still the value at the turn.
-    async fn tags(&self) -> Result<SessionTags, CloseOutcome> {
-        self.registration
-            .tags()
-            .await
-            .map_err(|_| CloseOutcome::InternalError)
-    }
-
     async fn handle_iq_get(
         &mut self,
         request: Stanza,
@@ -335,7 +324,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
         accounts: Vec<AccountKey>,
     ) -> Result<(), CloseOutcome> {
-        let tags = self.tags().await?;
         let (transaction, ticket) = Arc::clone(self.router.order())
             .fix(accounts, self.storage.begin_read())
             .await
@@ -347,7 +335,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             request,
             sender,
             response,
-            tags,
             delivery: self.delivery(),
         };
         let mut pending = after_turn(ticket, Some(self.registration.mailbox()), move |queued| {
@@ -378,7 +365,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         mut response: Arena<A>,
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
     ) -> Result<(), CloseOutcome> {
-        let tags = self.tags().await?;
         let mut transaction = self
             .storage
             .begin_write()
@@ -398,7 +384,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 sender,
                 target,
                 payload,
-                tags,
             };
             handler
                 .set(iq_request, &mut transaction, &delivery, &mut response)
@@ -407,17 +392,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         let reply = match reply {
             Ok(IqReply {
                 payload,
-                followups,
                 effects: Effects { accounts, deliver },
             }) => {
-                let mut committed = commit_and_deliver(
-                    Arc::clone(self.router.order()),
-                    accounts,
-                    transaction.commit(),
-                    deliver,
-                    delivery,
-                    Some(self.registration.mailbox()),
-                );
+                let ((), ticket) = Arc::clone(self.router.order())
+                    .fix(accounts, transaction.commit())
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                let mut committed =
+                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
                     .await?;
@@ -427,22 +409,21 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     .ok_or(CloseOutcome::InternalError)?
                     .map_err(|_| CloseOutcome::InternalError)?;
                 self.outbox.routed(queued);
-                Ok((payload, followups))
+                Ok(payload)
             }
             Err(error) => Err(error),
         };
         self.queue_iq_reply(request, sender, arena, response, reply)
     }
 
-    /// Queues the result with its follow-ups, or the error reply, behind whatever the
-    /// outbox already holds.
+    /// Queues the result, or the error reply, behind whatever the outbox already holds.
     fn queue_iq_reply(
         &mut self,
         request: Stanza,
         sender: Jid,
         mut arena: Arena<A>,
         mut response: Arena<A>,
-        reply: Result<(Option<Element>, Vec<Stanza>), HandlerError>,
+        reply: Result<Option<Element>, HandlerError>,
     ) -> Result<(), CloseOutcome> {
         match reply {
             Err(HandlerError::Stanza(condition)) => {
@@ -452,17 +433,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     arena,
                 });
             }
-            Ok((payload, followups)) => {
+            Ok(payload) => {
                 let reply = {
                     let sender = sender.resolve(&arena)?;
                     let stanza = request.resolve(&arena)?;
                     iq::result_reply(&stanza, sender, payload, &mut response)?
                 };
-                let mut stanzas = Vec::with_capacity(1 + followups.len());
-                stanzas.push(reply);
-                stanzas.extend(followups);
                 self.outbox.push(Output::Owned {
-                    stanzas,
+                    stanzas: vec![reply],
                     arena: response,
                 });
             }
@@ -684,6 +662,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         if let Err(condition) = authorized {
             return self.reply_error(&source, condition).await;
         }
+        let order = Arc::clone(self.router.order());
         let received = {
             let (sender, target) = presence_addresses(&routed)?;
             match self
@@ -711,14 +690,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         )
                         .await;
                     match effects {
-                        Ok(Effects { accounts, deliver }) => Ok(commit_and_deliver(
-                            Arc::clone(self.router.order()),
-                            accounts,
-                            transaction.commit(),
-                            deliver,
-                            delivery,
-                            Some(self.registration.mailbox()),
-                        )),
+                        Ok(Effects { accounts, deliver }) => {
+                            let ((), ticket) = order
+                                .fix(accounts, transaction.commit())
+                                .await
+                                .map_err(|_| CloseOutcome::InternalError)?;
+                            Ok((deliver, ticket, delivery))
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -728,7 +706,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         match received {
-            Ok(mut committed) => {
+            Ok((deliver, ticket, delivery)) => {
+                let mut committed =
+                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
                     .await?;
@@ -927,14 +907,13 @@ struct GetWork<A: ChunkAllocator> {
     request: Stanza,
     sender: Jid,
     response: Arena<A>,
-    tags: SessionTags,
     delivery: RouterDelivery<A>,
 }
 
 struct GetOutcome<A: ChunkAllocator> {
     arena: Arena<A>,
     response: Arena<A>,
-    reply: Result<(Option<Element>, Vec<Stanza>), HandlerError>,
+    reply: Result<Option<Element>, HandlerError>,
     /// Deliveries still queued when the ticket turned, written ahead of the reply.
     queued: Vec<RoutedStanza<A>>,
 }
@@ -948,7 +927,6 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
             request,
             sender,
             mut response,
-            tags,
             delivery,
         } = self;
         let reply = {
@@ -964,21 +942,16 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                 sender,
                 target,
                 payload,
-                tags,
             };
             handler.get(iq_request, &transaction, &mut response).await
         };
         drop(transaction);
         let reply = match reply {
-            Ok(IqReply {
-                payload,
-                followups,
-                effects,
-            }) => {
+            Ok(IqReply { payload, effects }) => {
                 (effects.deliver)(&delivery)
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
-                Ok((payload, followups))
+                Ok(payload)
             }
             Err(error) => Err(error),
         };

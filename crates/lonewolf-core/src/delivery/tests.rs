@@ -3,19 +3,21 @@
 use std::cell::Cell;
 use std::error::Error;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
-use lonewolf_extension::Deliver;
+use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionTag, StanzaFactory,
 };
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::RoutedStanza;
 
-use super::deliver_committed;
+use super::commit_and_deliver;
 use crate::order::Order;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -78,25 +80,30 @@ fn account(value: &str) -> TestResult<AccountKey> {
 }
 
 #[test]
-fn committed_effects_run_after_the_caller_is_gone() -> TestResult {
+fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> TestResult {
     Runtime::new()?.block_on(async {
+        let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
         let order = Order::new();
         let alice = account("alice@example.com")?;
         let ((), ahead) = order
             .fix(vec![alice.clone()], async { Ok::<_, DeliveryError>(()) })
             .await?;
-        let ((), ticket) = order
-            .fix(vec![alice], async { Ok::<_, DeliveryError>(()) })
-            .await?;
         let ran = Rc::new(Cell::new(false));
         let flag = Rc::clone(&ran);
-        let deliver: Deliver<GlobalChunkAllocator> = Box::new(move |_| {
+        let effects = Effects::new(vec![alice], move |_| {
             Box::pin(async move {
                 flag.set(true);
                 Ok(())
             })
         });
-        let committed = deliver_committed(ticket, deliver, NoDelivery, None);
+        let committed = commit_and_deliver(
+            Arc::clone(&order),
+            storage.begin_write().await?,
+            effects,
+            NoDelivery,
+            None,
+        );
         drop(committed);
         compio::time::sleep(Duration::from_millis(20)).await;
         assert!(!ran.get(), "effects ran before their turn");

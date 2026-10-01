@@ -119,16 +119,6 @@ impl C2sLimits {
                     ));
                 }
             }
-            if Instant::now()
-                .checked_add(Duration::from_secs(
-                    profile.distinct_recipients_per_connection.window_secs.get() as u64,
-                ))
-                .is_none()
-            {
-                return Err(format!(
-                    "limits.c2s.profiles.{name}.distinct_recipients_per_connection.window_secs exceeds the platform clock range"
-                ));
-            }
         }
         Ok(())
     }
@@ -162,7 +152,6 @@ pub struct C2sLimitProfile {
     pub incoming_stanzas_per_connection: EventRate,
     /// Measures XML bytes, including control elements and whitespace, without TCP or TLS overhead.
     pub incoming_xml_per_connection: ByteRate,
-    pub distinct_recipients_per_connection: RecipientLimit,
 }
 
 impl Default for C2sLimitProfile {
@@ -182,7 +171,6 @@ impl Default for C2sLimitProfile {
                 burst: const { nonzero(100) },
             },
             incoming_xml_per_connection: ByteRate::default(),
-            distinct_recipients_per_connection: RecipientLimit::default(),
         }
     }
 }
@@ -198,7 +186,6 @@ struct C2sLimitProfileInput {
     connection_attempts_per_ip: EventRateInput,
     incoming_stanzas_per_connection: EventRateInput,
     incoming_xml_per_connection: ByteRate,
-    distinct_recipients_per_connection: RecipientLimit,
 }
 
 impl From<C2sLimitProfileInput> for C2sLimitProfile {
@@ -225,7 +212,6 @@ impl From<C2sLimitProfileInput> for C2sLimitProfile {
                 .incoming_stanzas_per_connection
                 .with_defaults(defaults.incoming_stanzas_per_connection),
             incoming_xml_per_connection: input.incoming_xml_per_connection,
-            distinct_recipients_per_connection: input.distinct_recipients_per_connection,
         }
     }
 }
@@ -268,25 +254,6 @@ impl Default for ByteRate {
             Self {
                 bytes_per_second: nonzero(262_144),
                 burst_bytes: nonzero(1_048_576),
-            }
-        }
-    }
-}
-
-/// Counts distinct recipient bare JIDs within a rolling window for one connection.
-#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct RecipientLimit {
-    pub max: NonZeroUsize,
-    pub window_secs: NonZeroUsize,
-}
-
-impl Default for RecipientLimit {
-    fn default() -> Self {
-        const {
-            Self {
-                max: nonzero(100),
-                window_secs: nonzero(60),
             }
         }
     }

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::{Duration, Instant};
-
 use crate::config::limits::{C2sLimitProfile, LimitsConfig};
 use crate::config::{Config, ConfigError};
 use toml::Value;
@@ -15,7 +13,6 @@ const TABLES: &[&str] = &[
     "limits.c2s.profiles.default.connection_attempts_per_ip",
     "limits.c2s.profiles.default.incoming_stanzas_per_connection",
     "limits.c2s.profiles.default.incoming_xml_per_connection",
-    "limits.c2s.profiles.default.distinct_recipients_per_connection",
 ];
 
 fn defaults() -> Result<Value, toml::ser::Error> {
@@ -61,8 +58,6 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("incoming_stanzas_per_connection.burst", 100),
         ("incoming_xml_per_connection.bytes_per_second", 262_144),
         ("incoming_xml_per_connection.burst_bytes", 1_048_576),
-        ("distinct_recipients_per_connection.max", 100),
-        ("distinct_recipients_per_connection.window_secs", 60),
     ];
     let actual = limit_values()?;
     assert_eq!(actual.len(), expected.len() + 2);
@@ -392,33 +387,6 @@ max_stanza_bytes = 1
             .to_string()
             .contains("limits.c2s.profiles.unused.max_stanza_bytes")
     );
-    Ok(())
-}
-
-#[test]
-fn recipient_windows_must_fit_the_platform_clock() -> TestResult {
-    let seconds = i64::MAX as u64;
-    let file = setting(
-        "c2s.profiles.default.distinct_recipients_per_connection.window_secs",
-        seconds,
-    )?;
-    let result = Config::load(Some(file.path()));
-    if usize::try_from(seconds).is_err() {
-        assert!(matches!(result, Err(ConfigError::Parse { .. })));
-    } else if Instant::now()
-        .checked_add(Duration::from_secs(seconds))
-        .is_none()
-    {
-        let error = result.err().ok_or("unsupported window accepted")?;
-        assert!(matches!(error, ConfigError::Invalid { .. }));
-        assert!(
-            error
-                .to_string()
-                .contains("window_secs exceeds the platform clock range")
-        );
-    } else {
-        result?;
-    }
     Ok(())
 }
 

@@ -102,11 +102,6 @@
 # Use bytes_per_second for the sustained byte rate and burst_bytes for the bucket capacity.
 # incoming_xml_per_connection = { bytes_per_second = 262_144, burst_bytes = 1_048_576 }
 
-# Restrict how many distinct recipient bare JIDs one connection can address.
-# Set max to the recipient allowance within a rolling window of window_secs seconds.
-# The window duration must fit the platform clock range.
-# distinct_recipients_per_connection = { max = 100, window_secs = 60 }
-
 # [limits.c2s.profiles.internal]
 # max_stanza_bytes = 524_288
 

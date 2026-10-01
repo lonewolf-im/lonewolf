@@ -5,9 +5,9 @@ use std::sync::Arc;
 use lonewolf_storage::Storage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
-use lonewolf_xmpp::stanza::{Element, ElementRef, Stanza, StanzaErrorCondition};
+use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
 
-use crate::delivery::{HandlerError, HostLookup, SessionTags};
+use crate::delivery::{HandlerError, HostLookup};
 use crate::{Effects, ExtensionFuture, RegistrationError};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -36,32 +36,17 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     /// An omitted destination resolves to the authenticated account's bare JID.
     pub target: JidRef<'a>,
     pub payload: ElementRef<'a, Arena<A>>,
-    /// The tags the requesting resource carries, with the views they were attached under.
-    pub tags: SessionTags,
 }
 
 /// The result payload and the deliveries that follow a handled IQ.
 pub struct IqReply<A> {
     pub payload: Option<Element>,
-    /// Stanzas the requesting stream writes right after the result, in order. They are
-    /// allocated in the response arena and never pass through a mailbox, so their count
-    /// is bounded only by the response.
-    pub followups: Vec<Stanza>,
     pub effects: Effects<A>,
 }
 
 impl<A: ChunkAllocator> IqReply<A> {
     pub fn new(payload: Option<Element>, effects: Effects<A>) -> Self {
-        Self {
-            payload,
-            followups: Vec::new(),
-            effects,
-        }
-    }
-
-    pub fn followed_by(mut self, followups: Vec<Stanza>) -> Self {
-        self.followups = followups;
-        self
+        Self { payload, effects }
     }
 }
 

@@ -165,31 +165,17 @@ where
             let owner = owner_of(&request)?;
             let known = xml::parse_get(request.payload)?;
             let snapshot = transaction.roster(&owner).await?;
-            let interested_since = request
-                .tags
-                .since(SessionTag::Interested)
-                .map(RosterVersion::new);
-            let (payload, replay) = match versioning::answer(known, &snapshot, interested_since) {
+            let payload = match versioning::answer(known, &snapshot) {
                 versioning::Answer::Full { stamped } => {
                     let version = stamped.then_some(snapshot.version);
-                    let payload = xml::build_response(snapshot.items, version, response)?;
-                    (Some(payload), Vec::new())
+                    Some(xml::build_response(snapshot.items, version, response)?)
                 }
-                versioning::Answer::Unchanged => (None, Vec::new()),
-                versioning::Answer::Changes { since } => {
-                    let to = request
-                        .sender
-                        .clone_in(response)
-                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                    let changes = versioning::changes_since(snapshot.items, since);
-                    (None, xml::build_replay(to, changes, response)?)
-                }
+                versioning::Answer::Unchanged => None,
             };
-            let since = snapshot.version.get();
-            let effects = Effects::new(vec![owner], move |delivery| {
-                delivery.tag_session(SessionTag::Interested, since)
+            let effects = Effects::new(vec![owner], |delivery| {
+                delivery.tag_session(SessionTag::Interested)
             });
-            Ok(IqReply::new(payload, effects).followed_by(replay))
+            Ok(IqReply::new(payload, effects))
         })
     }
 

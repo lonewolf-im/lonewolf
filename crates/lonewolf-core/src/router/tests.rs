@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
 use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::delivery::RouterDelivery;
+use crate::delivery::{RouterDelivery, commit_and_deliver};
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Registration, RoutedStanza, Router, RouterError};
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use futures_channel::oneshot;
 use lonewolf_extension::Deliver;
 use lonewolf_extension::delivery::{DeliveryError, SessionTag};
 use lonewolf_storage::account::AccountKey;
@@ -514,6 +517,53 @@ fn failed_committed_deliveries_evict_every_session_of_the_accounts_they_addresse
         drop(phone);
         drop(bob_desk);
         drop(carol_desk);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let order = Arc::clone(handle.order());
+        let ((), ahead) = order
+            .fix(vec![alice.clone()], async { Ok::<_, DeliveryError>(()) })
+            .await?;
+        let (finish_commit, commit) = oneshot::channel::<()>();
+        let ran = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&ran);
+        let deliver: Deliver<GlobalChunkAllocator> = Box::new(move |_| {
+            Box::pin(async move {
+                flag.set(true);
+                Ok(())
+            })
+        });
+        let pending = commit_and_deliver(
+            order,
+            vec![alice],
+            async move { commit.await.map_err(|_| DeliveryError) },
+            deliver,
+            RouterDelivery::new(&handle, &GlobalChunkAllocator, None),
+            None,
+        );
+
+        drop(pending);
+        finish_commit.send(()).map_err(|()| "commit abandoned")?;
+        compio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!ran.get(), "effects ran before their turn");
+
+        drop(ahead);
+        for _ in 0..50 {
+            if ran.get() {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ran.get(), "effects were lost with their caller");
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())

@@ -30,7 +30,7 @@ use super::bind::Bound;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
-use crate::delivery::{RouterDelivery, after_turn, deliver_committed};
+use crate::delivery::{RouterDelivery, after_turn, commit_and_deliver};
 use crate::router::local::{PresenceChange, RetireCause};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
@@ -259,10 +259,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 
     /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. Once that view has its ticket, everything the ticket orders
-    /// runs on a task of its own, so retiring the session cannot lose it and a stalled
-    /// socket holds no account's line. Meanwhile the session drains its mailbox, and it
-    /// writes the reply afterwards, behind whatever preceded the ticket's turn.
+    /// transaction for a set. Everything a ticket orders runs on a task of its own, and
+    /// so does a set's commit with the ticket's admission, so retiring the session cannot
+    /// lose a committed change and a stalled socket holds no account's line. Meanwhile
+    /// the session drains its mailbox, and it writes the reply afterwards, behind
+    /// whatever preceded the ticket's turn.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -409,13 +410,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 followups,
                 effects: Effects { accounts, deliver },
             }) => {
-                let ((), ticket) = Arc::clone(self.router.order())
-                    .fix(accounts.clone(), transaction.commit())
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                let mut committed = deliver_committed(
-                    ticket,
+                let mut committed = commit_and_deliver(
+                    Arc::clone(self.router.order()),
                     accounts,
+                    transaction.commit(),
                     deliver,
                     delivery,
                     Some(self.registration.mailbox()),
@@ -686,7 +684,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         if let Err(condition) = authorized {
             return self.reply_error(&source, condition).await;
         }
-        let order = Arc::clone(self.router.order());
         let received = {
             let (sender, target) = presence_addresses(&routed)?;
             match self
@@ -714,13 +711,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         )
                         .await;
                     match effects {
-                        Ok(Effects { accounts, deliver }) => {
-                            let ((), ticket) = order
-                                .fix(accounts.clone(), transaction.commit())
-                                .await
-                                .map_err(|_| CloseOutcome::InternalError)?;
-                            Ok((accounts, deliver, ticket, delivery))
-                        }
+                        Ok(Effects { accounts, deliver }) => Ok(commit_and_deliver(
+                            Arc::clone(self.router.order()),
+                            accounts,
+                            transaction.commit(),
+                            deliver,
+                            delivery,
+                            Some(self.registration.mailbox()),
+                        )),
                         Err(error) => Err(error),
                     }
                 }
@@ -730,14 +728,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         match received {
-            Ok((accounts, deliver, ticket, delivery)) => {
-                let mut committed = deliver_committed(
-                    ticket,
-                    accounts,
-                    deliver,
-                    delivery,
-                    Some(self.registration.mailbox()),
-                );
+            Ok(mut committed) => {
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
                     .await?;

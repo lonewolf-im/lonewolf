@@ -14,6 +14,9 @@ mod routing;
 #[path = "protocol/roster/mod.rs"]
 mod roster;
 
+#[path = "protocol/presence.rs"]
+mod presence;
+
 #[path = "protocol/authentication.rs"]
 mod authentication;
 

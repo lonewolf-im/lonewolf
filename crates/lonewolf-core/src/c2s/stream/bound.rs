@@ -14,7 +14,7 @@ use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::PendingSubscription;
+use lonewolf_storage::roster::{PendingSubscription, RosterJid};
 use lonewolf_storage::{RedbRead, RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
@@ -45,6 +45,9 @@ struct BoundSession<A: ChunkAllocator> {
     allocator: A,
     /// Whether this resource currently has presence, mirroring the router's view.
     available: bool,
+    /// The addresses that received this resource's directed available presence since its
+    /// last unavailable presence.
+    directed: Vec<Box<str>>,
     outbox: Outbox<A>,
 }
 
@@ -90,6 +93,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         storage,
         allocator,
         available: false,
+        directed: Vec::new(),
         outbox,
     };
     let stopped = {
@@ -171,11 +175,15 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
     }
 
-    /// Withdraws the resource's presence and broadcasts it to the account's subscribers.
-    async fn end(&self) -> Result<(), CloseOutcome> {
+    /// Withdraws the resource's presence, broadcasts it to the account's subscribers, and
+    /// sends unavailable presence to the recipients of its directed presence.
+    async fn end(&mut self) -> Result<(), CloseOutcome> {
+        let directed = mem::take(&mut self.directed);
         let unavailable = match self.registration.end_presence().await {
             Ok(Some(unavailable)) => unavailable,
-            Ok(None) | Err(RouterError::NotFound) => return Ok(()),
+            Ok(None) | Err(RouterError::NotFound) => {
+                return self.send_directed_unavailable(directed).await;
+            }
             Err(_) => return Err(CloseOutcome::InternalError),
         };
         let handler = self
@@ -231,6 +239,17 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 Err(_) => Err(CloseOutcome::InternalError),
             },
         };
+        let subscribers = audience
+            .as_ref()
+            .map_or(&[][..], |audience| &audience.subscribers);
+        let result = match result {
+            Ok(()) => self
+                .router
+                .send_directed(&unavailable, &uncovered(directed, subscribers))
+                .await
+                .map_err(|_| CloseOutcome::InternalError),
+            Err(outcome) => Err(outcome),
+        };
         let finished = self
             .registration
             .finish_presence()
@@ -239,6 +258,33 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         drop(audience);
         drop(ticket);
         result.and(finished)
+    }
+
+    /// Sends unavailable presence from this resource to `directed`, for a stream that ends
+    /// without broadcast presence to withdraw.
+    async fn send_directed_unavailable(&self, directed: Vec<Box<str>>) -> Result<(), CloseOutcome> {
+        if directed.is_empty() {
+            return Ok(());
+        }
+        let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+        let account = self.registration.account();
+        let from = Jid::from_trusted_parts_in(
+            Some(account.username()),
+            account.domain(),
+            Some(self.registration.resource()),
+            &mut arena,
+        )?;
+        let stanza = Stanza::builder_in(
+            StanzaType::Presence(PresenceType::Unavailable),
+            StanzaNamespace::Client,
+            &mut arena,
+        )
+        .from(Some(from))?
+        .build()?;
+        self.router
+            .send_directed(&RoutedStanza::from_parts(stanza, arena), &directed)
+            .await
+            .map_err(|_| CloseOutcome::InternalError)
     }
 
     async fn handle_stanza(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
@@ -453,9 +499,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         directed: bool,
     ) -> Result<(), CloseOutcome> {
         if directed {
-            return match PresenceRequestType::from_subscription_stanza(kind) {
-                Some(kind) => self.handle_subscription(parsed, kind).await,
-                None => Ok(()),
+            return match (PresenceRequestType::from_subscription_stanza(kind), kind) {
+                (Some(kind), _) => self.handle_subscription(parsed, kind).await,
+                (None, PresenceType::Available | PresenceType::Unavailable) => {
+                    self.handle_directed(parsed, kind == PresenceType::Available)
+                        .await
+                }
+                (None, _) => Ok(()),
             };
         }
         match kind {
@@ -465,6 +515,39 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Delivers presence addressed to one entity and keeps track of who received directed
+    /// available presence, so they are told when the resource goes unavailable. The
+    /// account's own resources see its broadcasts and are not tracked.
+    async fn handle_directed(
+        &mut self,
+        parsed: Parsed<Stanza, A>,
+        available: bool,
+    ) -> Result<(), CloseOutcome> {
+        let routed = self.stamp(parsed)?;
+        let tracked: Option<Box<str>> = {
+            let view = routed.resolve()?;
+            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
+            if !self.router.is_local_host(to.domainpart()) || to.localpart().is_none() {
+                return Ok(());
+            }
+            (to.bare().as_str() != self.registration.account().as_str()).then(|| to.as_str().into())
+        };
+        if let Some(target) = tracked {
+            let known = self.directed.iter().position(|known| *known == target);
+            match (available, known) {
+                (true, None) => self.directed.push(target),
+                (false, Some(index)) => {
+                    self.directed.swap_remove(index);
+                }
+                (true, Some(_)) | (false, None) => {}
+            }
+        }
+        self.router
+            .route_directed_presence(routed)
+            .await
+            .map_err(|_| CloseOutcome::InternalError)
     }
 
     async fn handle_message(
@@ -596,6 +679,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             routed,
             unavailable,
             audience,
+            directed: if available {
+                Vec::new()
+            } else {
+                mem::take(&mut self.directed)
+            },
         };
         let outcome = match ticket {
             Some(ticket) => {
@@ -970,6 +1058,9 @@ struct PresenceWork<A: ChunkAllocator> {
     routed: RoutedStanza<A>,
     unavailable: Option<RoutedStanza<A>>,
     audience: Option<PresenceAudience>,
+    /// The recipients of directed presence to tell, when the update makes the resource
+    /// unavailable.
+    directed: Vec<Box<str>>,
 }
 
 struct PresenceOutcome<A: ChunkAllocator> {
@@ -991,6 +1082,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             routed,
             unavailable,
             mut audience,
+            directed,
         } = self;
         let change = session
             .set_presence(priority, routed.clone(), unavailable)
@@ -1012,15 +1104,19 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             }
             requests = mem::take(&mut audience.pending);
         }
-        if let Some(audience) = audience
-            && (available || change.became_unavailable)
-            && !audience.subscribers.is_empty()
-        {
+        let subscribers = audience
+            .as_ref()
+            .map_or(&[][..], |audience| &audience.subscribers);
+        if (available || change.became_unavailable) && !subscribers.is_empty() {
             router
-                .broadcast_presence(&routed, &audience.subscribers)
+                .broadcast_presence(&routed, subscribers)
                 .await
                 .map_err(|_| CloseOutcome::InternalError)?;
         }
+        router
+            .send_directed(&routed, &uncovered(directed, subscribers))
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
         Ok(PresenceOutcome {
             change,
             echo: routed,
@@ -1028,6 +1124,17 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             requests,
         })
     }
+}
+
+/// The recipients of directed presence that still need it: subscribers addressed by bare
+/// JID are left out, since the broadcast reaches them.
+fn uncovered(mut directed: Vec<Box<str>>, subscribers: &[RosterJid]) -> Vec<Box<str>> {
+    directed.retain(|recipient| {
+        !subscribers
+            .iter()
+            .any(|subscriber| subscriber.as_str() == recipient.as_ref())
+    });
+    directed
 }
 
 fn presence_addresses<A: ChunkAllocator>(

@@ -523,6 +523,39 @@ fn authorized_resources_receive_presence_and_abrupt_unavailable() -> TestResult 
 }
 
 #[test]
+fn a_subscriber_addressed_by_directed_presence_receives_one_unavailable() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_mutual_subscription)?;
+    suite.create_account("carol", "password")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost'/>",
+    )?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desk' to='alice@localhost'/>",
+    )?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost'/>",
+    )?;
+
+    alice.send("<presence to='bob@localhost' id='direct'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' id='direct' from='alice@localhost/desk' to='bob@localhost'/>")?;
+    alice.close()?;
+
+    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost'/>")?;
+    carol.send("<message to='bob@localhost/desk' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='carol@localhost/desk' to='bob@localhost/desk' id='sentinel'/>")?;
+    bob.close()?;
+    carol.close()
+}
+
+#[test]
 fn disabled_roster_does_not_broadcast_stored_subscriptions() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("", seed_roster)?;
     suite.create_account("bob", "password")?;

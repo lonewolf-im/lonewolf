@@ -359,6 +359,63 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
+    /// Delivers presence addressed to a local full or bare JID. An absent or busy
+    /// recipient, a remote domain, and a domain without a localpart are not errors.
+    pub(crate) async fn route_directed_presence(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let full = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            if !matches!(view.stanza_type(), StanzaType::Presence(_)) {
+                return Err(RouterError::InvalidTarget);
+            }
+            let to = view
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            if !self.hosts.is_local_host(to.domainpart()) || to.localpart().is_none() {
+                return Ok(());
+            }
+            to.resourcepart().is_some()
+        };
+        let delivered = if full {
+            self.local.deliver_full(stanza).await
+        } else {
+            self.local.deliver_presence(stanza).await
+        };
+        match delivered {
+            Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sends `source` to each recipient of directed presence, addressed to it.
+    pub(crate) async fn send_directed(
+        &self,
+        source: &RoutedStanza<A>,
+        recipients: &[Box<str>],
+    ) -> Result<(), RouterError> {
+        let view = source.resolve().map_err(|_| RouterError::Unavailable)?;
+        for recipient in recipients {
+            let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
+                .map_err(|_| RouterError::Unavailable)?;
+            let Ok(target) = Jid::parse_in(recipient, &mut arena) else {
+                continue;
+            };
+            let stanza = view
+                .to_builder_in(&mut arena)
+                .map_err(|_| RouterError::Unavailable)?
+                .to(Some(target))
+                .map_err(|_| RouterError::Unavailable)?
+                .build()
+                .map_err(|_| RouterError::Unavailable)?;
+            self.route_directed_presence(RoutedStanza::from_parts(stanza, arena))
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Builds and enqueues one stanza for each resource carrying `tag`.
     ///
     /// The builder receives the destination full JID and must not block the

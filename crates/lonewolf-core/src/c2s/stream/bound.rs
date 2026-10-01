@@ -8,7 +8,6 @@ use std::pin::pin;
 use std::sync::Arc;
 
 use futures_util::future::{Either, select};
-use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::presence::{
@@ -16,7 +15,7 @@ use lonewolf_extension::presence::{
 };
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::PendingSubscription;
-use lonewolf_storage::{RedbRead, RedbStorage, Storage, WriteTransaction};
+use lonewolf_storage::{RedbRead, RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
 use lonewolf_xmpp::parser::{Parsed, ParserConfig, StreamEvent, XmppParser};
@@ -30,7 +29,7 @@ use super::bind::Bound;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
-use crate::delivery::{RouterDelivery, after_turn, deliver_committed};
+use crate::delivery::{RouterDelivery, after_turn, commit_and_deliver};
 use crate::router::local::{PresenceChange, RetireCause};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
@@ -259,9 +258,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 
     /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. Once that view has its ticket, everything the ticket orders
-    /// runs on a task of its own, so retiring the session cannot lose it and a stalled
-    /// socket holds no account's line. Meanwhile the session drains its mailbox, and it
+    /// transaction for a set. Everything a ticket orders runs on a task of its own, and so
+    /// does a set's commit, so retiring the session cannot lose a change that landed and
+    /// a stalled socket holds no account's line. Meanwhile the session drains its mailbox, and it
     /// writes the reply afterwards, behind whatever preceded the ticket's turn.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
@@ -390,16 +389,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 .await
         };
         let reply = match reply {
-            Ok(IqReply {
-                payload,
-                effects: Effects { accounts, deliver },
-            }) => {
-                let ((), ticket) = Arc::clone(self.router.order())
-                    .fix(accounts, transaction.commit())
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                let mut committed =
-                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
+            Ok(IqReply { payload, effects }) => {
+                let mut committed = commit_and_deliver(
+                    Arc::clone(self.router.order()),
+                    transaction,
+                    effects,
+                    delivery,
+                    Some(self.registration.mailbox()),
+                );
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
                     .await?;
@@ -662,7 +659,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         if let Err(condition) = authorized {
             return self.reply_error(&source, condition).await;
         }
-        let order = Arc::clone(self.router.order());
         let received = {
             let (sender, target) = presence_addresses(&routed)?;
             match self
@@ -690,13 +686,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         )
                         .await;
                     match effects {
-                        Ok(Effects { accounts, deliver }) => {
-                            let ((), ticket) = order
-                                .fix(accounts, transaction.commit())
-                                .await
-                                .map_err(|_| CloseOutcome::InternalError)?;
-                            Ok((deliver, ticket, delivery))
-                        }
+                        Ok(effects) => Ok(commit_and_deliver(
+                            Arc::clone(self.router.order()),
+                            transaction,
+                            effects,
+                            delivery,
+                            Some(self.registration.mailbox()),
+                        )),
                         Err(error) => Err(error),
                     }
                 }
@@ -706,9 +702,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         match received {
-            Ok((deliver, ticket, delivery)) => {
-                let mut committed =
-                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
+            Ok(mut committed) => {
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
                     .await?;

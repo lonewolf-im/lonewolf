@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::{
-    RosterItem, RosterJid, RosterMutation, RosterVersion, SubscriptionState,
-};
+use lonewolf_storage::roster::{RosterItem, RosterJid, RosterVersion, SubscriptionState};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::stanza::{
@@ -120,15 +118,14 @@ pub(super) fn parse_set<A: ChunkAllocator>(
 
 /// Builds the full roster, stamped with `version` when the client asked for versioning.
 pub(super) fn build_response<A: ChunkAllocator>(
-    items: Vec<RosterMutation<RosterItem>>,
+    items: Vec<RosterItem>,
     version: Option<RosterVersion>,
     response: &mut Arena<A>,
 ) -> Result<Element, StanzaErrorCondition> {
     let mut built = Vec::with_capacity(items.len());
-    for entry in items {
+    for item in items {
         built.push(
-            build_item(&entry.value, response)
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?,
+            build_item(&item, response).map_err(|_| StanzaErrorCondition::InternalServerError)?,
         );
     }
     let mut query = Element::builder_in("query", NAMESPACE, response)

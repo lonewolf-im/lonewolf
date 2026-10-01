@@ -329,8 +329,7 @@ fn split_subscriptions(
 ) -> (Vec<RosterJid>, Vec<RosterJid>) {
     let mut subscribers = Vec::new();
     let mut watched = Vec::new();
-    for entry in snapshot.items {
-        let item = entry.value;
+    for item in snapshot.items {
         if item.jid.as_str() == owner.as_str() {
             continue;
         }

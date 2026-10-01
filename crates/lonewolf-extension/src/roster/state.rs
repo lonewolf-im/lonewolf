@@ -16,6 +16,13 @@ pub(super) enum RequestOutcome {
     /// The contact already grants the requester; `approved` is the requester's item once
     /// its outstanding request resolved, or `None` when it recorded none.
     AutoApproved { approved: ItemMutation },
+    /// The contact had pre-approved the requester, so the request is answered on the
+    /// contact's behalf: `grantor` is the contact's item, now granting without the
+    /// pre-approval, and `requester` the requester's item once it sees the contact.
+    PreApproved {
+        grantor: ItemMutation,
+        requester: ItemMutation,
+    },
     /// The request waits for the contact; `push` is the requester's item when it newly
     /// records the outstanding request.
     Pending { push: ItemMutation },
@@ -85,6 +92,15 @@ pub(super) fn approve_pending_out(
         SubscriptionState::To | SubscriptionState::Both => return None,
     };
     subscription.pending_out = false;
+    Some(subscription)
+}
+
+/// Notes the owner's pre-approval of a contact it does not grant yet (RFC 6121 §3.4.2).
+pub(super) fn pre_approve(mut subscription: RosterSubscription) -> Option<RosterSubscription> {
+    if grants(subscription.state) || subscription.approved {
+        return None;
+    }
+    subscription.approved = true;
     Some(subscription)
 }
 
@@ -166,15 +182,36 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
     contact_jid: &RosterJid,
     stanza: Box<[u8]>,
 ) -> Result<RequestOutcome, RosterError> {
-    let contact_grants = transaction
+    let contact_view = transaction
         .roster_item(contact, &requester_jid)
         .await?
-        .is_some_and(|item| grants(item.subscription.state));
-    if contact_grants {
+        .map(|item| item.subscription);
+    if contact_view.is_some_and(|subscription| grants(subscription.state)) {
         let approved =
             update_existing_subscription(transaction, requester, contact_jid, approve_pending_out)
                 .await?;
         return Ok(RequestOutcome::AutoApproved { approved });
+    }
+    if contact_view.is_some_and(|subscription| subscription.approved) {
+        let grantor =
+            update_existing_subscription(transaction, contact, &requester_jid, |subscription| {
+                let mut granted = grant(subscription)?;
+                granted.approved = false;
+                Some(granted)
+            })
+            .await?;
+        let requester =
+            update_subscription(transaction, requester, contact_jid, |mut subscription| {
+                subscription.state = match subscription.state {
+                    SubscriptionState::None => SubscriptionState::To,
+                    SubscriptionState::From => SubscriptionState::Both,
+                    SubscriptionState::To | SubscriptionState::Both => return None,
+                };
+                subscription.pending_out = false;
+                Some(subscription)
+            })
+            .await?;
+        return Ok(RequestOutcome::PreApproved { grantor, requester });
     }
     let stored = transaction
         .put_pending_request(

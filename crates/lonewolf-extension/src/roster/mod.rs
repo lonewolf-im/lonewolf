@@ -26,6 +26,7 @@ use subscription::Parties;
 pub const NAME: &str = "roster";
 pub const NAMESPACE: &str = "jabber:iq:roster";
 pub const VERSIONING_FEATURE: &str = "<ver xmlns='urn:xmpp:features:rosterver'/>";
+pub const PRE_APPROVAL_FEATURE: &str = "<sub xmlns='urn:xmpp:features:pre-approval'/>";
 
 const IQ_ROUTES: [IqRoute; 2] = [
     IqRoute {
@@ -137,7 +138,7 @@ where
     }
 
     fn stream_features(&self) -> &'static [&'static str] {
-        &[VERSIONING_FEATURE]
+        &[VERSIONING_FEATURE, PRE_APPROVAL_FEATURE]
     }
 
     fn forget_account<'a>(

@@ -17,8 +17,8 @@ use socket2::SockRef;
 
 use super::xml::{Element, XmlStream};
 use super::{
-    BIND_NAMESPACE, C2sSuite, ROSTER_VERSIONING_NAMESPACE, SASL_NAMESPACE, TIMEOUT, TLS_NAMESPACE,
-    TestResult,
+    BIND_NAMESPACE, C2sSuite, PRE_APPROVAL_NAMESPACE, ROSTER_VERSIONING_NAMESPACE, SASL_NAMESPACE,
+    TIMEOUT, TLS_NAMESPACE, TestResult,
 };
 
 pub type Client = XmlStream<StreamOwned<ClientConnection, TcpStream>>;
@@ -84,7 +84,9 @@ impl Client {
             assert!(
                 matches!(
                     (feature.namespace.as_str(), feature.name.as_str()),
-                    (BIND_NAMESPACE, "bind") | (ROSTER_VERSIONING_NAMESPACE, "ver")
+                    (BIND_NAMESPACE, "bind")
+                        | (ROSTER_VERSIONING_NAMESPACE, "ver")
+                        | (PRE_APPROVAL_NAMESPACE, "sub")
                 ),
                 "unexpected feature {}:{}",
                 feature.namespace,

@@ -17,8 +17,7 @@ use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const ITEMS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lonewolf_roster_items");
-/// The roster version and the version of the last removal, per owner.
-pub(crate) const VERSIONS: TableDefinition<&str, (u64, u64)> =
+pub(crate) const VERSIONS: TableDefinition<&str, u64> =
     TableDefinition::new("lonewolf_roster_versions");
 pub(crate) const PENDING: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lonewolf_roster_pending_subscriptions");
@@ -55,7 +54,7 @@ macro_rules! roster_reads {
                 let jid = jid.clone();
                 self.run(move |transaction| {
                     let table = transaction.open_table(ITEMS).map_err(storage_error)?;
-                    Ok(read_item(&table, &key, jid)?.map(|entry| entry.value))
+                    read_item(&table, &key, jid)
                 })
             }
 
@@ -102,15 +101,12 @@ impl RosterWrites for RedbWrite {
             if !account_exists(transaction, &owner)? {
                 return Err(RosterError::NoAccount);
             }
-            let mut record = encoded?;
-            let version = advance_version(transaction, &owner, false)?;
-            record.extend_from_slice(&version.get().to_le_bytes());
             transaction
                 .open_table(ITEMS)
                 .map_err(storage_error)?
-                .insert(key.as_ref(), record.as_slice())
+                .insert(key.as_ref(), encoded?.as_slice())
                 .map_err(storage_error)?;
-            Ok(version)
+            advance_version(transaction, &owner)
         })
     }
 
@@ -173,10 +169,13 @@ impl RosterWrites for RedbWrite {
 
 fn snapshot<V, I>(versions: &V, items: &I, owner: &str) -> Result<RosterSnapshot, RosterError>
 where
-    V: ReadableTable<&'static str, (u64, u64)>,
+    V: ReadableTable<&'static str, u64>,
     I: ReadableTable<&'static str, &'static [u8]>,
 {
-    let (version, last_removal) = header(versions, owner)?;
+    let version = versions
+        .get(owner)
+        .map_err(storage_error)?
+        .map_or(0, |version| version.value());
     let (start, end) = owner_range(owner);
     let mut roster = Vec::new();
     for entry in items
@@ -189,26 +188,15 @@ where
     }
     Ok(RosterSnapshot {
         version: RosterVersion(version),
-        last_removal: RosterVersion(last_removal),
         items: roster,
     })
-}
-
-fn header<V: ReadableTable<&'static str, (u64, u64)>>(
-    versions: &V,
-    owner: &str,
-) -> Result<(u64, u64), RosterError> {
-    Ok(versions
-        .get(owner)
-        .map_err(storage_error)?
-        .map_or((0, 0), |header| header.value()))
 }
 
 fn read_item<T: ReadableTable<&'static str, &'static [u8]>>(
     table: &T,
     key: &str,
     jid: RosterJid,
-) -> Result<Option<RosterMutation<RosterItem>>, RosterError> {
+) -> Result<Option<RosterItem>, RosterError> {
     table
         .get(key)
         .map_err(storage_error)?
@@ -281,9 +269,9 @@ fn remove(
         let Some(record) = table.remove(key.as_ref()).map_err(storage_error)? else {
             return Ok(None);
         };
-        decode_item(jid, record.value())?.value
+        decode_item(jid, record.value())?
     };
-    let version = advance_version(transaction, owner, true)?;
+    let version = advance_version(transaction, owner)?;
     Ok(Some(RosterMutation {
         version,
         value: item,
@@ -293,15 +281,14 @@ fn remove(
 fn advance_version(
     transaction: &WriteTransaction,
     owner: &str,
-    removal: bool,
 ) -> Result<RosterVersion, RosterError> {
     let mut versions = transaction.open_table(VERSIONS).map_err(storage_error)?;
-    let (current, last_removal) = header(&versions, owner)?;
+    let current = versions
+        .get(owner)
+        .map_err(storage_error)?
+        .map_or(0, |version| version.value());
     let next = current.checked_add(1).ok_or(RosterError::ValueTooLarge)?;
-    let last_removal = if removal { next } else { last_removal };
-    versions
-        .insert(owner, (next, last_removal))
-        .map_err(storage_error)?;
+    versions.insert(owner, next).map_err(storage_error)?;
     Ok(RosterVersion(next))
 }
 
@@ -365,7 +352,7 @@ fn encode_item(item: &RosterItem) -> Result<Vec<u8>, RosterError> {
         .iter()
         .try_fold(0usize, |len, group| len.checked_add(4 + group.len()))
         .ok_or(RosterError::ValueTooLarge)?;
-    let capacity = 18usize
+    let capacity = 10usize
         .checked_add(name_bytes.map_or(0, <[u8]>::len))
         .and_then(|len| len.checked_add(groups_len))
         .ok_or(RosterError::ValueTooLarge)?;
@@ -409,11 +396,7 @@ fn append_bytes(encoded: &mut Vec<u8>, value: &[u8]) -> Result<(), RosterError> 
     Ok(())
 }
 
-/// Decodes an item record into the item and the version that last changed it.
-fn decode_item(
-    jid: RosterJid,
-    mut bytes: &[u8],
-) -> Result<RosterMutation<RosterItem>, StorageError> {
+fn decode_item(jid: RosterJid, mut bytes: &[u8]) -> Result<RosterItem, StorageError> {
     let state = match take_byte(&mut bytes)? {
         0 => super::SubscriptionState::None,
         1 => super::SubscriptionState::To,
@@ -431,21 +414,17 @@ fn decode_item(
     for _ in 0..group_count {
         groups.push(take_string(&mut bytes)?);
     }
-    let version = take_u64(&mut bytes)?;
     if !bytes.is_empty() {
         return Err(StorageError::new(StorageErrorKind::CorruptData));
     }
-    Ok(RosterMutation {
-        version: RosterVersion(version),
-        value: RosterItem {
-            jid,
-            name,
-            groups,
-            subscription: RosterSubscription {
-                state,
-                pending_out: flags & 1 != 0,
-                approved: flags & 2 != 0,
-            },
+    Ok(RosterItem {
+        jid,
+        name,
+        groups,
+        subscription: RosterSubscription {
+            state,
+            pending_out: flags & 1 != 0,
+            approved: flags & 2 != 0,
         },
     })
 }
@@ -464,14 +443,6 @@ fn take_u32(bytes: &mut &[u8]) -> Result<u32, StorageError> {
         .ok_or_else(|| StorageError::new(StorageErrorKind::CorruptData))?;
     *bytes = remaining;
     Ok(u32::from_le_bytes(*value))
-}
-
-fn take_u64(bytes: &mut &[u8]) -> Result<u64, StorageError> {
-    let (value, remaining) = bytes
-        .split_first_chunk::<8>()
-        .ok_or_else(|| StorageError::new(StorageErrorKind::CorruptData))?;
-    *bytes = remaining;
-    Ok(u64::from_le_bytes(*value))
 }
 
 fn take_optional_string(bytes: &mut &[u8]) -> Result<Option<Box<str>>, StorageError> {

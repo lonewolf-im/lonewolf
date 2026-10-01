@@ -21,9 +21,7 @@ use super::initialize;
 use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY};
 use crate::account::{AccountReads, AccountWrites};
 use crate::roster::redb::{ITEMS, PENDING, VERSIONS};
-use crate::roster::{
-    RosterMutation, RosterReads, RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
-};
+use crate::roster::{RosterReads, RosterSubscription, RosterWrites, SubscriptionState};
 use crate::tests::{
     TIMEOUT, TestResult, assert_scram, assert_storage_error, assert_verifier, credentials,
     decoy_salt, item, item_with_subscription, jid, key, new_account, pending, poll, read, verifier,
@@ -286,13 +284,7 @@ fn committed_state_survives_reopening() -> TestResult {
         }
         let snapshot = reader.roster(&alice).await?;
         assert_eq!(snapshot.version.get(), 1);
-        assert_eq!(
-            snapshot.items,
-            [RosterMutation {
-                version: RosterVersion::new(1),
-                value: bob,
-            }]
-        );
+        assert_eq!(snapshot.items, [bob]);
         assert_eq!(reader.pending_requests(&alice).await?, [request]);
         Ok(())
     })

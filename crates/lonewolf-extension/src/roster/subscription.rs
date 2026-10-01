@@ -284,8 +284,7 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
     let items = transaction.roster(account).await?.items;
     let requests = transaction.pending_requests(account).await?;
     let mut removals = Vec::new();
-    for entry in items {
-        let item = entry.value;
+    for item in items {
         let contact = stored_local_account(transaction, &item.jid, hosts).await?;
         let removal = state::remove_item(
             transaction,

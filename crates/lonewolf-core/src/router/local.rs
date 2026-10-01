@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{HashMap, hash_map::RandomState};
 use std::future::Future;
 use std::hash::BuildHasher;
 use std::io;
+use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
@@ -50,6 +53,12 @@ pub struct Registration<A: ChunkAllocator> {
     resource: Box<str>,
     token: u64,
     alive: Arc<AtomicBool>,
+    /// Everything whose drop signals another task, deferred as a whole while unwinding.
+    links: mem::ManuallyDrop<Links<A>>,
+}
+
+struct Links<A: ChunkAllocator> {
+    /// Dropping it tells the shard the session is gone.
     _lease: oneshot::Sender<()>,
     retired: Retirement<A>,
     inbound: Receiver<RoutedStanza<A>>,
@@ -249,6 +258,16 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
     }
 }
 
+impl<A: ChunkAllocator> Drop for LocalRouterHandle<A> {
+    fn drop(&mut self) {
+        // Closing the shard channels wakes the shards, and waking another task while this
+        // thread unwinds aborts the process, so a handle dropped by a panic keeps them open.
+        if std::thread::panicking() {
+            mem::forget(mem::replace(&mut self.shards, Arc::from(Vec::new())));
+        }
+    }
+}
+
 impl<A: ChunkAllocator + Clone> Clone for LocalRouterHandle<A> {
     fn clone(&self) -> Self {
         Self {
@@ -270,6 +289,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         requested: Option<&str>,
         limit: NonZeroUsize,
     ) -> Result<Registration<A>, RouterError> {
+        release_deferred();
         let requested = requested
             .map(|resource| validate_resource(account, resource, self.allocator.clone()))
             .transpose()?;
@@ -481,29 +501,30 @@ impl<A: ChunkAllocator> Registration<A> {
     }
 
     pub(crate) async fn recv(&self) -> Option<RoutedStanza<A>> {
-        self.inbound.recv().await.ok()
+        self.links.inbound.recv().await.ok()
     }
 
     pub(crate) fn mailbox(&self) -> Mailbox<A> {
-        Mailbox(self.inbound.clone())
+        Mailbox(self.links.inbound.clone())
     }
 
     /// Everything delivered so far, in order, without waiting.
     pub(crate) fn take_queued(&self) -> Vec<RoutedStanza<A>> {
-        take_queued(&self.inbound)
+        take_queued(&self.links.inbound)
     }
 
     /// The returned future does not borrow the registration.
     pub(crate) fn wait_retired(
         &self,
     ) -> impl Future<Output = Result<Retired<A>, RouterError>> + use<A> {
-        let retired = self.retired.clone();
+        let retired = self.links.retired.clone();
         async move { retired.await.map_err(|_| RouterError::Stopped) }
     }
 
     pub(crate) async fn end_presence(&self) -> Result<Option<RoutedStanza<A>>, RouterError> {
         let (reply, result) = oneshot::channel();
-        self.shard
+        self.links
+            .shard
             .send(Command::EndPresence {
                 account: self.account.clone(),
                 resource: self.resource.clone(),
@@ -523,7 +544,8 @@ impl<A: ChunkAllocator> Registration<A> {
 
     pub(crate) async fn replacement_is_available(&self) -> Result<bool, RouterError> {
         let (reply, result) = oneshot::channel();
-        self.shard
+        self.links
+            .shard
             .send(Command::ReplacementAvailable {
                 account: self.account.clone(),
                 resource: self.resource.clone(),
@@ -537,7 +559,8 @@ impl<A: ChunkAllocator> Registration<A> {
 
     pub(crate) async fn finish_presence(&self) -> Result<(), RouterError> {
         let (reply, result) = oneshot::channel();
-        self.shard
+        self.links
+            .shard
             .send(Command::FinishPresence {
                 account: self.account.clone(),
                 token: self.token,
@@ -550,7 +573,14 @@ impl<A: ChunkAllocator> Registration<A> {
 
     /// Marks this bound resource as a recipient of deliveries addressed to `tag`.
     pub async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
-        tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await
+        tag_resource(
+            &self.links.shard,
+            &self.account,
+            &self.resource,
+            self.token,
+            tag,
+        )
+        .await
     }
 
     pub(crate) fn handle(&self) -> SessionHandle<A> {
@@ -558,7 +588,7 @@ impl<A: ChunkAllocator> Registration<A> {
             account: self.account.clone(),
             resource: self.resource.clone(),
             token: self.token,
-            shard: self.shard.clone(),
+            shard: self.links.shard.clone(),
         }
     }
 }
@@ -674,7 +704,32 @@ async fn tag_resource<A: ChunkAllocator>(
 impl<A: ChunkAllocator> Drop for Registration<A> {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
+        // SAFETY: `links` is taken exactly once, here, and never touched again.
+        let links = unsafe { mem::ManuallyDrop::take(&mut self.links) };
+        if std::thread::panicking() {
+            // Waking another task while this thread unwinds aborts the process, so the
+            // parts wait until the thread is no longer panicking.
+            DEFERRED.with(|deferred| deferred.borrow_mut().push(Box::new(links)));
+        } else {
+            drop(links);
+            release_deferred();
+        }
     }
+}
+
+thread_local! {
+    static DEFERRED: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drops what registrations dropped while this thread was unwinding left behind, so the
+/// shard learns of those sessions and their mailboxes are released. Called where a
+/// thread is known not to be panicking; a no-op otherwise.
+pub(crate) fn release_deferred() {
+    if std::thread::panicking() {
+        return;
+    }
+    let deferred = DEFERRED.with(|deferred| mem::take(&mut *deferred.borrow_mut()));
+    drop(deferred);
 }
 
 fn validate_resource<A: ChunkAllocator>(
@@ -947,10 +1002,12 @@ impl<A: ChunkAllocator> Shard<A> {
             resource,
             token,
             alive,
-            _lease: lease,
-            retired: retired_reply.shared(),
-            inbound,
-            shard,
+            links: mem::ManuallyDrop::new(Links {
+                _lease: lease,
+                retired: retired_reply.shared(),
+                inbound,
+                shard,
+            }),
         })
     }
 
@@ -1663,6 +1720,38 @@ mod tests {
                     .values()
                     .all(|session| session.alive.load(Ordering::Acquire))
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_registration_dropped_by_a_panic_is_released_afterwards() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let account = account()?;
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let (command_sender, _commands) = async_channel::bounded(1);
+            let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
+            let (outbound, inbound) = async_channel::bounded(64);
+            let desk = shard.register(
+                account.clone(),
+                Some("desk".into()),
+                limit,
+                outbound,
+                inbound,
+                command_sender.clone(),
+            )?;
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _held = desk;
+                panic!("deliberate");
+            }));
+            assert!(caught.is_err());
+            assert!(shard.cleanups.next().now_or_never().is_none());
+
+            release_deferred();
+            let (cleaned, resource, _) = shard.cleanups.next().await.ok_or("missing cleanup")?;
+            assert_eq!(cleaned, account);
+            assert_eq!(resource.as_ref(), "desk");
+            assert!(shard.cleanups.is_empty());
             Ok(())
         })
     }

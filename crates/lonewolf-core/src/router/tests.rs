@@ -865,3 +865,101 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn a_panic_while_holding_router_state_unwinds_instead_of_aborting() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = (router, dispatcher, handle, desk);
+            panic!("deliberate");
+        }));
+        assert!(caught.is_err());
+        Ok(())
+    })
+}
+
+#[test]
+fn a_panic_while_holding_only_a_registration_unwinds_instead_of_aborting() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        drop(handle);
+        drop(router);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = desk;
+            panic!("deliberate");
+        }));
+        assert!(caught.is_err());
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_an_evicted_registration_clears_its_retained_presence() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        desk.handle()
+            .set_presence(
+                Some(0),
+                presence("desk").await?,
+                Some(unavailable_presence("desk").await?),
+            )
+            .await?;
+        phone
+            .handle()
+            .set_presence(
+                Some(0),
+                presence("phone").await?,
+                Some(unavailable_presence("phone").await?),
+            )
+            .await?;
+        receive_routed(&desk).await?;
+        for _ in 0..64 {
+            handle
+                .route_full(stanza("alice@localhost/phone").await?)
+                .await?;
+        }
+        desk.handle()
+            .set_presence(
+                Some(1),
+                presence("desk").await?,
+                Some(unavailable_presence("desk").await?),
+            )
+            .await?;
+        assert!(phone.wait_retired().await?.unavailable.is_some());
+        assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 2);
+
+        drop(phone);
+        for _ in 0..100 {
+            if handle.local.withdrawal_snapshot(&alice).await?.len() == 1 {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 1);
+
+        drop(desk);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}

@@ -24,7 +24,7 @@ pub mod local;
 
 pub use local::Registration;
 use local::{LocalRouter, LocalRouterHandle};
-pub(crate) use local::{Mailbox, SessionHandle};
+pub(crate) use local::{Mailbox, SessionHandle, release_deferred};
 pub use lonewolf_xmpp::stanza::RoutedStanza;
 
 pub struct Router<A: ChunkAllocator> {

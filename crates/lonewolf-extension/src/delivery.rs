@@ -18,21 +18,35 @@ pub enum SessionTag {
 }
 
 impl SessionTag {
-    const fn bit(self) -> u8 {
-        1 << (self as u8)
+    const COUNT: usize = 1;
+
+    const fn index(self) -> usize {
+        self as usize
     }
 }
 
+/// The tags a resource carries, each with the view of storage its handler had when the
+/// resource acquired it. Every effect of a later view reaches the resource or evicts it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SessionTags(u8);
+pub struct SessionTags {
+    since: [Option<u64>; SessionTag::COUNT],
+}
 
 impl SessionTags {
-    pub const fn insert(&mut self, tag: SessionTag) {
-        self.0 |= tag.bit();
+    /// Attaches `tag`; a tag the resource already carries keeps its original view.
+    pub const fn insert(&mut self, tag: SessionTag, since: u64) {
+        if self.since[tag.index()].is_none() {
+            self.since[tag.index()] = Some(since);
+        }
     }
 
     pub const fn contains(self, tag: SessionTag) -> bool {
-        self.0 & tag.bit() != 0
+        self.since[tag.index()].is_some()
+    }
+
+    /// The view since which the resource carries `tag`.
+    pub const fn since(self, tag: SessionTag) -> Option<u64> {
+        self.since[tag.index()]
     }
 }
 
@@ -109,8 +123,9 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// Allocates an arena for stanzas the handler builds.
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;
 
-    /// Attaches `tag` to the requesting resource.
-    fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a>;
+    /// Attaches `tag` to the requesting resource, with `since` as the handler's view of
+    /// storage. A tag the resource already carries keeps its earlier view.
+    fn tag_session<'a>(&'a self, tag: SessionTag, since: u64) -> DeliveryFuture<'a>;
 
     /// Delivers a presence to the available resources of its bare `to` JID.
     /// An offline target is not an error.

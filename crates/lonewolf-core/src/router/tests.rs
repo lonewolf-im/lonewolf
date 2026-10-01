@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
 use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::delivery::{RouterDelivery, commit_and_deliver};
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Registration, RoutedStanza, Router, RouterError};
 use compio::runtime::Runtime;
 use compio::time::timeout;
-use lonewolf_extension::delivery::SessionTag;
+use futures_channel::oneshot;
+use lonewolf_extension::Deliver;
+use lonewolf_extension::delivery::{DeliveryError, SessionTag};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
@@ -399,8 +404,8 @@ fn roster_push_reaches_only_interested_resources() -> TestResult {
         let desk = handle.register(&alice, Some("desk"), limit).await?;
         let phone = handle.register(&alice, Some("phone"), limit).await?;
         let tablet = handle.register(&alice, Some("tablet"), limit).await?;
-        desk.tag(SessionTag::Interested).await?;
-        tablet.tag(SessionTag::Interested).await?;
+        desk.tag(SessionTag::Interested, 0).await?;
+        tablet.tag(SessionTag::Interested, 0).await?;
 
         handle
             .route_to_tagged(&alice, SessionTag::Interested, roster_pushes())
@@ -438,6 +443,134 @@ fn roster_push_reaches_only_interested_resources() -> TestResult {
 }
 
 #[test]
+fn a_tag_keeps_the_view_it_was_first_attached_under() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        assert!(!desk.tags().await?.contains(SessionTag::Interested));
+
+        desk.tag(SessionTag::Interested, 3).await?;
+        desk.tag(SessionTag::Interested, 7).await?;
+
+        assert_eq!(desk.tags().await?.since(SessionTag::Interested), Some(3));
+        assert!(!phone.tags().await?.contains(SessionTag::Interested));
+
+        drop(desk);
+        drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn failed_committed_deliveries_evict_every_session_of_the_accounts_they_addressed() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let bob = account("bob@localhost")?;
+        let carol = account("carol@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        let bob_desk = handle.register(&bob, Some("desk"), limit).await?;
+        let carol_desk = handle.register(&carol, Some("desk"), limit).await?;
+        let delivery = RouterDelivery::new(&handle, &GlobalChunkAllocator, None);
+        let deliver: Deliver<GlobalChunkAllocator> =
+            Box::new(|_| Box::pin(async { Err(DeliveryError) }));
+
+        let result = delivery
+            .deliver_or_evict(&[alice.clone(), bob.clone()], deliver)
+            .await;
+
+        assert!(result.is_err());
+        for retired in [&desk, &phone, &bob_desk] {
+            assert!(matches!(
+                retired.wait_retired().await?.cause,
+                RetireCause::Evicted
+            ));
+        }
+        for gone in [
+            "alice@localhost/desk",
+            "alice@localhost/phone",
+            "bob@localhost/desk",
+        ] {
+            assert!(matches!(
+                handle.route_full(stanza(gone).await?).await,
+                Err(RouterError::NotFound)
+            ));
+        }
+        handle
+            .route_full(stanza("carol@localhost/desk").await?)
+            .await?;
+        assert_eq!(
+            receive_routed(&carol_desk).await?.resolve()?.kind(),
+            StanzaKind::Message
+        );
+
+        drop(desk);
+        drop(phone);
+        drop(bob_desk);
+        drop(carol_desk);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let order = Arc::clone(handle.order());
+        let ((), ahead) = order
+            .fix(vec![alice.clone()], async { Ok::<_, DeliveryError>(()) })
+            .await?;
+        let (finish_commit, commit) = oneshot::channel::<()>();
+        let ran = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&ran);
+        let deliver: Deliver<GlobalChunkAllocator> = Box::new(move |_| {
+            Box::pin(async move {
+                flag.set(true);
+                Ok(())
+            })
+        });
+        let pending = commit_and_deliver(
+            order,
+            vec![alice],
+            async move { commit.await.map_err(|_| DeliveryError) },
+            deliver,
+            RouterDelivery::new(&handle, &GlobalChunkAllocator, None),
+            None,
+        );
+
+        drop(pending);
+        finish_commit.send(()).map_err(|()| "commit abandoned")?;
+        compio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!ran.get(), "effects ran before their turn");
+
+        drop(ahead);
+        for _ in 0..50 {
+            if ran.get() {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ran.get(), "effects were lost with their caller");
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;
@@ -446,8 +579,8 @@ fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResul
         let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
         let desk = handle.register(&alice, Some("desk"), limit).await?;
         let phone = handle.register(&alice, Some("phone"), limit).await?;
-        desk.tag(SessionTag::Interested).await?;
-        phone.tag(SessionTag::Interested).await?;
+        desk.tag(SessionTag::Interested, 0).await?;
+        phone.tag(SessionTag::Interested, 0).await?;
         for _ in 0..64 {
             handle
                 .route_full(stanza("alice@localhost/phone").await?)
@@ -496,9 +629,9 @@ fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
             let desk = handle.register(&account, Some("desk"), limit).await?;
             let phone = handle.register(&account, Some("phone"), limit).await?;
             let tablet = handle.register(&account, Some("tablet"), limit).await?;
-            desk.tag(SessionTag::Interested).await?;
-            phone.tag(SessionTag::Interested).await?;
-            tablet.tag(SessionTag::Interested).await?;
+            desk.tag(SessionTag::Interested, 0).await?;
+            phone.tag(SessionTag::Interested, 0).await?;
+            tablet.tag(SessionTag::Interested, 0).await?;
 
             let mut calls = 0;
             let result = handle
@@ -539,7 +672,7 @@ fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResul
         let desk = handle
             .register(&alice, Some("desk"), NonZeroUsize::MIN)
             .await?;
-        desk.tag(SessionTag::Interested).await?;
+        desk.tag(SessionTag::Interested, 0).await?;
         drop(desk);
 
         let calls = Arc::new(AtomicUsize::new(0));

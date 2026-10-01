@@ -36,7 +36,7 @@ impl UnauthenticatedLimiter {
     pub(super) async fn reserve(self: &Arc<Self>, now: Instant) -> Admission {
         if self
             .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 if active < self.max {
                     Some(active + 1)
                 } else {

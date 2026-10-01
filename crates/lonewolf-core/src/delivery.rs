@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
+use std::sync::Arc;
 
 use futures_channel::oneshot;
 use lonewolf_extension::Deliver;
@@ -11,7 +12,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 
-use crate::order::Ticket;
+use crate::order::{Order, Ticket};
 use crate::router::{
     Mailbox, Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle,
 };
@@ -36,6 +37,23 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
             allocator: allocator.clone(),
             session: session.map(Registration::handle),
         }
+    }
+
+    /// Runs committed deliveries. Should they fail partway, every session of the accounts
+    /// they addressed is evicted, so no client keeps a view that may have missed a change.
+    pub(crate) async fn deliver_or_evict(
+        &self,
+        accounts: &[AccountKey],
+        deliver: Deliver<A>,
+    ) -> Result<(), DeliveryError> {
+        let result = deliver(self).await;
+        if result.is_err() {
+            tracing::error!(accounts = accounts.len(), "committed deliveries failed");
+            for account in accounts {
+                let _ = self.router.evict_account(account).await;
+            }
+        }
+        result
     }
 }
 
@@ -88,21 +106,52 @@ where
     Pending { turned, done }
 }
 
-/// Runs committed effects once `ticket` turns and reports the deliveries that were
-/// queued for the caller at that moment, which the caller writes ahead of its reply.
-pub(crate) fn deliver_committed<A, D>(
-    ticket: Ticket,
+/// Why a committed change's effects did not run to completion.
+pub(crate) enum EffectsError {
+    /// The commit failed, so there was nothing to deliver.
+    Commit,
+    /// The deliveries failed partway and the addressed sessions were evicted.
+    Delivery,
+}
+
+/// Commits a change with its ticket admitted under the same lock, runs its effects once
+/// the ticket turns, and reports the deliveries queued for the caller at that moment,
+/// which the caller writes ahead of its reply. Everything from the commit on runs on a
+/// task of its own, so a caller retired meanwhile cannot drop what it committed.
+pub(crate) fn commit_and_deliver<A, C, E>(
+    order: Arc<Order>,
+    accounts: Vec<AccountKey>,
+    commit: C,
     deliver: Deliver<A>,
-    delivery: D,
+    delivery: RouterDelivery<A>,
     mailbox: Option<Mailbox<A>>,
-) -> Pending<Result<Vec<RoutedStanza<A>>, DeliveryError>>
+) -> Pending<Result<Vec<RoutedStanza<A>>, EffectsError>>
 where
     A: ChunkAllocator + Clone + 'static,
-    D: Delivery<A> + 'static,
+    C: Future<Output = Result<(), E>> + 'static,
 {
-    after_turn(ticket, mailbox, move |queued| async move {
-        deliver(&delivery).await.map(|()| queued)
+    let (report_turned, turned) = oneshot::channel();
+    let (report_done, done) = oneshot::channel();
+    compio::runtime::spawn(async move {
+        let result = async {
+            let ((), mut ticket) = order
+                .fix(accounts.clone(), commit)
+                .await
+                .map_err(|_| EffectsError::Commit)?;
+            ticket.turn().await;
+            let _ = report_turned.send(());
+            let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
+            let delivered = delivery.deliver_or_evict(&accounts, deliver).await;
+            drop(ticket);
+            delivered
+                .map(|()| queued)
+                .map_err(|_| EffectsError::Delivery)
+        }
+        .await;
+        let _ = report_done.send(result);
     })
+    .detach();
+    Pending { turned, done }
 }
 
 #[cfg(test)]
@@ -119,10 +168,10 @@ impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<A> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
     }
 
-    fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {
+    fn tag_session<'a>(&'a self, tag: SessionTag, since: u64) -> DeliveryFuture<'a> {
         Box::pin(async move {
             match &self.session {
-                Some(session) => session.tag(tag).await.map_err(|_| DeliveryError),
+                Some(session) => session.tag(tag, since).await.map_err(|_| DeliveryError),
                 None => Err(DeliveryError),
             }
         })

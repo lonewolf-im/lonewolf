@@ -15,7 +15,9 @@ use std::time::Instant;
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
+use futures_util::future::{
+    AbortHandle, Abortable, Aborted, BoxFuture, Either, Shared, poll_fn, select,
+};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_extension::delivery::{SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
@@ -32,6 +34,10 @@ const SHARD_BATCH_SIZE: usize = 64;
 
 type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
 type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
+
+/// Resolves with the session to remove once its registration is dropped, unless the
+/// record went away another way first.
+type Cleanup = Abortable<BoxFuture<'static, (AccountKey, Box<str>, u64)>>;
 
 /// Owns one account shard on each core worker.
 pub struct LocalRouter<A: ChunkAllocator> {
@@ -51,7 +57,13 @@ pub struct Registration<A: ChunkAllocator> {
     resource: Box<str>,
     token: u64,
     alive: Arc<AtomicBool>,
-    lease: Option<oneshot::Sender<()>>,
+    /// Everything whose drop signals another task, skipped as a whole while unwinding.
+    links: mem::ManuallyDrop<Links<A>>,
+}
+
+struct Links<A: ChunkAllocator> {
+    /// Dropping it tells the shard the session is gone.
+    _lease: oneshot::Sender<()>,
     retired: Retirement<A>,
     inbound: Receiver<RoutedStanza<A>>,
     shard: Sender<Command<A>>,
@@ -187,13 +199,15 @@ struct Session<A: ChunkAllocator> {
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
     retired: oneshot::Sender<Retired<A>>,
+    /// Ends the session's cleanup future when its record is removed another way.
+    cleanup: AbortHandle,
 }
 
 struct Shard<A: ChunkAllocator> {
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
     retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
     next_token: u64,
-    cleanups: FuturesUnordered<BoxFuture<'static, (AccountKey, Box<str>, u64)>>,
+    cleanups: FuturesUnordered<Cleanup>,
 }
 
 struct Inbox<A: ChunkAllocator>(Receiver<Command<A>>);
@@ -492,29 +506,30 @@ impl<A: ChunkAllocator> Registration<A> {
     }
 
     pub(crate) async fn recv(&self) -> Option<RoutedStanza<A>> {
-        self.inbound.recv().await.ok()
+        self.links.inbound.recv().await.ok()
     }
 
     pub(crate) fn mailbox(&self) -> Mailbox<A> {
-        Mailbox(self.inbound.clone())
+        Mailbox(self.links.inbound.clone())
     }
 
     /// Everything delivered so far, in order, without waiting.
     pub(crate) fn take_queued(&self) -> Vec<RoutedStanza<A>> {
-        take_queued(&self.inbound)
+        take_queued(&self.links.inbound)
     }
 
     /// The returned future does not borrow the registration.
     pub(crate) fn wait_retired(
         &self,
     ) -> impl Future<Output = Result<Retired<A>, RouterError>> + use<A> {
-        let retired = self.retired.clone();
+        let retired = self.links.retired.clone();
         async move { retired.await.map_err(|_| RouterError::Stopped) }
     }
 
     pub(crate) async fn end_presence(&self) -> Result<Option<RoutedStanza<A>>, RouterError> {
         let (reply, result) = oneshot::channel();
-        self.shard
+        self.links
+            .shard
             .send(Command::EndPresence {
                 account: self.account.clone(),
                 resource: self.resource.clone(),
@@ -534,7 +549,8 @@ impl<A: ChunkAllocator> Registration<A> {
 
     pub(crate) async fn replacement_is_available(&self) -> Result<bool, RouterError> {
         let (reply, result) = oneshot::channel();
-        self.shard
+        self.links
+            .shard
             .send(Command::ReplacementAvailable {
                 account: self.account.clone(),
                 resource: self.resource.clone(),
@@ -548,7 +564,8 @@ impl<A: ChunkAllocator> Registration<A> {
 
     pub(crate) async fn finish_presence(&self) -> Result<(), RouterError> {
         let (reply, result) = oneshot::channel();
-        self.shard
+        self.links
+            .shard
             .send(Command::FinishPresence {
                 account: self.account.clone(),
                 token: self.token,
@@ -561,7 +578,14 @@ impl<A: ChunkAllocator> Registration<A> {
 
     /// Marks this bound resource as a recipient of deliveries addressed to `tag`.
     pub async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
-        tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await
+        tag_resource(
+            &self.links.shard,
+            &self.account,
+            &self.resource,
+            self.token,
+            tag,
+        )
+        .await
     }
 
     pub(crate) fn handle(&self) -> SessionHandle<A> {
@@ -569,7 +593,7 @@ impl<A: ChunkAllocator> Registration<A> {
             account: self.account.clone(),
             resource: self.resource.clone(),
             token: self.token,
-            shard: self.shard.clone(),
+            shard: self.links.shard.clone(),
         }
     }
 }
@@ -686,9 +710,11 @@ impl<A: ChunkAllocator> Drop for Registration<A> {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         // Waking another task while this thread unwinds aborts the process, so a session
-        // ending in a panic leaves its record to be found stale instead of announcing it.
-        if std::thread::panicking() {
-            mem::forget(self.lease.take());
+        // ending in a panic leaks its channel ends and leaves its record to be found
+        // stale; the shard drops the record's side when it finds it.
+        if !std::thread::panicking() {
+            // SAFETY: `links` is dropped exactly once, here, and never touched again.
+            unsafe { mem::ManuallyDrop::drop(&mut self.links) };
         }
     }
 }
@@ -761,22 +787,29 @@ impl<A: ChunkAllocator> Shard<A> {
         prefer_cleanup: bool,
     ) -> Option<Either<Command<A>, (AccountKey, Box<str>, u64)>> {
         let work = async {
-            if self.cleanups.is_empty() {
-                return receiver.recv().await.ok().map(Either::Left);
-            }
-            let mut receive = pin!(receiver.recv());
-            let mut cleanup = pin!(self.cleanups.next());
-            if prefer_cleanup {
-                match select(cleanup.as_mut(), receive.as_mut()).await {
-                    Either::Left((Some(cleanup), _)) => Some(Either::Right(cleanup)),
-                    Either::Right((Ok(command), _)) => Some(Either::Left(command)),
-                    _ => None,
+            loop {
+                if self.cleanups.is_empty() {
+                    return receiver.recv().await.ok().map(Either::Left);
                 }
-            } else {
-                match select(receive.as_mut(), cleanup.as_mut()).await {
-                    Either::Left((Ok(command), _)) => Some(Either::Left(command)),
-                    Either::Right((Some(cleanup), _)) => Some(Either::Right(cleanup)),
-                    _ => None,
+                let mut receive = pin!(receiver.recv());
+                let mut cleanup = pin!(self.cleanups.next());
+                let event = if prefer_cleanup {
+                    match select(cleanup.as_mut(), receive.as_mut()).await {
+                        Either::Left((Some(cleanup), _)) => Either::Right(cleanup),
+                        Either::Right((Ok(command), _)) => Either::Left(command),
+                        _ => return None,
+                    }
+                } else {
+                    match select(receive.as_mut(), cleanup.as_mut()).await {
+                        Either::Left((Ok(command), _)) => Either::Left(command),
+                        Either::Right((Some(cleanup), _)) => Either::Right(cleanup),
+                        _ => return None,
+                    }
+                };
+                match event {
+                    Either::Left(command) => return Some(Either::Left(command)),
+                    Either::Right(Ok(cleanup)) => return Some(Either::Right(cleanup)),
+                    Either::Right(Err(Aborted)) => {}
                 }
             }
         };
@@ -934,16 +967,18 @@ impl<A: ChunkAllocator> Shard<A> {
         };
         let (lease, closed) = oneshot::channel();
         let (retired, retired_reply) = oneshot::channel();
+        let (cleanup, abortable) = AbortHandle::new_pair();
         let alive = Arc::new(AtomicBool::new(true));
         let cleanup_account = account.clone();
         let cleanup_resource = resource.clone();
-        self.cleanups.push(
+        self.cleanups.push(Abortable::new(
             async move {
                 let _ = closed.await;
                 (cleanup_account, cleanup_resource, token)
             }
             .boxed(),
-        );
+            abortable,
+        ));
         sessions.insert(
             resource.clone(),
             Session {
@@ -956,6 +991,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 presence: None,
                 unavailable: None,
                 retired,
+                cleanup,
             },
         );
         Ok(Registration {
@@ -963,10 +999,12 @@ impl<A: ChunkAllocator> Shard<A> {
             resource,
             token,
             alive,
-            lease: Some(lease),
-            retired: retired_reply.shared(),
-            inbound,
-            shard,
+            links: mem::ManuallyDrop::new(Links {
+                _lease: lease,
+                retired: retired_reply.shared(),
+                inbound,
+                shard,
+            }),
         })
     }
 
@@ -1491,6 +1529,7 @@ impl<A: ChunkAllocator> Shard<A> {
         }
         if let Some(session) = sessions.remove(resource) {
             session.alive.store(false, Ordering::Release);
+            session.cleanup.abort();
             if let Some(unavailable) = session.unavailable.as_ref() {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
@@ -1646,6 +1685,7 @@ mod tests {
                         presence: None,
                         unavailable: None,
                         retired,
+                        cleanup: AbortHandle::new_pair().0,
                     },
                 );
                 receivers.push(inbound);
@@ -1679,6 +1719,49 @@ mod tests {
                     .values()
                     .all(|session| session.alive.load(Ordering::Acquire))
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_stale_session_takes_its_cleanup_future_with_it() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let account = account()?;
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let (command_sender, _commands) = async_channel::bounded(1);
+            let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
+            let (outbound, inbound) = async_channel::bounded(64);
+            let desk = shard.register(
+                account.clone(),
+                Some("desk".into()),
+                limit,
+                outbound,
+                inbound,
+                command_sender.clone(),
+            )?;
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _held = desk;
+                panic!("deliberate");
+            }));
+            assert!(caught.is_err());
+            assert_eq!(shard.cleanups.len(), 1);
+
+            let (outbound, inbound) = async_channel::bounded(64);
+            let replacement = shard.register(
+                account.clone(),
+                Some("desk".into()),
+                limit,
+                outbound,
+                inbound,
+                command_sender,
+            )?;
+            assert_eq!(replacement.resource(), "desk");
+            assert!(matches!(shard.cleanups.next().await, Some(Err(Aborted))));
+            assert_eq!(shard.cleanups.len(), 1);
+
+            drop(replacement);
+            assert!(matches!(shard.cleanups.next().await, Some(Ok(_))));
+            assert!(shard.cleanups.is_empty());
             Ok(())
         })
     }
@@ -1760,7 +1843,7 @@ mod tests {
                 assert!(sender.try_send(command).is_ok());
                 let (lease, closed) = oneshot::channel::<()>();
                 let cleanup_account = account.clone();
-                shard.cleanups.push(
+                shard.cleanups.push(Abortable::new(
                     async move {
                         let _ = closed.await;
                         (
@@ -1770,7 +1853,8 @@ mod tests {
                         )
                     }
                     .boxed(),
-                );
+                    AbortHandle::new_pair().1,
+                ));
                 drop(lease);
             }
 

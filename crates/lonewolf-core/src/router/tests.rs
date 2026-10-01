@@ -883,3 +883,24 @@ fn a_panic_while_holding_router_state_unwinds_instead_of_aborting() -> TestResul
         Ok(())
     })
 }
+
+#[test]
+fn a_panic_while_holding_only_a_registration_unwinds_instead_of_aborting() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
+            .await?;
+        drop(handle);
+        drop(router);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = desk;
+            panic!("deliberate");
+        }));
+        assert!(caught.is_err());
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}

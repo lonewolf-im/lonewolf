@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::any::Any;
+use std::cell::RefCell;
 use std::collections::{HashMap, hash_map::RandomState};
 use std::future::Future;
 use std::hash::BuildHasher;
@@ -15,9 +17,7 @@ use std::time::Instant;
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use futures_util::future::{
-    AbortHandle, Abortable, Aborted, BoxFuture, Either, Shared, poll_fn, select,
-};
+use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_extension::delivery::{SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
@@ -34,10 +34,6 @@ const SHARD_BATCH_SIZE: usize = 64;
 
 type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
 type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
-
-/// Resolves with the session to remove once its registration is dropped, unless the
-/// record went away another way first.
-type Cleanup = Abortable<BoxFuture<'static, (AccountKey, Box<str>, u64)>>;
 
 /// Owns one account shard on each core worker.
 pub struct LocalRouter<A: ChunkAllocator> {
@@ -57,7 +53,7 @@ pub struct Registration<A: ChunkAllocator> {
     resource: Box<str>,
     token: u64,
     alive: Arc<AtomicBool>,
-    /// Everything whose drop signals another task, skipped as a whole while unwinding.
+    /// Everything whose drop signals another task, deferred as a whole while unwinding.
     links: mem::ManuallyDrop<Links<A>>,
 }
 
@@ -199,15 +195,13 @@ struct Session<A: ChunkAllocator> {
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
     retired: oneshot::Sender<Retired<A>>,
-    /// Ends the session's cleanup future when its record is removed another way.
-    cleanup: AbortHandle,
 }
 
 struct Shard<A: ChunkAllocator> {
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
     retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
     next_token: u64,
-    cleanups: FuturesUnordered<Cleanup>,
+    cleanups: FuturesUnordered<BoxFuture<'static, (AccountKey, Box<str>, u64)>>,
 }
 
 struct Inbox<A: ChunkAllocator>(Receiver<Command<A>>);
@@ -295,6 +289,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         requested: Option<&str>,
         limit: NonZeroUsize,
     ) -> Result<Registration<A>, RouterError> {
+        release_deferred();
         let requested = requested
             .map(|resource| validate_resource(account, resource, self.allocator.clone()))
             .transpose()?;
@@ -709,14 +704,32 @@ async fn tag_resource<A: ChunkAllocator>(
 impl<A: ChunkAllocator> Drop for Registration<A> {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        // Waking another task while this thread unwinds aborts the process, so a session
-        // ending in a panic leaks its channel ends and leaves its record to be found
-        // stale; the shard drops the record's side when it finds it.
-        if !std::thread::panicking() {
-            // SAFETY: `links` is dropped exactly once, here, and never touched again.
-            unsafe { mem::ManuallyDrop::drop(&mut self.links) };
+        // SAFETY: `links` is taken exactly once, here, and never touched again.
+        let links = unsafe { mem::ManuallyDrop::take(&mut self.links) };
+        if std::thread::panicking() {
+            // Waking another task while this thread unwinds aborts the process, so the
+            // parts wait until the thread is no longer panicking.
+            DEFERRED.with(|deferred| deferred.borrow_mut().push(Box::new(links)));
+        } else {
+            drop(links);
+            release_deferred();
         }
     }
+}
+
+thread_local! {
+    static DEFERRED: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drops what registrations dropped while this thread was unwinding left behind, so the
+/// shard learns of those sessions and their mailboxes are released. Called where a
+/// thread is known not to be panicking; a no-op otherwise.
+pub(crate) fn release_deferred() {
+    if std::thread::panicking() {
+        return;
+    }
+    let deferred = DEFERRED.with(|deferred| mem::take(&mut *deferred.borrow_mut()));
+    drop(deferred);
 }
 
 fn validate_resource<A: ChunkAllocator>(
@@ -787,29 +800,22 @@ impl<A: ChunkAllocator> Shard<A> {
         prefer_cleanup: bool,
     ) -> Option<Either<Command<A>, (AccountKey, Box<str>, u64)>> {
         let work = async {
-            loop {
-                if self.cleanups.is_empty() {
-                    return receiver.recv().await.ok().map(Either::Left);
+            if self.cleanups.is_empty() {
+                return receiver.recv().await.ok().map(Either::Left);
+            }
+            let mut receive = pin!(receiver.recv());
+            let mut cleanup = pin!(self.cleanups.next());
+            if prefer_cleanup {
+                match select(cleanup.as_mut(), receive.as_mut()).await {
+                    Either::Left((Some(cleanup), _)) => Some(Either::Right(cleanup)),
+                    Either::Right((Ok(command), _)) => Some(Either::Left(command)),
+                    _ => None,
                 }
-                let mut receive = pin!(receiver.recv());
-                let mut cleanup = pin!(self.cleanups.next());
-                let event = if prefer_cleanup {
-                    match select(cleanup.as_mut(), receive.as_mut()).await {
-                        Either::Left((Some(cleanup), _)) => Either::Right(cleanup),
-                        Either::Right((Ok(command), _)) => Either::Left(command),
-                        _ => return None,
-                    }
-                } else {
-                    match select(receive.as_mut(), cleanup.as_mut()).await {
-                        Either::Left((Ok(command), _)) => Either::Left(command),
-                        Either::Right((Some(cleanup), _)) => Either::Right(cleanup),
-                        _ => return None,
-                    }
-                };
-                match event {
-                    Either::Left(command) => return Some(Either::Left(command)),
-                    Either::Right(Ok(cleanup)) => return Some(Either::Right(cleanup)),
-                    Either::Right(Err(Aborted)) => {}
+            } else {
+                match select(receive.as_mut(), cleanup.as_mut()).await {
+                    Either::Left((Ok(command), _)) => Some(Either::Left(command)),
+                    Either::Right((Some(cleanup), _)) => Some(Either::Right(cleanup)),
+                    _ => None,
                 }
             }
         };
@@ -967,18 +973,16 @@ impl<A: ChunkAllocator> Shard<A> {
         };
         let (lease, closed) = oneshot::channel();
         let (retired, retired_reply) = oneshot::channel();
-        let (cleanup, abortable) = AbortHandle::new_pair();
         let alive = Arc::new(AtomicBool::new(true));
         let cleanup_account = account.clone();
         let cleanup_resource = resource.clone();
-        self.cleanups.push(Abortable::new(
+        self.cleanups.push(
             async move {
                 let _ = closed.await;
                 (cleanup_account, cleanup_resource, token)
             }
             .boxed(),
-            abortable,
-        ));
+        );
         sessions.insert(
             resource.clone(),
             Session {
@@ -991,7 +995,6 @@ impl<A: ChunkAllocator> Shard<A> {
                 presence: None,
                 unavailable: None,
                 retired,
-                cleanup,
             },
         );
         Ok(Registration {
@@ -1529,7 +1532,6 @@ impl<A: ChunkAllocator> Shard<A> {
         }
         if let Some(session) = sessions.remove(resource) {
             session.alive.store(false, Ordering::Release);
-            session.cleanup.abort();
             if let Some(unavailable) = session.unavailable.as_ref() {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
@@ -1685,7 +1687,6 @@ mod tests {
                         presence: None,
                         unavailable: None,
                         retired,
-                        cleanup: AbortHandle::new_pair().0,
                     },
                 );
                 receivers.push(inbound);
@@ -1724,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_session_takes_its_cleanup_future_with_it() -> Result<(), Box<dyn Error>> {
+    fn a_registration_dropped_by_a_panic_is_released_afterwards() -> Result<(), Box<dyn Error>> {
         Runtime::new()?.block_on(async {
             let account = account()?;
             let mut shard = Shard::<GlobalChunkAllocator>::new();
@@ -1744,23 +1745,12 @@ mod tests {
                 panic!("deliberate");
             }));
             assert!(caught.is_err());
-            assert_eq!(shard.cleanups.len(), 1);
+            assert!(shard.cleanups.next().now_or_never().is_none());
 
-            let (outbound, inbound) = async_channel::bounded(64);
-            let replacement = shard.register(
-                account.clone(),
-                Some("desk".into()),
-                limit,
-                outbound,
-                inbound,
-                command_sender,
-            )?;
-            assert_eq!(replacement.resource(), "desk");
-            assert!(matches!(shard.cleanups.next().await, Some(Err(Aborted))));
-            assert_eq!(shard.cleanups.len(), 1);
-
-            drop(replacement);
-            assert!(matches!(shard.cleanups.next().await, Some(Ok(_))));
+            release_deferred();
+            let (cleaned, resource, _) = shard.cleanups.next().await.ok_or("missing cleanup")?;
+            assert_eq!(cleaned, account);
+            assert_eq!(resource.as_ref(), "desk");
             assert!(shard.cleanups.is_empty());
             Ok(())
         })
@@ -1843,7 +1833,7 @@ mod tests {
                 assert!(sender.try_send(command).is_ok());
                 let (lease, closed) = oneshot::channel::<()>();
                 let cleanup_account = account.clone();
-                shard.cleanups.push(Abortable::new(
+                shard.cleanups.push(
                     async move {
                         let _ = closed.await;
                         (
@@ -1853,8 +1843,7 @@ mod tests {
                         )
                     }
                     .boxed(),
-                    AbortHandle::new_pair().1,
-                ));
+                );
                 drop(lease);
             }
 

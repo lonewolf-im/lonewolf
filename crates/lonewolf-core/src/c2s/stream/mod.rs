@@ -11,12 +11,14 @@ mod session;
 use std::future::Future;
 use std::net::Shutdown;
 use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
 use compio::time::timeout;
+use futures_util::FutureExt;
 use lonewolf_auth::server::Mechanism;
 use lonewolf_util::arena::ChunkAllocator;
 use socket2::SockRef;
@@ -33,7 +35,7 @@ use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::AuthMechanisms;
 use crate::config::limits::ByteRate;
 use crate::hosts::Hosts;
-use crate::router::RouterHandle;
+use crate::router::{RouterHandle, release_deferred};
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -264,8 +266,14 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             lifecycle.bound(bound.resource_requested, binding_started_at);
             Ok(bound_stream(bound).await)
         };
-        let outcome = match phases.await {
-            Ok(outcome) | Err(outcome) => outcome,
+        let outcome = match AssertUnwindSafe(phases).catch_unwind().await {
+            Ok(Ok(outcome) | Err(outcome)) => outcome,
+            Err(_) => {
+                // What the stream dropped while unwinding is released now that it is over.
+                release_deferred();
+                tracing::error!("connection task panicked");
+                CloseOutcome::InternalError
+            }
         };
         drop(unauthenticated_permit);
         drop(ip_permit);

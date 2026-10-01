@@ -26,7 +26,7 @@ impl SessionTag {
 }
 
 /// The tags a resource carries, each with the view of storage its handler had when the
-/// resource acquired it. Every effect of a later view reaches the resource.
+/// resource acquired it. Every effect of a later view reaches the resource or evicts it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SessionTags {
     since: [Option<u64>; SessionTag::COUNT],

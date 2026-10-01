@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lonewolf_extension::delivery::{HandlerError, HostLookup, SessionTag};
+use lonewolf_extension::delivery::{DeliveryError, HandlerError, HostLookup, SessionTag};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
@@ -44,6 +44,14 @@ const ACCOUNT_SLOW: IqRoute = IqRoute {
     kind: IqRequestType::Set,
     namespace: NAMESPACE,
     name: "slow",
+};
+
+/// A set whose effects push a marker to the account's interested resources and then fail.
+const ACCOUNT_FAIL: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: NAMESPACE,
+    name: "fail",
 };
 
 const SERVER_GET: IqRoute = IqRoute {
@@ -119,7 +127,7 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
     }
 
     fn iq_routes(&self) -> &'static [IqRoute] {
-        &[ACCOUNT_GET, ACCOUNT_SET, ACCOUNT_SLOW]
+        &[ACCOUNT_GET, ACCOUNT_SET, ACCOUNT_SLOW, ACCOUNT_FAIL]
     }
 }
 
@@ -141,15 +149,22 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
         _: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
-            if request.payload.name() != ACCOUNT_SLOW.name {
-                return Ok(IqReply::new(None, Effects::none()));
-            }
-            let millis = request
-                .payload
-                .attribute("millis", "")
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                .and_then(|value| value.parse().ok())
-                .ok_or(StanzaErrorCondition::BadRequest)?;
+            let route = match request.payload.name() {
+                name if name == ACCOUNT_SLOW.name => ACCOUNT_SLOW,
+                name if name == ACCOUNT_FAIL.name => ACCOUNT_FAIL,
+                _ => return Ok(IqReply::new(None, Effects::none())),
+            };
+            let hold = if route.name == ACCOUNT_SLOW.name {
+                let millis = request
+                    .payload
+                    .attribute("millis", "")
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or(StanzaErrorCondition::BadRequest)?;
+                Some(Duration::from_millis(millis))
+            } else {
+                None
+            };
             let account = AccountKey::try_from(request.target.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             let effects = Effects::new(vec![account.clone()], move |delivery| {
@@ -158,23 +173,28 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
                         .push_to_tagged(
                             &account,
                             SessionTag::Interested,
-                            Box::new(|to, arena| {
+                            Box::new(move |to, arena| {
                                 let marker =
-                                    Element::builder_in("slow", NAMESPACE, arena)?.build()?;
+                                    Element::builder_in(route.name, NAMESPACE, arena)?.build()?;
                                 Ok(Stanza::builder_in(
                                     StanzaType::Iq(IqType::Set),
                                     StanzaNamespace::Client,
                                     arena,
                                 )
-                                .id(Some("slow"))?
+                                .id(Some(route.name))?
                                 .to(Some(to))?
                                 .child(marker)?
                                 .build()?)
                             }),
                         )
                         .await?;
-                    compio::time::sleep(Duration::from_millis(millis)).await;
-                    Ok(())
+                    match hold {
+                        Some(hold) => {
+                            compio::time::sleep(hold).await;
+                            Ok(())
+                        }
+                        None => Err(DeliveryError),
+                    }
                 })
             });
             Ok(IqReply::new(None, effects))

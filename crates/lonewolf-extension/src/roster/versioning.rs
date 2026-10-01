@@ -15,9 +15,10 @@ pub(super) enum Answer {
 
 /// A removal cannot be expressed as a push without a record of what was removed, so a
 /// client whose version predates the last removal receives the whole roster. A resource
-/// that is already interested was pushed every change after `interested_since`, so it is
-/// answered from that point: nothing when it holds that version or a later one, and the
-/// whole roster when it fell behind it, since a replay would trail pushes it already has.
+/// that is already interested was pushed every change after `interested_since`, or was
+/// evicted, so it is answered from that point: nothing when it holds that version or a
+/// later one, and the whole roster when it fell behind it, since a replay would trail
+/// pushes it already has.
 pub(super) fn answer(
     known: Option<&str>,
     snapshot: &RosterSnapshot,

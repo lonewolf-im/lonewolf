@@ -1900,6 +1900,25 @@ fn versioned_roster_get_behind_the_resources_interest_point_returns_the_full_ros
 }
 
 #[test]
+fn a_committed_change_whose_deliveries_fail_closes_every_session_of_the_accounts_it_addressed()
+-> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut phone = suite.connect("alice", "password", "phone")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+
+    bob.send(
+        "<iq type='set' id='fail' to='alice@localhost'><fail xmlns='urn:lonewolf:test:iq'/></iq>",
+    )?;
+
+    bob.expect_stream_error("internal-server-error")?;
+    desk.expect_eof()?;
+    phone.expect_eof()
+}
+
+#[test]
 fn a_rejected_roster_get_still_delivers_the_pushes_queued_before_it() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
     suite.create_account("alice", "password")?;

@@ -37,6 +37,23 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
             session: session.map(Registration::handle),
         }
     }
+
+    /// Runs committed deliveries. Should they fail partway, every session of the accounts
+    /// they addressed is evicted, so no client keeps a view that may have missed a change.
+    pub(crate) async fn deliver_or_evict(
+        &self,
+        accounts: &[AccountKey],
+        deliver: Deliver<A>,
+    ) -> Result<(), DeliveryError> {
+        let result = deliver(self).await;
+        if result.is_err() {
+            tracing::error!(accounts = accounts.len(), "committed deliveries failed");
+            for account in accounts {
+                let _ = self.router.evict_account(account).await;
+            }
+        }
+        result
+    }
 }
 
 /// Work that runs on a task of its own once a ticket turns. Dropping the handle does
@@ -90,18 +107,22 @@ where
 
 /// Runs committed effects once `ticket` turns and reports the deliveries that were
 /// queued for the caller at that moment, which the caller writes ahead of its reply.
-pub(crate) fn deliver_committed<A, D>(
+/// Effects that fail evict the sessions of `accounts`.
+pub(crate) fn deliver_committed<A>(
     ticket: Ticket,
+    accounts: Vec<AccountKey>,
     deliver: Deliver<A>,
-    delivery: D,
+    delivery: RouterDelivery<A>,
     mailbox: Option<Mailbox<A>>,
 ) -> Pending<Result<Vec<RoutedStanza<A>>, DeliveryError>>
 where
     A: ChunkAllocator + Clone + 'static,
-    D: Delivery<A> + 'static,
 {
     after_turn(ticket, mailbox, move |queued| async move {
-        deliver(&delivery).await.map(|()| queued)
+        delivery
+            .deliver_or_evict(&accounts, deliver)
+            .await
+            .map(|()| queued)
     })
 }
 

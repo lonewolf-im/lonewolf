@@ -183,6 +183,7 @@ enum Command<A: ChunkAllocator> {
     },
     RetireAccount {
         account: AccountKey,
+        cause: RetireCause,
         reply: oneshot::Sender<()>,
     },
 }
@@ -472,12 +473,17 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
-    /// Removes every session bound to `account`, ending each stream as account deleted.
-    pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
+    /// Removes every session bound to `account`, ending each stream for `cause`.
+    pub(crate) async fn retire_account(
+        &self,
+        account: &AccountKey,
+        cause: RetireCause,
+    ) -> Result<(), RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard(account.as_str())
             .send(Command::RetireAccount {
                 account: account.clone(),
+                cause,
                 reply,
             })
             .await
@@ -969,8 +975,12 @@ impl<A: ChunkAllocator> Shard<A> {
                 self.finish_presence(&account, token);
                 let _ = reply.send(());
             }
-            Command::RetireAccount { account, reply } => {
-                self.retire_account(&account);
+            Command::RetireAccount {
+                account,
+                cause,
+                reply,
+            } => {
+                self.retire_account(&account, cause);
                 let _ = reply.send(());
             }
         }
@@ -1523,7 +1533,7 @@ impl<A: ChunkAllocator> Shard<A> {
             })
     }
 
-    fn retire_account(&mut self, account: &AccountKey) {
+    fn retire_account(&mut self, account: &AccountKey, cause: RetireCause) {
         let Some(sessions) = self.accounts.get(account.as_str()) else {
             return;
         };
@@ -1532,12 +1542,7 @@ impl<A: ChunkAllocator> Shard<A> {
             .map(|(resource, session)| (resource.clone(), session.token))
             .collect();
         for (resource, token) in bound {
-            self.remove(
-                account.as_str(),
-                &resource,
-                token,
-                RetireCause::AccountDeleted,
-            );
+            self.remove(account.as_str(), &resource, token, cause);
         }
     }
 

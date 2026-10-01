@@ -9,12 +9,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::delivery::RouterDelivery;
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Registration, RoutedStanza, Router, RouterError};
 use compio::runtime::Runtime;
 use compio::time::timeout;
-use lonewolf_extension::delivery::SessionTag;
+use lonewolf_extension::Deliver;
+use lonewolf_extension::delivery::{DeliveryError, SessionTag};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
@@ -456,6 +458,62 @@ fn a_tag_keeps_the_view_it_was_first_attached_under() -> TestResult {
 
         drop(desk);
         drop(phone);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn failed_committed_deliveries_evict_every_session_of_the_accounts_they_addressed() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let bob = account("bob@localhost")?;
+        let carol = account("carol@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        let bob_desk = handle.register(&bob, Some("desk"), limit).await?;
+        let carol_desk = handle.register(&carol, Some("desk"), limit).await?;
+        let delivery = RouterDelivery::new(&handle, &GlobalChunkAllocator, None);
+        let deliver: Deliver<GlobalChunkAllocator> =
+            Box::new(|_| Box::pin(async { Err(DeliveryError) }));
+
+        let result = delivery
+            .deliver_or_evict(&[alice.clone(), bob.clone()], deliver)
+            .await;
+
+        assert!(result.is_err());
+        for retired in [&desk, &phone, &bob_desk] {
+            assert!(matches!(
+                retired.wait_retired().await?.cause,
+                RetireCause::Evicted
+            ));
+        }
+        for gone in [
+            "alice@localhost/desk",
+            "alice@localhost/phone",
+            "bob@localhost/desk",
+        ] {
+            assert!(matches!(
+                handle.route_full(stanza(gone).await?).await,
+                Err(RouterError::NotFound)
+            ));
+        }
+        handle
+            .route_full(stanza("carol@localhost/desk").await?)
+            .await?;
+        assert_eq!(
+            receive_routed(&carol_desk).await?.resolve()?.kind(),
+            StanzaKind::Message
+        );
+
+        drop(desk);
+        drop(phone);
+        drop(bob_desk);
+        drop(carol_desk);
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())

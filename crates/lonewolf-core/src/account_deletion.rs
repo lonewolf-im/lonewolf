@@ -88,7 +88,7 @@ async fn delete<A: ChunkAllocator + Clone>(
         Err(AccountError::NotFound) => false,
         Err(error) => return Err(error.into()),
     };
-    let mut accounts = vec![account.clone()];
+    let mut addressed = Vec::new();
     let mut deliveries = Vec::with_capacity(extensions.len());
     for extension in extensions {
         let effects = extension
@@ -102,19 +102,17 @@ async fn delete<A: ChunkAllocator + Clone>(
                 );
                 deleter_error("an extension could not forget the account")
             })?;
-        accounts.extend(effects.accounts);
-        deliveries.push((extension.name(), effects.deliver));
+        addressed.extend(effects.accounts);
+        deliveries.push(effects.deliver);
     }
+    addressed.retain(|addressed| addressed != account);
+    let mut accounts = Vec::with_capacity(1 + addressed.len());
+    accounts.push(account.clone());
+    accounts.extend(addressed.iter().cloned());
     let ((), mut ticket) = router.order().fix(accounts, transaction.commit()).await?;
     ticket.turn().await;
-    for (extension, deliver) in deliveries {
-        if let Err(error) = deliver(&delivery).await {
-            tracing::error!(
-                extension,
-                error = ?error,
-                "account deletion notifications failed"
-            );
-        }
+    for deliver in deliveries {
+        let _ = delivery.deliver_or_evict(&addressed, deliver).await;
     }
     // Sessions end after the commit so their disconnect broadcasts to an empty audience.
     if let Err(error) = router.retire_account(account).await {

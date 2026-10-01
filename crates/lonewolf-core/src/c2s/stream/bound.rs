@@ -410,11 +410,16 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 effects: Effects { accounts, deliver },
             }) => {
                 let ((), ticket) = Arc::clone(self.router.order())
-                    .fix(accounts, transaction.commit())
+                    .fix(accounts.clone(), transaction.commit())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
-                let mut committed =
-                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
+                let mut committed = deliver_committed(
+                    ticket,
+                    accounts,
+                    deliver,
+                    delivery,
+                    Some(self.registration.mailbox()),
+                );
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
                     .await?;
@@ -711,10 +716,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                     match effects {
                         Ok(Effects { accounts, deliver }) => {
                             let ((), ticket) = order
-                                .fix(accounts, transaction.commit())
+                                .fix(accounts.clone(), transaction.commit())
                                 .await
                                 .map_err(|_| CloseOutcome::InternalError)?;
-                            Ok((deliver, ticket, delivery))
+                            Ok((accounts, deliver, ticket, delivery))
                         }
                         Err(error) => Err(error),
                     }
@@ -725,9 +730,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
         };
         match received {
-            Ok((deliver, ticket, delivery)) => {
-                let mut committed =
-                    deliver_committed(ticket, deliver, delivery, Some(self.registration.mailbox()));
+            Ok((accounts, deliver, ticket, delivery)) => {
+                let mut committed = deliver_committed(
+                    ticket,
+                    accounts,
+                    deliver,
+                    delivery,
+                    Some(self.registration.mailbox()),
+                );
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
                     .await?;

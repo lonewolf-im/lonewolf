@@ -8,10 +8,11 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use lonewolf_auth::server::Mechanism;
+use lonewolf_extension::offline::OfflineLimits;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
 use lonewolf_xmpp::jid::Jid;
@@ -25,8 +26,6 @@ use limits::LimitsConfig;
 pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 const MEBIBYTE: usize = 1024 * 1024;
 
-/// Applies defaults during deserialization and rejects unknown fields.
-///
 /// [`Self::load`] also validates value constraints; direct deserialization does not.
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -136,6 +135,16 @@ impl Config {
             _ => {}
         }
         for (domain, host) in &self.hosts {
+            if host.offline.is_some()
+                && !host
+                    .extensions
+                    .iter()
+                    .any(|name| name == lonewolf_extension::offline::NAME)
+            {
+                return Err(format!(
+                    "hosts.{domain}.offline requires the offline extension"
+                ));
+            }
             let mut arena = Arena::try_new(ArenaConfig::default())
                 .map_err(|error| format!("cannot validate hosts.{domain}: {error}"))?;
             let jid = Jid::from_parts_in(None, domain, None, &mut arena)
@@ -178,6 +187,21 @@ fn default_hosts() -> BTreeMap<String, HostConfig> {
 pub struct HostConfig {
     pub tls: Option<HostTlsConfig>,
     pub extensions: Vec<String>,
+    pub offline: Option<OfflineHostConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OfflineHostConfig {
+    pub max_messages_per_account: NonZeroU32,
+}
+
+impl Default for OfflineHostConfig {
+    fn default() -> Self {
+        Self {
+            max_messages_per_account: OfflineLimits::default().max_messages_per_account,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

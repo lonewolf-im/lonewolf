@@ -37,6 +37,15 @@
 # The domain below is an example.
 # [hosts."example.com"]
 
+# This example enables roster and offline storage for this host.
+# extensions = ["roster", "offline"]
+
+# Adjust the number of stored messages per account to suit clients that stay offline.
+# Use a positive integer. Senders receive resource-constraint when the queue reaches this limit.
+# Enable the offline extension before configuring its limit.
+# [hosts."example.com".offline]
+# max_messages_per_account = 100
+
 # Configure a PEM certificate chain and private key for each host except localhost.
 # Localhost uses a new self-signed certificate on each start if you omit its TLS section.
 # Use a leaf certificate signed with RSA PKCS#1 v1.5 or ECDSA and SHA-256, SHA-384, or SHA-512.
@@ -170,6 +179,4 @@
 
 # Choose where Lonewolf stores account records and credentials.
 # Leave this unset to use the default store. The value below is an example.
-# Roster state always lives in this store, so that a change to an account and to
-# its roster can be applied together.
 # storage = "primary"

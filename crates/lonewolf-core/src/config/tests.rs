@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
-    AccountConfig, Config, ConfigError, HostConfig, HostTlsConfig, StoreConfig, TcpListenerConfig,
-    XmppConfig,
+    AccountConfig, Config, ConfigError, HostConfig, HostTlsConfig, OfflineHostConfig, StoreConfig,
+    TcpListenerConfig, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
 
@@ -22,6 +22,84 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
     let mut file = tempfile::NamedTempFile::new()?;
     file.write_all(contents.as_bytes())?;
     Ok(file)
+}
+
+#[test]
+fn offline_limits_are_optional_and_default_to_one_hundred_messages() -> TestResult {
+    assert!(Config::default().hosts["localhost"].offline.is_none());
+    let file =
+        config_file("[hosts.localhost]\nextensions = ['offline']\n[hosts.localhost.offline]")?;
+    let config = Config::load(Some(file.path()))?;
+    assert_eq!(
+        config.hosts["localhost"].offline,
+        Some(OfflineHostConfig::default())
+    );
+    assert_eq!(
+        OfflineHostConfig::default().max_messages_per_account.get(),
+        100
+    );
+    Ok(())
+}
+
+#[test]
+fn offline_limits_use_the_configured_message_count() -> TestResult {
+    let file = config_file(
+        "[hosts.localhost]\nextensions = ['offline']\n[hosts.localhost.offline]\nmax_messages_per_account = 7",
+    )?;
+    let config = Config::load(Some(file.path()))?;
+    assert_eq!(
+        config.hosts["localhost"]
+            .offline
+            .ok_or("missing offline limit")?
+            .max_messages_per_account
+            .get(),
+        7
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_offline_limits_are_rejected() -> TestResult {
+    for setting in [
+        "max_messages_per_account = 0",
+        "max_messages_per_account = -1",
+        "max_messages_per_account = 4294967296",
+        "max_messages = 7",
+    ] {
+        let contents = format!(
+            "[hosts.localhost]\nextensions = ['offline']\n[hosts.localhost.offline]\n{setting}"
+        );
+        let file = config_file(&contents)?;
+        assert!(
+            matches!(
+                Config::load(Some(file.path())),
+                Err(ConfigError::Parse { .. })
+            ),
+            "{setting}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn offline_limits_require_the_enabled_extension() -> TestResult {
+    for extensions in ["[]", "['roster']"] {
+        let contents =
+            format!("[hosts.localhost]\nextensions = {extensions}\n[hosts.localhost.offline]");
+        let file = config_file(&contents)?;
+        assert!(
+            matches!(Config::load(Some(file.path())), Err(ConfigError::Invalid { reason, .. }) if reason == "hosts.localhost.offline requires the offline extension")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn offline_extension_can_use_the_default_without_a_limits_section() -> TestResult {
+    let file = config_file("[hosts.localhost]\nextensions = ['offline']")?;
+    let config = Config::load(Some(file.path()))?;
+    assert!(config.hosts["localhost"].offline.is_none());
+    Ok(())
 }
 
 #[test]
@@ -562,11 +640,12 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     expected.hosts.insert(
         "example.com".into(),
         HostConfig {
+            extensions: vec!["roster".into(), "offline".into()],
+            offline: Some(OfflineHostConfig::default()),
             tls: Some(HostTlsConfig {
                 certificate_chain_path: PathBuf::from("./certs/example.com.crt"),
                 private_key_path: PathBuf::from("./certs/example.com.key"),
             }),
-            ..HostConfig::default()
         },
     );
     expected.xmpp.default_host = Some("localhost".into());

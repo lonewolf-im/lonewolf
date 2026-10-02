@@ -6,6 +6,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 
 use super::iq::{IqHandler, IqRequestType, IqRoute, IqScope};
+use super::message::MessageHandler;
 use super::presence::{PresenceHandler, PresenceRequestType};
 use super::{Extension, Extensions, RegistrationError};
 
@@ -23,11 +24,14 @@ struct Fake {
     iq: &'static [IqRoute],
     presence: &'static [PresenceRequestType],
     features: &'static [&'static str],
+    messages: bool,
 }
 
 impl IqHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
 
 impl PresenceHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
+
+impl MessageHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
 
 impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
     fn name(&self) -> &'static str {
@@ -45,6 +49,10 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
     fn stream_features(&self) -> &'static [&'static str] {
         self.features
     }
+
+    fn stores_messages(&self) -> bool {
+        self.messages
+    }
 }
 
 fn extension(
@@ -57,6 +65,7 @@ fn extension(
         iq,
         presence,
         features: &[],
+        messages: false,
     })
 }
 
@@ -69,7 +78,54 @@ fn featured(
         iq: &[],
         presence: &[],
         features,
+        messages: false,
     })
+}
+
+fn message_extension(name: &'static str) -> Arc<dyn Extension<GlobalChunkAllocator, RedbStorage>> {
+    Arc::new(Fake {
+        name,
+        iq: &[],
+        presence: &[],
+        features: &[],
+        messages: true,
+    })
+}
+
+#[test]
+fn message_handler_is_selected_only_when_enabled() -> Result<(), RegistrationError> {
+    let mut extensions = TestExtensions::default();
+    let message = message_extension("messages");
+    let handler: Arc<dyn MessageHandler<GlobalChunkAllocator, RedbStorage>> = message.clone();
+    extensions.register(message)?;
+    extensions.register(extension("plain", &[], &[]))?;
+    let enabled = extensions.enable(["plain", "messages"])?;
+    assert!(
+        enabled
+            .messages()
+            .is_some_and(|selected| Arc::ptr_eq(selected, &handler))
+    );
+    assert!(extensions.enable(["plain"])?.messages().is_none());
+    assert!(extensions.enable([])?.messages().is_none());
+    assert_eq!(enabled.extensions().len(), 2);
+    assert_eq!(enabled.stream_features(), "");
+    Ok(())
+}
+
+#[test]
+fn conflicting_message_extensions_cannot_be_enabled_together() -> Result<(), RegistrationError> {
+    let mut extensions = TestExtensions::default();
+    extensions.register(message_extension("first"))?;
+    extensions.register(message_extension("second"))?;
+    for names in [["first", "second"], ["second", "first"]] {
+        assert!(matches!(
+            extensions.enable(names),
+            Err(RegistrationError::DuplicateMessageHandler)
+        ));
+    }
+    assert!(extensions.enable(["first"])?.messages().is_some());
+    assert!(extensions.enable(["second"])?.messages().is_some());
+    Ok(())
 }
 
 #[test]

@@ -16,6 +16,7 @@ use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
 use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
 use crate::iq::{IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope};
+use crate::message::MessageHandler;
 use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate, ReceiveFuture,
@@ -43,10 +44,6 @@ const IQ_ROUTES: [IqRoute; 2] = [
     },
 ];
 
-/// The RFC 6121 roster and subscription extension.
-///
-/// It keeps no state of its own: every request works on the transaction the server
-/// hands it and returns the deliveries that follow as effects.
 #[derive(Default)]
 pub struct Roster;
 
@@ -67,8 +64,7 @@ async fn account_exists(
         .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
-/// Refuses a mutation for an account whose record is gone, so a session that outlives
-/// its account cannot repopulate roster state.
+/// A session that outlives its account must not repopulate roster state.
 async fn require_account(
     transaction: &impl AccountReads,
     account: &AccountKey,
@@ -80,7 +76,6 @@ async fn require_account(
     }
 }
 
-/// The account a roster IQ addresses, which must be the sender's own.
 fn owner_of<A: ChunkAllocator>(
     request: &IqRequest<'_, A>,
 ) -> Result<AccountKey, StanzaErrorCondition> {
@@ -91,8 +86,7 @@ fn owner_of<A: ChunkAllocator>(
         .map_err(|_| StanzaErrorCondition::InternalServerError)
 }
 
-/// Keeps only the contacts whose own roster grants `owner` their presence, so a
-/// one-sided `to` item cannot expose a contact that never approved.
+/// A one-sided `to` item must not expose a contact that never approved.
 async fn granting_contacts(
     transaction: &impl RosterReads,
     owner: RosterJid,
@@ -150,6 +144,8 @@ where
         Box::pin(subscription::forget_account(transaction, account, hosts))
     }
 }
+
+impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Roster {}
 
 impl<A, S> IqHandler<A, S> for Roster
 where
@@ -323,7 +319,6 @@ async fn push_removal<A: ChunkAllocator>(
         .await
 }
 
-/// Splits the roster into the contacts that see the owner and the contacts the owner sees.
 fn split_subscriptions(
     snapshot: RosterSnapshot,
     owner: &AccountKey,

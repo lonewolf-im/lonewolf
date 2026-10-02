@@ -495,6 +495,15 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         &self,
         arena: &'b mut Arena<A>,
     ) -> Result<StanzaBuilder<'b, A>, BuildError> {
+        self.to_builder_in_filtered(arena, |_| Ok(true))
+    }
+
+    /// Evaluates `keep` on source children before copying them into the destination.
+    pub fn to_builder_in_filtered<'b, A: ChunkAllocator>(
+        &self,
+        arena: &'b mut Arena<A>,
+        mut keep: impl FnMut(&ElementRef<'a, R>) -> Result<bool, HandleError>,
+    ) -> Result<StanzaBuilder<'b, A>, BuildError> {
         let header = Header {
             stanza_type: self.stanza_type(),
             namespace: self.namespace(),
@@ -509,8 +518,10 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         let attributes = AttributesBuilder::copy_from(self.data.attributes, self.arena, arena)?;
         let mut children = SliceBuilder::new();
         for child in self.children()? {
-            let child = child?.clone_in(arena)?;
-            children.push(child, arena)?;
+            let child = child?;
+            if keep(&child)? {
+                children.push(child.clone_in(arena)?, arena)?;
+            }
         }
         Ok(StanzaBuilder {
             arena,

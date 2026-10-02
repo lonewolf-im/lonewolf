@@ -133,6 +133,24 @@ pub fn run_with_extensions(
                             lonewolf_extension::roster::NAME => {
                                 Arc::new(lonewolf_extension::roster::Roster::new())
                             }
+                            lonewolf_extension::offline::NAME => {
+                                let limits = config
+                                    .hosts
+                                    .iter()
+                                    .filter_map(|(domain, host)| {
+                                        host.offline.map(|offline| {
+                                            (
+                                                domain.as_str().into(),
+                                                lonewolf_extension::offline::OfflineLimits {
+                                                    max_messages_per_account: offline
+                                                        .max_messages_per_account,
+                                                },
+                                            )
+                                        })
+                                    })
+                                    .collect();
+                                Arc::new(lonewolf_extension::offline::Offline::new(limits))
+                            }
                             _ => continue,
                         };
                     extensions
@@ -232,8 +250,7 @@ async fn run_services(
 ) -> Result<(), RunError> {
     let admin_enabled = admin.is_some();
     let (stop_admin, stopped) = oneshot::channel::<()>();
-    // The deletion worker stays beside the admin service through its drain, since
-    // accepted deletions still need it; it ends once the service drops its sender.
+    // The admin service can wait for accepted deletions while it drains.
     let mut services = pin!(async move {
         let server = async move {
             match admin {

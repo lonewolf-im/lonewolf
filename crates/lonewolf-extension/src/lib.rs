@@ -13,6 +13,8 @@ use lonewolf_util::arena::ChunkAllocator;
 
 pub mod delivery;
 pub mod iq;
+pub mod message;
+pub mod offline;
 pub mod presence;
 pub mod roster;
 
@@ -20,15 +22,11 @@ pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use delivery::{Delivery, DeliveryFuture, HandlerError, HostLookup};
 use iq::{IqHandler, IqRegistry, IqRoute};
+use message::MessageHandler;
 use presence::{PresenceHandler, PresenceRegistry, PresenceRequestType};
 
-/// What a handler asks the server to do once its view of storage is fixed.
-///
-/// The server runs the deliveries after the transaction committed, and for each
-/// account named in `accounts` in the order the handlers' storage views were fixed, so
-/// a client never sees an older change after a newer one.
+/// Deliveries run after commit, in storage-view order for each account in `accounts`.
 pub struct Effects<A> {
-    /// The accounts whose clients the deliveries address.
     pub accounts: Vec<AccountKey>,
     pub deliver: Deliver<A>,
 }
@@ -51,35 +49,33 @@ impl<A: ChunkAllocator> Effects<A> {
     }
 }
 
-/// A server feature that hosts enable by name.
 /// One instance serves every host that enables it.
-///
-/// Handlers change state only through the transaction they are given and return the
-/// deliveries that follow as [`Effects`]; the server commits, orders, and delivers.
+/// Handlers use only the supplied transaction and return ordered deliveries as [`Effects`].
 pub trait Extension<A: ChunkAllocator, S: Storage>:
-    IqHandler<A, S> + PresenceHandler<A, S>
+    IqHandler<A, S> + PresenceHandler<A, S> + MessageHandler<A, S>
 {
     /// The name hosts use to enable the extension, nonempty and without surrounding whitespace.
     fn name(&self) -> &'static str;
 
-    /// The IQ routes dispatched to this extension's IQ handler.
     fn iq_routes(&self) -> &'static [IqRoute] {
         &[]
     }
 
-    /// The presence kinds dispatched to this extension's presence handler.
     fn presence_kinds(&self) -> &'static [PresenceRequestType] {
         &[]
     }
 
-    /// Stream feature elements, as XML, advertised to authenticated clients of every
-    /// host that enables the extension.
+    /// XML elements advertised to authenticated clients.
     fn stream_features(&self) -> &'static [&'static str] {
         &[]
     }
 
-    /// Clears the extension's state for the account inside the deletion's transaction
-    /// and returns what to deliver once it commits.
+    /// At most one enabled extension per host can store messages.
+    fn stores_messages(&self) -> bool {
+        false
+    }
+
+    /// Clears account state inside the deletion transaction and returns post-commit deliveries.
     fn forget_account<'a>(
         &'a self,
         _transaction: &'a mut S::Write,
@@ -97,6 +93,7 @@ pub enum RegistrationError {
     UnknownExtension(String),
     DuplicateRoute(IqRoute),
     DuplicatePresenceRoute(PresenceRequestType),
+    DuplicateMessageHandler,
 }
 
 impl fmt::Display for RegistrationError {
@@ -113,6 +110,7 @@ impl fmt::Display for RegistrationError {
             Self::DuplicatePresenceRoute(route) => {
                 write!(formatter, "conflicting presence route {route:?}")
             }
+            Self::DuplicateMessageHandler => formatter.write_str("conflicting message handlers"),
         }
     }
 }
@@ -122,6 +120,7 @@ impl Error for RegistrationError {}
 pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     iq: IqRegistry<A, S>,
     presence: PresenceRegistry<A, S>,
+    messages: Option<Arc<dyn MessageHandler<A, S>>>,
     extensions: Vec<Arc<dyn Extension<A, S>>>,
     stream_features: String,
 }
@@ -131,6 +130,7 @@ impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
         Self {
             iq: IqRegistry::default(),
             presence: PresenceRegistry::default(),
+            messages: None,
             extensions: Vec::new(),
             stream_features: String::new(),
         }
@@ -146,12 +146,15 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
         &self.presence
     }
 
+    pub fn messages(&self) -> Option<&Arc<dyn MessageHandler<A, S>>> {
+        self.messages.as_ref()
+    }
+
     /// The enabled extensions, in the order they were enabled.
     pub fn extensions(&self) -> &[Arc<dyn Extension<A, S>>] {
         &self.extensions
     }
 
-    /// The stream feature elements of the enabled extensions, concatenated as XML.
     pub fn stream_features(&self) -> &str {
         &self.stream_features
     }
@@ -192,6 +195,9 @@ impl<A: ChunkAllocator, S: Storage> Extensions<A, S> {
         for kind in presence_kinds {
             registry.presence.register(*kind, Arc::clone(&presence))?;
         }
+        if extension.stores_messages() {
+            registry.messages = Some(extension.clone());
+        }
         for feature in extension.stream_features() {
             registry.stream_features.push_str(feature);
         }
@@ -220,6 +226,12 @@ impl<A: ChunkAllocator, S: Storage> Extensions<A, S> {
             }
             for (kind, handler) in handlers.presence.registrations() {
                 enabled.presence.register(kind, handler)?;
+            }
+            if let Some(handler) = &handlers.messages {
+                if enabled.messages.is_some() {
+                    return Err(RegistrationError::DuplicateMessageHandler);
+                }
+                enabled.messages = Some(Arc::clone(handler));
             }
             enabled
                 .extensions

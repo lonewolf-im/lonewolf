@@ -179,6 +179,7 @@ where
                 operation = "get",
                 outcome,
                 item_count = if payload.is_some() { item_count } else { 0 },
+                owner_jid = ?owner.as_str(),
                 "roster response prepared"
             );
             let effects = Effects::new(vec![owner], |delivery| {
@@ -220,6 +221,8 @@ where
                             operation = "upsert",
                             outcome = "upserted",
                             item_count = 1,
+                            owner_jid = ?owner.as_str(),
+                            contact_jid = ?mutation.value.jid.as_str(),
                             "roster operation committed"
                         );
                         Box::pin(async move { push_roster(&owner, mutation, delivery).await })

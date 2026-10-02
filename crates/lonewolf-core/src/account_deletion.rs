@@ -108,6 +108,7 @@ async fn delete<A: ChunkAllocator + Clone>(
     tracing::info!(
         operation = "cleanup",
         outcome = "committed",
+        owner_jid = ?account.as_str(),
         "offline account state cleared"
     );
     ticket.turn().await;

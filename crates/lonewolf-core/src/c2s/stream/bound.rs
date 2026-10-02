@@ -717,6 +717,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 operation = "store",
                 outcome = "rejected",
                 reason = "missing_handler",
+                recipient_jid = ?recipient.as_str(),
                 "offline message policy decided"
             );
             return self
@@ -1180,6 +1181,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
                 operation = "replay",
                 outcome = "flushed",
                 pending_count,
+                owner_jid = ?self.account.as_str(),
                 "pending subscriptions flushed"
             );
         }
@@ -1189,6 +1191,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
                 outcome = "flushed",
                 messages_written,
                 messages_skipped,
+                owner_jid = ?self.account.as_str(),
                 "offline replay flushed"
             );
         }
@@ -1330,6 +1333,7 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
             tracing::info!(
                 operation = "acknowledge_replay",
                 outcome = "skipped_stale_session",
+                owner_jid = ?account.as_str(),
                 "offline backlog acknowledgement handled"
             );
             return Ok(());
@@ -1345,6 +1349,7 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
         tracing::info!(
             operation = "acknowledge_replay",
             outcome = "committed",
+            owner_jid = ?account.as_str(),
             "offline backlog acknowledgement handled"
         );
         if watermark.get() <= through {
@@ -1480,6 +1485,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
                 replay_count = replay.len(),
                 pending_count = requests.len(),
                 subscriber_count = audience.subscribers.len(),
+                owner_jid = ?account.as_str(),
                 "initial presence prepared"
             );
         }

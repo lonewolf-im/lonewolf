@@ -102,6 +102,8 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
             operation = "subscribe",
             outcome = outcome_name,
             item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
             "roster operation committed"
         );
         Box::pin(async move {
@@ -145,11 +147,13 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
     stanza: &RoutedStanza<A>,
 ) -> Result<Effects<A>, HandlerError> {
     if !check_parties(transaction, &parties).await? {
-        return Ok(Effects::new(Vec::new(), |_| {
+        return Ok(Effects::new(Vec::new(), move |_| {
             tracing::info!(
                 operation = "approve",
                 outcome = "processed",
                 item_count = 0,
+                sender_jid = ?parties.sender.as_str(),
+                recipient_jid = ?parties.target.as_str(),
                 "roster operation committed"
             );
             Box::pin(async { Ok(()) })
@@ -195,6 +199,8 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
             operation = "approve",
             outcome,
             item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
             "roster operation committed"
         );
         Box::pin(async move {
@@ -246,6 +252,8 @@ pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
                 "processed"
             },
             item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
             "roster operation committed"
         );
         Box::pin(async move {
@@ -298,6 +306,8 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
                 "processed"
             },
             item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
             "roster operation committed"
         );
         Box::pin(async move {
@@ -344,6 +354,8 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
             operation = "remove",
             outcome = "removed",
             item_count = 1,
+            owner_jid = ?owner.as_str(),
+            contact_jid = ?contact.as_str(),
             "roster operation committed"
         );
         Box::pin(async move {
@@ -416,6 +428,7 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
             pending_count,
             removal_count = removals.len(),
             cancellation_count = cancellations.len(),
+            owner_jid = ?owner.as_str(),
             "roster operation committed"
         );
         Box::pin(async move {

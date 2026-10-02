@@ -148,7 +148,8 @@ fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messag
             .find(|line| line.contains(summary))
             .ok_or("missing replay summary")?;
         assert!(line.contains("INFO"));
-        assert!(!line.contains("@localhost") && !line.contains("stored-") && !line.contains("id="));
+        assert!(line.contains("owner_jid=\"bob@localhost\""));
+        assert!(!line.contains("stored-") && !line.contains("<presence"));
     }
     bob.close()?;
     alice.close()

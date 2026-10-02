@@ -120,6 +120,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                 operation = "store",
                 outcome = "stored",
                 bytes = stored.bytes,
+                recipient_jid = ?stored.recipient.as_str(),
                 "offline message handled"
             );
             ticket.turn().await;
@@ -129,6 +130,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                     tracing::info!(
                         operation = "reroute",
                         outcome = "queued",
+                        recipient_jid = ?stored.recipient.as_str(),
                         "offline message rerouted"
                     );
                     let acknowledged: Result<(), HandlerError> = async {
@@ -146,6 +148,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                         tracing::info!(
                             operation = "acknowledge_live",
                             outcome = "committed",
+                            recipient_jid = ?stored.recipient.as_str(),
                             "offline message acknowledgement handled"
                         );
                         Ok(())
@@ -171,6 +174,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                         operation = "reroute",
                         outcome = "retained",
                         reason,
+                        recipient_jid = ?stored.recipient.as_str(),
                         "offline message rerouted"
                     );
                 }

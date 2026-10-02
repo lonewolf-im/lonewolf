@@ -93,6 +93,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                     operation = "store",
                     outcome = "rejected",
                     reason = "unsupported_type",
+                    recipient_jid = ?message.recipient.as_str(),
                     "offline message policy decided"
                 );
                 return Err(StanzaErrorCondition::ServiceUnavailable.into());
@@ -102,6 +103,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                     operation = "store",
                     outcome = "discarded",
                     reason = "chat_state_only",
+                    recipient_jid = ?message.recipient.as_str(),
                     "offline message policy decided"
                 );
                 return Ok(StoreOutcome::Discarded);
@@ -114,7 +116,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             let message_count = transaction
                 .offline_count(message.recipient)
                 .await
-                .map_err(store_error)?;
+                .map_err(|error| store_error(error, message.recipient))?;
             if message_count >= limits.max_messages_per_account.get() as usize {
                 tracing::info!(
                     operation = "store",
@@ -122,6 +124,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                     reason = "quota_exceeded",
                     message_count,
                     limit = limits.max_messages_per_account.get(),
+                    recipient_jid = ?message.recipient.as_str(),
                     "offline message policy decided"
                 );
                 return Err(StanzaErrorCondition::ResourceConstraint.into());
@@ -130,7 +133,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             let sequence = transaction
                 .push_offline_message(message.recipient, stored_at, stanza.as_bytes())
                 .await
-                .map_err(store_error)?;
+                .map_err(|error| store_error(error, message.recipient))?;
             Ok(StoreOutcome::Stored(sequence))
         })
     }
@@ -153,6 +156,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                     "available"
                 },
                 message_count = messages.len(),
+                owner_jid = ?account.as_str(),
                 "offline backlog snapshot read"
             );
             let Some(last) = messages.last() else {
@@ -194,7 +198,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
     }
 }
 
-fn store_error(error: OfflineError) -> StanzaErrorCondition {
+fn store_error(error: OfflineError, recipient: &AccountKey) -> StanzaErrorCondition {
     let reason = match &error {
         OfflineError::NoAccount => "no_account",
         OfflineError::ValueTooLarge => "value_too_large",
@@ -204,6 +208,7 @@ fn store_error(error: OfflineError) -> StanzaErrorCondition {
         operation = "store",
         outcome = "rejected",
         reason,
+        recipient_jid = ?recipient.as_str(),
         "offline message policy decided"
     );
     offline_error(error)

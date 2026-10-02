@@ -81,7 +81,8 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Use structured `tracing` events and spans. Keep each event message static and put context in named fields.
 - Use `error` for failed operations or broken invariants, `warn` for recoverable protocol or policy violations, `info` for low-volume lifecycle and security events, `debug` for routing and state decisions, and `trace` for high-volume protocol mechanics.
 - Never log raw XML stanzas, message bodies, presence text, roster or vCard content, SASL payloads, credentials, tokens, TLS key material, or other secrets.
-- Do not log full JIDs, IP addresses, XMPP stream IDs, or client-provided stanza IDs by default. Use log-specific correlation IDs. Pass necessary identifiers through one redaction or pseudonymization helper.
+- Include relevant bare or full JIDs in structured log fields when they identify the account or resource involved in an operation.
+- Do not log IP addresses, XMPP stream IDs, or client-provided stanza IDs by default. Use log-specific correlation IDs. Pass these identifiers through one redaction or pseudonymization helper when needed.
 - Log protocol metadata instead of payloads. Prefer fields such as `connection_id`, `direction`, `stream_phase`, `stanza_kind`, `namespace`, `outcome`, `latency_ms`, and `bytes`.
 - Treat every client-provided value as untrusted. Bound its length and sanitize control characters before logging it.
 - Log an error once at the layer that handles it. Lower layers must return contextual errors instead of logging duplicates.

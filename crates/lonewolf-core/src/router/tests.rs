@@ -32,6 +32,163 @@ fn run_test(test: impl Future<Output = TestResult>) -> TestResult {
     Runtime::new()?.block_on(timeout(TIMEOUT, test))?
 }
 
+#[test]
+fn absent_account_message_targets_distinguish_offline_from_missing_resources() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        for (to, kind, expected) in [
+            ("alice@localhost", "normal", RouterError::Offline),
+            ("alice@localhost", "chat", RouterError::Offline),
+            ("alice@localhost", "headline", RouterError::Offline),
+            ("alice@localhost/missing", "normal", RouterError::Offline),
+            ("alice@localhost/missing", "chat", RouterError::Offline),
+            ("alice@localhost/missing", "headline", RouterError::NotFound),
+            ("localhost", "normal", RouterError::NotFound),
+        ] {
+            let stanza = parse_stanza(&format!("<message to='{to}' type='{kind}'/>")).await?;
+            assert_eq!(
+                handle.route_message(stanza).await,
+                Err(expected),
+                "{to} {kind}"
+            );
+        }
+        let error = parse_stanza("<message to='alice@localhost/missing' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>").await?;
+        assert_eq!(
+            handle.route_message(error).await,
+            Err(RouterError::NotFound)
+        );
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn unavailable_negative_and_disconnected_resources_produce_offline() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let resource = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        for priority in [None, Some(-1)] {
+            resource
+                .handle()
+                .set_presence(
+                    priority,
+                    presence("desk").await?,
+                    Some(unavailable_presence("desk").await?),
+                )
+                .await?;
+            for (to, kind) in [
+                ("alice@localhost", "normal"),
+                ("alice@localhost", "chat"),
+                ("alice@localhost", "headline"),
+                ("alice@localhost/missing", "normal"),
+                ("alice@localhost/missing", "chat"),
+            ] {
+                let stanza = parse_stanza(&format!("<message to='{to}' type='{kind}'/>")).await?;
+                assert_eq!(
+                    handle.route_message(stanza).await,
+                    Err(RouterError::Offline)
+                );
+            }
+            assert!(resource.take_queued().is_empty());
+        }
+        drop(resource);
+        assert_eq!(
+            handle.route_message(stanza("alice@localhost").await?).await,
+            Err(RouterError::Offline)
+        );
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn missing_normal_resource_does_not_fall_back_to_an_eligible_sibling() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let resource = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        resource
+            .handle()
+            .set_presence(
+                Some(0),
+                presence("desk").await?,
+                Some(unavailable_presence("desk").await?),
+            )
+            .await?;
+        assert_eq!(
+            handle
+                .route_message(stanza("alice@localhost/missing").await?)
+                .await,
+            Err(RouterError::NotFound)
+        );
+        let chat = parse_stanza("<message to='alice@localhost/missing' type='chat'/>").await?;
+        handle.route_message(chat).await?;
+        assert_eq!(
+            receive_routed(&resource)
+                .await?
+                .resolve()?
+                .to()?
+                .ok_or("missing target")?
+                .as_str(),
+            "alice@localhost/missing"
+        );
+        drop(resource);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn full_eligible_mailboxes_remain_busy_instead_of_offline() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let resource = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        resource
+            .handle()
+            .set_presence(
+                Some(0),
+                presence("desk").await?,
+                Some(unavailable_presence("desk").await?),
+            )
+            .await?;
+        for _ in 0..64 {
+            handle
+                .route_full(stanza("alice@localhost/desk").await?)
+                .await?;
+        }
+        for kind in ["normal", "chat", "headline"] {
+            let stanza =
+                parse_stanza(&format!("<message to='alice@localhost' type='{kind}'/>")).await?;
+            assert_eq!(handle.route_message(stanza).await, Err(RouterError::Busy));
+        }
+        assert_eq!(
+            handle
+                .route_message(stanza("alice@localhost/missing").await?)
+                .await,
+            Err(RouterError::NotFound)
+        );
+        drop(resource);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
 async fn setup() -> Result<(Router<GlobalChunkAllocator>, CoreDispatcher), Box<dyn Error>> {
     let two = NonZeroUsize::MIN.saturating_add(1);
     let dispatcher = match CoreDispatcher::new(two, two) {

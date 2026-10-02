@@ -65,6 +65,7 @@ struct Links<A: ChunkAllocator> {
 
 pub(crate) struct PresenceChange<A: ChunkAllocator> {
     pub became_available: bool,
+    pub became_eligible: bool,
     pub became_unavailable: bool,
     /// Write these deliveries before the update's echo to preserve mailbox order.
     pub preceding: Vec<RoutedStanza<A>>,
@@ -482,6 +483,9 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
 }
 
 impl<A: ChunkAllocator> Registration<A> {
+    pub(crate) fn liveness(&self) -> SessionLiveness {
+        SessionLiveness(Arc::clone(&self.alive))
+    }
     pub fn account(&self) -> &AccountKey {
         &self.account
     }
@@ -582,6 +586,15 @@ impl<A: ChunkAllocator> Registration<A> {
             token: self.token,
             shard: self.links.shard.clone(),
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionLiveness(Arc<AtomicBool>);
+
+impl SessionLiveness {
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -1333,6 +1346,8 @@ impl<A: ChunkAllocator> Shard<A> {
                 return Err(RouterError::NotFound);
             }
             let became_available = priority.is_some() && source.priority.is_none();
+            let became_eligible = priority.is_some_and(|priority| priority >= 0)
+                && source.priority.is_none_or(|priority| priority < 0);
             let became_unavailable = priority.is_none() && source.priority.is_some();
             let preceding = take_queued(&source.inbound);
             let siblings = if became_available {
@@ -1345,7 +1360,15 @@ impl<A: ChunkAllocator> Shard<A> {
             } else {
                 Vec::new()
             };
-            ((became_available, became_unavailable, preceding), siblings)
+            (
+                (
+                    became_available,
+                    became_eligible,
+                    became_unavailable,
+                    preceding,
+                ),
+                siblings,
+            )
         };
 
         let mut failed = Vec::new();
@@ -1378,9 +1401,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 RetireCause::Evicted,
             );
         }
-        let (became_available, became_unavailable, preceding) = change;
+        let (became_available, became_eligible, became_unavailable, preceding) = change;
         Ok(PresenceChange {
             became_available,
+            became_eligible,
             became_unavailable,
             preceding,
             siblings,

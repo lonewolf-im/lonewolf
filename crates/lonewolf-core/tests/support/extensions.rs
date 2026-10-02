@@ -250,6 +250,26 @@ impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for SlowOffline {
     }
 }
 impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for SlowOffline {
+    fn backlog<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        transaction: &'a RedbRead,
+    ) -> PresenceFuture<'a, Option<lonewolf_extension::message::Backlog>> {
+        <Offline as MessageHandler<A, RedbStorage>>::backlog(&self.offline, account, transaction)
+    }
+    fn acknowledge<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        through: lonewolf_storage::offline::OfflineSequence,
+        transaction: &'a mut RedbWrite,
+    ) -> lonewolf_extension::ExtensionFuture<'a, Result<(), HandlerError>> {
+        <Offline as MessageHandler<A, RedbStorage>>::acknowledge(
+            &self.offline,
+            account,
+            through,
+            transaction,
+        )
+    }
     fn store<'a>(
         &'a self,
         message: UndeliverableMessage<'a, A>,

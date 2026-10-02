@@ -105,6 +105,12 @@ async fn delete<A: ChunkAllocator + Clone>(
             error => DeleterError::Other(Box::new(error)),
         })?;
     let ((), mut ticket) = router.order().fix(accounts, transaction.commit()).await?;
+    tracing::info!(
+        operation = "cleanup",
+        outcome = "committed",
+        owner_jid = ?account.as_str(),
+        "offline account state cleared"
+    );
     ticket.turn().await;
     for (extension, deliver) in deliveries {
         if let Err(error) = deliver(&delivery).await {

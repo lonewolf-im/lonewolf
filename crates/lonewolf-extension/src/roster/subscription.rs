@@ -41,7 +41,6 @@ impl Parties {
     }
 }
 
-/// Refuses a sender whose account is gone and reports whether the target is stored.
 async fn check_parties(
     transaction: &impl AccountReads,
     parties: &Parties,
@@ -88,6 +87,25 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
     };
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
+        let (outcome_name, item_count) = match &outcome {
+            RequestOutcome::Pending { push } => ("pending", usize::from(push.is_some())),
+            RequestOutcome::AutoApproved { approved: Some(_) } => ("auto_approved", 1),
+            RequestOutcome::PreApproved { grantor, requester } => (
+                "pre_approved",
+                usize::from(grantor.is_some()) + usize::from(requester.is_some()),
+            ),
+            RequestOutcome::AutoApproved { approved: None } | RequestOutcome::ContactMissing => {
+                ("no_change", 0)
+            }
+        };
+        tracing::info!(
+            operation = "subscribe",
+            outcome = outcome_name,
+            item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
+            "roster operation committed"
+        );
         Box::pin(async move {
             match outcome {
                 RequestOutcome::Pending { push } => {
@@ -129,7 +147,17 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
     stanza: &RoutedStanza<A>,
 ) -> Result<Effects<A>, HandlerError> {
     if !check_parties(transaction, &parties).await? {
-        return Ok(Effects::none());
+        return Ok(Effects::new(Vec::new(), move |_| {
+            tracing::info!(
+                operation = "approve",
+                outcome = "processed",
+                item_count = 0,
+                sender_jid = ?parties.sender.as_str(),
+                recipient_jid = ?parties.target.as_str(),
+                "roster operation committed"
+            );
+            Box::pin(async { Ok(()) })
+        }));
     }
     let accounts = parties.accounts();
     let Parties {
@@ -157,6 +185,24 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
     };
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
+        let item_count = usize::from(target_mutation.is_some())
+            + usize::from(sender_mutation.is_some())
+            + usize::from(pre_approval.is_some());
+        let outcome = if pre_approval.is_some() {
+            "pre_approved"
+        } else if item_count != 0 {
+            "approved"
+        } else {
+            "processed"
+        };
+        tracing::info!(
+            operation = "approve",
+            outcome,
+            item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
+            "roster operation committed"
+        );
         Box::pin(async move {
             if let Some(mutation) = target_mutation {
                 delivery.to_tagged(SessionTag::Interested, stanza).await?;
@@ -196,6 +242,20 @@ pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
     .await?;
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
+        let item_count =
+            usize::from(outcome.subscriber.is_some()) + usize::from(outcome.grantor.is_some());
+        tracing::info!(
+            operation = "cancel",
+            outcome = if item_count != 0 || outcome.route || outcome.send_unavailable {
+                "cancelled"
+            } else {
+                "processed"
+            },
+            item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
+            "roster operation committed"
+        );
         Box::pin(async move {
             if outcome.send_unavailable {
                 delivery.unavailable_presence(&sender, &target).await?;
@@ -236,6 +296,20 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
     .await?;
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
+        let item_count =
+            usize::from(outcome.contact.is_some()) + usize::from(outcome.subscriber.is_some());
+        tracing::info!(
+            operation = "unsubscribe",
+            outcome = if item_count != 0 || outcome.notify_contact {
+                "withdrawn"
+            } else {
+                "processed"
+            },
+            item_count,
+            sender_jid = ?sender.as_str(),
+            recipient_jid = ?target.as_str(),
+            "roster operation committed"
+        );
         Box::pin(async move {
             if outcome.notify_contact {
                 delivery.to_tagged(SessionTag::Interested, stanza).await?;
@@ -254,8 +328,7 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
     }))
 }
 
-/// Removes an item and, for a local contact, withdraws and cancels the subscriptions
-/// the two rosters record, in the order the separate presence flows use.
+/// Withdraw and cancel in the same order as separate subscription requests.
 pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
     transaction: &mut W,
     owner: AccountKey,
@@ -277,6 +350,14 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
     let mut accounts = vec![owner.clone()];
     accounts.extend(contact_account.clone());
     Ok(Effects::new(accounts, move |delivery| {
+        tracing::info!(
+            operation = "remove",
+            outcome = "removed",
+            item_count = 1,
+            owner_jid = ?owner.as_str(),
+            contact_jid = ?contact.as_str(),
+            "roster operation committed"
+        );
         Box::pin(async move {
             push_removal(&owner, contact, removal.version, delivery).await?;
             if let Some(contact_account) = contact_account {
@@ -293,10 +374,7 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
     }))
 }
 
-/// Clears every trace of a deleted account inside the deletion's transaction: its own
-/// roster and pending requests, and the subscriptions and requests its local contacts
-/// held with it. The effects tell every contact what it lost; a failed delivery does
-/// not stop the others, and the first failure is reported at the end.
+/// Continue cleanup notifications after a failure and return the first error.
 pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
     transaction: &mut W,
     account: &AccountKey,
@@ -305,6 +383,8 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
     let account_jid = RosterJid::from(account);
     let items = transaction.roster(account).await?.items;
     let requests = transaction.pending_requests(account).await?;
+    let item_count = items.len();
+    let pending_count = requests.len();
     let mut removals = Vec::new();
     for item in items {
         let contact = stored_local_account(transaction, &item.jid, hosts).await?;
@@ -341,6 +421,16 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
     accounts.extend(cancellations.iter().map(|(sender, _)| sender.clone()));
     let owner = account.clone();
     Ok(Effects::new(accounts, move |delivery| {
+        tracing::info!(
+            operation = "cleanup",
+            outcome = "committed",
+            item_count,
+            pending_count,
+            removal_count = removals.len(),
+            cancellation_count = cancellations.len(),
+            owner_jid = ?owner.as_str(),
+            "roster operation committed"
+        );
         Box::pin(async move {
             let mut failure = None;
             for (contact, removal) in removals {
@@ -362,7 +452,6 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
     }))
 }
 
-/// The stored local account a roster JID names, if any.
 async fn stored_local_account(
     transaction: &impl AccountReads,
     jid: &RosterJid,
@@ -374,7 +463,6 @@ async fn stored_local_account(
     }
 }
 
-/// Tells a requester that its pending request ended with the grantor's deletion.
 async fn notify_cancelled_requester<A: ChunkAllocator>(
     owner: &AccountKey,
     sender: &AccountKey,
@@ -393,9 +481,8 @@ async fn notify_cancelled_requester<A: ChunkAllocator>(
     Ok(())
 }
 
-/// Sends the contact what losing the owner implies and returns whether the contact
-/// had granted the owner its presence.
-/// Each side's resource addresses are only revealed under that side's own grant.
+/// Reveal each side's resource addresses only under that side's grant.
+/// Returns whether the contact granted the owner.
 async fn notify_removed_contact<A: ChunkAllocator>(
     owner: &AccountKey,
     contact: &AccountKey,
@@ -428,7 +515,6 @@ async fn notify_removed_contact<A: ChunkAllocator>(
     Ok(contact_granted)
 }
 
-/// The account a roster JID would name on this server, whether or not it is stored.
 fn local_candidate(jid: &RosterJid, hosts: &dyn HostLookup) -> Option<AccountKey> {
     AccountKey::try_from(jid)
         .ok()

@@ -215,9 +215,9 @@ path = "accounts.redb"
             assert!(event.contains(&format!("command={action:?}")), "{event}");
         }
         assert!(event.contains(&format!("status={status}")), "{event}");
+        assert!(!event.contains("private-account"), "{event}");
     }
     assert!(events.next().is_none());
-    assert!(!logs.contains("private-account"));
     assert!(!logs.contains("private-token"));
     assert!(!logs.contains("private-password"));
     assert!(!logs.contains("private-new-password"));

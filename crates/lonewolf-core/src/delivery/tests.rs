@@ -37,6 +37,8 @@ use crate::router::{Router, RouterError};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+mod logging;
+
 struct AckNotice {
     done: Mutex<Option<oneshot::Sender<()>>>,
     release: Mutex<Option<oneshot::Receiver<()>>>,
@@ -187,6 +189,7 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
 
 #[test]
 fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgement() -> TestResult {
+    let capture = crate::logging::tests::Capture::new()?;
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
@@ -257,11 +260,23 @@ fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgemen
             .fix(vec![owner.clone()], deletion.commit())
             .await?;
         acknowledging.await?;
+        assert_eq!(
+            capture.count("operation=\"reroute\" outcome=\"queued\"")?,
+            1
+        );
+        assert_eq!(
+            capture.count("operation=\"acknowledge_live\" outcome=\"committed\"")?,
+            0
+        );
         assert!(retirement.turn().now_or_never().is_none());
         release
             .send(())
             .map_err(|_| "acknowledgement gate closed")?;
         assert!(matches!(pending.finished().await, Some(Ok(()))));
+        assert_eq!(
+            capture.count("operation=\"acknowledge_live\" outcome=\"committed\"")?,
+            1
+        );
         retirement.turn().await;
         handle.retire_account(&owner).await?;
         drop(retirement);

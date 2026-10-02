@@ -39,3 +39,6 @@ pub(crate) fn init(level: LogLevel) -> Result<WorkerGuard, Box<dyn Error + Send 
         .try_init()?;
     Ok(guard)
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

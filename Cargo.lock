@@ -1221,6 +1221,7 @@ dependencies = [
  "lonewolf-xmpp",
  "tempfile",
  "time",
+ "tracing",
 ]
 
 [[package]]

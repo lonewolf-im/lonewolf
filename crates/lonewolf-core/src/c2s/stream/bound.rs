@@ -713,11 +713,17 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         )
         .map_err(|_| CloseOutcome::InternalError)?;
         let Some(handler) = self.router.message_handler(recipient.domain()).cloned() else {
+            tracing::info!(
+                operation = "store",
+                outcome = "rejected",
+                reason = "missing_handler",
+                "offline message policy decided"
+            );
             return self
                 .reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
                 .await;
         };
-        let bytes = if tracing::enabled!(tracing::Level::DEBUG) {
+        let bytes = if tracing::enabled!(tracing::Level::INFO) {
             stanza_bytes(&routed)?
         } else {
             0
@@ -743,12 +749,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         match outcome {
             Err(HandlerError::Stanza(condition)) => {
                 drop(transaction);
-                tracing::debug!(outcome = "rejected", bytes, "offline message handled");
                 self.reply_error(&routed, condition).await
             }
             Ok(StoreOutcome::Discarded) => {
                 drop(transaction);
-                tracing::debug!(outcome = "discarded", bytes, "offline message handled");
                 Ok(())
             }
             Ok(StoreOutcome::Stored(sequence)) => {
@@ -1113,6 +1117,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
             Arc<dyn MessageHandler<A, RedbStorage>>,
             OfflineSequence,
         )> = None;
+        let mut offline_replay = false;
+        let mut messages_written = 0usize;
+        let mut messages_skipped = 0usize;
+        let mut pending_count = 0usize;
         while let Some(output) = self.queue.pop_front() {
             match output {
                 Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
@@ -1131,19 +1139,27 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
                             )
                             .await?;
                         self.writer.write_routed(&stanza).await?;
+                        pending_count += 1;
                     }
                 }
                 Output::Offline { backlog, handler } => {
+                    offline_replay = true;
                     for message in backlog.messages {
                         match self
                             .parse_stored(&message.stanza, StoredKind::Message)
                             .await
                         {
-                            Ok(stanza) => self.writer.write_routed(&stanza).await?,
-                            Err(StoredRecordError::InvalidContent) => tracing::error!(
-                                sequence = message.sequence.get(),
-                                "stored offline message rejected"
-                            ),
+                            Ok(stanza) => {
+                                self.writer.write_routed(&stanza).await?;
+                                messages_written += 1;
+                            }
+                            Err(StoredRecordError::InvalidContent) => {
+                                messages_skipped += 1;
+                                tracing::error!(
+                                    sequence = message.sequence.get(),
+                                    "stored offline message rejected"
+                                );
+                            }
                             Err(StoredRecordError::ReplayFailure) => {
                                 return Err(CloseOutcome::InternalError);
                             }
@@ -1159,6 +1175,23 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
             }
         }
         self.writer.flush().await?;
+        if pending_count != 0 {
+            tracing::info!(
+                operation = "replay",
+                outcome = "flushed",
+                pending_count,
+                "pending subscriptions flushed"
+            );
+        }
+        if offline_replay {
+            tracing::info!(
+                operation = "replay",
+                outcome = "flushed",
+                messages_written,
+                messages_skipped,
+                "offline replay flushed"
+            );
+        }
         if let Some((handler, through)) = acknowledgement {
             self.acknowledge(handler, through);
         }
@@ -1294,6 +1327,11 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
         // Check after writer admission so account recreation cannot reset these sequences.
         if !liveness.is_alive() {
+            tracing::info!(
+                operation = "acknowledge_replay",
+                outcome = "skipped_stale_session",
+                "offline backlog acknowledgement handled"
+            );
             return Ok(());
         }
         let through = watermark.get();
@@ -1304,6 +1342,11 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
             .commit()
             .await
             .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        tracing::info!(
+            operation = "acknowledge_replay",
+            outcome = "committed",
+            "offline backlog acknowledgement handled"
+        );
         if watermark.get() <= through {
             return Ok(());
         }
@@ -1432,6 +1475,13 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
                 replay.extend(presence);
             }
             requests = mem::take(&mut audience.pending);
+            tracing::info!(
+                contact_count = audience.contacts.len(),
+                replay_count = replay.len(),
+                pending_count = requests.len(),
+                subscriber_count = audience.subscribers.len(),
+                "initial presence prepared"
+            );
         }
         let mut covered = Vec::new();
         if let Some(audience) = audience

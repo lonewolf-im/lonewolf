@@ -11,54 +11,51 @@ use lonewolf_storage::roster::{
 
 pub(super) type ItemMutation = Option<RosterMutation<RosterItem>>;
 
-/// How a subscription request was filed.
+pub(super) struct PendingResolution {
+    pub mutation: ItemMutation,
+    pub request_removed: bool,
+}
+
 pub(super) enum RequestOutcome {
-    /// The contact already grants the requester; `approved` is the requester's item once
-    /// its outstanding request resolved, or `None` when it recorded none.
-    AutoApproved { approved: ItemMutation },
-    /// The contact had pre-approved the requester, so the request is answered on the
-    /// contact's behalf: `grantor` is the contact's item, now granting without the
-    /// pre-approval, and `requester` the requester's item once it sees the contact.
+    AutoApproved {
+        approved: ItemMutation,
+    },
     PreApproved {
         grantor: ItemMutation,
         requester: ItemMutation,
     },
-    /// The request waits for the contact; `push` is the requester's item when it newly
-    /// records the outstanding request.
-    Pending { push: ItemMutation },
-    /// The contact's account is gone, so the request cannot be stored for it.
+    Pending {
+        push: ItemMutation,
+    },
     ContactMissing,
 }
 
-/// The effects of a grantor cancelling a contact's subscription.
 pub(super) struct Cancellation {
-    /// Whether the cancellation reaches the contact: it held a grant or a pending request.
+    pub request_removed: bool,
+    /// Route only when a local contact held a grant or request.
     pub route: bool,
-    /// Whether the grantor's presence was visible to the contact until now.
+    /// The contact could see the grantor before cancellation.
     pub send_unavailable: bool,
     pub grantor: ItemMutation,
     pub subscriber: ItemMutation,
 }
 
-/// The effects of a subscriber withdrawing from a contact.
 pub(super) struct Withdrawal {
-    /// Whether the contact granted the subscriber and so learns of the withdrawal.
+    pub request_removed: bool,
+    /// Notify only when the contact granted the subscriber.
     pub notify_contact: bool,
     pub subscriber: ItemMutation,
     pub contact: ItemMutation,
 }
 
-/// The effects of removing a roster item.
 pub(super) struct Removal {
-    /// The owner's roster version after the removal.
     pub version: RosterVersion,
-    /// The removed item's subscription, the owner's own grant to the contact.
+    /// The owner's subscription to the contact before removal.
     pub subscription: RosterSubscription,
-    /// Whether the contact had a subscription request pending with the owner.
+    /// The contact's request to the owner before removal.
     pub pending_request: bool,
-    /// The contact's subscription to the owner before the removal, when it held an item.
+    /// The contact's subscription to the owner before removal.
     pub contact_before: Option<RosterSubscription>,
-    /// The contact's item after losing every subscription to the owner.
     pub contact: ItemMutation,
 }
 
@@ -79,7 +76,6 @@ pub(super) fn bare_item(jid: RosterJid) -> RosterItem {
     }
 }
 
-/// Resolves the owner's outstanding request: the owner now sees the contact.
 pub(super) fn approve_pending_out(
     mut subscription: RosterSubscription,
 ) -> Option<RosterSubscription> {
@@ -95,7 +91,7 @@ pub(super) fn approve_pending_out(
     Some(subscription)
 }
 
-/// Notes the owner's pre-approval of a contact it does not grant yet (RFC 6121 §3.4.2).
+/// Pre-approval follows RFC 6121 §3.4.2.
 pub(super) fn pre_approve(mut subscription: RosterSubscription) -> Option<RosterSubscription> {
     if grants(subscription.state) || subscription.approved {
         return None;
@@ -104,7 +100,6 @@ pub(super) fn pre_approve(mut subscription: RosterSubscription) -> Option<Roster
     Some(subscription)
 }
 
-/// Grants the contact the owner's presence.
 pub(super) fn grant(mut subscription: RosterSubscription) -> Option<RosterSubscription> {
     subscription.state = match subscription.state {
         SubscriptionState::None => SubscriptionState::From,
@@ -114,8 +109,7 @@ pub(super) fn grant(mut subscription: RosterSubscription) -> Option<RosterSubscr
     Some(subscription)
 }
 
-/// Applies `update` to the owner's item for `jid`, creating a bare item when absent, and
-/// writes the item when `update` returns a new subscription.
+/// An absent item becomes bare only when the update returns a change.
 pub(super) async fn update_subscription<W: WriteTransaction>(
     transaction: &mut W,
     owner: &AccountKey,
@@ -129,7 +123,7 @@ pub(super) async fn update_subscription<W: WriteTransaction>(
     write_subscription(transaction, owner, item, update).await
 }
 
-/// Like [`update_subscription`], but leaves an absent item absent.
+/// Leave an absent item absent.
 pub(super) async fn update_existing_subscription<W: WriteTransaction>(
     transaction: &mut W,
     owner: &AccountKey,
@@ -159,21 +153,25 @@ async fn write_subscription<W: WriteTransaction>(
     }))
 }
 
-/// Removes the request `sender` left with the owner and applies `update` to the owner's
-/// item for it. Returns `None` without writing when no request was pending.
+/// A removed request can leave the roster item unchanged.
 pub(super) async fn resolve_pending<W: WriteTransaction>(
     transaction: &mut W,
     owner: &AccountKey,
     sender: &RosterJid,
     update: impl FnOnce(RosterSubscription) -> Option<RosterSubscription>,
-) -> Result<ItemMutation, RosterError> {
+) -> Result<PendingResolution, RosterError> {
     if !transaction.remove_pending_request(owner, sender).await? {
-        return Ok(None);
+        return Ok(PendingResolution {
+            mutation: None,
+            request_removed: false,
+        });
     }
-    update_subscription(transaction, owner, sender, update).await
+    Ok(PendingResolution {
+        mutation: update_subscription(transaction, owner, sender, update).await?,
+        request_removed: true,
+    })
 }
 
-/// Files `requester`'s request to see `contact`, a stored local account.
 pub(super) async fn request_subscription<W: WriteTransaction>(
     transaction: &mut W,
     requester: &AccountKey,
@@ -238,8 +236,7 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
     Ok(RequestOutcome::Pending { push })
 }
 
-/// Cancels the grant `grantor` gave `contact`, or denies the contact's pending request.
-/// `subscriber` names the contact's local account and its view of the grantor, when stored.
+/// `subscriber` identifies a stored local account and its roster view of the grantor.
 pub(super) async fn cancel_subscription<W: WriteTransaction>(
     transaction: &mut W,
     grantor: &AccountKey,
@@ -291,6 +288,7 @@ pub(super) async fn cancel_subscription<W: WriteTransaction>(
         _ => None,
     };
     Ok(Cancellation {
+        request_removed: pending,
         route,
         send_unavailable,
         grantor: grantor_mutation,
@@ -298,8 +296,7 @@ pub(super) async fn cancel_subscription<W: WriteTransaction>(
     })
 }
 
-/// Withdraws `subscriber` from `contact`, or retracts its pending request.
-/// `recipient` names the contact's local account and its view of the subscriber, when stored.
+/// `recipient` identifies a stored local account and its roster view of the subscriber.
 pub(super) async fn unsubscribe<W: WriteTransaction>(
     transaction: &mut W,
     subscriber: &AccountKey,
@@ -307,17 +304,18 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
     recipient: Option<(&AccountKey, &RosterJid)>,
 ) -> Result<Withdrawal, RosterError> {
     let same_item = recipient.is_some_and(|(account, _)| account == subscriber);
-    let notify_contact = match recipient {
+    let (request_removed, notify_contact) = match recipient {
         Some((account, subscriber_jid)) => {
-            transaction
+            let removed = transaction
                 .remove_pending_request(account, subscriber_jid)
                 .await?;
-            transaction
+            let granted = transaction
                 .roster_item(account, subscriber_jid)
                 .await?
-                .is_some_and(|item| grants(item.subscription.state))
+                .is_some_and(|item| grants(item.subscription.state));
+            (removed, granted)
         }
-        None => false,
+        None => (false, false),
     };
     let subscriber_mutation =
         update_existing_subscription(transaction, subscriber, contact, |mut subscription| {
@@ -359,15 +357,14 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
         _ => None,
     };
     Ok(Withdrawal {
+        request_removed,
         notify_contact,
         subscriber: subscriber_mutation,
         contact: contact_mutation,
     })
 }
 
-/// Removes the owner's item for `contact`, drops pending requests in both directions, and
-/// clears the local contact's subscription to the owner. Returns `None` without writing
-/// when the item is absent.
+/// Leave stored requests unchanged when the roster item is absent.
 pub(super) async fn remove_item<W: WriteTransaction>(
     transaction: &mut W,
     owner: &AccountKey,

@@ -162,13 +162,25 @@ where
             let owner = owner_of(&request)?;
             let known = xml::parse_get(request.payload)?;
             let snapshot = transaction.roster(&owner).await?;
+            let item_count = snapshot.items.len();
+            let outcome;
             let payload = match versioning::answer(known, &snapshot) {
                 versioning::Answer::Full { stamped } => {
+                    outcome = "full";
                     let version = stamped.then_some(snapshot.version);
                     Some(xml::build_response(snapshot.items, version, response)?)
                 }
-                versioning::Answer::Unchanged => None,
+                versioning::Answer::Unchanged => {
+                    outcome = "unchanged";
+                    None
+                }
             };
+            tracing::info!(
+                operation = "get",
+                outcome,
+                item_count = if payload.is_some() { item_count } else { 0 },
+                "roster response prepared"
+            );
             let effects = Effects::new(vec![owner], |delivery| {
                 delivery.tag_session(SessionTag::Interested)
             });
@@ -204,6 +216,12 @@ where
                         value: item,
                     };
                     let effects = Effects::new(vec![owner.clone()], move |delivery| {
+                        tracing::info!(
+                            operation = "upsert",
+                            outcome = "upserted",
+                            item_count = 1,
+                            "roster operation committed"
+                        );
                         Box::pin(async move { push_roster(&owner, mutation, delivery).await })
                     });
                     Ok(IqReply::new(None, effects))

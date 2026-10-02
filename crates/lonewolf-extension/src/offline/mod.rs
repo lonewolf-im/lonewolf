@@ -89,9 +89,21 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                 view.stanza_type(),
                 StanzaType::Message(MessageType::Normal | MessageType::Chat)
             ) {
+                tracing::info!(
+                    operation = "store",
+                    outcome = "rejected",
+                    reason = "unsupported_type",
+                    "offline message policy decided"
+                );
                 return Err(StanzaErrorCondition::ServiceUnavailable.into());
             }
             if xml::chat_state_only(&view)? {
+                tracing::info!(
+                    operation = "store",
+                    outcome = "discarded",
+                    reason = "chat_state_only",
+                    "offline message policy decided"
+                );
                 return Ok(StoreOutcome::Discarded);
             }
             let limits = self
@@ -99,19 +111,26 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                 .get(message.recipient.domain())
                 .copied()
                 .unwrap_or_default();
-            if transaction
+            let message_count = transaction
                 .offline_count(message.recipient)
                 .await
-                .map_err(offline_error)?
-                >= limits.max_messages_per_account.get() as usize
-            {
+                .map_err(store_error)?;
+            if message_count >= limits.max_messages_per_account.get() as usize {
+                tracing::info!(
+                    operation = "store",
+                    outcome = "rejected",
+                    reason = "quota_exceeded",
+                    message_count,
+                    limit = limits.max_messages_per_account.get(),
+                    "offline message policy decided"
+                );
                 return Err(StanzaErrorCondition::ResourceConstraint.into());
             }
             let (stored_at, stanza) = xml::stamped(&message, scratch)?;
             let sequence = transaction
                 .push_offline_message(message.recipient, stored_at, stanza.as_bytes())
                 .await
-                .map_err(offline_error)?;
+                .map_err(store_error)?;
             Ok(StoreOutcome::Stored(sequence))
         })
     }
@@ -126,6 +145,16 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                 .offline_messages(account)
                 .await
                 .map_err(offline_error)?;
+            tracing::info!(
+                operation = "backlog",
+                outcome = if messages.is_empty() {
+                    "empty"
+                } else {
+                    "available"
+                },
+                message_count = messages.len(),
+                "offline backlog snapshot read"
+            );
             let Some(last) = messages.last() else {
                 return Ok(None);
             };
@@ -163,6 +192,21 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             Ok(())
         })
     }
+}
+
+fn store_error(error: OfflineError) -> StanzaErrorCondition {
+    let reason = match &error {
+        OfflineError::NoAccount => "no_account",
+        OfflineError::ValueTooLarge => "value_too_large",
+        OfflineError::Storage(_) => "internal_error",
+    };
+    tracing::info!(
+        operation = "store",
+        outcome = "rejected",
+        reason,
+        "offline message policy decided"
+    );
+    offline_error(error)
 }
 
 fn offline_error(error: OfflineError) -> StanzaErrorCondition {

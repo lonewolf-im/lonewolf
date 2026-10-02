@@ -116,36 +116,63 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                 .fix(vec![stored.recipient.clone()], transaction.commit())
                 .await
                 .map_err(|_| EffectsError::Commit)?;
-            tracing::debug!(
+            tracing::info!(
+                operation = "store",
                 outcome = "stored",
                 bytes = stored.bytes,
                 "offline message handled"
             );
             ticket.turn().await;
             let _ = report_turned.send(());
-            if router.route_message(stored.stanza).await.is_ok() {
-                tracing::debug!(
-                    outcome = "delivered_live",
-                    bytes = stored.bytes,
-                    "offline message handled"
-                );
-                let acknowledged: Result<(), HandlerError> = async {
-                    let mut transaction = storage
-                        .begin_write()
-                        .await
-                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                    handler
-                        .acknowledge_one(&stored.recipient, stored.sequence, &mut transaction)
-                        .await?;
-                    transaction
-                        .commit()
-                        .await
-                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                    Ok(())
+            match router.route_message(stored.stanza).await {
+                Ok(()) => {
+                    tracing::info!(
+                        operation = "reroute",
+                        outcome = "queued",
+                        "offline message rerouted"
+                    );
+                    let acknowledged: Result<(), HandlerError> = async {
+                        let mut transaction = storage
+                            .begin_write()
+                            .await
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                        handler
+                            .acknowledge_one(&stored.recipient, stored.sequence, &mut transaction)
+                            .await?;
+                        transaction
+                            .commit()
+                            .await
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                        tracing::info!(
+                            operation = "acknowledge_live",
+                            outcome = "committed",
+                            "offline message acknowledgement handled"
+                        );
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(error) = acknowledged {
+                        tracing::error!(error = ?error, "offline message acknowledgement failed");
+                    }
                 }
-                .await;
-                if let Err(error) = acknowledged {
-                    tracing::error!(error = ?error, "offline message acknowledgement failed");
+                Err(error) => {
+                    let reason = match error {
+                        RouterError::InvalidTarget => "invalid_target",
+                        RouterError::RemoteUnsupported => "remote_unsupported",
+                        RouterError::InvalidResource => "invalid_resource",
+                        RouterError::ResourceLimit => "resource_limit",
+                        RouterError::NotFound => "not_found",
+                        RouterError::Offline => "offline",
+                        RouterError::Busy => "busy",
+                        RouterError::Unavailable => "unavailable",
+                        RouterError::Stopped => "stopped",
+                    };
+                    tracing::info!(
+                        operation = "reroute",
+                        outcome = "retained",
+                        reason,
+                        "offline message rerouted"
+                    );
                 }
             }
             // Keep account recreation behind this acknowledgement.

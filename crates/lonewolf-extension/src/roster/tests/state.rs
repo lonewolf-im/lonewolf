@@ -224,8 +224,7 @@ fn resolving_without_a_pending_request_writes_nothing() -> TestResult {
         })
         .await
     })?;
-    assert!(!resolution.request_removed);
-    assert!(resolution.mutation.is_none());
+    assert!(resolution.is_none());
     assert!(item(&roster, &owner, &sender).is_none());
     assert_eq!(version(&roster, &owner), 0);
     Ok(())
@@ -247,9 +246,8 @@ fn resolving_a_pending_request_removes_it_and_applies_the_transition() -> TestRe
             Some(current)
         })
         .await
-    })?;
-    assert!(resolved.request_removed);
-    let resolved = resolved.mutation.ok_or("missing pending request")?;
+    })?
+    .ok_or("missing pending request")?;
     assert_eq!(resolved.version.get(), 1);
     assert_eq!(resolved.value.subscription.state, SubscriptionState::From);
     assert!(pending(&roster, &owner).is_empty());
@@ -263,8 +261,7 @@ fn resolving_a_pending_request_removes_it_and_applies_the_transition() -> TestRe
     let denied = write(&roster, async |tx| {
         state::resolve_pending(tx, &owner, &sender, |_| None).await
     })?;
-    assert!(denied.request_removed);
-    assert!(denied.mutation.is_none());
+    assert!(denied.is_none());
     assert!(pending(&roster, &owner).is_empty());
     assert_eq!(version(&roster, &owner), 1);
     Ok(())

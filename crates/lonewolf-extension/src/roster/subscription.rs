@@ -148,7 +148,7 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
         return Ok(Effects::new(Vec::new(), |_| {
             tracing::info!(
                 operation = "approve",
-                outcome = "no_change",
+                outcome = "processed",
                 item_count = 0,
                 "roster operation committed"
             );
@@ -169,9 +169,8 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
         state::approve_pending_out,
     )
     .await?;
-    let resolution =
+    let sender_mutation =
         state::resolve_pending(transaction, &sender, &target_jid, state::grant).await?;
-    let sender_mutation = resolution.mutation;
     // An approval with no request to resolve is kept as a pre-approval and never routed.
     let pre_approval = match sender_mutation {
         Some(_) => None,
@@ -187,16 +186,15 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
             + usize::from(pre_approval.is_some());
         let outcome = if pre_approval.is_some() {
             "pre_approved"
-        } else if item_count != 0 || resolution.request_removed {
+        } else if item_count != 0 {
             "approved"
         } else {
-            "no_change"
+            "processed"
         };
         tracing::info!(
             operation = "approve",
             outcome,
             item_count,
-            requests_removed = usize::from(resolution.request_removed),
             "roster operation committed"
         );
         Box::pin(async move {
@@ -242,17 +240,12 @@ pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
             usize::from(outcome.subscriber.is_some()) + usize::from(outcome.grantor.is_some());
         tracing::info!(
             operation = "cancel",
-            outcome = if item_count != 0
-                || outcome.request_removed
-                || outcome.route
-                || outcome.send_unavailable
-            {
+            outcome = if item_count != 0 || outcome.route || outcome.send_unavailable {
                 "cancelled"
             } else {
-                "no_change"
+                "processed"
             },
             item_count,
-            requests_removed = usize::from(outcome.request_removed),
             "roster operation committed"
         );
         Box::pin(async move {
@@ -299,13 +292,12 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
             usize::from(outcome.contact.is_some()) + usize::from(outcome.subscriber.is_some());
         tracing::info!(
             operation = "unsubscribe",
-            outcome = if item_count != 0 || outcome.request_removed || outcome.notify_contact {
+            outcome = if item_count != 0 || outcome.notify_contact {
                 "withdrawn"
             } else {
-                "no_change"
+                "processed"
             },
             item_count,
-            requests_removed = usize::from(outcome.request_removed),
             "roster operation committed"
         );
         Box::pin(async move {

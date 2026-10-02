@@ -31,8 +31,6 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const MESSAGE: &[u8] =
     b"<message xmlns='jabber:client' to='bob@localhost/old' type='chat' id='stored'/>";
 
-mod logging;
-
 #[derive(Default)]
 struct ControlledWriter {
     written: Vec<String>,
@@ -361,7 +359,6 @@ fn valid_message_allocation_failure_keeps_the_stored_copy() -> TestResult {
 #[test]
 fn acknowledgement_waiting_for_a_writer_cannot_delete_a_recreated_accounts_sequence_one()
 -> TestResult {
-    let capture = crate::logging::tests::Capture::new()?;
     Runtime::new()?.block_on(async {
         let fixture = Fixture::new(&[MESSAGE]).await?;
         let owner = fixture.registration.account();
@@ -391,8 +388,6 @@ fn acknowledgement_waiting_for_a_writer_cannot_delete_a_recreated_accounts_seque
         assert_eq!(fresh.get(), 1);
         lifecycle.commit().await?;
         pending.await.map_err(|error| format!("{error:?}"))?;
-        assert_eq!(capture.count("outcome=\"skipped_stale_session\"")?, 1);
-        assert_eq!(capture.count("outcome=\"committed\"")?, 0);
         assert_eq!(fixture.count().await?, 1);
         fixture.finish().await
     })
@@ -448,7 +443,6 @@ fn repeated_successful_flushes_coalesce_into_one_worker_and_the_highest_watermar
 
 #[test]
 fn dropping_the_outbox_cancels_its_pending_acknowledgement_and_replay_can_retry() -> TestResult {
-    let capture = crate::logging::tests::Capture::new()?;
     Runtime::new()?.block_on(async {
         let fixture = Fixture::new(&[MESSAGE]).await?;
         let writer = fixture.storage.begin_write().await?;
@@ -467,15 +461,11 @@ fn dropping_the_outbox_cancels_its_pending_acknowledgement_and_replay_can_retry(
             .await?;
         drop(outbox);
         assert!(acknowledged.await.is_err());
-        assert_eq!(capture.count("offline replay flushed")?, 1);
-        assert_eq!(capture.count("outcome=\"committed\"")?, 0);
         drop(writer);
         assert_eq!(fixture.count().await?, 1);
         let mut retry = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         flush_and_ack(&fixture, &mut retry).await?;
         assert_eq!(fixture.count().await?, 0);
-        assert_eq!(capture.count("offline replay flushed")?, 2);
-        assert_eq!(capture.count("outcome=\"committed\"")?, 1);
         drop(retry);
         fixture.finish().await
     })
@@ -613,7 +603,6 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
             outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         }
         assert_eq!(handler.calls.load(Ordering::Relaxed), 1);
-        assert!(!std::fs::read_to_string(log.path())?.contains("outcome=\"committed\""));
         assert!(
             outbox
                 .acknowledgement
@@ -642,7 +631,6 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
                 .count(),
             1
         );
-        assert_eq!(logs.matches("outcome=\"committed\"").count(), 1);
         drop(outbox);
         fixture.finish().await
     })

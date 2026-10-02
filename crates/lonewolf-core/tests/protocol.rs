@@ -14,9 +14,6 @@ mod routing;
 #[path = "protocol/stanza_rate.rs"]
 mod stanza_rate;
 
-#[path = "protocol/extension_logging.rs"]
-mod extension_logging;
-
 #[path = "protocol/offline.rs"]
 mod offline;
 

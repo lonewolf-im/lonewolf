@@ -138,6 +138,18 @@ fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messag
         )?;
     }
     await_empty(&mut bob, "bob@localhost/phone")?;
+    let logs = suite.wait_for_log("messages_written=3 messages_skipped=0")?;
+    for summary in [
+        "pending subscriptions flushed operation=\"replay\" outcome=\"flushed\" pending_count=1",
+        "offline replay flushed operation=\"replay\" outcome=\"flushed\" messages_written=3 messages_skipped=0",
+    ] {
+        let line = logs
+            .lines()
+            .find(|line| line.contains(summary))
+            .ok_or("missing replay summary")?;
+        assert!(line.contains("INFO"));
+        assert!(!line.contains("@localhost") && !line.contains("stored-") && !line.contains("id="));
+    }
     bob.close()?;
     alice.close()
 }

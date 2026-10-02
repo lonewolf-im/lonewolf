@@ -752,6 +752,42 @@ fn invalid_and_remote_destinations_are_not_routed_locally() -> TestResult {
 }
 
 #[test]
+fn presence_eligibility_only_changes_when_a_resource_enters_nonnegative_priority() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        for (old, new, expected) in [
+            (None, Some(0), true),
+            (None, Some(-1), false),
+            (Some(-1), Some(0), true),
+            (Some(5), Some(3), false),
+            (Some(0), None, false),
+            (Some(0), Some(-1), false),
+        ] {
+            let registration = handle
+                .register(&owner, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            if old.is_some() {
+                registration
+                    .handle()
+                    .set_presence(old, presence("desk").await?, None)
+                    .await?;
+            }
+            let change = registration
+                .handle()
+                .set_presence(new, presence("desk").await?, None)
+                .await?;
+            assert_eq!(change.became_eligible, expected, "{old:?} -> {new:?}");
+            drop(registration);
+        }
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;

@@ -1,31 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures_util::future::{Either, select};
 use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
-use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
+use lonewolf_extension::message::{Backlog, MessageHandler, StoreOutcome, UndeliverableMessage};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
-use lonewolf_storage::{RedbRead, RedbStorage, Storage};
-use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator};
-use lonewolf_xmpp::jid::{Jid, JidRef};
-use lonewolf_xmpp::parser::{Parsed, ParserConfig, StreamEvent, XmppParser};
+use lonewolf_storage::{RedbRead, RedbStorage, Storage, WriteTransaction};
+use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
+use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
+use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType, Stanza, StanzaErrorCondition,
-    StanzaNamespace, StanzaRef, StanzaType,
+    BuildError, CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType, Stanza,
+    StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
 };
-use tokio::io::BufReader;
 
 use super::bind::Bound;
 use super::outcome::CloseOutcome;
@@ -34,7 +36,7 @@ use crate::c2s::iq;
 use crate::delivery::{
     RouterDelivery, StoredDelivery, after_turn, commit_and_deliver, commit_and_store,
 };
-use crate::router::local::{PresenceChange, RetireCause};
+use crate::router::local::{PresenceChange, RetireCause, SessionLiveness};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
@@ -47,16 +49,27 @@ struct BoundSession<A: ChunkAllocator> {
     storage: RedbStorage,
     allocator: A,
     available: bool,
+    priority: Option<i8>,
     /// Directed recipients remain here until unavailable presence is sent.
     directed: Vec<Box<str>>,
     outbox: Outbox<A>,
 }
 
-struct Outbox<A: ChunkAllocator> {
+struct Outbox<A: ChunkAllocator, W = Writer> {
     queue: VecDeque<Output<A>>,
-    writer: Writer,
+    writer: W,
     allocator: A,
     account: AccountKey,
+    storage: RedbStorage,
+    liveness: SessionLiveness,
+    acknowledgement: Option<ReplayAcknowledgement>,
+}
+
+struct ReplayAcknowledgement {
+    through: Rc<Cell<OfflineSequence>>,
+    task: compio::runtime::JoinHandle<()>,
+    #[cfg(test)]
+    entered: futures_channel::oneshot::Receiver<()>,
 }
 
 enum Output<A: ChunkAllocator> {
@@ -67,6 +80,84 @@ enum Output<A: ChunkAllocator> {
     },
     /// Parse each request at write time to keep large backlogs out of memory.
     Requests(Vec<PendingSubscription>),
+    Offline {
+        backlog: Backlog,
+        handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+    },
+}
+
+enum StoredKind<'a> {
+    Subscription(&'a RosterJid),
+    Message,
+}
+
+enum StoredRecordError {
+    InvalidContent,
+    ReplayFailure,
+}
+
+impl From<ParseError> for StoredRecordError {
+    fn from(error: ParseError) -> Self {
+        if error.is_transport_error() {
+            return Self::ReplayFailure;
+        }
+        match error {
+            ParseError::Build(BuildError::Allocation(_) | BuildError::Access(_))
+            | ParseError::Build(BuildError::Jid(
+                JidError::AllocationFailed(_) | JidError::AccessFailed(_),
+            ))
+            | ParseError::ParserFailed => Self::ReplayFailure,
+            _ => Self::InvalidContent,
+        }
+    }
+}
+
+impl From<HandleError> for StoredRecordError {
+    fn from(_: HandleError) -> Self {
+        Self::ReplayFailure
+    }
+}
+
+impl From<StoredRecordError> for CloseOutcome {
+    fn from(_: StoredRecordError) -> Self {
+        Self::InternalError
+    }
+}
+
+trait OutboxWriter {
+    async fn write_stanza<R: ArenaRead>(
+        &mut self,
+        stanza: &StanzaRef<'_, R>,
+    ) -> Result<(), CloseOutcome>;
+
+    async fn flush(&mut self) -> Result<(), CloseOutcome>;
+
+    async fn write_routed<A: ChunkAllocator>(
+        &mut self,
+        stanza: &RoutedStanza<A>,
+    ) -> Result<(), CloseOutcome> {
+        self.write_stanza(&stanza.resolve()?).await
+    }
+}
+
+impl OutboxWriter for Writer {
+    async fn write_stanza<R: ArenaRead>(
+        &mut self,
+        stanza: &StanzaRef<'_, R>,
+    ) -> Result<(), CloseOutcome> {
+        Writer::write_stanza(self, stanza).await
+    }
+
+    async fn flush(&mut self) -> Result<(), CloseOutcome> {
+        Writer::flush(self).await
+    }
+
+    async fn write_routed<A: ChunkAllocator>(
+        &mut self,
+        stanza: &RoutedStanza<A>,
+    ) -> Result<(), CloseOutcome> {
+        Writer::write_routed(self, stanza).await
+    }
 }
 
 pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcome {
@@ -83,6 +174,9 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         writer,
         allocator: allocator.clone(),
         account: registration.account().clone(),
+        storage: storage.clone(),
+        liveness: registration.liveness(),
+        acknowledgement: None,
     };
     let mut session = BoundSession {
         registration,
@@ -90,6 +184,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         storage,
         allocator,
         available: false,
+        priority: None,
         directed: Vec::new(),
         outbox,
     };
@@ -719,27 +814,46 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 PresenceTransition::Unavailable,
             ),
         };
-        let (result, ticket) = match self
+        let candidate = priority.is_some_and(|priority| priority >= 0)
+            && self.priority.is_none_or(|priority| priority < 0);
+        let presence_handler = self
             .router
             .presence_handlers(self.registration.account().domain())
-            .and_then(|handlers| handlers.find(kind))
-        {
-            None => (Ok(None), None),
-            Some(handler) => {
-                let owner = self.registration.account().clone();
+            .and_then(|handlers| handlers.find(kind));
+        let message_handler = self
+            .router
+            .message_handler(self.registration.account().domain())
+            .cloned();
+        let (result, ticket) =
+            if presence_handler.is_some() || (candidate && message_handler.is_some()) {
+                let owner = self.registration.account();
                 let (transaction, ticket) = Arc::clone(self.router.order())
-                    .fix(vec![owner], self.storage.begin_read())
+                    .fix(vec![owner.clone()], self.storage.begin_read())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
                 let sender = from.resolve(&arena)?;
-                let result = handler
-                    .audience(PresenceUpdate { sender, transition }, &transaction)
-                    .await;
+                let result = async {
+                    let audience = match presence_handler {
+                        Some(handler) => {
+                            handler
+                                .audience(PresenceUpdate { sender, transition }, &transaction)
+                                .await?
+                        }
+                        None => None,
+                    };
+                    let backlog = match message_handler.as_ref().filter(|_| candidate) {
+                        Some(handler) => handler.backlog(owner, &transaction).await?,
+                        None => None,
+                    };
+                    Ok((audience, backlog))
+                }
+                .await;
                 (result, Some(ticket))
-            }
-        };
-        let audience = match result {
-            Ok(audience) => audience,
+            } else {
+                (Ok((None, None)), None)
+            };
+        let (audience, backlog) = match result {
+            Ok(result) => result,
             Err(condition) => {
                 let routed = RoutedStanza::from_parts(stamped, arena);
                 return self.reply_error(&routed, condition).await;
@@ -762,6 +876,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             routed,
             unavailable,
             audience,
+            backlog,
         };
         let outcome = match ticket {
             Some(ticket) => {
@@ -778,6 +893,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             None => work.run().await?,
         };
         self.available = priority.is_some();
+        self.priority = priority;
         if !available {
             self.tell_directed(Some(outcome.echo.clone()), &outcome.covered)
                 .await?;
@@ -789,6 +905,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         self.outbox.routed(outcome.replay);
         if !outcome.requests.is_empty() {
             self.outbox.push(Output::Requests(outcome.requests));
+        }
+        if let Some(backlog) = outcome.backlog
+            && let Some(handler) = message_handler
+        {
+            self.outbox.push(Output::Offline { backlog, handler });
         }
         Ok(())
     }
@@ -939,7 +1060,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 }
 
-impl<A: ChunkAllocator + Clone> Outbox<A> {
+impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
     fn push(&mut self, output: Output<A>) {
         self.queue.push_back(output);
     }
@@ -988,6 +1109,10 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
         if self.queue.is_empty() {
             return Ok(());
         }
+        let mut acknowledgement: Option<(
+            Arc<dyn MessageHandler<A, RedbStorage>>,
+            OfflineSequence,
+        )> = None;
         while let Some(output) = self.queue.pop_front() {
             match output {
                 Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
@@ -999,25 +1124,95 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
                 }
                 Output::Requests(requests) => {
                     for subscription in requests {
-                        let stanza = self.parse_pending_subscription(subscription).await?;
+                        let stanza = self
+                            .parse_stored(
+                                &subscription.stanza,
+                                StoredKind::Subscription(&subscription.sender),
+                            )
+                            .await?;
                         self.writer.write_routed(&stanza).await?;
                     }
                 }
+                Output::Offline { backlog, handler } => {
+                    for message in backlog.messages {
+                        match self
+                            .parse_stored(&message.stanza, StoredKind::Message)
+                            .await
+                        {
+                            Ok(stanza) => self.writer.write_routed(&stanza).await?,
+                            Err(StoredRecordError::InvalidContent) => tracing::error!(
+                                sequence = message.sequence.get(),
+                                "stored offline message rejected"
+                            ),
+                            Err(StoredRecordError::ReplayFailure) => {
+                                return Err(CloseOutcome::InternalError);
+                            }
+                        }
+                    }
+                    let through = acknowledgement
+                        .as_ref()
+                        .map_or(backlog.through, |(_, through)| {
+                            (*through).max(backlog.through)
+                        });
+                    acknowledgement = Some((handler, through));
+                }
             }
         }
-        self.writer.flush().await
+        self.writer.flush().await?;
+        if let Some((handler, through)) = acknowledgement {
+            self.acknowledge(handler, through);
+        }
+        Ok(())
     }
 
-    async fn parse_pending_subscription(
+    fn acknowledge(
+        &mut self,
+        handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+        through: OfflineSequence,
+    ) {
+        if let Some(pending) = &self.acknowledgement {
+            pending.through.set(pending.through.get().max(through));
+            if !pending.task.is_finished() {
+                return;
+            }
+        }
+        let watermark = self
+            .acknowledgement
+            .take()
+            .map_or_else(|| Rc::new(Cell::new(through)), |pending| pending.through);
+        let through = watermark.clone();
+        let storage = self.storage.clone();
+        let account = self.account.clone();
+        let liveness = self.liveness.clone();
+        #[cfg(test)]
+        let (report_entered, entered) = futures_channel::oneshot::channel();
+        let task = compio::runtime::spawn(async move {
+            #[cfg(test)]
+            let _ = report_entered.send(());
+            let result =
+                acknowledge_backlog(&storage, &account, &liveness, &*handler, &through).await;
+            if let Err(error) = result {
+                tracing::error!(error = ?error, "offline backlog acknowledgement failed");
+            }
+        });
+        self.acknowledgement = Some(ReplayAcknowledgement {
+            through: watermark,
+            task,
+            #[cfg(test)]
+            entered,
+        });
+    }
+
+    async fn parse_stored(
         &self,
-        subscription: PendingSubscription,
-    ) -> Result<RoutedStanza<A>, CloseOutcome> {
-        let stanza_bytes = subscription.stanza.as_ref();
+        stanza_bytes: &[u8],
+        kind: StoredKind<'_>,
+    ) -> Result<RoutedStanza<A>, StoredRecordError> {
         let max_stanza_bytes =
-            NonZeroUsize::new(stanza_bytes.len()).ok_or(CloseOutcome::InternalError)?;
+            NonZeroUsize::new(stanza_bytes.len()).ok_or(StoredRecordError::InvalidContent)?;
         let input = tokio::io::AsyncReadExt::chain(STORED_STANZA_STREAM_HEADER, stanza_bytes);
         let mut parser = XmppParser::new(
-            BufReader::new(input),
+            input,
             ParserConfig {
                 max_stanza_bytes,
                 arena: ArenaConfig::default(),
@@ -1025,31 +1220,93 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
             self.allocator.clone(),
         );
         if !matches!(
-            parser.next_event().await,
-            Ok(Some(StreamEvent::StreamStart { .. }))
+            parser.next_event().await?,
+            Some(StreamEvent::StreamStart { .. })
         ) {
-            return Err(CloseOutcome::InternalError);
+            return Err(StoredRecordError::InvalidContent);
         }
-        let parsed = match parser.next_event().await {
-            Ok(Some(StreamEvent::Stanza(parsed))) => parsed,
-            _ => return Err(CloseOutcome::InternalError),
+        let parsed = match parser.next_event().await? {
+            Some(StreamEvent::Stanza(parsed)) => parsed,
+            _ => return Err(StoredRecordError::InvalidContent),
         };
         let (stanza, arena) = parsed.into_parts();
+        if matches!(kind, StoredKind::Message) {
+            use tokio::io::AsyncBufReadExt;
+            let mut remainder = parser.into_inner();
+            loop {
+                let bytes = remainder
+                    .fill_buf()
+                    .await
+                    .map_err(|_| StoredRecordError::ReplayFailure)?;
+                if bytes.is_empty() {
+                    break;
+                }
+                if bytes
+                    .iter()
+                    .any(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    return Err(StoredRecordError::InvalidContent);
+                }
+                let consumed = bytes.len();
+                remainder.consume(consumed);
+            }
+        }
         {
             let stanza = stanza.resolve(&arena)?;
-            if stanza.namespace() != StanzaNamespace::Client
-                || stanza.stanza_type() != StanzaType::Presence(PresenceType::Subscribe)
-                || stanza
-                    .from()?
-                    .is_none_or(|sender| sender.as_str() != subscription.sender.as_str())
-                || stanza
-                    .to()?
-                    .is_none_or(|target| target.as_str() != self.account.as_str())
-            {
-                return Err(CloseOutcome::InternalError);
+            let valid_kind = match kind {
+                StoredKind::Subscription(sender) => {
+                    stanza.stanza_type() == StanzaType::Presence(PresenceType::Subscribe)
+                        && stanza
+                            .from()?
+                            .is_some_and(|from| from.as_str() == sender.as_str())
+                        && stanza
+                            .to()?
+                            .is_some_and(|to| to.as_str() == self.account.as_str())
+                }
+                StoredKind::Message => {
+                    matches!(
+                        stanza.stanza_type(),
+                        StanzaType::Message(MessageType::Normal | MessageType::Chat)
+                    ) && stanza
+                        .to()?
+                        .is_some_and(|to| to.bare().as_str() == self.account.as_str())
+                }
+            };
+            if stanza.namespace() != StanzaNamespace::Client || !valid_kind {
+                return Err(StoredRecordError::InvalidContent);
             }
         }
         Ok(RoutedStanza::from_parts(stanza, arena))
+    }
+}
+
+async fn acknowledge_backlog<A: ChunkAllocator>(
+    storage: &RedbStorage,
+    account: &AccountKey,
+    liveness: &SessionLiveness,
+    handler: &dyn MessageHandler<A, RedbStorage>,
+    watermark: &Cell<OfflineSequence>,
+) -> Result<(), HandlerError> {
+    loop {
+        let mut transaction = storage
+            .begin_write()
+            .await
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        // Check after writer admission so account recreation cannot reset these sequences.
+        if !liveness.is_alive() {
+            return Ok(());
+        }
+        let through = watermark.get();
+        handler
+            .acknowledge(account, through, &mut transaction)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        if watermark.get() <= through {
+            return Ok(());
+        }
     }
 }
 
@@ -1126,6 +1383,7 @@ struct PresenceWork<A: ChunkAllocator> {
     routed: RoutedStanza<A>,
     unavailable: Option<RoutedStanza<A>>,
     audience: Option<PresenceAudience>,
+    backlog: Option<Backlog>,
 }
 
 struct PresenceOutcome<A: ChunkAllocator> {
@@ -1135,6 +1393,7 @@ struct PresenceOutcome<A: ChunkAllocator> {
     requests: Vec<PendingSubscription>,
     /// The subscribers the broadcast reached, which directed presence must not repeat.
     covered: Vec<RosterJid>,
+    backlog: Option<Backlog>,
 }
 
 impl<A: ChunkAllocator + Clone> PresenceWork<A> {
@@ -1148,11 +1407,17 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             routed,
             unavailable,
             mut audience,
+            backlog,
         } = self;
         let change = session
             .set_presence(priority, routed.clone(), unavailable)
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
+        let backlog = if change.became_eligible {
+            backlog
+        } else {
+            None
+        };
         let mut replay = Vec::new();
         let mut requests = Vec::new();
         if change.became_available
@@ -1185,6 +1450,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             replay,
             requests,
             covered,
+            backlog,
         })
     }
 }
@@ -1247,3 +1513,6 @@ fn presence_priority<R: ArenaRead>(stanza: &StanzaRef<'_, R>) -> Result<i8, Stan
     }
     Ok(priority.unwrap_or(0))
 }
+
+#[cfg(test)]
+mod tests;

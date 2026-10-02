@@ -24,6 +24,7 @@ use super::header::{
 };
 use super::outcome::CloseOutcome;
 use super::session::{IO_BUFFER_BYTES, Session, namespace_error};
+use super::stanza_rate::StanzaLimiter;
 use crate::hosts::Hosts;
 
 pub(super) const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
@@ -166,7 +167,12 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         },
         settings.allocator.clone(),
     );
-    let mut session = Session::new(parser, writer, selected_host);
+    let mut session = Session::new(
+        parser,
+        writer,
+        selected_host,
+        StanzaLimiter::new(settings.stanzas_per_second, settings.stanza_burst),
+    );
     let header = session.read_header(hosts).await?;
     if header.host != session.host() {
         return Err(session

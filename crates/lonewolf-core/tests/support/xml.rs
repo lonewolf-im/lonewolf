@@ -126,6 +126,10 @@ impl<R: Read> XmlStream<R> {
         self.reader.get_mut().get_mut()
     }
 
+    pub fn has_buffered_input(&self) -> bool {
+        !self.reader.get_ref().buffer().is_empty()
+    }
+
     pub fn send(&mut self, xml: &str) -> TestResult
     where
         R: Write,

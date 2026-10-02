@@ -7,6 +7,7 @@ mod establish;
 mod header;
 mod outcome;
 mod session;
+mod stanza_rate;
 
 use std::future::Future;
 use std::net::Shutdown;
@@ -33,7 +34,7 @@ use super::AuthService;
 use super::connection_limit::ConnectionPermit;
 use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::AuthMechanisms;
-use crate::config::limits::ByteRate;
+use crate::config::limits::{ByteRate, EventRate};
 use crate::hosts::Hosts;
 use crate::router::{RouterHandle, release_deferred};
 
@@ -68,6 +69,8 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
     auth_mechanisms: AuthMechanisms,
     sasl_features: Arc<str>,
     max_stanza_bytes: NonZeroUsize,
+    stanzas_per_second: NonZeroUsize,
+    stanza_burst: NonZeroUsize,
     xml_bytes_per_second: NonZeroUsize,
     xml_burst_bytes: NonZeroUsize,
     establishment_timeout: Duration,
@@ -88,6 +91,7 @@ impl<A: ChunkAllocator> StreamSettings<A> {
     pub(super) fn new(
         auth_mechanisms: AuthMechanisms,
         max_stanza_bytes: NonZeroUsize,
+        stanza_rate: &EventRate,
         xml_rate: &ByteRate,
         timeouts: StreamTimeouts,
         max_resources_per_account: NonZeroUsize,
@@ -97,6 +101,8 @@ impl<A: ChunkAllocator> StreamSettings<A> {
             auth_mechanisms,
             sasl_features: sasl_features(auth_mechanisms).into(),
             max_stanza_bytes,
+            stanzas_per_second: stanza_rate.per_second,
+            stanza_burst: stanza_rate.burst,
             xml_bytes_per_second: xml_rate.bytes_per_second,
             xml_burst_bytes: xml_rate.burst_bytes,
             establishment_timeout: timeouts.establishment,
@@ -269,7 +275,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         let outcome = match AssertUnwindSafe(phases).catch_unwind().await {
             Ok(Ok(outcome) | Err(outcome)) => outcome,
             Err(_) => {
-                // What the stream dropped while unwinding is released now that it is over.
+                // Release deferred values after unwinding ends.
                 release_deferred();
                 tracing::error!("connection task panicked");
                 CloseOutcome::InternalError

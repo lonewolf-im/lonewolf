@@ -102,6 +102,7 @@
 # connection_attempts_per_ip = { per_second = 10, burst = 50 }
 
 # Bound sustained stanza traffic while allowing short bursts on each connection.
+# Message, presence, and IQ processing waits when the allowance is empty.
 # Use per_second for the sustained event rate and burst for the bucket capacity.
 # incoming_stanzas_per_connection = { per_second = 20, burst = 100 }
 

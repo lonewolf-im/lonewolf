@@ -192,6 +192,7 @@ impl Listeners {
                 let settings = StreamSettings::new(
                     config.auth_mechanisms,
                     max_stanza_bytes,
+                    &profile.incoming_stanzas_per_connection,
                     xml_rate,
                     StreamTimeouts {
                         establishment: establishment_timeout,

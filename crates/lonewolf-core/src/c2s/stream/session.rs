@@ -11,13 +11,14 @@ use lonewolf_xmpp::parser::{ParseError, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
     AsyncWriteError, CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaNamespace, StanzaRef,
 };
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufRead, BufReader};
 
 use super::header::{
     ClientHeader, STREAM_FOOTER, response_header_xml, response_to_from_header, stream_error_xml,
     validate_header,
 };
 use super::outcome::CloseOutcome;
+use super::stanza_rate::StanzaLimiter;
 use crate::hosts::Hosts;
 use crate::router::RoutedStanza;
 
@@ -28,17 +29,15 @@ pub(super) type TlsReader = ReadHalf<TlsTransport>;
 pub(super) type TlsWriter = WriteHalf<TlsTransport>;
 pub(super) type XmlInput = RateLimitedReader<BufReader<tokio_util::compat::Compat<TlsReader>>>;
 
-/// The TLS-protected XML stream of one client connection.
-///
-/// The halves are separate fields so a pending read can stay pinned while
-/// stanzas are written.
+/// Separate halves keep a read pinned while the stream writes stanzas.
 pub(super) struct Session<A: ChunkAllocator> {
     pub(super) reader: Reader<A>,
     pub(super) writer: Writer,
 }
 
-pub(super) struct Reader<A: ChunkAllocator> {
-    parser: XmppParser<XmlInput, A>,
+pub(super) struct Reader<A: ChunkAllocator, R = XmlInput> {
+    parser: XmppParser<R, A>,
+    stanzas: StanzaLimiter,
 }
 
 pub(super) struct Writer {
@@ -47,9 +46,14 @@ pub(super) struct Writer {
 }
 
 impl<A: ChunkAllocator + Clone> Session<A> {
-    pub(super) fn new(parser: XmppParser<XmlInput, A>, writer: TlsWriter, host: String) -> Self {
+    pub(super) fn new(
+        parser: XmppParser<XmlInput, A>,
+        writer: TlsWriter,
+        host: String,
+        stanzas: StanzaLimiter,
+    ) -> Self {
         Self {
-            reader: Reader { parser },
+            reader: Reader { parser, stanzas },
             writer: Writer {
                 output: BufWriter::with_capacity(IO_BUFFER_BYTES, writer),
                 host,
@@ -61,21 +65,16 @@ impl<A: ChunkAllocator + Clone> Session<A> {
         &self.writer.host
     }
 
-    /// Prepares the parser for the stream header the client sends after authentication.
     pub(super) async fn restart(self) -> Result<Self, CloseOutcome> {
         let Self { reader, mut writer } = self;
-        match reader.parser.restart() {
-            Ok(parser) => Ok(Self {
-                reader: Reader { parser },
-                writer,
-            }),
+        match reader.restart() {
+            Ok(reader) => Ok(Self { reader, writer }),
             Err(_) => Err(writer
                 .reject_header(None, false, CloseOutcome::ParserError)
                 .await),
         }
     }
 
-    /// Reads the next event and answers a parse failure with its stream error.
     pub(super) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, CloseOutcome> {
         match self.reader.next_event().await {
             Ok(event) => Ok(event),
@@ -83,7 +82,7 @@ impl<A: ChunkAllocator + Clone> Session<A> {
         }
     }
 
-    /// Reads and validates the client's stream header, answering a rejection in place.
+    /// Rejects invalid client headers on the same stream.
     pub(super) async fn read_header(
         &mut self,
         hosts: &Hosts,
@@ -116,11 +115,23 @@ impl<A: ChunkAllocator + Clone> Session<A> {
     }
 }
 
-impl<A: ChunkAllocator + Clone> Reader<A> {
-    /// Maps the transport end to `Eof` and a parse failure to its outcome without replying.
+impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin> Reader<A, R> {
+    fn restart(self) -> Result<Self, ParseError> {
+        Ok(Self {
+            parser: self.parser.restart()?,
+            stanzas: self.stanzas,
+        })
+    }
+
+    /// Each complete stanza consumes one token before its caller can process it.
     pub(super) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, CloseOutcome> {
         match self.parser.next_event().await {
-            Ok(event) => Ok(event),
+            Ok(event) => {
+                if matches!(event, Some(StreamEvent::Stanza(_))) {
+                    self.stanzas.acquire().await;
+                }
+                Ok(event)
+            }
             Err(ParseError::UnexpectedEof) => Err(CloseOutcome::Eof),
             Err(error) => Err(CloseOutcome::from_parse_error(&error)),
         }
@@ -136,7 +147,7 @@ impl Writer {
         self.flush().await
     }
 
-    /// Buffers the stanza without flushing, so a batch reaches the socket in one write.
+    /// The caller must flush buffered output.
     pub(super) async fn write_stanza<R: ArenaRead>(
         &mut self,
         stanza: &StanzaRef<'_, R>,
@@ -194,7 +205,6 @@ impl Writer {
         self.fail(outcome).await
     }
 
-    /// Ends the stream after the client closed its side.
     pub(super) async fn close(&mut self) -> CloseOutcome {
         if self.send(STREAM_FOOTER).await.is_err() || self.output.close().await.is_err() {
             CloseOutcome::TransportError
@@ -211,7 +221,7 @@ impl Writer {
     }
 }
 
-/// Sends the stream error for `outcome`, when it has one, and closes the output.
+/// Closes the output when the outcome has a stream error.
 pub(super) async fn send_stream_error<W: AsyncWrite + Unpin>(
     output: &mut W,
     outcome: CloseOutcome,
@@ -231,7 +241,6 @@ pub(super) async fn send_stream_error<W: AsyncWrite + Unpin>(
     }
 }
 
-/// Reports an event that belongs to the server-to-server namespace on a client stream.
 pub(super) fn namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Option<CloseOutcome> {
     match event {
         StreamEvent::Stanza(parsed) => match parsed.value().resolve(parsed.arena()) {
@@ -251,3 +260,6 @@ pub(super) fn namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Opti
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests;

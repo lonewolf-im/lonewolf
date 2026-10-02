@@ -124,6 +124,7 @@ async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, B
                 StreamSettings::new(
                     AuthMechanisms::ALL,
                     profile.max_stanza_bytes,
+                    &profile.incoming_stanzas_per_connection,
                     &profile.incoming_xml_per_connection,
                     StreamTimeouts {
                         establishment: TIMEOUT,
@@ -286,6 +287,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         StreamSettings::new(
                             AuthMechanisms::ALL,
                             profile.max_stanza_bytes,
+                            &profile.incoming_stanzas_per_connection,
                             &profile.incoming_xml_per_connection,
                             StreamTimeouts {
                                 establishment: Duration::from_secs(
@@ -380,6 +382,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                             StreamSettings::new(
                                 AuthMechanisms::ALL,
                                 profile.max_stanza_bytes,
+                                &profile.incoming_stanzas_per_connection,
                                 &profile.incoming_xml_per_connection,
                                 StreamTimeouts {
                                     establishment: Duration::from_secs(

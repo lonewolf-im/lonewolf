@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::{ErrorKind, Read};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +26,11 @@ pub type PlainClient = XmlStream<TcpStream>;
 
 impl PlainClient {
     pub fn tcp(server: &C2sSuite) -> TestResult<Self> {
-        let socket = TcpStream::connect_timeout(&server.address, TIMEOUT)?;
+        Self::tcp_at(server.address)
+    }
+
+    fn tcp_at(address: SocketAddr) -> TestResult<Self> {
+        let socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
         socket.set_read_timeout(Some(TIMEOUT))?;
         socket.set_write_timeout(Some(TIMEOUT))?;
         socket.set_nodelay(true)?;
@@ -49,7 +53,11 @@ impl PlainClient {
 
 impl Client {
     pub fn encrypted(server: &C2sSuite) -> TestResult<Self> {
-        let mut plain = PlainClient::tcp(server)?;
+        Self::encrypted_at(server, server.address)
+    }
+
+    fn encrypted_at(server: &C2sSuite, address: SocketAddr) -> TestResult<Self> {
+        let mut plain = PlainClient::tcp_at(address)?;
         let features = plain.open()?;
         features
             .child(TLS_NAMESPACE, "starttls")?
@@ -59,7 +67,11 @@ impl Client {
     }
 
     pub fn secure(server: &C2sSuite) -> TestResult<Self> {
-        let mut client = Self::encrypted(server)?;
+        Self::secure_at(server, server.address)
+    }
+
+    fn secure_at(server: &C2sSuite, address: SocketAddr) -> TestResult<Self> {
+        let mut client = Self::encrypted_at(server, address)?;
         client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
         Ok(client)
     }
@@ -68,14 +80,22 @@ impl Client {
         Ok(Self::authenticated_with_features(server, username, password)?.0)
     }
 
-    /// Authenticates and also returns the features offered to the authenticated stream,
-    /// which must be `bind` plus optional features an extension advertises.
+    /// Rejects stream features outside binding and the supported roster features.
     pub fn authenticated_with_features(
         server: &C2sSuite,
         username: &str,
         password: &str,
     ) -> TestResult<(Self, Element)> {
-        let mut client = Self::secure(server)?;
+        Self::authenticated_with_features_at(server, server.address, username, password)
+    }
+
+    fn authenticated_with_features_at(
+        server: &C2sSuite,
+        address: SocketAddr,
+        username: &str,
+        password: &str,
+    ) -> TestResult<(Self, Element)> {
+        let mut client = Self::secure_at(server, address)?;
         client.authenticate(username, password)?;
         let mut client = client.restart();
         let features = client.open()?;
@@ -102,7 +122,18 @@ impl Client {
         password: &str,
         resource: &str,
     ) -> TestResult<Self> {
-        let mut client = Self::authenticated(server, username, password)?;
+        Self::connect_at(server, server.address, username, password, resource)
+    }
+
+    pub fn connect_at(
+        server: &C2sSuite,
+        address: SocketAddr,
+        username: &str,
+        password: &str,
+        resource: &str,
+    ) -> TestResult<Self> {
+        let mut client =
+            Self::authenticated_with_features_at(server, address, username, password)?.0;
         let jid = client.bind(Some(resource))?;
         assert_eq!(jid, format!("{username}@localhost/{resource}"));
         Ok(client)
@@ -154,14 +185,13 @@ impl Client {
 }
 
 impl Client {
-    /// Closes the connection with a reset, so the server's next write to it fails.
+    /// Forces a TCP reset to expose failed writes.
     pub fn reset(self) -> TestResult {
         let stream = self.into_inner().into_inner();
         SockRef::from(&stream.sock).set_linger(Some(Duration::ZERO))?;
         Ok(())
     }
 
-    /// Reads and discards everything the server still sends until it closes the connection.
     pub fn drain(&mut self) -> TestResult {
         let mut sink = [0; 4096];
         loop {

@@ -183,6 +183,7 @@ fn run_case_with_timeouts(
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 max_stanza_bytes,
+                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
                 xml_rate,
                 StreamTimeouts {
                     establishment: establishment_timeout,
@@ -321,6 +322,7 @@ fn run_starttls_restart_case_with_timeout(
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
+                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
                 &ByteRate::default(),
                 StreamTimeouts {
                     establishment: Duration::from_secs(10),
@@ -472,6 +474,7 @@ where
             StreamSettings::new(
                 mechanisms,
                 MAX_STANZA_BYTES,
+                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
                 &ByteRate::default(),
                 StreamTimeouts {
                     establishment: Duration::from_secs(10),
@@ -630,6 +633,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
             StreamSettings::new(
                 AuthMechanisms::ALL,
                 MAX_STANZA_BYTES,
+                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
                 &rate,
                 StreamTimeouts {
                     establishment: Duration::from_secs(10),

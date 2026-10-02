@@ -11,6 +11,9 @@ mod stream;
 #[path = "protocol/routing.rs"]
 mod routing;
 
+#[path = "protocol/stanza_rate.rs"]
+mod stanza_rate;
+
 #[path = "protocol/offline.rs"]
 mod offline;
 

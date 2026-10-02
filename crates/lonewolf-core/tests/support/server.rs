@@ -94,6 +94,10 @@ impl C2sSuite {
         Self::configured("", limits)
     }
 
+    pub fn with_profile_settings(default: &str, limits: &str) -> TestResult<Self> {
+        Self::settings_with_profile("", limits, 10, "", Some(default), |_| Ok(()))
+    }
+
     pub fn with_auth_mechanisms(mechanisms: &[&str]) -> TestResult<Self> {
         let listener = format!(
             "auth_mechanisms = [{}]",
@@ -125,9 +129,21 @@ impl C2sSuite {
         hosts: &str,
         setup: impl FnOnce(&Path) -> TestResult,
     ) -> TestResult<Self> {
+        Self::settings_with_profile(listener, limits, resources, hosts, None, setup)
+    }
+
+    fn settings_with_profile(
+        listener: &str,
+        limits: &str,
+        resources: usize,
+        hosts: &str,
+        default: Option<&str>,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
         let permit = C2sSuitePermit::acquire();
         let directory = tempfile::tempdir()?;
         let tls = tls::configure(directory.path())?;
+        let default = default.map_or_else(String::new, |name| format!("default = {name:?}"));
         fs::write(
             directory.path().join("lonewolf.toml"),
             format!(
@@ -144,6 +160,7 @@ certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
 [limits.c2s]
 max_resources_per_account = {resources}
+{default}
 [limits.c2s.profiles.default]
 {limits}
 "#
@@ -211,6 +228,42 @@ max_resources_per_account = {resources}
             }
             if Instant::now() >= deadline {
                 return Err(format!("missing log event {event}: {logs}").into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub fn listener_address(&self, listener_id: usize) -> TestResult<SocketAddr> {
+        let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
+        let listener = format!("listener_id={listener_id}");
+        let port = logs
+            .lines()
+            .find(|line| {
+                line.contains("c2s TCP listener started")
+                    && line.split_whitespace().any(|field| field == listener)
+            })
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("port="))
+            })
+            .ok_or("missing listener port")?
+            .parse()?;
+        Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    }
+
+    pub fn stop(&mut self) -> TestResult {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id().try_into()?),
+            nix::sys::signal::Signal::SIGINT,
+        )?;
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                assert!(status.success(), "{status}");
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("server did not stop".into());
             }
             thread::sleep(Duration::from_millis(10));
         }

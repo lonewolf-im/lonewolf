@@ -39,7 +39,6 @@ fn expect_roster_push(client: &mut Client, to: &str, item: &str) -> TestResult<S
     Ok(id)
 }
 
-/// Receives a push stamped with `version` and returns the contact it carries.
 fn receive_versioned_push(client: &mut Client, version: u64) -> TestResult<String> {
     let push = client.receive()?;
     push.assert_name("jabber:client", "iq");
@@ -62,8 +61,7 @@ fn receive_versioned_push(client: &mut Client, version: u64) -> TestResult<Strin
         .to_owned())
 }
 
-/// Stores the records the seeded roster state belongs to; every seeded account
-/// authenticates with "password".
+/// Seeded accounts authenticate with "password".
 async fn seed_accounts(repository: &mut RedbWrite, accounts: &[&AccountKey]) -> TestResult {
     for account in accounts {
         let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?;
@@ -1783,6 +1781,7 @@ fn subscription_request_rejected_by_the_recipient_host_does_not_mutate_the_roste
 [hosts.localhost]
 extensions = ["roster"]
 [hosts."other.localhost"]
+extensions = []
 [hosts."other.localhost".tls]
 certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
@@ -1858,7 +1857,7 @@ fn roster_features_are_advertised_only_where_the_roster_is_enabled() -> TestResu
     assert_eq!(features.children.len(), 3);
     client.close()?;
 
-    let without_roster = C2sSuite::start()?;
+    let without_roster = C2sSuite::with_extensions("")?;
     without_roster.create_account("alice", "password")?;
     let (mut client, features) =
         Client::authenticated_with_features(&without_roster, "alice", "password")?;
@@ -1968,12 +1967,10 @@ fn versioned_roster_get_preceded_by_queued_pushes_returns_the_full_roster() -> T
     assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
     one.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
     two.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
-    // Both sets commit at once but deliver only after the slow effect releases the
-    // account, so the wait keeps the get's view of storage behind both commits.
+    // The blocked ticket prevents replies from confirming these commits.
     thread::sleep(Duration::from_millis(500));
     desk.send("<iq type='get' id='since-0'><query xmlns='jabber:iq:roster' ver='0'/></iq>")?;
 
-    // The two resources commit in whichever order the server reaches them.
     let first = receive_versioned_push(&mut desk, 1)?;
     let second = receive_versioned_push(&mut desk, 2)?;
     let mut contacts = [first.as_str(), second.as_str()];
@@ -2018,8 +2015,7 @@ fn a_rejected_roster_get_still_delivers_the_pushes_queued_before_it() -> TestRes
     assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
     one.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
     two.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
-    // Both sets commit at once but deliver only after the slow effect releases the
-    // account, so the wait keeps the get's view of storage behind both commits.
+    // The blocked ticket prevents replies from confirming these commits.
     thread::sleep(Duration::from_millis(500));
     desk.send("<iq type='get' id='invalid'><query xmlns='jabber:iq:roster' ver='0'><item jid='bob@localhost'/></query></iq>")?;
 
@@ -2211,11 +2207,8 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
     }
 
     tablet.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
-    // The commit is not observable until its ticket turns, so the flood below waits long
-    // enough for the server to have handled the set before it reaches the tablet.
+    // The blocked ticket prevents the reply from confirming this commit.
     thread::sleep(Duration::from_millis(300));
-    // Far more than any mailbox could hold, so only a session that keeps writing while
-    // it waits can survive it.
     for index in 0..1200 {
         bob.send(&format!(
             "<presence><priority>{}</priority></presence>",
@@ -2255,8 +2248,7 @@ fn a_client_that_stops_reading_does_not_hold_up_account_deletion() -> TestResult
             "<iq type='get' id='get-{index}'><query xmlns='{ROSTER_NAMESPACE}'/></iq>"
         ))?;
     }
-    // The stalled write is not observable from outside, so the deletion waits long enough
-    // for the server to reach it instead of running against an idle session.
+    // Socket backpressure has no client-visible acknowledgement.
     thread::sleep(Duration::from_secs(1));
 
     suite.delete_account("alice")?;

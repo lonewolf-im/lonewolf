@@ -182,12 +182,25 @@ fn default_hosts() -> BTreeMap<String, HostConfig> {
     BTreeMap::from([(String::from("localhost"), HostConfig::default())])
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     pub tls: Option<HostTlsConfig>,
     pub extensions: Vec<String>,
     pub offline: Option<OfflineHostConfig>,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            tls: None,
+            extensions: vec![
+                lonewolf_extension::roster::NAME.into(),
+                lonewolf_extension::offline::NAME.into(),
+            ],
+            offline: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

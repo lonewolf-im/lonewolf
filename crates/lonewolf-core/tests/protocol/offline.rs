@@ -79,6 +79,31 @@ fn await_empty(client: &mut Client, owner: &str) -> TestResult {
 }
 
 #[test]
+fn default_host_answers_roster_get_and_delivers_offline_messages_on_login() -> TestResult {
+    let suite = C2sSuite::start()?;
+    accounts(&suite)?;
+    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    alice.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>")?;
+    alice
+        .send("<message to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>")?;
+    barrier(&mut alice, "alice@localhost/desk")?;
+
+    let mut bob = suite.connect("bob", "secret", "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    receive_stored(
+        &mut bob,
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>",
+    )?;
+    barrier(&mut bob, "bob@localhost/phone")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
 fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messages() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup(
         "'roster', 'offline', 'test-offline-inspect'",

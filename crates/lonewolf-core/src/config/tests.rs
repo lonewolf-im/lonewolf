@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
@@ -22,6 +23,64 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
     let mut file = tempfile::NamedTempFile::new()?;
     file.write_all(contents.as_bytes())?;
     Ok(file)
+}
+
+#[test]
+fn host_extensions_default_to_roster_and_offline() -> TestResult {
+    assert_eq!(HostConfig::default().extensions, ["roster", "offline"]);
+    assert_eq!(
+        Config::default().hosts["localhost"].extensions,
+        ["roster", "offline"]
+    );
+    for contents in ["", "[hosts.localhost]"] {
+        let file = config_file(contents)?;
+        assert_eq!(
+            Config::load(Some(file.path()))?.hosts["localhost"].extensions,
+            ["roster", "offline"]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn configured_host_extensions_replace_the_default_list() -> TestResult {
+    for (setting, expected) in [
+        ("[]", [].as_slice()),
+        ("['roster']", ["roster"].as_slice()),
+        ("['offline']", ["offline"].as_slice()),
+        ("['offline', 'roster']", ["offline", "roster"].as_slice()),
+    ] {
+        let file = config_file(&format!("[hosts.localhost]\nextensions = {setting}"))?;
+        assert_eq!(
+            Config::load(Some(file.path()))?.hosts["localhost"].extensions,
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn no_configuration_file_enables_roster_and_offline() -> TestResult {
+    const CHILD: &str = "LONEWOLF_CONFIG_DEFAULTS_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert!(!Path::new(super::DEFAULT_CONFIG_PATH).exists());
+        let config = Config::load(None)?;
+        assert_eq!(config, Config::default());
+        assert_eq!(config.hosts["localhost"].extensions, ["roster", "offline"]);
+    } else {
+        let directory = tempfile::tempdir()?;
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "config::tests::no_configuration_file_enables_roster_and_offline",
+            ])
+            .env(CHILD, "1")
+            .current_dir(directory.path())
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8(output.stdout)?.contains("1 passed;"));
+    }
+    Ok(())
 }
 
 #[test]
@@ -43,10 +102,9 @@ fn offline_limits_are_optional_and_default_to_one_hundred_messages() -> TestResu
 
 #[test]
 fn offline_limits_use_the_configured_message_count() -> TestResult {
-    let file = config_file(
-        "[hosts.localhost]\nextensions = ['offline']\n[hosts.localhost.offline]\nmax_messages_per_account = 7",
-    )?;
+    let file = config_file("[hosts.localhost.offline]\nmax_messages_per_account = 7")?;
     let config = Config::load(Some(file.path()))?;
+    assert_eq!(config.hosts["localhost"].extensions, ["roster", "offline"]);
     assert_eq!(
         config.hosts["localhost"]
             .offline

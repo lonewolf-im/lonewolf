@@ -29,9 +29,9 @@
 # Use lowercase ASCII names or Punycode for internationalized domains.
 # [hosts.localhost]
 
-# Choose the extensions enabled for this host when the server starts.
-# Names must identify extensions included in the server build.
-# extensions = []
+# Choose extensions included in the server build for this host.
+# This list replaces the default, including when it is empty.
+# extensions = ["roster", "offline"]
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
@@ -42,7 +42,7 @@
 
 # Adjust the number of stored messages per account to suit clients that stay offline.
 # Use a positive integer. Senders receive resource-constraint when the queue reaches this limit.
-# Enable the offline extension before configuring its limit.
+# Keep offline in this host's extension list when configuring its limit.
 # [hosts."example.com".offline]
 # max_messages_per_account = 100
 

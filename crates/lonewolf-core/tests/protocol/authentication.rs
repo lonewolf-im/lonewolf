@@ -5,7 +5,7 @@ use super::support::{C2sSuite, OPEN, SASL_NAMESPACE, STREAM_ERRORS, TestResult};
 
 #[test]
 fn scram_sha256_authenticates() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.unauthenticated_client()?;
 
@@ -27,7 +27,7 @@ fn scram_sha256_authenticates() -> TestResult {
 
 #[test]
 fn scram_sha256_plus_with_tls_exporter_authenticates() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.unauthenticated_client()?;
 
@@ -54,7 +54,7 @@ fn scram_sha256_plus_with_tls_exporter_authenticates() -> TestResult {
 
 #[test]
 fn scram_sha256_plus_with_tls_server_end_point_authenticates() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.unauthenticated_client()?;
 
@@ -81,7 +81,7 @@ fn scram_sha256_plus_with_tls_server_end_point_authenticates() -> TestResult {
 
 #[test]
 fn scram_sha1_authenticates() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.unauthenticated_client()?;
 
@@ -103,7 +103,7 @@ fn scram_sha1_authenticates() -> TestResult {
 
 #[test]
 fn scram_sha1_plus_with_tls_exporter_authenticates() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.unauthenticated_client()?;
 
@@ -125,7 +125,7 @@ fn scram_sha1_plus_with_tls_exporter_authenticates() -> TestResult {
 
 #[test]
 fn scram_sha1_plus_with_tls_server_end_point_authenticates() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.unauthenticated_client()?;
 

@@ -158,7 +158,7 @@ fn full_jid_delivery_ignores_unavailable_presence() -> TestResult {
 
 #[test]
 fn negative_priority_excludes_a_resource_from_bare_delivery() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -388,7 +388,7 @@ fn missing_full_jid_groupchat_returns_service_unavailable() -> TestResult {
 
 #[test]
 fn unavailable_account_returns_service_unavailable_with_the_original_payload() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -405,7 +405,7 @@ fn unavailable_account_returns_service_unavailable_with_the_original_payload() -
 
 #[test]
 fn offline_account_returns_service_unavailable_with_the_original_payload() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     suite.create_account("offline", "secret")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
@@ -441,7 +441,7 @@ fn unknown_account_returns_service_unavailable_with_the_original_payload() -> Te
 #[test]
 fn missing_full_jid_without_fallback_returns_service_unavailable_with_the_original_payload()
 -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -646,7 +646,7 @@ fn presence_sender_is_replaced_with_the_authenticated_full_jid() -> TestResult {
 
 #[test]
 fn presence_priority_above_maximum_does_not_make_the_resource_available() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -667,7 +667,7 @@ fn presence_priority_above_maximum_does_not_make_the_resource_available() -> Tes
 
 #[test]
 fn presence_priority_below_minimum_does_not_make_the_resource_available() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -688,7 +688,7 @@ fn presence_priority_below_minimum_does_not_make_the_resource_available() -> Tes
 
 #[test]
 fn presence_priority_nonnumeric_does_not_make_the_resource_available() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -709,7 +709,7 @@ fn presence_priority_nonnumeric_does_not_make_the_resource_available() -> TestRe
 
 #[test]
 fn presence_priority_empty_does_not_make_the_resource_available() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -730,7 +730,7 @@ fn presence_priority_empty_does_not_make_the_resource_available() -> TestResult 
 
 #[test]
 fn presence_priority_with_attributes_does_not_make_the_resource_available() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -751,7 +751,7 @@ fn presence_priority_with_attributes_does_not_make_the_resource_available() -> T
 
 #[test]
 fn presence_priority_duplicate_does_not_make_the_resource_available() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -772,7 +772,7 @@ fn presence_priority_duplicate_does_not_make_the_resource_available() -> TestRes
 
 #[test]
 fn directed_presence_does_not_change_local_availability() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -786,7 +786,7 @@ fn directed_presence_does_not_change_local_availability() -> TestResult {
 
 #[test]
 fn subscribe_presence_does_not_change_local_availability() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -800,7 +800,7 @@ fn subscribe_presence_does_not_change_local_availability() -> TestResult {
 
 #[test]
 fn subscribed_presence_does_not_change_local_availability() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -814,7 +814,7 @@ fn subscribed_presence_does_not_change_local_availability() -> TestResult {
 
 #[test]
 fn unsubscribe_presence_does_not_change_local_availability() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -828,7 +828,7 @@ fn unsubscribe_presence_does_not_change_local_availability() -> TestResult {
 
 #[test]
 fn unsubscribed_presence_does_not_change_local_availability() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -842,7 +842,7 @@ fn unsubscribed_presence_does_not_change_local_availability() -> TestResult {
 
 #[test]
 fn probe_presence_does_not_change_local_availability() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
@@ -856,7 +856,7 @@ fn probe_presence_does_not_change_local_availability() -> TestResult {
 
 #[test]
 fn error_presence_does_not_change_local_availability() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 

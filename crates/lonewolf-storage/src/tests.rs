@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Storage contract tests, written once over the storage traits and run by each backend.
-
 pub(crate) mod account;
+pub(crate) mod offline;
 pub(crate) mod roster;
 pub(crate) mod transaction;
 
@@ -134,7 +133,6 @@ pub(crate) fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// Runs `operation` in a new write transaction and commits it.
 pub(crate) async fn write<S, T, E>(
     storage: &S,
     operation: impl AsyncFnOnce(&mut S::Write) -> Result<T, E>,
@@ -161,7 +159,6 @@ where
     operation(&transaction).await.map_err(Into::into)
 }
 
-/// Generates one `#[test]` per contract function, each over a store from `$storage()`.
 macro_rules! storage_contract_tests {
     ($storage:path) => {
         $crate::tests::storage_contract_tests!(@generate $storage;
@@ -194,6 +191,16 @@ macro_rules! storage_contract_tests {
             roster::put_roster_item_is_rejected_for_an_owner_without_an_account_record,
             roster::put_pending_request_is_rejected_for_an_owner_without_an_account_record,
             roster::roster_removals_and_clearing_succeed_for_a_deleted_owner,
+            offline::offline_reads_of_an_empty_or_absent_account_return_no_messages,
+            offline::offline_messages_keep_every_field_in_sequence_order,
+            offline::removing_offline_messages_through_preserves_later_messages_and_the_counter,
+            offline::removing_one_offline_message_preserves_other_messages_and_the_counter,
+            offline::clearing_offline_messages_during_deletion_resets_a_recreated_accounts_counter,
+            offline::offline_operations_isolate_accounts_with_shared_prefixes,
+            offline::offline_push_for_an_absent_or_deleted_account_writes_nothing,
+            offline::offline_removals_and_clear_succeed_without_messages,
+            offline::dropping_offline_writes_preserves_messages_and_the_counter,
+            offline::offline_reads_keep_their_snapshot_across_commits,
             transaction::uncommitted_writes_are_visible_only_inside_their_transaction,
             transaction::dropping_a_write_transaction_aborts_every_write,
             transaction::commit_persists_account_and_roster_writes_together,

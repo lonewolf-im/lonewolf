@@ -6,6 +6,7 @@ use lonewolf_auth::server::ScramDecoy;
 
 use crate::StorageError;
 use crate::account::{AccountReads, AccountWrites};
+use crate::offline::{OfflineReads, OfflineWrites};
 use crate::roster::{RosterReads, RosterWrites};
 
 /// One store, which is one transaction domain.
@@ -29,18 +30,13 @@ pub trait Storage: Clone + Send + Sync + 'static {
 }
 
 /// The operations available on one consistent snapshot.
-pub trait ReadTransaction: AccountReads + RosterReads + Send + Sync {}
+pub trait ReadTransaction: AccountReads + OfflineReads + RosterReads + Send + Sync {}
 
-/// The operations available inside one atomic write.
-///
-/// Every value read through the transaction stays as read until the transaction
-/// commits or aborts: no other transaction changes it in between, so a flow that reads,
-/// decides, and writes never loses an update. A store meets this by admitting one write
-/// transaction at a time or by locking what a transaction reads. Read-committed
-/// isolation without locks does not meet it.
+/// Writes commit atomically, and values read stay stable until commit or abort.
+/// The store must serialize writers or lock all values read; read-committed isolation is insufficient.
 ///
 /// Dropping the transaction without committing aborts every write in it.
-pub trait WriteTransaction: ReadTransaction + AccountWrites + RosterWrites {
+pub trait WriteTransaction: ReadTransaction + AccountWrites + OfflineWrites + RosterWrites {
     /// Persists every write made through this transaction.
     ///
     /// # Errors

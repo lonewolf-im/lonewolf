@@ -16,7 +16,7 @@ use lonewolf_auth::server::ScramDecoy;
 use lonewolf_util::blocking::BlockingExecutor;
 
 use crate::storage::{ReadTransaction, Storage, WriteTransaction};
-use crate::{StorageError, StorageErrorKind, account, roster};
+use crate::{StorageError, StorageErrorKind, account, offline, roster};
 
 mod error;
 
@@ -109,6 +109,7 @@ fn initialize(database: &Database) -> Result<ScramDecoy, StorageError> {
     let transaction = begin_write(database)?;
     let decoy = account::redb::initialize(&transaction)?;
     roster::redb::initialize(&transaction)?;
+    offline::redb::initialize(&transaction)?;
     transaction.commit().map_err(commit_error)?;
     Ok(decoy)
 }

@@ -20,6 +20,8 @@ use self::backend::{FailingSyncBackend, ObservedBackend};
 use super::initialize;
 use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY};
 use crate::account::{AccountReads, AccountWrites};
+use crate::offline::OfflineReads;
+use crate::offline::redb::{MESSAGES, SEQUENCES};
 use crate::roster::redb::{ITEMS, PENDING, VERSIONS};
 use crate::roster::{RosterReads, RosterSubscription, RosterWrites, SubscriptionState};
 use crate::tests::{
@@ -64,13 +66,15 @@ fn fresh_database_initializes_all_tables() -> TestResult {
     let storage = RedbStorage::new(database)?;
     let transaction = storage.as_ref().begin_read()?;
     let tables: Vec<_> = transaction.list_tables()?.collect();
-    assert_eq!(tables.len(), 5);
+    assert_eq!(tables.len(), 7);
     for expected in [
         ACCOUNTS.name(),
         DECOY_SECRET.name(),
         ITEMS.name(),
         PENDING.name(),
         VERSIONS.name(),
+        MESSAGES.name(),
+        SEQUENCES.name(),
     ] {
         assert!(
             tables.iter().any(|table| table.name() == expected),
@@ -102,7 +106,7 @@ fn unknown_tables_are_left_untouched() -> TestResult {
     let reinitialized = initialize(storage.as_ref())?;
     assert_eq!(decoy_salt(&reinitialized)?, before);
     let transaction = storage.as_ref().begin_read()?;
-    assert_eq!(transaction.list_tables()?.count(), 6);
+    assert_eq!(transaction.list_tables()?.count(), 8);
     assert_eq!(
         transaction
             .open_table(METADATA)?
@@ -111,6 +115,39 @@ fn unknown_tables_are_left_untouched() -> TestResult {
             .value(),
         1
     );
+    Ok(())
+}
+
+#[test]
+fn existing_database_gains_offline_tables_without_changing_accounts() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("storage.redb");
+    let storage = RedbStorage::open(&path)?;
+    let owner = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    let decoy = decoy_salt(storage.scram_decoy())?;
+    block_on(write(&storage, async |tx| tx.create_account(account).await))?;
+    let transaction = storage.as_ref().begin_write()?;
+    assert!(transaction.delete_table(MESSAGES)?);
+    assert!(transaction.delete_table(SEQUENCES)?);
+    transaction.commit()?;
+    drop(storage);
+
+    let storage = RedbStorage::open(&path)?;
+    assert_eq!(decoy_salt(storage.scram_decoy())?, decoy);
+    block_on(async {
+        let reader = storage.begin_read().await?;
+        assert!(reader.account(&owner).await?.is_some());
+        assert_scram(reader.scram(&owner, ScramHash::Sha1).await?, 10)?;
+        assert_scram(reader.scram(&owner, ScramHash::Sha256).await?, 13)?;
+        assert!(reader.offline_messages(&owner).await?.is_empty());
+        assert_eq!(reader.offline_count(&owner).await?, 0);
+        Ok::<_, Box<dyn Error>>(())
+    })?;
+    let reader = storage.as_ref().begin_read()?;
+    assert_eq!(reader.list_tables()?.count(), 7);
+    reader.open_table(MESSAGES)?;
+    reader.open_table(SEQUENCES)?;
     Ok(())
 }
 

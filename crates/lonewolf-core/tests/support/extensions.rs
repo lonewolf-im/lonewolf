@@ -7,6 +7,7 @@ use lonewolf_extension::delivery::{HandlerError, HostLookup, SessionTag};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
+use lonewolf_extension::message::MessageHandler;
 use lonewolf_extension::presence::{
     PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
 };
@@ -37,8 +38,6 @@ const ACCOUNT_SET: IqRoute = IqRoute {
     name: "query",
 };
 
-/// A set whose effects push a marker to the account's interested resources and then hold
-/// the account's delivery order for `millis`.
 const ACCOUNT_SLOW: IqRoute = IqRoute {
     scope: IqScope::Account,
     kind: IqRequestType::Set,
@@ -112,6 +111,18 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingIq {
 }
 
 impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ConflictingIq {}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ConflictingIq {}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for TestIq {}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ServerIq {}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ErrorIq {}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for TestPresence {}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ConflictingPresence {}
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
     fn name(&self) -> &'static str {

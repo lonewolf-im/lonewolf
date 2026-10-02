@@ -150,6 +150,127 @@ fn builds_message_with_normalized_addresses_and_extensions() -> TestResult {
 }
 
 #[test]
+fn filtered_copy_preserves_headers_attributes_and_retained_child_order() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let from = Jid::parse_in("alice@example.com/desk", &mut source)?;
+    let to = Jid::parse_in("bob@example.org", &mut source)?;
+    let first = body(&mut source, "first")?;
+    let removed = Element::builder_in("delay", "urn:xmpp:delay", &mut source)?
+        .attribute("from", "", "example.org")?
+        .build()?;
+    let last = Element::builder_in("received", "urn:xmpp:receipts", &mut source)?
+        .attribute("id", "", "receipt")?
+        .build()?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut source,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .id(Some("message-id"))?
+    .lang(Some("en"))?
+    .attribute("flag", "urn:test:flag", "yes")?
+    .child(first)?
+    .child(removed)?
+    .child(last)?
+    .build()?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let mut visited = Vec::new();
+    let copied = stanza
+        .resolve(&source)?
+        .to_builder_in_filtered(&mut destination, |child| {
+            visited.push(child.name());
+            Ok(child.name() != "delay")
+        })?
+        .build()?;
+    assert_eq!(visited, ["body", "delay", "received"]);
+    drop(source);
+    let view = copied.resolve(&destination)?;
+    assert_eq!(view.stanza_type(), StanzaType::Message(MessageType::Chat));
+    assert_eq!(view.namespace(), StanzaNamespace::Client);
+    assert_eq!(
+        view.from()?.ok_or("missing sender")?.as_str(),
+        "alice@example.com/desk"
+    );
+    assert_eq!(
+        view.to()?.ok_or("missing recipient")?.as_str(),
+        "bob@example.org"
+    );
+    assert_eq!(view.id()?, Some("message-id"));
+    assert_eq!(view.lang()?, Some("en"));
+    assert_eq!(view.attribute("flag", "urn:test:flag")?, Some("yes"));
+    let children = view.children()?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0].name(), "body");
+    assert_eq!(children[0].text()?, Some("first"));
+    assert_eq!(children[1].name(), "received");
+    assert_eq!(children[1].attribute("id", "")?, Some("receipt"));
+    Ok(())
+}
+
+#[test]
+fn filtered_copy_does_not_allocate_removed_children() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let removed = Element::builder_in("large", "urn:test:large", &mut source)?
+        .text(&"x".repeat(65_536))?
+        .build()?;
+    let retained = body(&mut source, "small")?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Normal),
+        StanzaNamespace::Client,
+        &mut source,
+    )
+    .child(removed)?
+    .child(retained)?
+    .build()?;
+    let config = ArenaConfig {
+        chunk_size: NonZeroUsize::new(1_024).ok_or("invalid chunk size")?,
+        max_reserved_bytes: NonZeroUsize::new(4_096).ok_or("invalid arena limit")?,
+    };
+    let mut destination = Arena::try_new(config)?;
+    let copied = stanza
+        .resolve(&source)?
+        .to_builder_in_filtered(&mut destination, |child| Ok(child.name() != "large"))?
+        .build()?;
+    assert!(
+        copied
+            .resolve(&destination)?
+            .child("large", "urn:test:large")?
+            .is_none()
+    );
+    assert_eq!(
+        copied
+            .resolve(&destination)?
+            .child("body", CLIENT_NAMESPACE)?
+            .ok_or("missing body")?
+            .text()?,
+        Some("small")
+    );
+    let mut unfiltered = Arena::try_new(config)?;
+    assert!(matches!(
+        stanza.resolve(&source)?.to_builder_in(&mut unfiltered),
+        Err(BuildError::Allocation(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn filtered_copy_propagates_predicate_access_errors() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let child = body(&mut source, "hello")?;
+    let stanza = message(&mut source, child)?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    assert!(matches!(
+        stanza
+            .resolve(&source)?
+            .to_builder_in_filtered(&mut destination, |_| Err(HandleError::WrongArena)),
+        Err(BuildError::Access(HandleError::WrongArena))
+    ));
+    Ok(())
+}
+
+#[test]
 fn writes_default_and_explicit_stanza_types() -> TestResult {
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     for (kind, name, value) in [

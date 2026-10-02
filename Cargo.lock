@@ -1220,6 +1220,7 @@ dependencies = [
  "lonewolf-util",
  "lonewolf-xmpp",
  "tempfile",
+ "time",
 ]
 
 [[package]]

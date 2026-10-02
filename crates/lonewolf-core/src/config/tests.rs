@@ -640,7 +640,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     expected.hosts.insert(
         "example.com".into(),
         HostConfig {
-            extensions: vec!["offline".into()],
+            extensions: vec!["roster".into(), "offline".into()],
             offline: Some(OfflineHostConfig::default()),
             tls: Some(HostTlsConfig {
                 certificate_chain_path: PathBuf::from("./certs/example.com.crt"),

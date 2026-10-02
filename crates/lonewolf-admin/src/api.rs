@@ -550,6 +550,9 @@ mod tests {
     use lonewolf_auth::server::ScramDecoy;
     use lonewolf_storage::ReadTransaction;
     use lonewolf_storage::account::Account;
+    use lonewolf_storage::offline::{
+        OfflineError, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage,
+    };
     use lonewolf_storage::roster::{self, RosterReads, RosterWrites};
     use serde_json::{Value, json};
 
@@ -785,9 +788,50 @@ mod tests {
         }
     }
 
-    /// Removes the record through the wrapped storage, counts calls, optionally reports
-    /// when a deletion starts and holds it until released, and fails the first `failures`
-    /// calls before touching storage.
+    impl OfflineReads for MemoryTransaction {
+        async fn offline_messages(
+            &self,
+            _: &AccountKey,
+        ) -> Result<Vec<StoredMessage>, OfflineError> {
+            unreachable!()
+        }
+
+        async fn offline_count(&self, _: &AccountKey) -> Result<usize, OfflineError> {
+            unreachable!()
+        }
+    }
+
+    impl OfflineWrites for MemoryTransaction {
+        async fn push_offline_message(
+            &mut self,
+            _: &AccountKey,
+            _: u64,
+            _: &[u8],
+        ) -> Result<OfflineSequence, OfflineError> {
+            unreachable!()
+        }
+
+        async fn remove_offline_messages_through(
+            &mut self,
+            _: &AccountKey,
+            _: OfflineSequence,
+        ) -> Result<usize, OfflineError> {
+            unreachable!()
+        }
+
+        async fn remove_offline_message(
+            &mut self,
+            _: &AccountKey,
+            _: OfflineSequence,
+        ) -> Result<bool, OfflineError> {
+            unreachable!()
+        }
+
+        async fn clear_offline_messages(&mut self, _: &AccountKey) -> Result<(), OfflineError> {
+            unreachable!()
+        }
+    }
+
     struct GatedDeleter {
         storage: MemoryStorage,
         started: std::sync::Mutex<Option<oneshot::Sender<()>>>,

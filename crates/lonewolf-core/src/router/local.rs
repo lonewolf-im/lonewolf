@@ -35,7 +35,6 @@ const SHARD_BATCH_SIZE: usize = 64;
 type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
 type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
 
-/// Owns one account shard on each core worker.
 pub struct LocalRouter<A: ChunkAllocator> {
     handle: LocalRouterHandle<A>,
     tasks: Vec<Task<()>>,
@@ -58,7 +57,6 @@ pub struct Registration<A: ChunkAllocator> {
 }
 
 struct Links<A: ChunkAllocator> {
-    /// Dropping it tells the shard the session is gone.
     _lease: oneshot::Sender<()>,
     retired: Retirement<A>,
     inbound: Receiver<RoutedStanza<A>>,
@@ -68,23 +66,18 @@ struct Links<A: ChunkAllocator> {
 pub(crate) struct PresenceChange<A: ChunkAllocator> {
     pub became_available: bool,
     pub became_unavailable: bool,
-    /// Deliveries the router handed the resource before this update, taken out of its
-    /// mailbox in the same step, so the caller writes them ahead of its own echo.
+    /// Write these deliveries before the update's echo to preserve mailbox order.
     pub preceding: Vec<RoutedStanza<A>>,
-    /// The current presence of the account's other available resources, for a resource
-    /// that just became available; empty otherwise.
+    /// Includes sibling presence only when this resource becomes available.
     pub siblings: Vec<RoutedStanza<A>>,
 }
 
-/// Why the router removed a session before its stream ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetireCause {
     Evicted,
     AccountDeleted,
 }
 
-/// What a removed session's stream needs to finish: the cause and the unavailable
-/// presence it still has to broadcast.
 pub(crate) struct Retired<A: ChunkAllocator> {
     pub(crate) cause: RetireCause,
     pub(crate) unavailable: Option<RoutedStanza<A>>,
@@ -197,6 +190,14 @@ struct Session<A: ChunkAllocator> {
     retired: oneshot::Sender<Retired<A>>,
 }
 
+impl<A: ChunkAllocator> Session<A> {
+    fn accepts_bare_message(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+            && !self.outbound.is_closed()
+            && self.priority.is_some_and(|priority| priority >= 0)
+    }
+}
+
 struct Shard<A: ChunkAllocator> {
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
     retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
@@ -214,11 +215,7 @@ impl<A: ChunkAllocator> Drop for Inbox<A> {
 }
 
 impl<A: ChunkAllocator + Clone> LocalRouter<A> {
-    /// Starts one shard actor per dispatcher worker.
-    ///
-    /// # Errors
-    ///
-    /// Returns a dispatcher error if a worker cannot accept its actor.
+    /// Returns an error if a worker cannot accept its shard actor.
     pub async fn start(dispatcher: &DispatchHandle, allocator: A) -> io::Result<Self> {
         let count = dispatcher.worker_count();
         let mut senders = Vec::with_capacity(count);
@@ -246,7 +243,6 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
         self.handle.clone()
     }
 
-    /// Stops admission and waits for every shard actor.
     pub async fn shutdown(self) -> io::Result<()> {
         for shard in self.handle.shards.iter() {
             shard.close();
@@ -260,8 +256,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
 
 impl<A: ChunkAllocator> Drop for LocalRouterHandle<A> {
     fn drop(&mut self) {
-        // Closing the shard channels wakes the shards, and waking another task while this
-        // thread unwinds aborts the process, so a handle dropped by a panic keeps them open.
+        // Waking another task while this thread unwinds aborts the process.
         if std::thread::panicking() {
             mem::forget(mem::replace(&mut self.shards, Arc::from(Vec::new())));
         }
@@ -465,7 +460,6 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
-    /// Removes every session bound to `account`, ending each stream as account deleted.
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard(account.as_str())
@@ -508,7 +502,6 @@ impl<A: ChunkAllocator> Registration<A> {
         Mailbox(self.links.inbound.clone())
     }
 
-    /// Everything delivered so far, in order, without waiting.
     pub(crate) fn take_queued(&self) -> Vec<RoutedStanza<A>> {
         take_queued(&self.links.inbound)
     }
@@ -571,7 +564,6 @@ impl<A: ChunkAllocator> Registration<A> {
         result.await.map_err(|_| RouterError::Stopped)
     }
 
-    /// Marks this bound resource as a recipient of deliveries addressed to `tag`.
     pub async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
         tag_resource(
             &self.links.shard,
@@ -593,11 +585,9 @@ impl<A: ChunkAllocator> Registration<A> {
     }
 }
 
-/// The deliveries waiting for a bound resource, shared with work done on its behalf.
 pub(crate) struct Mailbox<A: ChunkAllocator>(Receiver<RoutedStanza<A>>);
 
 impl<A: ChunkAllocator> Mailbox<A> {
-    /// Everything delivered so far, in order, without waiting.
     pub(crate) fn take_queued(&self) -> Vec<RoutedStanza<A>> {
         take_queued(&self.0)
     }
@@ -631,7 +621,6 @@ impl<A: ChunkAllocator> Clone for SessionHandle<A> {
 }
 
 impl<A: ChunkAllocator> SessionHandle<A> {
-    /// Marks the resource as a recipient of deliveries addressed to `tag`.
     pub(crate) async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
         tag_resource(&self.shard, &self.account, &self.resource, self.token, tag).await
     }
@@ -707,8 +696,7 @@ impl<A: ChunkAllocator> Drop for Registration<A> {
         // SAFETY: `links` is taken exactly once, here, and never touched again.
         let links = unsafe { mem::ManuallyDrop::take(&mut self.links) };
         if std::thread::panicking() {
-            // Waking another task while this thread unwinds aborts the process, so the
-            // parts wait until the thread is no longer panicking.
+            // Waking another task while this thread unwinds aborts the process.
             DEFERRED.with(|deferred| deferred.borrow_mut().push(Box::new(links)));
         } else {
             drop(links);
@@ -721,9 +709,7 @@ thread_local! {
     static DEFERRED: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Drops what registrations dropped while this thread was unwinding left behind, so the
-/// shard learns of those sessions and their mailboxes are released. Called where a
-/// thread is known not to be panicking; a no-op otherwise.
+/// Deferred registration cleanup must run outside panic unwinding.
 pub(crate) fn release_deferred() {
     if std::thread::panicking() {
         return;
@@ -1045,6 +1031,15 @@ impl<A: ChunkAllocator> Shard<A> {
             {
                 self.deliver_bare(stanza, true)
             }
+            Err(RouterError::NotFound)
+                if fallback_chat
+                    && view.stanza_type() == StanzaType::Message(MessageType::Normal)
+                    && !self.accounts.get(account).is_some_and(|sessions| {
+                        sessions.values().any(Session::accepts_bare_message)
+                    }) =>
+            {
+                Err(RouterError::Offline)
+            }
             result => result,
         }
     }
@@ -1062,7 +1057,12 @@ impl<A: ChunkAllocator> Shard<A> {
         let sessions = self
             .accounts
             .get(to.bare().as_str())
-            .ok_or(RouterError::NotFound)?;
+            .ok_or(match view.stanza_type() {
+                StanzaType::Message(
+                    MessageType::Normal | MessageType::Chat | MessageType::Headline,
+                ) => RouterError::Offline,
+                _ => RouterError::NotFound,
+            })?;
         if !allow_full && to.resourcepart().is_some() {
             return Err(RouterError::InvalidTarget);
         }
@@ -1070,21 +1070,18 @@ impl<A: ChunkAllocator> Shard<A> {
             StanzaType::Message(MessageType::Normal | MessageType::Chat) => {
                 let recipient = sessions
                     .values()
-                    .filter(|session| {
-                        session.alive.load(Ordering::Acquire)
-                            && session.priority.is_some_and(|priority| priority >= 0)
-                    })
+                    .filter(|session| session.accepts_bare_message())
                     .max_by_key(|session| (session.priority, std::cmp::Reverse(session.token)))
-                    .ok_or(RouterError::NotFound)?;
-                recipient.outbound.try_send(stanza).map_err(mailbox_error)
+                    .ok_or(RouterError::Offline)?;
+                enqueue_bare_message(sessions, recipient, stanza)
             }
             StanzaType::Message(MessageType::Headline) => {
                 let mut delivered = false;
                 let mut busy = false;
-                for session in sessions.values().filter(|session| {
-                    session.alive.load(Ordering::Acquire)
-                        && session.priority.is_some_and(|priority| priority >= 0)
-                }) {
+                for session in sessions
+                    .values()
+                    .filter(|session| session.accepts_bare_message())
+                {
                     match session.outbound.try_send(stanza.clone()) {
                         Ok(()) => delivered = true,
                         Err(TrySendError::Full(_)) => busy = true,
@@ -1096,7 +1093,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 } else if busy {
                     Err(RouterError::Busy)
                 } else {
-                    Err(RouterError::NotFound)
+                    Err(RouterError::Offline)
                 }
             }
             _ => Err(RouterError::InvalidTarget),
@@ -1551,8 +1548,7 @@ impl<A: ChunkAllocator> Shard<A> {
                     },
                 ));
             }
-            // The stream polls its retirement before its mailbox, so signalling first lets
-            // it observe the cause instead of a closed mailbox.
+            // Report retirement before closing the mailbox so the stream can observe its cause.
             let _ = session.retired.send(Retired {
                 cause,
                 unavailable: session.unavailable,
@@ -1583,6 +1579,19 @@ fn mailbox_error<T>(error: TrySendError<T>) -> RouterError {
     match error {
         TrySendError::Full(_) => RouterError::Busy,
         TrySendError::Closed(_) => RouterError::NotFound,
+    }
+}
+
+fn enqueue_bare_message<A: ChunkAllocator>(
+    sessions: &HashMap<Box<str>, Session<A>>,
+    recipient: &Session<A>,
+    stanza: RoutedStanza<A>,
+) -> Result<(), RouterError> {
+    match recipient.outbound.try_send(stanza) {
+        Err(TrySendError::Closed(_)) if !sessions.values().any(Session::accepts_bare_message) => {
+            Err(RouterError::Offline)
+        }
+        result => result.map_err(mailbox_error),
     }
 }
 
@@ -1665,6 +1674,56 @@ mod tests {
     }
 
     #[test]
+    fn closing_selected_bare_recipient_rechecks_eligibility_without_retrying_a_sibling()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for kind in ["normal", "chat"] {
+                for eligible_sibling in [false, true] {
+                    let mut sessions = HashMap::new();
+                    let mut receivers = Vec::new();
+                    for (token, resource, priority) in [
+                        (1, "selected", Some(1)),
+                        (2, "sibling", eligible_sibling.then_some(0)),
+                    ] {
+                        let (outbound, inbound) = async_channel::bounded(1);
+                        let (retired, _) = oneshot::channel();
+                        sessions.insert(
+                            resource.into(),
+                            Session {
+                                token,
+                                alive: Arc::new(AtomicBool::new(true)),
+                                outbound,
+                                inbound: inbound.clone(),
+                                priority,
+                                tags: SessionTags::default(),
+                                presence: None,
+                                unavailable: None,
+                                retired,
+                            },
+                        );
+                        receivers.push(inbound);
+                    }
+                    let selected = &sessions["selected"];
+                    assert!(selected.accepts_bare_message());
+                    receivers[0].close();
+                    let stanza =
+                        routed(&format!("<message to='alice@localhost' type='{kind}'/>")).await?;
+                    assert_eq!(
+                        enqueue_bare_message(&sessions, selected, stanza),
+                        Err(if eligible_sibling {
+                            RouterError::NotFound
+                        } else {
+                            RouterError::Offline
+                        })
+                    );
+                    assert!(receivers[1].is_empty());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn headline_prefers_success_then_busy_and_keeps_closed_sessions() -> Result<(), Box<dyn Error>>
     {
         Runtime::new()?.block_on(async {
@@ -1709,10 +1768,7 @@ mod tests {
                 Err(RouterError::Busy)
             );
             receivers[1].close();
-            assert_eq!(
-                shard.deliver_bare(stanza, false),
-                Err(RouterError::NotFound)
-            );
+            assert_eq!(shard.deliver_bare(stanza, false), Err(RouterError::Offline));
             let sessions = &shard.accounts[account.as_str()];
             assert_eq!(sessions.len(), 3);
             assert!(

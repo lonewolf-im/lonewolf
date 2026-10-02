@@ -8,6 +8,7 @@ use async_channel::{Receiver, Sender};
 use futures_channel::oneshot;
 use lonewolf_admin::{AccountDeleter, DeleterError};
 use lonewolf_storage::account::{AccountError, AccountKey, AccountWrites};
+use lonewolf_storage::offline::{OfflineError, OfflineWrites};
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 
@@ -21,9 +22,7 @@ pub(crate) struct DeletionRequest {
     done: oneshot::Sender<Result<bool, DeleterError>>,
 }
 
-/// Forwards account deletions from the admin service to the core runtime, where the
-/// extensions take part, and completes each request once its transaction committed,
-/// its notifications went out, and the account's sessions are gone.
+/// Deletion completes after commit, notifications, and session retirement.
 pub(crate) struct AccountDeletion {
     requests: Sender<DeletionRequest>,
 }
@@ -54,7 +53,6 @@ impl AccountDeleter for AccountDeletion {
     }
 }
 
-/// Serves deletion requests until the admin service drops its sender.
 pub(crate) async fn run<A: ChunkAllocator + Clone>(
     requests: Receiver<DeletionRequest>,
     storage: &RedbStorage,
@@ -67,13 +65,7 @@ pub(crate) async fn run<A: ChunkAllocator + Clone>(
     }
 }
 
-/// Removes the account's record and every extension's state for it in one transaction,
-/// then delivers what the extensions returned, in order with every other delivery to
-/// the accounts they named, and ends the account's sessions.
-///
-/// Only the transaction can fail the deletion. Once it committed the account is gone,
-/// so a failed notification or session termination is logged and the deletion still
-/// reports success.
+/// Notification and retirement failures do not fail a committed deletion.
 async fn delete<A: ChunkAllocator + Clone>(
     account: &AccountKey,
     storage: &RedbStorage,
@@ -105,6 +97,13 @@ async fn delete<A: ChunkAllocator + Clone>(
         accounts.extend(effects.accounts);
         deliveries.push((extension.name(), effects.deliver));
     }
+    transaction
+        .clear_offline_messages(account)
+        .await
+        .map_err(|error| match error {
+            OfflineError::Storage(error) => DeleterError::from(error),
+            error => DeleterError::Other(Box::new(error)),
+        })?;
     let ((), mut ticket) = router.order().fix(accounts, transaction.commit()).await?;
     ticket.turn().await;
     for (extension, deliver) in deliveries {

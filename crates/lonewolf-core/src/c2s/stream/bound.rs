@@ -6,10 +6,12 @@ use std::mem;
 use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use futures_util::future::{Either, select};
 use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
+use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
@@ -29,30 +31,27 @@ use super::bind::Bound;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error};
 use crate::c2s::iq;
-use crate::delivery::{RouterDelivery, after_turn, commit_and_deliver};
+use crate::delivery::{
+    RouterDelivery, StoredDelivery, after_turn, commit_and_deliver, commit_and_store,
+};
 use crate::router::local::{PresenceChange, RetireCause};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 
-/// The bound resource's side of the stream: everything except the parser, which
-/// stays outside so a pending read can be kept while stanzas are handled.
+/// The parser stays outside this state so stanza handling preserves a pending read.
 struct BoundSession<A: ChunkAllocator> {
     registration: Registration<A>,
     router: RouterHandle<A>,
     storage: RedbStorage,
     allocator: A,
-    /// Whether this resource currently has presence, mirroring the router's view.
     available: bool,
-    /// The addresses that received this resource's directed available presence since its
-    /// last unavailable presence.
+    /// Directed recipients remain here until unavailable presence is sent.
     directed: Vec<Box<str>>,
     outbox: Outbox<A>,
 }
 
-/// The session's output path: everything the client has yet to receive, in order, and
-/// the writer that only it uses.
 struct Outbox<A: ChunkAllocator> {
     queue: VecDeque<Output<A>>,
     writer: Writer,
@@ -62,13 +61,11 @@ struct Outbox<A: ChunkAllocator> {
 
 enum Output<A: ChunkAllocator> {
     Routed(RoutedStanza<A>),
-    /// Stanzas built by this session in one arena, written in order.
     Owned {
         stanzas: Vec<Stanza>,
         arena: Arena<A>,
     },
-    /// Stored subscription requests, parsed one at a time as they are written so a large
-    /// backlog never sits in memory at once.
+    /// Parse each request at write time to keep large backlogs out of memory.
     Requests(Vec<PendingSubscription>),
 }
 
@@ -120,7 +117,6 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
 }
 
 impl<A: ChunkAllocator + Clone> BoundSession<A> {
-    /// Alternates between client stanzas and router deliveries until the stream ends.
     async fn run(&mut self, reader: &mut Reader<A>) -> CloseOutcome {
         let mut prefer_outbound = true;
         'stream: loop {
@@ -175,9 +171,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
     }
 
-    /// Withdraws the resource's presence, broadcasts it to the account's subscribers, and
-    /// sends unavailable presence to the recipients of its directed presence, also when
-    /// the withdrawal fails.
+    /// Directed recipients need unavailable presence even when withdrawal fails.
     async fn end(&mut self) -> Result<(), CloseOutcome> {
         let mut notice = None;
         let mut covered = Vec::new();
@@ -186,9 +180,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         withdrawn.and(told)
     }
 
-    /// Withdraws the resource's presence and broadcasts it to the account's subscribers.
-    /// `notice` receives the withdrawn presence and `covered` the subscribers that must not
-    /// receive it again as directed presence, each as soon as it is known.
+    /// Preserve `notice` and `covered` on failure so directed withdrawal can still finish.
     async fn withdraw(
         &self,
         notice: &mut Option<RoutedStanza<A>>,
@@ -241,9 +233,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
         let result = match audience {
             None => Ok(()),
-            // The ticket keeps replacement updates behind this broadcast until it ends. A
-            // replacement already told the subscribers its own presence, so they are
-            // covered without a broadcast.
+            // The ticket prevents replacement updates from passing this broadcast.
             Some(audience) => match self.registration.replacement_is_available().await {
                 Ok(true) => {
                     *covered = audience.subscribers;
@@ -267,9 +257,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         result.and(finished)
     }
 
-    /// Sends unavailable presence to every recipient of directed presence not in
-    /// `covered`, and forgets them once it is sent. Without a withdrawn presence to send,
-    /// a bare unavailable presence from this resource is sent.
+    /// Exclude `covered` to avoid repeating the broadcast for directed recipients.
     async fn tell_directed(
         &mut self,
         notice: Option<RoutedStanza<A>>,
@@ -330,11 +318,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
     }
 
-    /// Answers an IQ from one fixed view of storage: a snapshot for a get, a committed
-    /// transaction for a set. Everything a ticket orders runs on a task of its own, and so
-    /// does a set's commit, so retiring the session cannot lose a change that landed and
-    /// a stalled socket holds no account's line. Meanwhile the session drains its mailbox, and it
-    /// writes the reply afterwards, behind whatever preceded the ticket's turn.
+    /// Detached work owns commit and delivery, so retiring this session cannot cancel them.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration)?;
@@ -486,7 +470,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         self.queue_iq_reply(request, sender, arena, response, reply)
     }
 
-    /// Queues the result, or the error reply, behind whatever the outbox already holds.
     fn queue_iq_reply(
         &mut self,
         request: Stanza,
@@ -518,7 +501,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         Ok(())
     }
 
-    /// Directed presence only enters subscription handling; other directed presence is dropped.
     async fn handle_presence(
         &mut self,
         parsed: Parsed<Stanza, A>,
@@ -544,9 +526,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         }
     }
 
-    /// Delivers presence addressed to one entity and keeps track of who received directed
-    /// available presence, so they are told when the resource goes unavailable. The
-    /// account's own resources see its broadcasts and are not tracked.
+    /// Track directed recipients for withdrawal, except siblings covered by broadcasts.
     async fn handle_directed(
         &mut self,
         parsed: Parsed<Stanza, A>,
@@ -600,8 +580,14 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         if let Err(error) = self.router.route_message(routed.clone()).await {
             if kind == MessageType::Error
                 || (bare && kind == MessageType::Headline && error == RouterError::NotFound)
+                || (kind == MessageType::Headline && error == RouterError::Offline)
             {
                 return Ok(());
+            }
+            if error == RouterError::Offline
+                && matches!(kind, MessageType::Normal | MessageType::Chat)
+            {
+                return self.store_message(routed).await;
             }
             let condition = match error {
                 RouterError::Busy | RouterError::ResourceLimit => {
@@ -610,7 +596,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 RouterError::InvalidTarget | RouterError::InvalidResource => {
                     StanzaErrorCondition::BadRequest
                 }
-                RouterError::NotFound | RouterError::RemoteUnsupported => {
+                RouterError::NotFound | RouterError::Offline | RouterError::RemoteUnsupported => {
                     StanzaErrorCondition::ServiceUnavailable
                 }
                 RouterError::Unavailable | RouterError::Stopped => {
@@ -620,6 +606,76 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             self.reply_error(&routed, condition).await?;
         }
         Ok(())
+    }
+
+    async fn store_message(&mut self, routed: RoutedStanza<A>) -> Result<(), CloseOutcome> {
+        let recipient = AccountKey::try_from(
+            routed
+                .resolve()?
+                .to()?
+                .ok_or(CloseOutcome::InternalError)?
+                .bare(),
+        )
+        .map_err(|_| CloseOutcome::InternalError)?;
+        let Some(handler) = self.router.message_handler(recipient.domain()).cloned() else {
+            return self
+                .reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
+                .await;
+        };
+        let bytes = if tracing::enabled!(tracing::Level::DEBUG) {
+            stanza_bytes(&routed)?
+        } else {
+            0
+        };
+        let mut transaction = self
+            .storage
+            .begin_write()
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+        let mut scratch = Arena::try_new_in(ArenaConfig::default(), self.allocator.clone())?;
+        let outcome = handler
+            .store(
+                UndeliverableMessage {
+                    recipient: &recipient,
+                    stanza: &routed,
+                    received_at: SystemTime::now(),
+                },
+                &mut transaction,
+                &mut scratch,
+            )
+            .await;
+        drop(scratch);
+        match outcome {
+            Err(HandlerError::Stanza(condition)) => {
+                drop(transaction);
+                tracing::debug!(outcome = "rejected", bytes, "offline message handled");
+                self.reply_error(&routed, condition).await
+            }
+            Ok(StoreOutcome::Discarded) => {
+                drop(transaction);
+                tracing::debug!(outcome = "discarded", bytes, "offline message handled");
+                Ok(())
+            }
+            Ok(StoreOutcome::Stored(sequence)) => {
+                let pending = commit_and_store(
+                    self.router.clone(),
+                    self.storage.clone(),
+                    transaction,
+                    handler,
+                    StoredDelivery {
+                        recipient,
+                        sequence,
+                        stanza: routed,
+                        bytes,
+                    },
+                );
+                self.outbox
+                    .drain_until(&self.registration, pending.finished())
+                    .await?
+                    .ok_or(CloseOutcome::InternalError)?
+                    .map_err(|_| CloseOutcome::InternalError)
+            }
+        }
     }
 
     async fn handle_availability(
@@ -726,8 +782,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             self.tell_directed(Some(outcome.echo.clone()), &outcome.covered)
                 .await?;
         }
-        // The router takes the cut with the update itself, so without a ticket a
-        // sibling's earlier update still lands ahead of this echo.
+        // The router's mailbox cut keeps earlier sibling updates ahead of this echo.
         self.outbox.routed(outcome.change.preceding);
         self.outbox.routed(outcome.change.siblings);
         self.outbox.push(Output::Routed(outcome.echo));
@@ -858,7 +913,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         Ok(RoutedStanza::from_parts(stanza, arena))
     }
 
-    /// Stamps the authenticated full JID as `from` and, when asked, the bare JID as `to`.
     fn stamp_in(
         &self,
         stanza: Stanza,
@@ -894,8 +948,6 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
         self.queue.extend(stanzas.into_iter().map(Output::Routed));
     }
 
-    /// Queues one delivery and everything else the mailbox already holds, then writes
-    /// the batch in one go.
     async fn drain_mailbox(
         &mut self,
         registration: &Registration<A>,
@@ -906,11 +958,8 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
         self.flush().await
     }
 
-    /// Writes deliveries as they arrive until `until` resolves, so a session waiting for
-    /// its turn keeps draining its mailbox. The ticket the request took lives on a task of
-    /// its own, so a write that stalls here holds no account's line; a client that stops
-    /// reading fills its mailbox and is evicted as usual. `until` is polled first, so
-    /// nothing that arrives after it resolves is taken.
+    /// Drain while work is pending to avoid evicting a client that keeps reading.
+    /// Poll `until` first to leave deliveries after its cut in the mailbox.
     async fn drain_until<F: Future>(
         &mut self,
         registration: &Registration<A>,
@@ -935,7 +984,6 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
         }
     }
 
-    /// Writes everything queued, in order, and flushes the socket once.
     async fn flush(&mut self) -> Result<(), CloseOutcome> {
         if self.queue.is_empty() {
             return Ok(());
@@ -960,7 +1008,6 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
         self.writer.flush().await
     }
 
-    /// Parses a stored request and checks it still addresses this account from its sender.
     async fn parse_pending_subscription(
         &self,
         subscription: PendingSubscription,
@@ -1006,8 +1053,6 @@ impl<A: ChunkAllocator + Clone> Outbox<A> {
     }
 }
 
-/// A get from the moment its ticket turns: the handler runs on the snapshot, its effects
-/// run, and the reply goes back to the session to write.
 struct GetWork<A: ChunkAllocator> {
     transaction: RedbRead,
     handler: Arc<dyn IqHandler<A, RedbStorage>>,
@@ -1072,9 +1117,6 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
     }
 }
 
-/// A presence update from the moment its ticket turns: the router applies it and takes
-/// the cut, the replay for a newly available resource is gathered, and the subscribers
-/// are told.
 struct PresenceWork<A: ChunkAllocator> {
     session: SessionHandle<A>,
     router: RouterHandle<A>,
@@ -1089,7 +1131,6 @@ struct PresenceWork<A: ChunkAllocator> {
 struct PresenceOutcome<A: ChunkAllocator> {
     change: PresenceChange<A>,
     echo: RoutedStanza<A>,
-    /// The contacts' current presence for a resource that just became available.
     replay: Vec<RoutedStanza<A>>,
     requests: Vec<PendingSubscription>,
     /// The subscribers the broadcast reached, which directed presence must not repeat.
@@ -1117,8 +1158,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
         if change.became_available
             && let Some(audience) = audience.as_mut()
         {
-            // The ticket is still held, so a contact captured here cannot have revoked the
-            // subscription before its presence is written.
+            // The ticket keeps subscription revocation behind these deliveries.
             for contact in &audience.contacts {
                 let presence = router
                     .current_presence(contact, &account)
@@ -1147,6 +1187,22 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             covered,
         })
     }
+}
+
+fn stanza_bytes<A: ChunkAllocator>(stanza: &RoutedStanza<A>) -> Result<usize, CloseOutcome> {
+    struct Counter(usize);
+    impl std::fmt::Write for Counter {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    stanza
+        .resolve()?
+        .write_xml(&mut counter)
+        .map_err(|_| CloseOutcome::InternalError)?;
+    Ok(counter.0)
 }
 
 fn presence_addresses<A: ChunkAllocator>(

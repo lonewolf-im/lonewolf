@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lonewolf_extension::delivery::{HandlerError, HostLookup, SessionTag};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
-use lonewolf_extension::message::MessageHandler;
+use lonewolf_extension::message::{MessageHandler, StoreFuture, UndeliverableMessage};
+use lonewolf_extension::offline::Offline;
 use lonewolf_extension::presence::{
-    PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
+    PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
+    PresenceTransition, PresenceUpdate,
 };
 use lonewolf_extension::{Effects, Extension, Extensions};
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
@@ -23,6 +27,22 @@ use lonewolf_xmpp::stanza::{
 use super::TestResult;
 
 const NAMESPACE: &str = "urn:lonewolf:test:iq";
+const OFFLINE_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Get,
+    namespace: "urn:lonewolf:test:offline",
+    name: "query",
+};
+const OFFLINE_PUSH: IqRoute = IqRoute {
+    kind: IqRequestType::Set,
+    name: "push",
+    ..OFFLINE_ROUTE
+};
+const OFFLINE_RELEASE: IqRoute = IqRoute {
+    scope: IqScope::Server,
+    name: "release",
+    ..OFFLINE_ROUTE
+};
 
 const ACCOUNT_GET: IqRoute = IqRoute {
     scope: IqScope::Account,
@@ -74,6 +94,23 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(ErrorIq))?;
     extensions.register(Arc::new(TestPresence))?;
     extensions.register(Arc::new(ConflictingPresence))?;
+    extensions.register(Arc::new(OfflineInspect))?;
+    extensions.register(Arc::new(SlowOffline {
+        offline: Offline::new(Default::default()),
+        ready: async_lock::Semaphore::new(0),
+        entered: AtomicUsize::new(0),
+        block_ack: false,
+        acknowledge: async_lock::Semaphore::new(0),
+        fail_ack: AtomicBool::new(false),
+    }))?;
+    extensions.register(Arc::new(SlowOffline {
+        offline: Offline::new(Default::default()),
+        ready: async_lock::Semaphore::new(0),
+        entered: AtomicUsize::new(0),
+        block_ack: true,
+        acknowledge: async_lock::Semaphore::new(0),
+        fail_ack: AtomicBool::new(false),
+    }))?;
     Ok(extensions)
 }
 
@@ -88,6 +125,233 @@ struct ErrorIq;
 struct TestPresence;
 
 struct ConflictingPresence;
+
+struct OfflineInspect;
+
+struct SlowOffline {
+    offline: Offline,
+    ready: async_lock::Semaphore,
+    entered: AtomicUsize,
+    block_ack: bool,
+    acknowledge: async_lock::Semaphore,
+    fail_ack: AtomicBool,
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for OfflineInspect {
+    fn name(&self) -> &'static str {
+        "test-offline-inspect"
+    }
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[OFFLINE_ROUTE, OFFLINE_PUSH]
+    }
+}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for OfflineInspect {}
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for OfflineInspect {}
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for OfflineInspect {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        transaction: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(inspect_offline(request, transaction, response))
+    }
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        transaction: &'a mut RedbWrite,
+        _hosts: &'a dyn HostLookup,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            if request.sender.bare() != request.target {
+                return Err(StanzaErrorCondition::Forbidden.into());
+            }
+            let condition = StanzaErrorCondition::InternalServerError;
+            let owner = AccountKey::try_from(request.target).map_err(|_| condition)?;
+            let sequence = transaction
+                .push_offline_message(&owner, 0, b"<message xmlns='jabber:client'/>")
+                .await
+                .map_err(|_| condition)?
+                .get()
+                .to_string();
+            let payload = Element::builder_in("pushed", OFFLINE_ROUTE.namespace, response)
+                .and_then(|builder| builder.attribute("sequence", "", &sequence))
+                .and_then(|builder| builder.build())
+                .map_err(|_| condition)?;
+            Ok(IqReply::new(
+                Some(payload),
+                Effects::new(vec![owner], |_| Box::pin(async { Ok(()) })),
+            ))
+        })
+    }
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for SlowOffline {
+    fn name(&self) -> &'static str {
+        if self.block_ack {
+            "test-blocked-offline-ack"
+        } else {
+            "test-slow-offline"
+        }
+    }
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        if self.block_ack {
+            &[OFFLINE_ROUTE, OFFLINE_RELEASE]
+        } else {
+            &[]
+        }
+    }
+    fn stores_messages(&self) -> bool {
+        true
+    }
+    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
+        &[PresenceRequestType::Available]
+    }
+}
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for SlowOffline {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        transaction: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            if request.payload.name() == "release" {
+                let fail = request
+                    .payload
+                    .attribute("fail", "")
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                    == Some("true");
+                self.fail_ack.store(fail, Ordering::Release);
+                self.acknowledge.add_permits(1);
+                let released = Element::builder_in("released", OFFLINE_ROUTE.namespace, response)
+                    .and_then(|builder| builder.build())
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                return Ok(IqReply::new(Some(released), Effects::none()));
+            }
+            inspect_offline(request, transaction, response).await
+        })
+    }
+}
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for SlowOffline {
+    fn audience<'a>(
+        &'a self,
+        update: PresenceUpdate<'a>,
+        _transaction: &'a RedbRead,
+    ) -> PresenceFuture<'a, Option<PresenceAudience>> {
+        if update.transition == PresenceTransition::Initial
+            && self.entered.load(Ordering::Acquire) > 0
+        {
+            self.ready.add_permits(1);
+        }
+        Box::pin(async { Ok(None) })
+    }
+}
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for SlowOffline {
+    fn store<'a>(
+        &'a self,
+        message: UndeliverableMessage<'a, A>,
+        transaction: &'a mut RedbWrite,
+        scratch: &'a mut Arena<A>,
+    ) -> StoreFuture<'a> {
+        Box::pin(async move {
+            self.entered.fetch_add(1, Ordering::Release);
+            tracing::info!("test offline store waiting");
+            let _ready = self.ready.acquire().await;
+            <Offline as MessageHandler<A, RedbStorage>>::store(
+                &self.offline,
+                message,
+                transaction,
+                scratch,
+            )
+            .await
+        })
+    }
+    fn acknowledge_one<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        sequence: lonewolf_storage::offline::OfflineSequence,
+        transaction: &'a mut RedbWrite,
+    ) -> lonewolf_extension::ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async move {
+            if self.block_ack {
+                tracing::info!("test offline acknowledgement waiting");
+                let _ready = self.acknowledge.acquire().await;
+                if self.fail_ack.load(Ordering::Acquire) {
+                    return Err(StanzaErrorCondition::InternalServerError.into());
+                }
+            }
+            <Offline as MessageHandler<A, RedbStorage>>::acknowledge_one(
+                &self.offline,
+                account,
+                sequence,
+                transaction,
+            )
+            .await
+        })
+    }
+}
+
+async fn inspect_offline<A: ChunkAllocator>(
+    request: IqRequest<'_, A>,
+    transaction: &RedbRead,
+    response: &mut Arena<A>,
+) -> Result<IqReply<A>, HandlerError> {
+    let condition = StanzaErrorCondition::InternalServerError;
+    if request.sender.bare() != request.target {
+        return Err(StanzaErrorCondition::Forbidden.into());
+    }
+    let owner = AccountKey::try_from(request.target).map_err(|_| condition)?;
+    let messages = transaction
+        .offline_messages(&owner)
+        .await
+        .map_err(|_| condition)?;
+    let target = match messages.last() {
+        None => None,
+        Some(message) => {
+            let mut parser = quick_xml::Reader::from_reader(message.stanza.as_ref());
+            let start = match parser.read_event().map_err(|_| condition)? {
+                quick_xml::events::Event::Start(start) | quick_xml::events::Event::Empty(start) => {
+                    start
+                }
+                _ => return Err(condition.into()),
+            };
+            start
+                .attributes()
+                .find_map(|attribute| match attribute {
+                    Ok(attribute) if attribute.key.as_ref() == "to" => Some(
+                        attribute
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .map(|value| value.into_owned())
+                            .map_err(|_| condition),
+                    ),
+                    Ok(_) => None,
+                    Err(_) => Some(Err(condition)),
+                })
+                .transpose()?
+        }
+    };
+    let count = messages.len().to_string();
+    let through = messages
+        .last()
+        .map_or(0, |message| message.sequence.get())
+        .to_string();
+    let mut query = Element::builder_in("query", OFFLINE_ROUTE.namespace, response)
+        .and_then(|builder| builder.attribute("count", "", &count))
+        .and_then(|builder| builder.attribute("through", "", &through))
+        .map_err(|_| condition)?;
+    if let Some(target) = target {
+        query = query
+            .attribute("last_to", "", &target)
+            .map_err(|_| condition)?;
+    }
+    Ok(IqReply::new(
+        Some(query.build().map_err(|_| condition)?),
+        Effects::none(),
+    ))
+}
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for ConflictingIq {
     fn name(&self) -> &'static str {

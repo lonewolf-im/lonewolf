@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
+use lonewolf_extension::message::MessageHandler;
 use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_extension::{Extension, ExtensionRegistry};
 use lonewolf_storage::RedbStorage;
@@ -46,6 +47,7 @@ pub enum RouterError {
     InvalidResource,
     ResourceLimit,
     NotFound,
+    Offline,
     Busy,
     Unavailable,
     Stopped,
@@ -106,26 +108,31 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.extensions.get(domain).map(ExtensionRegistry::presence)
     }
 
-    /// The stream features of the extensions enabled for `domain`, as XML.
+    pub(crate) fn message_handler(
+        &self,
+        domain: &str,
+    ) -> Option<&Arc<dyn MessageHandler<A, RedbStorage>>> {
+        self.extensions
+            .get(domain)
+            .and_then(ExtensionRegistry::messages)
+    }
+
     pub(crate) fn stream_features(&self, domain: &str) -> &str {
         self.extensions
             .get(domain)
             .map_or("", ExtensionRegistry::stream_features)
     }
 
-    /// The per-account delivery order shared by every handler on this node.
     pub(crate) fn order(&self) -> &Arc<Order> {
         &self.order
     }
 
-    /// The extensions enabled for `domain`, or none for an unknown host.
     pub(crate) fn extensions(&self, domain: &str) -> &[Arc<dyn Extension<A, RedbStorage>>] {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::extensions)
     }
 
-    /// Removes every session bound to `account` and ends each stream as account deleted.
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
         self.local.retire_account(account).await
     }
@@ -236,7 +243,6 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
-    /// Returns the presence of every available resource of `source`, addressed to `target`.
     pub(crate) async fn current_presence(
         &self,
         source: &AccountKey,
@@ -359,8 +365,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
-    /// Delivers presence addressed to a local full or bare JID. An absent or busy
-    /// recipient, a remote domain, and a domain without a localpart are not errors.
+    /// Absent or busy recipients and nonlocal or domain-only targets are not errors.
     pub(crate) async fn route_directed_presence(
         &self,
         stanza: RoutedStanza<A>,
@@ -390,7 +395,6 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         }
     }
 
-    /// Sends `source` to each recipient of directed presence, addressed to it.
     pub(crate) async fn send_directed<'r>(
         &self,
         source: &RoutedStanza<A>,
@@ -416,11 +420,8 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
-    /// Builds and enqueues one stanza for each resource carrying `tag`.
-    ///
-    /// The builder receives the destination full JID and must not block the
-    /// router worker. Each stanza must use that JID. Build failures retire all
-    /// tagged sessions. Mailbox failures retire the affected session.
+    /// The builder must use the supplied full JID and must not block the router worker.
+    /// Build failures retire all tagged sessions; mailbox failures retire the affected session.
     pub async fn route_to_tagged(
         &self,
         account: &AccountKey,
@@ -442,6 +443,7 @@ impl fmt::Display for RouterError {
             Self::InvalidResource => "resource identifier is invalid",
             Self::ResourceLimit => "account resource limit reached",
             Self::NotFound => "destination resource is not connected",
+            Self::Offline => "destination account has no eligible resource",
             Self::Busy => "destination resource cannot accept a stanza",
             Self::Unavailable => "router cannot register a resource",
             Self::Stopped => "router has stopped",

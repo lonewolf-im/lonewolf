@@ -92,25 +92,17 @@ impl CloseContext {
     ) -> Result<T, ()> {
         let mut future = pin!(future);
         let first = {
-            let wait = pin!(compio::time::timeout(
-                deadline.saturating_duration_since(Instant::now()),
-                future.as_mut()
-            ));
+            let wait = pin!(before_deadline(deadline, future.as_mut()));
             match select(pin!(self.shutdown.clone()), wait).await {
-                Either::Right((result, _)) => Either::Right(result.map_err(|_| ())),
+                Either::Right((result, _)) => Either::Right(result),
                 Either::Left((shutdown, _)) => Either::Left(shutdown),
             }
         };
         let result = match first {
             Either::Right(result) => result,
-            Either::Left(shutdown) => compio::time::timeout(
-                deadline
-                    .min(shutdown)
-                    .saturating_duration_since(Instant::now()),
-                future.as_mut(),
-            )
-            .await
-            .map_err(|_| ()),
+            Either::Left(shutdown) => {
+                before_deadline(deadline.min(shutdown), future.as_mut()).await
+            }
         };
         if result.is_err() {
             self.abort();
@@ -195,6 +187,24 @@ where
         .await;
     context.abort();
     completed(result, outcome)
+}
+
+async fn before_deadline<T>(
+    deadline: Instant,
+    mut future: std::pin::Pin<&mut impl Future<Output = T>>,
+) -> Result<T, ()> {
+    compio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        poll_fn(|context| {
+            if Instant::now() >= deadline {
+                Poll::Ready(Err(()))
+            } else {
+                future.as_mut().poll(context).map(Ok)
+            }
+        }),
+    )
+    .await
+    .map_err(|_| ())?
 }
 
 fn completed(

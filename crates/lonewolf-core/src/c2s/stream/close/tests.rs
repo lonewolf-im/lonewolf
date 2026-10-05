@@ -208,3 +208,92 @@ fn shutdown_shortens_a_close_already_waiting_on_its_original_deadline() -> TestR
         Ok(())
     })
 }
+
+#[test]
+fn elapsed_close_budgets_preserve_the_phase_timeout_without_polling_network_work() -> TestResult {
+    use futures_util::FutureExt as _;
+    use std::io::Read as _;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
+
+    Runtime::new()?.block_on(async {
+        for expired_shutdown in [false, true] {
+            let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+            let mut peer = StdTcpStream::connect(listener.local_addr()?)?;
+            peer.set_read_timeout(Some(Duration::from_secs(1)))?;
+            let (socket, _) = listener.accept().await?;
+            let expired = Instant::now();
+            let shutdown = if expired_shutdown {
+                std::future::ready(expired).boxed_local().shared()
+            } else {
+                std::future::pending::<Instant>().boxed_local().shared()
+            };
+            let context = CloseContext {
+                socket,
+                shutdown,
+                phase_deadline: None,
+            };
+            let deadline = if expired_shutdown {
+                expired + Duration::from_secs(1)
+            } else {
+                expired
+            };
+            let polled = Cell::new(false);
+            let result = context
+                .until(deadline, async {
+                    polled.set(true);
+                    Err(CloseOutcome::TransportError)
+                })
+                .await;
+            assert_eq!(
+                completed(result, CloseOutcome::AuthenticationTimeout),
+                CloseOutcome::AuthenticationTimeout
+            );
+            assert!(!polled.get());
+            assert_eq!(peer.read(&mut [0; 1])?, 0);
+            listener.close().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestResult {
+    use futures_util::FutureExt as _;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
+
+    Runtime::new()?.block_on(async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let _peer = StdTcpStream::connect(listener.local_addr()?)?;
+        let (socket, _) = listener.accept().await?;
+        let context = CloseContext {
+            socket,
+            shutdown: std::future::pending::<Instant>().boxed_local().shared(),
+            phase_deadline: None,
+        };
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let ready = Cell::new(false);
+        let polls = Cell::new(0);
+        let mut close = Box::pin(context.until(
+            deadline,
+            poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                if ready.get() {
+                    Poll::Ready(Err(CloseOutcome::TransportError))
+                } else {
+                    Poll::Pending
+                }
+            }),
+        ));
+        assert!(poll!(close.as_mut()).is_pending());
+        assert_eq!(polls.get(), 1);
+        compio::time::sleep(Duration::from_millis(30)).await;
+        ready.set(true);
+        assert_eq!(
+            completed(close.await, CloseOutcome::AuthenticationTimeout),
+            CloseOutcome::AuthenticationTimeout
+        );
+        assert_eq!(polls.get(), 1);
+        listener.close().await?;
+        Ok(())
+    })
+}

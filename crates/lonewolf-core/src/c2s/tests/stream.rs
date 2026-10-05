@@ -286,7 +286,8 @@ fn run_starttls_restart_case_with_timeout(
                 let mut after_tls = if restart_open == PSI_OPEN {
                     let features = read_through(&mut tls, b"</stream:features>")?;
                     if wait_for_timeout {
-                        std::thread::sleep(authentication_timeout + Duration::from_millis(50));
+                        let mut buffer = [0; 256];
+                        while tls.sock.read(&mut buffer)? != 0 {}
                         return Ok((before_tls, String::from_utf8(features)?));
                     }
                     tls.write_all(CLOSE.as_bytes())?;

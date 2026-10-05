@@ -24,6 +24,11 @@ use super::{
 pub type Client = XmlStream<StreamOwned<ClientConnection, TcpStream>>;
 pub type PlainClient = XmlStream<TcpStream>;
 
+pub struct ScramExchange {
+    response: String,
+    server_signature: Vec<u8>,
+}
+
 impl PlainClient {
     pub fn tcp(server: &C2sSuite) -> TestResult<Self> {
         Self::tcp_at(server.address)
@@ -218,9 +223,25 @@ impl Client {
         mechanism: &str,
         binding: Option<&str>,
     ) -> TestResult<Element> {
-        let gs2 = binding
-            .map(|binding| format!("p={binding},,"))
-            .unwrap_or_else(|| "n,,".into());
+        let exchange = self.begin_scram(username, password, mechanism, binding, None)?;
+        self.finish_scram(exchange)
+    }
+
+    pub fn begin_scram(
+        &mut self,
+        username: &str,
+        password: &str,
+        mechanism: &str,
+        binding: Option<&str>,
+        authzid: Option<&str>,
+    ) -> TestResult<ScramExchange> {
+        let flag = binding
+            .map(|binding| format!("p={binding}"))
+            .unwrap_or_else(|| "n".into());
+        let authzid = authzid
+            .map(|value| format!("a={}", value.replace('=', "=3D").replace(',', "=2C")))
+            .unwrap_or_default();
+        let gs2 = format!("{flag},{authzid},");
         let mut channel = gs2.as_bytes().to_vec();
         match binding {
             Some("tls-exporter") => {
@@ -282,23 +303,23 @@ impl Client {
         for (byte, signature) in proof.iter_mut().zip(client_signature) {
             *byte ^= signature;
         }
-        self.send(&format!(
-            "<response xmlns='{SASL_NAMESPACE}'>{}</response>",
-            STANDARD.encode(format!(
-                "{final_without_proof},p={}",
-                STANDARD.encode(proof)
-            )),
-        ))?;
+        let server_key = hmac(sha1, &salted, b"Server Key")?;
+        Ok(ScramExchange {
+            response: format!("{final_without_proof},p={}", STANDARD.encode(proof)),
+            server_signature: hmac(sha1, &server_key, auth_message.as_bytes())?,
+        })
+    }
+
+    pub fn finish_scram(&mut self, exchange: ScramExchange) -> TestResult<Element> {
+        self.send_sasl_response(&exchange.response)?;
         let success = self.receive()?;
         if success.name != "success" || success.namespace != SASL_NAMESPACE {
             return Ok(success);
         }
         let final_message = String::from_utf8(STANDARD.decode(&success.text)?)?;
         let signature = STANDARD.decode(scram_attribute(&final_message, "v=")?)?;
-        let server_key = hmac(sha1, &salted, b"Server Key")?;
         assert_eq!(
-            signature,
-            hmac(sha1, &server_key, auth_message.as_bytes())?,
+            signature, exchange.server_signature,
             "incorrect SCRAM server signature"
         );
         Ok(success)

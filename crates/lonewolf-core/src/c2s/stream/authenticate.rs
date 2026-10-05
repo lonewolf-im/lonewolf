@@ -47,7 +47,6 @@ pub(super) fn sasl_features(mechanisms: AuthMechanisms) -> String {
     features
 }
 
-/// Runs SASL SCRAM until the client authenticates or exhausts its attempts.
 /// A rejected request, an aborted exchange and a replaced request each cost one attempt.
 pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
     established: &mut Established<A>,
@@ -115,7 +114,6 @@ enum Attempt {
     Authenticated(AccountKey, Mechanism),
     /// A SASL failure was sent and the client may try again.
     Rejected,
-    /// The client opened a new exchange instead of answering the challenge.
     Replaced(AuthRequest),
 }
 
@@ -125,14 +123,18 @@ enum Response {
     Rejected,
 }
 
-/// The account a first message names, and whether its stored credential may authenticate it.
+enum Authorization {
+    Allowed,
+    Invalid,
+}
+
 struct Identity {
     account: Option<AccountKey>,
-    known: bool,
+    credential_known: bool,
+    authorization: Authorization,
 }
 
 impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
-    /// Reads the next `<auth/>`; a malformed or aborted request is rejected and yields `None`.
     async fn read_request(&mut self) -> Result<Option<AuthRequest>, CloseOutcome> {
         let failure = match self.next_element().await? {
             StreamEvent::Element(element) => match parse_sasl_message(&element) {
@@ -196,18 +198,21 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         self.verify(mechanism, identity, &server, &response).await
     }
 
-    /// Issues the server challenge for the account's verifier.
-    /// Unknown accounts, stale credentials and authorization identity mismatches get a
-    /// decoy verifier so the exchange takes the same path and fails only at the proof.
+    /// Unknown accounts and unsupported stored credentials use a decoy until proof verification.
     async fn challenge(
         &mut self,
         mechanism: Mechanism,
         first: ClientFirst,
     ) -> Result<Option<(Identity, ScramServer, String)>, CloseOutcome> {
         let account = account_key(first.username(), self.host);
-        let authzid_matches = first
+        let authorization = if first
             .authzid()
-            .is_none_or(|authzid| account_key_from_jid(authzid).as_ref() == account.as_ref());
+            .is_none_or(|authzid| account_key_from_jid(authzid).as_ref() == account.as_ref())
+        {
+            Authorization::Allowed
+        } else {
+            Authorization::Invalid
+        };
         let verifier = match account.as_ref() {
             Some(key) => match self.auth.scram(key, mechanism.hash()).await {
                 Ok(verifier) => verifier,
@@ -219,7 +224,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             None => None,
         };
         let verifier = verifier.filter(|verifier| verifier.iterations() == SCRAM_POLICY_ITERATIONS);
-        let known = verifier.is_some() && authzid_matches;
+        let credential_known = verifier.is_some();
         let verifier = match verifier {
             Some(verifier) => verifier,
             None => match self.auth.decoy().verifier(
@@ -238,12 +243,19 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         }
         let nonce = STANDARD.encode(server_nonce);
         match first.start(verifier, &nonce) {
-            Ok((server, challenge)) => Ok(Some((Identity { account, known }, server, challenge))),
+            Ok((server, challenge)) => Ok(Some((
+                Identity {
+                    account,
+                    credential_known,
+                    authorization,
+                },
+                server,
+                challenge,
+            ))),
             Err(_) => Err(self.session.writer.fail(CloseOutcome::InternalError).await),
         }
     }
 
-    /// Checks the client proof and, for a known account, that its credential is still current.
     async fn verify(
         &mut self,
         mechanism: Mechanism,
@@ -257,7 +269,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             None => &[],
         };
         let final_message = match server.finish(response, binding_data) {
-            Ok(message) if identity.known => Some(message),
+            Ok(message) if identity.credential_known => Some(message),
             Ok(_) | Err(ServerError::InvalidProof | ServerError::ChannelBindingMismatch) => None,
             Err(error) => {
                 self.reject(scram_failure(error)).await?;
@@ -279,6 +291,11 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 .as_ref()
                 .is_some_and(|current| server.credential_is_current(current))
             {
+                // Authorization failures must not reveal an account before its credential is verified.
+                if matches!(identity.authorization, Authorization::Invalid) {
+                    self.reject("invalid-authzid").await?;
+                    return Ok(Attempt::Rejected);
+                }
                 if self
                     .client_from
                     .is_some_and(|from| from != account.as_str())
@@ -293,7 +310,6 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         Ok(Attempt::Rejected)
     }
 
-    /// Reads the client's answer to a challenge; a malformed answer is rejected.
     async fn read_response(&mut self) -> Result<Response, CloseOutcome> {
         let failure = match self.next_element().await? {
             StreamEvent::Element(element) => match parse_sasl_message(&element) {
@@ -302,13 +318,19 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 Ok(SaslMessage::Abort) => "aborted",
                 Err(condition) => condition,
             },
+            StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_) => {
+                return Err(self
+                    .session
+                    .writer
+                    .fail(CloseOutcome::UnsupportedInput)
+                    .await);
+            }
             _ => "malformed-request",
         };
         self.reject(failure).await?;
         Ok(Response::Rejected)
     }
 
-    /// Reads the next event, ending the stream on the client's footer.
     async fn next_element(&mut self) -> Result<StreamEvent<A>, CloseOutcome> {
         let Some(event) = self.session.next_event().await? else {
             return Err(CloseOutcome::Eof);

@@ -45,6 +45,7 @@ private_key_path = "certs/chat.key"
         .ok_or("missing TLS settings")?;
     assert_eq!(tls.certificate_chain_path, Path::new("certs/chat.pem"));
     assert_eq!(tls.private_key_path, Path::new("certs/chat.key"));
+    assert!(tls.client_auth.is_none());
     Ok(())
 }
 
@@ -193,6 +194,45 @@ fn invalid_roster_limits_are_rejected() -> TestResult {
         assert!(
             matches!(Config::load(Some(file.path())), Err(ConfigError::Invalid { reason, .. }) if reason == "hosts.localhost.roster requires the roster extension")
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn client_auth_paths_are_required_only_when_configured() -> TestResult {
+    let tls = "[hosts.localhost.tls]\ncertificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'\n";
+    let file = config_file(&format!(
+        "{tls}[hosts.localhost.tls.client_auth]\ntrust_anchors_path = 'roots.pem'\ncrls_path = 'crls.pem'"
+    ))?;
+    let config = Config::load(Some(file.path()))?;
+    let client = config.hosts["localhost"]
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.client_auth.as_ref())
+        .ok_or("missing client auth")?;
+    assert_eq!(client.trust_anchors_path, Path::new("roots.pem"));
+    assert_eq!(client.crls_path, Path::new("crls.pem"));
+    for paths in [
+        "",
+        "trust_anchors_path = 'roots.pem'",
+        "crls_path = 'crls.pem'",
+        "trust_anchors_path = 'roots.pem'\ncrls_path = 'crls.pem'\nunknown = true",
+    ] {
+        let file = config_file(&format!("{tls}[hosts.localhost.tls.client_auth]\n{paths}"))?;
+        assert!(matches!(
+            Config::load(Some(file.path())),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+    for paths in [
+        "trust_anchors_path = ''\ncrls_path = 'crls.pem'",
+        "trust_anchors_path = 'roots.pem'\ncrls_path = ''",
+    ] {
+        let file = config_file(&format!("{tls}[hosts.localhost.tls.client_auth]\n{paths}"))?;
+        assert!(matches!(
+            Config::load(Some(file.path())),
+            Err(ConfigError::Invalid { .. })
+        ));
     }
     Ok(())
 }

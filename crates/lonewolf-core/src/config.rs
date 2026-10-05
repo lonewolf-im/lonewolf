@@ -178,6 +178,18 @@ impl Config {
                         "hosts.{domain}.tls.certificate_chain_path must not be empty"
                     ));
                 }
+                if let Some(client) = &tls.client_auth {
+                    for (name, path) in [
+                        ("trust_anchors_path", &client.trust_anchors_path),
+                        ("crls_path", &client.crls_path),
+                    ] {
+                        if path.as_os_str().is_empty() {
+                            return Err(format!(
+                                "hosts.{domain}.tls.client_auth.{name} must not be empty"
+                            ));
+                        }
+                    }
+                }
                 if tls.private_key_path.as_os_str().is_empty() {
                     return Err(format!(
                         "hosts.{domain}.tls.private_key_path must not be empty"
@@ -250,6 +262,15 @@ impl Default for OfflineHostConfig {
 pub struct HostTlsConfig {
     pub certificate_chain_path: PathBuf,
     pub private_key_path: PathBuf,
+    #[serde(default)]
+    pub client_auth: Option<ClientCertificateConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCertificateConfig {
+    pub trust_anchors_path: PathBuf,
+    pub crls_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]

@@ -150,6 +150,7 @@ fn certificate_files_are_checked_during_bootstrap() -> TestResult {
         .tls = Some(HostTlsConfig {
         certificate_chain_path: tls.certificate_chain_path,
         private_key_path: PathBuf::from("missing.key"),
+        client_auth: None,
     });
     assert!(matches!(
         Hosts::new(&config.hosts, None),
@@ -171,6 +172,7 @@ fn mismatched_private_key_is_rejected() -> TestResult {
             tls: Some(HostTlsConfig {
                 certificate_chain_path: tls.certificate_chain_path,
                 private_key_path: other.private_key_path,
+                client_auth: None,
             }),
             ..HostConfig::default()
         },
@@ -277,6 +279,7 @@ fn hashless_certificate_signature_is_rejected_at_bootstrap() -> TestResult {
             tls: Some(HostTlsConfig {
                 certificate_chain_path,
                 private_key_path,
+                client_auth: None,
             }),
             ..HostConfig::default()
         },
@@ -366,6 +369,7 @@ fn test_tls_files(
     Ok(HostTlsConfig {
         certificate_chain_path,
         private_key_path,
+        client_auth: None,
     })
 }
 
@@ -424,4 +428,148 @@ impl rcgen::SigningKey for Ed25519TestSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
         Ok(self.key.sign(message).to_vec())
     }
+}
+
+#[test]
+fn client_certificate_material_is_checked_during_bootstrap() -> TestResult {
+    use super::client_identity::tests::{Fixture, pem};
+    let fixture = Fixture::new()?;
+    let mut tls = test_tls_files(&fixture.directory, "localhost", "client")?;
+    tls.client_auth = Some(fixture.config.clone());
+    let mut config = Config::default();
+    config.hosts.get_mut("localhost").ok_or("missing host")?.tls = Some(tls);
+    let hosts = Hosts::new(&config.hosts, None)?;
+    let policy = hosts
+        .client_certificate_policy("localhost")
+        .ok_or("missing policy")?;
+    assert!(policy.verifier().offer_client_auth());
+    assert!(!policy.verifier().client_auth_mandatory());
+    assert!(hosts.client_certificate_policy("other").is_none());
+    assert!(std::sync::Arc::ptr_eq(
+        policy,
+        hosts
+            .clone()
+            .client_certificate_policy("localhost")
+            .ok_or("missing cloned policy")?
+    ));
+    for material in [
+        b"".as_slice(),
+        b"broken PEM",
+        b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n",
+    ] {
+        fs::write(&fixture.config.trust_anchors_path, material)?;
+        assert!(matches!(
+            Hosts::new(&config.hosts, None),
+            Err(HostsError::ClientCertificates { .. })
+        ));
+    }
+    fs::write(
+        &fixture.config.trust_anchors_path,
+        pem("CERTIFICATE", b"not DER")?,
+    )?;
+    assert!(matches!(
+        Hosts::new(&config.hosts, None),
+        Err(HostsError::ClientCertificates { .. })
+    ));
+    fs::remove_file(&fixture.config.trust_anchors_path)?;
+    assert!(matches!(
+        Hosts::new(&config.hosts, None),
+        Err(HostsError::ClientCertificates { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn required_crls_cannot_be_missing_empty_malformed_stale_or_unusable_at_bootstrap() -> TestResult {
+    use super::client_identity::tests::{Fixture, pem};
+    use rustls::pki_types::pem::PemObject;
+    use x509_cert::der::{Decode, Encode};
+    let fixture = Fixture::new()?;
+    let mut tls = test_tls_files(&fixture.directory, "localhost", "crl")?;
+    tls.client_auth = Some(fixture.config.clone());
+    let mut config = Config::default();
+    config.hosts.get_mut("localhost").ok_or("missing host")?.tls = Some(tls);
+    let der =
+        rustls::pki_types::CertificateRevocationListDer::from_pem_file(&fixture.config.crls_path)?;
+    let parsed: x509_cert::crl::CertificateList =
+        x509_cert::crl::CertificateList::from_der(der.as_ref())?;
+    for material in [
+        b"".as_slice(),
+        b"broken PEM",
+        b"-----BEGIN X509 CRL-----\n!\n-----END X509 CRL-----\n",
+    ] {
+        fs::write(&fixture.config.crls_path, material)?;
+        assert!(matches!(
+            Hosts::new(&config.hosts, None),
+            Err(HostsError::ClientCertificates { .. })
+        ));
+    }
+    fs::write(&fixture.config.crls_path, pem("X509 CRL", b"not DER")?)?;
+    assert!(Hosts::new(&config.hosts, None).is_err());
+    for next_update in [None, Some(parsed.tbs_cert_list.this_update)] {
+        let mut invalid = parsed.clone();
+        invalid.tbs_cert_list.next_update = next_update;
+        fs::write(
+            &fixture.config.crls_path,
+            pem("X509 CRL", &invalid.to_der()?)?,
+        )?;
+        assert!(Hosts::new(&config.hosts, None).is_err());
+    }
+    let mut unsupported = parsed;
+    unsupported.signature_algorithm.oid =
+        x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.2.3.4");
+    fs::write(
+        &fixture.config.crls_path,
+        pem("X509 CRL", &unsupported.to_der()?)?,
+    )?;
+    assert!(Hosts::new(&config.hosts, None).is_err());
+    fs::remove_file(&fixture.config.crls_path)?;
+    assert!(matches!(
+        Hosts::new(&config.hosts, None),
+        Err(HostsError::ClientCertificates { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn refreshed_host_configs_keep_session_caches_separate() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        let fixture = super::client_identity::tests::Fixture::new()?;
+        let mut tls = test_tls_files(&fixture.directory, "localhost", "fresh")?;
+        tls.client_auth = Some(fixture.config.clone());
+        let mut config = Config::default();
+        config.hosts.get_mut("localhost").ok_or("missing host")?.tls = Some(tls);
+        let hosts = Hosts::new(&config.hosts, None)?;
+        let first = hosts
+            .tls_server_config("localhost")
+            .await
+            .ok_or("missing first TLS config")?;
+        let second = hosts
+            .tls_server_config("localhost")
+            .await
+            .ok_or("missing second TLS config")?;
+        assert!(first.require_ems && second.require_ems);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.session_storage,
+            &second.session_storage
+        ));
+        assert!(!std::sync::Arc::ptr_eq(&first.ticketer, &second.ticketer));
+        assert!(std::sync::Arc::ptr_eq(
+            &first.cert_resolver,
+            &second.cert_resolver
+        ));
+        let config = Config::default();
+        let hosts = Hosts::new(&config.hosts, None)?;
+        let first = hosts
+            .tls_server_config("localhost")
+            .await
+            .ok_or("missing cached TLS config")?;
+        let second = hosts
+            .tls_server_config("localhost")
+            .await
+            .ok_or("missing cached TLS config")?;
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(hosts.tls_server_config("unknown").await.is_none());
+        Ok(())
+    })
 }

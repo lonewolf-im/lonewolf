@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,6 +22,11 @@ use x509_cert::der::Decode;
 use zeroize::Zeroizing;
 
 use crate::config::{HostConfig, HostTlsConfig};
+use lonewolf_util::blocking::BlockingExecutor;
+
+pub mod client_identity;
+
+use client_identity::{ClientCertificatePolicy, ClientIdentityError};
 
 #[derive(Clone, Debug)]
 pub struct Hosts {
@@ -34,7 +40,10 @@ struct Host {
     config: HostConfig,
     certified_key: Arc<CertifiedKey>,
     tls_server_config: Arc<rustls::ServerConfig>,
+    tls_builder: rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier>,
+    certificate_resolver: Arc<HostCertResolver>,
     tls_server_end_point: Vec<u8>,
+    client_certificate_policy: Option<Arc<ClientCertificatePolicy>>,
 }
 
 #[derive(Debug)]
@@ -72,6 +81,7 @@ impl Hosts {
         let provider = Arc::new(rustls_graviola::default_provider());
         let mut resolver = ResolvesServerCertUsingSni::new();
         let mut sorted_hosts = Vec::with_capacity(hosts.len());
+        let blocking = BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() });
         for (domain, config) in hosts {
             let certified_key = match config.tls.as_ref() {
                 Some(tls) => load_certified_key(domain, tls, &provider)?,
@@ -90,15 +100,38 @@ impl Hosts {
                 .first()
                 .and_then(|cert| tls_server_end_point(cert.as_ref()))
                 .ok_or_else(|| HostsError::UnsupportedChannelBinding(domain.clone()))?;
-            let mut tls_server_config =
-                rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
-                    .with_safe_default_protocol_versions()
-                    .map_err(HostsError::TlsConfiguration)?
-                    .with_no_client_auth()
-                    .with_cert_resolver(Arc::new(HostCertResolver {
-                        domain: domain.clone(),
-                        certified_key: Arc::clone(&certified_key),
-                    }));
+            let client_certificate_policy = config
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_auth.as_ref())
+                .map(|client| {
+                    ClientCertificatePolicy::load(
+                        domain,
+                        client,
+                        Arc::clone(&provider),
+                        blocking.clone(),
+                    )
+                })
+                .transpose()
+                .map_err(|source| HostsError::ClientCertificates {
+                    domain: domain.clone(),
+                    source,
+                })?;
+            let verifier = client_certificate_policy.as_ref().map_or_else(
+                rustls::server::WebPkiClientVerifier::no_client_auth,
+                |policy| policy.verifier(),
+            );
+            let tls_builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .map_err(HostsError::TlsConfiguration)?;
+            let certificate_resolver = Arc::new(HostCertResolver {
+                domain: domain.clone(),
+                certified_key: Arc::clone(&certified_key),
+            });
+            let mut tls_server_config = tls_builder
+                .clone()
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(certificate_resolver.clone());
             // TLS 1.2 exporters need an extended master secret for channel binding.
             tls_server_config.require_ems = true;
             sorted_hosts.push(Host {
@@ -106,7 +139,10 @@ impl Hosts {
                 config: config.clone(),
                 certified_key,
                 tls_server_config: Arc::new(tls_server_config),
+                tls_builder,
+                certificate_resolver,
                 tls_server_end_point,
+                client_certificate_policy,
             });
         }
         let default_host_index = sorted_hosts
@@ -139,12 +175,28 @@ impl Hosts {
         Some(&self.find_host(domain)?.certified_key)
     }
 
-    pub fn tls_server_config(&self, domain: &str) -> Option<&Arc<rustls::ServerConfig>> {
-        Some(&self.find_host(domain)?.tls_server_config)
+    pub async fn tls_server_config(&self, domain: &str) -> Option<Arc<rustls::ServerConfig>> {
+        let host = self.find_host(domain)?;
+        let Some(policy) = &host.client_certificate_policy else {
+            return Some(Arc::clone(&host.tls_server_config));
+        };
+        let verifier = policy.handshake_verifier().await;
+        // A new session cache prevents resuming an older certificate verdict.
+        let mut config = host
+            .tls_builder
+            .clone()
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(host.certificate_resolver.clone());
+        config.require_ems = true;
+        Some(Arc::new(config))
     }
 
     pub fn tls_server_end_point(&self, domain: &str) -> Option<&[u8]> {
         Some(&self.find_host(domain)?.tls_server_end_point)
+    }
+
+    pub fn client_certificate_policy(&self, domain: &str) -> Option<&Arc<ClientCertificatePolicy>> {
+        self.find_host(domain)?.client_certificate_policy.as_ref()
     }
 
     fn find_host(&self, domain: &str) -> Option<&Host> {
@@ -321,6 +373,10 @@ pub enum HostsError {
         domain: String,
         source: rustls::Error,
     },
+    ClientCertificates {
+        domain: String,
+        source: ClientIdentityError,
+    },
     UnsupportedChannelBinding(String),
     TlsConfiguration(rustls::Error),
     GenerateLocalhost(String),
@@ -370,6 +426,10 @@ impl fmt::Display for HostsError {
                     "invalid TLS material for hosts.{domain}: {source}"
                 )
             }
+            Self::ClientCertificates { domain, source } => write!(
+                formatter,
+                "invalid client certificate policy for hosts.{domain}: {source}"
+            ),
             Self::UnsupportedChannelBinding(domain) => write!(
                 formatter,
                 "TLS certificate for hosts.{domain} has no supported signature hash for tls-server-end-point channel binding"
@@ -394,6 +454,7 @@ impl Error for HostsError {
                 Some(source)
             }
             Self::InvalidCertificate { source, .. } => Some(source),
+            Self::ClientCertificates { source, .. } => Some(source),
             _ => None,
         }
     }

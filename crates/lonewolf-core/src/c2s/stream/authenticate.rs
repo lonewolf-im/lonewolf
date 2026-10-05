@@ -59,6 +59,7 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         client_from,
         binding,
         auth_started_at: _,
+        client: _,
     } = established;
     let host = session.host().to_owned();
     let Some(endpoint) = hosts.tls_server_end_point(&host) else {
@@ -122,7 +123,6 @@ struct AuthRequest {
 
 enum Attempt {
     Authenticated(AccountKey, Mechanism),
-    /// A SASL failure was sent.
     Rejected,
     Replaced(AuthRequest),
 }

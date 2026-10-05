@@ -61,6 +61,13 @@
 # certificate_chain_path = "./certs/example.com.crt"
 # private_key_path = "./certs/example.com.key"
 
+# Request trusted client certificates while keeping password authentication available.
+# Both paths are required for this table. Use PEM trust anchors and current CRLs.
+# These paths are example values.
+# [hosts."example.com".tls.client_auth]
+# trust_anchors_path = "./certs/client-roots.pem"
+# crls_path = "./certs/client-crls.pem"
+
 # ------------------------------------ Limits ---------------------------------------------------
 
 # All numeric limits are positive integers.

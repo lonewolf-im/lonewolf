@@ -47,6 +47,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     max_resources_per_account: NonZeroUsize,
     allocator: A,
 ) -> Result<Bound<A>, CloseOutcome> {
+    drop(established.client);
     let mut session = established.session.restart().await?;
     let context = session.close.clone();
     let result = context

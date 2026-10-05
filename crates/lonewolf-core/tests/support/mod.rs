@@ -3,7 +3,7 @@
 mod client;
 mod extensions;
 mod server;
-mod tls;
+pub mod tls;
 pub mod xml;
 
 pub use client::{Client, PlainClient};

@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, KeyInit, Mac};
 use quick_xml::escape::escape;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConnection, StreamOwned};
+use rustls::{ClientConfig, ClientConnection, StreamOwned, SupportedProtocolVersion};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use socket2::SockRef;
@@ -42,13 +42,16 @@ impl PlainClient {
         Ok(Self::new(socket))
     }
 
-    pub fn start_tls(mut self, server: &C2sSuite) -> TestResult<Client> {
+    pub fn start_tls(self, server: &C2sSuite) -> TestResult<Client> {
+        self.start_tls_with_config(Arc::clone(&server.tls))
+    }
+
+    fn start_tls_with_config(mut self, config: Arc<ClientConfig>) -> TestResult<Client> {
         self.send(&format!("<starttls xmlns='{TLS_NAMESPACE}'/>"))?;
         self.receive()?.assert_name(TLS_NAMESPACE, "proceed");
         let socket = self.into_inner();
         assert!(socket.buffer().is_empty());
-        let connection =
-            ClientConnection::new(Arc::clone(&server.tls), ServerName::try_from("localhost")?)?;
+        let connection = ClientConnection::new(config, ServerName::try_from("localhost")?)?;
         Ok(XmlStream::new(StreamOwned::new(
             connection,
             socket.into_inner(),
@@ -73,6 +76,17 @@ impl Client {
 
     pub fn secure(server: &C2sSuite) -> TestResult<Self> {
         Self::secure_at(server, server.address)
+    }
+
+    pub fn secure_with_versions(
+        server: &C2sSuite,
+        versions: &[&'static SupportedProtocolVersion],
+    ) -> TestResult<Self> {
+        let mut plain = PlainClient::tcp(server)?;
+        plain.open()?.child(TLS_NAMESPACE, "starttls")?;
+        let mut client = plain.start_tls_with_config(server.tls_with_versions(versions)?)?;
+        client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
+        Ok(client)
     }
 
     fn secure_at(server: &C2sSuite, address: SocketAddr) -> TestResult<Self> {
@@ -249,7 +263,7 @@ impl Client {
                 self.transport().conn.export_keying_material(
                     &mut exporter,
                     b"EXPORTER-Channel-Binding",
-                    None,
+                    Some(&[]),
                 )?;
                 channel.extend_from_slice(&exporter);
             }
@@ -265,6 +279,31 @@ impl Client {
             Some(_) => return Err("unsupported test channel binding".into()),
             None => {}
         }
+        self.scram_exchange(username, password, mechanism, &gs2, &channel)
+    }
+
+    pub fn begin_scram_with_channel_binding(
+        &mut self,
+        username: &str,
+        password: &str,
+        mechanism: &str,
+        binding: &str,
+        data: &[u8],
+    ) -> TestResult<ScramExchange> {
+        let gs2 = format!("p={binding},,");
+        let mut channel = gs2.as_bytes().to_vec();
+        channel.extend_from_slice(data);
+        self.scram_exchange(username, password, mechanism, &gs2, &channel)
+    }
+
+    fn scram_exchange(
+        &mut self,
+        username: &str,
+        password: &str,
+        mechanism: &str,
+        gs2: &str,
+        channel: &[u8],
+    ) -> TestResult<ScramExchange> {
         let sha1 = mechanism.starts_with("SCRAM-SHA-1");
         let mut random = [0; 18];
         graviola::random::fill(&mut random)?;

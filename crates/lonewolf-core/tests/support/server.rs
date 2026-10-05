@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustls::ClientConfig;
+use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
 use super::{Client, PlainClient, TIMEOUT, TestResult, tls};
 
@@ -48,6 +48,7 @@ pub struct C2sSuite {
     directory: tempfile::TempDir,
     pub address: SocketAddr,
     pub tls: Arc<ClientConfig>,
+    tls_roots: RootCertStore,
 }
 
 impl C2sSuite {
@@ -146,7 +147,8 @@ impl C2sSuite {
     ) -> TestResult<Self> {
         let permit = C2sSuitePermit::acquire();
         let directory = tempfile::tempdir()?;
-        let tls = tls::configure(directory.path())?;
+        let tls_roots = tls::configure(directory.path())?;
+        let tls = tls::client_config(tls_roots.clone(), rustls::DEFAULT_VERSIONS)?;
         let default = default.map_or_else(String::new, |name| format!("default = {name:?}"));
         fs::write(
             directory.path().join("lonewolf.toml"),
@@ -190,9 +192,20 @@ max_resources_per_account = {resources}
             directory,
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             tls: Arc::new(tls),
+            tls_roots,
         };
         server.wait_until_ready()?;
         Ok(server)
+    }
+
+    pub fn tls_with_versions(
+        &self,
+        versions: &[&'static SupportedProtocolVersion],
+    ) -> TestResult<Arc<ClientConfig>> {
+        Ok(Arc::new(tls::client_config(
+            self.tls_roots.clone(),
+            versions,
+        )?))
     }
 
     fn wait_until_ready(&mut self) -> TestResult {

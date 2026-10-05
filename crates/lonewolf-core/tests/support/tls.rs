@@ -10,11 +10,11 @@ use graviola::hashing::Sha256;
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, PublicKeyData};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
 use super::TestResult;
 
-pub fn configure(directory: &Path) -> TestResult<ClientConfig> {
+pub fn configure(directory: &Path) -> TestResult<RootCertStore> {
     let key = SigningKey::<P256> {
         private_key: StaticPrivateKey::new_random()?,
     };
@@ -38,9 +38,16 @@ pub fn configure(directory: &Path) -> TestResult<ClientConfig> {
     )?;
     let mut roots = RootCertStore::empty();
     roots.add(certificate.der().clone())?;
+    Ok(roots)
+}
+
+pub fn client_config(
+    roots: RootCertStore,
+    versions: &[&'static SupportedProtocolVersion],
+) -> TestResult<ClientConfig> {
     Ok(
         ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-            .with_safe_default_protocol_versions()?
+            .with_protocol_versions(versions)?
             .with_root_certificates(roots)
             .with_no_client_auth(),
     )

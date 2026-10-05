@@ -393,7 +393,7 @@ fn retiring_an_account_ends_every_session_and_frees_its_resources() -> TestResul
             Err(RouterError::NotFound)
         ));
         assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 1);
-        assert!(desk.end_presence().await?.is_some());
+        assert!(desk.end_presence().await?.unavailable.is_some());
         desk.finish_presence().await?;
         assert!(handle.local.withdrawal_snapshot(&alice).await?.is_empty());
 
@@ -860,6 +860,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
         let unavailable = phone
             .end_presence()
             .await?
+            .unavailable
             .ok_or("missing retired presence")?;
         assert_eq!(
             unavailable
@@ -874,7 +875,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
             .register(&alice, Some("phone"), NonZeroUsize::new(2).unwrap())
             .await?;
         assert_eq!(replacement.resource(), "phone");
-        assert!(!phone.replacement_is_available().await?);
+        assert!(!phone.handle().replacement_is_available().await?);
         replacement
             .handle()
             .set_presence(
@@ -883,7 +884,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 Some(unavailable_presence("phone").await?),
             )
             .await?;
-        assert!(phone.replacement_is_available().await?);
+        assert!(phone.handle().replacement_is_available().await?);
         assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 2);
         phone.finish_presence().await?;
         assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 2);
@@ -930,7 +931,7 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
         )
         .await?;
 
-        assert!(alice_desk.end_presence().await?.is_some());
+        assert!(alice_desk.end_presence().await?.unavailable.is_some());
         assert!(handle.local.presence_snapshot(&alice).await?.is_empty());
         handle
             .route_unavailable_presence(&alice, &bob_account)
@@ -1151,6 +1152,284 @@ fn dropping_an_evicted_registration_clears_its_retained_presence() -> TestResult
         assert_eq!(handle.local.withdrawal_snapshot(&alice).await?.len(), 1);
 
         drop(desk);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+async fn directed_grant(
+    source: &Registration<GlobalChunkAllocator>,
+    to: &str,
+    available: bool,
+) -> Result<(), Box<dyn Error>> {
+    let kind = if available { "" } else { " type='unavailable'" };
+    source
+        .handle()
+        .directed_presence(
+            parse_stanza(&format!(
+                "<presence from='{}' to='{to}'{kind}/>",
+                source.full_jid()
+            ))
+            .await?,
+            available,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn has_grant(
+    handle: &super::RouterHandle<GlobalChunkAllocator>,
+    source: &AccountKey,
+    resource: &str,
+    observer: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    let observer = Jid::parse_in(observer, &mut arena)?.resolve(&arena)?;
+    Ok(handle
+        .has_directed_grant(source, resource, observer)
+        .await?)
+}
+
+fn recipient(value: &str) -> Result<super::DirectedRecipient, Box<dyn Error>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    Ok(super::DirectedRecipient::new(
+        Jid::parse_in(value, &mut arena)?.resolve(&arena)?,
+    ))
+}
+
+#[test]
+fn directed_grants_keep_exact_recipients_and_source_resources() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        directed_grant(&desk, "bob@localhost/desk", true).await?;
+        assert!(has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
+        assert!(!has_grant(&handle, &alice, "desk", "bob@localhost/phone").await?);
+        assert!(!has_grant(&handle, &alice, "desk", "bob@localhost").await?);
+        assert!(!has_grant(&handle, &alice, "phone", "bob@localhost/desk").await?);
+        directed_grant(&desk, "bob@localhost", true).await?;
+        assert!(has_grant(&handle, &alice, "desk", "bob@localhost/phone").await?);
+        directed_grant(&desk, "bob@localhost/desk", false).await?;
+        assert!(has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
+        directed_grant(&desk, "bob@localhost", false).await?;
+        assert!(!has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
+        drop((desk, phone));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn incoming_unavailable_prunes_connected_only_grants_by_sender_scope() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        for source in [&desk, &phone] {
+            for target in ["bob@localhost", "bob@localhost/desk", "bob@localhost/phone"] {
+                directed_grant(source, target, true).await?;
+            }
+        }
+        handle.route_directed_presence(parse_stanza("<presence from='bob@localhost/desk' to='alice@localhost/desk' type='unavailable'/>").await?).await?;
+        assert!(has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
+        directed_grant(&desk, "bob@localhost", false).await?;
+        assert!(!has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
+        assert!(has_grant(&handle, &alice, "desk", "bob@localhost/phone").await?);
+        assert!(has_grant(&handle, &alice, "phone", "bob@localhost/desk").await?);
+        handle
+            .route_directed_presence(
+                parse_stanza(
+                    "<presence from='bob@localhost' to='alice@localhost' type='unavailable'/>",
+                )
+                .await?,
+            )
+            .await?;
+        for resource in ["desk", "phone"] {
+            for observer in ["bob@localhost", "bob@localhost/desk", "bob@localhost/phone"] {
+                assert!(!has_grant(&handle, &alice, resource, observer).await?);
+            }
+        }
+        drop((desk, phone));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn retirement_transfers_grants_once_and_stale_handles_cannot_change_replacement() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let old = desk.handle();
+        directed_grant(&desk, "bob@localhost/desk", true).await?;
+        handle.retire_account(&alice).await?;
+        let first = desk.wait_retired().await?;
+        let second = first.clone();
+        assert_eq!(first.cause, second.cause);
+        let owned = old.end_presence().await?;
+        assert_eq!(owned.directed.recipients.len(), 1);
+        assert!(old.end_presence().await?.directed.recipients.is_empty());
+        let replacement = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        directed_grant(&replacement, "carol@localhost/desk", true).await?;
+        assert_eq!(old.directed_presence(parse_stanza("<presence from='alice@localhost/desk' to='carol@localhost/desk' type='unavailable'/>").await?, false).await, Err(RouterError::NotFound));
+        old.finish_presence(owned.directed.source_token).await?;
+        assert!(has_grant(&handle, &alice, "desk", "carol@localhost/desk").await?);
+        drop((desk, replacement));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn selected_delivery_dies_on_revocation_regrant_or_source_replacement() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let bob = account("bob@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let observer = handle
+            .register(&bob, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        directed_grant(&desk, "bob@localhost/desk", true).await?;
+        observer.take_queued();
+        let response =
+            parse_stanza("<presence from='alice@localhost/desk' to='bob@localhost/desk'/>").await?;
+        let selected = handle
+            .local
+            .presence_access(
+                &alice,
+                Some("desk".into()),
+                recipient("bob@localhost/desk")?,
+                false,
+                Box::new(move |source| {
+                    assert_eq!(source.resource, "desk");
+                    assert!(source.presence.is_none());
+                    assert_eq!(
+                        source.access,
+                        super::local::PresenceAccess {
+                            subscribed: false,
+                            directed: true
+                        }
+                    );
+                    Ok(Some(response.clone()))
+                }),
+            )
+            .await?;
+        directed_grant(&desk, "bob@localhost/desk", false).await?;
+        directed_grant(&desk, "bob@localhost/desk", true).await?;
+        observer.take_queued();
+        for delivery in selected {
+            handle.local.authorized_delivery(delivery).await?;
+        }
+        assert!(observer.take_queued().is_empty());
+        let response =
+            parse_stanza("<presence from='alice@localhost/desk' to='bob@localhost/desk'/>").await?;
+        let selected = handle
+            .local
+            .presence_access(
+                &alice,
+                None,
+                recipient("bob@localhost/desk")?,
+                true,
+                Box::new(move |_| Ok(Some(response.clone()))),
+            )
+            .await?;
+        let withdrawal = desk.handle().end_presence().await?;
+        assert!(withdrawal.unavailable.is_none());
+        assert_eq!(withdrawal.directed.recipients.len(), 1);
+        let replacement = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        for delivery in selected {
+            handle.local.authorized_delivery(delivery).await?;
+        }
+        assert!(observer.take_queued().is_empty());
+        drop((desk, replacement, observer));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn protected_access_survives_requester_cancellation_and_observes_prior_revocation() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let directory = tempfile::tempdir()?;
+        let storage = lonewolf_storage::RedbStorage::open(directory.path().join("presence.redb"))?;
+        let alice = account("alice@localhost")?;
+        let bob = account("bob@localhost")?;
+        let source = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let observer = handle
+            .register(&bob, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        directed_grant(&source, "bob@localhost/desk", true).await?;
+        observer.take_queued();
+        let ((), mut blocker) = handle
+            .order()
+            .fix(vec![alice.clone()], async { Ok::<_, RouterError>(()) })
+            .await?;
+        blocker.turn().await;
+        let mut work = crate::delivery::WorkGroup::new();
+        let called = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&called);
+        let pending = handle.with_presence_access(
+            work.start(),
+            storage.clone(),
+            alice.clone(),
+            Some("desk".into()),
+            recipient("bob@localhost/desk")?,
+            move |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            },
+        );
+        drop(pending);
+        directed_grant(&source, "bob@localhost/desk", false).await?;
+        observer.take_queued();
+        drop(blocker);
+        work.drain().await;
+        assert_eq!(called.load(Ordering::Relaxed), 0);
+        let reply =
+            parse_stanza("<presence from='bob@localhost/desk' to='bob@localhost/desk'/>").await?;
+        let pending = handle.with_presence_access(
+            work.start(),
+            storage,
+            bob,
+            Some("desk".into()),
+            recipient("bob@localhost/desk")?,
+            move |source| {
+                assert!(!source.access.subscribed);
+                assert!(!source.access.directed);
+                Ok(Some(reply.clone()))
+            },
+        );
+        pending.finished().await.ok_or("lost effect")??;
+        assert_eq!(observer.take_queued().len(), 1);
+        drop((source, observer));
         router.shutdown().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())

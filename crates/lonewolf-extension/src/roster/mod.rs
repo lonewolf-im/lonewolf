@@ -15,6 +15,7 @@ use lonewolf_storage::roster::{
     RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
 use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
@@ -267,6 +268,26 @@ where
     A: ChunkAllocator,
     S: Storage,
 {
+    fn visibility<'a>(
+        &'a self,
+        owner: &'a AccountKey,
+        observer: JidRef<'a>,
+        transaction: &'a S::Read,
+    ) -> PresenceFuture<'a, bool> {
+        Box::pin(async move {
+            Ok(transaction
+                .roster_item(owner, &RosterJid::from(observer.bare()))
+                .await
+                .map_err(roster_error)?
+                .is_some_and(|item| {
+                    matches!(
+                        item.subscription.state,
+                        SubscriptionState::From | SubscriptionState::Both
+                    )
+                }))
+        })
+    }
+
     fn audience<'a>(
         &'a self,
         update: PresenceUpdate<'a>,

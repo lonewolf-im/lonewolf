@@ -43,7 +43,6 @@ struct TestRoster {
 struct RecordingDelivery {
     tags: RefCell<Vec<SessionTag>>,
     pushes: RefCell<Vec<String>>,
-    /// How many upcoming tagged deliveries fail.
     failing_deliveries: Cell<usize>,
 }
 
@@ -164,7 +163,6 @@ fn subscribed(jid: RosterJid, state: SubscriptionState) -> RosterItem {
     }
 }
 
-/// Keeps borrowed arenas alive until the handler future completes.
 struct IqCall {
     request: Arena<GlobalChunkAllocator>,
     response: Arena<GlobalChunkAllocator>,
@@ -333,7 +331,6 @@ fn remove_item(roster: &TestRoster, owner: &AccountKey, jid: &str) -> RosterVers
     .unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// A subscription request as the target host receives it, with bare addresses.
 struct SubscribeCall {
     stanza: RoutedStanza<GlobalChunkAllocator>,
 }
@@ -752,4 +749,79 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
         pushes[0].contains(r#"to="carol@example.com/desk""#),
         "{pushes:?}"
     );
+}
+
+#[test]
+fn visibility_uses_owner_grant_and_keeps_its_read_snapshot() {
+    let (_directory, roster) = roster();
+    let owner = account("alice@example.com");
+    let observer = account("bob@example.com");
+    create_account(&roster, &owner);
+    create_account(&roster, &observer);
+    let mut arena = Arena::try_new(Default::default()).unwrap_or_else(|error| panic!("{error}"));
+    let observer_jid = Jid::parse_in("bob@example.com/phone", &mut arena)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let observer_jid = observer_jid
+        .resolve(&arena)
+        .unwrap_or_else(|error| panic!("{error}"));
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        transaction
+            .put_roster_item(
+                &observer,
+                &subscribed(RosterJid::from(&owner), SubscriptionState::Both),
+            )
+            .await?;
+        transaction.commit().await?;
+        let snapshot = roster.storage.begin_read().await?;
+        assert!(
+            !TestPresenceHandler::visibility(&Roster::default(), &owner, observer_jid, &snapshot)
+                .await
+                .map_err(|error| format!("{error:?}"))?
+        );
+        drop(snapshot);
+        for state in [
+            SubscriptionState::None,
+            SubscriptionState::To,
+            SubscriptionState::From,
+            SubscriptionState::Both,
+        ] {
+            let mut transaction = roster.storage.begin_write().await?;
+            transaction
+                .put_roster_item(&owner, &subscribed(RosterJid::from(&observer), state))
+                .await?;
+            transaction.commit().await?;
+            let snapshot = roster.storage.begin_read().await?;
+            let expected = matches!(state, SubscriptionState::From | SubscriptionState::Both);
+            assert_eq!(
+                TestPresenceHandler::visibility(
+                    &Roster::default(),
+                    &owner,
+                    observer_jid,
+                    &snapshot
+                )
+                .await
+                .map_err(|error| format!("{error:?}"))?,
+                expected
+            );
+            let mut transaction = roster.storage.begin_write().await?;
+            transaction
+                .remove_roster_item(&owner, &RosterJid::from(&observer))
+                .await?;
+            transaction.commit().await?;
+            assert_eq!(
+                TestPresenceHandler::visibility(
+                    &Roster::default(),
+                    &owner,
+                    observer_jid,
+                    &snapshot
+                )
+                .await
+                .map_err(|error| format!("{error:?}"))?,
+                expected
+            );
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .unwrap_or_else(|error| panic!("{error}"));
 }

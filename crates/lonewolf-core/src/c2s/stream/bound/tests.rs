@@ -855,3 +855,270 @@ fn shutdown_interrupts_pending_certificate_revalidation() -> TestResult {
         Ok(())
     })
 }
+
+fn routed_presence(
+    from: &str,
+    to: Option<&str>,
+    kind: PresenceType,
+) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    let from = Jid::parse_in(from, &mut arena)?;
+    let to = to.map(|to| Jid::parse_in(to, &mut arena)).transpose()?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Presence(kind),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(to)?
+    .build()?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
+}
+
+#[test]
+fn cancelled_terminal_owner_keeps_directed_withdrawal_and_replacement_grants() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut fixture = Fixture::new(&[]).await?;
+        let handle = fixture.router.handle();
+        let mut arena = Arena::try_new(Default::default())?;
+        let alice =
+            AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+        let observer = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        fixture
+            .registration
+            .handle()
+            .directed_presence(
+                routed_presence(
+                    "bob@localhost/phone",
+                    Some("alice@localhost/desk"),
+                    PresenceType::Available,
+                )?,
+                true,
+            )
+            .await?;
+        assert_eq!(observer.take_queued().len(), 1);
+        let ((), mut blocker) = handle
+            .order()
+            .fix(vec![fixture.registration.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        blocker.turn().await;
+        let pending = Pending::spawn(
+            fixture.work.start(),
+            TerminalPresenceWork {
+                session: fixture.registration.handle(),
+                router: handle.clone(),
+                storage: fixture.storage.clone(),
+                account: fixture.registration.account().clone(),
+                fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            }
+            .run(),
+        );
+        assert!(fixture.registration.recv().await.is_none());
+        drop(pending);
+        let unavailable = observer.recv().await.ok_or("missing terminal withdrawal")?;
+        assert_eq!(
+            unavailable.resolve()?.stanza_type(),
+            StanzaType::Presence(PresenceType::Unavailable)
+        );
+        let replacement = handle
+            .register(
+                fixture.registration.account(),
+                Some("phone"),
+                NonZeroUsize::MIN,
+            )
+            .await?;
+        replacement
+            .handle()
+            .directed_presence(
+                routed_presence(
+                    "bob@localhost/phone",
+                    Some("alice@localhost/desk"),
+                    PresenceType::Available,
+                )?,
+                true,
+            )
+            .await?;
+        assert_eq!(observer.take_queued().len(), 1);
+        drop(blocker);
+        fixture.work.drain().await;
+        assert!(observer.take_queued().is_empty());
+        let jid = Jid::parse_in("alice@localhost/desk", &mut arena)?.resolve(&arena)?;
+        assert!(
+            handle
+                .has_directed_grant(replacement.account(), replacement.resource(), jid)
+                .await?
+        );
+        drop((replacement, observer));
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut fixture = Fixture::new(&[]).await?;
+        let handle = fixture.router.handle();
+        let mut arena = Arena::try_new(Default::default())?;
+        let alice =
+            AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+        let observer = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        fixture
+            .registration
+            .handle()
+            .directed_presence(
+                routed_presence(
+                    "bob@localhost/phone",
+                    Some("alice@localhost/desk"),
+                    PresenceType::Available,
+                )?,
+                true,
+            )
+            .await?;
+        observer.take_queued();
+        let ((), mut blocker) = handle
+            .order()
+            .fix(vec![fixture.registration.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        blocker.turn().await;
+        let ((), ticket) = handle
+            .order()
+            .fix(vec![fixture.registration.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        let work = PresenceWork {
+            session: fixture.registration.handle(),
+            router: handle.clone(),
+            account: fixture.registration.account().clone(),
+            priority: None,
+            available: false,
+            routed: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            unavailable: None,
+            audience: None,
+            backlog: None,
+        };
+        drop(after_turn(
+            fixture.work.start(),
+            ticket,
+            None,
+            move |_: Vec<RoutedStanza<GlobalChunkAllocator>>| work.run(),
+        ));
+        drop(blocker);
+        fixture.work.drain().await;
+        assert_eq!(observer.take_queued().len(), 1);
+        let jid = Jid::parse_in("alice@localhost/desk", &mut arena)?.resolve(&arena)?;
+        assert!(
+            !handle
+                .has_directed_grant(
+                    fixture.registration.account(),
+                    fixture.registration.resource(),
+                    jid
+                )
+                .await?
+        );
+        Pending::spawn(
+            fixture.work.start(),
+            TerminalPresenceWork {
+                session: fixture.registration.handle(),
+                router: handle,
+                storage: fixture.storage.clone(),
+                account: fixture.registration.account().clone(),
+                fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            }
+            .run(),
+        )
+        .finished()
+        .await
+        .ok_or("missing terminal result")?
+        .map_err(|error| format!("{error:?}"))?;
+        assert!(observer.take_queued().is_empty());
+        drop(observer);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut fixture = Fixture::new(&[]).await?;
+        let handle = fixture.router.handle();
+        let mut arena = Arena::try_new(Default::default())?;
+        let alice =
+            AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+        let observer = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        fixture
+            .registration
+            .handle()
+            .directed_presence(
+                routed_presence(
+                    "bob@localhost/phone",
+                    Some("alice@localhost/desk"),
+                    PresenceType::Available,
+                )?,
+                true,
+            )
+            .await?;
+        observer.take_queued();
+        let ((), mut blocker) = handle
+            .order()
+            .fix(vec![fixture.registration.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        blocker.turn().await;
+        let ((), ticket) = handle
+            .order()
+            .fix(vec![fixture.registration.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        let work = PresenceWork {
+            session: fixture.registration.handle(),
+            router: handle.clone(),
+            account: fixture.registration.account().clone(),
+            priority: None,
+            available: false,
+            routed: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            unavailable: None,
+            audience: None,
+            backlog: None,
+        };
+        drop(after_turn(
+            fixture.work.start(),
+            ticket,
+            None,
+            move |_: Vec<RoutedStanza<GlobalChunkAllocator>>| work.run(),
+        ));
+        Pending::spawn(
+            fixture.work.start(),
+            TerminalPresenceWork {
+                session: fixture.registration.handle(),
+                router: handle,
+                storage: fixture.storage.clone(),
+                account: fixture.registration.account().clone(),
+                fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            }
+            .run(),
+        )
+        .finished()
+        .await
+        .ok_or("missing terminal result")?
+        .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(observer.take_queued().len(), 1);
+        drop(blocker);
+        fixture.work.drain().await;
+        assert!(observer.take_queued().is_empty());
+        drop(observer);
+        fixture.finish().await
+    })
+}

@@ -36,9 +36,10 @@ use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error, peer_stream_error};
 use crate::c2s::iq;
 use crate::delivery::{
-    RouterDelivery, StoredDelivery, WorkGroup, after_turn, commit_and_deliver, commit_and_store,
+    Pending, RouterDelivery, StoredDelivery, WorkGroup, after_turn, commit_and_deliver,
+    commit_and_store,
 };
-use crate::router::local::{PresenceChange, RetireCause, SessionLiveness};
+use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
@@ -52,8 +53,6 @@ struct BoundSession<'w, A: ChunkAllocator> {
     allocator: A,
     available: bool,
     priority: Option<i8>,
-    /// Directed recipients remain here until unavailable presence is sent.
-    directed: Vec<Box<str>>,
     outbox: Outbox<'w, A>,
 }
 
@@ -199,7 +198,6 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         allocator,
         available: false,
         priority: None,
-        directed: Vec::new(),
         outbox,
     };
     let stopped = {
@@ -321,116 +319,18 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         }
     }
 
-    /// Directed recipients need unavailable presence even when withdrawal fails.
     async fn end(&mut self) -> Result<(), CloseOutcome> {
-        let mut notice = None;
-        let mut covered = Vec::new();
-        let withdrawn = self.withdraw(&mut notice, &mut covered).await;
-        let told = self.tell_directed(notice, &covered).await;
-        withdrawn.and(told)
-    }
-
-    /// Preserve `notice` and `covered` on failure so directed withdrawal can still finish.
-    async fn withdraw(
-        &self,
-        notice: &mut Option<RoutedStanza<A>>,
-        covered: &mut Vec<RosterJid>,
-    ) -> Result<(), CloseOutcome> {
-        let unavailable = match self.registration.end_presence().await {
-            Ok(Some(unavailable)) => &*notice.insert(unavailable),
-            Ok(None) | Err(RouterError::NotFound) => return Ok(()),
-            Err(_) => return Err(CloseOutcome::InternalError),
+        let work = TerminalPresenceWork {
+            session: self.registration.handle(),
+            router: self.router.clone(),
+            storage: self.storage.clone(),
+            account: self.registration.account().clone(),
+            fallback: self.unavailable_notice()?,
         };
-        let handler = self
-            .router
-            .presence_handlers(self.registration.account().domain())
-            .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
-        let (audience, mut ticket) = match handler {
-            None => (None, None),
-            Some(handler) => {
-                let owner = self.registration.account().clone();
-                let fixed = Arc::clone(self.router.order())
-                    .fix(vec![owner], self.storage.begin_read())
-                    .await;
-                let result = match fixed {
-                    Ok((transaction, ticket)) => {
-                        let view = unavailable.resolve()?;
-                        let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
-                        handler
-                            .audience(
-                                PresenceUpdate {
-                                    sender,
-                                    transition: PresenceTransition::Unavailable,
-                                },
-                                &transaction,
-                            )
-                            .await
-                            .map(|audience| (audience, ticket))
-                    }
-                    Err(_) => Err(StanzaErrorCondition::InternalServerError),
-                };
-                match result {
-                    Ok((audience, ticket)) => (audience, Some(ticket)),
-                    Err(_) => {
-                        let _ = self.registration.finish_presence().await;
-                        return Err(CloseOutcome::InternalError);
-                    }
-                }
-            }
-        };
-        if let Some(ticket) = ticket.as_mut() {
-            ticket.turn().await;
-        }
-        let result = match audience {
-            None => Ok(()),
-            // The ticket prevents replacement updates from passing this broadcast.
-            Some(audience) => match self.registration.replacement_is_available().await {
-                Ok(true) => {
-                    *covered = audience.subscribers;
-                    Ok(())
-                }
-                Ok(false) => self
-                    .router
-                    .broadcast_presence(unavailable, &audience.subscribers)
-                    .await
-                    .map(|()| *covered = audience.subscribers)
-                    .map_err(|_| CloseOutcome::InternalError),
-                Err(_) => Err(CloseOutcome::InternalError),
-            },
-        };
-        let finished = self
-            .registration
-            .finish_presence()
+        Pending::spawn(self.outbox.work.start(), work.run())
+            .finished()
             .await
-            .map_err(|_| CloseOutcome::InternalError);
-        drop(ticket);
-        result.and(finished)
-    }
-
-    /// Exclude `covered` to avoid repeating the broadcast for directed recipients.
-    async fn tell_directed(
-        &mut self,
-        notice: Option<RoutedStanza<A>>,
-        covered: &[RosterJid],
-    ) -> Result<(), CloseOutcome> {
-        if self.directed.is_empty() {
-            return Ok(());
-        }
-        let notice = match notice {
-            Some(notice) => notice,
-            None => self.unavailable_notice()?,
-        };
-        let recipients = self.directed.iter().map(AsRef::as_ref).filter(|recipient| {
-            !covered
-                .iter()
-                .any(|subscriber| subscriber.as_str() == *recipient)
-        });
-        self.router
-            .send_directed(&notice, recipients)
-            .await
-            .map_err(|_| CloseOutcome::InternalError)?;
-        self.directed.clear();
-        Ok(())
+            .ok_or(CloseOutcome::InternalError)?
     }
 
     fn unavailable_notice(&self) -> Result<RoutedStanza<A>, CloseOutcome> {
@@ -703,34 +603,39 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         }
     }
 
-    /// Track directed recipients for withdrawal, except siblings covered by broadcasts.
     async fn handle_directed(
         &mut self,
         parsed: Parsed<Stanza, A>,
         available: bool,
     ) -> Result<(), CloseOutcome> {
         let routed = self.stamp(parsed)?;
-        let tracked: Option<Box<str>> = {
+        let target = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
             if !self.router.is_local_host(to.domainpart()) || to.localpart().is_none() {
                 return Ok(());
             }
-            (to.bare().as_str() != self.registration.account().as_str()).then(|| to.as_str().into())
+            AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
         };
-        if let Some(target) = tracked {
-            let known = self.directed.iter().position(|known| *known == target);
-            match (available, known) {
-                (true, None) => self.directed.push(target),
-                (false, Some(index)) => {
-                    self.directed.swap_remove(index);
-                }
-                (true, Some(_)) | (false, None) => {}
+        let session = self.registration.handle();
+        let router = self.router.clone();
+        let account = self.registration.account().clone();
+        let pending = Pending::spawn(self.outbox.work.start(), async move {
+            let mut accounts = vec![account];
+            if accounts[0] != target {
+                accounts.push(target);
             }
-        }
-        self.router
-            .route_directed_presence(routed)
-            .await
+            let ((), mut ticket) = router
+                .order()
+                .fix(accounts, async { Ok::<_, RouterError>(()) })
+                .await?;
+            ticket.turn().await;
+            session.directed_presence(routed, available).await
+        });
+        self.outbox
+            .drain_until(&self.registration, pending.finished())
+            .await?
+            .ok_or(CloseOutcome::InternalError)?
             .map_err(|_| CloseOutcome::InternalError)
     }
 
@@ -936,9 +841,16 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                     Ok((audience, backlog))
                 }
                 .await;
-                (result, Some(ticket))
+                (result, ticket)
             } else {
-                (Ok((None, None)), None)
+                let ((), ticket) = self
+                    .router
+                    .order()
+                    .fix(vec![self.registration.account().clone()], async {
+                        Ok::<_, CloseOutcome>(())
+                    })
+                    .await?;
+                (Ok((None, None)), ticket)
             };
         let (audience, backlog) = match result {
             Ok(result) => result,
@@ -966,30 +878,21 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             audience,
             backlog,
         };
-        let outcome = match ticket {
-            Some(ticket) => {
-                let mut pending = after_turn(
-                    self.outbox.work.start(),
-                    ticket,
-                    None,
-                    move |_: Vec<RoutedStanza<A>>| work.run(),
-                );
-                self.outbox
-                    .drain_until(&self.registration, pending.turned())
-                    .await?;
-                pending
-                    .finished()
-                    .await
-                    .ok_or(CloseOutcome::InternalError)??
-            }
-            None => work.run().await?,
-        };
+        let mut pending = after_turn(
+            self.outbox.work.start(),
+            ticket,
+            None,
+            move |_: Vec<RoutedStanza<A>>| work.run(),
+        );
+        self.outbox
+            .drain_until(&self.registration, pending.turned())
+            .await?;
+        let outcome = pending
+            .finished()
+            .await
+            .ok_or(CloseOutcome::InternalError)??;
         self.available = priority.is_some();
         self.priority = priority;
-        if !available {
-            self.tell_directed(Some(outcome.echo.clone()), &outcome.covered)
-                .await?;
-        }
         // The router's mailbox cut keeps earlier sibling updates ahead of this echo.
         self.outbox.routed(outcome.change.preceding);
         self.outbox.routed(outcome.change.siblings);
@@ -1520,6 +1423,126 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
     }
 }
 
+struct TerminalPresenceWork<A: ChunkAllocator> {
+    session: SessionHandle<A>,
+    router: RouterHandle<A>,
+    storage: RedbStorage,
+    account: AccountKey,
+    fallback: RoutedStanza<A>,
+}
+
+impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
+    async fn run(self) -> Result<(), CloseOutcome> {
+        let withdrawal = self
+            .session
+            .end_presence()
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+        if withdrawal.unavailable.is_none() {
+            let directed =
+                send_withdrawal(&self.router, &self.fallback, &withdrawal.directed, &[]).await;
+            let finished = self
+                .session
+                .finish_presence(withdrawal.directed.source_token)
+                .await
+                .map_err(|_| CloseOutcome::InternalError);
+            return directed.and(finished);
+        }
+        let notice = withdrawal.unavailable.as_ref().unwrap_or(&self.fallback);
+        let mut covered = Vec::new();
+        let mut ticket = None;
+        let broadcast = async {
+            let handler = self
+                .router
+                .presence_handlers(self.account.domain())
+                .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
+            let (transaction, admitted) = self
+                .router
+                .order()
+                .fix(vec![self.account.clone()], async {
+                    match handler {
+                        Some(_) => self
+                            .storage
+                            .begin_read()
+                            .await
+                            .map(Some)
+                            .map_err(|_| CloseOutcome::InternalError),
+                        None => Ok(None),
+                    }
+                })
+                .await?;
+            ticket = Some(admitted);
+            let audience = match (handler, transaction.as_ref()) {
+                (Some(handler), Some(transaction)) => {
+                    let view = notice.resolve()?;
+                    let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
+                    handler
+                        .audience(
+                            PresenceUpdate {
+                                sender,
+                                transition: PresenceTransition::Unavailable,
+                            },
+                            transaction,
+                        )
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?
+                }
+                _ => None,
+            };
+            if let Some(ticket) = ticket.as_mut() {
+                ticket.turn().await;
+            }
+            if let Some(audience) = audience {
+                if !self
+                    .session
+                    .replacement_is_available()
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?
+                {
+                    self.router
+                        .broadcast_presence(notice, &audience.subscribers)
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                }
+                covered = audience.subscribers;
+            }
+            Ok(())
+        }
+        .await;
+        if let Some(ticket) = ticket.as_mut() {
+            ticket.turn().await;
+        }
+        let directed = send_withdrawal(&self.router, notice, &withdrawal.directed, &covered).await;
+        let finished = self
+            .session
+            .finish_presence(withdrawal.directed.source_token)
+            .await
+            .map_err(|_| CloseOutcome::InternalError);
+        broadcast.and(directed).and(finished)
+    }
+}
+
+async fn send_withdrawal<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    notice: &RoutedStanza<A>,
+    withdrawal: &DirectedWithdrawal,
+    covered: &[RosterJid],
+) -> Result<(), CloseOutcome> {
+    let recipients = withdrawal
+        .recipients
+        .iter()
+        .map(|recipient| recipient.as_str())
+        .filter(|recipient| {
+            !covered
+                .iter()
+                .any(|subscriber| subscriber.as_str() == *recipient)
+        });
+    router
+        .send_directed(notice, recipients)
+        .await
+        .map_err(|_| CloseOutcome::InternalError)
+}
+
 struct PresenceWork<A: ChunkAllocator> {
     session: SessionHandle<A>,
     router: RouterHandle<A>,
@@ -1537,8 +1560,6 @@ struct PresenceOutcome<A: ChunkAllocator> {
     echo: RoutedStanza<A>,
     replay: Vec<RoutedStanza<A>>,
     requests: Vec<PendingSubscription>,
-    /// The subscribers the broadcast reached, which directed presence must not repeat.
-    covered: Vec<RosterJid>,
     backlog: Option<Backlog>,
 }
 
@@ -1555,7 +1576,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             mut audience,
             backlog,
         } = self;
-        let change = session
+        let mut change = session
             .set_presence(priority, routed.clone(), unavailable)
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
@@ -1588,22 +1609,30 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             );
         }
         let mut covered = Vec::new();
-        if let Some(audience) = audience
+        let broadcast = if let Some(audience) = audience
             && (available || change.became_unavailable)
             && !audience.subscribers.is_empty()
         {
             router
                 .broadcast_presence(&routed, &audience.subscribers)
                 .await
-                .map_err(|_| CloseOutcome::InternalError)?;
-            covered = audience.subscribers;
-        }
+                .map(|()| covered = audience.subscribers)
+                .map_err(|_| CloseOutcome::InternalError)
+        } else {
+            Ok(())
+        };
+        let directed = if !available {
+            send_withdrawal(&router, &routed, &change.directed, &covered).await
+        } else {
+            Ok(())
+        };
+        change.directed.recipients.clear();
+        broadcast.and(directed)?;
         Ok(PresenceOutcome {
             change,
             echo: routed,
             replay,
             requests,
-            covered,
             backlog,
         })
     }

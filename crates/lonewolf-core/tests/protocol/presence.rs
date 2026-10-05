@@ -137,3 +137,31 @@ fn repeated_directed_presence_and_the_own_account_are_told_once() -> TestResult 
     phone.close()?;
     bob.close()
 }
+
+#[test]
+fn incoming_directed_unavailable_removes_only_its_full_recipient_grant() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    for user in ["alice", "bob", "carol"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut phone = suite.connect("bob", "password", "phone")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+    alice.send("<presence to='bob@localhost/desk'/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk'/>",
+    )?;
+    alice.send("<presence to='bob@localhost/phone'/>")?;
+    phone.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone'/>",
+    )?;
+    bob.send("<presence to='alice@localhost/desk' type='unavailable'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='bob@localhost/desk' to='alice@localhost/desk'/>")?;
+    alice.close()?;
+    phone.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost/phone'/>")?;
+    sentinel(&mut carol, &mut bob, "bob@localhost/desk")?;
+    phone.close()?;
+    bob.close()?;
+    carol.close()
+}

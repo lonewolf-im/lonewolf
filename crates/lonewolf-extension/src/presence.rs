@@ -48,31 +48,25 @@ impl PresenceRequestType {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresenceTransition {
-    /// The resource becomes available.
     Initial,
-    /// An available resource changes its presence.
     Update,
     Unavailable,
 }
 
-/// An undirected availability change of a bound resource.
 pub struct PresenceUpdate<'a> {
     /// The authenticated full JID, independent of the client's `from` attribute.
     pub sender: JidRef<'a>,
     pub transition: PresenceTransition,
 }
 
-/// A subscription presence exchanged between two accounts.
 pub struct PresenceRequest<'a, A: ChunkAllocator> {
     pub kind: PresenceRequestType,
     /// The authenticated full JID while authorizing, and the bare JID while receiving.
     pub sender: JidRef<'a>,
     pub target: JidRef<'a>,
-    /// The stanza with `sender` as its `from` attribute.
     pub stanza: &'a RoutedStanza<A>,
 }
 
-/// The recipients of an availability change.
 pub struct PresenceAudience {
     /// Bare JIDs that receive the resource's availability.
     pub subscribers: Vec<RosterJid>,
@@ -85,9 +79,17 @@ pub struct PresenceAudience {
 pub type PresenceFuture<'a, T> = ExtensionFuture<'a, Result<T, StanzaErrorCondition>>;
 pub type ReceiveFuture<'a, A> = ExtensionFuture<'a, Result<Effects<A>, HandlerError>>;
 
-/// Every future runs on the connection worker and can be cancelled on shutdown.
 /// A stanza error condition is answered to the request sender.
 pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
+    fn visibility<'a>(
+        &'a self,
+        _owner: &'a AccountKey,
+        _observer: JidRef<'a>,
+        _transaction: &'a S::Read,
+    ) -> PresenceFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
     /// Selects who receives an availability change from one consistent snapshot; the
     /// server performs the broadcast in order with the sender's other deliveries.
     fn audience<'a>(

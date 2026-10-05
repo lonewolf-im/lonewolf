@@ -117,12 +117,26 @@ pub(crate) struct Pending<T> {
 }
 
 impl<T> Pending<T> {
+    pub(crate) fn spawn<F: Future<Output = T> + 'static>(guard: WorkGuard, work: F) -> Self
+    where
+        T: 'static,
+    {
+        let (report_turned, turned) = oneshot::channel();
+        let (report_done, done) = oneshot::channel();
+        compio::runtime::spawn(guard.run(async move {
+            let result = work.await;
+            let _ = report_turned.send(());
+            let _ = report_done.send(result);
+        }))
+        .detach();
+        Self { turned, done }
+    }
+
     /// Deliveries before this cut predate the caller's storage view.
     pub(crate) async fn turned(&mut self) {
         let _ = (&mut self.turned).await;
     }
 
-    /// The work's result, or `None` when its task ended without reporting.
     pub(crate) async fn finished(self) -> Option<T> {
         self.done.await.ok()
     }

@@ -19,6 +19,7 @@ mod storage;
 pub(crate) mod xml;
 
 pub use element::{AttributeRef, Element, ElementBuilder, ElementRef, NodeRef};
+pub use incoming::{RejectedStanza, StanzaRejection};
 pub use routed::RoutedStanza;
 
 use element::{Attribute, AttributesBuilder};
@@ -103,6 +104,7 @@ pub enum StanzaErrorCondition {
     Forbidden,
     InternalServerError,
     ItemNotFound,
+    JidMalformed,
     NotAcceptable,
     NotAllowed,
     ResourceConstraint,
@@ -117,6 +119,7 @@ impl StanzaErrorCondition {
             Self::Forbidden => "forbidden",
             Self::InternalServerError => "internal-server-error",
             Self::ItemNotFound => "item-not-found",
+            Self::JidMalformed => "jid-malformed",
             Self::NotAcceptable => "not-acceptable",
             Self::NotAllowed => "not-allowed",
             Self::ResourceConstraint => "resource-constraint",
@@ -126,7 +129,7 @@ impl StanzaErrorCondition {
 
     pub const fn error_type(self) -> &'static str {
         match self {
-            Self::BadRequest | Self::NotAcceptable => "modify",
+            Self::BadRequest | Self::JidMalformed | Self::NotAcceptable => "modify",
             Self::Conflict | Self::ItemNotFound | Self::NotAllowed | Self::ServiceUnavailable => {
                 "cancel"
             }
@@ -194,7 +197,6 @@ pub enum BuildError {
     InvalidText,
     DuplicateAttribute,
     ReservedAttribute,
-    EmptyId,
     MissingIqId,
     InvalidIqPayload,
     InvalidErrorPayload,
@@ -219,6 +221,7 @@ pub enum AsyncWriteError {
 #[derive(Clone, Copy)]
 struct Header {
     stanza_type: StanzaType,
+    original_message_type: Option<Handle<str>>,
     namespace: StanzaNamespace,
     from: Option<Jid>,
     to: Option<Jid>,
@@ -282,6 +285,7 @@ impl Stanza {
             arena,
             header: Header {
                 stanza_type,
+                original_message_type: None,
                 namespace,
                 from: None,
                 to: None,
@@ -344,6 +348,7 @@ impl Stanza {
             return Err(BuildError::NotIqRequest);
         }
         header.stanza_type = StanzaType::Iq(IqType::Result);
+        header.original_message_type = None;
         std::mem::swap(&mut header.from, &mut header.to);
         Ok(StanzaBuilder {
             arena,
@@ -374,6 +379,7 @@ impl Stanza {
             }
             _ => return Err(BuildError::InvalidErrorSource),
         };
+        header.original_message_type = None;
         let children = arena.get(self.data)?.children;
         let defined_condition =
             Element::builder_in(condition.as_str(), STANZA_ERROR_NAMESPACE, arena)?.build()?;
@@ -506,6 +512,14 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
     ) -> Result<StanzaBuilder<'b, A>, BuildError> {
         let header = Header {
             stanza_type: self.stanza_type(),
+            original_message_type: self
+                .data
+                .header
+                .original_message_type
+                .map(|value| self.arena.get(value))
+                .transpose()?
+                .map(|value| arena.try_alloc_str(value))
+                .transpose()?,
             namespace: self.namespace(),
             from: self.from()?.map(|jid| jid.clone_in(arena)).transpose()?,
             to: self.to()?.map(|jid| jid.clone_in(arena)).transpose()?,
@@ -531,6 +545,15 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         })
     }
 
+    fn serialized_type(&self) -> Result<Option<&str>, HandleError> {
+        self.data
+            .header
+            .original_message_type
+            .map(|value| self.arena.get(value))
+            .transpose()
+            .map(|original| original.or_else(|| self.stanza_type().as_str()))
+    }
+
     /// Writes namespace declarations without requiring an enclosing stream.
     ///
     /// # Errors
@@ -551,7 +574,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         if let Some(id) = self.id()? {
             xml::attribute(output, "id", id)?;
         }
-        if let Some(stanza_type) = self.stanza_type().as_str() {
+        if let Some(stanza_type) = self.serialized_type()? {
             xml::attribute(output, "type", stanza_type)?;
         }
         if let Some(lang) = self.lang()? {
@@ -592,7 +615,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         if let Some(id) = self.id()? {
             xml::attribute_async(output, "id", id).await?;
         }
-        if let Some(stanza_type) = self.stanza_type().as_str() {
+        if let Some(stanza_type) = self.serialized_type()? {
             xml::attribute_async(output, "type", stanza_type).await?;
         }
         if let Some(lang) = self.lang()? {
@@ -619,6 +642,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
 impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
     pub fn stanza_type(mut self, stanza_type: StanzaType) -> Self {
         self.header.stanza_type = stanza_type;
+        self.header.original_message_type = None;
         self
     }
 
@@ -662,13 +686,9 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
     ///
     /// # Errors
     ///
-    /// Returns [`BuildError::EmptyId`] for an empty string,
-    /// [`BuildError::InvalidText`] for invalid XML characters, or
+    /// Returns [`BuildError::InvalidText`] for invalid XML characters or
     /// [`BuildError::Allocation`] if arena allocation fails.
     pub fn id(mut self, id: Option<&str>) -> Result<Self, BuildError> {
-        if id == Some("") {
-            return Err(BuildError::EmptyId);
-        }
         self.header.id = store_text(id, self.arena)?;
         Ok(self)
     }
@@ -766,6 +786,10 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
     /// [`BuildError::Access`], and [`BuildError::Allocation`], respectively.
     pub fn build(self) -> Result<Stanza, BuildError> {
         self.validate()?;
+        self.build_validated()
+    }
+
+    fn build_validated(self) -> Result<Stanza, BuildError> {
         Ok(Stanza {
             data: self.arena.try_alloc(StanzaData {
                 header: self.header,
@@ -900,7 +924,6 @@ impl fmt::Display for BuildError {
             Self::ReservedAttribute => {
                 formatter.write_str("common stanza attribute requires its typed setter")
             }
-            Self::EmptyId => formatter.write_str("stanza ID must not be empty"),
             Self::MissingIqId => formatter.write_str("IQ stanza requires an ID"),
             Self::InvalidIqPayload => formatter.write_str("invalid IQ payload count"),
             Self::InvalidErrorPayload => formatter

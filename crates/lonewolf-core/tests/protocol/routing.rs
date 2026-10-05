@@ -92,7 +92,7 @@ fn bare_normal_reaches_the_highest_priority_resource() -> TestResult {
     )?;
 
     desktop.send(r#"<message to='alice@localhost' type='normal' id='hello'/>"#)?;
-    phone.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' id='hello'/>"#)?;
+    phone.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' id='hello' type='normal'/>"#)?;
     phone.close()?;
     desktop.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost' type='unavailable'/>")?;
     desktop.close()
@@ -133,7 +133,7 @@ fn unavailable_resource_stops_receiving_bare_messages() -> TestResult {
     phone.expect_xml(r#"<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost' type='unavailable'/>"#)?;
 
     desktop.send(r#"<message to='alice@localhost' type='normal' id='hello'/>"#)?;
-    desktop.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' id='hello'/>"#)?;
+    desktop.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' id='hello' type='normal'/>"#)?;
     phone.close()?;
     desktop.close()
 }
@@ -310,7 +310,7 @@ fn headline_skips_a_negative_priority_resource() -> TestResult {
     desktop.send(r#"<message to='alice@localhost' type='headline' id='news'/>"#)?;
     desktop.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' id='news' type='headline'/>"#)?;
     desktop.send(r#"<message to='alice@localhost/phone' type='normal' id='sentinel'/>"#)?;
-    phone.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost/phone' id='sentinel'/>"#)?;
+    phone.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost/phone' id='sentinel' type='normal'/>"#)?;
     phone.close()?;
     desktop.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost' type='unavailable'/>")?;
     desktop.close()
@@ -517,7 +517,7 @@ fn bare_error_is_silently_dropped() -> TestResult {
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
      </message>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
-    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>"#)?;
+    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel' type='normal'/>"#)?;
     alice.close()
 }
 
@@ -531,7 +531,7 @@ fn unknown_account_error_is_silently_dropped() -> TestResult {
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
      </message>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
-    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>"#)?;
+    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel' type='normal'/>"#)?;
     alice.close()
 }
 
@@ -545,7 +545,7 @@ fn missing_full_jid_error_is_silently_dropped() -> TestResult {
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
      </message>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
-    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>"#)?;
+    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel' type='normal'/>"#)?;
     alice.close()
 }
 
@@ -559,7 +559,7 @@ fn remote_error_is_silently_dropped() -> TestResult {
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
      </message>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
-    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>"#)?;
+    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel' type='normal'/>"#)?;
     alice.close()
 }
 
@@ -571,7 +571,7 @@ fn unavailable_account_headline_is_silently_dropped() -> TestResult {
 
     alice.send(r#"<message to='alice@localhost' type='headline' id='silent'/>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
-    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>"#)?;
+    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel' type='normal'/>"#)?;
     alice.close()
 }
 
@@ -583,7 +583,7 @@ fn unknown_account_headline_is_silently_dropped() -> TestResult {
 
     alice.send(r#"<message to='missing@localhost' type='headline' id='silent'/>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
-    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>"#)?;
+    alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel' type='normal'/>"#)?;
     alice.close()
 }
 
@@ -1174,4 +1174,40 @@ fn message_sender_is_replaced_with_the_authenticated_full_jid() -> TestResult {
         <body>Hello</body>
      </message>"#)?;
     alice.close()
+}
+
+#[test]
+fn unknown_message_type_uses_normal_routing_and_preserves_the_original_xml() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "secret")?;
+    let mut alice = suite.unauthenticated_client()?;
+    alice.authenticate("alice", "pencil")?;
+    let mut alice = alice.restart();
+    alice.open_with(&super::support::OPEN.replace('>', " xml:lang='es'>"))?;
+    alice.features()?;
+    alice.bind(Some("sender"))?;
+    let mut desktop = suite.connect("bob", "secret", "desktop")?;
+    let mut phone = suite.connect("bob", "secret", "phone")?;
+    desktop.send("<presence/>")?;
+    desktop.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desktop' to='bob@localhost'/>",
+    )?;
+    phone.send("<presence><priority>5</priority></presence>")?;
+    phone.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/desktop' to='bob@localhost'/>",
+    )?;
+    phone.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>5</priority></presence>")?;
+    desktop.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>5</priority></presence>")?;
+
+    alice.send("<message to='bob@localhost' from='mallory@localhost' type='future-type' id='bare' custom='kept'><body>Hello</body><extra xmlns='urn:test:payload'>value</extra></message>")?;
+    phone.expect_xml("<message xmlns='jabber:client' from='alice@localhost/sender' to='bob@localhost' type='future-type' id='bare' custom='kept' xml:lang='es'><body>Hello</body><extra xmlns='urn:test:payload'>value</extra></message>")?;
+    alice.send("<message to='bob@localhost/desktop' type='future-type' id='full'><body>Exact</body></message>")?;
+    desktop.expect_xml("<message xmlns='jabber:client' from='alice@localhost/sender' to='bob@localhost/desktop' type='future-type' id='full' xml:lang='es'><body>Exact</body></message>")?;
+    alice.send("<message to='bob@localhost/desktop' id='absent' xml:lang=''/>")?;
+    desktop.expect_xml("<message xmlns='jabber:client' from='alice@localhost/sender' to='bob@localhost/desktop' id='absent' xml:lang=''/>")?;
+    alice.close()?;
+    phone.close()?;
+    desktop.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost' type='unavailable'/>")?;
+    desktop.close()
 }

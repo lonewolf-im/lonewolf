@@ -105,46 +105,70 @@ fn stream_footer_does_not_wait_for_depleted_stanza_allowance() -> TestResult {
 }
 
 #[test]
-fn cancelling_a_token_wait_releases_its_single_parsed_stanza() -> TestResult {
+fn cancelling_a_token_wait_releases_valid_and_rejected_stanzas() -> TestResult {
+    for waiting in ["<message/>", "<iq type='unknown'/>"] {
+        Runtime::new()?.block_on(async {
+            let input = format!("{HEADER}<message/>{waiting}<message/>");
+            let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
+                total_bytes: NonZeroUsize::new(8 * 1024 * 1024).ok_or("invalid pool size")?,
+                shards_per_bucket: NonZeroUsize::MIN,
+            })?);
+            let mut reader = Reader {
+                parser: XmppParser::new(
+                    input.as_bytes(),
+                    ParserConfig {
+                        max_stanza_bytes: NonZeroUsize::new(10_000).ok_or("invalid stanza size")?,
+                        arena: ArenaConfig::default(),
+                    },
+                    pool.clone(),
+                ),
+                stanzas: StanzaLimiter::new(NonZeroUsize::MIN, NonZeroUsize::MIN),
+            };
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::StreamStart { .. }))
+            ));
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::Stanza(_)))
+            ));
+            let live_chunks = || {
+                pool.stats()
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.total_chunks - bucket.available_chunks)
+                    .sum::<usize>()
+            };
+            assert_eq!(live_chunks(), 0);
+            let mut waiting = Box::pin(reader.next_event());
+            assert!(poll!(waiting.as_mut()).is_pending());
+            assert!((1..=3).contains(&live_chunks()));
+            assert_eq!(pool.stats().heap_allocation_count, 0);
+            drop(waiting);
+            assert_eq!(live_chunks(), 0);
+            Ok::<(), Box<dyn Error>>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_requests_and_responses_each_consume_a_stanza_token() -> TestResult {
     Runtime::new()?.block_on(async {
-        let input = format!("{HEADER}<message/><message/><message/>");
-        let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
-            total_bytes: NonZeroUsize::new(8 * 1024 * 1024).ok_or("invalid pool size")?,
-            shards_per_bucket: NonZeroUsize::MIN,
-        })?);
-        let mut reader = Reader {
-            parser: XmppParser::new(
-                input.as_bytes(),
-                ParserConfig {
-                    max_stanza_bytes: NonZeroUsize::new(10_000).ok_or("invalid stanza size")?,
-                    arena: ArenaConfig::default(),
-                },
-                pool.clone(),
-            ),
-            stanzas: StanzaLimiter::new(NonZeroUsize::MIN, NonZeroUsize::MIN),
-        };
+        let input = format!("{HEADER}<iq type='unknown'/><iq type='result'/><message/>");
+        let mut reader = reader(input.as_bytes(), 2)?;
         assert!(matches!(
             reader.next_event().await,
             Ok(Some(StreamEvent::StreamStart { .. }))
         ));
-        assert!(matches!(
-            reader.next_event().await,
-            Ok(Some(StreamEvent::Stanza(_)))
-        ));
-        let live_chunks = || {
-            pool.stats()
-                .buckets
-                .iter()
-                .map(|bucket| bucket.total_chunks - bucket.available_chunks)
-                .sum::<usize>()
-        };
-        assert_eq!(live_chunks(), 0);
-        let mut waiting = Box::pin(reader.next_event());
-        assert!(poll!(waiting.as_mut()).is_pending());
-        assert!((1..=3).contains(&live_chunks()));
-        assert_eq!(pool.stats().heap_allocation_count, 0);
-        drop(waiting);
-        assert_eq!(live_chunks(), 0);
+        for _ in 0..2 {
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::RejectedStanza(_)))
+            ));
+        }
+        let mut depleted = pin!(reader.next_event());
+        assert!(poll!(depleted.as_mut()).is_pending());
         Ok(())
     })
 }

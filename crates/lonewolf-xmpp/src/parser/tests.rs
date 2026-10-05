@@ -14,12 +14,13 @@ use crate::parser::{
 };
 use crate::stanza::{
     BuildError, CLIENT_NAMESPACE, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, MessageType, NodeRef,
-    Stanza, StanzaNamespace, StanzaType,
+    Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRejection, StanzaType,
 };
 use compio_io::compat::AsyncReadStream;
 use futures_executor::block_on;
 use lonewolf_util::arena::{
-    ArenaConfig, ArenaError, ChunkAllocator, ChunkAllocatorHandle, GlobalChunkAllocator,
+    Arena, ArenaConfig, ArenaError, ChunkAllocator, ChunkAllocatorHandle, GlobalChunkAllocator,
+    HandleError,
 };
 use lonewolf_util::pool::{MIN_POOL_SIZE, PoolConfig, PooledChunkAllocator};
 use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
@@ -396,7 +397,7 @@ fn preserves_unread_bytes_for_transport_upgrade() -> TestResult {
 }
 
 #[test]
-fn rejects_malformed_restricted_and_invalid_stanza_input() -> TestResult {
+fn rejects_malformed_and_restricted_xml() -> TestResult {
     let cases = [
         "<message><body></message>",
         "<message id='a' id='b'/>",
@@ -418,10 +419,6 @@ fn rejects_malformed_restricted_and_invalid_stanza_input() -> TestResult {
         "<message><?pi value?></message>",
         "<!DOCTYPE message><message/>",
         "<?xml version='1.0'?><message/>",
-        "<message>invalid top-level text</message>",
-        "<message type='invalid'/>",
-        "<iq type='get' id='1'/>",
-        "<iq type='result'/>",
         "<stream:stream>",
     ];
     for invalid in cases {
@@ -445,29 +442,15 @@ fn rejects_malformed_restricted_and_invalid_stanza_input() -> TestResult {
 }
 
 #[test]
-fn distinguishes_unbound_prefix_from_invalid_stanza_type() -> TestResult {
+fn unbound_prefix_remains_fatal() -> TestResult {
     block_on(async {
-        for (input, expected) in [
-            ("<x:message/>", "prefix"),
-            ("<iq type='subscribe'/>", "stanza type"),
-        ] {
-            let input = format!("{OPEN}{input}");
-            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
-            open(&mut parser).await?;
-            let error = parser
-                .next_event()
-                .await
-                .err()
-                .ok_or("accepted invalid input")?;
-            assert!(
-                matches!(
-                    (&error, expected),
-                    (ParseError::UnboundNamespacePrefix, "prefix")
-                        | (ParseError::InvalidStanzaType, "stanza type")
-                ),
-                "{error}: {input}"
-            );
-        }
+        let input = format!("{OPEN}<x:message/>");
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        assert!(matches!(
+            parser.next_event().await,
+            Err(ParseError::UnboundNamespacePrefix)
+        ));
         Ok(())
     })
 }
@@ -751,6 +734,390 @@ fn node_limit_is_enforced_before_the_tree_is_complete() -> TestResult {
                     Err(ParseError::Build(BuildError::TreeLimitExceeded))
                 ));
             }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn complete_stanza_rejections_preserve_ids_and_allow_the_next_stanza() -> TestResult {
+    block_on(async {
+        for (input, reason, id, can_reply) in [
+            ("<iq><q/></iq>", StanzaRejection::BadRequest, Some(""), true),
+            (
+                "<iq type='get'><q/></iq>",
+                StanzaRejection::BadRequest,
+                Some(""),
+                true,
+            ),
+            (
+                "<iq type='future' id=''><q/></iq>",
+                StanzaRejection::BadRequest,
+                Some(""),
+                true,
+            ),
+            (
+                "<iq type='future' id='a&amp;b'><q/></iq>",
+                StanzaRejection::BadRequest,
+                Some("a&b"),
+                true,
+            ),
+            (
+                "<iq type='get' id='zero'/>",
+                StanzaRejection::BadRequest,
+                Some("zero"),
+                true,
+            ),
+            (
+                "<iq type='set' id='two'><q/><q/></iq>",
+                StanzaRejection::BadRequest,
+                Some("two"),
+                true,
+            ),
+            (
+                "<presence type='future' id='presence'/>",
+                StanzaRejection::BadRequest,
+                Some("presence"),
+                true,
+            ),
+            (
+                "<message id='text'>text<child/></message>",
+                StanzaRejection::BadRequest,
+                Some("text"),
+                true,
+            ),
+            (
+                "<message id='error-child'><error/></message>",
+                StanzaRejection::BadRequest,
+                Some("error-child"),
+                true,
+            ),
+            (
+                "<message to='bad@' id='to'/>",
+                StanzaRejection::JidMalformed,
+                Some("to"),
+                true,
+            ),
+            (
+                "<presence from='@bad' id='from'/>",
+                StanzaRejection::JidMalformed,
+                Some("from"),
+                true,
+            ),
+            (
+                "<iq type='get' id='to' to='bad@'><q/></iq>",
+                StanzaRejection::JidMalformed,
+                Some("to"),
+                true,
+            ),
+            (
+                "<iq type='future' id='precedence' to='bad@'><q/></iq>",
+                StanzaRejection::BadRequest,
+                Some("precedence"),
+                true,
+            ),
+            (
+                "<iq type='result'/>",
+                StanzaRejection::BadRequest,
+                None,
+                false,
+            ),
+            (
+                "<iq type='result' id='result'><q/><q/></iq>",
+                StanzaRejection::BadRequest,
+                None,
+                false,
+            ),
+            (
+                "<iq type='result' id='result' to='bad@'/>",
+                StanzaRejection::JidMalformed,
+                None,
+                false,
+            ),
+            (
+                "<iq type='error' id='error'/>",
+                StanzaRejection::BadRequest,
+                None,
+                false,
+            ),
+            (
+                "<message type='error' to='bad@'/>",
+                StanzaRejection::BadRequest,
+                None,
+                false,
+            ),
+            (
+                "<presence type='error' from='bad@'><error/></presence>",
+                StanzaRejection::JidMalformed,
+                None,
+                false,
+            ),
+        ] {
+            let input = format!(
+                "{}{input}<presence id='sentinel'/>{CLOSE}",
+                OPEN.replace('>', " xml:lang='es'>")
+            );
+            let mut parser = XmppParser::new(
+                Fragmented::new(input.as_bytes(), 1),
+                config(4096)?,
+                GlobalChunkAllocator,
+            );
+            open(&mut parser).await?;
+            let Some(StreamEvent::RejectedStanza(parsed)) = parser.next_event().await? else {
+                return Err(format!("expected rejection: {input}").into());
+            };
+            let (rejected, mut arena) = parsed.into_parts();
+            assert_eq!(rejected.reason(), reason, "{input}");
+            assert_eq!(rejected.can_reply(), can_reply, "{input}");
+            let authenticated = crate::jid::Jid::parse_in("alice@example.org/desk", &mut arena)?;
+            if can_reply {
+                let reply = rejected.error_in(authenticated, &mut arena)?;
+                let reply = reply.resolve(&arena)?;
+                assert_eq!(reply.kind(), rejected.kind());
+                assert!(reply.stanza_type().is_error());
+                assert_eq!(reply.id()?, id);
+                assert_eq!(reply.lang()?, Some("es"));
+                assert_eq!(
+                    reply.to()?.ok_or("reply recipient")?.as_str(),
+                    "alice@example.org/desk"
+                );
+                assert!(reply.from()?.is_none());
+                let error = reply
+                    .child("error", CLIENT_NAMESPACE)?
+                    .ok_or("error child")?;
+                assert_eq!(error.attribute("type", "")?, Some("modify"));
+                let condition = match reason {
+                    StanzaRejection::BadRequest => "bad-request",
+                    StanzaRejection::JidMalformed => "jid-malformed",
+                };
+                assert!(
+                    error
+                        .child(condition, crate::stanza::STANZA_ERROR_NAMESPACE)?
+                        .is_some()
+                );
+            } else {
+                assert!(matches!(
+                    rejected.error_in(authenticated, &mut arena),
+                    Err(BuildError::InvalidErrorSource)
+                ));
+            }
+            let sentinel = stanza(&mut parser).await?;
+            assert_eq!(
+                sentinel.value().resolve(sentinel.arena())?.id()?,
+                Some("sentinel")
+            );
+            assert!(matches!(
+                parser.next_event().await?,
+                Some(StreamEvent::StreamEnd)
+            ));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn rejected_stanza_error_checks_both_arena_owners_without_optional_metadata() -> TestResult {
+    block_on(async {
+        let input = format!("{OPEN}<iq/>");
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let Some(StreamEvent::RejectedStanza(parsed)) = parser.next_event().await? else {
+            return Err("expected rejection".into());
+        };
+        let (rejected, mut source) = parsed.into_parts();
+        let mut other = Arena::try_new(ArenaConfig::default())?;
+        let foreign = crate::jid::Jid::parse_in("alice@example.org/desk", &mut other)?;
+        assert!(matches!(
+            rejected.error_in(foreign, &mut other),
+            Err(BuildError::Access(HandleError::WrongArena))
+        ));
+        assert!(matches!(
+            rejected.error_in(foreign, &mut source),
+            Err(BuildError::Access(HandleError::WrongArena))
+        ));
+        Ok(())
+    })
+}
+
+#[test]
+fn explicit_empty_ids_are_valid_for_every_stanza_kind() -> TestResult {
+    block_on(async {
+        for input in [
+            "<message id=''/>",
+            "<presence id=''/>",
+            "<iq type='get' id=''><q/></iq>",
+            "<iq type='result' id=''/>",
+        ] {
+            let input = format!("{OPEN}{input}");
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            let parsed = stanza(&mut parser).await?;
+            let (stanza, mut arena) = parsed.into_parts();
+            assert_eq!(stanza.resolve(&arena)?.id()?, Some(""));
+            if !matches!(
+                stanza.resolve(&arena)?.stanza_type(),
+                StanzaType::Iq(crate::stanza::IqType::Result)
+            ) {
+                let reply = stanza
+                    .error_reply_in(&mut arena, StanzaErrorCondition::BadRequest)?
+                    .build()?;
+                assert_eq!(reply.resolve(&arena)?.id()?, Some(""));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn original_message_type_survives_copying_and_is_cleared_for_new_types() -> TestResult {
+    block_on(async {
+        for raw_type in [None, Some("normal"), Some("future-type"), Some("")] {
+            let attribute = raw_type.map_or_else(String::new, |value| format!(" type='{value}'"));
+            let input = format!(
+                "{}<message{attribute} id='' xmlns:x='urn:attr' x:flag='yes'><body>hello</body><extra xmlns='urn:payload'/></message>",
+                OPEN.replace('>', " xml:lang='es'>")
+            );
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            let (original, mut arena) = stanza(&mut parser).await?.into_parts();
+            let view = original.resolve(&arena)?;
+            assert_eq!(view.stanza_type(), StanzaType::Message(MessageType::Normal));
+            let mut expected = String::new();
+            view.write_xml(&mut expected)?;
+            match raw_type {
+                Some(value) => assert!(expected.contains(&format!(" type=\"{value}\""))),
+                None => assert!(!expected.contains(" type=")),
+            }
+            assert_eq!(view.lang()?, Some("es"));
+            assert_eq!(view.attribute("flag", "urn:attr")?, Some("yes"));
+            assert_eq!(
+                view.child("body", CLIENT_NAMESPACE)?
+                    .ok_or("body")?
+                    .text()?,
+                Some("hello")
+            );
+            let mut copied_arena = Arena::try_new(ArenaConfig::default())?;
+            let copied = view.clone_in(&mut copied_arena)?;
+            let mut actual = String::new();
+            copied.resolve(&copied_arena)?.write_xml(&mut actual)?;
+            assert_eq!(actual, expected);
+            let derived = original.derive_in(&mut arena)?.build()?;
+            actual.clear();
+            derived.resolve(&arena)?.write_xml(&mut actual)?;
+            assert_eq!(actual, expected);
+            let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
+            derived
+                .resolve(&arena)?
+                .write_xml_async(&mut asynchronous)
+                .await?;
+            assert_eq!(asynchronous.into_inner(), expected.as_bytes());
+            let changed = original
+                .derive_in(&mut arena)?
+                .stanza_type(StanzaType::Message(MessageType::Chat))
+                .build()?;
+            actual.clear();
+            changed.resolve(&arena)?.write_xml(&mut actual)?;
+            assert!(actual.contains(" type=\"chat\""));
+            let error = original
+                .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)?
+                .build()?;
+            actual.clear();
+            error.resolve(&arena)?.write_xml(&mut actual)?;
+            assert!(actual.contains(" type=\"error\""));
+            assert!(!actual.contains("future-type"));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn fatal_errors_override_recoverable_envelopes_and_release_the_pool() -> TestResult {
+    block_on(async {
+        let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
+            total_bytes: NonZeroUsize::new(MIN_POOL_SIZE).ok_or("pool size")?,
+            ..PoolConfig::default()
+        })?);
+        for (input, expected, limit, arena_limit) in [
+            (
+                "<iq type='unknown'><q></iq>".to_owned(),
+                "xml",
+                4096,
+                1024 * 1024,
+            ),
+            (
+                "<iq type='unknown'><!--forbidden--></iq>".to_owned(),
+                "restricted",
+                4096,
+                1024 * 1024,
+            ),
+            (
+                "<iq type='unknown' to='bad@'><q>\0</q></iq>".to_owned(),
+                "text",
+                4096,
+                1024 * 1024,
+            ),
+            (
+                "<iq type='unknown'><q xmlns:p=''/></iq>".to_owned(),
+                "namespace",
+                4096,
+                1024 * 1024,
+            ),
+            (
+                format!(
+                    "<iq type='unknown'>{}{}</iq>",
+                    "<x>".repeat(MAX_ELEMENT_DEPTH),
+                    "</x>".repeat(MAX_ELEMENT_DEPTH)
+                ),
+                "tree",
+                4096,
+                1024 * 1024,
+            ),
+            (
+                format!("<iq type='unknown'><q>{}</q></iq>", "x".repeat(4096)),
+                "size",
+                4096,
+                1024 * 1024,
+            ),
+            (
+                format!("<iq type='unknown'><q>{}</q></iq>", "x".repeat(8192)),
+                "allocation",
+                16384,
+                4096,
+            ),
+        ] {
+            let before = pool.stats().buckets.map(|bucket| bucket.available_chunks);
+            let input = format!("{OPEN}{input}");
+            let mut limits = config(limit)?;
+            limits.arena.max_reserved_bytes =
+                NonZeroUsize::new(arena_limit).ok_or("arena limit")?;
+            let mut parser = XmppParser::new(input.as_bytes(), limits, pool.clone());
+            open(&mut parser).await?;
+            let error = parser
+                .next_event()
+                .await
+                .err()
+                .ok_or("expected fatal error")?;
+            assert!(
+                matches!(
+                    (&error, expected),
+                    (ParseError::Xml(_), "xml")
+                        | (ParseError::RestrictedXml, "restricted")
+                        | (ParseError::InvalidNamespace, "namespace")
+                        | (ParseError::Build(BuildError::InvalidText), "text")
+                        | (ParseError::Build(BuildError::TreeLimitExceeded), "tree")
+                        | (ParseError::SizeLimitExceeded { .. }, "size")
+                        | (ParseError::Build(BuildError::Allocation(_)), "allocation")
+                ),
+                "{error:?}: {expected}"
+            );
+            assert_eq!(
+                pool.stats().buckets.map(|bucket| bucket.available_chunks),
+                before
+            );
+            assert!(matches!(
+                parser.next_event().await,
+                Err(ParseError::ParserFailed)
+            ));
         }
         Ok(())
     })

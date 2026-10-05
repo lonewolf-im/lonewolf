@@ -20,16 +20,18 @@ pub enum PresenceRequestType {
     Subscribed,
     Unsubscribe,
     Unsubscribed,
+    Probe,
 }
 
 impl PresenceRequestType {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Available,
         Self::Unavailable,
         Self::Subscribe,
         Self::Subscribed,
         Self::Unsubscribe,
         Self::Unsubscribed,
+        Self::Probe,
     ];
 
     pub const fn from_subscription_stanza(value: PresenceType) -> Option<Self> {

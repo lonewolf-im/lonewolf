@@ -825,3 +825,52 @@ fn visibility_uses_owner_grant_and_keeps_its_read_snapshot() {
     })
     .unwrap_or_else(|error| panic!("{error}"));
 }
+
+#[test]
+fn probe_visibility_preserves_pending_requests_preapproval_and_versions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, roster) = roster();
+    let owner = account("alice@example.com");
+    let observer = account("bob@example.com");
+    create_account(&roster, &owner);
+    create_account(&roster, &observer);
+    let mut arena = Arena::try_new(Default::default())?;
+    let observer_jid = Jid::parse_in("bob@example.com/phone", &mut arena)?.resolve(&arena)?;
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        let mut item = subscribed(RosterJid::from(&observer), SubscriptionState::None);
+        item.subscription.approved = true;
+        item.subscription.pending_out = true;
+        transaction.put_roster_item(&owner, &item).await?;
+        transaction
+            .put_pending_request(
+                &owner,
+                PendingSubscription {
+                    sender: RosterJid::from(&observer),
+                    stanza: Box::from(b"stored".as_slice()),
+                },
+                std::num::NonZeroUsize::MAX,
+            )
+            .await?;
+        transaction.commit().await?;
+        let transaction = roster.storage.begin_read().await?;
+        let before = transaction.roster(&owner).await?;
+        let pending = transaction.pending_requests(&owner).await?;
+        assert!(
+            TestExtension::presence_kinds(&Roster::default()).contains(&PresenceRequestType::Probe)
+        );
+        assert!(
+            !TestPresenceHandler::visibility(
+                &Roster::default(),
+                &owner,
+                observer_jid,
+                &transaction
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?
+        );
+        assert_eq!(transaction.roster(&owner).await?, before);
+        assert_eq!(transaction.pending_requests(&owner).await?, pending);
+        Ok(())
+    })
+}

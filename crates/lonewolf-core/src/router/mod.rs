@@ -5,6 +5,7 @@ use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
@@ -16,7 +17,7 @@ use lonewolf_storage::roster::RosterJid;
 use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
-use lonewolf_xmpp::stanza::{PresenceType, Stanza, StanzaNamespace, StanzaType};
+use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, StanzaType};
 
 use crate::delivery::{Pending, WorkGuard};
 use crate::hosts::Hosts;
@@ -319,6 +320,35 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
+    /// The caller holds both account tickets through mailbox admission.
+    pub(crate) async fn probe_presence(
+        &self,
+        requester: &SessionHandle<A>,
+        request: &RoutedStanza<A>,
+        subscribed: bool,
+    ) -> Result<(), RouterError> {
+        let target = request
+            .resolve()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !self.is_local_host(target.domainpart()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        for delivery in self
+            .local
+            .probe_snapshot(requester, request, subscribed)
+            .await?
+        {
+            match self.local.authorized_delivery(delivery).await {
+                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn current_presence(
         &self,
         source: &AccountKey,
@@ -509,6 +539,86 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         }
         self.local.deliver_to_tagged(account, tag, build).await
     }
+}
+
+fn probe_current<A: ChunkAllocator>(
+    request: &RoutedStanza<A>,
+    presence: &RoutedStanza<A>,
+    allocator: A,
+) -> Result<RoutedStanza<A>, RouterError> {
+    let mut arena =
+        Arena::try_new_in(Default::default(), allocator).map_err(|_| RouterError::Unavailable)?;
+    let observer = request
+        .resolve()
+        .map_err(|_| RouterError::InvalidTarget)?
+        .from()
+        .map_err(|_| RouterError::InvalidTarget)?
+        .ok_or(RouterError::InvalidTarget)?;
+    let to = Jid::parse_in(observer.as_str(), &mut arena).map_err(|_| RouterError::Unavailable)?;
+    let stanza = presence
+        .resolve()
+        .map_err(|_| RouterError::Unavailable)?
+        .to_builder_in(&mut arena)
+        .and_then(|builder| builder.to(Some(to)))
+        .and_then(|builder| builder.build())
+        .map_err(|_| RouterError::Unavailable)?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
+}
+
+fn probe_reply<A: ChunkAllocator>(
+    request: &RoutedStanza<A>,
+    from: &str,
+    kind: PresenceType,
+    at: Option<SystemTime>,
+    allocator: A,
+) -> Result<RoutedStanza<A>, RouterError> {
+    let mut arena =
+        Arena::try_new_in(Default::default(), allocator).map_err(|_| RouterError::Unavailable)?;
+    let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
+    let observer = view
+        .from()
+        .map_err(|_| RouterError::InvalidTarget)?
+        .ok_or(RouterError::InvalidTarget)?;
+    let to = Jid::parse_in(observer.as_str(), &mut arena).map_err(|_| RouterError::Unavailable)?;
+    let from = Jid::parse_in(from, &mut arena).map_err(|_| RouterError::Unavailable)?;
+    let delay = at
+        .map(|at| {
+            let seconds = at
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| RouterError::Unavailable)?
+                .as_secs();
+            let seconds = i64::try_from(seconds).map_err(|_| RouterError::Unavailable)?;
+            let time = time::OffsetDateTime::from_unix_timestamp(seconds)
+                .map_err(|_| RouterError::Unavailable)?;
+            let mut stamp = [0; 20];
+            let written = time
+                .format_into(
+                    &mut stamp.as_mut_slice(),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .map_err(|_| RouterError::Unavailable)?;
+            let stamp =
+                std::str::from_utf8(&stamp[..written]).map_err(|_| RouterError::Unavailable)?;
+            Element::builder_in("delay", "urn:xmpp:delay", &mut arena)
+                .and_then(|builder| builder.attribute("stamp", "", stamp))
+                .and_then(|builder| builder.build())
+                .map_err(|_| RouterError::Unavailable)
+        })
+        .transpose()?;
+    let mut builder = Stanza::builder_in(
+        StanzaType::Presence(kind),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))
+    .and_then(|builder| builder.to(Some(to)))
+    .and_then(|builder| builder.id(view.id()?))
+    .map_err(|_| RouterError::Unavailable)?;
+    if let Some(delay) = delay {
+        builder = builder.child(delay).map_err(|_| RouterError::Unavailable)?;
+    }
+    let stanza = builder.build().map_err(|_| RouterError::Unavailable)?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
 }
 
 impl fmt::Display for RouterError {

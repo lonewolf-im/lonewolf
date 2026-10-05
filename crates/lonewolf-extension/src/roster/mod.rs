@@ -350,7 +350,9 @@ where
                 PresenceRequestType::Unsubscribe => {
                     subscription::withdraw_subscription(transaction, parties, request.stanza).await
                 }
-                PresenceRequestType::Available | PresenceRequestType::Unavailable => {
+                PresenceRequestType::Available
+                | PresenceRequestType::Unavailable
+                | PresenceRequestType::Probe => {
                     Err(StanzaErrorCondition::ServiceUnavailable.into())
                 }
             }

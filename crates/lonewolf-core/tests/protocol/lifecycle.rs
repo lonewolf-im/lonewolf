@@ -291,3 +291,123 @@ fn endpoint_and_non_plus_attempts_keep_their_retry_budget() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn local_error_waits_for_delayed_xml_and_tls_closure() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desk")?;
+    client.send("<unsupported/>")?;
+    client.receive()?.assert_xml("<stream:error xmlns:stream='http://etherx.jabber.org/streams'><unsupported-stanza-type xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>")?;
+    client.expect_footer()?;
+    client.expect_no_tls_input()?;
+    client.send("<message to='alice@localhost/desk' id='discarded'/></stream:stream>")?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()
+}
+
+#[test]
+fn peer_footer_waits_for_delayed_tls_close_notify() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desk")?;
+    client.send("</stream:stream>")?;
+    client.expect_footer()?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()
+}
+
+#[test]
+fn silent_peer_close_uses_one_five_second_budget() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desk")?;
+    let started = Instant::now();
+    client.send("<unsupported/>")?;
+    client.receive()?;
+    client.expect_footer()?;
+    std::thread::sleep(Duration::from_secs(4));
+    client.send("</stream:stream>")?;
+    client.expect_tls_close()?;
+    client.expect_tcp_eof()?;
+    assert!(started.elapsed() >= Duration::from_millis(4800));
+    assert!(started.elapsed() < Duration::from_secs(7));
+    Ok(())
+}
+
+#[test]
+fn authentication_deadline_caps_a_local_close_wait() -> TestResult {
+    let suite = C2sSuite::with_limits("authentication_timeout_secs = 1")?;
+    let mut client = suite.unauthenticated_client()?;
+    let started = Instant::now();
+    client.send("<message/>")?;
+    client.receive()?;
+    client.expect_footer()?;
+    client.expect_eof()?;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
+
+#[test]
+fn account_retirement_preserves_a_partial_read_while_recreation_proceeds() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut retiring = suite.connect("alice", "pencil", "desk")?;
+    retiring.send("<message to='alice@localhost/desk' id='discarded'")?;
+    std::thread::sleep(Duration::from_millis(50));
+    suite.delete_account("alice")?;
+    retiring
+        .receive()?
+        .child("urn:ietf:params:xml:ns:xmpp-streams", "not-authorized")?;
+    retiring.expect_footer()?;
+    retiring.expect_no_tls_input()?;
+    suite.create_account("alice", "pencil")?;
+    let mut recreated = suite.connect("alice", "pencil", "desk")?;
+    retiring.send("/></stream:stream>")?;
+    retiring.expect_tls_close()?;
+    retiring.send_tls_close()?;
+    retiring.expect_tcp_eof()?;
+    recreated.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
+    recreated.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
+    recreated.close()
+}
+
+#[test]
+fn unavailable_presence_and_resource_retirement_precede_a_silent_peer_wait() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut observer = suite.connect("alice", "pencil", "observer")?;
+    observer.send("<presence/>")?;
+    observer.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
+    )?;
+    let mut retiring = suite.connect("alice", "pencil", "desk")?;
+    retiring.send("<presence/>")?;
+    retiring.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
+    )?;
+    retiring.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    observer.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    retiring.send("<unsupported/>")?;
+    retiring.receive()?;
+    retiring.expect_footer()?;
+    observer.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost' type='unavailable'/>")?;
+    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    retiring.expect_no_tls_input()?;
+    retiring.send("</stream:stream>")?;
+    retiring.expect_tls_close()?;
+    retiring.send_tls_close()?;
+    retiring.expect_tcp_eof()?;
+    observer.send("<message to='alice@localhost/observer' id='sentinel'/>")?;
+    observer.expect_xml("<message xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost/observer' id='sentinel'/>")?;
+    replacement.close()?;
+    observer.close()
+}

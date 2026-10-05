@@ -24,7 +24,6 @@ const BIND_FEATURES: &str =
     "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
 const MAX_BIND_FAILURES: usize = 6;
 
-/// An authenticated stream whose resource is registered with the router.
 pub(super) struct Bound<A: ChunkAllocator> {
     pub(super) session: Session<A>,
     pub(super) registration: Registration<A>,
@@ -49,6 +48,37 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     allocator: A,
 ) -> Result<Bound<A>, CloseOutcome> {
     let mut session = established.session.restart().await?;
+    let context = session.close.clone();
+    let result = context
+        .interrupt(bind_session(
+            &mut session,
+            hosts,
+            account,
+            router,
+            max_resources_per_account,
+        ))
+        .await;
+    let (registration, resource_requested) = match result {
+        Ok(bound) => bound,
+        Err(outcome) => return Err(session.finish(outcome).await),
+    };
+    Ok(Bound {
+        session,
+        registration,
+        router: router.clone(),
+        storage,
+        allocator,
+        resource_requested,
+    })
+}
+
+async fn bind_session<A: ChunkAllocator + Clone>(
+    session: &mut Session<A>,
+    hosts: &Hosts,
+    account: &AccountKey,
+    router: &RouterHandle<A>,
+    max_resources_per_account: NonZeroUsize,
+) -> Result<(Registration<A>, bool), CloseOutcome> {
     let header = session.read_header(hosts).await?;
     if header.host != session.host()
         || header
@@ -78,37 +108,37 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     loop {
         let parsed = match session.next_event().await? {
             Some(StreamEvent::Stanza(parsed)) => parsed,
-            Some(StreamEvent::StreamEnd) | None => return Err(session.writer.close().await),
+            Some(StreamEvent::StreamEnd) | None => return Err(CloseOutcome::StreamEnd),
             Some(event) => {
                 let outcome = namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedInput);
-                return Err(session.writer.fail(outcome).await);
+                return Err(outcome);
             }
         };
         let Ok(stanza) = parsed.value().resolve(parsed.arena()) else {
-            return Err(session.writer.fail(CloseOutcome::InternalError).await);
+            return Err(CloseOutcome::InternalError);
         };
         if stanza.namespace() != StanzaNamespace::Client {
-            return Err(session.writer.fail(CloseOutcome::InvalidNamespace).await);
+            return Err(CloseOutcome::InvalidNamespace);
         }
         if stanza.stanza_type() != StanzaType::Iq(IqType::Set) {
-            return Err(session.writer.fail(CloseOutcome::UnsupportedInput).await);
+            return Err(CloseOutcome::UnsupportedInput);
         }
         let id = match stanza.id() {
             Ok(Some(id)) => id,
-            Ok(None) => return Err(session.writer.fail(CloseOutcome::ParserError).await),
-            Err(_) => return Err(session.writer.fail(CloseOutcome::InternalError).await),
+            Ok(None) => return Err(CloseOutcome::ParserError),
+            Err(_) => return Err(CloseOutcome::InternalError),
         };
         let Ok(from) = stanza.from() else {
-            return Err(session.writer.fail(CloseOutcome::InternalError).await);
+            return Err(CloseOutcome::InternalError);
         };
         if from.is_some_and(|from| from.as_str() != account.as_str()) {
-            return Err(session.writer.fail(CloseOutcome::InvalidFrom).await);
+            return Err(CloseOutcome::InvalidFrom);
         }
         let Ok(to) = stanza.to() else {
-            return Err(session.writer.fail(CloseOutcome::InternalError).await);
+            return Err(CloseOutcome::InternalError);
         };
         if to.is_some_and(|to| to.as_str() != session.host()) {
-            return Err(session.writer.fail(CloseOutcome::UnsupportedInput).await);
+            return Err(CloseOutcome::UnsupportedInput);
         }
         let requested = match requested_resource(&stanza) {
             Ok(requested) => requested,
@@ -116,15 +146,12 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 send_bind_error(&mut session.writer, id, "modify", "bad-request").await?;
                 invalid_attempts += 1;
                 if invalid_attempts == MAX_BIND_FAILURES {
-                    return Err(session
-                        .writer
-                        .fail(CloseOutcome::BindingAttemptsExceeded)
-                        .await);
+                    return Err(CloseOutcome::BindingAttemptsExceeded);
                 }
                 continue;
             }
             Err(BindRequestError::Internal) => {
-                return Err(session.writer.fail(CloseOutcome::InternalError).await);
+                return Err(CloseOutcome::InternalError);
             }
         };
         let registration = match router
@@ -136,10 +163,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 send_bind_error(&mut session.writer, id, "modify", "bad-request").await?;
                 invalid_attempts += 1;
                 if invalid_attempts == MAX_BIND_FAILURES {
-                    return Err(session
-                        .writer
-                        .fail(CloseOutcome::BindingAttemptsExceeded)
-                        .await);
+                    return Err(CloseOutcome::BindingAttemptsExceeded);
                 }
                 continue;
             }
@@ -147,17 +171,10 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 send_bind_error(&mut session.writer, id, "wait", "resource-constraint").await?;
                 continue;
             }
-            Err(_) => return Err(session.writer.fail(CloseOutcome::InternalError).await),
+            Err(_) => return Err(CloseOutcome::InternalError),
         };
         send_bind_result(&mut session.writer, id, &registration).await?;
-        return Ok(Bound {
-            session,
-            registration,
-            router: router.clone(),
-            storage,
-            allocator,
-            resource_requested: requested.is_some(),
-        });
+        return Ok((registration, requested.is_some()));
     }
 }
 

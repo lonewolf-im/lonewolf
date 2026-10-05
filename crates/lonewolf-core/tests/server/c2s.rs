@@ -338,7 +338,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     ));
     server.stop(Signal::SIGINT)?;
     replacement.set_read_timeout(Some(TIMEOUT))?;
-    assert_eq!(replacement.read(&mut [0; 1])?, 0);
+    assert_eq!(read_until_closed(&mut replacement)?, b"<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
     let logs = server.logs()?;
     assert!(logs.contains("outcome=\"connection_limit\""));
     assert!(!logs.contains("127.0.0.1"));
@@ -380,7 +380,7 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
     server.stop(Signal::SIGINT)?;
     for mut stream in held {
         stream.set_read_timeout(Some(TIMEOUT))?;
-        assert_eq!(stream.read(&mut [0; 1])?, 0);
+        assert_eq!(read_until_closed(&mut stream)?, b"<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
     }
     let logs = server.logs()?;
     let mut rejected = std::collections::BTreeSet::new();

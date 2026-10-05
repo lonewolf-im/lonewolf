@@ -43,7 +43,12 @@ use unauthenticated_limit::{
 const BACKLOG: i32 = 128;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
-type Stop = Shared<BoxFuture<'static, ()>>;
+type Stop = Shared<BoxFuture<'static, Instant>>;
+
+struct ListenerControl {
+    stop: Stop,
+    report_failure: async_channel::Sender<io::Error>,
+}
 
 #[derive(Clone)]
 struct AdmissionLimits {
@@ -126,9 +131,28 @@ struct StreamServices<A: ChunkAllocator> {
     router: RouterHandle<A>,
 }
 
+#[derive(Debug)]
+pub(crate) struct StartError {
+    pub(crate) error: io::Error,
+    pub(crate) deadline: Instant,
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for StartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 pub(crate) struct Listeners {
-    stop: Option<oneshot::Sender<()>>,
+    stop: Option<oneshot::Sender<Instant>>,
     tasks: FuturesUnordered<Task<io::Result<()>>>,
+    failures: async_channel::Receiver<io::Error>,
     listener_count: usize,
     worker_count: usize,
 }
@@ -142,10 +166,13 @@ impl Listeners {
         router: RouterHandle<A>,
         dispatcher: &DispatchHandle,
         allocator: A,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, StartError> {
         let (stop, stopped) = oneshot::channel();
+        let (report_failure, failures) = async_channel::bounded(1);
         let stopped = async move {
-            let _ = stopped.await;
+            stopped
+                .await
+                .unwrap_or_else(|_| Instant::now() + crate::WORKER_SHUTDOWN_GRACE)
         }
         .boxed()
         .shared();
@@ -153,12 +180,14 @@ impl Listeners {
             limits.max_unauthenticated_connections,
         ));
         let auth = Arc::new(AuthService { storage });
-        let listeners = Self {
+        let mut listeners = Self {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
+            failures,
             listener_count: config.listeners.len(),
             worker_count: dispatcher.worker_count(),
         };
+        let started: io::Result<()> = async {
         for (listener_id, config) in config.listeners.iter().enumerate() {
             let profile_name = config.limits.as_deref().unwrap_or(&limits.default);
             let profile = limits.profiles.get(profile_name).ok_or_else(|| {
@@ -183,6 +212,7 @@ impl Listeners {
             for worker_id in 0..dispatcher.worker_count() {
                 let (ready, readiness) = oneshot::channel();
                 let stop = stopped.clone();
+                let report_failure = report_failure.clone();
                 let admission = admission.clone();
                 let services = StreamServices {
                     hosts: hosts.clone(),
@@ -213,7 +243,7 @@ impl Listeners {
                             run_listener(
                                 listener,
                                 context,
-                                stop,
+                                ListenerControl { stop, report_failure },
                                 listener_id,
                                 admission,
                                 services,
@@ -244,15 +274,30 @@ impl Listeners {
                 "c2s TCP listener started"
             );
         }
+        Ok(())
+        }.await;
+        if let Err(error) = started {
+            let deadline = Instant::now() + crate::WORKER_SHUTDOWN_GRACE;
+            listeners.stop(deadline);
+            let _ = compio::time::timeout_at(deadline, listeners.join()).await;
+            return Err(StartError { error, deadline });
+        }
         Ok(listeners)
     }
 
-    pub(crate) fn stop(&mut self) {
-        self.stop.take();
+    pub(crate) fn stop(&mut self, deadline: Instant) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(deadline);
+        }
     }
 
     pub(crate) async fn failure(&mut self) -> io::Error {
-        match self.tasks.next().await {
+        let task = match select(pin!(self.failures.recv()), pin!(self.tasks.next())).await {
+            Either::Left((Ok(error), _)) => return error,
+            Either::Left((Err(_), _)) => self.tasks.next().await,
+            Either::Right((task, _)) => task,
+        };
+        match task {
             Some(Ok(Err(error))) => error,
             Some(Err(error)) => io::Error::other(error),
             Some(Ok(Ok(()))) => io::Error::other("c2s listener stopped unexpectedly"),
@@ -293,12 +338,16 @@ async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
 async fn run_listener<A: ChunkAllocator + Clone>(
     listener: TcpListener,
     context: WorkerContext,
-    stop: Stop,
+    control: ListenerControl,
     listener_id: usize,
     admission: AdmissionLimits,
     services: StreamServices<A>,
     settings: StreamSettings<A>,
 ) -> io::Result<()> {
+    let ListenerControl {
+        stop,
+        report_failure,
+    } = control;
     let worker_id = context.worker.index;
     tracing::debug!(
         listener_id,
@@ -306,10 +355,14 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         port = listener.local_addr()?.port(),
         "c2s TCP worker listener started"
     );
-    let shutdown = async {
-        select(pin!(context.shutdown_requested()), pin!(stop)).await;
-    };
-    let mut shutdown = pin!(shutdown);
+    let shutdown = async move {
+        match select(pin!(context.shutdown_requested()), pin!(stop)).await {
+            Either::Left((deadline, _)) | Either::Right((deadline, _)) => deadline,
+        }
+    }
+    .boxed_local()
+    .shared();
+    let mut shutdown_wait = Box::pin(shutdown.clone());
     let mut active = FuturesUnordered::new();
     let mut accept = Box::pin(listener.accept());
     let result = loop {
@@ -323,7 +376,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                 }
             }
         };
-        let event = match select(shutdown.as_mut(), pin!(next)).await {
+        let event = match select(shutdown_wait.as_mut(), pin!(next)).await {
             Either::Left(_) => break Ok(()),
             Either::Right((event, _)) => event,
         };
@@ -346,7 +399,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                 services.router.clone(),
                                 settings.clone(),
                             )
-                            .run(),
+                            .run_until(shutdown.clone()),
                         );
                     }
                     Err(AdmissionRejection::PerIp {
@@ -417,7 +470,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                         "c2s accept delayed by resource exhaustion"
                     );
                     if let Either::Left(_) = select(
-                        shutdown.as_mut(),
+                        shutdown_wait.as_mut(),
                         pin!(compio::time::sleep(ACCEPT_RETRY_DELAY)),
                     )
                     .await
@@ -431,10 +484,22 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         }
     };
     drop(accept);
-    drop(active);
+    if let Err(error) = &result {
+        let _ = report_failure.try_send(io::Error::new(error.kind(), error.to_string()));
+    }
+    let deadline = shutdown.await;
+    let drained =
+        compio::time::timeout_at(deadline, async { while active.next().await.is_some() {} }).await;
     let closed = listener.close().await;
     tracing::debug!(listener_id, worker_id, "c2s TCP worker listener stopped");
-    result.and(closed)
+    result
+        .and(drained.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "c2s connections exceeded shutdown deadline",
+            )
+        }))
+        .and(closed)
 }
 
 enum ListenerEvent {

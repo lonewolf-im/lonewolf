@@ -57,6 +57,14 @@ impl<R> RateLimitedReader<R> {
         }
     }
 
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
     pub fn into_state(self) -> RateLimitState {
         RateLimitState {
             bytes_per_second: self.bytes_per_second,

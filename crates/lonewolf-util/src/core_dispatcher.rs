@@ -178,10 +178,15 @@ impl CoreDispatcher {
     /// [`io::ErrorKind::TimedOut`] if a worker exceeds it, or
     /// [`io::ErrorKind::Other`] if a task or worker panicked. When several
     /// workers fail, reports the first failure in worker order.
-    pub async fn shutdown(mut self, grace_period: Duration) -> io::Result<()> {
+    pub async fn shutdown(self, grace_period: Duration) -> io::Result<()> {
         let deadline = Instant::now().checked_add(grace_period).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "shutdown deadline overflows")
         })?;
+        self.shutdown_at(deadline).await
+    }
+
+    /// Stops admission and joins workers within the supplied absolute deadline.
+    pub async fn shutdown_at(mut self, deadline: Instant) -> io::Result<()> {
         self.stop(deadline);
         let workers = std::mem::take(&mut self.workers);
         ::blocking::unblock(move || join_workers(workers)).await

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::pin::pin;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
@@ -120,6 +120,7 @@ pub fn run_with_extensions(
         runtime.block_on(async {
             let mut listeners = None;
             let mut router = None;
+            let mut shutdown_deadline = None;
             let result = async {
                 let storage = stores.storage(account_store)?;
                 let referenced = config
@@ -217,11 +218,15 @@ pub fn run_with_extensions(
                         Arc::clone(&stanza_pool),
                     )
                     .await
-                    .map_err(RunError::C2s)?,
+                    .map_err(|failure| {
+                        shutdown_deadline = Some(failure.deadline);
+                        RunError::C2s(failure.error)
+                    })?,
                 );
                 run_services(
                     admin,
                     listeners,
+                    &mut shutdown_deadline,
                     account_deletion::run(
                         deletions,
                         &deletion_storage,
@@ -232,18 +237,29 @@ pub fn run_with_extensions(
                 .await
             }
             .await;
-            let stopped = dispatcher
-                .shutdown(WORKER_SHUTDOWN_GRACE)
-                .await
-                .map_err(RunError::DispatcherShutdown);
+            let deadline =
+                shutdown_deadline.unwrap_or_else(|| Instant::now() + WORKER_SHUTDOWN_GRACE);
             let listeners_stopped = match listeners {
-                Some(mut listeners) => listeners.join().await.map_err(RunError::C2s),
+                Some(mut listeners) => {
+                    listeners.stop(deadline);
+                    compio::time::timeout_at(deadline, listeners.join())
+                        .await
+                        .unwrap_or_else(|_| Err(shutdown_timeout()))
+                        .map_err(RunError::C2s)
+                }
                 None => Ok(()),
             };
             let router_stopped = match router {
-                Some(router) => router.shutdown().await.map_err(RunError::RouterShutdown),
+                Some(router) => compio::time::timeout_at(deadline, router.shutdown())
+                    .await
+                    .unwrap_or_else(|_| Err(shutdown_timeout()))
+                    .map_err(RunError::RouterShutdown),
                 None => Ok(()),
             };
+            let stopped = dispatcher
+                .shutdown_at(deadline)
+                .await
+                .map_err(RunError::DispatcherShutdown);
             if stopped.is_ok() {
                 tracing::info!("core dispatcher stopped");
             }
@@ -261,6 +277,7 @@ pub fn run_with_extensions(
 async fn run_services(
     admin: Option<lonewolf_admin::Server>,
     listeners: &mut c2s::Listeners,
+    shutdown_deadline: &mut Option<Instant>,
     deletions: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
     let admin_enabled = admin.is_some();
@@ -294,12 +311,30 @@ async fn run_services(
             Either::Right((result, _)) => Either::Left(result),
         }
     };
-    listeners.stop();
+    let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
+    *shutdown_deadline = Some(deadline);
+    listeners.stop(deadline);
     drop(stop_admin);
-    match result {
-        Either::Left(result) if admin_enabled => result.and(services.await),
-        Either::Left(result) | Either::Right(result) => result,
-    }
+    let drain = async {
+        let services = async {
+            match result {
+                Either::Left(result) if admin_enabled => result.and(services.await),
+                Either::Left(result) | Either::Right(result) => result,
+            }
+        };
+        let (services, listeners) = join(services, listeners.join()).await;
+        services.and(listeners.map_err(RunError::C2s))
+    };
+    compio::time::timeout_at(deadline, drain)
+        .await
+        .unwrap_or_else(|_| Err(RunError::DispatcherShutdown(shutdown_timeout())))
+}
+
+fn shutdown_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "services exceeded shutdown deadline",
+    )
 }
 
 fn worker_count() -> io::Result<NonZeroUsize> {

@@ -118,7 +118,7 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for AckNotice {
 
 async fn flush_and_ack<A: ChunkAllocator + Clone>(
     fixture: &Fixture,
-    outbox: &mut Outbox<A, ControlledWriter>,
+    outbox: &mut Outbox<'_, A, ControlledWriter>,
 ) -> TestResult {
     let (done, acknowledged) = oneshot::channel();
     outbox.push(Output::Offline {
@@ -137,6 +137,7 @@ struct Fixture {
     router: Router<GlobalChunkAllocator>,
     dispatcher: CoreDispatcher,
     registration: Registration<GlobalChunkAllocator>,
+    work: WorkGroup,
 }
 
 fn credentials() -> ScramCredentials {
@@ -182,6 +183,7 @@ impl Fixture {
             router,
             dispatcher,
             registration,
+            work: WorkGroup::new(),
         })
     }
 
@@ -189,7 +191,7 @@ impl Fixture {
         &self,
         allocator: A,
         writer: ControlledWriter,
-    ) -> Outbox<A, ControlledWriter> {
+    ) -> Outbox<'_, A, ControlledWriter> {
         Outbox {
             queue: VecDeque::new(),
             writer,
@@ -198,6 +200,7 @@ impl Fixture {
             storage: self.storage.clone(),
             liveness: self.registration.liveness(),
             acknowledgement: None,
+            work: &self.work,
         }
     }
 

@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 
 use futures_channel::oneshot;
+use futures_util::FutureExt;
+use futures_util::task::AtomicWaker;
 use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
@@ -20,6 +25,69 @@ use crate::order::{Order, Ticket};
 use crate::router::{
     Mailbox, Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle,
 };
+
+pub(crate) struct WorkGroup {
+    state: Arc<WorkState>,
+}
+
+struct WorkState {
+    active: AtomicUsize,
+    drained: AtomicWaker,
+}
+
+pub(crate) struct WorkGuard {
+    state: Arc<WorkState>,
+}
+
+impl WorkGroup {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(WorkState {
+                active: AtomicUsize::new(0),
+                drained: AtomicWaker::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn start(&self) -> WorkGuard {
+        self.state.active.fetch_add(1, Ordering::Relaxed);
+        WorkGuard {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Stop admitting work before waiting for this group.
+    pub(crate) async fn drain(&mut self) {
+        poll_fn(|context| {
+            self.state.drained.register(context.waker());
+            if self.state.active.load(Ordering::Acquire) == 0 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+impl WorkGuard {
+    pub(crate) async fn run<F: Future>(self, work: F) -> F::Output {
+        let result = AssertUnwindSafe(work).catch_unwind().await;
+        drop(self);
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+}
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        if self.state.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.state.drained.wake();
+        }
+    }
+}
 
 pub(crate) struct RouterDelivery<A: ChunkAllocator> {
     router: RouterHandle<A>,
@@ -62,6 +130,7 @@ impl<T> Pending<T> {
 
 /// Detached work holds the ticket, so a stalled caller cannot block later deliveries.
 pub(crate) fn after_turn<A, T, F, Fut>(
+    guard: WorkGuard,
     mut ticket: Ticket,
     mailbox: Option<Mailbox<A>>,
     work: F,
@@ -74,14 +143,14 @@ where
 {
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
-    compio::runtime::spawn(async move {
+    compio::runtime::spawn(guard.run(async move {
         ticket.turn().await;
         let _ = report_turned.send(());
         let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
         let result = work(queued).await;
         drop(ticket);
         let _ = report_done.send(result);
-    })
+    }))
     .detach();
     Pending { turned, done }
 }
@@ -101,6 +170,7 @@ pub(crate) struct StoredDelivery<A: ChunkAllocator> {
 
 /// A preceding availability snapshot misses this commit, so retry routing after its ticket turns.
 pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
+    guard: WorkGuard,
     router: RouterHandle<A>,
     storage: RedbStorage,
     transaction: RedbWrite,
@@ -109,7 +179,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
 ) -> Pending<Result<(), EffectsError>> {
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
-    compio::runtime::spawn(async move {
+    compio::runtime::spawn(guard.run(async move {
         let result = async {
             let ((), mut ticket) = router
                 .order()
@@ -185,7 +255,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
         }
         .await;
         let _ = report_done.send(result);
-    })
+    }))
     .detach();
     Pending { turned, done }
 }
@@ -193,6 +263,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
 /// Detached work owns commit and ticket admission even when the caller retires.
 /// The caller must write the returned deliveries before its reply.
 pub(crate) fn commit_and_deliver<A, D, W>(
+    guard: WorkGuard,
     order: Arc<Order>,
     transaction: W,
     Effects { accounts, deliver }: Effects<A>,
@@ -206,7 +277,7 @@ where
 {
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
-    compio::runtime::spawn(async move {
+    compio::runtime::spawn(guard.run(async move {
         let result = async {
             let ((), mut ticket) = order
                 .fix(accounts, transaction.commit())
@@ -223,7 +294,7 @@ where
         }
         .await;
         let _ = report_done.send(result);
-    })
+    }))
     .detach();
     Pending { turned, done }
 }

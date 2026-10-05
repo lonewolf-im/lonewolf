@@ -9,6 +9,23 @@ use quick_xml::reader::NsReader;
 
 use super::TestResult;
 
+pub trait CloseTransport: Read + Write {
+    fn close_notify(&mut self) -> std::io::Result<()>;
+}
+
+impl CloseTransport for std::net::TcpStream {
+    fn close_notify(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CloseTransport for rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+    fn close_notify(&mut self) -> std::io::Result<()> {
+        self.conn.send_close_notify();
+        self.flush()
+    }
+}
+
 pub const STREAM_NAMESPACE: &str = "http://etherx.jabber.org/streams";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,6 +115,7 @@ impl Element {
 pub struct XmlStream<R> {
     reader: NsReader<BufReader<R>>,
     buffer: Vec<u8>,
+    footer_sent: bool,
 }
 
 impl<R: Read> XmlStream<R> {
@@ -111,6 +129,7 @@ impl<R: Read> XmlStream<R> {
         Self {
             reader,
             buffer: Vec::new(),
+            footer_sent: false,
         }
     }
 
@@ -134,7 +153,11 @@ impl<R: Read> XmlStream<R> {
     where
         R: Write,
     {
-        self.send_bytes(xml.as_bytes())
+        self.send_bytes(xml.as_bytes())?;
+        if xml == "</stream:stream>" {
+            self.footer_sent = true;
+        }
+        Ok(())
     }
 
     pub fn send_bytes(&mut self, xml: &[u8]) -> TestResult
@@ -232,23 +255,60 @@ impl<R: Read> XmlStream<R> {
         self.receive()?.assert_xml(expected)
     }
 
-    pub fn expect_stream_error(&mut self, condition: &str) -> TestResult {
+    pub fn expect_stream_error(&mut self, condition: &str) -> TestResult
+    where
+        R: CloseTransport,
+    {
         let error = self.receive()?;
         error.assert_name(STREAM_NAMESPACE, "error");
         assert_eq!(error.children.len(), 1, "{error:?}");
         error.child(super::STREAM_ERRORS, condition)?;
-        self.expect_end()
+        self.expect_footer()?;
+        self.complete_close(true)
     }
 
     pub fn close(&mut self) -> TestResult
     where
-        R: Write,
+        R: CloseTransport,
     {
         self.send("</stream:stream>")?;
         self.expect_end()
     }
 
-    pub fn expect_end(&mut self) -> TestResult {
+    pub fn expect_end(&mut self) -> TestResult
+    where
+        R: CloseTransport,
+    {
+        self.expect_footer()?;
+        self.complete_close(false)
+    }
+
+    fn complete_close(&mut self, allow_disconnected: bool) -> TestResult
+    where
+        R: CloseTransport,
+    {
+        let result = (|| -> TestResult {
+            if !self.footer_sent {
+                self.send("</stream:stream>")?;
+            }
+            self.transport().close_notify()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let disconnected = error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                )
+            });
+            if !allow_disconnected || !disconnected {
+                return Err(error);
+            }
+        }
+        self.expect_eof()
+    }
+
+    pub fn expect_footer(&mut self) -> TestResult {
         self.buffer.clear();
         match self.reader.read_event_into(&mut self.buffer)? {
             Event::End(end) => {
@@ -260,7 +320,7 @@ impl<R: Read> XmlStream<R> {
             }
             event => return Err(format!("expected stream footer, received {event:?}").into()),
         }
-        self.expect_eof()
+        Ok(())
     }
 
     pub fn expect_eof(&mut self) -> TestResult {

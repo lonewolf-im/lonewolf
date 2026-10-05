@@ -3,6 +3,7 @@
 mod authenticate;
 mod bind;
 mod bound;
+mod close;
 mod establish;
 mod header;
 mod outcome;
@@ -212,7 +213,13 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn run(self) -> CloseOutcome {
+        self.run_until(std::future::pending::<Instant>().boxed_local().shared())
+            .await
+    }
+
+    pub(super) async fn run_until(self, shutdown: close::ShutdownSignal) -> CloseOutcome {
         let Self {
             transport,
             admission,
@@ -229,23 +236,42 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         let accepted_at = lifecycle.accepted_at;
         let close_control = transport.clone();
         let mut unauthenticated_permit = Some(unauthenticated_permit);
+        let mut context = close::CloseContext {
+            socket: close_control.clone(),
+            shutdown,
+            phase_deadline: accepted_at.checked_add(settings.establishment_timeout),
+        };
+        let mut work = crate::delivery::WorkGroup::new();
         let phases = async {
             let mut established = run_phase(
                 &close_control,
                 phase_remaining(accepted_at, settings.establishment_timeout),
                 CloseOutcome::EstablishmentTimeout,
-                establish(transport, &hosts, &settings),
+                establish(transport, &hosts, &settings, context.clone()),
             )
             .await?;
             lifecycle.established(established.session.host());
             lifecycle.stream_phase = "authenticating";
-            let (account, mechanism) = run_phase(
+            context.phase_deadline = established
+                .auth_started_at
+                .checked_add(settings.authentication_timeout);
+            established.session.close = context.clone();
+            let authenticated = run_phase(
                 &close_control,
                 phase_remaining(established.auth_started_at, settings.authentication_timeout),
                 CloseOutcome::AuthenticationTimeout,
-                authenticate(&mut established, &hosts, &auth, settings.auth_mechanisms),
+                context.interrupt(authenticate(
+                    &mut established,
+                    &hosts,
+                    &auth,
+                    settings.auth_mechanisms,
+                )),
             )
-            .await?;
+            .await;
+            let (account, mechanism) = match authenticated {
+                Ok(authenticated) => authenticated,
+                Err(outcome) => return Err(established.session.finish(outcome).await),
+            };
             lifecycle.authenticated(
                 established.session.host(),
                 mechanism,
@@ -254,7 +280,9 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             lifecycle.stream_phase = "binding";
             unauthenticated_permit.take();
             let binding_started_at = Instant::now();
-            let bound = run_phase(
+            context.phase_deadline = binding_started_at.checked_add(settings.binding_timeout);
+            established.session.close = context.clone();
+            let mut bound = run_phase(
                 &close_control,
                 phase_remaining(binding_started_at, settings.binding_timeout),
                 CloseOutcome::BindingTimeout,
@@ -270,21 +298,31 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             )
             .await?;
             lifecycle.bound(bound.resource_requested, binding_started_at);
-            Ok(bound_stream(bound).await)
+            bound.session.close.phase_deadline = None;
+            Ok(bound_stream(bound, &mut work).await)
         };
-        let outcome = match AssertUnwindSafe(phases).catch_unwind().await {
-            Ok(Ok(outcome) | Err(outcome)) => outcome,
-            Err(_) => {
-                // Release deferred values after unwinding ends.
-                release_deferred();
-                tracing::error!("connection task panicked");
-                CloseOutcome::InternalError
-            }
-        };
+        let outcome = finish_phases(phases, &close_control).await;
+        work.drain().await;
         drop(unauthenticated_permit);
         drop(ip_permit);
         lifecycle.outcome = Some(outcome);
         outcome
+    }
+}
+
+async fn finish_phases(
+    phases: impl Future<Output = Result<CloseOutcome, CloseOutcome>>,
+    close_control: &TcpStream,
+) -> CloseOutcome {
+    match AssertUnwindSafe(phases).catch_unwind().await {
+        Ok(Ok(outcome) | Err(outcome)) => outcome,
+        Err(_) => {
+            let _ = SockRef::from(close_control).shutdown(Shutdown::Both);
+            // Release deferred values after unwinding ends.
+            release_deferred();
+            tracing::error!("connection task panicked");
+            CloseOutcome::InternalError
+        }
     }
 }
 

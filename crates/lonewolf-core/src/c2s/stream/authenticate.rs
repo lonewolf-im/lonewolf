@@ -90,16 +90,12 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         }
         match attempt {
             Attempt::Authenticated(account, mechanism) => return Ok((account, mechanism)),
-            _ if exporter_finished => return Err(authentication.session.writer.close().await),
+            _ if exporter_finished => return Err(CloseOutcome::LocalClose),
             Attempt::Rejected => {}
             Attempt::Replaced(request) => replacement = Some(request),
         }
     }
-    Err(authentication
-        .session
-        .writer
-        .fail(CloseOutcome::AuthenticationAttemptsExceeded)
-        .await)
+    Err(CloseOutcome::AuthenticationAttemptsExceeded)
 }
 
 struct Authentication<'a, A: ChunkAllocator> {
@@ -155,20 +151,12 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 Ok(SaslMessage::Auth(request)) => return Ok(Some(request)),
                 Ok(SaslMessage::Abort) => "aborted",
                 Ok(SaslMessage::Response(_)) => {
-                    return Err(self
-                        .session
-                        .writer
-                        .fail(CloseOutcome::UnsupportedInput)
-                        .await);
+                    return Err(CloseOutcome::UnsupportedInput);
                 }
                 Err(condition) => condition,
             },
             _ => {
-                return Err(self
-                    .session
-                    .writer
-                    .fail(CloseOutcome::UnsupportedInput)
-                    .await);
+                return Err(CloseOutcome::UnsupportedInput);
             }
         };
         self.reject(failure).await?;
@@ -204,7 +192,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             match self.exporter_use {
                 ExporterUse::Unused => self.exporter_use = ExporterUse::InUse,
                 ExporterUse::InUse | ExporterUse::Finished => {
-                    return Err(self.session.writer.close().await);
+                    return Err(CloseOutcome::LocalClose);
                 }
             }
         }
@@ -255,13 +243,13 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             ) {
                 Ok(verifier) => verifier,
                 Err(_) => {
-                    return Err(self.session.writer.fail(CloseOutcome::InternalError).await);
+                    return Err(CloseOutcome::InternalError);
                 }
             },
         };
         let mut server_nonce = [0_u8; 24];
         if graviola::random::fill(&mut server_nonce).is_err() {
-            return Err(self.session.writer.fail(CloseOutcome::InternalError).await);
+            return Err(CloseOutcome::InternalError);
         }
         let nonce = STANDARD.encode(server_nonce);
         match first.start(verifier, &nonce) {
@@ -274,7 +262,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 server,
                 challenge,
             ))),
-            Err(_) => Err(self.session.writer.fail(CloseOutcome::InternalError).await),
+            Err(_) => Err(CloseOutcome::InternalError),
         }
     }
 
@@ -322,7 +310,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                     .client_from
                     .is_some_and(|from| from != account.as_str())
                 {
-                    return Err(self.session.writer.fail(CloseOutcome::InvalidFrom).await);
+                    return Err(CloseOutcome::InvalidFrom);
                 }
                 self.send_sasl("success", &final_message).await?;
                 return Ok(Attempt::Authenticated(account, mechanism));
@@ -341,11 +329,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 Err(condition) => condition,
             },
             StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_) => {
-                return Err(self
-                    .session
-                    .writer
-                    .fail(CloseOutcome::UnsupportedInput)
-                    .await);
+                return Err(CloseOutcome::UnsupportedInput);
             }
             _ => "malformed-request",
         };
@@ -358,10 +342,10 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             return Err(CloseOutcome::Eof);
         };
         if let Some(outcome) = namespace_error(&event) {
-            return Err(self.session.writer.fail(outcome).await);
+            return Err(outcome);
         }
         if matches!(event, StreamEvent::StreamEnd) {
-            return Err(self.session.writer.close().await);
+            return Err(CloseOutcome::StreamEnd);
         }
         Ok(event)
     }

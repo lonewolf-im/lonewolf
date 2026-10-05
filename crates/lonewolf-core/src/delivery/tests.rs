@@ -28,7 +28,7 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
-use super::{StoredDelivery, commit_and_deliver, commit_and_store};
+use super::{StoredDelivery, WorkGroup, commit_and_deliver, commit_and_store};
 use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::order::Order;
@@ -147,6 +147,7 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
             release: Mutex::new(None),
         });
         let pending = commit_and_store(
+            WorkGroup::new().start(),
             handle.clone(),
             storage.clone(),
             transaction,
@@ -224,6 +225,7 @@ fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgemen
         let (done, acknowledging) = oneshot::channel();
         let (release, released) = oneshot::channel();
         let pending = commit_and_store(
+            WorkGroup::new().start(),
             handle.clone(),
             storage.clone(),
             transaction,
@@ -362,7 +364,9 @@ fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> Test
                 Ok(())
             })
         });
+        let mut work = WorkGroup::new();
         let committed = commit_and_deliver(
+            work.start(),
             Arc::clone(&order),
             storage.begin_write().await?,
             effects,
@@ -372,15 +376,62 @@ fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> Test
         drop(committed);
         compio::time::sleep(Duration::from_millis(20)).await;
         assert!(!ran.get(), "effects ran before their turn");
+        assert!(work.drain().now_or_never().is_none());
 
         drop(ahead);
-        for _ in 0..50 {
-            if ran.get() {
-                break;
-            }
-            compio::time::sleep(Duration::from_millis(10)).await;
-        }
+        compio::time::timeout(Duration::from_secs(1), work.drain()).await?;
         assert!(ran.get(), "effects were lost with their caller");
         Ok(())
     })
+}
+
+#[test]
+fn work_admitted_before_spawn_is_drained_after_cancellation() {
+    let mut group = WorkGroup::new();
+    let work = group.start().run(std::future::pending::<()>());
+    assert!(group.drain().now_or_never().is_none());
+    drop(work);
+    assert!(group.drain().now_or_never().is_some());
+
+    let mut work = Box::pin(group.start().run(std::future::pending::<()>()));
+    assert!(work.as_mut().now_or_never().is_none());
+    assert!(group.drain().now_or_never().is_none());
+    drop(work);
+    assert!(group.drain().now_or_never().is_some());
+}
+
+#[test]
+fn panicked_work_wakes_its_drain_and_preserves_the_panic() {
+    use futures_util::task::{ArcWake, waker};
+    use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct WakeCount(AtomicUsize);
+    impl ArcWake for WakeCount {
+        fn wake_by_ref(value: &Arc<Self>) {
+            value.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let mut group = WorkGroup::new();
+    let work = group.start().run(async { std::panic::panic_any(42_u32) });
+    let count = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = waker(Arc::clone(&count));
+    let mut context = Context::from_waker(&waker);
+    let mut drain = Box::pin(group.drain());
+    assert!(matches!(
+        std::future::Future::poll(drain.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    let result = AssertUnwindSafe(work).catch_unwind().now_or_never();
+    let Some(Err(payload)) = result else {
+        panic!("work did not retain its panic")
+    };
+    assert_eq!(payload.downcast_ref::<u32>(), Some(&42));
+    assert_eq!(count.0.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        std::future::Future::poll(drain.as_mut(), &mut context),
+        Poll::Ready(())
+    ));
 }

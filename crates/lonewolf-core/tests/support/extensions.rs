@@ -17,9 +17,11 @@ use lonewolf_extension::presence::{
 use lonewolf_extension::{Effects, Extension, Extensions};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::roster::{RosterJid, RosterWrites};
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
+use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
     Element, IqType, PresenceType, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaType,
 };
@@ -431,9 +433,9 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
     fn set<'a>(
         &'a self,
         request: IqRequest<'a, A>,
-        _: &'a mut RedbWrite,
+        transaction: &'a mut RedbWrite,
         _: &'a dyn HostLookup,
-        _: &'a mut Arena<A>,
+        response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
             if request.payload.name() != ACCOUNT_SLOW.name {
@@ -447,6 +449,24 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
                 .ok_or(StanzaErrorCondition::BadRequest)?;
             let account = AccountKey::try_from(request.target.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            if let Some(observer) = request
+                .payload
+                .attribute("revoke", "")
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+            {
+                let observer = Jid::parse_in(observer, response)
+                    .map_err(|_| StanzaErrorCondition::BadRequest)?;
+                let observer = RosterJid::from(
+                    observer
+                        .resolve(response)
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .bare(),
+                );
+                transaction
+                    .remove_roster_item(&account, &observer)
+                    .await
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            }
             let effects = Effects::new(vec![account.clone()], move |delivery| {
                 Box::pin(async move {
                     delivery
@@ -600,6 +620,7 @@ async fn verify_authorization<A: ChunkAllocator>(
         .map_err(|_| StanzaErrorCondition::InternalServerError)?
         .ok_or(StanzaErrorCondition::InternalServerError)?;
     let stanza_kind = match request.kind {
+        PresenceRequestType::Probe => PresenceType::Probe,
         PresenceRequestType::Available => PresenceType::Available,
         PresenceRequestType::Unavailable => PresenceType::Unavailable,
         PresenceRequestType::Subscribe => PresenceType::Subscribe,

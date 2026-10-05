@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, hash_map::RandomState};
+use std::collections::{HashMap, VecDeque, hash_map::RandomState};
 use std::future::Future;
 use std::hash::BuildHasher;
 use std::io;
@@ -12,7 +12,7 @@ use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
@@ -31,6 +31,7 @@ use super::{RoutedStanza, RouterError};
 const SHARD_QUEUE_CAPACITY: usize = 1_024;
 const RESOURCE_QUEUE_CAPACITY: usize = 64;
 const SHARD_BATCH_SIZE: usize = 64;
+const LAST_UNAVAILABLE_CAPACITY: usize = 1_024;
 
 type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
 type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
@@ -113,6 +114,7 @@ pub(crate) struct Withdrawal<A: ChunkAllocator> {
 pub(crate) struct PresenceDelivery<A: ChunkAllocator> {
     pub(crate) stanza: RoutedStanza<A>,
     source: SessionLiveness,
+    requester: Option<SessionLiveness>,
     target_token: Option<u64>,
     ordinary_access: bool,
     grants: [Option<Arc<AtomicBool>>; 2],
@@ -181,6 +183,12 @@ impl<A: ChunkAllocator> Clone for Retired<A> {
 }
 
 enum Command<A: ChunkAllocator> {
+    Probe {
+        requester: SessionHandle<A>,
+        request: RoutedStanza<A>,
+        subscribed: bool,
+        reply: oneshot::Sender<Result<Vec<PresenceDelivery<A>>, RouterError>>,
+    },
     DirectedPresence {
         account: AccountKey,
         resource: Box<str>,
@@ -316,7 +324,12 @@ impl<A: ChunkAllocator> Session<A> {
     }
 }
 
+struct LastUnavailable {
+    at: SystemTime,
+}
+
 struct Shard<A: ChunkAllocator> {
+    last_unavailable: VecDeque<(Box<str>, LastUnavailable)>,
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
     retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
     next_token: u64,
@@ -646,6 +659,31 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
+    pub(crate) async fn probe_snapshot(
+        &self,
+        requester: &SessionHandle<A>,
+        request: &RoutedStanza<A>,
+        subscribed: bool,
+    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
+        let source = request
+            .resolve()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let (reply, result) = oneshot::channel();
+        self.shard(source.bare().as_str())
+            .send(Command::Probe {
+                requester: requester.clone(),
+                request: request.clone(),
+                subscribed,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard(account.as_str())
@@ -798,6 +836,11 @@ impl<A: ChunkAllocator + Clone> Clone for SessionHandle<A> {
 }
 
 impl<A: ChunkAllocator> SessionHandle<A> {
+    pub(crate) fn matches(&self, jid: JidRef<'_>) -> bool {
+        jid.bare().as_str() == self.account.as_str()
+            && jid.resourcepart() == Some(self.resource.as_ref())
+    }
+
     pub(crate) async fn end_presence(&self) -> Result<Withdrawal<A>, RouterError> {
         let (reply, result) = oneshot::channel();
         self.shard
@@ -931,6 +974,7 @@ impl<A: ChunkAllocator + Clone> SessionHandle<A> {
                 .authorized_delivery(PresenceDelivery {
                     stanza,
                     source: self.liveness.clone(),
+                    requester: None,
                     target_token: None,
                     ordinary_access: true,
                     grants: [None, None],
@@ -1046,9 +1090,10 @@ fn validate_resource<A: ChunkAllocator>(
         .map(Into::into)
 }
 
-impl<A: ChunkAllocator> Shard<A> {
+impl<A: ChunkAllocator + Clone> Shard<A> {
     fn new() -> Self {
         Self {
+            last_unavailable: VecDeque::new(),
             accounts: HashMap::new(),
             retiring: HashMap::new(),
             next_token: 0,
@@ -1148,6 +1193,15 @@ impl<A: ChunkAllocator> Shard<A> {
                                 .any(|grant| grant.recipient.matches_prepared(&observer))
                     });
                 let _ = reply.send(granted);
+            }
+            Command::Probe {
+                requester,
+                request,
+                subscribed,
+                reply,
+            } => {
+                let result = self.probe_snapshot(&requester, &request, subscribed);
+                let _ = reply.send(result);
             }
             Command::PresenceAccess {
                 account,
@@ -1403,7 +1457,9 @@ impl<A: ChunkAllocator> Shard<A> {
         resource: Option<&str>,
         observer: &DirectedRecipient,
         subscribed: bool,
-        build: &mut PresenceBuilder<A>,
+        build: &mut impl for<'a> FnMut(
+            PresenceSource<'a, A>,
+        ) -> Result<Option<RoutedStanza<A>>, RouterError>,
     ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
         let mut deliveries = Vec::new();
         let Some(sessions) = self.accounts.get(account.as_str()) else {
@@ -1454,6 +1510,7 @@ impl<A: ChunkAllocator> Shard<A> {
             deliveries.push(PresenceDelivery {
                 stanza,
                 source: SessionLiveness(Arc::clone(&session.alive)),
+                requester: None,
                 target_token: to_source.then_some(session.token),
                 ordinary_access,
                 grants,
@@ -1462,16 +1519,130 @@ impl<A: ChunkAllocator> Shard<A> {
         Ok(deliveries)
     }
 
+    fn probe_snapshot(
+        &self,
+        requester: &SessionHandle<A>,
+        request: &RoutedStanza<A>,
+        subscribed: bool,
+    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
+        let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let observer = view
+            .from()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !requester.matches(observer)
+            || view.stanza_type() != StanzaType::Presence(PresenceType::Probe)
+        {
+            return Err(RouterError::InvalidTarget);
+        }
+        let target = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let owner = AccountKey::try_from(target.bare()).map_err(|_| RouterError::InvalidTarget)?;
+        let ordinary = subscribed || owner.as_str() == observer.bare().as_str();
+        let full = target.resourcepart().is_some();
+        let mut build = |source: PresenceSource<'_, A>| {
+            if !full && ordinary {
+                return source
+                    .presence
+                    .map(|presence| {
+                        super::probe_current(request, presence, requester.router.allocator.clone())
+                    })
+                    .transpose();
+            }
+            if source.presence.is_none() && !source.access.directed {
+                return Ok(None);
+            }
+            let from = format!("{}/{}", owner.as_str(), source.resource);
+            super::probe_reply(
+                request,
+                &from,
+                PresenceType::Available,
+                None,
+                requester.router.allocator.clone(),
+            )
+            .map(Some)
+        };
+        let mut deliveries = self.presence_access(
+            &owner,
+            target.resourcepart(),
+            &DirectedRecipient::new(observer),
+            subscribed,
+            &mut build,
+        )?;
+        if deliveries.is_empty() {
+            let (from, kind, at) = if ordinary {
+                (
+                    target.as_str(),
+                    PresenceType::Unavailable,
+                    if full {
+                        None
+                    } else {
+                        self.last_unavailable
+                            .iter()
+                            .find(|(account, _)| account.as_ref() == target.bare().as_str())
+                            .map(|(_, value)| value.at)
+                    },
+                )
+            } else {
+                (target.bare().as_str(), PresenceType::Unsubscribed, None)
+            };
+            let stanza =
+                super::probe_reply(request, from, kind, at, requester.router.allocator.clone())?;
+            deliveries.push(PresenceDelivery {
+                stanza,
+                source: requester.liveness.clone(),
+                requester: None,
+                target_token: Some(requester.token),
+                ordinary_access: true,
+                grants: [None, None],
+            });
+        }
+        for delivery in &mut deliveries {
+            delivery.requester = Some(requester.liveness.clone());
+            delivery.target_token = Some(requester.token);
+        }
+        Ok(deliveries)
+    }
+
+    fn has_available(&self, account: &str) -> bool {
+        self.accounts
+            .get(account)
+            .is_some_and(|sessions| sessions.values().any(|session| session.priority.is_some()))
+    }
+
+    fn record_last_unavailable(&mut self, account: &str) {
+        if self
+            .last_unavailable
+            .iter()
+            .any(|(known, _)| known.as_ref() == account)
+        {
+            return;
+        }
+        if self.last_unavailable.len() == LAST_UNAVAILABLE_CAPACITY {
+            self.last_unavailable.pop_front();
+        }
+        self.last_unavailable.push_back((
+            account.into(),
+            LastUnavailable {
+                at: SystemTime::now(),
+            },
+        ));
+    }
+
     fn authorized_delivery(&mut self, delivery: PresenceDelivery<A>) -> Result<(), RouterError> {
         let PresenceDelivery {
             stanza,
             source,
+            requester,
             target_token,
             ordinary_access,
             grants,
         } = delivery;
         let valid = || {
             source.is_alive()
+                && requester.as_ref().is_none_or(SessionLiveness::is_alive)
                 && (ordinary_access
                     || grants
                         .iter()
@@ -1902,6 +2073,7 @@ impl<A: ChunkAllocator> Shard<A> {
         stanza: RoutedStanza<A>,
         unavailable: Option<RoutedStanza<A>>,
     ) -> Result<PresenceChange<A>, RouterError> {
+        let had_available = self.has_available(account.as_str());
         let (change, siblings) = {
             let sessions = self
                 .accounts
@@ -1976,6 +2148,12 @@ impl<A: ChunkAllocator> Shard<A> {
                 RetireCause::Evicted,
             );
         }
+        if priority.is_some() {
+            self.last_unavailable
+                .retain(|(known, _)| known.as_ref() != account.as_str());
+        } else if had_available && !self.has_available(account.as_str()) {
+            self.record_last_unavailable(account.as_str());
+        }
         let (became_available, became_eligible, became_unavailable, preceding) = change;
         Ok(PresenceChange {
             became_available,
@@ -1993,6 +2171,7 @@ impl<A: ChunkAllocator> Shard<A> {
         resource: &str,
         token: u64,
     ) -> Result<Withdrawal<A>, RouterError> {
+        let had_available = self.has_available(account.as_str());
         let sessions = self
             .accounts
             .get_mut(account.as_str())
@@ -2039,6 +2218,9 @@ impl<A: ChunkAllocator> Shard<A> {
                     },
                 );
         }
+        if had_available && !self.has_available(account.as_str()) {
+            self.record_last_unavailable(account.as_str());
+        }
         Ok(Withdrawal {
             unavailable,
             directed,
@@ -2066,6 +2248,8 @@ impl<A: ChunkAllocator> Shard<A> {
     }
 
     fn retire_account(&mut self, account: &AccountKey) {
+        self.last_unavailable
+            .retain(|(known, _)| known.as_ref() != account.as_str());
         let Some(sessions) = self.accounts.get(account.as_str()) else {
             return;
         };
@@ -2084,6 +2268,7 @@ impl<A: ChunkAllocator> Shard<A> {
     }
 
     fn remove(&mut self, account: &str, resource: &str, token: u64, cause: RetireCause) {
+        let had_available = self.has_available(account);
         let mut retiring = Vec::new();
         if let Some(sessions) = self.accounts.get_mut(account) {
             let mut pending = Vec::new();
@@ -2108,6 +2293,9 @@ impl<A: ChunkAllocator> Shard<A> {
             if sessions.is_empty() {
                 self.accounts.remove(account);
             }
+        }
+        if cause == RetireCause::Evicted && had_available && !self.has_available(account) {
+            self.record_last_unavailable(account);
         }
         for (token, presence) in retiring {
             self.retiring
@@ -2698,6 +2886,160 @@ mod tests {
                 assert!(replacement_state.directed[0].live.load(Ordering::Acquire));
                 assert_eq!(replacement_state.directed[0].recipient.as_str(), "bob@localhost/desk");
             }
+            Ok(())
+        })
+    }
+    fn register_probe_session(
+        shard: &mut Shard<GlobalChunkAllocator>,
+        router: &LocalRouterHandle<GlobalChunkAllocator>,
+        owner: &AccountKey,
+        resource: &str,
+    ) -> Result<Registration<GlobalChunkAllocator>, Box<dyn Error>> {
+        let (outbound, inbound) = async_channel::bounded(64);
+        Ok(shard.register(
+            owner.clone(),
+            Some(resource.into()),
+            NonZeroUsize::new(4).ok_or("zero limit")?,
+            outbound,
+            inbound,
+            router.clone(),
+        )?)
+    }
+
+    #[test]
+    fn queued_probe_rechecks_source_and_grant_generations() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for invalidation in ["revoke", "replace", "delete"] {
+                for subscribed in [false, true] {
+                    if subscribed && invalidation == "revoke" { continue; }
+                    let alice = account()?;
+                    let mut arena = Arena::try_new(Default::default())?;
+                    let bob_jid = Jid::parse_in("bob@localhost/desk", &mut arena)?.resolve(&arena)?;
+                    let bob = AccountKey::try_from(bob_jid.bare())?;
+                    let mut source = Shard::<GlobalChunkAllocator>::new();
+                    let mut destination = Shard::<GlobalChunkAllocator>::new();
+                    let (commands, inbox) = async_channel::bounded(1);
+                    let router = test_router(commands);
+                    let desk = register_probe_session(&mut source, &router, &alice, "desk")?;
+                    let observer = register_probe_session(&mut destination, &router, &bob, "desk")?;
+                    source.presence(&alice, "desk", desk.token, Some(0), routed("<presence from='alice@localhost/desk' id='old'><status>private</status></presence>").await?, Some(routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?))?;
+                    source.record_directed_presence(&alice, "desk", desk.token, DirectedRecipient::new(bob_jid), true)?;
+                    let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='probe'/>").await?;
+                    let mut selected = source.probe_snapshot(&observer.handle(), &request, subscribed)?;
+                    assert_eq!(selected.len(), 1);
+                    let delivery = selected.pop().ok_or("missing reply")?;
+                    let mut admitted = pin!(router.authorized_delivery(delivery));
+                    assert!(futures_util::poll!(admitted.as_mut()).is_pending());
+                    let command = inbox.recv().await?;
+                    match invalidation {
+                        "revoke" => {
+                            source.record_directed_presence(&alice, "desk", desk.token, DirectedRecipient::new(bob_jid), false)?;
+                            source.record_directed_presence(&alice, "desk", desk.token, DirectedRecipient::new(bob_jid), true)?;
+                        }
+                        "replace" => {
+                            source.end_presence(&alice, "desk", desk.token)?;
+                            let replacement = register_probe_session(&mut source, &router, &alice, "desk")?;
+                            assert_ne!(replacement.token, desk.token);
+                        }
+                        _ => source.retire_account(&alice),
+                    }
+                    destination.command(command);
+                    admitted.await?;
+                    assert!(observer.take_queued().is_empty());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn queued_probe_never_reaches_a_replacement_requester() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for reply in ["available", "denial", "offline"] {
+                let alice = account()?;
+                let mut arena = Arena::try_new(Default::default())?;
+                let bob = AccountKey::try_from(
+                    Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?,
+                )?;
+                let mut source = Shard::<GlobalChunkAllocator>::new();
+                let mut destination = Shard::<GlobalChunkAllocator>::new();
+                let (commands, inbox) = async_channel::bounded(1);
+                let router = test_router(commands);
+                let desk = register_probe_session(&mut source, &router, &alice, "desk")?;
+                let observer = register_probe_session(&mut destination, &router, &bob, "desk")?;
+                if reply == "available" {
+                    source.presence(
+                        &alice,
+                        "desk",
+                        desk.token,
+                        Some(0),
+                        routed("<presence from='alice@localhost/desk'/>").await?,
+                        None,
+                    )?;
+                }
+                let request = routed(
+                    "<presence from='bob@localhost/desk' to='alice@localhost' type='probe'/>",
+                )
+                .await?;
+                let mut selected =
+                    source.probe_snapshot(&observer.handle(), &request, reply != "denial")?;
+                assert_eq!(selected.len(), 1);
+                let mut admitted =
+                    pin!(router.authorized_delivery(selected.pop().ok_or("missing reply")?));
+                assert!(futures_util::poll!(admitted.as_mut()).is_pending());
+                let command = inbox.recv().await?;
+                destination.end_presence(&bob, "desk", observer.token)?;
+                let replacement = register_probe_session(&mut destination, &router, &bob, "desk")?;
+                destination.command(command);
+                admitted.await?;
+                assert!(observer.take_queued().is_empty());
+                assert!(replacement.take_queued().is_empty());
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn probe_unavailable_cache_is_bounded_and_does_not_invent_history() -> Result<(), Box<dyn Error>>
+    {
+        Runtime::new()?.block_on(async {
+            let alice = account()?;
+            let mut arena = Arena::try_new(Default::default())?;
+            let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+            let (commands, _) = async_channel::bounded(1);
+            let router = test_router(commands);
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+            let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='offline'/>").await?;
+            let first = shard.probe_snapshot(&observer.handle(), &request, true)?;
+            assert!(first[0].stanza.resolve()?.children()?.next().is_none());
+            let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+            let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
+            let available = routed("<presence from='alice@localhost/desk'/>").await?;
+            let unavailable = routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?;
+            shard.presence(&alice, "desk", desk.token, Some(0), available.clone(), Some(unavailable.clone()))?;
+            shard.presence(&alice, "phone", phone.token, Some(0), available.clone(), Some(unavailable.clone()))?;
+            shard.end_presence(&alice, "desk", desk.token)?;
+            assert!(shard.last_unavailable.is_empty());
+            shard.end_presence(&alice, "phone", phone.token)?;
+            let at = shard.last_unavailable[0].1.at;
+            let offline = shard.probe_snapshot(&observer.handle(), &request, true)?;
+            assert!(offline[0].stanza.resolve()?.child("delay", "urn:xmpp:delay")?.is_some());
+            shard.record_last_unavailable(alice.as_str());
+            assert_eq!(shard.last_unavailable[0].1.at, at);
+            for index in 0..LAST_UNAVAILABLE_CAPACITY { shard.record_last_unavailable(&format!("user{index}@localhost")); }
+            assert_eq!(shard.last_unavailable.len(), LAST_UNAVAILABLE_CAPACITY);
+            let evicted = shard.probe_snapshot(&observer.handle(), &request, true)?;
+            assert!(evicted[0].stanza.resolve()?.child("delay", "urn:xmpp:delay")?.is_none());
+            shard.record_last_unavailable(alice.as_str());
+            let replacement = register_probe_session(&mut shard, &router, &alice, "desk")?;
+            shard.presence(&alice, "desk", replacement.token, Some(0), available.clone(), Some(unavailable))?;
+            assert!(!shard.last_unavailable.iter().any(|(known, _)| known.as_ref() == alice.as_str()));
+            drop(replacement);
+            shard.remove(alice.as_str(), "desk", shard.accounts[alice.as_str()]["desk"].token, RetireCause::Evicted);
+            assert!(shard.last_unavailable.iter().any(|(known, _)| known.as_ref() == alice.as_str()));
+            shard.retire_account(&alice);
+            assert!(!shard.last_unavailable.iter().any(|(known, _)| known.as_ref() == alice.as_str()));
             Ok(())
         })
     }

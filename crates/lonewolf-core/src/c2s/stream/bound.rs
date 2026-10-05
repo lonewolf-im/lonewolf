@@ -591,6 +591,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                     self.handle_directed(parsed, kind == PresenceType::Available)
                         .await
                 }
+                (None, PresenceType::Probe) => self.handle_probe(parsed).await,
                 (None, _) => Ok(()),
             };
         }
@@ -601,6 +602,56 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             }
             _ => Ok(()),
         }
+    }
+
+    async fn handle_probe(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
+        let routed = self.stamp(parsed)?;
+        let target = {
+            let view = routed.resolve()?;
+            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
+            if !self.router.is_local_host(to.domainpart()) || to.localpart().is_none() {
+                return Ok(());
+            }
+            AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
+        };
+        let session = self.registration.handle();
+        let router = self.router.clone();
+        let storage = self.storage.clone();
+        let account = self.registration.account().clone();
+        let pending = Pending::spawn(self.outbox.work.start(), async move {
+            let mut accounts = vec![account];
+            if accounts[0] != target {
+                accounts.push(target.clone());
+            }
+            let (transaction, mut ticket) = router
+                .order()
+                .fix(accounts, storage.begin_read())
+                .await
+                .map_err(|_| RouterError::Unavailable)?;
+            let observer = routed
+                .resolve()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .from()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            let subscribed = match router
+                .presence_handlers(target.domain())
+                .and_then(|handlers| handlers.find(PresenceRequestType::Probe))
+            {
+                Some(handler) => handler
+                    .visibility(&target, observer, &transaction)
+                    .await
+                    .map_err(|_| RouterError::Unavailable)?,
+                None => false,
+            };
+            ticket.turn().await;
+            router.probe_presence(&session, &routed, subscribed).await
+        });
+        self.outbox
+            .drain_until(&self.registration, pending.finished())
+            .await?
+            .ok_or(CloseOutcome::InternalError)?
+            .map_err(|_| CloseOutcome::InternalError)
     }
 
     async fn handle_directed(

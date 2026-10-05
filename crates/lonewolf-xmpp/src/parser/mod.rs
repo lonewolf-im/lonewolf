@@ -18,8 +18,8 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 use crate::stanza::incoming::{Completed, Frame};
 use crate::stanza::{
-    BuildError, Element, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, STREAM_NAMESPACE, Stanza,
-    XML_NAMESPACE,
+    BuildError, Element, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, RejectedStanza, STREAM_NAMESPACE,
+    Stanza, XML_NAMESPACE,
 };
 
 mod input;
@@ -72,6 +72,7 @@ pub enum StreamEvent<A: ChunkAllocator> {
         content_namespace: String,
     },
     Stanza(Parsed<Stanza, A>),
+    RejectedStanza(Parsed<RejectedStanza, A>),
     Element(Parsed<Element, A>),
     StreamEnd,
 }
@@ -90,7 +91,6 @@ pub enum ParseError {
     RestrictedXml,
     UnexpectedEvent,
     UnexpectedEof,
-    InvalidStanzaType,
     ParserFailed,
 }
 
@@ -179,6 +179,7 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
 impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
     /// Returns `None` only after [`StreamEvent::StreamEnd`].
     ///
+    /// Completed stanza-envelope errors yield [`StreamEvent::RejectedStanza`].
     /// An error or cancellation after the first poll makes the parser unusable.
     /// The incomplete event's arena is dropped in either case.
     ///
@@ -186,7 +187,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
     ///
     /// Returns [`ParseError::ParserFailed`] after a failed or cancelled read.
     /// Input violations return the matching [`ParseError`] variant;
-    /// transport errors use [`ParseError::Xml`], and arena or stanza validation
+    /// transport errors use [`ParseError::Xml`], and arena or XML tree construction
     /// failures use [`ParseError::Build`]. EOF before the stream footer returns
     /// [`ParseError::UnexpectedEof`].
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, ParseError> {
@@ -282,7 +283,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                                 .map_err(BuildError::from)?;
                         let header =
                             names::frame(&self.namespaces, start, &mut header_arena, false, "")?
-                                .finish(&mut header_arena)?;
+                                .finish(&mut header_arena, &mut self.text)?;
                         let Completed::Element(value) = header else {
                             return Err(ParseError::UnexpectedEvent);
                         };
@@ -409,7 +410,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
         arena: &mut Option<Arena<A>>,
     ) -> Result<Option<StreamEvent<A>>, ParseError> {
         let current = arena.as_mut().ok_or(ParseError::UnexpectedEvent)?;
-        let completed = frame.finish(current)?;
+        let completed = frame.finish(current, &mut self.text)?;
         if let Some(parent) = self.frames.last_mut() {
             let Completed::Element(element) = completed else {
                 return Err(ParseError::UnexpectedEvent);
@@ -445,6 +446,11 @@ fn completed_event<A: ChunkAllocator>(
 ) -> StreamEvent<A> {
     match completed {
         Completed::Element(value) => StreamEvent::Element(Parsed {
+            value,
+            arena,
+            explicit_attributes,
+        }),
+        Completed::RejectedStanza(value) => StreamEvent::RejectedStanza(Parsed {
             value,
             arena,
             explicit_attributes,
@@ -531,7 +537,6 @@ impl fmt::Display for ParseError {
             Self::RestrictedXml => "restricted XML construct",
             Self::UnexpectedEvent => "unexpected XML stream event",
             Self::UnexpectedEof => "XML stream ended without a closing tag",
-            Self::InvalidStanzaType => "invalid stanza type",
             Self::ParserFailed => "parser failed or its read was cancelled",
         })
     }

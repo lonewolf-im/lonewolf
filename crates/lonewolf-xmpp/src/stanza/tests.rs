@@ -1114,10 +1114,8 @@ fn validates_server_addresses_and_protects_common_attributes() -> TestResult {
             Some(BuildError::ReservedAttribute)
         );
     }
-    assert_eq!(
-        stanza.derive_in(&mut arena)?.id(Some("")).err(),
-        Some(BuildError::EmptyId)
-    );
+    let empty_id = stanza.derive_in(&mut arena)?.id(Some(""))?.build()?;
+    assert_eq!(empty_id.resolve(&arena)?.id()?, Some(""));
     assert_eq!(
         stanza.derive_in(&mut arena)?.id(Some("\0")).err(),
         Some(BuildError::InvalidText)

@@ -8,8 +8,7 @@ use quick_xml::name::{Namespace, NamespaceResolver, PrefixDeclaration, QName, Re
 use super::{MAX_ATTRIBUTES_PER_ELEMENT, ParseError};
 use crate::stanza::incoming::Frame;
 use crate::stanza::{
-    CLIENT_NAMESPACE, IqType, MessageType, PresenceType, SERVER_NAMESPACE, StanzaNamespace,
-    StanzaType, XML_NAMESPACE, xml,
+    CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaKind, StanzaNamespace, XML_NAMESPACE, xml,
 };
 
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
@@ -76,11 +75,12 @@ pub(super) fn frame<A: ChunkAllocator>(
         && matches!(name, "message" | "presence" | "iq")
         && let Some(namespace) = stanza_namespace
     {
-        let attribute = start
-            .try_get_attribute("type")
-            .map_err(quick_xml::Error::from)?;
-        let value = attribute.as_ref().map(normalized).transpose()?;
-        Frame::stanza(stanza_type(name, value.as_deref())?, namespace)
+        let kind = match name {
+            "message" => StanzaKind::Message,
+            "presence" => StanzaKind::Presence,
+            _ => StanzaKind::Iq,
+        };
+        Frame::stanza(kind, namespace)
     } else {
         Frame::element(name, namespace, arena)?
     };
@@ -129,27 +129,4 @@ fn validate_qname(name: QName<'_>) -> Result<(), ParseError> {
         xml::validate_name(name, "", false)?;
     }
     Ok(())
-}
-
-fn stanza_type(name: &str, value: Option<&str>) -> Result<StanzaType, ParseError> {
-    match (name, value) {
-        ("message", None | Some("normal")) => Ok(StanzaType::Message(MessageType::Normal)),
-        ("message", Some("chat")) => Ok(StanzaType::Message(MessageType::Chat)),
-        ("message", Some("groupchat")) => Ok(StanzaType::Message(MessageType::Groupchat)),
-        ("message", Some("headline")) => Ok(StanzaType::Message(MessageType::Headline)),
-        ("message", Some("error")) => Ok(StanzaType::Message(MessageType::Error)),
-        ("presence", None) => Ok(StanzaType::Presence(PresenceType::Available)),
-        ("presence", Some("unavailable")) => Ok(StanzaType::Presence(PresenceType::Unavailable)),
-        ("presence", Some("subscribe")) => Ok(StanzaType::Presence(PresenceType::Subscribe)),
-        ("presence", Some("subscribed")) => Ok(StanzaType::Presence(PresenceType::Subscribed)),
-        ("presence", Some("unsubscribe")) => Ok(StanzaType::Presence(PresenceType::Unsubscribe)),
-        ("presence", Some("unsubscribed")) => Ok(StanzaType::Presence(PresenceType::Unsubscribed)),
-        ("presence", Some("probe")) => Ok(StanzaType::Presence(PresenceType::Probe)),
-        ("presence", Some("error")) => Ok(StanzaType::Presence(PresenceType::Error)),
-        ("iq", Some("get")) => Ok(StanzaType::Iq(IqType::Get)),
-        ("iq", Some("set")) => Ok(StanzaType::Iq(IqType::Set)),
-        ("iq", Some("result")) => Ok(StanzaType::Iq(IqType::Result)),
-        ("iq", Some("error")) => Ok(StanzaType::Iq(IqType::Error)),
-        _ => Err(ParseError::InvalidStanzaType),
-    }
 }

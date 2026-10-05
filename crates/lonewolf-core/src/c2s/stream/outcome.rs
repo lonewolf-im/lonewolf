@@ -45,7 +45,7 @@ impl CloseOutcome {
         match error {
             ParseError::SizeLimitExceeded { .. } => Self::SizeLimitExceeded,
             ParseError::InvalidNamespace => Self::InvalidNamespace,
-            ParseError::InvalidXml | ParseError::InvalidStanzaType => Self::InvalidXml,
+            ParseError::InvalidXml => Self::InvalidXml,
             ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
             ParseError::RestrictedXml => Self::RestrictedXml,
             ParseError::UnsupportedEncoding => Self::UnsupportedEncoding,

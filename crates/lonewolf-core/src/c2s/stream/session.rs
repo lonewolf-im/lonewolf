@@ -127,7 +127,10 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin> Reader<A, R> {
     pub(super) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, CloseOutcome> {
         match self.parser.next_event().await {
             Ok(event) => {
-                if matches!(event, Some(StreamEvent::Stanza(_))) {
+                if matches!(
+                    event,
+                    Some(StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_))
+                ) {
                     self.stanzas.acquire().await;
                 }
                 Ok(event)
@@ -250,6 +253,9 @@ pub(super) fn namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Opti
             Ok(_) => None,
             Err(_) => Some(CloseOutcome::InternalError),
         },
+        StreamEvent::RejectedStanza(parsed) => (parsed.value().namespace()
+            != StanzaNamespace::Client)
+            .then_some(CloseOutcome::InvalidNamespace),
         StreamEvent::Element(parsed) => match parsed.value().resolve(parsed.arena()) {
             Ok(element) if element.namespace() == SERVER_NAMESPACE => {
                 Some(CloseOutcome::InvalidNamespace)

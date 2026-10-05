@@ -334,7 +334,7 @@ fn offline_only_host_replays_three_messages_after_the_echo_and_a_second_login_ge
         receive_stored(
             &mut bob,
             &format!(
-                "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/old' id='stored-{index}'><body>Hello {index}</body></message>"
+                "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/old' type='normal' id='stored-{index}'><body>Hello {index}</body></message>"
             ),
         )?;
     }
@@ -681,4 +681,32 @@ fn failed_live_acknowledgement_retains_the_stored_copy_and_logs_once() -> TestRe
     );
     bob.close()?;
     alice.close()
+}
+
+#[test]
+fn unknown_message_type_round_trips_through_offline_storage_with_inherited_language() -> TestResult
+{
+    let suite = C2sSuite::start()?;
+    accounts(&suite)?;
+    let mut alice = suite.unauthenticated_client()?;
+    alice.authenticate("alice", "pencil")?;
+    let mut alice = alice.restart();
+    alice.open_with(&super::support::OPEN.replace('>', " xml:lang='es'>"))?;
+    alice.features()?;
+    alice.bind(Some("desk"))?;
+    alice.send("<message to='bob@localhost' type='future-type' id='stored' custom='kept'><body>Hello</body><extra xmlns='urn:test:payload'>value</extra></message>")?;
+    alice.send("<iq type='get' id='sentinel'><query xmlns='jabber:iq:roster'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' to='alice@localhost/desk' type='result' id='sentinel'><query xmlns='jabber:iq:roster'/></iq>")?;
+    let mut bob = suite.connect("bob", "secret", "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    receive_stored(
+        &mut bob,
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='future-type' id='stored' custom='kept' xml:lang='es'><body>Hello</body><extra xmlns='urn:test:payload'>value</extra></message>",
+    )?;
+    barrier(&mut bob, "bob@localhost/phone")?;
+    alice.close()?;
+    bob.close()
 }

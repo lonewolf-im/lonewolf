@@ -25,8 +25,8 @@ use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, Handle
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    BuildError, CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType, Stanza,
-    StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
+    BuildError, CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType, RejectedStanza,
+    Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
 };
 
 use super::bind::Bound;
@@ -256,6 +256,13 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         break self.outbox.writer.fail(outcome).await;
                     }
                 }
+                Ok(Some(StreamEvent::RejectedStanza(parsed))) => {
+                    let handled = self.handle_rejected(parsed);
+                    let flushed = self.outbox.flush().await;
+                    if let Err(outcome) = handled.and(flushed) {
+                        break self.outbox.writer.fail(outcome).await;
+                    }
+                }
                 Ok(Some(event)) => {
                     let outcome =
                         namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
@@ -395,6 +402,29 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         .from(Some(from))?
         .build()?;
         Ok(RoutedStanza::from_parts(stanza, arena))
+    }
+
+    fn handle_rejected(&mut self, parsed: Parsed<RejectedStanza, A>) -> Result<(), CloseOutcome> {
+        let (rejected, mut arena) = parsed.into_parts();
+        if rejected.namespace() != StanzaNamespace::Client {
+            return Err(CloseOutcome::InvalidNamespace);
+        }
+        if !rejected.can_reply() {
+            return Ok(());
+        }
+        let account = self.registration.account();
+        let authenticated = Jid::from_trusted_parts_in(
+            Some(account.username()),
+            account.domain(),
+            Some(self.registration.resource()),
+            &mut arena,
+        )?;
+        let reply = rejected.error_in(authenticated, &mut arena)?;
+        self.outbox.push(Output::Owned {
+            stanzas: vec![reply],
+            arena,
+        });
+        Ok(())
     }
 
     async fn handle_stanza(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {

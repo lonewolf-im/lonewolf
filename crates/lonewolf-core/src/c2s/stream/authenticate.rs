@@ -69,6 +69,7 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         host: &host,
         client_from: client_from.as_deref(),
         exporter: &binding.exporter,
+        exporter_use: ExporterUse::Unused,
         endpoint,
         auth,
         mechanisms,
@@ -82,8 +83,14 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
                 None => continue,
             },
         };
-        match authentication.attempt(request).await? {
+        let attempt = authentication.attempt(request).await?;
+        let exporter_finished = matches!(authentication.exporter_use, ExporterUse::InUse);
+        if exporter_finished {
+            authentication.exporter_use = ExporterUse::Finished;
+        }
+        match attempt {
             Attempt::Authenticated(account, mechanism) => return Ok((account, mechanism)),
+            _ if exporter_finished => return Err(authentication.session.writer.close().await),
             Attempt::Rejected => {}
             Attempt::Replaced(request) => replacement = Some(request),
         }
@@ -100,9 +107,16 @@ struct Authentication<'a, A: ChunkAllocator> {
     host: &'a str,
     client_from: Option<&'a str>,
     exporter: &'a [u8; 32],
+    exporter_use: ExporterUse,
     endpoint: &'a [u8],
     auth: &'a AuthService,
     mechanisms: AuthMechanisms,
+}
+
+enum ExporterUse {
+    Unused,
+    InUse,
+    Finished,
 }
 
 struct AuthRequest {
@@ -112,7 +126,7 @@ struct AuthRequest {
 
 enum Attempt {
     Authenticated(AccountKey, Mechanism),
-    /// A SASL failure was sent and the client may try again.
+    /// A SASL failure was sent.
     Rejected,
     Replaced(AuthRequest),
 }
@@ -186,6 +200,14 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 return Ok(Attempt::Rejected);
             }
         };
+        if first.binding() == Some(BindingType::TlsExporter) {
+            match self.exporter_use {
+                ExporterUse::Unused => self.exporter_use = ExporterUse::InUse,
+                ExporterUse::InUse | ExporterUse::Finished => {
+                    return Err(self.session.writer.close().await);
+                }
+            }
+        }
         let Some((identity, server, challenge)) = self.challenge(mechanism, first).await? else {
             return Ok(Attempt::Rejected);
         };

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::support::xml::STREAM_NAMESPACE;
-use super::support::{C2sSuite, OPEN, SASL_NAMESPACE, STREAM_ERRORS, TestResult};
+use rustls::{ProtocolVersion, SupportedProtocolVersion, version};
+
+use super::support::{C2sSuite, Client, OPEN, SASL_NAMESPACE, STREAM_ERRORS, TestResult};
 
 #[test]
 fn scram_sha256_authenticates() -> TestResult {
@@ -26,30 +28,109 @@ fn scram_sha256_authenticates() -> TestResult {
 }
 
 #[test]
-fn scram_sha256_plus_with_tls_exporter_authenticates() -> TestResult {
+fn tls12_exporter_authenticates_both_plus_mechanisms() -> TestResult {
+    exporter_authenticates_both_plus_mechanisms(&version::TLS12)
+}
+
+#[test]
+fn tls13_exporter_authenticates_both_plus_mechanisms() -> TestResult {
+    exporter_authenticates_both_plus_mechanisms(&version::TLS13)
+}
+
+fn exporter_authenticates_both_plus_mechanisms(
+    version: &'static SupportedProtocolVersion,
+) -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
-    let mut client = suite.unauthenticated_client()?;
+    for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
+        let mut client = Client::secure_with_versions(&suite, &[version])?;
+        assert_eq!(
+            client.transport().conn.protocol_version(),
+            Some(version.version)
+        );
+        client
+            .scram("Alice", "pencil", mechanism, Some("tls-exporter"))?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.send("<message to='alice@localhost/desk' type='chat' id='bound'><body>Ready</body></message>")?;
+        client.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' type='chat' id='bound'><body>Ready</body></message>")?;
+        client.close()?;
+    }
+    Ok(())
+}
 
-    client
-        .scram(
-            "Alice",
+#[test]
+fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
+        let mut client = Client::secure_with_versions(&suite, &[&version::TLS12])?;
+        assert_eq!(
+            client.transport().conn.protocol_version(),
+            Some(ProtocolVersion::TLSv1_2)
+        );
+        let mut absent = [0; 32];
+        let mut empty = [0; 32];
+        client.transport().conn.export_keying_material(
+            &mut absent,
+            b"EXPORTER-Channel-Binding",
+            None,
+        )?;
+        client.transport().conn.export_keying_material(
+            &mut empty,
+            b"EXPORTER-Channel-Binding",
+            Some(&[]),
+        )?;
+        assert_ne!(absent, empty);
+        let exchange = client.begin_scram_with_channel_binding(
+            "alice",
             "pencil",
-            "SCRAM-SHA-256-PLUS",
-            Some("tls-exporter"),
-        )?
-        .assert_name(SASL_NAMESPACE, "success");
-    let mut client = client.restart();
-    let header = client.open_with(OPEN)?;
-    assert_eq!(header.attribute("from"), Some("localhost"));
+            mechanism,
+            "tls-exporter",
+            &absent,
+        )?;
+        client.finish_scram(exchange)?.assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+        )?;
+        client.expect_end()?;
+    }
+    Ok(())
+}
 
-    client.features()?.assert_xml(
-        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
-        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
-    </stream:features>",
-    )?;
-    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
-    client.close()
+#[test]
+fn wrong_exporter_data_rejects_both_plus_mechanisms_on_each_tls_version() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for version in [&version::TLS12, &version::TLS13] {
+        for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
+            let mut client = Client::secure_with_versions(&suite, &[version])?;
+            assert_eq!(
+                client.transport().conn.protocol_version(),
+                Some(version.version)
+            );
+            let mut wrong = [0; 32];
+            client.transport().conn.export_keying_material(
+                &mut wrong,
+                b"EXPORTER-Channel-Binding",
+                Some(&[]),
+            )?;
+            wrong[0] ^= 1;
+            let exchange = client.begin_scram_with_channel_binding(
+                "alice",
+                "pencil",
+                mechanism,
+                "tls-exporter",
+                &wrong,
+            )?;
+            client.finish_scram(exchange)?.assert_xml(
+                "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+            )?;
+            client.expect_end()?;
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -87,28 +168,6 @@ fn scram_sha1_authenticates() -> TestResult {
 
     client
         .scram("Alice", "pencil", "SCRAM-SHA-1", None)?
-        .assert_name(SASL_NAMESPACE, "success");
-    let mut client = client.restart();
-    let header = client.open_with(OPEN)?;
-    assert_eq!(header.attribute("from"), Some("localhost"));
-
-    client.features()?.assert_xml(
-        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
-        <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
-    </stream:features>",
-    )?;
-    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
-    client.close()
-}
-
-#[test]
-fn scram_sha1_plus_with_tls_exporter_authenticates() -> TestResult {
-    let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.unauthenticated_client()?;
-
-    client
-        .scram("Alice", "pencil", "SCRAM-SHA-1-PLUS", Some("tls-exporter"))?
         .assert_name(SASL_NAMESPACE, "success");
     let mut client = client.restart();
     let header = client.open_with(OPEN)?;

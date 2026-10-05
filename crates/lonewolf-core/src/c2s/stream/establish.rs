@@ -153,7 +153,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     transport
         .get_ref()
         .1
-        .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", None)
+        .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", Some(&[]))
         .map_err(|_| CloseOutcome::TlsFailure)?;
     let (reader, writer) = transport.split();
     let parser = XmppParser::new(

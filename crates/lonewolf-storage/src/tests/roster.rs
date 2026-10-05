@@ -269,10 +269,14 @@ pub(crate) fn pending_requests_are_deduplicated_by_sender_and_returned_in_sender
         create_owners(&storage, &["alice@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
         writer
-            .put_pending_request(&owner, from_zara.clone())
+            .put_pending_request(&owner, from_zara.clone(), std::num::NonZeroUsize::MAX)
             .await?;
-        writer.put_pending_request(&owner, first).await?;
-        writer.put_pending_request(&owner, last.clone()).await?;
+        writer
+            .put_pending_request(&owner, first, std::num::NonZeroUsize::MAX)
+            .await?;
+        writer
+            .put_pending_request(&owner, last.clone(), std::num::NonZeroUsize::MAX)
+            .await?;
         writer.commit().await?;
 
         let reader = storage.begin_read().await?;
@@ -310,7 +314,11 @@ pub(crate) fn remove_pending_request_reports_existence_and_leaves_items_and_vers
         let mut writer = storage.begin_write().await?;
         writer.put_roster_item(&owner, &stored).await?;
         writer
-            .put_pending_request(&owner, pending("bob@example.com", b"<presence/>")?)
+            .put_pending_request(
+                &owner,
+                pending("bob@example.com", b"<presence/>")?,
+                std::num::NonZeroUsize::MAX,
+            )
             .await?;
         writer.commit().await?;
 
@@ -347,7 +355,11 @@ pub(crate) fn clear_roster_removes_one_owners_items_version_and_pending_requests
                 .put_roster_item(owner, &item("dave@example.com", None, &[])?)
                 .await?;
             writer
-                .put_pending_request(owner, pending("bob@example.com", b"<presence/>")?)
+                .put_pending_request(
+                    owner,
+                    pending("bob@example.com", b"<presence/>")?,
+                    std::num::NonZeroUsize::MAX,
+                )
                 .await?;
         }
         writer.commit().await?;
@@ -440,22 +452,26 @@ pub(crate) fn put_pending_request_is_rejected_for_an_owner_without_an_account_re
         create_owners(&storage, &["deleted@example.com", "active@example.com"]).await?;
         let mut writer = storage.begin_write().await?;
         writer
-            .put_pending_request(&deleted, from_bob.clone())
+            .put_pending_request(&deleted, from_bob.clone(), std::num::NonZeroUsize::MIN)
             .await?;
         writer.delete_account(&deleted).await?;
         writer.commit().await?;
 
         let mut writer = storage.begin_write().await?;
         assert!(matches!(
-            writer.put_pending_request(&unknown, from_bob.clone()).await,
+            writer
+                .put_pending_request(&unknown, from_bob.clone(), std::num::NonZeroUsize::MIN)
+                .await,
             Err(RosterError::NoAccount)
         ));
         assert!(matches!(
-            writer.put_pending_request(&deleted, from_dave).await,
+            writer
+                .put_pending_request(&deleted, from_dave, std::num::NonZeroUsize::MIN)
+                .await,
             Err(RosterError::NoAccount)
         ));
         writer
-            .put_pending_request(&active, from_bob.clone())
+            .put_pending_request(&active, from_bob.clone(), std::num::NonZeroUsize::MIN)
             .await?;
         assert!(writer.pending_requests(&unknown).await?.is_empty());
         assert!(writer.pending_request(&deleted, &dave).await?.is_none());
@@ -496,7 +512,11 @@ pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleted_owner<S: Storag
         writer.put_roster_item(&alice, &dave_item).await?;
         for sender in ["bob@example.com", "dave@example.com"] {
             writer
-                .put_pending_request(&alice, pending(sender, b"<presence/>")?)
+                .put_pending_request(
+                    &alice,
+                    pending(sender, b"<presence/>")?,
+                    std::num::NonZeroUsize::MAX,
+                )
                 .await?;
         }
         writer.delete_account(&alice).await?;
@@ -528,6 +548,126 @@ pub(crate) fn roster_removals_and_clearing_succeed_for_a_deleted_owner<S: Storag
         assert!(reader.roster_item(&alice, &dave).await?.is_none());
         assert!(reader.pending_requests(&alice).await?.is_empty());
         assert!(reader.account(&alice).await?.is_none());
+        Ok(())
+    })
+}
+
+pub(crate) fn pending_limit_is_atomic_and_isolated_by_recipient<S: Storage>(
+    storage: S,
+) -> TestResult {
+    block_on(async {
+        create_owners(&storage, &["alice@example.com", "alice@example.com.au"]).await?;
+        let alice = key("alice@example.com")?;
+        let other = key("alice@example.com.au")?;
+        let cap = std::num::NonZeroUsize::new(2).ok_or("invalid cap")?;
+        let mut writer = storage.begin_write().await?;
+        for sender in ["bob@example.com", "carol@example.com"] {
+            writer
+                .put_pending_request(&alice, pending(sender, b"original")?, cap)
+                .await?;
+        }
+        assert!(matches!(
+            writer
+                .put_pending_request(&alice, pending("dave@example.com", b"rejected")?, cap)
+                .await,
+            Err(RosterError::PendingLimitExceeded)
+        ));
+        writer
+            .put_pending_request(&alice, pending("bob@example.com", b"refreshed")?, cap)
+            .await?;
+        writer
+            .put_pending_request(
+                &other,
+                pending("dave@example.com", b"other")?,
+                std::num::NonZeroUsize::MIN,
+            )
+            .await?;
+        writer.commit().await?;
+        let reader = storage.begin_read().await?;
+        assert_eq!(
+            reader.pending_requests(&alice).await?,
+            [
+                pending("bob@example.com", b"refreshed")?,
+                pending("carol@example.com", b"original")?
+            ]
+        );
+        assert_eq!(
+            reader.pending_requests(&other).await?,
+            [pending("dave@example.com", b"other")?]
+        );
+        assert_eq!(reader.roster(&alice).await?.version.get(), 0);
+        assert!(reader.roster(&alice).await?.items.is_empty());
+        Ok(())
+    })
+}
+
+pub(crate) fn pending_removal_and_clear_release_capacity<S: Storage>(storage: S) -> TestResult {
+    block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
+        let alice = key("alice@example.com")?;
+        let cap = std::num::NonZeroUsize::MIN;
+        let mut writer = storage.begin_write().await?;
+        writer
+            .put_pending_request(&alice, pending("bob@example.com", b"one")?, cap)
+            .await?;
+        assert!(
+            writer
+                .remove_pending_request(&alice, &jid("bob@example.com")?)
+                .await?
+        );
+        writer
+            .put_pending_request(&alice, pending("carol@example.com", b"two")?, cap)
+            .await?;
+        writer.clear_roster(&alice).await?;
+        writer
+            .put_pending_request(&alice, pending("dave@example.com", b"three")?, cap)
+            .await?;
+        writer.commit().await?;
+        assert_eq!(
+            storage.begin_read().await?.pending_requests(&alice).await?,
+            [pending("dave@example.com", b"three")?]
+        );
+        Ok(())
+    })
+}
+
+pub(crate) fn aborted_pending_changes_preserve_payload_and_capacity<S: Storage>(
+    storage: S,
+) -> TestResult {
+    block_on(async {
+        create_owners(&storage, &["alice@example.com"]).await?;
+        let alice = key("alice@example.com")?;
+        let cap = std::num::NonZeroUsize::MIN;
+        let mut writer = storage.begin_write().await?;
+        writer
+            .put_pending_request(&alice, pending("bob@example.com", b"original")?, cap)
+            .await?;
+        writer.commit().await?;
+        let mut writer = storage.begin_write().await?;
+        writer
+            .put_pending_request(&alice, pending("bob@example.com", b"replacement")?, cap)
+            .await?;
+        drop(writer);
+        let mut writer = storage.begin_write().await?;
+        writer
+            .remove_pending_request(&alice, &jid("bob@example.com")?)
+            .await?;
+        writer
+            .put_pending_request(&alice, pending("carol@example.com", b"uncommitted")?, cap)
+            .await?;
+        drop(writer);
+        let mut writer = storage.begin_write().await?;
+        assert!(matches!(
+            writer
+                .put_pending_request(&alice, pending("dave@example.com", b"rejected")?, cap)
+                .await,
+            Err(RosterError::PendingLimitExceeded)
+        ));
+        writer.commit().await?;
+        assert_eq!(
+            storage.begin_read().await?.pending_requests(&alice).await?,
+            [pending("bob@example.com", b"original")?]
+        );
         Ok(())
     })
 }

@@ -35,7 +35,6 @@ type TestIqHandler = dyn IqHandler<GlobalChunkAllocator, RedbStorage>;
 type TestPresenceHandler = dyn PresenceHandler<GlobalChunkAllocator, RedbStorage>;
 type TestExtension = dyn Extension<GlobalChunkAllocator, RedbStorage>;
 
-/// The storage the roster extension acts on in a test.
 struct TestRoster {
     storage: RedbStorage,
 }
@@ -165,7 +164,7 @@ fn subscribed(jid: RosterJid, state: SubscriptionState) -> RosterItem {
     }
 }
 
-/// A roster IQ from alice's desk whose borrowed arenas outlive the handler future.
+/// Keeps borrowed arenas alive until the handler future completes.
 struct IqCall {
     request: Arena<GlobalChunkAllocator>,
     response: Arena<GlobalChunkAllocator>,
@@ -242,7 +241,13 @@ impl IqCall {
                     .begin_read()
                     .await
                     .unwrap_or_else(|error| panic!("{error}"));
-                TestIqHandler::get(&Roster, request, &transaction, &mut self.response).await
+                TestIqHandler::get(
+                    &Roster::default(),
+                    request,
+                    &transaction,
+                    &mut self.response,
+                )
+                .await
             }
             IqRequestType::Set => {
                 let mut transaction = roster
@@ -251,7 +256,7 @@ impl IqCall {
                     .await
                     .unwrap_or_else(|error| panic!("{error}"));
                 let reply = TestIqHandler::set(
-                    &Roster,
+                    &Roster::default(),
                     request,
                     &mut transaction,
                     delivery,
@@ -281,8 +286,6 @@ fn handle_iq(
     Ok(accounts)
 }
 
-/// Answers a roster get from alice's desk and returns the result payload as XML, after
-/// running its effects against `delivery`.
 fn roster_get(
     roster: &TestRoster,
     ver: Option<&str>,
@@ -378,7 +381,7 @@ impl SubscribeCall {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let effects = TestPresenceHandler::receive(
-            &Roster,
+            &Roster::default(),
             PresenceRequest {
                 kind: PresenceRequestType::Subscribe,
                 sender,
@@ -422,8 +425,12 @@ fn audience(roster: &TestRoster, sender: &str, transition: PresenceTransition) -
             .begin_read()
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        TestPresenceHandler::audience(&Roster, PresenceUpdate { sender, transition }, &transaction)
-            .await
+        TestPresenceHandler::audience(
+            &Roster::default(),
+            PresenceUpdate { sender, transition },
+            &transaction,
+        )
+        .await
     })
     .unwrap_or_else(|error| panic!("{error:?}"))
     .unwrap_or_else(|| panic!("expected an audience"))
@@ -716,9 +723,10 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
     let effects = block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
         transaction.delete_account(alice).await?;
-        let effects = TestExtension::forget_account(&Roster, &mut transaction, alice, &delivery)
-            .await
-            .map_err(|error| format!("{error:?}"))?;
+        let effects =
+            TestExtension::forget_account(&Roster::default(), &mut transaction, alice, &delivery)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
         transaction.commit().await?;
         Ok::<_, Box<dyn std::error::Error>>(effects)
     })

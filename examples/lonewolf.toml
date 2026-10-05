@@ -37,8 +37,14 @@
 # The domain below is an example.
 # [hosts."example.com"]
 
-# This example enables roster and offline storage for this host.
 # extensions = ["roster", "offline"]
+
+# Limit distinct pending subscription senders per account to bound requests awaiting approval.
+# Choose a positive count. At capacity, new senders receive a resource-constraint error.
+# Existing senders can still update their requests.
+# Keep roster in this host's extension list when configuring its limit.
+# [hosts."example.com".roster]
+# max_pending_subscription_requests = 100
 
 # Adjust the number of stored messages per account to suit clients that stay offline.
 # Use a positive integer. Senders receive resource-constraint when the queue reaches this limit.

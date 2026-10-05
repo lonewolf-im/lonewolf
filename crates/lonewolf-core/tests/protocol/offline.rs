@@ -189,7 +189,7 @@ fn seed_replay_roster(directory: &Path) -> TestResult {
         transaction.create_account(NewAccount { key: alice_account.clone(), credentials }).await?;
         transaction.put_roster_item(&alice_account, &RosterItem { jid: bob_contact, name: None, groups: Vec::new(), subscription: RosterSubscription { state: SubscriptionState::From, ..Default::default() } }).await?;
         transaction.put_roster_item(&bob, &RosterItem { jid: alice, name: None, groups: Vec::new(), subscription: RosterSubscription { state: SubscriptionState::To, ..Default::default() } }).await?;
-        transaction.put_pending_request(&bob, PendingSubscription { sender: charlie, stanza: Box::from(b"<presence xmlns='jabber:client' from='charlie@localhost' to='bob@localhost' type='subscribe' id='pending'/>".as_slice()) }).await?;
+        transaction.put_pending_request(&bob, PendingSubscription { sender: charlie, stanza: Box::from(b"<presence xmlns='jabber:client' from='charlie@localhost' to='bob@localhost' type='subscribe' id='pending'/>".as_slice()) }, std::num::NonZeroUsize::MAX).await?;
         transaction.commit().await?;
         Ok(())
     })

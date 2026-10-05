@@ -5,6 +5,7 @@ pub mod redb;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use crate::StorageError;
 use crate::account::AccountKey;
@@ -85,12 +86,12 @@ impl fmt::Debug for PendingSubscription {
 #[derive(Debug)]
 pub enum RosterError {
     ValueTooLarge,
+    PendingLimitExceeded,
     /// The owner of the written state has no account record.
     NoAccount,
     Storage(StorageError),
 }
 
-/// Roster reads available on any transaction.
 pub trait RosterReads {
     /// Reads one consistent roster version and item set.
     fn roster(
@@ -119,9 +120,7 @@ pub trait RosterReads {
 
 /// Roster writes, each taking effect when the transaction commits.
 pub trait RosterWrites {
-    /// Stores the item as given, replacing any item for the same JID, and advances the
-    /// owner's roster version. Fails with [`RosterError::NoAccount`] when the owner has
-    /// no account record, so nothing can be written for a deleted account.
+    /// Replaces the item and advances the owner's version; rejects owners without an account.
     fn put_roster_item(
         &mut self,
         owner: &AccountKey,
@@ -135,12 +134,13 @@ pub trait RosterWrites {
         jid: &RosterJid,
     ) -> impl Future<Output = Result<Option<RosterMutation<RosterItem>>, RosterError>> + Send;
 
-    /// Replaces any pending request from the same sender. Fails with
-    /// [`RosterError::NoAccount`] when the owner has no account record.
+    /// Replaces existing senders even at the limit; rejects new senders at capacity.
+    /// Returns [`RosterError::NoAccount`] for owners without an account.
     fn put_pending_request(
         &mut self,
         owner: &AccountKey,
         request: PendingSubscription,
+        max_pending_subscription_requests: NonZeroUsize,
     ) -> impl Future<Output = Result<(), RosterError>> + Send;
 
     /// Returns whether a pending request existed.
@@ -162,6 +162,9 @@ impl fmt::Display for RosterError {
         match self {
             Self::ValueTooLarge => formatter.write_str("roster value is too large"),
             Self::NoAccount => formatter.write_str("roster owner has no account"),
+            Self::PendingLimitExceeded => {
+                formatter.write_str("pending subscription request limit reached")
+            }
             Self::Storage(error) => write!(formatter, "roster storage failed: {error}"),
         }
     }
@@ -170,7 +173,7 @@ impl fmt::Display for RosterError {
 impl Error for RosterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ValueTooLarge | Self::NoAccount => None,
+            Self::ValueTooLarge | Self::NoAccount | Self::PendingLimitExceeded => None,
             Self::Storage(error) => Some(error),
         }
     }

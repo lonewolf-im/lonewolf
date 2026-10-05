@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use lonewolf_auth::server::Mechanism;
 use lonewolf_extension::offline::OfflineLimits;
+use lonewolf_extension::roster::RosterLimits;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
 use lonewolf_xmpp::jid::Jid;
@@ -135,6 +136,16 @@ impl Config {
             _ => {}
         }
         for (domain, host) in &self.hosts {
+            if host.roster.is_some()
+                && !host
+                    .extensions
+                    .iter()
+                    .any(|name| name == lonewolf_extension::roster::NAME)
+            {
+                return Err(format!(
+                    "hosts.{domain}.roster requires the roster extension"
+                ));
+            }
             if host.offline.is_some()
                 && !host
                     .extensions
@@ -188,6 +199,7 @@ pub struct HostConfig {
     pub tls: Option<HostTlsConfig>,
     pub extensions: Vec<String>,
     pub offline: Option<OfflineHostConfig>,
+    pub roster: Option<RosterHostConfig>,
 }
 
 impl Default for HostConfig {
@@ -199,6 +211,22 @@ impl Default for HostConfig {
                 lonewolf_extension::offline::NAME.into(),
             ],
             offline: None,
+            roster: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RosterHostConfig {
+    pub max_pending_subscription_requests: NonZeroUsize,
+}
+
+impl Default for RosterHostConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_subscription_requests: RosterLimits::default()
+                .max_pending_subscription_requests,
         }
     }
 }

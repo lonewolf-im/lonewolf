@@ -131,7 +131,22 @@ pub fn run_with_extensions(
                     let extension: Arc<dyn Extension<Arc<PooledChunkAllocator>, RedbStorage>> =
                         match name {
                             lonewolf_extension::roster::NAME => {
-                                Arc::new(lonewolf_extension::roster::Roster::new())
+                                let limits = config
+                                    .hosts
+                                    .iter()
+                                    .filter_map(|(domain, host)| {
+                                        host.roster.map(|roster| {
+                                            (
+                                                domain.as_str().into(),
+                                                lonewolf_extension::roster::RosterLimits {
+                                                    max_pending_subscription_requests: roster
+                                                        .max_pending_subscription_requests,
+                                                },
+                                            )
+                                        })
+                                    })
+                                    .collect();
+                                Arc::new(lonewolf_extension::roster::Roster::new(limits))
                             }
                             lonewolf_extension::offline::NAME => {
                                 let limits = config

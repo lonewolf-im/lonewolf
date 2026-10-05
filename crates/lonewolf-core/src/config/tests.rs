@@ -9,8 +9,8 @@ use std::process::Command;
 
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
-    AccountConfig, Config, ConfigError, HostConfig, HostTlsConfig, OfflineHostConfig, StoreConfig,
-    TcpListenerConfig, XmppConfig,
+    AccountConfig, Config, ConfigError, HostConfig, HostTlsConfig, OfflineHostConfig,
+    RosterHostConfig, StoreConfig, TcpListenerConfig, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
 
@@ -700,6 +700,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         HostConfig {
             extensions: vec!["roster".into(), "offline".into()],
             offline: Some(OfflineHostConfig::default()),
+            roster: Some(RosterHostConfig::default()),
             tls: Some(HostTlsConfig {
                 certificate_chain_path: PathBuf::from("./certs/example.com.crt"),
                 private_key_path: PathBuf::from("./certs/example.com.key"),

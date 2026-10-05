@@ -30,6 +30,7 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::bind::Bound;
+use super::certificate::CertificateMonitor;
 use super::close;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error, peer_stream_error};
@@ -65,6 +66,7 @@ struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     liveness: SessionLiveness,
     acknowledgement: Option<ReplayAcknowledgement>,
     work: &'w WorkGroup,
+    certificate: Option<&'w CertificateMonitor>,
 }
 
 struct ReplayAcknowledgement {
@@ -172,6 +174,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
             writer,
             close,
         },
+        monitor,
         registration,
         router,
         storage,
@@ -187,6 +190,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         liveness: registration.liveness(),
         acknowledgement: None,
         work,
+        certificate: monitor.as_ref(),
     };
     let mut session = BoundSession {
         registration,
@@ -202,7 +206,13 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         let retired = pin!(session.registration.wait_retired());
         match select(
             retired,
-            pin!(close.interrupt(async { Ok(session.run(&mut reader).await) })),
+            pin!(close.interrupt(async {
+                let operation = async { Ok(session.run(&mut reader).await) };
+                match &monitor {
+                    Some(monitor) => monitor.interrupt(operation).await,
+                    None => operation.await,
+                }
+            })),
         )
         .await
         {
@@ -243,6 +253,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
     async fn run(&mut self, reader: &mut Reader<A>) -> CloseOutcome {
         let mut prefer_outbound = true;
         'stream: loop {
+            if let Err(outcome) = self.outbox.check_certificate() {
+                break outcome;
+            }
             let mut next = pin!(reader.next_event());
             let event = loop {
                 let selected = {
@@ -274,6 +287,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                     Either::Right(None) => break 'stream CloseOutcome::InternalError,
                 }
             };
+            if let Err(outcome) = self.outbox.check_certificate() {
+                break outcome;
+            }
             match event {
                 Ok(Some(StreamEvent::StreamEnd) | None) => break CloseOutcome::StreamEnd,
                 Ok(Some(StreamEvent::Stanza(parsed))) => {
@@ -1138,6 +1154,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
 }
 
 impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
+    fn check_certificate(&self) -> Result<(), CloseOutcome> {
+        self.certificate.map_or(Ok(()), CertificateMonitor::check)
+    }
     fn push(&mut self, output: Output<A>) {
         self.queue.push_back(output);
     }
@@ -1196,10 +1215,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
         let mut pending_count = 0usize;
         while let Some(output) = self.queue.pop_front() {
             match output {
-                Output::Routed(stanza) => self.writer.write_routed(&stanza).await?,
+                Output::Routed(stanza) => {
+                    self.check_certificate()?;
+                    self.writer.write_routed(&stanza).await?;
+                }
                 Output::Owned { stanzas, arena } => {
                     for stanza in &stanzas {
                         let stanza = stanza.resolve(&arena)?;
+                        self.check_certificate()?;
                         self.writer.write_stanza(&stanza).await?;
                     }
                 }
@@ -1211,6 +1234,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                                 StoredKind::Subscription(&subscription.sender),
                             )
                             .await?;
+                        self.check_certificate()?;
                         self.writer.write_routed(&stanza).await?;
                         pending_count += 1;
                     }
@@ -1223,6 +1247,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                             .await
                         {
                             Ok(stanza) => {
+                                self.check_certificate()?;
                                 self.writer.write_routed(&stanza).await?;
                                 messages_written += 1;
                             }
@@ -1247,6 +1272,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                 }
             }
         }
+        self.check_certificate()?;
         self.writer.flush().await?;
         if pending_count != 0 {
             tracing::info!(

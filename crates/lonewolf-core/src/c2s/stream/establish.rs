@@ -16,6 +16,7 @@ use tokio::io::BufReader;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use super::StreamSettings;
+use super::certificate::CertificateMonitor;
 use super::close::{self, CloseContext};
 use super::header::{response_to_from_header, validate_header};
 use super::outcome::CloseOutcome;
@@ -35,6 +36,7 @@ const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'
 pub(super) struct Established<A: ChunkAllocator> {
     pub(super) session: Session<A>,
     pub(super) client: Option<VerifiedClient>,
+    pub(super) monitor: Option<CertificateMonitor>,
     pub(super) client_from: Option<String>,
     pub(super) binding: TlsBinding,
     pub(super) auth_started_at: Instant,
@@ -206,7 +208,15 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                     .await);
             }
             session.writer.send_header(&header).await?;
-            session.writer.send(&settings.sasl_features).await?;
+            let features = if client
+                .as_ref()
+                .is_some_and(|client| !client.identities().accounts.is_empty())
+            {
+                &settings.external_sasl_features
+            } else {
+                &settings.sasl_features
+            };
+            session.writer.send(features).await?;
             Ok(header)
         })
         .await;
@@ -217,6 +227,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     Ok(Established {
         session,
         client,
+        monitor: None,
         client_from: header.response_to,
         binding: TlsBinding { exporter },
         auth_started_at: Instant::now(),

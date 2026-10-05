@@ -13,24 +13,52 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{Parsed, StreamEvent};
 use lonewolf_xmpp::stanza::{Element, NodeRef, XML_NAMESPACE};
 
+use super::certificate::CertificateMonitor;
 use super::establish::Established;
 use super::outcome::CloseOutcome;
 use super::session::{Session, namespace_error};
 use crate::c2s::AuthService;
 use crate::config::AuthMechanisms;
 use crate::hosts::Hosts;
+use crate::hosts::client_identity::{ClientValidity, VerifiedClient};
 
 pub(super) const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const EMPTY_CHALLENGE: &str = "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>";
 const MAX_AUTH_ATTEMPTS: usize = 3;
 
-pub(super) fn sasl_features(mechanisms: AuthMechanisms) -> String {
-    let mut features = String::with_capacity(440);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SaslMechanism {
+    External,
+    Scram(Mechanism),
+}
+
+impl SaslMechanism {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::External => "EXTERNAL",
+            Self::Scram(mechanism) => mechanism.name(),
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        if name == "EXTERNAL" {
+            Some(Self::External)
+        } else {
+            Mechanism::from_name(name).map(Self::Scram)
+        }
+    }
+}
+
+pub(super) fn sasl_features(mechanisms: AuthMechanisms, external_available: bool) -> String {
+    let mut features = String::with_capacity(480);
     features.push_str("<stream:features>");
     if mechanisms.has_plus() {
         features.push_str("<sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/><channel-binding type='tls-exporter'/></sasl-channel-binding>");
     }
     features.push_str("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>");
+    if mechanisms.allows_external() && external_available {
+        features.push_str("<mechanism>EXTERNAL</mechanism>");
+    }
     for mechanism in [
         Mechanism::Sha256Plus,
         Mechanism::Sha256,
@@ -53,13 +81,14 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
     hosts: &Hosts,
     auth: &AuthService,
     mechanisms: AuthMechanisms,
-) -> Result<(AccountKey, Mechanism), CloseOutcome> {
+) -> Result<(AccountKey, SaslMechanism), CloseOutcome> {
     let Established {
         session,
         client_from,
         binding,
         auth_started_at: _,
-        client: _,
+        client,
+        monitor,
     } = established;
     let host = session.host().to_owned();
     let Some(endpoint) = hosts.tls_server_end_point(&host) else {
@@ -74,6 +103,8 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         endpoint,
         auth,
         mechanisms,
+        client: client.as_ref(),
+        client_validity: None,
     };
     let mut replacement = None;
     for _ in 0..MAX_AUTH_ATTEMPTS {
@@ -90,7 +121,16 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
             authentication.exporter_use = ExporterUse::Finished;
         }
         match attempt {
-            Attempt::Authenticated(account, mechanism) => return Ok((account, mechanism)),
+            Attempt::Authenticated(account, mechanism) => {
+                let validity = authentication.client_validity;
+                if let Some(validity) = validity {
+                    let client = client.take().ok_or(CloseOutcome::InternalError)?;
+                    *monitor = Some(CertificateMonitor::new(client, validity));
+                } else {
+                    client.take();
+                }
+                return Ok((account, mechanism));
+            }
             _ if exporter_finished => return Err(CloseOutcome::LocalClose),
             Attempt::Rejected => {}
             Attempt::Replaced(request) => replacement = Some(request),
@@ -108,6 +148,8 @@ struct Authentication<'a, A: ChunkAllocator> {
     endpoint: &'a [u8],
     auth: &'a AuthService,
     mechanisms: AuthMechanisms,
+    client: Option<&'a VerifiedClient>,
+    client_validity: Option<ClientValidity>,
 }
 
 enum ExporterUse {
@@ -117,12 +159,12 @@ enum ExporterUse {
 }
 
 struct AuthRequest {
-    mechanism: Option<Mechanism>,
-    initial: Vec<u8>,
+    mechanism: Option<SaslMechanism>,
+    initial: Option<Vec<u8>>,
 }
 
 enum Attempt {
-    Authenticated(AccountKey, Mechanism),
+    Authenticated(AccountKey, SaslMechanism),
     Rejected,
     Replaced(AuthRequest),
 }
@@ -164,14 +206,19 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
     }
 
     async fn attempt(&mut self, request: AuthRequest) -> Result<Attempt, CloseOutcome> {
-        let Some(mechanism) = request
-            .mechanism
-            .filter(|mechanism| self.mechanisms.allows(*mechanism))
-        else {
+        let Some(mechanism) = request.mechanism.filter(|mechanism| match mechanism {
+            SaslMechanism::External => {
+                self.mechanisms.allows_external()
+                    && self
+                        .client
+                        .is_some_and(|client| !client.identities().accounts.is_empty())
+            }
+            SaslMechanism::Scram(mechanism) => self.mechanisms.allows(*mechanism),
+        }) else {
             self.reject("invalid-mechanism").await?;
             return Ok(Attempt::Rejected);
         };
-        let initial = if request.initial.is_empty() {
+        let initial = if request.initial.is_none() {
             self.session.writer.send(EMPTY_CHALLENGE).await?;
             match self.read_response().await? {
                 Response::Data(initial) => initial,
@@ -179,7 +226,11 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 Response::Rejected => return Ok(Attempt::Rejected),
             }
         } else {
-            request.initial
+            request.initial.unwrap_or_default()
+        };
+        let mechanism = match mechanism {
+            SaslMechanism::External => return self.external(&initial).await,
+            SaslMechanism::Scram(mechanism) => mechanism,
         };
         let first = match ClientFirst::parse(mechanism, &initial, self.mechanisms.has_plus()) {
             Ok(first) => first,
@@ -206,6 +257,78 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             Response::Rejected => return Ok(Attempt::Rejected),
         };
         self.verify(mechanism, identity, &server, &response).await
+    }
+
+    async fn external(&mut self, initial: &[u8]) -> Result<Attempt, CloseOutcome> {
+        let identity = match std::str::from_utf8(initial) {
+            Ok(identity) => identity,
+            Err(_) => {
+                self.reject("malformed-request").await?;
+                return Ok(Attempt::Rejected);
+            }
+        };
+        let requested = if identity.is_empty() {
+            None
+        } else {
+            match account_key_from_jid(identity) {
+                Some(account) => Some(account),
+                None => {
+                    self.reject("invalid-authzid").await?;
+                    return Ok(Attempt::Rejected);
+                }
+            }
+        };
+        let Some(client) = self.client else {
+            return Err(CloseOutcome::InternalError);
+        };
+        let account = match client
+            .identities()
+            .authorize(requested.as_ref(), self.client_from)
+        {
+            Ok(account) => account.clone(),
+            Err(_) => {
+                self.reject("invalid-authzid").await?;
+                return Ok(Attempt::Rejected);
+            }
+        };
+        match self.auth.account_exists(&account).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.reject("not-authorized").await?;
+                return Ok(Attempt::Rejected);
+            }
+            Err(_) => {
+                self.reject("temporary-auth-failure").await?;
+                return Ok(Attempt::Rejected);
+            }
+        }
+        if self
+            .client_from
+            .is_some_and(|from| from != account.as_str())
+        {
+            return Err(CloseOutcome::InvalidFrom);
+        }
+        let validity = super::certificate::revalidate(client, *client.validity()).await?;
+        match self.auth.account_exists(&account).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.reject("not-authorized").await?;
+                return Ok(Attempt::Rejected);
+            }
+            Err(_) => {
+                self.reject("temporary-auth-failure").await?;
+                return Ok(Attempt::Rejected);
+            }
+        }
+        super::certificate::before_expiry(
+            validity.valid_until,
+            self.session
+                .writer
+                .send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>"),
+        )
+        .await?;
+        self.client_validity = Some(validity);
+        Ok(Attempt::Authenticated(account, SaslMechanism::External))
     }
 
     /// Unknown accounts and unsupported stored credentials use a decoy until proof verification.
@@ -313,7 +436,10 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                     return Err(CloseOutcome::InvalidFrom);
                 }
                 self.send_sasl("success", &final_message).await?;
-                return Ok(Attempt::Authenticated(account, mechanism));
+                return Ok(Attempt::Authenticated(
+                    account,
+                    SaslMechanism::Scram(mechanism),
+                ));
             }
         }
         self.reject("not-authorized").await?;
@@ -442,8 +568,12 @@ fn parse_sasl_message<A: ChunkAllocator>(
         "auth" if attribute_count == 1 => {
             let mechanism = mechanism.ok_or("malformed-request")?;
             Ok(SaslMessage::Auth(AuthRequest {
-                mechanism: Mechanism::from_name(mechanism),
-                initial: decode_sasl_text(content)?,
+                mechanism: SaslMechanism::from_name(mechanism),
+                initial: if content.is_none_or(str::is_empty) {
+                    None
+                } else {
+                    Some(decode_sasl_text(content)?)
+                },
             }))
         }
         "response" if attribute_count == 0 => Ok(SaslMessage::Response(decode_sasl_text(content)?)),

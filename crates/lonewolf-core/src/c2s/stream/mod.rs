@@ -3,6 +3,7 @@
 mod authenticate;
 mod bind;
 mod bound;
+mod certificate;
 mod close;
 mod establish;
 mod header;
@@ -21,11 +22,10 @@ use std::time::{Duration, Instant};
 use compio::net::TcpStream;
 use compio::time::timeout;
 use futures_util::FutureExt;
-use lonewolf_auth::server::Mechanism;
 use lonewolf_util::arena::ChunkAllocator;
 use socket2::SockRef;
 
-use authenticate::{authenticate, sasl_features};
+use authenticate::{SaslMechanism, authenticate, sasl_features};
 use bind::bind_resource;
 use bound::bound_stream;
 use establish::establish;
@@ -69,6 +69,7 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
 pub(super) struct StreamSettings<A: ChunkAllocator> {
     auth_mechanisms: AuthMechanisms,
     sasl_features: Arc<str>,
+    external_sasl_features: Arc<str>,
     max_stanza_bytes: NonZeroUsize,
     stanzas_per_second: NonZeroUsize,
     stanza_burst: NonZeroUsize,
@@ -100,7 +101,8 @@ impl<A: ChunkAllocator> StreamSettings<A> {
     ) -> Self {
         Self {
             auth_mechanisms,
-            sasl_features: sasl_features(auth_mechanisms).into(),
+            sasl_features: sasl_features(auth_mechanisms, false).into(),
+            external_sasl_features: sasl_features(auth_mechanisms, true).into(),
             max_stanza_bytes,
             stanzas_per_second: stanza_rate.per_second,
             stanza_burst: stanza_rate.burst,
@@ -129,7 +131,7 @@ impl ConnectionLifecycle {
         );
     }
 
-    fn authenticated(&mut self, host: &str, mechanism: Mechanism, started_at: Instant) {
+    fn authenticated(&mut self, host: &str, mechanism: SaslMechanism, started_at: Instant) {
         self.stream_phase = "authenticated";
         tracing::info!(
             connection_type = "c2s",
@@ -318,7 +320,6 @@ async fn finish_phases(
         Ok(Ok(outcome) | Err(outcome)) => outcome,
         Err(_) => {
             let _ = SockRef::from(close_control).shutdown(Shutdown::Both);
-            // Release deferred values after unwinding ends.
             release_deferred();
             tracing::error!("connection task panicked");
             CloseOutcome::InternalError

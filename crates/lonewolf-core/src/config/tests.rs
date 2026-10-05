@@ -180,6 +180,7 @@ fn xmpp_defaults_reserve_256_mib_for_stanza_arenas() {
 fn c2s_defaults_to_one_ipv4_endpoint_on_port_5222() -> TestResult {
     let config = Config::default();
     assert_eq!(config.c2s.listeners.len(), 1);
+    assert!(config.c2s.listeners[0].auth_mechanisms.allows_external());
     assert_eq!(config.c2s.listeners[0].address, "0.0.0.0:5222".parse()?);
     for mechanism in [
         Mechanism::Sha1,
@@ -238,6 +239,8 @@ fn auth_mechanisms_are_configured_per_listener() -> TestResult {
     let config = Config::load(Some(file.path()))?;
     let first = config.c2s.listeners[0].auth_mechanisms;
     let second = config.c2s.listeners[1].auth_mechanisms;
+    assert!(!first.allows_external());
+    assert!(!second.allows_external());
 
     assert!(first.allows(Mechanism::Sha256));
     assert!(!first.allows(Mechanism::Sha1Plus));
@@ -266,6 +269,7 @@ fn empty_auth_mechanisms_are_rejected() -> TestResult {
 fn unsupported_or_duplicate_auth_mechanisms_are_rejected() -> TestResult {
     for (names, reason) in [
         ("['PLAIN']", "unsupported auth mechanism"),
+        ("['EXTERNAL', 'EXTERNAL']", "duplicate auth mechanism"),
         (
             "['SCRAM-SHA-256', 'SCRAM-SHA-256']",
             "duplicate auth mechanism",
@@ -736,5 +740,24 @@ fn stanza_pool_shard_count_matches_worker_count() -> Result<(), Box<dyn Error>> 
     let config = XmppConfig::default().stanza_pool_config(worker_count)?;
 
     assert_eq!(config.shards_per_bucket, worker_count);
+    Ok(())
+}
+
+#[test]
+fn external_only_listener_preserves_scram_bits() -> TestResult {
+    let file = config_file("[[c2s.listeners]]\nauth_mechanisms = ['EXTERNAL']\n")?;
+    let config = Config::load(Some(file.path()))?;
+    let mechanisms = config.c2s.listeners[0].auth_mechanisms;
+    assert!(mechanisms.allows_external());
+    assert!(!mechanisms.is_empty());
+    assert!(!mechanisms.has_plus());
+    for mechanism in [
+        Mechanism::Sha1,
+        Mechanism::Sha1Plus,
+        Mechanism::Sha256,
+        Mechanism::Sha256Plus,
+    ] {
+        assert!(!mechanisms.allows(mechanism));
+    }
     Ok(())
 }

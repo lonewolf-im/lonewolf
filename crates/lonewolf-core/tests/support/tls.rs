@@ -124,6 +124,28 @@ impl ClientCertificates {
         Ok(())
     }
 
+    pub fn identity_key(
+        &self,
+        identities: &[&str],
+        expires: time::OffsetDateTime,
+    ) -> TestResult<Arc<rustls::sign::CertifiedKey>> {
+        let mut parameters = CertificateParams::new(Vec::<String>::new())?;
+        parameters.serial_number = Some(42u64.into());
+        parameters.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        parameters.not_after = expires;
+        parameters.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        parameters.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        for identity in identities {
+            parameters
+                .subject_alt_names
+                .push(rcgen::SanType::OtherName((
+                    vec![1, 3, 6, 1, 5, 5, 7, 8, 5],
+                    (*identity).into(),
+                )));
+        }
+        client_key_from_parameters(&self.issuer, parameters)
+    }
+
     pub fn configure(directory: &Path) -> TestResult<Self> {
         use rcgen::{
             BasicConstraints, CertifiedIssuer, DnType, IsCa, KeyIdMethod, KeyUsagePurpose,

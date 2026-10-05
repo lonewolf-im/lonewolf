@@ -357,7 +357,7 @@ fn authentication_deadline_starts_after_sasl_offer() -> Result<(), Box<dyn Error
         run_starttls_restart_case_with_timeout(PSI_OPEN, Duration::from_millis(50), true)?;
     assert_eq!(outcome, CloseOutcome::AuthenticationTimeout);
     assert!(before_tls.contains(STARTTLS_FEATURES));
-    assert!(after_tls.contains(sasl_features(AuthMechanisms::ALL).as_str()));
+    assert!(after_tls.contains(sasl_features(AuthMechanisms::ALL, false).as_str()));
     Ok(())
 }
 
@@ -755,4 +755,15 @@ fn panicking_phase_closes_its_socket_before_waiting_for_tracked_work() -> Result
         listener.close().await?;
         Ok(())
     })
+}
+
+#[test]
+fn external_features_require_connection_candidates_and_precede_scram() {
+    let absent = sasl_features(AuthMechanisms::ALL, false);
+    assert!(!absent.contains("EXTERNAL"));
+    let present = sasl_features(AuthMechanisms::ALL, true);
+    assert!(
+        present
+            .contains("<mechanism>EXTERNAL</mechanism><mechanism>SCRAM-SHA-256-PLUS</mechanism>")
+    );
 }

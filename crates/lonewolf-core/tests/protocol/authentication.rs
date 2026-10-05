@@ -705,3 +705,238 @@ fn protected_from_must_match_the_authenticated_account() -> TestResult {
     reply.child(STREAM_ERRORS, "invalid-from")?;
     client.expect_end()
 }
+
+#[test]
+fn optional_client_certificates_keep_no_certificate_and_trusted_certificate_scram_working()
+-> TestResult {
+    use super::support::tls::{ClientCertificates, with_client_certificate};
+    let mut certificates = None;
+    let suite = C2sSuite::with_extensions_and_setup("", |directory| {
+        certificates = Some(ClientCertificates::configure(directory)?);
+        Ok(())
+    })?;
+    let certificates = certificates.ok_or("missing client certificate fixtures")?;
+    suite.create_account("alice", "pencil")?;
+    for key in [
+        None,
+        Some(certificates.trusted),
+        Some(certificates.without_xmpp_addr),
+        Some(certificates.absent_key_usage),
+    ] {
+        let mut plain = super::support::PlainClient::tcp(&suite)?;
+        plain.open()?;
+        let config = key.map_or_else(
+            || std::sync::Arc::clone(&suite.tls),
+            |key| with_client_certificate(&suite.tls, key),
+        );
+        let mut client = plain.start_tls_with_config(config)?;
+        client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
+        client
+            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn optional_client_certificates_reject_invalid_presented_certificates() -> TestResult {
+    use super::support::tls::{ClientCertificates, with_client_certificate};
+    let mut certificates = None;
+    let suite = C2sSuite::with_extensions_and_setup("", |directory| {
+        certificates = Some(ClientCertificates::configure(directory)?);
+        Ok(())
+    })?;
+    let mut certificates = certificates.ok_or("missing client certificate fixtures")?;
+    certificates.rejected.push((
+        "resource-bearing XmppAddr",
+        certificates.malformed_xmpp_addr,
+    ));
+    for (scenario, key) in certificates.rejected {
+        for version in [&version::TLS12, &version::TLS13] {
+            let mut plain = super::support::PlainClient::tcp(&suite)?;
+            plain.open()?;
+            let config = suite.tls_with_versions(&[version])?;
+            let mut client = plain.start_tls_with_config(with_client_certificate(
+                &config,
+                std::sync::Arc::clone(&key),
+            ))?;
+            assert!(
+                client.open_with(OPEN).is_err(),
+                "accepted {scenario} with {:?}",
+                version.version
+            );
+        }
+    }
+    let logs = suite.wait_for_log("outcome=\"tls_failure\"")?;
+    assert!(!logs.contains("alice@localhost"));
+    Ok(())
+}
+
+#[test]
+fn client_certificate_handshakes_use_replaced_crls_without_restarting() -> TestResult {
+    use super::support::tls::{ClientCertificates, with_client_certificate};
+    let mut certificates = None;
+    let suite = C2sSuite::with_extensions_and_setup("", |directory| {
+        certificates = Some(ClientCertificates::configure(directory)?);
+        Ok(())
+    })?;
+    let certificates = certificates.ok_or("missing client certificate fixtures")?;
+    suite.create_account("alice", "pencil")?;
+    let config = with_client_certificate(&suite.tls, std::sync::Arc::clone(&certificates.trusted));
+    for replace in [false, true] {
+        if replace {
+            certificates.replace_crl(
+                false,
+                time::OffsetDateTime::now_utc() + time::Duration::days(2),
+            )?;
+        }
+        let mut plain = super::support::PlainClient::tcp(&suite)?;
+        plain.open()?;
+        let mut client = plain.start_tls_with_config(std::sync::Arc::clone(&config))?;
+        client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
+        client
+            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
+    }
+    certificates.replace_crl(
+        true,
+        time::OffsetDateTime::now_utc() + time::Duration::days(2),
+    )?;
+    let mut plain = super::support::PlainClient::tcp(&suite)?;
+    plain.open()?;
+    let mut client = plain.start_tls_with_config(config)?;
+    assert!(client.open_with(OPEN).is_err());
+    Ok(())
+}
+
+#[test]
+fn runtime_crl_failures_reject_certificates_and_keep_no_certificate_scram_working() -> TestResult {
+    use super::support::tls::{ClientCertificates, with_client_certificate};
+    let mut certificates = None;
+    let mut crls_path = None;
+    let suite = C2sSuite::with_extensions_and_setup("", |directory| {
+        certificates = Some(ClientCertificates::configure(directory)?);
+        crls_path = Some(directory.join("client-crls.pem"));
+        Ok(())
+    })?;
+    let certificates = certificates.ok_or("missing client certificate fixtures")?;
+    let crls_path = crls_path.ok_or("missing CRL path")?;
+    suite.create_account("alice", "pencil")?;
+    for material in [
+        None,
+        Some(b"".as_slice()),
+        Some(b"-----BEGIN X509 CRL-----\n!\n-----END X509 CRL-----\n".as_slice()),
+    ] {
+        match material {
+            None => std::fs::remove_file(&crls_path)?,
+            Some(bytes) => std::fs::write(&crls_path, bytes)?,
+        }
+        let mut plain = super::support::PlainClient::tcp(&suite)?;
+        plain.open()?;
+        let mut client = plain.start_tls_with_config(with_client_certificate(
+            &suite.tls,
+            std::sync::Arc::clone(&certificates.trusted),
+        ))?;
+        assert!(client.open_with(OPEN).is_err());
+        let mut client = suite.unauthenticated_client()?;
+        client
+            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
+    }
+    certificates.replace_crl(
+        false,
+        time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
+    )?;
+    let mut plain = super::support::PlainClient::tcp(&suite)?;
+    plain.open()?;
+    let mut client =
+        plain.start_tls_with_config(with_client_certificate(&suite.tls, certificates.trusted))?;
+    assert!(client.open_with(OPEN).is_err());
+    let mut client = suite.unauthenticated_client()?;
+    client
+        .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    client.open()?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn blocked_handshake_crl_reload_obeys_establishment_timeout_and_late_results_are_isolated()
+-> TestResult {
+    use super::support::tls::{
+        ClientCertificates, block_crl_reads, wait_for_crl_reader, with_client_certificate,
+    };
+    use std::io::Write as _;
+    let mut certificates = None;
+    let mut crls_path = None;
+    let suite = C2sSuite::with_extensions_limits_and_setup(
+        "",
+        "connection_establishment_timeout_secs = 1",
+        |directory| {
+            certificates = Some(ClientCertificates::configure(directory)?);
+            crls_path = Some(directory.join("client-crls.pem"));
+            Ok(())
+        },
+    )?;
+    let certificates = certificates.ok_or("missing client certificate fixtures")?;
+    let crls_path = crls_path.ok_or("missing CRL path")?;
+    suite.create_account("alice", "pencil")?;
+    let material = block_crl_reads(&crls_path)?;
+    let mut plain = super::support::PlainClient::tcp(&suite)?;
+    plain.open()?;
+    let mut client = plain.start_tls_with_config(std::sync::Arc::clone(&suite.tls))?;
+    let mut release = wait_for_crl_reader(&crls_path)?;
+    assert!(client.open_with(OPEN).is_err());
+    suite.wait_for_log("outcome=\"establishment_timeout\"")?;
+    release.write_all(&material)?;
+    drop(release);
+    std::fs::remove_file(&crls_path)?;
+    std::fs::write(&crls_path, &material)?;
+    let mut plain = super::support::PlainClient::tcp(&suite)?;
+    plain.open()?;
+    let mut client =
+        plain.start_tls_with_config(with_client_certificate(&suite.tls, certificates.trusted))?;
+    client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
+    client
+        .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    client.open()?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn blocked_handshake_crl_reload_obeys_shutdown() -> TestResult {
+    use super::support::tls::{ClientCertificates, block_crl_reads, wait_for_crl_reader};
+    let mut crls_path = None;
+    let mut suite = C2sSuite::with_extensions_and_setup("", |directory| {
+        ClientCertificates::configure(directory)?;
+        crls_path = Some(directory.join("client-crls.pem"));
+        Ok(())
+    })?;
+    let crls_path = crls_path.ok_or("missing CRL path")?;
+    block_crl_reads(&crls_path)?;
+    let mut plain = super::support::PlainClient::tcp(&suite)?;
+    plain.open()?;
+    let mut client = plain.start_tls_with_config(std::sync::Arc::clone(&suite.tls))?;
+    let _release = wait_for_crl_reader(&crls_path)?;
+    suite.stop()?;
+    assert!(client.open_with(OPEN).is_err());
+    suite.wait_for_log("outcome=\"system_shutdown\"")?;
+    Ok(())
+}

@@ -2,7 +2,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Instant;
 
 use compio::io::compat::{AsyncReadStream, AsyncStream};
@@ -26,6 +25,7 @@ use super::session::{
 };
 use super::stanza_rate::StanzaLimiter;
 use crate::hosts::Hosts;
+use crate::hosts::client_identity::VerifiedClient;
 
 pub(super) const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 pub(super) const STARTTLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
@@ -34,6 +34,7 @@ const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'
 
 pub(super) struct Established<A: ChunkAllocator> {
     pub(super) session: Session<A>,
+    pub(super) client: Option<VerifiedClient>,
     pub(super) client_from: Option<String>,
     pub(super) binding: TlsBinding,
     pub(super) auth_started_at: Instant,
@@ -130,18 +131,37 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     };
     let rate_state = reader.take_input().await?.into_rate_limited().into_state();
     drop(writer);
-    let Some(tls_config) = hosts.tls_server_config(&selected_host) else {
-        return Err(CloseOutcome::InternalError);
-    };
-    let acceptor = TlsAcceptor::from(Arc::clone(tls_config));
     let transport = context
         .interrupt(async {
+            let tls_config = hosts
+                .tls_server_config(&selected_host)
+                .await
+                .ok_or(CloseOutcome::InternalError)?;
+            let acceptor = TlsAcceptor::from(tls_config);
             acceptor
                 .accept(Box::pin(AsyncStream::new(transport)))
                 .await
                 .map_err(|_| CloseOutcome::TlsFailure)
         })
         .await?;
+    let client = match transport.get_ref().1.peer_certificates() {
+        Some(chain) if !chain.is_empty() => {
+            let policy = hosts
+                .client_certificate_policy(&selected_host)
+                .ok_or(CloseOutcome::TlsFailure)?;
+            Some(
+                context
+                    .interrupt(async {
+                        policy
+                            .verify_client(chain.iter().cloned().collect())
+                            .await
+                            .map_err(|_| CloseOutcome::TlsFailure)
+                    })
+                    .await?,
+            )
+        }
+        _ => None,
+    };
     let mut exporter = [0_u8; 32];
     transport
         .get_ref()
@@ -196,6 +216,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     };
     Ok(Established {
         session,
+        client,
         client_from: header.response_to,
         binding: TlsBinding { exporter },
         auth_started_at: Instant::now(),

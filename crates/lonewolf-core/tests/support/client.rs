@@ -46,7 +46,7 @@ impl PlainClient {
         self.start_tls_with_config(Arc::clone(&server.tls))
     }
 
-    fn start_tls_with_config(mut self, config: Arc<ClientConfig>) -> TestResult<Client> {
+    pub fn start_tls_with_config(mut self, config: Arc<ClientConfig>) -> TestResult<Client> {
         self.send(&format!("<starttls xmlns='{TLS_NAMESPACE}'/>"))?;
         self.receive()?.assert_name(TLS_NAMESPACE, "proceed");
         let socket = self.into_inner();

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroUsize;
+
 use lonewolf_storage::WriteTransaction;
 use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::roster::RosterJid;
@@ -53,6 +55,7 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
     transaction: &mut W,
     parties: Parties,
     stanza: &RoutedStanza<A>,
+    max_pending_subscription_requests: NonZeroUsize,
 ) -> Result<Effects<A>, HandlerError> {
     if !check_parties(transaction, &parties).await? {
         return Err(StanzaErrorCondition::ServiceUnavailable.into());
@@ -77,6 +80,7 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
         &target,
         &target_jid,
         request.into_bytes().into_boxed_slice(),
+        max_pending_subscription_requests,
     )
     .await?
     {

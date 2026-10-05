@@ -1,7 +1,6 @@
 # Copy this file to lonewolf.toml and uncomment the settings you want to change.
 # The values shown are the defaults unless a comment identifies an example.
 
-# ------------------------------------ Logging --------------------------------------------------
 
 # [logging]
 
@@ -9,7 +8,6 @@
 # Use "off", "error", "warn", "info", "debug", or "trace".
 # level = "info"
 
-# ------------------------------------ XMPP -----------------------------------------------------
 
 # [xmpp]
 
@@ -22,7 +20,6 @@
 # memory when the pool is exhausted.
 # stanza_pool_size_mib = 256
 
-# ------------------------------------ Hosts ----------------------------------------------------
 
 # Add one section for each XMPP domain served by Lonewolf.
 # Defining hosts replaces the built-in host map.
@@ -37,8 +34,14 @@
 # The domain below is an example.
 # [hosts."example.com"]
 
-# This example enables roster and offline storage for this host.
 # extensions = ["roster", "offline"]
+
+# Limit distinct pending subscription senders per account to bound requests awaiting approval.
+# Choose a positive count. At capacity, new senders receive a resource-constraint error.
+# Existing senders can still update their requests.
+# Keep roster in this host's extension list when configuring its limit.
+# [hosts."example.com".roster]
+# max_pending_subscription_requests = 100
 
 # Adjust the number of stored messages per account to suit clients that stay offline.
 # Use a positive integer. Senders receive resource-constraint when the queue reaches this limit.
@@ -55,7 +58,6 @@
 # certificate_chain_path = "./certs/example.com.crt"
 # private_key_path = "./certs/example.com.key"
 
-# ------------------------------------ Limits ---------------------------------------------------
 
 # All numeric limits are positive integers.
 # [limits.c2s]
@@ -115,7 +117,6 @@
 # [limits.c2s.profiles.internal]
 # max_stanza_bytes = 524_288
 
-# ------------------------------------ C2S ------------------------------------------------------
 
 # Add one section per TCP endpoint. These sections replace the default endpoint.
 # Lonewolf requires at least one client endpoint.
@@ -140,7 +141,6 @@
 # address = "127.0.0.1:5223"
 # limits = "internal"
 
-# ------------------------------------ Storage --------------------------------------------------
 
 # [storage]
 
@@ -160,7 +160,6 @@
 # where Lonewolf was launched.
 # path = "./data/lonewolf.dat"
 
-# ------------------------------------ Admin ----------------------------------------------------
 
 # [admin]
 
@@ -174,7 +173,6 @@
 # must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
 
-# ------------------------------------ Account --------------------------------------------------
 
 # [account]
 

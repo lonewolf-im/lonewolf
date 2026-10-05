@@ -137,3 +137,62 @@ fn unknown_host_and_tls_keys_are_rejected() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn roster_limits_default_and_override_per_host() -> TestResult {
+    assert!(Config::default().hosts["localhost"].roster.is_none());
+    for (section, expected) in [
+        ("", None),
+        ("[hosts.localhost.roster]", Some(100)),
+        (
+            "[hosts.localhost.roster]\nmax_pending_subscription_requests = 7",
+            Some(7),
+        ),
+    ] {
+        let file = config_file(section)?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(
+            config.hosts["localhost"]
+                .roster
+                .map(|limits| limits.max_pending_subscription_requests.get()),
+            expected
+        );
+    }
+    assert_eq!(
+        lonewolf_extension::roster::RosterLimits::default()
+            .max_pending_subscription_requests
+            .get(),
+        100
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_roster_limits_are_rejected() -> TestResult {
+    for setting in [
+        "max_pending_subscription_requests = 0",
+        "max_pending_subscription_requests = -1",
+        "max_pending_subscription_requests = '100'",
+        "max_pending_subscription_requests = 1.5",
+        "max_pending_subscription_requests = 18446744073709551616",
+        "unknown = 1",
+    ] {
+        let file = config_file(&format!("[hosts.localhost.roster]\n{setting}"))?;
+        assert!(
+            matches!(
+                Config::load(Some(file.path())),
+                Err(ConfigError::Parse { .. })
+            ),
+            "{setting}"
+        );
+    }
+    for extensions in ["[]", "['offline']"] {
+        let file = config_file(&format!(
+            "[hosts.localhost]\nextensions = {extensions}\n[hosts.localhost.roster]"
+        ))?;
+        assert!(
+            matches!(Config::load(Some(file.path())), Err(ConfigError::Invalid { reason, .. }) if reason == "hosts.localhost.roster requires the roster extension")
+        );
+    }
+    Ok(())
+}

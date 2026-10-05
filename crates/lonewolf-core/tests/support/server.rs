@@ -90,6 +90,10 @@ impl C2sSuite {
         Self::settings("", "", 10, hosts)
     }
 
+    pub fn with_hosts_and_profile(hosts: &str, default: &str) -> TestResult<Self> {
+        Self::settings_with_profile("", "", 10, hosts, Some(default), |_| Ok(()))
+    }
+
     pub fn with_limits(limits: &str) -> TestResult<Self> {
         Self::configured("", limits)
     }

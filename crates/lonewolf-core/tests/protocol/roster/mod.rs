@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod pending_limits;
+
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -231,7 +233,9 @@ fn seed_pending_subscriptions(directory: &Path) -> TestResult {
         let mut repository = storage.begin_write().await?;
         seed_accounts(&mut repository, &[&owner]).await?;
         for subscription in subscriptions {
-            repository.put_pending_request(&owner, subscription).await?;
+            repository
+                .put_pending_request(&owner, subscription, std::num::NonZeroUsize::MAX)
+                .await?;
         }
         repository.commit().await?;
         TestResult::Ok(())
@@ -263,8 +267,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
                     stanza: b"<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>"
                         .to_vec()
                         .into_boxed_slice(),
-                },
-            )
+                }, std::num::NonZeroUsize::MAX)
             .await?;
         repository.commit().await?;
         TestResult::Ok(())

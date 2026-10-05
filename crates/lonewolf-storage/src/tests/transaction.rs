@@ -28,7 +28,11 @@ pub(crate) fn uncommitted_writes_are_visible_only_inside_their_transaction<S: St
             .await?;
         let version = writer.put_roster_item(&alice, &bob_item).await?;
         writer
-            .put_pending_request(&alice, pending("bob@example.com", b"<presence/>")?)
+            .put_pending_request(
+                &alice,
+                pending("bob@example.com", b"<presence/>")?,
+                std::num::NonZeroUsize::MAX,
+            )
             .await?;
         assert!(writer.account(&alice).await?.is_some());
         assert_eq!(
@@ -89,7 +93,11 @@ pub(crate) fn dropping_a_write_transaction_aborts_every_write<S: Storage>(
             .put_roster_item(&bob, &item("alice@example.com", None, &[])?)
             .await?;
         writer
-            .put_pending_request(&bob, pending("alice@example.com", b"<presence/>")?)
+            .put_pending_request(
+                &bob,
+                pending("alice@example.com", b"<presence/>")?,
+                std::num::NonZeroUsize::MAX,
+            )
             .await?;
         assert!(writer.account(&alice).await?.is_none());
         assert!(writer.account(&bob).await?.is_some());
@@ -119,7 +127,11 @@ pub(crate) fn commit_persists_account_and_roster_writes_together<S: Storage>(
                 .put_roster_item(&key(owner)?, &item("bob@example.com", None, &[])?)
                 .await?;
             writer
-                .put_pending_request(&key(owner)?, pending("bob@example.com", b"<presence/>")?)
+                .put_pending_request(
+                    &key(owner)?,
+                    pending("bob@example.com", b"<presence/>")?,
+                    std::num::NonZeroUsize::MAX,
+                )
                 .await?;
         }
         writer.commit().await?;

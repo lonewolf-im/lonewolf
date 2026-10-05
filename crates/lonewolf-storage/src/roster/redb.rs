@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use ::redb::{ReadableTable, TableDefinition, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
@@ -22,7 +23,6 @@ pub(crate) const VERSIONS: TableDefinition<&str, u64> =
 pub(crate) const PENDING: TableDefinition<&str, &[u8]> =
     TableDefinition::new("lonewolf_roster_pending_subscriptions");
 
-/// Creates the roster tables.
 pub(crate) fn initialize(transaction: &WriteTransaction) -> Result<(), StorageError> {
     transaction.open_table(ITEMS).map_err(storage_error)?;
     transaction.open_table(VERSIONS).map_err(storage_error)?;
@@ -125,6 +125,7 @@ impl RosterWrites for RedbWrite {
         &mut self,
         owner: &AccountKey,
         request: PendingSubscription,
+        max_pending_subscription_requests: NonZeroUsize,
     ) -> impl Future<Output = Result<(), RosterError>> + Send {
         let owner = Box::<str>::from(owner.as_str());
         let key = item_key_text(&owner, &request.sender);
@@ -132,9 +133,22 @@ impl RosterWrites for RedbWrite {
             if !account_exists(transaction, &owner)? {
                 return Err(RosterError::NoAccount);
             }
-            transaction
-                .open_table(PENDING)
-                .map_err(storage_error)?
+            let mut table = transaction.open_table(PENDING).map_err(storage_error)?;
+            if table.get(key.as_ref()).map_err(storage_error)?.is_none() {
+                let (start, end) = owner_range(&owner);
+                for (index, entry) in table
+                    .range(start.as_ref()..end.as_ref())
+                    .map_err(storage_error)?
+                    .take(max_pending_subscription_requests.get())
+                    .enumerate()
+                {
+                    entry.map_err(storage_error)?;
+                    if index + 1 == max_pending_subscription_requests.get() {
+                        return Err(RosterError::PendingLimitExceeded);
+                    }
+                }
+            }
+            table
                 .insert(key.as_ref(), request.stanza.as_ref())
                 .map_err(storage_error)?;
             Ok(())

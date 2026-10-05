@@ -5,6 +5,9 @@ mod subscription;
 mod versioning;
 mod xml;
 
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::roster::{
@@ -29,6 +32,8 @@ pub const NAMESPACE: &str = "jabber:iq:roster";
 pub const VERSIONING_FEATURE: &str = "<ver xmlns='urn:xmpp:features:rosterver'/>";
 pub const PRE_APPROVAL_FEATURE: &str = "<sub xmlns='urn:xmpp:features:pre-approval'/>";
 
+const DEFAULT_MAX_PENDING_SUBSCRIPTION_REQUESTS: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
 const IQ_ROUTES: [IqRoute; 2] = [
     IqRoute {
         scope: IqScope::Account,
@@ -44,12 +49,28 @@ const IQ_ROUTES: [IqRoute; 2] = [
     },
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RosterLimits {
+    pub max_pending_subscription_requests: NonZeroUsize,
+}
+
+impl Default for RosterLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_subscription_requests: DEFAULT_MAX_PENDING_SUBSCRIPTION_REQUESTS,
+        }
+    }
+}
+
 #[derive(Default)]
-pub struct Roster;
+pub struct Roster {
+    limits: BTreeMap<Box<str>, RosterLimits>,
+}
 
 impl Roster {
-    pub const fn new() -> Self {
-        Self
+    /// Hosts without a limits entry use the default.
+    pub fn new(limits: BTreeMap<Box<str>, RosterLimits>) -> Self {
+        Self { limits }
     }
 }
 
@@ -286,7 +307,18 @@ where
             let parties = Parties::new(&request)?;
             match request.kind {
                 PresenceRequestType::Subscribe => {
-                    subscription::request_subscription(transaction, parties, request.stanza).await
+                    let limits = self
+                        .limits
+                        .get(request.target.domainpart())
+                        .copied()
+                        .unwrap_or_default();
+                    subscription::request_subscription(
+                        transaction,
+                        parties,
+                        request.stanza,
+                        limits.max_pending_subscription_requests,
+                    )
+                    .await
                 }
                 PresenceRequestType::Subscribed => {
                     subscription::approve_subscription(transaction, parties, request.stanza).await
@@ -366,6 +398,7 @@ fn split_subscriptions(
 fn roster_error(error: RosterError) -> StanzaErrorCondition {
     match error {
         RosterError::ValueTooLarge => StanzaErrorCondition::NotAcceptable,
+        RosterError::PendingLimitExceeded => StanzaErrorCondition::ResourceConstraint,
         RosterError::NoAccount => StanzaErrorCondition::Forbidden,
         RosterError::Storage(_) => StanzaErrorCondition::InternalServerError,
     }

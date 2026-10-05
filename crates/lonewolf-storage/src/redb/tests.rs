@@ -299,7 +299,9 @@ fn committed_state_survives_reopening() -> TestResult {
                 .await?;
             writer.delete_account(&deleted).await?;
             writer.put_roster_item(&alice, &bob).await?;
-            writer.put_pending_request(&alice, request.clone()).await?;
+            writer
+                .put_pending_request(&alice, request.clone(), std::num::NonZeroUsize::MAX)
+                .await?;
             writer.commit().await?;
             Ok::<(), Box<dyn Error>>(())
         })?;
@@ -437,7 +439,11 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
             .await?;
         assert_worker_threads(&backend)?;
         writer
-            .put_pending_request(&alice, pending("bob@example.com", b"<presence/>")?)
+            .put_pending_request(
+                &alice,
+                pending("bob@example.com", b"<presence/>")?,
+                std::num::NonZeroUsize::MAX,
+            )
             .await?;
         assert_worker_threads(&backend)?;
         assert_eq!(writer.roster(&alice).await?.items.len(), 1);
@@ -642,5 +648,141 @@ fn commit_fails_while_a_cancelled_operation_still_holds_the_transaction() -> Tes
                 .is_some()
         );
         Ok(())
+    })
+}
+
+#[test]
+fn pending_limit_serializes_simultaneous_writers() -> TestResult {
+    let storage = storage()?;
+    block_on(async {
+        let mut writer = storage.begin_write().await?;
+        writer
+            .create_account(new_account("alice@example.com", 10)?)
+            .await?;
+        writer.commit().await?;
+        TestResult::Ok(())
+    })?;
+    let barrier = std::sync::Barrier::new(2);
+    thread::scope(|scope| -> TestResult {
+        let mut writers = Vec::new();
+        for sender in ["bob@example.com", "carol@example.com"] {
+            let storage = storage.clone();
+            let barrier = &barrier;
+            writers.push(scope.spawn(move || -> Result<bool, String> {
+                let alice = key("alice@example.com").map_err(|error| error.to_string())?;
+                let request = pending(sender, b"request").map_err(|error| error.to_string())?;
+                barrier.wait();
+                block_on(async {
+                    let mut writer = storage
+                        .begin_write()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    match writer
+                        .put_pending_request(&alice, request, NonZeroUsize::MIN)
+                        .await
+                    {
+                        Ok(()) => {
+                            writer.commit().await.map_err(|error| error.to_string())?;
+                            Ok(true)
+                        }
+                        Err(crate::roster::RosterError::PendingLimitExceeded) => Ok(false),
+                        Err(error) => Err(error.to_string()),
+                    }
+                })
+            }));
+        }
+        let admitted = writers
+            .into_iter()
+            .map(|writer| writer.join().map_err(|_| "writer panicked")?)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(admitted.iter().filter(|admitted| **admitted).count(), 1);
+        Ok(())
+    })?;
+    block_on(async {
+        assert_eq!(
+            storage
+                .begin_read()
+                .await?
+                .pending_requests(&key("alice@example.com")?)
+                .await?
+                .len(),
+            1
+        );
+        TestResult::Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn reopened_pending_queue_preserves_rows_above_a_lower_limit() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("pending.redb");
+    let alice = key("alice@example.com")?;
+    {
+        let storage = RedbStorage::open(&path)?;
+        block_on(async {
+            let mut writer = storage.begin_write().await?;
+            writer
+                .create_account(new_account("alice@example.com", 10)?)
+                .await?;
+            for sender in ["bob@example.com", "carol@example.com", "dave@example.com"] {
+                writer
+                    .put_pending_request(
+                        &alice,
+                        pending(sender, sender.as_bytes())?,
+                        NonZeroUsize::MAX,
+                    )
+                    .await?;
+            }
+            writer.commit().await?;
+            TestResult::Ok(())
+        })?;
+    }
+    let storage = RedbStorage::open(&path)?;
+    block_on(async {
+        let cap = NonZeroUsize::new(2).ok_or("invalid cap")?;
+        let mut writer = storage.begin_write().await?;
+        assert_eq!(writer.pending_requests(&alice).await?.len(), 3);
+        writer
+            .put_pending_request(&alice, pending("bob@example.com", b"updated")?, cap)
+            .await?;
+        assert!(matches!(
+            writer
+                .put_pending_request(&alice, pending("erin@example.com", b"new")?, cap)
+                .await,
+            Err(crate::roster::RosterError::PendingLimitExceeded)
+        ));
+        assert_eq!(
+            writer.pending_requests(&alice).await?,
+            [
+                pending("bob@example.com", b"updated")?,
+                pending("carol@example.com", b"carol@example.com")?,
+                pending("dave@example.com", b"dave@example.com")?
+            ]
+        );
+        writer
+            .remove_pending_request(&alice, &jid("bob@example.com")?)
+            .await?;
+        assert!(matches!(
+            writer
+                .put_pending_request(&alice, pending("erin@example.com", b"new")?, cap)
+                .await,
+            Err(crate::roster::RosterError::PendingLimitExceeded)
+        ));
+        writer
+            .remove_pending_request(&alice, &jid("carol@example.com")?)
+            .await?;
+        writer
+            .put_pending_request(&alice, pending("erin@example.com", b"new")?, cap)
+            .await?;
+        writer.commit().await?;
+        assert_eq!(
+            storage.begin_read().await?.pending_requests(&alice).await?,
+            [
+                pending("dave@example.com", b"dave@example.com")?,
+                pending("erin@example.com", b"new")?
+            ]
+        );
+        TestResult::Ok(())
     })
 }

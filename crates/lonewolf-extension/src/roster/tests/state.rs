@@ -80,7 +80,8 @@ fn put_pending(
     request: PendingSubscription,
 ) -> Result<(), RosterError> {
     write(roster, async |tx| {
-        tx.put_pending_request(owner, request).await
+        tx.put_pending_request(owner, request, std::num::NonZeroUsize::MAX)
+            .await
     })
 }
 
@@ -282,6 +283,7 @@ fn subscription_request_updates_the_sender_and_recipient_in_one_transaction() ->
             &bob,
             &bob_jid,
             stanza(b"<presence id='first'/>"),
+            std::num::NonZeroUsize::MAX,
         )
         .await
     })?;
@@ -304,6 +306,7 @@ fn subscription_request_updates_the_sender_and_recipient_in_one_transaction() ->
             &bob,
             &bob_jid,
             stanza(b"<presence id='last'/>"),
+            std::num::NonZeroUsize::MAX,
         )
         .await
     })?;
@@ -343,6 +346,7 @@ fn established_subscription_requests_are_automatically_approved_without_changes(
                 &bob,
                 &bob_jid,
                 stanza(b"<presence id='repeat'/>"),
+                std::num::NonZeroUsize::MAX,
             )
             .await
         })?;
@@ -404,6 +408,7 @@ fn automatic_approval_resolves_an_outstanding_request() -> TestResult {
                 &bob,
                 &bob_jid,
                 stanza(b"<presence id='repeat'/>"),
+                std::num::NonZeroUsize::MAX,
             )
             .await
         })?;
@@ -438,6 +443,7 @@ fn denying_a_pending_request_clears_both_sides_without_changing_the_grantor_rost
             &bob,
             &bob_jid,
             stanza(b"<presence type='subscribe'/>"),
+            std::num::NonZeroUsize::MAX,
         )
         .await
     })?;
@@ -904,6 +910,7 @@ fn a_pre_approved_request_grants_the_requester_and_consumes_the_pre_approval() -
                 &bob,
                 &bob_jid,
                 stanza(b"<presence id='request'/>"),
+                std::num::NonZeroUsize::MAX,
             )
             .await
         })?;
@@ -924,6 +931,122 @@ fn a_pre_approved_request_grants_the_requester_and_consumes_the_pre_approval() -
             snapshot(&roster, &bob).items[0].subscription,
             subscription(grantor_after)
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn pending_overflow_preserves_both_rosters_and_reverse_requests() -> TestResult {
+    for existing_item in [false, true] {
+        let (_directory, roster) = roster();
+        let alice = account("alice@example.com");
+        let bob = account("bob@example.com");
+        let bob_jid = RosterJid::from(&bob);
+        if existing_item {
+            write(&roster, async |tx| {
+                tx.put_roster_item(
+                    &alice,
+                    &RosterItem {
+                        name: Some("Bob".into()),
+                        groups: vec!["Friends".into()],
+                        ..state::bare_item(bob_jid.clone())
+                    },
+                )
+                .await
+            })?;
+        }
+        put_pending(&roster, &bob, request("carol@example.com", b"full"))?;
+        put_pending(&roster, &alice, request("bob@example.com", b"reverse"))?;
+        let alice_before = snapshot(&roster, &alice);
+        let bob_before = snapshot(&roster, &bob);
+        block_on(async {
+            let mut tx = roster.storage.begin_write().await?;
+            assert!(matches!(
+                state::request_subscription(
+                    &mut tx,
+                    &alice,
+                    RosterJid::from(&alice),
+                    &bob,
+                    &bob_jid,
+                    stanza(b"rejected"),
+                    std::num::NonZeroUsize::MIN
+                )
+                .await,
+                Err(RosterError::PendingLimitExceeded)
+            ));
+            tx.commit().await?;
+            TestResult::Ok(())
+        })?;
+        assert_eq!(snapshot(&roster, &alice), alice_before);
+        assert_eq!(snapshot(&roster, &bob), bob_before);
+        assert_eq!(
+            pending(&roster, &bob),
+            [request("carol@example.com", b"full")]
+        );
+        assert_eq!(
+            pending(&roster, &alice),
+            [request("bob@example.com", b"reverse")]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn granted_and_preapproved_requests_bypass_a_full_pending_queue() -> TestResult {
+    for preapproved in [false, true] {
+        let (_directory, roster) = roster();
+        let alice = account("alice@example.com");
+        let bob = account("bob@example.com");
+        let alice_jid = RosterJid::from(&alice);
+        let bob_jid = RosterJid::from(&bob);
+        put_pending(&roster, &bob, request("carol@example.com", b"full"))?;
+        set_subscription(
+            &roster,
+            &bob,
+            &alice_jid,
+            RosterSubscription {
+                state: if preapproved {
+                    SubscriptionState::None
+                } else {
+                    SubscriptionState::From
+                },
+                approved: preapproved,
+                pending_out: false,
+            },
+        )?;
+        set_subscription(
+            &roster,
+            &alice,
+            &bob_jid,
+            RosterSubscription {
+                pending_out: true,
+                ..RosterSubscription::default()
+            },
+        )?;
+        let outcome = write(&roster, async |tx| {
+            state::request_subscription(
+                tx,
+                &alice,
+                alice_jid,
+                &bob,
+                &bob_jid,
+                stanza(b"approved"),
+                std::num::NonZeroUsize::MIN,
+            )
+            .await
+        })?;
+        assert!(if preapproved {
+            matches!(outcome, RequestOutcome::PreApproved { .. })
+        } else {
+            matches!(outcome, RequestOutcome::AutoApproved { approved: Some(_) })
+        });
+        assert_eq!(
+            pending(&roster, &bob),
+            [request("carol@example.com", b"full")]
+        );
+        let granted = item(&roster, &alice, &bob_jid).ok_or("missing grant")?;
+        assert_eq!(granted.subscription.state, SubscriptionState::To);
+        assert!(!granted.subscription.pending_out);
     }
     Ok(())
 }

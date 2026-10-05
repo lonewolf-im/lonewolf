@@ -231,9 +231,7 @@ impl<S: Storage> Api<S> {
         }
     }
 
-    /// Runs a deletion in a task of its own, so a request abandoned by the connection
-    /// deadline still delivers the notifications and ends the sessions that follow the
-    /// commit.
+    /// Deletion must outlive HTTP cancellation to deliver notifications and retire sessions.
     async fn run_to_completion<T, Fut>(
         self: &Arc<Self>,
         key: AccountKey,
@@ -773,6 +771,7 @@ mod tests {
             &mut self,
             _: &AccountKey,
             _: roster::PendingSubscription,
+            _: std::num::NonZeroUsize,
         ) -> Result<(), roster::RosterError> {
             unreachable!()
         }

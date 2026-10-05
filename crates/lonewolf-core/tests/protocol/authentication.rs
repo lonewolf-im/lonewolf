@@ -524,6 +524,117 @@ fn replacement_auth_discards_the_empty_initial_challenge() -> TestResult {
 }
 
 #[test]
+fn valid_proof_with_unauthorized_authzid_can_retry_after_invalid_authzid() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "other password")?;
+
+    for authzid in [
+        "bob@localhost",
+        "alice@other.example",
+        "alice@localhost/desk",
+        "localhost",
+        "not a jid",
+        "",
+    ] {
+        let mut client = suite.unauthenticated_client()?;
+        let exchange =
+            client.begin_scram("alice", "pencil", "SCRAM-SHA-256", None, Some(authzid))?;
+        client.finish_scram(exchange)?.assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-authzid/></failure>",
+        )?;
+
+        client.authenticate("alice", "pencil")?;
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn normalized_same_account_authzid_authenticates_with_channel_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+    let exchange = client.begin_scram(
+        "Alice",
+        "pencil",
+        "SCRAM-SHA-256-PLUS",
+        Some("tls-server-end-point"),
+        Some("ALICE@LOCALHOST."),
+    )?;
+    client
+        .finish_scram(exchange)?
+        .assert_name(SASL_NAMESPACE, "success");
+    let mut client = client.restart();
+    client.open()?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn unknown_account_and_wrong_proof_hide_authzid_outcomes() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+
+    for username in ["alice", "missing"] {
+        let mut client = suite.unauthenticated_client()?;
+        for authzid in [None, Some("bob@localhost"), Some("alice@localhost")] {
+            let exchange = client.begin_scram(username, "wrong", "SCRAM-SHA-256", None, authzid)?;
+            client.finish_scram(exchange)?.assert_xml(
+                "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+            )?;
+        }
+        client.expect_stream_error("policy-violation")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn password_rotation_rejects_old_proof_before_authzid_validation() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+
+    for authzid in [None, Some("bob@localhost")] {
+        suite.change_password("alice", "pencil")?;
+        let mut client = suite.unauthenticated_client()?;
+        let exchange = client.begin_scram("alice", "pencil", "SCRAM-SHA-256", None, authzid)?;
+        suite.change_password("alice", "replacement")?;
+        client.finish_scram(exchange)?.assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+        )?;
+
+        client.authenticate("alice", "replacement")?;
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn account_deletion_rejects_old_proof_before_authzid_validation() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+    let exchange = client.begin_scram(
+        "alice",
+        "pencil",
+        "SCRAM-SHA-256",
+        None,
+        Some("bob@localhost"),
+    )?;
+    suite.delete_account("alice")?;
+    client.finish_scram(exchange)?.assert_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
 fn protected_from_must_match_the_authenticated_account() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;

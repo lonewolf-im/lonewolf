@@ -470,6 +470,56 @@ fn presence_is_not_authorized_before_authentication() -> TestResult {
 }
 
 #[test]
+fn application_stanzas_during_empty_sasl_challenge_close_before_reauthentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+
+    for stanza in [
+        "<message to='bob@localhost'><body>hello</body></message>",
+        "<presence to='bob@localhost'/>",
+        "<iq to='bob@localhost' type='get' id='one'><query xmlns='urn:test'/></iq>",
+        "<message to='bad jid'/>",
+        "<presence to='bob@localhost' type='invalid'/>",
+        "<iq to='bob@localhost' type='get'><query xmlns='urn:test'/></iq>",
+    ] {
+        let mut client = suite.unauthenticated_client()?;
+        client.send_sasl_auth("SCRAM-SHA-256", "")?;
+        assert!(client.receive_sasl_challenge()?.is_empty());
+
+        client.send(&format!(
+            "{stanza}<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-256'/>"
+        ))?;
+        client.expect_stream_error("not-authorized")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn application_stanzas_during_scram_proof_challenge_close_before_reauthentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+
+    for stanza in [
+        "<message to='bob@localhost'><body>hello</body></message>",
+        "<presence to='bob@localhost'/>",
+        "<iq to='bob@localhost' type='get' id='one'><query xmlns='urn:test'/></iq>",
+        "<message to='bad jid'/>",
+        "<presence to='bob@localhost' type='invalid'/>",
+        "<iq to='bob@localhost' type='get'><query xmlns='urn:test'/></iq>",
+    ] {
+        let mut client = suite.unauthenticated_client()?;
+        client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
+        assert!(client.receive_sasl_challenge()?.starts_with("r=nonce"));
+
+        client.send(&format!(
+            "{stanza}<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-256'/>"
+        ))?;
+        client.expect_stream_error("not-authorized")?;
+    }
+    Ok(())
+}
+
+#[test]
 fn unknown_element_during_sasl_returns_malformed_request() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.unauthenticated_client()?;

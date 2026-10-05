@@ -940,3 +940,422 @@ fn blocked_handshake_crl_reload_obeys_shutdown() -> TestResult {
     suite.wait_for_log("outcome=\"system_shutdown\"")?;
     Ok(())
 }
+
+fn external_suite(
+    extensions: &str,
+) -> TestResult<(
+    C2sSuite,
+    super::support::tls::ClientCertificates,
+    std::path::PathBuf,
+)> {
+    let mut certificates = None;
+    let mut path = None;
+    let suite = C2sSuite::with_extensions_and_setup(extensions, |directory| {
+        certificates = Some(super::support::tls::ClientCertificates::configure(
+            directory,
+        )?);
+        path = Some(directory.join("client-crls.pem"));
+        Ok(())
+    })?;
+    Ok((
+        suite,
+        certificates.ok_or("missing certificate fixtures")?,
+        path.ok_or("missing CRL path")?,
+    ))
+}
+
+fn certificate_client(
+    suite: &C2sSuite,
+    key: std::sync::Arc<rustls::sign::CertifiedKey>,
+    from: Option<&str>,
+) -> TestResult<Client> {
+    let mut plain = super::support::PlainClient::tcp(suite)?;
+    plain.open()?;
+    let mut client = plain.start_tls_with_config(super::support::tls::with_client_certificate(
+        &suite.tls, key,
+    ))?;
+    let open =
+        from.map(|from| OPEN.replace("to='localhost'", &format!("from='{from}' to='localhost'")));
+    client.open_with(open.as_deref().unwrap_or(OPEN))?;
+    let features = client.features()?;
+    let mechanisms = features.child(SASL_NAMESPACE, "mechanisms")?;
+    assert_eq!(
+        mechanisms
+            .children
+            .first()
+            .map(|mechanism| mechanism.text.as_str()),
+        Some("EXTERNAL")
+    );
+    Ok(client)
+}
+
+#[test]
+fn external_explicit_empty_and_omitted_responses_bind_and_route() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    for authzid in [Some("Alice@LOCALHOST"), Some(""), None] {
+        let mut client =
+            certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
+        client.send_external_auth(authzid)?;
+        if authzid.is_none() {
+            client.expect_xml("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+            client.send_sasl_response("")?;
+        }
+        client.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.send("<message to='alice@localhost/desk' type='chat' id='external'><body>Ready</body></message>")?;
+        client.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' type='chat' id='external'><body>Ready</body></message>")?;
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn external_multiple_candidates_require_explicit_or_protected_identity() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let key = certificates.identity_key(
+        &["alice@localhost", "bob@localhost"],
+        time::OffsetDateTime::now_utc() + time::Duration::days(1),
+    )?;
+    for (from, authzid, account) in [
+        (None, Some("bob@localhost"), "bob"),
+        (Some("alice@localhost"), Some(""), "alice"),
+    ] {
+        let mut client = certificate_client(&suite, std::sync::Arc::clone(&key), from)?;
+        client.send_external_auth(authzid)?;
+        client.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(
+            client.bind(Some("desk"))?,
+            format!("{account}@localhost/desk")
+        );
+        client.close()?;
+    }
+    let mut client = certificate_client(&suite, key, None)?;
+    client.send_external_auth(Some(""))?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-authzid/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn external_rejects_unprovisioned_unauthorized_and_malformed_identities() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    for (response, condition) in [
+        ("=", "not-authorized"),
+        ("Ym9iQGxvY2FsaG9zdA==", "invalid-authzid"),
+        ("YWxpY2VAbG9jYWxob3N0L3Bob25l", "invalid-authzid"),
+        ("YWxpY2VAb3RoZXIubG9jYWxob3N0", "invalid-authzid"),
+        ("/w==", "malformed-request"),
+        ("!", "incorrect-encoding"),
+    ] {
+        let mut client =
+            certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
+        client.send(&format!(
+            "<auth xmlns='{SASL_NAMESPACE}' mechanism='EXTERNAL'>{response}</auth>"
+        ))?;
+        client.expect_xml(&format!(
+            "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
+        ))?;
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn external_protected_from_mismatch_uses_invalid_from() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = certificate_client(&suite, certificates.trusted, Some("bob@localhost"))?;
+    client.send_external_auth(Some("alice@localhost"))?;
+    client.receive()?.child(STREAM_ERRORS, "invalid-from")?;
+    client.expect_end()
+}
+
+#[test]
+fn external_absent_for_no_certificate_no_candidates_and_disabled_policy() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    for key in [
+        None,
+        Some(std::sync::Arc::clone(&certificates.without_xmpp_addr)),
+        Some(certificates.identity_key(
+            &["alice@other.localhost"],
+            time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        )?),
+    ] {
+        let mut plain = super::support::PlainClient::tcp(&suite)?;
+        assert!(
+            !plain
+                .open()?
+                .children
+                .iter()
+                .any(|feature| feature.namespace == SASL_NAMESPACE)
+        );
+        let config = key.map_or_else(
+            || std::sync::Arc::clone(&suite.tls),
+            |key| super::support::tls::with_client_certificate(&suite.tls, key),
+        );
+        let mut client = plain.start_tls_with_config(config)?;
+        let features = client.open()?;
+        assert!(
+            !features
+                .child(SASL_NAMESPACE, "mechanisms")?
+                .children
+                .iter()
+                .any(|mechanism| mechanism.text == "EXTERNAL")
+        );
+        client.send_external_auth(Some(""))?;
+        client.expect_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+        )?;
+        client.close()?;
+    }
+    let mut material = None;
+    let suite = C2sSuite::with_extensions_and_setup("", |directory| {
+        material = Some(super::support::tls::ClientCertificates::configure(
+            directory,
+        )?);
+        let mut config = std::fs::read_to_string(directory.join("lonewolf.toml"))?;
+        config = config.replace(
+            "[[c2s.listeners]]",
+            "[[c2s.listeners]]\nauth_mechanisms = ['SCRAM-SHA-256']",
+        );
+        std::fs::write(directory.join("lonewolf.toml"), config)?;
+        Ok(())
+    })?;
+    let mut plain = super::support::PlainClient::tcp(&suite)?;
+    plain.open()?;
+    let mut client = plain.start_tls_with_config(super::support::tls::with_client_certificate(
+        &suite.tls,
+        material.ok_or("missing certificates")?.trusted,
+    ))?;
+    let features = client.open()?;
+    assert!(
+        !features
+            .child(SASL_NAMESPACE, "mechanisms")?
+            .children
+            .iter()
+            .any(|mechanism| mechanism.text == "EXTERNAL")
+    );
+    client.send_external_auth(Some(""))?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn external_abort_replacement_and_attempt_budget_match_scram() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client =
+        certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
+    client.send_external_auth(None)?;
+    assert_eq!(client.receive_sasl_challenge()?, "");
+    client.abort_sasl()?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    client.send_external_auth(None)?;
+    assert_eq!(client.receive_sasl_challenge()?, "");
+    client.send_external_auth(Some(""))?;
+    client.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    let mut client = client.restart();
+    client.open()?;
+    client.bind(Some("desk"))?;
+    client.close()?;
+    let mut client = certificate_client(&suite, certificates.trusted, None)?;
+    for _ in 0..3 {
+        client.send_external_auth(None)?;
+        assert_eq!(client.receive_sasl_challenge()?, "");
+        client.abort_sasl()?;
+        client
+            .expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+    }
+    client.receive()?.child(STREAM_ERRORS, "policy-violation")?;
+    client.expect_end()
+}
+
+#[test]
+fn external_revalidates_revocation_before_success() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client =
+        certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
+    certificates.replace_crl(
+        true,
+        time::OffsetDateTime::now_utc() + time::Duration::days(1),
+    )?;
+    client.send_external_auth(Some(""))?;
+    client.receive()?.child(STREAM_ERRORS, "reset")?;
+    client.expect_end()
+}
+
+#[test]
+fn external_account_deletion_during_revalidation_prevents_success() -> TestResult {
+    use super::support::tls::{block_crl_reads, wait_for_crl_reader};
+    use std::io::Write as _;
+    let (suite, certificates, path) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = certificate_client(&suite, certificates.trusted, None)?;
+    let material = block_crl_reads(&path)?;
+    client.send_external_auth(Some(""))?;
+    let mut release = wait_for_crl_reader(&path)?;
+    suite.delete_account("alice")?;
+    std::fs::remove_file(&path)?;
+    std::fs::write(&path, &material)?;
+    release.write_all(&material)?;
+    drop(release);
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn external_expiry_during_binding_uses_reset() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    let key = certificates.identity_key(
+        &["alice@localhost"],
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(3),
+    )?;
+    let mut client = certificate_client(&suite, key, None)?;
+    client.send_external_auth(Some(""))?;
+    client.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    let mut client = client.restart();
+    client.open()?;
+    client.receive()?.child(STREAM_ERRORS, "reset")?;
+    client.expect_end()
+}
+
+#[test]
+fn external_expiry_after_binding_sends_directed_unavailable() -> TestResult {
+    let (suite, certificates, _) = external_suite("'roster'")?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let mut bob = Client::authenticated(&suite, "bob", "pencil")?;
+    bob.bind(Some("desk"))?;
+    let key = certificates.identity_key(
+        &["alice@localhost"],
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(3),
+    )?;
+    let mut alice = certificate_client(&suite, key, None)?;
+    alice.send_external_auth(Some(""))?;
+    alice.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    let mut alice = alice.restart();
+    alice.open()?;
+    alice.bind(Some("phone"))?;
+    alice.send("<presence to='bob@localhost/desk'/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/phone' to='bob@localhost/desk'/>",
+    )?;
+    alice.receive()?.child(STREAM_ERRORS, "reset")?;
+    alice.expect_end()?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='bob@localhost/desk' type='unavailable'/>")?;
+    bob.close()
+}
+
+#[test]
+fn external_account_deletion_before_and_after_binding_retires_only_its_session() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    for bound in [false, true] {
+        suite.create_account("alice", "pencil")?;
+        let mut client =
+            certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
+        client.send_external_auth(Some(""))?;
+        client.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+        let mut client = client.restart();
+        client.open()?;
+        if bound {
+            client.bind(Some("desk"))?;
+        }
+        suite.delete_account("alice")?;
+        if !bound {
+            client.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
+        }
+        client.receive()?.child(STREAM_ERRORS, "not-authorized")?;
+        client.expect_end()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn scram_with_a_certificate_does_not_activate_certificate_expiry_monitoring() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
+    let key = certificates.identity_key(&["alice@localhost"], expires)?;
+    let mut client = certificate_client(&suite, key, None)?;
+    client.authenticate("alice", "pencil")?;
+    let mut client = client.restart();
+    client.open()?;
+    client.bind(Some("desk"))?;
+    let remaining = (expires - time::OffsetDateTime::now_utc()).max(time::Duration::ZERO);
+    std::thread::sleep(
+        std::time::Duration::try_from(remaining)? + std::time::Duration::from_millis(50),
+    );
+    client.send("<message to='alice@localhost/desk' type='chat' id='scram'/>")?;
+    client.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' type='chat' id='scram'/>")?;
+    client.close()
+}
+
+#[test]
+fn external_shutdown_cancels_blocked_revalidation() -> TestResult {
+    use super::support::tls::{block_crl_reads, wait_for_crl_reader};
+    use std::io::Write as _;
+    let (mut suite, certificates, path) = external_suite("")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = certificate_client(&suite, certificates.trusted, None)?;
+    let material = block_crl_reads(&path)?;
+    client.send_external_auth(Some(""))?;
+    let mut release = wait_for_crl_reader(&path)?;
+    let stopped = std::thread::spawn(move || suite.stop().map_err(|error| error.to_string()));
+    client.receive()?.child(STREAM_ERRORS, "system-shutdown")?;
+    client.expect_end()?;
+    release.write_all(&material)?;
+    drop(release);
+    stopped.join().map_err(|_| "shutdown worker panicked")??;
+    Ok(())
+}
+
+#[test]
+fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
+    use super::support::tls::{block_crl_reads, wait_for_crl_reader};
+    use std::io::Write as _;
+    let mut material = None;
+    let mut path = None;
+    let suite = C2sSuite::with_extensions_limits_and_setup(
+        "",
+        "authentication_timeout_secs = 1",
+        |directory| {
+            material = Some(super::support::tls::ClientCertificates::configure(
+                directory,
+            )?);
+            path = Some(directory.join("client-crls.pem"));
+            Ok(())
+        },
+    )?;
+    let certificates = material.ok_or("missing certificate fixtures")?;
+    let path = path.ok_or("missing CRL path")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = certificate_client(&suite, certificates.trusted, None)?;
+    let material = block_crl_reads(&path)?;
+    client.send_external_auth(Some(""))?;
+    let mut release = wait_for_crl_reader(&path)?;
+    assert!(client.receive().is_err());
+    suite.wait_for_log("outcome=\"authentication_timeout\"")?;
+    std::fs::remove_file(&path)?;
+    std::fs::write(&path, &material)?;
+    release.write_all(&material)?;
+    drop(release);
+    let mut client = Client::authenticated(&suite, "alice", "pencil")?;
+    client.bind(Some("desk"))?;
+    client.send("<message to='alice@localhost/desk' type='chat' id='retry'/>")?;
+    client.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' type='chat' id='retry'/>")?;
+    client.close()
+}

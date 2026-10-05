@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use futures_util::poll;
+use futures_util::{FutureExt, poll};
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
@@ -201,6 +201,7 @@ impl Fixture {
             liveness: self.registration.liveness(),
             acknowledgement: None,
             work: &self.work,
+            certificate: None,
         }
     }
 
@@ -636,5 +637,221 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
         );
         drop(outbox);
         fixture.finish().await
+    })
+}
+
+fn certificate_monitor() -> super::super::certificate::ValidityMonitor {
+    let now = SystemTime::now();
+    super::super::certificate::ValidityMonitor {
+        validity: Cell::new(crate::hosts::client_identity::ClientValidity {
+            recheck_at: now,
+            valid_until: now + Duration::from_secs(1),
+        }),
+    }
+}
+
+#[test]
+fn certificate_revalidation_keeps_the_outbox_draining() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        let monitor = certificate_monitor();
+        let revalidating = Cell::new(false);
+        let flushed = monitor
+            .interrupt(
+                async {
+                    outbox.push(Output::Offline {
+                        backlog: fixture
+                            .backlog()
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?,
+                        handler: Arc::new(Offline::new(Default::default())),
+                    });
+                    outbox.flush().await
+                },
+                |_| {
+                    revalidating.set(true);
+                    std::future::pending()
+                },
+            )
+            .await;
+        assert_eq!(flushed, Ok(()));
+        assert!(revalidating.get());
+        assert_eq!(outbox.writer.written.len(), 1);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn certificate_expiry_interrupts_a_blocked_outbox_write() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let (entered, writing) = oneshot::channel();
+        let (_release, blocked) = oneshot::channel();
+        let mut outbox = fixture.outbox(
+            GlobalChunkAllocator,
+            ControlledWriter {
+                flush_entered: Some(entered),
+                flush_release: Some(blocked),
+                ..Default::default()
+            },
+        );
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+        let monitor = certificate_monitor();
+        let mut validity = monitor.validity.get();
+        validity.valid_until = SystemTime::now() + Duration::from_millis(30);
+        monitor.validity.set(validity);
+        assert_eq!(
+            monitor
+                .interrupt(outbox.flush(), |_| std::future::pending())
+                .await,
+            Err(CloseOutcome::CertificateInvalid)
+        );
+        writing.await?;
+        assert_eq!(fixture.count().await?, 1);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn account_retirement_wins_while_certificate_revalidation_is_pending() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let monitor = certificate_monitor();
+        let revalidating = Cell::new(false);
+        let session = monitor.interrupt(std::future::pending::<Result<(), CloseOutcome>>(), |_| {
+            revalidating.set(true);
+            std::future::pending()
+        });
+        let mut session = Box::pin(session);
+        assert!(futures_util::poll!(session.as_mut()).is_pending());
+        assert!(revalidating.get());
+        fixture.router.handle().retire_account(fixture.registration.account()).await?;
+        let retired = pin!(fixture.registration.wait_retired());
+        let retirement = select(retired, session.as_mut()).await;
+        assert!(matches!(retirement, Either::Left((Ok(retired), _)) if retired.cause == RetireCause::AccountDeleted));
+        drop(session);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn late_certificate_revalidation_cannot_retire_a_replacement_resource() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let monitor = certificate_monitor();
+        let executor = lonewolf_util::blocking::BlockingExecutor::new(NonZeroUsize::MIN);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (done, completed) = oneshot::channel();
+        let blocked = Mutex::new(Some(blocked));
+        let entered = Mutex::new(Some(entered));
+        let done = Mutex::new(Some(done));
+        let session = monitor.interrupt(std::future::pending::<Result<(), CloseOutcome>>(), |_| {
+            let blocked = blocked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let entered = entered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let done = done
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let executor = executor.clone();
+            async move {
+                executor
+                    .run(move || {
+                        if let Some(entered) = entered {
+                            let _ = entered.send(());
+                        }
+                        if let Some(blocked) = blocked {
+                            let _ = blocked.recv();
+                        }
+                        if let Some(done) = done {
+                            let _ = done.send(());
+                        }
+                        Err(CloseOutcome::CertificateInvalid)
+                    })
+                    .await
+            }
+        });
+        let mut session = Box::pin(session);
+        assert!(futures_util::poll!(session.as_mut()).is_pending());
+        started.recv_timeout(Duration::from_secs(1))?;
+        fixture
+            .router
+            .handle()
+            .retire_account(fixture.registration.account())
+            .await?;
+        let replacement = fixture
+            .router
+            .handle()
+            .register(
+                fixture.registration.account(),
+                Some("phone"),
+                NonZeroUsize::MIN,
+            )
+            .await?;
+        fixture.registration.wait_retired().await?;
+        drop(session);
+        release.send(())?;
+        completed.await?;
+        assert!(replacement.liveness().is_alive());
+        let mut replacement_outbox =
+            fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        replacement_outbox.liveness = replacement.liveness();
+        replacement_outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+        replacement_outbox
+            .flush()
+            .await
+            .map_err(|outcome| format!("{outcome:?}"))?;
+        assert_eq!(replacement_outbox.writer.written.len(), 1);
+        drop(replacement_outbox);
+        drop(replacement);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn shutdown_interrupts_pending_certificate_revalidation() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let socket = compio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let (_peer, _) = listener.accept().await?;
+        let (stop, shutdown) = oneshot::channel();
+        let context = close::CloseContext {
+            socket,
+            shutdown: async move { shutdown.await.unwrap_or_else(|_| std::time::Instant::now()) }
+                .boxed_local()
+                .shared(),
+            phase_deadline: None,
+        };
+        let monitor = certificate_monitor();
+        let revalidating = Cell::new(false);
+        let session = context.interrupt(monitor.interrupt(
+            std::future::pending::<Result<(), CloseOutcome>>(),
+            |_| {
+                revalidating.set(true);
+                std::future::pending()
+            },
+        ));
+        let mut session = Box::pin(session);
+        assert!(futures_util::poll!(session.as_mut()).is_pending());
+        assert!(revalidating.get());
+        stop.send(std::time::Instant::now())
+            .map_err(|_| "shutdown receiver closed")?;
+        assert_eq!(session.await, Err(CloseOutcome::SystemShutdown));
+        Ok(())
     })
 }

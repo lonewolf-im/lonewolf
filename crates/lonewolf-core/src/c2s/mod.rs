@@ -120,6 +120,16 @@ impl AuthService {
         self.storage.begin_read().await?.scram(key, hash).await
     }
 
+    async fn account_exists(&self, key: &AccountKey) -> Result<bool, AccountError> {
+        Ok(self
+            .storage
+            .begin_read()
+            .await?
+            .account(key)
+            .await?
+            .is_some())
+    }
+
     fn decoy(&self) -> &ScramDecoy {
         self.storage.scram_decoy()
     }

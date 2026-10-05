@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::NonZeroUsize;
+use std::pin::pin;
 
-use lonewolf_storage::RedbStorage;
-use lonewolf_storage::account::AccountKey;
+use futures_util::future::{Either, select};
+use lonewolf_storage::account::{AccountKey, AccountReads};
+use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::parser::StreamEvent;
 use lonewolf_xmpp::stanza::{
@@ -11,11 +13,13 @@ use lonewolf_xmpp::stanza::{
     StanzaType,
 };
 
+use super::certificate::CertificateMonitor;
 use super::establish::Established;
 use super::header::escape_attribute;
 use super::outcome::CloseOutcome;
 use super::session::{Session, Writer, namespace_error};
 use crate::hosts::Hosts;
+use crate::router::local::RetireCause;
 use crate::router::{Registration, RouterError, RouterHandle};
 
 const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
@@ -26,6 +30,7 @@ const MAX_BIND_FAILURES: usize = 6;
 
 pub(super) struct Bound<A: ChunkAllocator> {
     pub(super) session: Session<A>,
+    pub(super) monitor: Option<CertificateMonitor>,
     pub(super) registration: Registration<A>,
     pub(super) router: RouterHandle<A>,
     pub(super) storage: RedbStorage,
@@ -48,16 +53,24 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     allocator: A,
 ) -> Result<Bound<A>, CloseOutcome> {
     drop(established.client);
+    let monitor = established.monitor;
     let mut session = established.session.restart().await?;
     let context = session.close.clone();
+    let operation = bind_session(
+        &mut session,
+        hosts,
+        account,
+        router,
+        max_resources_per_account,
+        monitor.as_ref().map(|monitor| (&storage, monitor)),
+    );
     let result = context
-        .interrupt(bind_session(
-            &mut session,
-            hosts,
-            account,
-            router,
-            max_resources_per_account,
-        ))
+        .interrupt(async {
+            match &monitor {
+                Some(monitor) => monitor.interrupt(operation).await,
+                None => operation.await,
+            }
+        })
         .await;
     let (registration, resource_requested) = match result {
         Ok(bound) => bound,
@@ -65,6 +78,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     };
     Ok(Bound {
         session,
+        monitor,
         registration,
         router: router.clone(),
         storage,
@@ -79,6 +93,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
     account: &AccountKey,
     router: &RouterHandle<A>,
     max_resources_per_account: NonZeroUsize,
+    certificate: Option<(&RedbStorage, &CertificateMonitor)>,
 ) -> Result<(Registration<A>, bool), CloseOutcome> {
     let header = session.read_header(hosts).await?;
     if header.host != session.host()
@@ -107,6 +122,9 @@ async fn bind_session<A: ChunkAllocator + Clone>(
     }
     let mut invalid_attempts = 0;
     loop {
+        if let Some((_, monitor)) = certificate {
+            monitor.check()?;
+        }
         let parsed = match session.next_event().await? {
             Some(StreamEvent::Stanza(parsed)) => parsed,
             Some(StreamEvent::StreamEnd) | None => return Err(CloseOutcome::StreamEnd),
@@ -174,7 +192,34 @@ async fn bind_session<A: ChunkAllocator + Clone>(
             }
             Err(_) => return Err(CloseOutcome::InternalError),
         };
-        send_bind_result(&mut session.writer, id, &registration).await?;
+        if let Some((storage, monitor)) = certificate {
+            monitor.check()?;
+            if storage
+                .begin_read()
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?
+                .account(account)
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?
+                .is_none()
+            {
+                return Err(CloseOutcome::AccountDeleted);
+            }
+            match select(
+                pin!(registration.wait_retired()),
+                pin!(send_bind_result(&mut session.writer, id, &registration)),
+            )
+            .await
+            {
+                Either::Left((Ok(retired), _)) if retired.cause == RetireCause::AccountDeleted => {
+                    return Err(CloseOutcome::AccountDeleted);
+                }
+                Either::Left(_) => return Err(CloseOutcome::InternalError),
+                Either::Right((result, _)) => result?,
+            }
+        } else {
+            send_bind_result(&mut session.writer, id, &registration).await?;
+        }
         return Ok((registration, requested.is_some()));
     }
 }

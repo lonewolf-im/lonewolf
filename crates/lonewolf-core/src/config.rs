@@ -345,7 +345,13 @@ impl Default for TcpListenerConfig {
 pub struct AuthMechanisms(u8);
 
 impl AuthMechanisms {
-    pub const ALL: Self = Self(0b1111);
+    pub const ALL: Self = Self(0b1_1111);
+
+    const EXTERNAL: u8 = 0b1_0000;
+
+    pub fn allows_external(self) -> bool {
+        self.0 & Self::EXTERNAL != 0
+    }
 
     const fn bit(mechanism: Mechanism) -> u8 {
         match mechanism {
@@ -380,9 +386,14 @@ impl<'de> Deserialize<'de> for AuthMechanisms {
         let names = Vec::<String>::deserialize(deserializer)?;
         let mut enabled = Self(0);
         for name in names {
-            let mechanism = Mechanism::from_name(&name)
-                .ok_or_else(|| D::Error::custom(format!("unsupported auth mechanism {name:?}")))?;
-            let bit = Self::bit(mechanism);
+            let bit = if name == "EXTERNAL" {
+                Self::EXTERNAL
+            } else {
+                let mechanism = Mechanism::from_name(&name).ok_or_else(|| {
+                    D::Error::custom(format!("unsupported auth mechanism {name:?}"))
+                })?;
+                Self::bit(mechanism)
+            };
             if enabled.0 & bit != 0 {
                 return Err(D::Error::custom(format!(
                     "duplicate auth mechanism {name:?}"

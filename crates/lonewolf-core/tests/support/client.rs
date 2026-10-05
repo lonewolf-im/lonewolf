@@ -165,6 +165,22 @@ impl Client {
         ))
     }
 
+    pub fn send_external_auth(&mut self, authzid: Option<&str>) -> TestResult {
+        match authzid {
+            None => self.send(&format!(
+                "<auth xmlns='{SASL_NAMESPACE}' mechanism='EXTERNAL'/>"
+            )),
+            Some("") => self.send(&format!(
+                "<auth xmlns='{SASL_NAMESPACE}' mechanism='EXTERNAL'>=</auth>"
+            )),
+            Some(identity) => self.send_sasl_auth("EXTERNAL", identity),
+        }
+    }
+
+    pub fn abort_sasl(&mut self) -> TestResult {
+        self.send(&format!("<abort xmlns='{SASL_NAMESPACE}'/>"))
+    }
+
     pub fn receive_sasl_challenge(&mut self) -> TestResult<String> {
         let reply = self.receive()?;
         reply.assert_name(SASL_NAMESPACE, "challenge");

@@ -30,11 +30,12 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::bind::Bound;
+use super::close;
 use super::outcome::CloseOutcome;
-use super::session::{Reader, Session, Writer, namespace_error};
+use super::session::{Reader, Session, Writer, namespace_error, peer_stream_error};
 use crate::c2s::iq;
 use crate::delivery::{
-    RouterDelivery, StoredDelivery, after_turn, commit_and_deliver, commit_and_store,
+    RouterDelivery, StoredDelivery, WorkGroup, after_turn, commit_and_deliver, commit_and_store,
 };
 use crate::router::local::{PresenceChange, RetireCause, SessionLiveness};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
@@ -43,7 +44,7 @@ const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 
 /// The parser stays outside this state so stanza handling preserves a pending read.
-struct BoundSession<A: ChunkAllocator> {
+struct BoundSession<'w, A: ChunkAllocator> {
     registration: Registration<A>,
     router: RouterHandle<A>,
     storage: RedbStorage,
@@ -52,10 +53,10 @@ struct BoundSession<A: ChunkAllocator> {
     priority: Option<i8>,
     /// Directed recipients remain here until unavailable presence is sent.
     directed: Vec<Box<str>>,
-    outbox: Outbox<A>,
+    outbox: Outbox<'w, A>,
 }
 
-struct Outbox<A: ChunkAllocator, W = Writer> {
+struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     queue: VecDeque<Output<A>>,
     writer: W,
     allocator: A,
@@ -63,6 +64,7 @@ struct Outbox<A: ChunkAllocator, W = Writer> {
     storage: RedbStorage,
     liveness: SessionLiveness,
     acknowledgement: Option<ReplayAcknowledgement>,
+    work: &'w WorkGroup,
 }
 
 struct ReplayAcknowledgement {
@@ -160,9 +162,16 @@ impl OutboxWriter for Writer {
     }
 }
 
-pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> CloseOutcome {
+pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
+    bound: Bound<A>,
+    work: &mut WorkGroup,
+) -> CloseOutcome {
     let Bound {
-        session: Session { mut reader, writer },
+        session: Session {
+            mut reader,
+            writer,
+            close,
+        },
         registration,
         router,
         storage,
@@ -177,6 +186,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
         storage: storage.clone(),
         liveness: registration.liveness(),
         acknowledgement: None,
+        work,
     };
     let mut session = BoundSession {
         registration,
@@ -190,32 +200,49 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(bound: Bound<A>) -> 
     };
     let stopped = {
         let retired = pin!(session.registration.wait_retired());
-        match select(retired, pin!(session.run(&mut reader))).await {
+        match select(
+            retired,
+            pin!(close.interrupt(async { Ok(session.run(&mut reader).await) })),
+        )
+        .await
+        {
             Either::Left((retired, _)) => Either::Left(retired.map(|retired| retired.cause)),
-            Either::Right((outcome, _)) => Either::Right(outcome),
+            Either::Right((outcome, _)) => Either::Right(outcome.unwrap_or_else(|outcome| outcome)),
         }
     };
     let outcome = match stopped {
         Either::Right(outcome) => outcome,
-        Either::Left(Ok(RetireCause::AccountDeleted)) => {
-            session
-                .outbox
-                .writer
-                .fail(CloseOutcome::AccountDeleted)
-                .await
-        }
+        Either::Left(Ok(RetireCause::AccountDeleted)) => CloseOutcome::AccountDeleted,
         Either::Left(_) => CloseOutcome::InternalError,
     };
-    let ended = session.end().await;
-    drop(session);
-    ended.map_or(CloseOutcome::InternalError, |()| outcome)
+    let deadline = close.deadline();
+    let (mut writer, acknowledgement, outcome) = close
+        .cleanup(deadline, async {
+            let ended = session.end().await;
+            let outcome = ended.map_or(CloseOutcome::InternalError, |()| outcome);
+            let BoundSession {
+                registration,
+                outbox,
+                ..
+            } = session;
+            drop(registration);
+            let Outbox {
+                writer,
+                acknowledgement,
+                ..
+            } = outbox;
+            (writer, acknowledgement, outcome)
+        })
+        .await;
+    close.cleanup(deadline, work.drain()).await;
+    drop(acknowledgement);
+    close::finish(&mut reader, &mut writer, outcome.into(), &close, deadline).await
 }
 
-impl<A: ChunkAllocator + Clone> BoundSession<A> {
+impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
     async fn run(&mut self, reader: &mut Reader<A>) -> CloseOutcome {
         let mut prefer_outbound = true;
         'stream: loop {
-            // Cancelling an in-progress parser read can lose buffered XML.
             let mut next = pin!(reader.next_event());
             let event = loop {
                 let selected = {
@@ -248,27 +275,32 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                 }
             };
             match event {
-                Ok(Some(StreamEvent::StreamEnd) | None) => break self.outbox.writer.close().await,
+                Ok(Some(StreamEvent::StreamEnd) | None) => break CloseOutcome::StreamEnd,
                 Ok(Some(StreamEvent::Stanza(parsed))) => {
                     let handled = self.handle_stanza(parsed).await;
                     let flushed = self.outbox.flush().await;
                     if let Err(outcome) = handled.and(flushed) {
-                        break self.outbox.writer.fail(outcome).await;
+                        break outcome;
                     }
                 }
                 Ok(Some(StreamEvent::RejectedStanza(parsed))) => {
                     let handled = self.handle_rejected(parsed);
                     let flushed = self.outbox.flush().await;
                     if let Err(outcome) = handled.and(flushed) {
-                        break self.outbox.writer.fail(outcome).await;
+                        break outcome;
                     }
                 }
                 Ok(Some(event)) => {
+                    match peer_stream_error(&event) {
+                        Ok(Some(condition)) => break CloseOutcome::PeerError(condition),
+                        Err(outcome) => break outcome,
+                        Ok(None) => {}
+                    }
                     let outcome =
                         namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
-                    break self.outbox.writer.fail(outcome).await;
+                    break outcome;
                 }
-                Err(outcome) => break self.outbox.writer.fail(outcome).await,
+                Err(outcome) => break outcome,
             }
         }
     }
@@ -518,9 +550,12 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             response,
             delivery: self.delivery(),
         };
-        let mut pending = after_turn(ticket, Some(self.registration.mailbox()), move |queued| {
-            work.run(queued)
-        });
+        let mut pending = after_turn(
+            self.outbox.work.start(),
+            ticket,
+            Some(self.registration.mailbox()),
+            move |queued| work.run(queued),
+        );
         self.outbox
             .drain_until(&self.registration, pending.turned())
             .await?;
@@ -573,6 +608,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         let reply = match reply {
             Ok(IqReply { payload, effects }) => {
                 let mut committed = commit_and_deliver(
+                    self.outbox.work.start(),
                     Arc::clone(self.router.order()),
                     transaction,
                     effects,
@@ -788,6 +824,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
             }
             Ok(StoreOutcome::Stored(sequence)) => {
                 let pending = commit_and_store(
+                    self.outbox.work.start(),
                     self.router.clone(),
                     self.storage.clone(),
                     transaction,
@@ -915,8 +952,12 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
         };
         let outcome = match ticket {
             Some(ticket) => {
-                let mut pending =
-                    after_turn(ticket, None, move |_: Vec<RoutedStanza<A>>| work.run());
+                let mut pending = after_turn(
+                    self.outbox.work.start(),
+                    ticket,
+                    None,
+                    move |_: Vec<RoutedStanza<A>>| work.run(),
+                );
                 self.outbox
                     .drain_until(&self.registration, pending.turned())
                     .await?;
@@ -1012,6 +1053,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
                         .await;
                     match effects {
                         Ok(effects) => Ok(commit_and_deliver(
+                            self.outbox.work.start(),
                             Arc::clone(self.router.order()),
                             transaction,
                             effects,
@@ -1095,7 +1137,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<A> {
     }
 }
 
-impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
+impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
     fn push(&mut self, output: Output<A>) {
         self.queue.push_back(output);
     }
@@ -1252,7 +1294,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
         let liveness = self.liveness.clone();
         #[cfg(test)]
         let (report_entered, entered) = futures_channel::oneshot::channel();
-        let task = compio::runtime::spawn(async move {
+        let task = compio::runtime::spawn(self.work.start().run(async move {
             #[cfg(test)]
             let _ = report_entered.send(());
             let result =
@@ -1260,7 +1302,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<A, W> {
             if let Err(error) = result {
                 tracing::error!(error = ?error, "offline backlog acknowledgement failed");
             }
-        });
+        }));
         self.acknowledgement = Some(ReplayAcknowledgement {
             through: watermark,
             task,

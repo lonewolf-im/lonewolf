@@ -372,3 +372,23 @@ fn worker_count_cannot_exceed_allowed_cpus() {
         Some(io::ErrorKind::InvalidInput)
     );
 }
+
+#[test]
+fn absolute_shutdown_deadline_is_forwarded_without_a_new_grace_period() -> TestResult {
+    run_test(async {
+        let dispatcher = dispatcher()?;
+        let (started, running) = oneshot::channel();
+        let task = dispatcher
+            .handle()
+            .dispatch_at(0, move |context| async move {
+                let _ = started.send(());
+                context.shutdown_requested().await
+            })
+            .await?;
+        running.await?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        dispatcher.shutdown_at(deadline).await?;
+        assert_eq!(task.await?, deadline);
+        Ok(())
+    })
+}

@@ -174,9 +174,14 @@ fn shutdown_cancels_a_stanza_token_wait() -> TestResult {
     expect_no_response(&mut alice)?;
 
     let started = Instant::now();
-    suite.stop()?;
+    std::thread::scope(|scope| -> TestResult {
+        let stopped = scope.spawn(|| suite.stop().map_err(|error| error.to_string()));
+        alice.expect_stream_error("system-shutdown")?;
+        stopped.join().map_err(|_| "shutdown thread panicked")??;
+        Ok(())
+    })?;
     assert!(started.elapsed() < Duration::from_secs(2));
-    alice.drain()
+    Ok(())
 }
 
 #[test]

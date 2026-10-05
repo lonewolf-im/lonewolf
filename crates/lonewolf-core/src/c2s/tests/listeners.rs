@@ -109,11 +109,15 @@ async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, B
             run_listener(
                 listener,
                 context,
-                async move {
-                    let _ = stopped.await;
-                }
-                .boxed()
-                .shared(),
+                ListenerControl {
+                    stop: async move {
+                        let _ = stopped.await;
+                        Instant::now() + TIMEOUT
+                    }
+                    .boxed()
+                    .shared(),
+                    report_failure: async_channel::bounded(1).0,
+                },
                 7,
                 admission,
                 StreamServices {
@@ -276,7 +280,10 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                     run_listener(
                         listener,
                         context,
-                        pending().boxed().shared(),
+                        ListenerControl {
+                            stop: pending().boxed().shared(),
+                            report_failure: async_channel::bounded(1).0,
+                        },
                         0,
                         admission,
                         StreamServices {
@@ -371,7 +378,10 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                         run_listener(
                             listener,
                             context,
-                            pending().boxed().shared(),
+                            ListenerControl {
+                                stop: pending().boxed().shared(),
+                                report_failure: async_channel::bounded(1).0,
+                            },
                             listener_id,
                             admission,
                             StreamServices {
@@ -474,7 +484,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
             listeners.tasks.len(),
             config.listeners.len() * handle.worker_count()
         );
-        listeners.stop();
+        listeners.stop(Instant::now() + TIMEOUT);
         while let Some(result) = listeners.tasks.next().await {
             result??;
         }
@@ -524,9 +534,9 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
         .await
         .err()
         .ok_or("startup succeeded")?;
-        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(error.error.kind(), io::ErrorKind::AddrInUse);
         assert!(error.to_string().contains("listener 1 on worker 0"));
-        dispatcher.shutdown(TIMEOUT).await?;
+        dispatcher.shutdown_at(error.deadline).await?;
         router.shutdown().await?;
         probe.close().await?;
         let _rebound = std::net::TcpListener::bind(first)?;
@@ -556,6 +566,7 @@ fn listener_failures_reach_the_supervisor() -> TestResult {
         let mut listeners = Listeners {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
+            failures: async_channel::bounded(1).1,
             listener_count: 0,
             worker_count: dispatcher.handle().worker_count(),
         };
@@ -568,6 +579,42 @@ fn listener_failures_reach_the_supervisor() -> TestResult {
                 .await?,
         );
         assert_eq!(listeners.failure().await.kind(), io::ErrorKind::BrokenPipe);
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn fatal_listener_notification_precedes_connection_drain() -> TestResult {
+    run_test(async {
+        let dispatcher = dispatcher()?;
+        let (stop, stopped) = oneshot::channel();
+        let (report, failures) = async_channel::bounded(1);
+        let mut listeners = Listeners {
+            stop: Some(stop),
+            tasks: FuturesUnordered::new(),
+            failures,
+            listener_count: 0,
+            worker_count: dispatcher.handle().worker_count(),
+        };
+        let (drained, complete) = oneshot::channel();
+        listeners.tasks.push(
+            dispatcher
+                .handle()
+                .dispatch_at(0, move |_| async move {
+                    report
+                        .try_send(io::Error::new(io::ErrorKind::BrokenPipe, "listener failed"))
+                        .map_err(io::Error::other)?;
+                    let _ = stopped.await;
+                    let _ = drained.send(());
+                    Ok(())
+                })
+                .await?,
+        );
+        assert_eq!(listeners.failure().await.kind(), io::ErrorKind::BrokenPipe);
+        assert!(complete.now_or_never().is_none());
+        listeners.stop(Instant::now() + TIMEOUT);
+        listeners.join().await?;
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })

@@ -29,7 +29,6 @@ use sha2::{Digest, Sha256};
 use super::authenticate::{SASL_NAMESPACE, account_key, decoy_identity};
 use super::establish::{STARTTLS_FEATURES, STARTTLS_NAMESPACE, STARTTLS_PROCEED};
 use super::header::STREAM_FOOTER;
-use super::session::send_stream_error;
 use super::*;
 use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
 use crate::c2s::unauthenticated_limit::{
@@ -287,7 +286,8 @@ fn run_starttls_restart_case_with_timeout(
                 let mut after_tls = if restart_open == PSI_OPEN {
                     let features = read_through(&mut tls, b"</stream:features>")?;
                     if wait_for_timeout {
-                        std::thread::sleep(authentication_timeout + Duration::from_millis(50));
+                        let mut buffer = [0; 256];
+                        while tls.sock.read(&mut buffer)? != 0 {}
                         return Ok((before_tls, String::from_utf8(features)?));
                     }
                     tls.write_all(CLOSE.as_bytes())?;
@@ -295,6 +295,15 @@ fn run_starttls_restart_case_with_timeout(
                 } else {
                     String::new()
                 };
+                after_tls.push_str(&String::from_utf8(read_through(
+                    &mut tls,
+                    CLOSE.as_bytes(),
+                )?)?);
+                if restart_open != PSI_OPEN {
+                    tls.write_all(CLOSE.as_bytes())?;
+                }
+                tls.conn.send_close_notify();
+                tls.flush()?;
                 tls.read_to_string(&mut after_tls)?;
                 Ok((before_tls, after_tls))
             },
@@ -556,8 +565,9 @@ fn legacy_iteration_account_gets_decoy_challenge_and_cannot_log_in()
             let failure = String::from_utf8(read_through(tls, b"</failure>")?)?;
             assert!(failure.contains("<not-authorized/>"), "{failure}");
             tls.write_all(CLOSE.as_bytes())?;
-            let mut rest = String::new();
-            tls.read_to_string(&mut rest)?;
+            let rest = String::from_utf8(read_through(tls, CLOSE.as_bytes())?)?;
+            tls.conn.send_close_notify();
+            tls.flush()?;
             assert!(rest.ends_with(STREAM_FOOTER));
             Ok(())
         })?;
@@ -717,9 +727,32 @@ fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
 #[test]
 fn internal_failure_sends_a_stream_error_before_closing() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
-        let mut output = Vec::new();
-        assert_eq!(send_stream_error(&mut output, CloseOutcome::InternalError).await, CloseOutcome::InternalError);
-        assert_eq!(std::str::from_utf8(&output)?, "<stream:error><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
+        let output = super::header::stream_error_xml(CloseOutcome::InternalError).ok_or("missing error")?;
+        assert_eq!(output, "<stream:error><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
+        Ok(())
+    })
+}
+
+#[test]
+fn panicking_phase_closes_its_socket_before_waiting_for_tracked_work() -> Result<(), Box<dyn Error>>
+{
+    Runtime::new()?.block_on(async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let mut client = StdTcpStream::connect(listener.local_addr()?)?;
+        client.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let (transport, _) = listener.accept().await?;
+        let mut work = crate::delivery::WorkGroup::new();
+        let guard = work.start();
+        let mut completion = Box::pin(async {
+            let outcome = finish_phases(async { panic!("phase failure") }, &transport).await;
+            work.drain().await;
+            outcome
+        });
+        assert!(futures_util::poll!(completion.as_mut()).is_pending());
+        assert_eq!(client.read(&mut [0; 1])?, 0);
+        drop(guard);
+        assert_eq!(completion.await, CloseOutcome::InternalError);
+        listener.close().await?;
         Ok(())
     })
 }

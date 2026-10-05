@@ -10,6 +10,10 @@ use lonewolf_xmpp::stream::StreamErrorCondition;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloseOutcome {
     StreamEnd,
+    LocalClose,
+    PeerError(StreamErrorCondition),
+    ClosingTimeout,
+    SystemShutdown,
     Eof,
     UnsupportedInput,
     UnsupportedStanzaType,
@@ -54,9 +58,9 @@ impl CloseOutcome {
         }
     }
 
-    /// Outcomes without a condition close the transport silently.
     pub(super) fn stream_condition(self) -> Option<StreamErrorCondition> {
         match self {
+            Self::SystemShutdown => Some(StreamErrorCondition::SystemShutdown),
             Self::UnsupportedInput => Some(StreamErrorCondition::NotAuthorized),
             Self::SizeLimitExceeded => Some(StreamErrorCondition::PolicyViolation),
             Self::ParserError | Self::InvalidLanguage | Self::InvalidTo => {
@@ -81,7 +85,10 @@ impl CloseOutcome {
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::StreamEnd => "stream_end",
+            Self::StreamEnd | Self::LocalClose => "stream_end",
+            Self::PeerError(_) => "peer_stream_error",
+            Self::ClosingTimeout => "closing_timeout",
+            Self::SystemShutdown => "system_shutdown",
             Self::Eof => "eof",
             Self::UnsupportedInput => "unsupported_input",
             Self::UnsupportedStanzaType => "unsupported_stanza_type",

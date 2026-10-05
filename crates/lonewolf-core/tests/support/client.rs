@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,6 +204,47 @@ impl Client {
 }
 
 impl Client {
+    pub fn send_tls_close(&mut self) -> TestResult {
+        self.transport().conn.send_close_notify();
+        self.transport().flush()?;
+        Ok(())
+    }
+
+    pub fn expect_tls_close(&mut self) -> TestResult {
+        assert!(!self.has_buffered_input());
+        assert_eq!(self.transport().read(&mut [0; 1])?, 0);
+        Ok(())
+    }
+
+    pub fn expect_tcp_open(&mut self) -> TestResult {
+        let socket = &self.transport().sock;
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let result = socket.peek(&mut [0; 1]);
+        socket.set_read_timeout(Some(TIMEOUT))?;
+        assert!(
+            matches!(result, Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
+        );
+        Ok(())
+    }
+
+    pub fn expect_tcp_eof(&mut self) -> TestResult {
+        assert_eq!(self.transport().sock.read(&mut [0; 1])?, 0);
+        Ok(())
+    }
+
+    pub fn expect_no_tls_input(&mut self) -> TestResult {
+        assert!(!self.has_buffered_input());
+        self.transport()
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(100)))?;
+        let result = self.transport().read(&mut [0; 1]);
+        self.transport().sock.set_read_timeout(Some(TIMEOUT))?;
+        assert!(
+            matches!(result, Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
+        );
+        Ok(())
+    }
+
     /// Forces a TCP reset to expose failed writes.
     pub fn reset(self) -> TestResult {
         let stream = self.into_inner().into_inner();

@@ -784,3 +784,61 @@ fn fatal_errors_in_rejected_envelopes_withdraw_the_bound_resource() -> TestResul
     }
     observer.close()
 }
+
+#[test]
+fn peer_stream_errors_end_each_open_stream_phase_without_a_reciprocal_error() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for condition in ["policy-violation", "future-condition"] {
+        let error = format!(
+            "<stream:error><{condition} xmlns='urn:ietf:params:xml:ns:xmpp-streams'/><text xmlns='urn:ietf:params:xml:ns:xmpp-streams'>private peer error text</text></stream:error>"
+        );
+        let mut plain = suite.tcp_client()?;
+        plain.open()?;
+        plain.send(&error)?;
+        plain.expect_end()?;
+        for phase in 0..4 {
+            let mut client = if phase < 2 {
+                suite.unauthenticated_client()?
+            } else {
+                suite.authenticated_client("alice", "pencil")?
+            };
+            if phase == 1 {
+                client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
+                client.receive_sasl_challenge()?;
+            } else if phase == 3 {
+                client.bind(Some("desk"))?;
+            }
+            client.send(&error)?;
+            client.expect_end()?;
+        }
+    }
+    let logs = suite.wait_for_log("peer_stream_error")?;
+    assert!(!logs.contains("private peer error text"));
+    Ok(())
+}
+
+#[test]
+fn a_stream_error_in_another_namespace_is_not_a_peer_termination() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desk")?;
+    client.send("<error xmlns='urn:example:wrong'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></error>")?;
+    client.expect_stream_error("unsupported-stanza-type")
+}
+
+#[test]
+fn failed_parser_enters_tls_closure_without_interpreting_footer_text() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desk")?;
+    client.send("<message><!--forbidden--></message>")?;
+    client
+        .receive()?
+        .child("urn:ietf:params:xml:ns:xmpp-streams", "restricted-xml")?;
+    client.expect_footer()?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()
+}

@@ -8,7 +8,6 @@ publish.workspace = true
 
 [dependencies]
 async-lock.workspace = true
-futures-util.workspace = true
 getrandom.workspace = true
 lonewolf-auth.workspace = true
 lonewolf-util.workspace = true

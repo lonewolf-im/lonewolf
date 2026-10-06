@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex;
+use lonewolf_util::token_bucket::TokenBucket;
 
 use crate::config::limits::EventRate;
 
@@ -14,8 +16,8 @@ const MAX_TRACKED_SOURCES: usize = 16_384;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) struct AttemptLimiter {
-    per_second: usize,
-    burst: usize,
+    per_second: NonZeroUsize,
+    burst: NonZeroUsize,
     state: Mutex<State>,
 }
 
@@ -35,22 +37,16 @@ impl Admission {
 }
 
 struct State {
-    sources: HashMap<IpAddr, Bucket>,
+    sources: HashMap<IpAddr, TokenBucket>,
     next_cleanup: Instant,
     report: RejectionReport,
-}
-
-struct Bucket {
-    tokens: usize,
-    remainder: u128,
-    updated_at: Instant,
 }
 
 impl AttemptLimiter {
     pub(super) fn new(rate: &EventRate) -> Self {
         Self {
-            per_second: rate.per_second.get(),
-            burst: rate.burst.get(),
+            per_second: rate.per_second,
+            burst: rate.burst,
             state: Mutex::new(State {
                 sources: HashMap::new(),
                 next_cleanup: Instant::now(),
@@ -65,7 +61,7 @@ impl AttemptLimiter {
             if now >= state.next_cleanup {
                 state.sources.retain(|_, bucket| {
                     bucket.replenish(self.per_second, self.burst, now);
-                    bucket.tokens < self.burst
+                    bucket.available() < self.burst.get()
                 });
                 state.next_cleanup = now.checked_add(CLEANUP_INTERVAL).unwrap_or(now);
             }
@@ -73,16 +69,15 @@ impl AttemptLimiter {
                 return state.deny(now, "source_tracking_full");
             }
         }
-        let bucket = state.sources.entry(source).or_insert(Bucket {
-            tokens: self.burst,
-            remainder: 0,
-            updated_at: now,
-        });
+        let bucket = state
+            .sources
+            .entry(source)
+            .or_insert(TokenBucket::new(self.burst, now));
         bucket.replenish(self.per_second, self.burst, now);
-        if bucket.tokens == 0 {
+        if bucket.available() == 0 {
             return state.deny(now, "rate_limited");
         }
-        bucket.tokens -= 1;
+        bucket.consume(1);
         Admission::Allowed
     }
 }
@@ -93,24 +88,6 @@ impl State {
             outcome,
             report_count: self.report.record(now),
         }
-    }
-}
-
-impl Bucket {
-    fn replenish(&mut self, per_second: usize, burst: usize, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.updated_at);
-        let credit = elapsed
-            .as_nanos()
-            .saturating_mul(per_second as u128)
-            .saturating_add(self.remainder);
-        let replenished = (credit / 1_000_000_000).min(burst as u128) as usize;
-        self.tokens = self.tokens.saturating_add(replenished).min(burst);
-        self.remainder = if self.tokens == burst {
-            0
-        } else {
-            credit % 1_000_000_000
-        };
-        self.updated_at = self.updated_at.max(now);
     }
 }
 

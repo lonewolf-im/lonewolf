@@ -3,6 +3,29 @@
 use super::support::{C2sSuite, TestResult};
 
 #[test]
+fn ipv6_zone_destinations_return_recoverable_jid_malformed_errors() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut alice = suite.connect("alice", "pencil", "desktop")?;
+
+    for destination in ["bob@[fe80::1%eth0]", "bob@[fe80::1%25eth0]/phone"] {
+        for (kind, attributes, payload) in [
+            ("message", "type='chat'", "<body>Hello</body>"),
+            ("presence", "", ""),
+            ("iq", "type='get'", "<query xmlns='test:query'/>"),
+        ] {
+            alice.send(&format!(
+                "<{kind} {attributes} to='{destination}' id='scoped'>{payload}</{kind}>"
+            ))?;
+            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' id='scoped' to='alice@localhost/desktop'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></{kind}>"))?;
+            alice.send("<message to='alice@localhost/desktop' type='chat' id='sentinel'/>")?;
+            alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost/desktop' type='chat' id='sentinel'/>")?;
+        }
+    }
+    alice.close()
+}
+
+#[test]
 fn full_jid_normal_and_chat_reach_unavailable_and_negative_priority_resources() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;

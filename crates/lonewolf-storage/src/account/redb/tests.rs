@@ -219,6 +219,55 @@ fn accounts_after_rejects_invalid_or_noncanonical_stored_keys() -> TestResult {
 }
 
 #[test]
+fn scoped_ipv6_account_records_survive_reopening_without_aliasing() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("accounts.redb");
+    let pure = key("alice@[FE80::1]")?;
+    let legacy_keys = [
+        "alice@[fe80::1%eth0]",
+        "alice@[fe80::1%25eth0]",
+        "alice@[fe80::1%25eth%32]",
+    ];
+    let record = {
+        let storage = RedbStorage::open(&path)?;
+        let account = NewAccount {
+            key: pure.clone(),
+            credentials: credentials(10),
+        };
+        block_on(write(&storage, async |tx| tx.create_account(account).await))?;
+        let record = stored_record(&storage, pure.as_str())?.ok_or("missing record")?;
+        for legacy in legacy_keys {
+            insert_record(&storage, legacy, &record)?;
+        }
+        record
+    };
+    let storage = RedbStorage::open(&path)?;
+    block_on(async {
+        let reader = storage.begin_read().await?;
+        assert_eq!(
+            reader
+                .account(&pure)
+                .await?
+                .ok_or("missing pure account")?
+                .key,
+            pure
+        );
+        assert_storage_error(
+            reader.accounts_after(None, NonZeroUsize::MAX).await,
+            StorageErrorKind::CorruptData,
+        );
+        Ok::<(), Box<dyn Error>>(())
+    })?;
+    for stored in legacy_keys.into_iter().chain([pure.as_str()]) {
+        assert_eq!(
+            stored_record(&storage, stored)?.as_deref(),
+            Some(record.as_slice())
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn a_page_that_ends_before_a_malformed_record_succeeds() -> TestResult {
     let storage = storage()?;
     let alice = key("alice@example.com")?;

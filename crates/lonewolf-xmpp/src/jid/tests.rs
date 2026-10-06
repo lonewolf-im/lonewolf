@@ -101,14 +101,46 @@ fn normalizes_domains_and_ip_literals() -> TestResult {
         ("192.0.2.1", "192.0.2.1"),
         ("[2001:0DB8:0000:0000:0000:0000:0000:0001]", "[2001:db8::1]"),
         ("[::FFFF:C000:201]", "[::ffff:192.0.2.1]"),
-        ("[FE80::1%25Eth0]", "[fe80::1%25Eth0]"),
-        ("[fe80::1%25eth%32]", "[fe80::1%25eth%32]"),
+        ("[FE80::1]", "[fe80::1]"),
+        ("[2001:db8::1].", "[2001:db8::1]"),
+        ("ALICE@[2001:0DB8::1]/Phone", "alice@[2001:db8::1]/Phone"),
     ] {
         let jid = Jid::parse_in(input, &mut arena)?;
         let reparsed = Jid::parse_in(expected, &mut arena)?;
         let jid = jid.resolve(&arena)?;
         assert_eq!(jid.as_str(), expected, "{input}");
         assert_eq!(reparsed.resolve(&arena)?, jid);
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_ipv6_zones_in_domain_bare_and_full_jids() -> TestResult {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    for domain in [
+        "[fe80::1%eth0]",
+        "[fe80::1%2]",
+        "[FE80::1%25Eth0]",
+        "[fe80::1%25eth%32]",
+        "[2001:db8::1%25eth0]",
+        "[fe80::1%25eth0].",
+    ] {
+        assert_eq!(
+            Jid::from_parts_in(Some("alice"), domain, Some("Phone"), &mut arena).map(|_| ()),
+            Err(JidError::InvalidPart(JidPart::Domainpart)),
+            "{domain}"
+        );
+        for input in [
+            domain.to_owned(),
+            format!("alice@{domain}"),
+            format!("alice@{domain}/Phone"),
+        ] {
+            assert_eq!(
+                Jid::parse_in(&input, &mut arena).map(|_| ()),
+                Err(JidError::InvalidPart(JidPart::Domainpart)),
+                "{input}"
+            );
+        }
     }
     Ok(())
 }

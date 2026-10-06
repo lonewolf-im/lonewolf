@@ -313,6 +313,32 @@ fn malformed_sender_is_rejected_before_tls() -> TestResult {
 }
 
 #[test]
+fn ipv6_zone_stream_identities_are_terminal_before_and_after_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for domain in ["[fe80::1%eth0]", "[fe80::1%25eth0]"] {
+        for (attributes, condition) in [
+            (format!("to='{domain}'"), "bad-format"),
+            (
+                format!("to='localhost' from='alice@{domain}'"),
+                "invalid-from",
+            ),
+        ] {
+            let opening = format!(
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' {attributes} version='1.0'>"
+            );
+            let mut plain = suite.tcp_client()?;
+            plain.open_with(&opening)?;
+            plain.expect_stream_error(condition)?;
+
+            let mut encrypted = suite.tls_client()?;
+            encrypted.open_with(&opening)?;
+            encrypted.expect_stream_error(condition)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn duplicate_attribute_is_rejected_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.tcp_client()?;

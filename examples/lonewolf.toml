@@ -26,7 +26,7 @@
 
 # Add one section for each XMPP domain served by Lonewolf.
 # Defining hosts replaces the built-in host map.
-# Use lowercase ASCII names or Punycode for internationalized domains.
+# Use normalized domain names or bracketed IPv6 literals without zone identifiers.
 # [hosts.localhost]
 
 # Choose extensions included in the server build for this host.

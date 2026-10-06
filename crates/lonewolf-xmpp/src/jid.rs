@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Normalizes JIDs while keeping stored text in caller-owned arenas.
-
 use std::borrow::Cow;
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
@@ -26,13 +24,9 @@ pub const MAX_JID_LEN: usize = 3 * MAX_PART_LEN + 2;
 // NFC combines at most four scalars. Each input scalar uses at most four UTF-8 bytes.
 const MAX_INPUT_PART_LEN: usize = 16 * MAX_PART_LEN;
 
-/// Holds normalized [RFC 7622] text without retaining its arena.
-///
+/// Stores normalized text without retaining its arena.
 /// Resourceparts remain case-sensitive; localpart escaping is not automatic.
-/// Unicode preparation can allocate temporary heap buffers. [`JidRef`] compares
-/// and hashes normalized text.
-///
-/// [RFC 7622]: https://www.rfc-editor.org/rfc/rfc7622.html
+/// Unicode preparation can allocate temporary heap buffers.
 #[derive(Clone, Copy)]
 pub struct Jid {
     text: Handle<str>,
@@ -41,8 +35,6 @@ pub struct Jid {
     resourcepart_start: Option<NonZeroU16>,
 }
 
-/// Borrows normalized text from the arena. It does not retain the arena.
-///
 /// ```compile_fail
 /// use lonewolf_util::arena::{Arena, ArenaConfig};
 /// use lonewolf_xmpp::jid::Jid;
@@ -144,8 +136,6 @@ impl Jid {
         compose_parts(localpart, domainpart, resourcepart, &mut buffer)?.clone_in(arena)
     }
 
-    /// Borrows text from the arena that owns this handle.
-    ///
     /// # Errors
     ///
     /// Returns [`HandleError::WrongArena`] for a different arena.
@@ -501,44 +491,13 @@ fn ip_literal<'buffer>(
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .ok_or(JidError::InvalidPart(JidPart::Domainpart))?;
-    let (address, zone) = inner
-        .split_once("%25")
-        .map_or((inner, None), |(address, zone)| (address, Some(zone)));
-    let address: Ipv6Addr = address
+    let address: Ipv6Addr = inner
         .parse()
         .map_err(|_| JidError::InvalidPart(JidPart::Domainpart))?;
-    if zone.is_some_and(|zone| !valid_zone(zone)) {
-        return Err(JidError::InvalidPart(JidPart::Domainpart));
-    }
     let mut writer = SliceWriter { buffer, length: 0 };
-    write!(writer, "[{address}").map_err(|_| JidError::PartTooLong(JidPart::Domainpart))?;
-    if let Some(zone) = zone {
-        write!(writer, "%25{zone}").map_err(|_| JidError::PartTooLong(JidPart::Domainpart))?;
-    }
-    writer
-        .write_char(']')
-        .map_err(|_| JidError::PartTooLong(JidPart::Domainpart))?;
+    write!(writer, "[{address}]").map_err(|_| JidError::PartTooLong(JidPart::Domainpart))?;
     let length = writer.length;
     std::str::from_utf8(&buffer[..length]).map_err(|_| JidError::InvalidPart(JidPart::Domainpart))
-}
-
-fn valid_zone(zone: &str) -> bool {
-    if zone.is_empty() {
-        return false;
-    }
-    let mut bytes = zone.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'%' {
-            if !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
-                || !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
-            {
-                return false;
-            }
-        } else if !byte.is_ascii_alphanumeric() && !b"-._~".contains(&byte) {
-            return false;
-        }
-    }
-    true
 }
 
 // UTS #46 alone permits symbols and omits CONTEXTO checks required by RFC 5892.

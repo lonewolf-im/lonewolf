@@ -852,15 +852,9 @@ fn revoking_a_grant_sends_unavailable_before_unsubscribed_and_updates_both_roste
         "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='to'/>",
     )?;
     alice.send(&format!("<iq type='result' id='{approved}'/>"))?;
-    let first = alice.receive()?;
-    let second = alice.receive()?;
-    let (phone, tablet) = if first.attribute("from") == Some("bob@localhost/phone") {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    phone.assert_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'><show>away</show></presence>")?;
-    tablet.assert_xml(
+    expect_presence_pair(
+        &mut alice,
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'><show>away</show></presence>",
         "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='alice@localhost'/>",
     )?;
     let granted = expect_roster_push(
@@ -871,15 +865,11 @@ fn revoking_a_grant_sends_unavailable_before_unsubscribed_and_updates_both_roste
     bob.send(&format!("<iq type='result' id='{granted}'/>"))?;
 
     bob.send("<presence type='unsubscribed' id='revoked' to='alice@localhost'/>")?;
-    let first = alice.receive()?;
-    let second = alice.receive()?;
-    let (phone, tablet) = if first.attribute("from") == Some("bob@localhost/phone") {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    phone.assert_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost' type='unavailable'/>")?;
-    tablet.assert_xml("<presence xmlns='jabber:client' from='bob@localhost/tablet' to='alice@localhost' type='unavailable'/>")?;
+    expect_presence_pair(
+        &mut alice,
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost' type='unavailable'/>",
+        "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='alice@localhost' type='unavailable'/>",
+    )?;
     alice.expect_xml("<presence xmlns='jabber:client' type='unsubscribed' id='revoked' from='bob@localhost' to='alice@localhost'/>")?;
     let alice_revoked = expect_roster_push(
         &mut alice,
@@ -979,17 +969,9 @@ fn unsubscribe_notifies_the_contact_before_roster_push_and_unavailable_presence(
         "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='to'/>",
     )?;
     alice.send(&format!("<iq type='result' id='{approved}'/>"))?;
-    let first = alice.receive()?;
-    let second = alice.receive()?;
-    let (phone, tablet) = if first.attribute("from") == Some("bob@localhost/phone") {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    phone.assert_xml(
+    expect_presence_pair(
+        &mut alice,
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
-    )?;
-    tablet.assert_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='alice@localhost'/>",
     )?;
     let granted = expect_roster_push(
@@ -1026,15 +1008,11 @@ fn unsubscribe_notifies_the_contact_before_roster_push_and_unavailable_presence(
         "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='none'/>",
     )?;
     alice.send(&format!("<iq type='result' id='{alice_push}'/>"))?;
-    let first = alice.receive()?;
-    let second = alice.receive()?;
-    let (phone, tablet) = if first.attribute("from") == Some("bob@localhost/phone") {
-        (&first, &second)
-    } else {
-        (&second, &first)
-    };
-    phone.assert_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost' type='unavailable'/>")?;
-    tablet.assert_xml("<presence xmlns='jabber:client' from='bob@localhost/tablet' to='alice@localhost' type='unavailable'/>")?;
+    expect_presence_pair(
+        &mut alice,
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost' type='unavailable'/>",
+        "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='alice@localhost' type='unavailable'/>",
+    )?;
     alice.send("<presence type='unsubscribe' id='repeat' to='bob@localhost'/>")?;
     request_roster(
         &mut alice,

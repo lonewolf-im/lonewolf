@@ -1,27 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{ErrorKind, Read};
 use std::time::{Duration, Instant};
 
 use crate::support::{C2sSuite, Client, TestResult};
 
 const STRICT: &str = "incoming_stanzas_per_connection = { per_second = 1, burst = 1 }";
-const TIMEOUT: Duration = Duration::from_secs(10);
-
-fn expect_no_response(client: &mut Client) -> TestResult {
-    assert!(!client.has_buffered_input());
-    client
-        .transport()
-        .sock
-        .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let result = client.transport().read(&mut [0; 1]);
-    client.transport().sock.set_read_timeout(Some(TIMEOUT))?;
-    assert!(
-        matches!(result, Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
-    );
-    Ok(())
-}
-
 fn expect_self_message(client: &mut Client, resource: &str, id: &str) -> TestResult {
     client.expect_xml(&format!("<message xmlns='jabber:client' from='alice@localhost/{resource}' to='alice@localhost/{resource}' type='chat' id='{id}'/>"))
 }
@@ -39,7 +22,7 @@ fn message_presence_and_iq_share_one_burst_then_resume_in_order() -> TestResult 
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
     )?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>")?;
-    expect_no_response(&mut alice)?;
+    alice.expect_no_tls_input()?;
     expect_self_message(&mut alice, "desk", "last")?;
     alice.close()
 }
@@ -52,7 +35,7 @@ fn iq_results_and_errors_consume_allowance_before_the_next_request() -> TestResu
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
     alice.send("<iq type='result' id='ignored-result'/><iq type='error' id='ignored-error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq><message to='alice@localhost/desk' type='chat' id='after'/>")?;
-    expect_no_response(&mut alice)?;
+    alice.expect_no_tls_input()?;
     expect_self_message(&mut alice, "desk", "after")?;
     alice.close()
 }
@@ -66,10 +49,10 @@ fn rejected_binding_and_bound_stanzas_preserve_the_connection_allowance() -> Tes
     alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
-    expect_no_response(&mut alice)?;
+    alice.expect_no_tls_input()?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/desk</jid></bind></iq>")?;
     alice.send(" \t\r\n<message to='alice@localhost/desk' type='chat' id='bound'/>")?;
-    expect_no_response(&mut alice)?;
+    alice.expect_no_tls_input()?;
     expect_self_message(&mut alice, "desk", "bound")?;
     alice.close()
 }
@@ -82,7 +65,7 @@ fn connections_have_independent_stanza_allowances() -> TestResult {
     let mut phone = suite.authenticated_client("alice", "pencil")?;
     assert_eq!(desk.bind(Some("desk"))?, "alice@localhost/desk");
     desk.send("<message to='alice@localhost/desk' type='chat' id='desk'/>")?;
-    expect_no_response(&mut desk)?;
+    desk.expect_no_tls_input()?;
 
     let started = Instant::now();
     assert_eq!(phone.bind(Some("phone"))?, "alice@localhost/phone");
@@ -103,7 +86,7 @@ fn listeners_apply_default_and_selected_stanza_profiles() -> TestResult {
     suite.create_account("alice", "pencil")?;
     let mut strict = suite.connect("alice", "pencil", "desk")?;
     strict.send("<message to='alice@localhost/desk' type='chat' id='strict'/>")?;
-    expect_no_response(&mut strict)?;
+    strict.expect_no_tls_input()?;
 
     let mut selected = Client::connect_at(
         &suite,
@@ -117,7 +100,7 @@ fn listeners_apply_default_and_selected_stanza_profiles() -> TestResult {
     expect_self_message(&mut selected, "phone", "first")?;
     expect_self_message(&mut selected, "phone", "second")?;
     assert!(started.elapsed() < Duration::from_millis(500));
-    expect_no_response(&mut selected)?;
+    selected.expect_no_tls_input()?;
     expect_self_message(&mut strict, "desk", "strict")?;
     expect_self_message(&mut selected, "phone", "last")?;
     strict.close()?;
@@ -138,7 +121,7 @@ fn a_shaped_reader_keeps_delivering_more_than_a_mailbox_of_live_stanzas() -> Tes
     let mut bob = Client::connect_at(&suite, suite.listener_address(1)?, "bob", "secret", "phone")?;
 
     alice.send("<message to='alice@localhost/desk' type='chat' id='pending'/>")?;
-    expect_no_response(&mut alice)?;
+    alice.expect_no_tls_input()?;
     for index in 0..80 {
         bob.send(&format!(
             "<message to='alice@localhost/desk' type='chat' id='live-{index}'/>"
@@ -156,7 +139,7 @@ fn deleting_an_account_cancels_its_token_wait_and_releases_its_resource() -> Tes
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
     alice.send("<message to='alice@localhost/desk' type='chat' id='pending'/>")?;
-    expect_no_response(&mut alice)?;
+    alice.expect_no_tls_input()?;
 
     suite.delete_account("alice")?;
     alice.expect_stream_error("not-authorized")?;
@@ -171,7 +154,7 @@ fn shutdown_cancels_a_stanza_token_wait() -> TestResult {
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
     alice.send("<message to='alice@localhost/desk' type='chat' id='pending'/>")?;
-    expect_no_response(&mut alice)?;
+    alice.expect_no_tls_input()?;
 
     let started = Instant::now();
     std::thread::scope(|scope| -> TestResult {

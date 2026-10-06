@@ -689,6 +689,7 @@ fn unsubscribe_keeps_the_reverse_grant_and_does_not_advance_versions_twice() -> 
         state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
     })?;
     assert!(withdrawal.notify_contact);
+    assert!(withdrawal.send_unavailable);
     let subscriber = withdrawal.subscriber.ok_or("missing subscriber change")?;
     assert_eq!(subscriber.version.get(), 2);
     assert_eq!(subscriber.value.subscription.state, SubscriptionState::From);
@@ -702,6 +703,7 @@ fn unsubscribe_keeps_the_reverse_grant_and_does_not_advance_versions_twice() -> 
         state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
     })?;
     assert!(!repeated.notify_contact);
+    assert!(!repeated.send_unavailable);
     assert!(repeated.subscriber.is_none());
     assert!(repeated.contact.is_none());
     assert_eq!(version(&roster, &alice), 2);
@@ -725,6 +727,7 @@ fn unsubscribe_from_self_writes_one_roster_version() -> TestResult {
         state::unsubscribe(tx, &alice, &alice_jid, Some((&alice, &alice_jid))).await
     })?;
     assert!(withdrawal.notify_contact);
+    assert!(withdrawal.send_unavailable);
     assert!(withdrawal.contact.is_none());
     let subscriber = withdrawal.subscriber.ok_or("missing roster change")?;
     assert_eq!(subscriber.version.get(), 2);
@@ -749,6 +752,7 @@ fn unsubscribe_clears_a_stale_subscription_after_the_contact_is_deleted() -> Tes
         state::unsubscribe(tx, &alice, &bob_jid, None).await
     })?;
     assert!(!withdrawal.notify_contact);
+    assert!(!withdrawal.send_unavailable);
     assert!(withdrawal.contact.is_none());
     let subscriber = withdrawal.subscriber.ok_or("missing roster change")?;
     assert_eq!(subscriber.value.subscription.state, SubscriptionState::None);
@@ -1048,5 +1052,170 @@ fn granted_and_preapproved_requests_bypass_a_full_pending_queue() -> TestResult 
         assert_eq!(granted.subscription.state, SubscriptionState::To);
         assert!(!granted.subscription.pending_out);
     }
+    Ok(())
+}
+
+#[test]
+fn pending_withdrawal_notifies_without_revoking_the_reverse_grant() -> TestResult {
+    for (subscriber_state, contact_state, pending_out) in [
+        (None, None, false),
+        (Some(SubscriptionState::None), None, true),
+        (
+            Some(SubscriptionState::None),
+            Some(SubscriptionState::None),
+            true,
+        ),
+        (
+            Some(SubscriptionState::From),
+            Some(SubscriptionState::To),
+            true,
+        ),
+        (
+            Some(SubscriptionState::To),
+            Some(SubscriptionState::From),
+            false,
+        ),
+        (
+            Some(SubscriptionState::Both),
+            Some(SubscriptionState::Both),
+            false,
+        ),
+    ] {
+        let (_directory, roster) = roster();
+        let alice = account("alice@example.com");
+        let bob = account("bob@example.com");
+        let alice_jid = RosterJid::from(&alice);
+        let bob_jid = RosterJid::from(&bob);
+        if let Some(state) = subscriber_state {
+            set_subscription(
+                &roster,
+                &alice,
+                &bob_jid,
+                RosterSubscription {
+                    state,
+                    pending_out,
+                    approved: true,
+                },
+            )?;
+        }
+        if let Some(state) = contact_state {
+            set_subscription(
+                &roster,
+                &bob,
+                &alice_jid,
+                RosterSubscription {
+                    state,
+                    pending_out: true,
+                    approved: true,
+                },
+            )?;
+        }
+        put_pending(&roster, &bob, request("alice@example.com", b"request"))?;
+        put_pending(&roster, &alice, request("bob@example.com", b"reverse"))?;
+        let before_alice = version(&roster, &alice);
+        let before_bob = version(&roster, &bob);
+        let withdrawal = write(&roster, async |tx| {
+            state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
+        })?;
+        let prior_grant = contact_state.is_some_and(state::grants);
+        assert!(withdrawal.notify_contact);
+        assert_eq!(withdrawal.send_unavailable, prior_grant);
+        let subscriber_changed = pending_out
+            || subscriber_state.is_some_and(|state| {
+                matches!(state, SubscriptionState::To | SubscriptionState::Both)
+            });
+        assert_eq!(withdrawal.subscriber.is_some(), subscriber_changed);
+        assert_eq!(withdrawal.contact.is_some(), prior_grant);
+        assert_eq!(
+            version(&roster, &alice),
+            before_alice + u64::from(subscriber_changed)
+        );
+        assert_eq!(version(&roster, &bob), before_bob + u64::from(prior_grant));
+        assert!(pending(&roster, &bob).is_empty());
+        assert_eq!(
+            pending(&roster, &alice),
+            vec![request("bob@example.com", b"reverse")]
+        );
+        for (owner, contact, before, expected) in [
+            (
+                &alice,
+                &bob_jid,
+                subscriber_state,
+                match subscriber_state {
+                    Some(SubscriptionState::To) => Some(SubscriptionState::None),
+                    Some(SubscriptionState::Both) => Some(SubscriptionState::From),
+                    state => state,
+                },
+            ),
+            (
+                &bob,
+                &alice_jid,
+                contact_state,
+                match contact_state {
+                    Some(SubscriptionState::From) => Some(SubscriptionState::None),
+                    Some(SubscriptionState::Both) => Some(SubscriptionState::To),
+                    state => state,
+                },
+            ),
+        ] {
+            let result = item(&roster, owner, contact);
+            assert_eq!(
+                result.as_ref().map(|item| item.subscription.state),
+                expected
+            );
+            assert_eq!(
+                result.as_ref().map(|item| item.subscription.approved),
+                before.map(|_| true)
+            );
+        }
+        if let Some(contact) = item(&roster, &bob, &alice_jid) {
+            assert!(contact.subscription.pending_out);
+        }
+        let versions = (version(&roster, &alice), version(&roster, &bob));
+        let repeated = write(&roster, async |tx| {
+            state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
+        })?;
+        assert!(!repeated.notify_contact);
+        assert!(!repeated.send_unavailable);
+        assert!(repeated.subscriber.is_none());
+        assert!(repeated.contact.is_none());
+        assert_eq!((version(&roster, &alice), version(&roster, &bob)), versions);
+    }
+    Ok(())
+}
+
+#[test]
+fn pending_self_withdrawal_preserves_preapproval_and_writes_once() -> TestResult {
+    let (_directory, roster) = roster();
+    let alice = account("alice@example.com");
+    let alice_jid = RosterJid::from(&alice);
+    set_subscription(
+        &roster,
+        &alice,
+        &alice_jid,
+        RosterSubscription {
+            state: SubscriptionState::None,
+            pending_out: true,
+            approved: true,
+        },
+    )?;
+    put_pending(&roster, &alice, request("alice@example.com", b"request"))?;
+    let withdrawal = write(&roster, async |tx| {
+        state::unsubscribe(tx, &alice, &alice_jid, Some((&alice, &alice_jid))).await
+    })?;
+    assert!(withdrawal.notify_contact);
+    assert!(!withdrawal.send_unavailable);
+    assert!(withdrawal.contact.is_none());
+    let mutation = withdrawal.subscriber.ok_or("missing subscriber change")?;
+    assert_eq!(mutation.version.get(), 2);
+    assert_eq!(
+        mutation.value.subscription,
+        RosterSubscription {
+            state: SubscriptionState::None,
+            pending_out: false,
+            approved: true,
+        }
+    );
+    assert!(pending(&roster, &alice).is_empty());
     Ok(())
 }

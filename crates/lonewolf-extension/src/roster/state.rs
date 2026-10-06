@@ -38,8 +38,8 @@ pub(super) struct Cancellation {
 }
 
 pub(super) struct Withdrawal {
-    /// Whether the contact granted the subscriber and so learns of the withdrawal.
     pub notify_contact: bool,
+    pub send_unavailable: bool,
     pub subscriber: ItemMutation,
     pub contact: ItemMutation,
 }
@@ -294,17 +294,18 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
     recipient: Option<(&AccountKey, &RosterJid)>,
 ) -> Result<Withdrawal, RosterError> {
     let same_item = recipient.is_some_and(|(account, _)| account == subscriber);
-    let notify_contact = match recipient {
+    let (pending_removed, prior_grant) = match recipient {
         Some((account, subscriber_jid)) => {
-            transaction
+            let removed = transaction
                 .remove_pending_request(account, subscriber_jid)
                 .await?;
-            transaction
+            let granted = transaction
                 .roster_item(account, subscriber_jid)
                 .await?
-                .is_some_and(|item| grants(item.subscription.state))
+                .is_some_and(|item| grants(item.subscription.state));
+            (removed, granted)
         }
-        None => false,
+        None => (false, false),
     };
     let subscriber_mutation =
         update_existing_subscription(transaction, subscriber, contact, |mut subscription| {
@@ -315,7 +316,7 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
                 state => state,
             };
             subscription.pending_out = false;
-            if same_item && notify_contact {
+            if same_item && prior_grant {
                 subscription.state = match subscription.state {
                     SubscriptionState::From => SubscriptionState::None,
                     SubscriptionState::Both => SubscriptionState::To,
@@ -326,7 +327,7 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
         })
         .await?;
     let contact_mutation = match recipient {
-        Some((account, subscriber_jid)) if notify_contact && !same_item => {
+        Some((account, subscriber_jid)) if prior_grant && !same_item => {
             update_existing_subscription(
                 transaction,
                 account,
@@ -346,7 +347,8 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
         _ => None,
     };
     Ok(Withdrawal {
-        notify_contact,
+        notify_contact: pending_removed || prior_grant,
+        send_unavailable: prior_grant,
         subscriber: subscriber_mutation,
         contact: contact_mutation,
     })

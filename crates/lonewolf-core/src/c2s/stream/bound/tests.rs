@@ -1326,3 +1326,492 @@ fn iq_visibility_reads_prior_roster_revocation_while_delivery_waits_on_order() -
         Ok(())
     })
 }
+
+async fn subscription_effects(
+    transaction: &mut RedbWrite,
+    stanza: &RoutedStanza<GlobalChunkAllocator>,
+    kind: PresenceRequestType,
+    delivery: &RouterDelivery<GlobalChunkAllocator>,
+) -> TestResult<lonewolf_extension::Effects<GlobalChunkAllocator>> {
+    let (sender, target) = presence_addresses(stanza).map_err(|error| format!("{error:?}"))?;
+    <lonewolf_extension::roster::Roster as lonewolf_extension::presence::PresenceHandler<
+        GlobalChunkAllocator,
+        RedbStorage,
+    >>::receive(
+        &Default::default(),
+        PresenceRequest {
+            kind,
+            sender,
+            target,
+            stanza,
+        },
+        transaction,
+        delivery,
+    )
+    .await
+    .map_err(|error| format!("{error:?}").into())
+}
+
+async fn subscription_fixture() -> TestResult<(Fixture, Registration<GlobalChunkAllocator>)> {
+    let fixture = Fixture::new(&[]).await?;
+    let router = fixture.router.handle();
+    let mut arena = Arena::try_new(Default::default())?;
+    let target =
+        AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+    let mut tx = fixture.storage.begin_write().await?;
+    tx.create_account(NewAccount {
+        key: target.clone(),
+        credentials: credentials(),
+    })
+    .await?;
+    subscription_effects(
+        &mut tx,
+        &routed_presence(
+            "bob@localhost",
+            Some("alice@localhost"),
+            PresenceType::Subscribe,
+        )?,
+        PresenceRequestType::Subscribe,
+        &RouterDelivery::new(&router, &GlobalChunkAllocator, Some(&fixture.registration)),
+    )
+    .await?;
+    tx.commit().await?;
+    let target = router
+        .register(&target, Some("desk"), NonZeroUsize::MIN)
+        .await?;
+    target
+        .handle()
+        .tag(lonewolf_extension::delivery::SessionTag::Interested)
+        .await?;
+    fixture
+        .registration
+        .handle()
+        .tag(lonewolf_extension::delivery::SessionTag::Interested)
+        .await?;
+    Ok((fixture, target))
+}
+
+#[test]
+fn subscription_admission_linearizes_at_lookup_before_or_after_replacement() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for replace_before in [false, true] {
+            let (fixture, original) = subscription_fixture().await?;
+            let router = fixture.router.handle();
+            let original_token = router
+                .resource_match(original.account(), "desk")
+                .await?
+                .ok_or("missing original")?
+                .token;
+            let mut tx = fixture.storage.begin_write().await?;
+            let mut arena = Arena::try_new(Default::default())?;
+            let target = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+            let replacement = if replace_before {
+                router.retire_account(original.account()).await?;
+                Some(
+                    router
+                        .register(original.account(), Some("desk"), NonZeroUsize::MIN)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            // The shard lookup admits this bare operation while the writer excludes account changes.
+            let witness = subscription_target(&router, &tx, target.resolve(&arena)?)
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or("missing target admission")?;
+            let replacement = match replacement {
+                Some(replacement) => replacement,
+                None => {
+                    router.retire_account(original.account()).await?;
+                    router
+                        .register(original.account(), Some("desk"), NonZeroUsize::MIN)
+                        .await?
+                }
+            };
+            let replacement_token = router
+                .resource_match(original.account(), "desk")
+                .await?
+                .ok_or("missing replacement")?
+                .token;
+            assert_ne!(original_token, replacement_token);
+            assert_eq!(
+                witness.token,
+                if replace_before {
+                    replacement_token
+                } else {
+                    original_token
+                }
+            );
+            replacement
+                .handle()
+                .tag(lonewolf_extension::delivery::SessionTag::Interested)
+                .await?;
+            let delivery =
+                RouterDelivery::new(&router, &GlobalChunkAllocator, Some(&fixture.registration));
+            let effects = subscription_effects(
+                &mut tx,
+                &routed_presence(
+                    "bob@localhost",
+                    Some("alice@localhost"),
+                    PresenceType::Unsubscribe,
+                )?,
+                PresenceRequestType::Unsubscribe,
+                &delivery,
+            )
+            .await?;
+            let committed = commit_and_deliver(
+                fixture.work.start(),
+                Arc::clone(router.order()),
+                tx,
+                effects,
+                delivery,
+                None,
+            );
+            assert!(matches!(committed.finished().await, Some(Ok(_))));
+            assert_eq!(
+                witness.token,
+                if replace_before {
+                    replacement_token
+                } else {
+                    original_token
+                }
+            );
+            let notification = replacement
+                .recv()
+                .await
+                .ok_or("missing bare notification")?;
+            assert_eq!(
+                notification.resolve()?.stanza_type(),
+                StanzaType::Presence(PresenceType::Unsubscribe)
+            );
+            assert_eq!(
+                notification
+                    .resolve()?
+                    .to()?
+                    .ok_or("missing target")?
+                    .as_str(),
+                "alice@localhost"
+            );
+            assert!(replacement.take_queued().is_empty());
+            let snapshot = fixture.storage.begin_read().await?;
+            use lonewolf_storage::roster::RosterReads;
+            assert!(
+                snapshot
+                    .pending_requests(original.account())
+                    .await?
+                    .is_empty()
+            );
+            let roster = snapshot.roster(fixture.registration.account()).await?;
+            assert_eq!(roster.version.get(), 2);
+            assert!(!roster.items[0].subscription.pending_out);
+            drop(snapshot);
+            drop((original, replacement));
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn subscription_admission_ignores_deleted_accounts_and_does_not_survive_rollback() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_storage::roster::RosterReads;
+        for deleted in [false, true] {
+            let (fixture, target) = subscription_fixture().await?;
+            let router = fixture.router.handle();
+            let mut arena = Arena::try_new(Default::default())?;
+            let jid = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+            let mut tx = fixture.storage.begin_write().await?;
+            if deleted {
+                tx.delete_account(target.account()).await?;
+                tx.commit().await?;
+                tx = fixture.storage.begin_write().await?;
+                assert!(
+                    router
+                        .resource_match(target.account(), "desk")
+                        .await?
+                        .is_some()
+                );
+                assert!(
+                    subscription_target(&router, &tx, jid.resolve(&arena)?)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?
+                        .is_none()
+                );
+            } else {
+                assert!(
+                    subscription_target(&router, &tx, jid.resolve(&arena)?)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?
+                        .is_some()
+                );
+                let delivery = RouterDelivery::new(
+                    &router,
+                    &GlobalChunkAllocator,
+                    Some(&fixture.registration),
+                );
+                subscription_effects(
+                    &mut tx,
+                    &routed_presence(
+                        "bob@localhost",
+                        Some("alice@localhost"),
+                        PresenceType::Unsubscribe,
+                    )?,
+                    PresenceRequestType::Unsubscribe,
+                    &delivery,
+                )
+                .await?;
+                drop(tx);
+                router.retire_account(target.account()).await?;
+                tx = fixture.storage.begin_write().await?;
+                assert!(
+                    subscription_target(&router, &tx, jid.resolve(&arena)?)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?
+                        .is_none()
+                );
+            }
+            drop(tx);
+            let snapshot = fixture.storage.begin_read().await?;
+            assert_eq!(snapshot.pending_requests(target.account()).await?.len(), 1);
+            let roster = snapshot.roster(fixture.registration.account()).await?;
+            assert_eq!(roster.version.get(), 1);
+            assert!(roster.items[0].subscription.pending_out);
+            assert!(fixture.registration.take_queued().is_empty());
+            assert!(target.take_queued().is_empty());
+            drop(snapshot);
+            drop(target);
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recreation() -> TestResult
+{
+    Runtime::new()?.block_on(async {
+        use lonewolf_storage::roster::RosterReads;
+        let (mut fixture, target) = subscription_fixture().await?;
+        let router = fixture.router.handle();
+        let mut arena = Arena::try_new(Default::default())?;
+        let jid = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+        let mut tx = fixture.storage.begin_write().await?;
+        assert!(
+            subscription_target(&router, &tx, jid.resolve(&arena)?)
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .is_some()
+        );
+        let mut deletion = Box::pin(fixture.storage.begin_write());
+        assert!(poll!(deletion.as_mut()).is_pending());
+        let ((), blocker) = router
+            .order()
+            .fix(vec![target.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        let delivery =
+            RouterDelivery::new(&router, &GlobalChunkAllocator, Some(&fixture.registration));
+        let effects = subscription_effects(
+            &mut tx,
+            &routed_presence(
+                "bob@localhost",
+                Some("alice@localhost"),
+                PresenceType::Unsubscribe,
+            )?,
+            PresenceRequestType::Unsubscribe,
+            &delivery,
+        )
+        .await?;
+        let committed = commit_and_deliver(
+            fixture.work.start(),
+            Arc::clone(router.order()),
+            tx,
+            effects,
+            delivery,
+            None,
+        );
+        let mut deletion = deletion.await?;
+        let snapshot = fixture.storage.begin_read().await?;
+        assert!(
+            snapshot
+                .pending_requests(target.account())
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot
+                .roster(fixture.registration.account())
+                .await?
+                .version
+                .get(),
+            2
+        );
+        drop(snapshot);
+        router
+            .retire_account(fixture.registration.account())
+            .await?;
+        drop(committed);
+        assert!(target.take_queued().is_empty());
+        deletion.delete_account(target.account()).await?;
+        let cleanup = <lonewolf_extension::roster::Roster as lonewolf_extension::Extension<
+            GlobalChunkAllocator,
+            RedbStorage,
+        >>::forget_account(
+            &Default::default(),
+            &mut deletion,
+            target.account(),
+            &RouterDelivery::new(&router, &GlobalChunkAllocator, None),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        let ((), mut retirement) = router
+            .order()
+            .fix(cleanup.accounts, deletion.commit())
+            .await?;
+        assert!(retirement.turn().now_or_never().is_none());
+        drop(blocker);
+        retirement.turn().await;
+        let notification = target
+            .recv()
+            .await
+            .ok_or("lost withdrawal after requester retirement")?;
+        assert_eq!(
+            notification.resolve()?.stanza_type(),
+            StanzaType::Presence(PresenceType::Unsubscribe)
+        );
+        (cleanup.deliver)(&RouterDelivery::new(&router, &GlobalChunkAllocator, None)).await?;
+        router.retire_account(target.account()).await?;
+        drop(retirement);
+        fixture.work.drain().await;
+        let mut recreation = fixture.storage.begin_write().await?;
+        recreation
+            .create_account(NewAccount {
+                key: target.account().clone(),
+                credentials: credentials(),
+            })
+            .await?;
+        recreation.commit().await?;
+        let replacement = router
+            .register(target.account(), Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let snapshot = fixture.storage.begin_read().await?;
+        assert!(snapshot.roster(target.account()).await?.items.is_empty());
+        assert_eq!(snapshot.roster(target.account()).await?.version.get(), 0);
+        assert!(
+            snapshot
+                .pending_requests(target.account())
+                .await?
+                .is_empty()
+        );
+        assert!(replacement.take_queued().is_empty());
+        drop(snapshot);
+        drop((target, replacement));
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn admitted_pending_withdrawal_keeps_healthy_effects_under_mailbox_pressure_and_cancellation()
+-> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_storage::roster::RosterReads;
+        let (mut fixture, target) = subscription_fixture().await?;
+        let router = fixture.router.handle();
+        let sibling = router
+            .register(
+                target.account(),
+                Some("phone"),
+                NonZeroUsize::new(2).ok_or("zero limit")?,
+            )
+            .await?;
+        sibling
+            .handle()
+            .tag(lonewolf_extension::delivery::SessionTag::Interested)
+            .await?;
+        for _ in 0..64 {
+            router
+                .route_full(routed_presence(
+                    "bob@localhost",
+                    Some("alice@localhost/desk"),
+                    PresenceType::Available,
+                )?)
+                .await?;
+        }
+        let mut tx = fixture.storage.begin_write().await?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let jid = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+        assert!(
+            subscription_target(&router, &tx, jid.resolve(&arena)?)
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .is_some()
+        );
+        let ((), blocker) = router
+            .order()
+            .fix(vec![target.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        let delivery =
+            RouterDelivery::new(&router, &GlobalChunkAllocator, Some(&fixture.registration));
+        let effects = subscription_effects(
+            &mut tx,
+            &routed_presence(
+                "bob@localhost",
+                Some("alice@localhost"),
+                PresenceType::Unsubscribe,
+            )?,
+            PresenceRequestType::Unsubscribe,
+            &delivery,
+        )
+        .await?;
+        let committed = commit_and_deliver(
+            fixture.work.start(),
+            Arc::clone(router.order()),
+            tx,
+            effects,
+            delivery,
+            None,
+        );
+        drop(fixture.storage.begin_write().await?);
+        router
+            .retire_account(fixture.registration.account())
+            .await?;
+        drop(committed);
+        assert!(sibling.take_queued().is_empty());
+        drop(blocker);
+        fixture.work.drain().await;
+        assert!(!target.liveness().is_alive());
+        assert_eq!(
+            sibling
+                .recv()
+                .await
+                .ok_or("lost sibling notification")?
+                .resolve()?
+                .stanza_type(),
+            StanzaType::Presence(PresenceType::Unsubscribe)
+        );
+        assert!(sibling.take_queued().is_empty());
+        let snapshot = fixture.storage.begin_read().await?;
+        assert!(
+            snapshot
+                .pending_requests(target.account())
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot
+                .roster(fixture.registration.account())
+                .await?
+                .version
+                .get(),
+            2
+        );
+        drop(snapshot);
+        drop((target, sibling));
+        fixture.finish().await
+    })
+}

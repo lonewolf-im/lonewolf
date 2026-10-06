@@ -43,6 +43,8 @@ struct TestRoster {
 struct RecordingDelivery {
     tags: RefCell<Vec<SessionTag>>,
     pushes: RefCell<Vec<String>>,
+    controls: RefCell<Vec<String>>,
+    unavailable: Cell<usize>,
     failing_deliveries: Cell<usize>,
 }
 
@@ -69,13 +71,23 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
     fn to_tagged<'a>(
         &'a self,
         _: SessionTag,
-        _: RoutedStanza<GlobalChunkAllocator>,
+        stanza: RoutedStanza<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
         let remaining = self.failing_deliveries.get();
         if remaining > 0 {
             self.failing_deliveries.set(remaining - 1);
             return Box::pin(async { Err(DeliveryError) });
         }
+        let mut xml = String::new();
+        stanza
+            .resolve()
+            .and_then(|stanza| {
+                stanza
+                    .write_xml(&mut xml)
+                    .map_err(|_| panic!("cannot write control"))
+            })
+            .unwrap_or_else(|error| panic!("{error}"));
+        self.controls.borrow_mut().push(xml);
         Box::pin(async { Ok(()) })
     }
 
@@ -98,6 +110,7 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         _: &'a AccountKey,
         _: &'a AccountKey,
     ) -> DeliveryFuture<'a> {
+        self.unavailable.set(self.unavailable.get() + 1);
         Box::pin(async { Ok(()) })
     }
 }
@@ -873,4 +886,120 @@ fn probe_visibility_preserves_pending_requests_preapproval_and_versions()
         assert_eq!(transaction.pending_requests(&owner).await?, pending);
         Ok(())
     })
+}
+
+#[test]
+fn withdrawal_effects_notify_pending_contacts_only_after_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    for granted in [false, true] {
+        let (_directory, roster) = roster();
+        let alice = account("alice@example.com");
+        let bob = account("bob@example.com");
+        create_account(&roster, &alice);
+        create_account(&roster, &bob);
+        let delivery = RecordingDelivery::default();
+        receive_subscribe(&roster, "alice@example.com", "bob@example.com", &delivery)
+            .map_err(|error| format!("{error:?}"))?;
+        if granted {
+            block_on(async {
+                let mut tx = roster.storage.begin_write().await?;
+                tx.put_roster_item(
+                    &bob,
+                    &subscribed(RosterJid::from(&alice), SubscriptionState::From),
+                )
+                .await?;
+                tx.put_roster_item(
+                    &alice,
+                    &subscribed(RosterJid::from(&bob), SubscriptionState::To),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
+        delivery.pushes.borrow_mut().clear();
+        let mut arena = Arena::try_new(Default::default())?;
+        let from = Jid::parse_in("alice@example.com", &mut arena)?;
+        let to = Jid::parse_in("bob@example.com", &mut arena)?;
+        let stanza = Stanza::builder_in(
+            StanzaType::Presence(PresenceType::Unsubscribe),
+            StanzaNamespace::Client,
+            &mut arena,
+        )
+        .from(Some(from))?
+        .to(Some(to))?
+        .build()?;
+        let stanza = RoutedStanza::from_parts(stanza, arena);
+        for rollback in [true, false] {
+            let effects = block_on(async {
+                let mut tx = roster.storage.begin_write().await?;
+                let view = stanza.resolve()?;
+                let effects = TestPresenceHandler::receive(
+                    &Roster::default(),
+                    PresenceRequest {
+                        kind: PresenceRequestType::Unsubscribe,
+                        sender: view.from()?.ok_or("missing sender")?,
+                        target: view.to()?.ok_or("missing target")?,
+                        stanza: &stanza,
+                    },
+                    &mut tx,
+                    &delivery,
+                )
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+                assert!(delivery.controls.borrow().is_empty());
+                assert!(delivery.pushes.borrow().is_empty());
+                assert_eq!(delivery.unavailable.get(), 0);
+                if rollback {
+                    drop(tx);
+                    Ok::<_, Box<dyn std::error::Error>>(None)
+                } else {
+                    tx.commit().await?;
+                    Ok(Some(effects))
+                }
+            })?;
+            if let Some(effects) = effects {
+                assert!(pending(&roster, &bob).is_empty());
+                block_on((effects.deliver)(&delivery))?;
+                assert_eq!(delivery.controls.borrow().len(), 1);
+                assert_eq!(delivery.unavailable.get(), usize::from(granted));
+                assert_eq!(delivery.pushes.borrow().len(), if granted { 2 } else { 1 });
+            } else {
+                assert_eq!(pending(&roster, &bob).len(), 1);
+                assert!(
+                    item(&roster, &alice, &RosterJid::from(&bob)).is_some_and(|item| {
+                        item.subscription.pending_out
+                            || item.subscription.state == SubscriptionState::To
+                    })
+                );
+            }
+        }
+        delivery.controls.borrow_mut().clear();
+        delivery.pushes.borrow_mut().clear();
+        delivery.unavailable.set(0);
+        block_on(async {
+            let mut tx = roster.storage.begin_write().await?;
+            let view = stanza.resolve()?;
+            let effects = TestPresenceHandler::receive(
+                &Roster::default(),
+                PresenceRequest {
+                    kind: PresenceRequestType::Unsubscribe,
+                    sender: view.from()?.ok_or("missing sender")?,
+                    target: view.to()?.ok_or("missing target")?,
+                    stanza: &stanza,
+                },
+                &mut tx,
+                &delivery,
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+            tx.commit().await?;
+            (effects.deliver)(&delivery).await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+        assert!(delivery.controls.borrow().is_empty());
+        assert!(delivery.pushes.borrow().is_empty());
+        assert_eq!(delivery.unavailable.get(), 0);
+    }
+    Ok(())
 }

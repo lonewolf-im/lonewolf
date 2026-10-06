@@ -19,8 +19,10 @@ use crate::storage::{ReadTransaction, Storage, WriteTransaction};
 use crate::{StorageError, StorageErrorKind, account, offline, roster};
 
 mod error;
+mod jid;
 
 pub(crate) use error::{commit_error, storage_error};
+pub(crate) use jid::with_canonical_jid;
 
 /// A redb database as one transaction domain.
 ///

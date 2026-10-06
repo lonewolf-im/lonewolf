@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stores each account and all its verifiers in one versioned redb record.
-
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::Bound;
@@ -14,12 +12,11 @@ use lonewolf_auth::scram::{
     ScramVerifier, ScramVerifierData,
 };
 use lonewolf_auth::server::ScramDecoy;
-use lonewolf_util::arena::{Arena, ArenaConfig};
-use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
+use lonewolf_xmpp::jid::MAX_PART_LEN;
 use zeroize::Zeroizing;
 
 use crate::account::{Account, AccountError, AccountKey, AccountReads, AccountWrites, NewAccount};
-use crate::redb::{RedbRead, RedbWrite, storage_error};
+use crate::redb::{RedbRead, RedbWrite, storage_error, with_canonical_jid};
 use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
@@ -173,7 +170,6 @@ fn read_scram<T: ReadableTable<&'static str, &'static [u8]>>(
     })
 }
 
-/// Whether `key` has an account record; roster writes use it to refuse deleted owners.
 pub(crate) fn account_exists(
     transaction: &WriteTransaction,
     key: &str,
@@ -208,27 +204,10 @@ fn list_accounts<T: ReadableTable<&'static str, &'static [u8]>>(
 }
 
 fn decode_account_key(text: &str) -> Result<AccountKey, StorageError> {
-    if text.len() > MAX_PART_LEN * 2 + 1 {
-        return Err(StorageError::new(StorageErrorKind::CorruptData));
-    }
-    let mut arena = Arena::try_new(ArenaConfig::default())
-        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
-    let jid = Jid::parse_in(text, &mut arena).map_err(|error| {
-        let kind = match error {
-            JidError::AllocationFailed(_) | JidError::AccessFailed(_) => StorageErrorKind::Other,
-            _ => StorageErrorKind::CorruptData,
-        };
-        StorageError::with_source(kind, error)
-    })?;
-    let jid = jid
-        .resolve(&arena)
-        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
-    // Normalizing stored keys would break cursor ordering and hide corruption.
-    if jid.as_str() != text {
-        return Err(StorageError::new(StorageErrorKind::CorruptData));
-    }
-    AccountKey::try_from(jid)
-        .map_err(|error| StorageError::with_source(StorageErrorKind::CorruptData, error))
+    with_canonical_jid(text, MAX_PART_LEN * 2 + 1, |jid| {
+        AccountKey::try_from(jid)
+            .map_err(|error| StorageError::with_source(StorageErrorKind::CorruptData, error))
+    })
 }
 
 fn create(transaction: &WriteTransaction, account: NewAccount) -> Result<(), AccountError> {

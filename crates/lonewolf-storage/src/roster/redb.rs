@@ -4,8 +4,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 
 use ::redb::{ReadableTable, TableDefinition, WriteTransaction};
-use lonewolf_util::arena::{Arena, ArenaConfig};
-use lonewolf_xmpp::jid::{Jid, JidError, MAX_JID_LEN};
+use lonewolf_xmpp::jid::MAX_JID_LEN;
 
 use super::{
     PendingSubscription, RosterError, RosterItem, RosterJid, RosterMutation, RosterReads,
@@ -13,7 +12,7 @@ use super::{
 };
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
-use crate::redb::{RedbRead, RedbWrite, storage_error};
+use crate::redb::{RedbRead, RedbWrite, storage_error, with_canonical_jid};
 use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const ITEMS: TableDefinition<&str, &[u8]> =
@@ -337,25 +336,7 @@ fn decode_key(owner: &str, key: &str) -> Result<RosterJid, StorageError> {
 }
 
 fn decode_jid(text: &str) -> Result<RosterJid, StorageError> {
-    if text.len() > MAX_JID_LEN {
-        return Err(StorageError::new(StorageErrorKind::CorruptData));
-    }
-    let mut arena = Arena::try_new(ArenaConfig::default())
-        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
-    let jid = Jid::parse_in(text, &mut arena).map_err(|error| {
-        let kind = match error {
-            JidError::AllocationFailed(_) | JidError::AccessFailed(_) => StorageErrorKind::Other,
-            _ => StorageErrorKind::CorruptData,
-        };
-        StorageError::with_source(kind, error)
-    })?;
-    let jid = jid
-        .resolve(&arena)
-        .map_err(|error| StorageError::with_source(StorageErrorKind::Other, error))?;
-    if jid.as_str() != text {
-        return Err(StorageError::new(StorageErrorKind::CorruptData));
-    }
-    Ok(RosterJid::from(jid))
+    with_canonical_jid(text, MAX_JID_LEN, |jid| Ok(RosterJid::from(jid)))
 }
 
 fn encode_item(item: &RosterItem) -> Result<Vec<u8>, RosterError> {

@@ -1695,3 +1695,61 @@ fn iq_requests_do_not_fall_back_on_backpressure_or_reuse_replaced_grants() -> Te
         Ok(())
     })
 }
+
+#[test]
+fn resource_match_observes_connected_tokens_without_availability_or_capacity_filters() -> TestResult
+{
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        assert_eq!(handle.resource_match(&alice, "desk").await?, None);
+        assert_eq!(
+            handle
+                .resource_match(&account("alice@example.com")?, "desk")
+                .await,
+            Err(RouterError::RemoteUnsupported)
+        );
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let observed = handle
+            .resource_match(&alice, "desk")
+            .await?
+            .ok_or("missing resource")?;
+        assert_eq!(handle.resource_match(&alice, "Desk").await?, None);
+        for _ in 0..64 {
+            handle
+                .route_full(stanza("alice@localhost/desk").await?)
+                .await?;
+        }
+        assert_eq!(handle.resource_match(&alice, "desk").await?, Some(observed));
+        assert!(desk.liveness().is_alive());
+        desk.take_queued();
+        let before = handle
+            .resource_match(&alice, "desk")
+            .await?
+            .ok_or("missing resource")?;
+        handle.retire_account(&alice).await?;
+        assert_eq!(handle.resource_match(&alice, "desk").await?, None);
+        let replacement = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let after = handle
+            .resource_match(&alice, "desk")
+            .await?
+            .ok_or("missing replacement")?;
+        assert_ne!(before.token, after.token);
+        drop(desk);
+        assert_eq!(handle.resource_match(&alice, "desk").await?, Some(after));
+        drop(replacement);
+        assert_eq!(handle.resource_match(&alice, "desk").await?, None);
+        router.shutdown().await?;
+        assert_eq!(
+            handle.resource_match(&alice, "desk").await,
+            Err(RouterError::Stopped)
+        );
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}

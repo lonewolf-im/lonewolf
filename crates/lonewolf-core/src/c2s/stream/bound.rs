@@ -17,10 +17,10 @@ use lonewolf_extension::message::{Backlog, MessageHandler, StoreOutcome, Undeliv
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
-use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
-use lonewolf_storage::{RedbRead, RedbStorage, Storage, WriteTransaction};
+use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
@@ -41,7 +41,9 @@ use crate::delivery::{
 };
 use crate::order::Ticket;
 use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
-use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
+use crate::router::{
+    Registration, ResourceMatch, RoutedStanza, RouterError, RouterHandle, SessionHandle,
+};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
@@ -1079,17 +1081,27 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         }
         let received = {
             let (sender, target) = presence_addresses(&routed)?;
+            let mut transaction = self
+                .storage
+                .begin_write()
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?;
+            let (_, original_target) = presence_addresses(&source)?;
+            if kind != PresenceRequestType::Subscribe
+                && self.router.is_local_host(original_target.domainpart())
+                && original_target.resourcepart().is_some()
+                && subscription_target(&self.router, &transaction, original_target)
+                    .await?
+                    .is_none()
+            {
+                return Ok(());
+            }
             match self
                 .router
                 .presence_handlers(target.domainpart())
                 .and_then(|handlers| handlers.find(kind))
             {
                 Some(target_host) => {
-                    let mut transaction = self
-                        .storage
-                        .begin_write()
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
                     let delivery = self.delivery();
                     let effects = target_host
                         .receive(
@@ -1828,6 +1840,30 @@ fn presence_priority<R: ArenaRead>(stanza: &StanzaRef<'_, R>) -> Result<i8, Stan
         );
     }
     Ok(priority.unwrap_or(0))
+}
+
+async fn subscription_target<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    transaction: &RedbWrite,
+    target: JidRef<'_>,
+) -> Result<Option<ResourceMatch>, CloseOutcome> {
+    let (Ok(account), Some(resource)) =
+        (AccountKey::try_from(target.bare()), target.resourcepart())
+    else {
+        return Ok(None);
+    };
+    if transaction
+        .account(&account)
+        .await
+        .map_err(|_| CloseOutcome::InternalError)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    router
+        .resource_match(&account, resource)
+        .await
+        .map_err(|_| CloseOutcome::InternalError)
 }
 
 struct ResourceIqWork<A: ChunkAllocator> {

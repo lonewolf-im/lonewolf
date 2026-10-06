@@ -324,7 +324,7 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
             if let Some(mutation) = outcome.subscriber {
                 push_roster(&sender, mutation, delivery).await?;
             }
-            if outcome.notify_contact {
+            if outcome.send_unavailable {
                 delivery.unavailable_presence(&target, &sender).await?;
             }
             Ok(())

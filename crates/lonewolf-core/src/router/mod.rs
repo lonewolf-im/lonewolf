@@ -22,7 +22,7 @@ use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, Stan
 use crate::delivery::{Pending, WorkGuard};
 use crate::hosts::Hosts;
 use crate::order::Order;
-pub(crate) use local::{DirectedRecipient, PresenceSource};
+pub(crate) use local::{DirectedRecipient, PresenceSource, ResourceMatch};
 
 pub mod local;
 
@@ -139,6 +139,17 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
         self.local.retire_account(account).await
+    }
+
+    pub(crate) async fn resource_match(
+        &self,
+        account: &AccountKey,
+        resource: &str,
+    ) -> Result<Option<ResourceMatch>, RouterError> {
+        if !self.is_local_host(account.domain()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        self.local.resource_match(account, resource).await
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

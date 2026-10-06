@@ -66,6 +66,11 @@ pub(crate) struct PresenceAccess {
     pub(crate) directed: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ResourceMatch {
+    pub(crate) token: u64,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PresenceSource<'a, A: ChunkAllocator> {
     pub(crate) resource: &'a str,
@@ -183,6 +188,11 @@ impl<A: ChunkAllocator> Clone for Retired<A> {
 }
 
 enum Command<A: ChunkAllocator> {
+    ResourceMatch {
+        account: AccountKey,
+        resource: Box<str>,
+        reply: oneshot::Sender<Option<ResourceMatch>>,
+    },
     Probe {
         requester: SessionHandle<A>,
         request: RoutedStanza<A>,
@@ -418,6 +428,23 @@ impl<A: ChunkAllocator + Clone> Clone for LocalRouterHandle<A> {
 impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     pub(super) fn allocator(&self) -> A {
         self.allocator.clone()
+    }
+
+    pub(crate) async fn resource_match(
+        &self,
+        account: &AccountKey,
+        resource: &str,
+    ) -> Result<Option<ResourceMatch>, RouterError> {
+        let (reply, result) = oneshot::channel();
+        self.shard(account.as_str())
+            .send(Command::ResourceMatch {
+                account: account.clone(),
+                resource: resource.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)
     }
 
     pub(crate) async fn register(
@@ -1241,6 +1268,23 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
 
     fn command(&mut self, command: Command<A>) {
         match command {
+            Command::ResourceMatch {
+                account,
+                resource,
+                reply,
+            } => {
+                let matched = self
+                    .accounts
+                    .get(account.as_str())
+                    .and_then(|sessions| sessions.get(resource.as_ref()))
+                    .filter(|session| {
+                        session.alive.load(Ordering::Acquire) && !session.outbound.is_closed()
+                    })
+                    .map(|session| ResourceMatch {
+                        token: session.token,
+                    });
+                let _ = reply.send(matched);
+            }
             Command::DirectedPresence {
                 account,
                 resource,
@@ -2731,6 +2775,39 @@ mod tests {
                     .values()
                     .all(|session| session.alive.load(Ordering::Acquire))
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn resource_match_ignores_dead_and_closed_sessions() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for closed in [false, true] {
+                let account = account()?;
+                let mut shard = Shard::<GlobalChunkAllocator>::new();
+                let (commands, _) = async_channel::bounded(1);
+                let (outbound, inbound) = async_channel::bounded(64);
+                let registration = shard.register(
+                    account.clone(),
+                    Some("desk".into()),
+                    NonZeroUsize::MIN,
+                    outbound,
+                    inbound,
+                    test_router(commands),
+                )?;
+                if closed {
+                    registration.links.inbound.close();
+                } else {
+                    registration.alive.store(false, Ordering::Release);
+                }
+                let (reply, result) = oneshot::channel();
+                shard.command(Command::ResourceMatch {
+                    account,
+                    resource: "desk".into(),
+                    reply,
+                });
+                assert_eq!(result.await?, None);
+            }
             Ok(())
         })
     }

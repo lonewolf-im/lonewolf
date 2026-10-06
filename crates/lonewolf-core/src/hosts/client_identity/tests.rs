@@ -8,15 +8,12 @@ use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
-use base64::Engine;
+use crate::hosts::test_support::{TestSigner, pem};
 use compio::runtime::Runtime;
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyUsagePurpose, OtherNameValue, PublicKeyData,
-    RevokedCertParams, SanType,
+    ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyUsagePurpose, OtherNameValue, RevokedCertParams,
+    SanType,
 };
 use x509_cert::der::{Encode, asn1::Ia5String};
 use x509_cert::ext::pkix::name::OtherName;
@@ -452,50 +449,6 @@ fn deadlines_stop_at_leaf_intermediate_crl_or_one_hour() -> TestResult {
         Err(ClientIdentityError::Verification(_))
     ));
     Ok(())
-}
-
-pub(in crate::hosts) fn pem(label: &str, bytes: &[u8]) -> TestResult<String> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let mut output = format!("-----BEGIN {label}-----\n");
-    for chunk in encoded.as_bytes().chunks(64) {
-        output.push_str(std::str::from_utf8(chunk)?);
-        output.push('\n');
-    }
-    output.push_str(&format!("-----END {label}-----\n"));
-    Ok(output)
-}
-
-struct TestSigner {
-    key: SigningKey<P256>,
-    public_key: [u8; 65],
-}
-impl TestSigner {
-    fn new() -> TestResult<Self> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
-        Ok(Self {
-            public_key: key.private_key.public_key_uncompressed(),
-            key,
-        })
-    }
-}
-impl PublicKeyData for TestSigner {
-    fn der_bytes(&self) -> &[u8] {
-        &self.public_key
-    }
-    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
-        &rcgen::PKCS_ECDSA_P256_SHA256
-    }
-}
-impl rcgen::SigningKey for TestSigner {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
-        self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
-            .map_err(|_| rcgen::Error::RemoteKeyError)
-    }
 }
 
 #[test]

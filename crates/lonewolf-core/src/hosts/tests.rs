@@ -6,11 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::{Config, HostConfig, HostTlsConfig};
+use crate::hosts::test_support::{TestSigner, pem};
 use crate::hosts::{Hosts, HostsError};
-use base64::Engine;
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
 use graviola::signing::eddsa::Ed25519SigningKey;
 use rcgen::{CertificateParams, PublicKeyData};
 use tempfile::TempDir;
@@ -347,13 +344,7 @@ fn test_tls_files(
     domain: &str,
     suffix: &str,
 ) -> Result<HostTlsConfig, Box<dyn Error>> {
-    let key = SigningKey::<P256> {
-        private_key: StaticPrivateKey::new_random()?,
-    };
-    let signer = TestSigner {
-        public_key: key.private_key.public_key_uncompressed(),
-        key,
-    };
+    let signer = TestSigner::new()?;
     let mut parameters = CertificateParams::new(vec![domain.into()])?;
     parameters.serial_number = Some(rcgen::SerialNumber::from(1_u64));
     let certificate = parameters.self_signed(&signer)?;
@@ -371,42 +362,6 @@ fn test_tls_files(
         private_key_path,
         client_auth: None,
     })
-}
-
-fn pem(label: &str, der: &[u8]) -> Result<String, std::str::Utf8Error> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut output = format!("-----BEGIN {label}-----\n");
-    for chunk in encoded.as_bytes().chunks(64) {
-        output.push_str(std::str::from_utf8(chunk)?);
-        output.push('\n');
-    }
-    output.push_str(&format!("-----END {label}-----\n"));
-    Ok(output)
-}
-
-struct TestSigner {
-    key: SigningKey<P256>,
-    public_key: [u8; 65],
-}
-
-impl PublicKeyData for TestSigner {
-    fn der_bytes(&self) -> &[u8] {
-        &self.public_key
-    }
-
-    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
-        &rcgen::PKCS_ECDSA_P256_SHA256
-    }
-}
-
-impl rcgen::SigningKey for TestSigner {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0_u8; 80];
-        self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
-            .map_err(|_| rcgen::Error::RemoteKeyError)
-    }
 }
 
 struct Ed25519TestSigner {
@@ -432,7 +387,7 @@ impl rcgen::SigningKey for Ed25519TestSigner {
 
 #[test]
 fn client_certificate_material_is_checked_during_bootstrap() -> TestResult {
-    use super::client_identity::tests::{Fixture, pem};
+    use super::client_identity::tests::Fixture;
     let fixture = Fixture::new()?;
     let mut tls = test_tls_files(&fixture.directory, "localhost", "client")?;
     tls.client_auth = Some(fixture.config.clone());
@@ -481,7 +436,7 @@ fn client_certificate_material_is_checked_during_bootstrap() -> TestResult {
 
 #[test]
 fn required_crls_cannot_be_missing_empty_malformed_stale_or_unusable_at_bootstrap() -> TestResult {
-    use super::client_identity::tests::{Fixture, pem};
+    use super::client_identity::tests::Fixture;
     use rustls::pki_types::pem::PemObject;
     use x509_cert::der::{Decode, Encode};
     let fixture = Fixture::new()?;

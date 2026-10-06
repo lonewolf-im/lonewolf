@@ -11,6 +11,116 @@ fn sentinel(from: &mut Client, to: &mut Client, target: &str) -> TestResult {
 }
 
 #[test]
+fn presence_errors_reach_exact_and_available_resources_without_replies() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for user in ["alice", "bob", "offline"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut desk = suite.connect("alice", "password", "desk")?;
+    let mut phone = suite.connect("alice", "password", "phone")?;
+    let mut tablet = suite.connect("alice", "password", "tablet")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+
+    bob.send("<presence type='error' from='mallory@localhost/forged' to='alice@localhost/desk' id='full' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='fr'>indisponible</text></error></presence>")?;
+    desk.expect_xml("<presence xmlns='jabber:client' type='error' from='bob@localhost/desk' to='alice@localhost/desk' id='full' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='fr'>indisponible</text></error></presence>")?;
+    sentinel(&mut bob, &mut phone, "alice@localhost/phone")?;
+    phone.send("<presence id='phone'><priority>-1</priority></presence>")?;
+    assert_eq!(phone.receive()?.attribute("id"), Some("phone"));
+    tablet.send("<presence id='tablet'/>")?;
+    assert_eq!(tablet.receive()?.attribute("id"), Some("phone"));
+    assert_eq!(tablet.receive()?.attribute("id"), Some("tablet"));
+    assert_eq!(phone.receive()?.attribute("id"), Some("tablet"));
+
+    bob.send("<presence type='error' to='alice@localhost' id='bare'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    for resource in [&mut phone, &mut tablet] {
+        resource.expect_xml("<presence xmlns='jabber:client' type='error' from='bob@localhost/desk' to='alice@localhost' id='bare'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    }
+    sentinel(&mut bob, &mut desk, "alice@localhost/desk")?;
+    for target in [
+        "offline@localhost",
+        "offline@localhost/desk",
+        "unknown@localhost",
+        "alice@localhost/missing",
+        "alice@remote.example/desk",
+        "bob@localhost",
+        "localhost",
+    ] {
+        bob.send(&format!("<presence type='error' to='{target}'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+    }
+    bob.send("<presence type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    sentinel(&mut bob, &mut desk, "alice@localhost/desk")?;
+    sentinel(&mut desk, &mut bob, "bob@localhost/desk")?;
+    desk.close()?;
+    phone.close()?;
+    assert_eq!(tablet.receive()?.attribute("type"), Some("unavailable"));
+    tablet.close()?;
+    bob.close()
+}
+
+#[test]
+fn presence_errors_keep_roster_state_cached_presence_and_later_broadcasts() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    for user in ["alice", "bob", "carol"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+    bob.send("<presence id='bob'/>")?;
+    assert_eq!(bob.receive()?.attribute("id"), Some("bob"));
+    alice.send("<presence id='original'><show>away</show><priority>5</priority></presence>")?;
+    assert_eq!(alice.receive()?.attribute("id"), Some("original"));
+    bob.send("<presence to='alice@localhost' type='subscribe'/>")?;
+    assert_eq!(alice.receive()?.attribute("type"), Some("subscribe"));
+    alice.send("<presence to='bob@localhost' type='subscribed'/>")?;
+    assert_eq!(bob.receive()?.attribute("id"), Some("original"));
+    alice.send("<presence to='carol@localhost' type='subscribed'/>")?;
+    alice.send("<presence to='carol@localhost' type='subscribe'/>")?;
+    alice.send("<presence to='carol@localhost/desk' id='directed'/>")?;
+    assert_eq!(carol.receive()?.attribute("id"), Some("directed"));
+    alice.send("<iq type='get' id='before'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
+    let before = alice.receive()?;
+    let before = before.child("jabber:iq:roster", "query")?;
+    assert!(
+        before
+            .children
+            .iter()
+            .any(|item| item.attribute("subscription") == Some("from"))
+    );
+    assert!(
+        before
+            .children
+            .iter()
+            .any(|item| item.attribute("approved") == Some("true")
+                && item.attribute("ask") == Some("subscribe"))
+    );
+    let version = before.attribute("ver").ok_or("missing version")?.to_owned();
+
+    bob.send("<presence type='error' to='alice@localhost/desk' id='full'><priority>-128</priority><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    assert_eq!(alice.receive()?.attribute("id"), Some("full"));
+    carol.send("<presence type='error' to='alice@localhost' id='bare'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    assert_eq!(alice.receive()?.attribute("id"), Some("bare"));
+    bob.send("<presence type='probe' to='alice@localhost' id='cached'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' id='original'><show>away</show><priority>5</priority></presence>")?;
+    carol.send("<presence type='probe' to='alice@localhost/desk' id='grant'/>")?;
+    carol.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='carol@localhost/desk' id='grant'/>")?;
+    alice.send("<iq type='get' id='after'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
+    let after = alice.receive()?;
+    let after = after.child("jabber:iq:roster", "query")?;
+    assert_eq!(after.attribute("ver"), Some(version.as_str()));
+    assert_eq!(after.children, before.children);
+    alice.send("<presence id='updated'><show>chat</show></presence>")?;
+    assert_eq!(alice.receive()?.attribute("id"), Some("updated"));
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' id='updated'><show>chat</show></presence>")?;
+    sentinel(&mut alice, &mut carol, "carol@localhost/desk")?;
+    alice.close()?;
+    assert_eq!(bob.receive()?.attribute("type"), Some("unavailable"));
+    assert_eq!(carol.receive()?.attribute("type"), Some("unavailable"));
+    bob.close()?;
+    carol.close()
+}
+
+#[test]
 fn directed_presence_reaches_a_full_and_a_bare_jid_and_broadcasts_skip_them() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     for user in ["alice", "bob", "carol"] {

@@ -247,6 +247,10 @@ enum Command<A: ChunkAllocator> {
         stanza: RoutedStanza<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
+    DeliverPresenceError {
+        stanza: RoutedStanza<A>,
+        reply: oneshot::Sender<Result<(), RouterError>>,
+    },
     DeliverPresenceToTagged {
         tag: SessionTag,
         stanza: RoutedStanza<A>,
@@ -560,6 +564,33 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         let (reply, result) = oneshot::channel();
         self.shards[shard]
             .send(Command::DeliverPresence { stanza, reply })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
+    pub(crate) async fn deliver_presence_error(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            if view.stanza_type() != StanzaType::Presence(PresenceType::Error) {
+                return Err(RouterError::InvalidTarget);
+            }
+            let to = view
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            to.localpart().ok_or(RouterError::InvalidTarget)?;
+            if to.resourcepart().is_some() {
+                return Err(RouterError::InvalidTarget);
+            }
+            self.shard_index(to.as_str())
+        };
+        let (reply, result) = oneshot::channel();
+        self.shards[shard]
+            .send(Command::DeliverPresenceError { stanza, reply })
             .await
             .map_err(|_| RouterError::Stopped)?;
         result.await.map_err(|_| RouterError::Stopped)?
@@ -1313,6 +1344,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             }
             Command::DeliverPresence { stanza, reply } => {
                 let result = self.deliver_presence(stanza);
+                let _ = reply.send(result);
+            }
+            Command::DeliverPresenceError { stanza, reply } => {
+                let result =
+                    self.deliver_presence_where(stanza, |session| session.priority.is_some());
                 let _ = reply.send(result);
             }
             Command::DeliverPresenceToTagged { tag, stanza, reply } => {
@@ -2734,67 +2770,77 @@ mod tests {
     #[test]
     fn full_delivery_removes_stale_session_and_broadcasts_unavailable() -> Result<(), Box<dyn Error>>
     {
-        Runtime::new()?.block_on(async {
-            let account = account()?;
-            let mut shard = Shard::<GlobalChunkAllocator>::new();
-            let (command_sender, _) = async_channel::bounded(1);
-            let (desk_outbound, desk_inbound) = async_channel::bounded(64);
-            let desk = shard.register(
-                account.clone(),
-                Some("desk".into()),
-                NonZeroUsize::new(2).ok_or("zero resource limit")?,
-                desk_outbound,
-                desk_inbound,
-                test_router(command_sender.clone()),
-            )?;
-            let (phone_outbound, phone_inbound) = async_channel::bounded(64);
-            let phone = shard.register(
-                account.clone(),
-                Some("phone".into()),
-                NonZeroUsize::new(2).ok_or("zero resource limit")?,
-                phone_outbound,
-                phone_inbound,
-                test_router(command_sender),
-            )?;
-            let became_available = shard.presence(
-                &account,
-                "desk",
-                desk.token,
-                Some(0),
-                routed("<presence from='alice@localhost/desk'/>").await?,
-                Some(routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?),
-            )?;
-            assert!(became_available.became_available);
-            assert!(became_available.siblings.is_empty());
-            let became_available = shard.presence(
-                &account,
-                "phone",
-                phone.token,
-                Some(0),
-                routed("<presence from='alice@localhost/phone'/>").await?,
-                None,
-            )?;
-            assert!(became_available.became_available);
-            assert_eq!(became_available.siblings.len(), 1);
-            if desk.recv().await.is_none() {
-                return Err("missing peer presence".into());
-            }
+        for xml in [
+            "<message to='alice@localhost/desk'/>",
+            "<presence from='bob@localhost/desk' to='alice@localhost/desk' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>",
+        ] {
+            Runtime::new()?.block_on(async {
+                let account = account()?;
+                let mut shard = Shard::<GlobalChunkAllocator>::new();
+                let (command_sender, _) = async_channel::bounded(1);
+                let (desk_outbound, desk_inbound) = async_channel::bounded(64);
+                let desk = shard.register(
+                    account.clone(),
+                    Some("desk".into()),
+                    NonZeroUsize::new(2).ok_or("zero resource limit")?,
+                    desk_outbound,
+                    desk_inbound,
+                    test_router(command_sender.clone()),
+                )?;
+                let (phone_outbound, phone_inbound) = async_channel::bounded(64);
+                let phone = shard.register(
+                    account.clone(),
+                    Some("phone".into()),
+                    NonZeroUsize::new(2).ok_or("zero resource limit")?,
+                    phone_outbound,
+                    phone_inbound,
+                    test_router(command_sender),
+                )?;
+                let became_available = shard.presence(
+                    &account,
+                    "desk",
+                    desk.token,
+                    Some(0),
+                    routed("<presence from='alice@localhost/desk'/>").await?,
+                    Some(
+                        routed("<presence from='alice@localhost/desk' type='unavailable'/>")
+                            .await?,
+                    ),
+                )?;
+                assert!(became_available.became_available);
+                assert!(became_available.siblings.is_empty());
+                let became_available = shard.presence(
+                    &account,
+                    "phone",
+                    phone.token,
+                    Some(0),
+                    routed("<presence from='alice@localhost/phone'/>").await?,
+                    None,
+                )?;
+                assert!(became_available.became_available);
+                assert_eq!(became_available.siblings.len(), 1);
+                if desk.recv().await.is_none() {
+                    return Err("missing peer presence".into());
+                }
 
-            drop(desk);
-            assert_eq!(
-                shard.deliver(routed("<message to='alice@localhost/desk'/>").await?, false),
-                Err(RouterError::NotFound)
-            );
-            let Some(unavailable) = phone.recv().await else {
-                return Err("missing unavailable".into());
-            };
-            assert_eq!(
-                unavailable.resolve()?.stanza_type(),
-                StanzaType::Presence(PresenceType::Unavailable)
-            );
-            assert!(!shard.accounts[account.as_str()].contains_key("desk"));
-            Ok(())
-        })
+                drop(desk);
+                assert_eq!(
+                    shard.deliver(routed(xml).await?, false),
+                    Err(RouterError::NotFound)
+                );
+                let Some(unavailable) = phone.recv().await else {
+                    return Err("missing unavailable".into());
+                };
+                assert_eq!(
+                    unavailable.resolve()?.stanza_type(),
+                    StanzaType::Presence(PresenceType::Unavailable)
+                );
+                assert!(!shard.accounts[account.as_str()].contains_key("desk"));
+                assert!(phone.take_queued().is_empty());
+                Ok::<_, Box<dyn Error>>(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]

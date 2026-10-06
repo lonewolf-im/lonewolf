@@ -33,6 +33,135 @@ fn run_test(test: impl Future<Output = TestResult>) -> TestResult {
 }
 
 #[test]
+fn presence_errors_keep_exact_and_available_audiences_and_presence_state() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero limit")?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        let tablet = handle.register(&alice, Some("tablet"), limit).await?;
+        for (resource, priority) in [(&phone, -1), (&tablet, 5)] {
+            resource
+                .handle()
+                .set_presence(
+                    Some(priority),
+                    identified_presence(resource.resource(), resource.resource()).await?,
+                    Some(unavailable_presence(resource.resource()).await?),
+                )
+                .await?;
+        }
+        phone.take_queued();
+        for resource in [&desk, &phone, &tablet] {
+            directed_grant(resource, "bob@localhost/desk", true).await?;
+        }
+        let full = parse_stanza("<presence from='bob@localhost/desk' to='alice@localhost/desk' type='error' id='full'><priority>127</priority><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>").await?;
+        handle.route_presence_error(full).await?;
+        assert_eq!(receive_routed(&desk).await?.resolve()?.id()?, Some("full"));
+        assert!(phone.take_queued().is_empty());
+        assert!(tablet.take_queued().is_empty());
+        let bare = parse_stanza("<presence from='bob@localhost/desk' to='alice@localhost' type='error' id='bare'><priority>127</priority><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>").await?;
+        assert_eq!(
+            handle.route_presence(bare.clone()).await,
+            Err(RouterError::InvalidTarget)
+        );
+        handle.route_presence_error(bare).await?;
+        assert!(desk.take_queued().is_empty());
+        for resource in [&phone, &tablet] {
+            assert_eq!(
+                receive_routed(resource).await?.resolve()?.id()?,
+                Some("bare")
+            );
+        }
+        let snapshots = handle.local.presence_snapshot(&alice).await?;
+        assert_eq!(snapshots.len(), 2);
+        let mut ids = [snapshots[0].resolve()?.id()?, snapshots[1].resolve()?.id()?];
+        ids.sort();
+        assert_eq!(ids, [Some("phone"), Some("tablet")]);
+        for resource in [&desk, &phone, &tablet] {
+            assert!(has_grant(&handle, &alice, resource.resource(), "bob@localhost/desk").await?);
+        }
+        handle
+            .route_message(stanza("alice@localhost").await?)
+            .await?;
+        receive_routed(&tablet).await?;
+        assert!(phone.take_queued().is_empty());
+        drop(tablet);
+        assert_eq!(
+            handle.route_message(stanza("alice@localhost").await?).await,
+            Err(RouterError::Offline)
+        );
+        drop((desk, phone));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn presence_errors_use_bounded_mailboxes_and_keep_replacement_registrations() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.handle()
+            .set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        let bob = handle
+            .register(&account("bob@localhost")?, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        for _ in 0..64 {
+            handle
+                .route_full(stanza("alice@localhost/desk").await?)
+                .await?;
+        }
+        let full = parse_stanza(
+            "<presence from='bob@localhost/desk' to='alice@localhost/desk' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>",
+        )
+        .await?;
+        assert_eq!(
+            handle.route_presence_error(full.clone()).await,
+            Err(RouterError::Busy)
+        );
+        assert!(desk.liveness().is_alive());
+        let bare =
+            parse_stanza("<presence from='bob@localhost/desk' to='alice@localhost' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")
+                .await?;
+        assert_eq!(
+            handle.route_presence_error(bare).await,
+            Err(RouterError::Busy)
+        );
+        assert!(!desk.liveness().is_alive());
+        assert_eq!(desk.take_queued().len(), 64);
+        assert!(desk.recv().await.is_none());
+        assert!(bob.take_queued().is_empty());
+        assert_eq!(
+            handle.route_presence_error(full.clone()).await,
+            Err(RouterError::NotFound)
+        );
+        let replacement = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        drop(desk);
+        handle.route_presence_error(full).await?;
+        let delivered = receive_routed(&replacement).await?;
+        assert_eq!(
+            delivered.resolve()?.stanza_type(),
+            StanzaType::Presence(lonewolf_xmpp::stanza::PresenceType::Error)
+        );
+        assert!(bob.take_queued().is_empty());
+        drop((replacement, bob));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn absent_account_message_targets_distinguish_offline_from_missing_resources() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;

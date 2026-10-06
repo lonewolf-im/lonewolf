@@ -662,6 +662,19 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                         .await
                 }
                 (None, PresenceType::Probe) => self.handle_probe(parsed).await,
+                (None, PresenceType::Error) => {
+                    let routed = self.stamp(parsed)?;
+                    match self.router.route_presence_error(routed).await {
+                        Ok(())
+                        | Err(
+                            RouterError::NotFound
+                            | RouterError::Busy
+                            | RouterError::InvalidTarget
+                            | RouterError::RemoteUnsupported,
+                        ) => Ok(()),
+                        Err(_) => Err(CloseOutcome::InternalError),
+                    }
+                }
                 (None, _) => Ok(()),
             };
         }

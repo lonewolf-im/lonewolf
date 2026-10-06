@@ -239,6 +239,62 @@ fn account_lifecycle_uses_canonical_jids_and_never_returns_credentials() -> Test
 }
 
 #[test]
+fn ipv6_account_identities_reject_zones_without_aliasing_the_pure_address() -> TestResult {
+    with_server(|path, accounts| async move {
+        let reply = request(
+            &path,
+            "POST",
+            "/v1/accounts",
+            Some(json!({"jid":"ALICE@[FE80::1]", "password":"initial"})),
+        )
+        .await?;
+        assert_eq!(reply.status, 201);
+        assert_eq!(reply.body, json!({"jid":"alice@[fe80::1]"}));
+        let pure = key("alice@[fe80::1]")?;
+        let before = scram(&accounts, &pure, ScramHash::Sha256).await?;
+        for zone in ["eth0", "25eth0"] {
+            let reply = request(
+                &path,
+                "POST",
+                "/v1/accounts",
+                Some(json!({"jid":format!("alice@[fe80::1%{zone}]"), "password":"replacement"})),
+            )
+            .await?;
+            assert_eq!(reply.status, 400);
+            let target = format!("/v1/accounts/alice%40%5Bfe80%3A%3A1%25{zone}%5D");
+            assert_eq!(request(&path, "GET", &target, None).await?.status, 400);
+            assert_eq!(request(&path, "DELETE", &target, None).await?.status, 400);
+            assert_eq!(
+                request(
+                    &path,
+                    "PUT",
+                    &format!("{target}/password"),
+                    Some(json!({"password":"replacement"}))
+                )
+                .await?
+                .status,
+                400
+            );
+        }
+        match (scram(&accounts, &pure, ScramHash::Sha256).await?, before) {
+            (Some(ScramVerifier::Sha256(actual)), Some(ScramVerifier::Sha256(expected))) => {
+                assert_eq!(actual.salt(), expected.salt());
+                assert_eq!(actual.iterations(), expected.iterations());
+                assert_eq!(actual.stored_key(), expected.stored_key());
+                assert_eq!(actual.server_key(), expected.server_key());
+            }
+            _ => return Err("missing SHA-256 credentials".into()),
+        }
+        let reply = request(&path, "GET", "/v1/accounts", None).await?;
+        assert_eq!(
+            reply.body,
+            json!({"accounts":[{"jid":"alice@[fe80::1]"}],"next_cursor":null})
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn pagination_handles_empty_exact_and_partial_pages_and_deleted_cursors() -> TestResult {
     with_server(|path, accounts| async move {
         let reply = request(&path, "GET", "/v1/accounts", None).await?;

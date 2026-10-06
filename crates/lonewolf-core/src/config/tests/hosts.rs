@@ -99,6 +99,39 @@ fn hosts_must_be_nonempty_normalized_xmpp_domains() -> TestResult {
 }
 
 #[test]
+fn configured_hosts_and_default_host_reject_ipv6_zones() -> TestResult {
+    for domain in ["[fe80::1%eth0]", "[FE80::1%25Eth0]", "[fe80::1%25eth%32]"] {
+        let host = format!(
+            "[hosts.\"{domain}\".tls]\ncertificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'"
+        );
+        for contents in [
+            host.clone(),
+            format!("[xmpp]\ndefault_host = '{domain}'\n{host}"),
+        ] {
+            let file = config_file(&contents)?;
+            let error = Config::load(Some(file.path())).expect_err(&contents);
+            assert!(
+                matches!(error, ConfigError::Invalid { ref reason, .. }
+                if reason.starts_with(&format!("hosts.{domain} is not a valid XMPP domain:"))),
+                "{error}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pure_ipv6_literals_are_usable_as_configured_hosts() -> TestResult {
+    let file = config_file(
+        "[xmpp]\ndefault_host = '[2001:db8::1]'\n[hosts.\"[2001:db8::1]\".tls]\ncertificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'",
+    )?;
+    let config = Config::load(Some(file.path()))?;
+    assert_eq!(config.xmpp.default_host.as_deref(), Some("[2001:db8::1]"));
+    assert!(config.hosts.contains_key("[2001:db8::1]"));
+    Ok(())
+}
+
+#[test]
 fn tls_paths_must_be_present_and_nonempty() -> TestResult {
     for contents in [
         "[hosts.localhost.tls]",

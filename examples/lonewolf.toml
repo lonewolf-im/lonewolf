@@ -1,15 +1,11 @@
 # Copy this file to lonewolf.toml and uncomment the settings you want to change.
 # The values shown are the defaults unless a comment identifies an example.
 
-# ------------------------------------ Logging --------------------------------------------------
-
 # [logging]
 
 # Choose how much detail Lonewolf writes to standard error.
 # Use "off", "error", "warn", "info", "debug", or "trace".
 # level = "info"
-
-# ------------------------------------ XMPP -----------------------------------------------------
 
 # [xmpp]
 
@@ -22,11 +18,9 @@
 # memory when the pool is exhausted.
 # stanza_pool_size_mib = 256
 
-# ------------------------------------ Hosts ----------------------------------------------------
-
 # Add one section for each XMPP domain served by Lonewolf.
 # Defining hosts replaces the built-in host map.
-# Use lowercase ASCII names or Punycode for internationalized domains.
+# Use normalized domain names or bracketed IPv6 literals without zone identifiers.
 # [hosts.localhost]
 
 # Choose extensions included in the server build for this host.
@@ -67,8 +61,6 @@
 # [hosts."example.com".tls.client_auth]
 # trust_anchors_path = "./certs/client-roots.pem"
 # crls_path = "./certs/client-crls.pem"
-
-# ------------------------------------ Limits ---------------------------------------------------
 
 # All numeric limits are positive integers.
 # [limits.c2s]
@@ -128,8 +120,6 @@
 # [limits.c2s.profiles.internal]
 # max_stanza_bytes = 524_288
 
-# ------------------------------------ C2S ------------------------------------------------------
-
 # Add one section per TCP endpoint. These sections replace the default endpoint.
 # Lonewolf requires at least one client endpoint.
 # [[c2s.listeners]]
@@ -154,8 +144,6 @@
 # address = "127.0.0.1:5223"
 # limits = "internal"
 
-# ------------------------------------ Storage --------------------------------------------------
-
 # [storage]
 
 # Choose the store Lonewolf uses by default.
@@ -174,8 +162,6 @@
 # where Lonewolf was launched.
 # path = "./data/lonewolf.dat"
 
-# ------------------------------------ Admin ----------------------------------------------------
-
 # [admin]
 
 # Enable the local HTTP API used to manage accounts.
@@ -187,8 +173,6 @@
 # Lonewolf will not replace an existing file at this path. The parent directory
 # must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
-
-# ------------------------------------ Account --------------------------------------------------
 
 # [account]
 

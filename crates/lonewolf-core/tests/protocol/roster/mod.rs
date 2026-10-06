@@ -2413,6 +2413,36 @@ fn roster_set_with_a_full_jid_returns_bad_request() -> TestResult {
 }
 
 #[test]
+fn roster_set_with_an_ipv6_zone_returns_bad_request_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<iq type='set' id='pure-ipv6'><query xmlns='jabber:iq:roster'><item jid='bob@[FE80::1]'/></query></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='pure-ipv6' to='alice@localhost/desk'/>",
+    )?;
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@[fe80::1]' subscription='none'/></query></iq>",
+    )?;
+
+    for domain in ["[fe80::1%eth0]", "[fe80::1%25eth0]", "[fe80::1%25eth%32]"] {
+        for fields in ["name='Scoped'", "subscription='remove'"] {
+            alice.send(&format!("<iq type='set' id='scoped'><query xmlns='jabber:iq:roster'><item jid='bob@{domain}' {fields}/></query></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='scoped' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@{domain}' {fields}/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            request_roster(
+                &mut alice,
+                "unchanged-roster",
+                "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@[fe80::1]' subscription='none'/></query></iq>",
+            )?;
+        }
+    }
+    alice.close()
+}
+
+#[test]
 fn roster_set_does_not_push_to_an_uninterested_initiating_resource() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;

@@ -35,6 +35,7 @@ const LAST_UNAVAILABLE_CAPACITY: usize = 1_024;
 
 type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
 type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
+#[cfg(test)]
 pub(crate) type PresenceBuilder<A> = Box<
     dyn for<'a> FnMut(PresenceSource<'a, A>) -> Result<Option<RoutedStanza<A>>, RouterError> + Send,
 >;
@@ -71,7 +72,6 @@ pub(crate) struct ResourceMatch {
     pub(crate) token: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PresenceSource<'a, A: ChunkAllocator> {
     pub(crate) resource: &'a str,
     pub(crate) presence: Option<&'a RoutedStanza<A>>,
@@ -207,14 +207,14 @@ enum Command<A: ChunkAllocator> {
         available: bool,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     HasDirectedGrant {
         account: AccountKey,
         resource: Box<str>,
         observer: DirectedRecipient,
         reply: oneshot::Sender<bool>,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     PresenceAccess {
         account: AccountKey,
         resource: Option<Box<str>>,
@@ -223,7 +223,6 @@ enum Command<A: ChunkAllocator> {
         build: PresenceBuilder<A>,
         reply: oneshot::Sender<Result<Vec<PresenceDelivery<A>>, RouterError>>,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
     AuthorizedDelivery {
         delivery: PresenceDelivery<A>,
         reply: oneshot::Sender<Result<(), RouterError>>,
@@ -697,7 +696,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn has_directed_grant(
         &self,
         account: &AccountKey,
@@ -717,7 +716,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn presence_access(
         &self,
         account: &AccountKey,
@@ -741,7 +740,6 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)?
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn authorized_delivery(
         &self,
         delivery: PresenceDelivery<A>,
@@ -1297,6 +1295,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                     self.record_directed_presence(&account, &resource, token, recipient, available);
                 let _ = reply.send(result);
             }
+            #[cfg(test)]
             Command::HasDirectedGrant {
                 account,
                 resource,
@@ -1326,6 +1325,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 let result = self.probe_snapshot(&requester, &request, subscribed);
                 let _ = reply.send(result);
             }
+            #[cfg(test)]
             Command::PresenceAccess {
                 account,
                 resource,

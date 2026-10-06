@@ -10,19 +10,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
-use lonewolf_extension::presence::{PresenceRegistry, PresenceRequestType};
+use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_extension::{Extension, ExtensionRegistry};
+use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
-use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
-use lonewolf_xmpp::jid::{Jid, JidRef};
+use lonewolf_xmpp::jid::Jid;
+#[cfg(test)]
+use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, StanzaType};
 
-use crate::delivery::{Pending, WorkGuard};
 use crate::hosts::Hosts;
 use crate::order::Order;
-pub(crate) use local::{DirectedRecipient, PresenceSource, ResourceMatch};
+#[cfg(test)]
+pub(crate) use local::DirectedRecipient;
+pub(crate) use local::ResourceMatch;
 
 pub mod local;
 
@@ -152,7 +155,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.resource_match(account, resource).await
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn has_directed_grant(
         &self,
         source: &AccountKey,
@@ -162,68 +165,6 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local
             .has_directed_grant(source, resource, observer)
             .await
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn with_presence_access(
-        &self,
-        guard: WorkGuard,
-        storage: RedbStorage,
-        source: AccountKey,
-        resource: Option<Box<str>>,
-        observer: DirectedRecipient,
-        build: impl for<'a> FnMut(PresenceSource<'a, A>) -> Result<Option<RoutedStanza<A>>, RouterError>
-        + Send
-        + 'static,
-    ) -> Pending<Result<(), RouterError>> {
-        let router = self.clone();
-        Pending::spawn(guard, async move {
-            let mut arena = Arena::try_new_in(Default::default(), router.local.allocator())
-                .map_err(|_| RouterError::Unavailable)?;
-            let jid = Jid::parse_in(observer.as_str(), &mut arena)
-                .map_err(|_| RouterError::InvalidTarget)?;
-            let jid = jid
-                .resolve(&arena)
-                .map_err(|_| RouterError::InvalidTarget)?;
-            let observer_account =
-                AccountKey::try_from(jid.bare()).map_err(|_| RouterError::InvalidTarget)?;
-            if !router.is_local_host(source.domain())
-                || !router.is_local_host(observer_account.domain())
-            {
-                return Err(RouterError::RemoteUnsupported);
-            }
-            let mut accounts = vec![source.clone()];
-            if observer_account != source {
-                accounts.push(observer_account);
-            }
-            let (transaction, mut ticket) = router
-                .order
-                .fix(accounts, storage.begin_read())
-                .await
-                .map_err(|_| RouterError::Unavailable)?;
-            let subscribed = match router
-                .presence_handlers(source.domain())
-                .and_then(|handlers| handlers.find(PresenceRequestType::Available))
-            {
-                Some(handler) => handler
-                    .visibility(&source, jid, &transaction)
-                    .await
-                    .map_err(|_| RouterError::Unavailable)?,
-                None => false,
-            };
-            ticket.turn().await;
-            let deliveries = router
-                .local
-                .presence_access(&source, resource, observer, subscribed, Box::new(build))
-                .await?;
-            for delivery in deliveries {
-                match router.local.authorized_delivery(delivery).await {
-                    Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        })
     }
 
     /// Applies the incoming listener's limit to resources on all listeners.
@@ -252,8 +193,8 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.deliver_full(stanza).await
     }
 
-    /// Hold the source and target account tickets through admission.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The caller holds the source and target account tickets through admission.
+    #[cfg(test)]
     pub(crate) async fn route_iq_request(
         &self,
         stanza: RoutedStanza<A>,

@@ -1,0 +1,9 @@
+[test-groups]
+protocol-servers = { max-threads = 8 }
+
+[[profile.default.overrides]]
+filter = 'binary(protocol)'
+test-group = 'protocol-servers'
+
+[profile.ci]
+test-threads = 8

@@ -123,12 +123,7 @@ async fn granting_contacts(
             .roster_item(&account, &owner)
             .await
             .map_err(roster_error)?
-            .is_some_and(|item| {
-                matches!(
-                    item.subscription.state,
-                    SubscriptionState::From | SubscriptionState::Both
-                )
-            });
+            .is_some_and(|item| state::grants(item.subscription.state));
         if granted {
             contacts.push(account);
         }
@@ -279,12 +274,7 @@ where
                 .roster_item(owner, &RosterJid::from(observer.bare()))
                 .await
                 .map_err(roster_error)?
-                .is_some_and(|item| {
-                    matches!(
-                        item.subscription.state,
-                        SubscriptionState::From | SubscriptionState::Both
-                    )
-                }))
+                .is_some_and(|item| state::grants(item.subscription.state)))
         })
     }
 

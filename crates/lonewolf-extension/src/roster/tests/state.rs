@@ -635,6 +635,56 @@ fn cancellation_clears_the_grantor_when_the_subscriber_is_missing() -> TestResul
 }
 
 #[test]
+fn cancellation_removes_only_the_from_direction() -> TestResult {
+    for (initial, final_state) in [
+        (SubscriptionState::None, SubscriptionState::None),
+        (SubscriptionState::To, SubscriptionState::To),
+        (SubscriptionState::From, SubscriptionState::None),
+        (SubscriptionState::Both, SubscriptionState::To),
+    ] {
+        let (_directory, roster) = roster();
+        let owner = account("alice@example.com");
+        let contact = jid("bob@example.com");
+        set_subscription(
+            &roster,
+            &owner,
+            &contact,
+            RosterSubscription {
+                state: initial,
+                pending_out: true,
+                approved: true,
+            },
+        )?;
+
+        let cancellation = write(&roster, async |tx| {
+            state::cancel_subscription(tx, &owner, &contact, None).await
+        })?;
+        let mutation = cancellation.grantor.ok_or("missing grantor change")?;
+        let persisted = item(&roster, &owner, &contact).ok_or("missing roster item")?;
+        assert_eq!(
+            persisted.subscription,
+            RosterSubscription {
+                state: final_state,
+                pending_out: true,
+                approved: false,
+            }
+        );
+        assert_eq!(mutation.value, persisted);
+        assert_eq!(mutation.version.get(), 2);
+        assert_eq!(version(&roster, &owner), 2);
+
+        let repeated = write(&roster, async |tx| {
+            state::cancel_subscription(tx, &owner, &contact, None).await
+        })?;
+        assert!(repeated.grantor.is_none());
+        assert!(repeated.subscriber.is_none());
+        assert_eq!(item(&roster, &owner, &contact), Some(persisted));
+        assert_eq!(version(&roster, &owner), 2);
+    }
+    Ok(())
+}
+
+#[test]
 fn self_subscription_cancellation_writes_one_final_roster_version() -> TestResult {
     let (_directory, roster) = roster();
     let alice = account("alice@example.com");
@@ -708,6 +758,56 @@ fn unsubscribe_keeps_the_reverse_grant_and_does_not_advance_versions_twice() -> 
     assert!(repeated.contact.is_none());
     assert_eq!(version(&roster, &alice), 2);
     assert_eq!(version(&roster, &bob), 2);
+    Ok(())
+}
+
+#[test]
+fn unsubscribe_removes_only_the_to_direction() -> TestResult {
+    for (initial, final_state) in [
+        (SubscriptionState::None, SubscriptionState::None),
+        (SubscriptionState::To, SubscriptionState::None),
+        (SubscriptionState::From, SubscriptionState::From),
+        (SubscriptionState::Both, SubscriptionState::From),
+    ] {
+        let (_directory, roster) = roster();
+        let owner = account("alice@example.com");
+        let contact = jid("bob@example.com");
+        set_subscription(
+            &roster,
+            &owner,
+            &contact,
+            RosterSubscription {
+                state: initial,
+                pending_out: true,
+                approved: true,
+            },
+        )?;
+
+        let withdrawal = write(&roster, async |tx| {
+            state::unsubscribe(tx, &owner, &contact, None).await
+        })?;
+        let mutation = withdrawal.subscriber.ok_or("missing subscriber change")?;
+        let persisted = item(&roster, &owner, &contact).ok_or("missing roster item")?;
+        assert_eq!(
+            persisted.subscription,
+            RosterSubscription {
+                state: final_state,
+                pending_out: false,
+                approved: true,
+            }
+        );
+        assert_eq!(mutation.value, persisted);
+        assert_eq!(mutation.version.get(), 2);
+        assert_eq!(version(&roster, &owner), 2);
+
+        let repeated = write(&roster, async |tx| {
+            state::unsubscribe(tx, &owner, &contact, None).await
+        })?;
+        assert!(repeated.subscriber.is_none());
+        assert!(repeated.contact.is_none());
+        assert_eq!(item(&roster, &owner, &contact), Some(persisted));
+        assert_eq!(version(&roster, &owner), 2);
+    }
     Ok(())
 }
 

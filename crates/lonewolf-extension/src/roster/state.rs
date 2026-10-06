@@ -64,6 +64,22 @@ fn subscribed_to(state: SubscriptionState) -> bool {
     matches!(state, SubscriptionState::To | SubscriptionState::Both)
 }
 
+fn without_from(state: SubscriptionState) -> SubscriptionState {
+    match state {
+        SubscriptionState::From => SubscriptionState::None,
+        SubscriptionState::Both => SubscriptionState::To,
+        state => state,
+    }
+}
+
+fn without_to(state: SubscriptionState) -> SubscriptionState {
+    match state {
+        SubscriptionState::To => SubscriptionState::None,
+        SubscriptionState::Both => SubscriptionState::From,
+        state => state,
+    }
+}
+
 pub(super) fn bare_item(jid: RosterJid) -> RosterItem {
     RosterItem {
         jid,
@@ -245,18 +261,10 @@ pub(super) async fn cancel_subscription<W: WriteTransaction>(
     let grantor_mutation =
         update_existing_subscription(transaction, grantor, contact, |mut subscription| {
             let old = subscription;
-            subscription.state = match subscription.state {
-                SubscriptionState::From => SubscriptionState::None,
-                SubscriptionState::Both => SubscriptionState::To,
-                state => state,
-            };
+            subscription.state = without_from(subscription.state);
             subscription.approved = false;
             if same_item && route {
-                subscription.state = match subscription.state {
-                    SubscriptionState::To => SubscriptionState::None,
-                    SubscriptionState::Both => SubscriptionState::From,
-                    state => state,
-                };
+                subscription.state = without_to(subscription.state);
                 subscription.pending_out = false;
             }
             (subscription != old).then_some(subscription)
@@ -266,11 +274,7 @@ pub(super) async fn cancel_subscription<W: WriteTransaction>(
         Some((account, grantor_jid)) if route && !same_item => {
             update_existing_subscription(transaction, account, grantor_jid, |mut subscription| {
                 let old = subscription;
-                subscription.state = match subscription.state {
-                    SubscriptionState::To => SubscriptionState::None,
-                    SubscriptionState::Both => SubscriptionState::From,
-                    state => state,
-                };
+                subscription.state = without_to(subscription.state);
                 subscription.pending_out = false;
                 (subscription != old).then_some(subscription)
             })
@@ -310,18 +314,10 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
     let subscriber_mutation =
         update_existing_subscription(transaction, subscriber, contact, |mut subscription| {
             let old = subscription;
-            subscription.state = match subscription.state {
-                SubscriptionState::To => SubscriptionState::None,
-                SubscriptionState::Both => SubscriptionState::From,
-                state => state,
-            };
+            subscription.state = without_to(subscription.state);
             subscription.pending_out = false;
             if same_item && prior_grant {
-                subscription.state = match subscription.state {
-                    SubscriptionState::From => SubscriptionState::None,
-                    SubscriptionState::Both => SubscriptionState::To,
-                    state => state,
-                };
+                subscription.state = without_from(subscription.state);
             }
             (subscription != old).then_some(subscription)
         })
@@ -334,11 +330,7 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
                 subscriber_jid,
                 |mut subscription| {
                     let old = subscription;
-                    subscription.state = match subscription.state {
-                        SubscriptionState::From => SubscriptionState::None,
-                        SubscriptionState::Both => SubscriptionState::To,
-                        state => state,
-                    };
+                    subscription.state = without_from(subscription.state);
                     (subscription != old).then_some(subscription)
                 },
             )

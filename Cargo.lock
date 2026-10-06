@@ -1213,7 +1213,6 @@ dependencies = [
 name = "lonewolf-extension"
 version = "0.1.0"
 dependencies = [
- "async-lock",
  "futures-executor",
  "lonewolf-auth",
  "lonewolf-storage",

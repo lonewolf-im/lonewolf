@@ -1020,7 +1020,7 @@ fn unsupported_bare_jid_iq_get_returns_service_unavailable() -> TestResult {
 }
 
 #[test]
-fn unsupported_full_jid_iq_get_returns_service_unavailable() -> TestResult {
+fn full_jid_iq_get_reaches_its_sender_resource() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
@@ -1030,8 +1030,8 @@ fn unsupported_full_jid_iq_get_returns_service_unavailable() -> TestResult {
         <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query>
      </iq>"#,
     )?;
-    alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='alice@localhost/desk'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+    alice.expect_xml(r#"<iq xmlns='jabber:client' type='get' id='unsupported' from='alice@localhost/desk' to='alice@localhost/desk'>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query>
      </iq>"#)?;
     alice.close()
 }
@@ -1105,7 +1105,7 @@ fn unsupported_bare_jid_iq_set_returns_service_unavailable() -> TestResult {
 }
 
 #[test]
-fn unsupported_full_jid_iq_set_returns_service_unavailable() -> TestResult {
+fn full_jid_iq_set_reaches_its_sender_resource() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
@@ -1115,8 +1115,8 @@ fn unsupported_full_jid_iq_set_returns_service_unavailable() -> TestResult {
         <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query>
      </iq>"#,
     )?;
-    alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='alice@localhost/desk'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+    alice.expect_xml(r#"<iq xmlns='jabber:client' type='set' id='unsupported' from='alice@localhost/desk' to='alice@localhost/desk'>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query>
      </iq>"#)?;
     alice.close()
 }
@@ -1210,4 +1210,121 @@ fn unknown_message_type_uses_normal_routing_and_preserves_the_original_xml() -> 
     phone.close()?;
     desktop.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost' type='unavailable'/>")?;
     desktop.close()
+}
+
+#[test]
+fn directed_full_jid_iq_exchanges_preserve_envelopes_and_sender_order() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    bob.send("<presence to='alice@localhost/desk'/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost/desk'/>",
+    )?;
+
+    alice.send("<iq type='get' from='mallory@localhost/spy' to='bob@localhost/phone' id='get' xml:lang='es'><query xmlns='urn:lonewolf:test:iq'><value>kept</value></query></iq>")?;
+    alice.send("<iq type='set' to='bob@localhost/phone' id='set' xml:lang='fr'><query xmlns='urn:lonewolf:test:iq'><value>changed</value></query></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='get' from='alice@localhost/desk' to='bob@localhost/phone' id='get' xml:lang='es'><query xmlns='urn:lonewolf:test:iq'><value>kept</value></query></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='set' from='alice@localhost/desk' to='bob@localhost/phone' id='set' xml:lang='fr'><query xmlns='urn:lonewolf:test:iq'><value>changed</value></query></iq>")?;
+    bob.send("<iq type='result' from='mallory@localhost/spy' to='alice@localhost/desk' id='get' xml:lang='es'><query xmlns='urn:lonewolf:test:iq'><value>answer</value></query></iq>")?;
+    bob.send("<iq type='error' to='alice@localhost/desk' id='set' xml:lang='fr'><query xmlns='urn:lonewolf:test:iq'><value>changed</value></query><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' from='bob@localhost/phone' to='alice@localhost/desk' id='get' xml:lang='es'><query xmlns='urn:lonewolf:test:iq'><value>answer</value></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='set' xml:lang='fr'><query xmlns='urn:lonewolf:test:iq'><value>changed</value></query><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    bob.send("<presence to='alice@localhost/desk' type='unavailable'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='bob@localhost/phone' to='alice@localhost/desk'/>")?;
+    alice.send(
+        "<iq type='get' to='bob@localhost/phone' id='revoked'><query xmlns='urn:test:iq'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn missing_and_unauthorized_full_jid_iq_requests_have_the_same_error() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    for target in [
+        "bob@localhost/phone",
+        "bob@localhost/missing",
+        "nobody@localhost/phone",
+    ] {
+        alice.send(&format!(
+            "<iq type='get' to='{target}' id='denied'><query xmlns='urn:test:iq'/></iq>"
+        ))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='denied'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+    }
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn full_jid_iq_responses_ignore_presence_and_do_not_generate_error_loops() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    for priority in ["", "<priority>-1</priority>"] {
+        if !priority.is_empty() {
+            bob.send(&format!("<presence>{priority}</presence>"))?;
+            bob.expect_xml(&format!("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'>{priority}</presence>"))?;
+        }
+        alice.send("<iq type='result' to='bob@localhost/phone' id='answer'><query xmlns='urn:test:iq'/></iq>")?;
+        alice.send("<iq type='error' to='bob@localhost/phone' id='failure'><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        bob.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost/desk' to='bob@localhost/phone' id='answer'><query xmlns='urn:test:iq'/></iq>")?;
+        bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost/desk' to='bob@localhost/phone' id='failure'><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    }
+    for target in [
+        "bob@localhost/missing",
+        "bob@remote.example/phone",
+        "localhost",
+        "bob@localhost",
+    ] {
+        alice.send(&format!("<iq type='result' to='{target}' id='discard'/><iq type='error' to='{target}' id='discard'><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+    }
+    alice.send("<iq type='get' id='sentinel'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='sentinel' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='alice@localhost'/></iq>")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    alice.send("<presence type='subscribe' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>")?;
+    bob.send("<presence type='subscribed' to='alice@localhost'/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
+    )?;
+    alice.send(
+        "<iq type='get' to='bob@localhost/phone' id='allowed'><query xmlns='urn:test:iq'/></iq>",
+    )?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='get' from='alice@localhost/desk' to='bob@localhost/phone' id='allowed'><query xmlns='urn:test:iq'/></iq>")?;
+    bob.send("<presence type='unsubscribed' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='bob@localhost/phone' to='alice@localhost'/>")?;
+    alice.send(
+        "<iq type='set' to='bob@localhost/phone' id='revoked'><query xmlns='urn:test:iq'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.close()?;
+    bob.close()
 }

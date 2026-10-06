@@ -1435,3 +1435,134 @@ fn protected_access_survives_requester_cancellation_and_observes_prior_revocatio
         Ok(())
     })
 }
+
+async fn iq_request(
+    from: &str,
+    to: &str,
+) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn Error>> {
+    parse_stanza(&format!(
+        "<iq type='get' from='{from}' to='{to}' id='request'><query xmlns='urn:test:iq'/></iq>"
+    ))
+    .await
+}
+
+#[test]
+fn iq_requests_authorize_exact_resource_grants_and_same_accounts() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN.saturating_add(1))
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::MIN.saturating_add(1))
+            .await?;
+        let target = "alice@localhost/desk";
+        handle
+            .route_iq_request(iq_request("alice@localhost/phone", target).await?, false)
+            .await?;
+        assert_eq!(desk.take_queued().len(), 1);
+        assert_eq!(
+            handle
+                .route_iq_request(iq_request("bob@localhost/desk", target).await?, false)
+                .await,
+            Err(RouterError::NotFound)
+        );
+        directed_grant(&phone, "bob@localhost/desk", true).await?;
+        assert_eq!(
+            handle
+                .route_iq_request(iq_request("bob@localhost/desk", target).await?, false)
+                .await,
+            Err(RouterError::NotFound)
+        );
+        directed_grant(&desk, "bob@localhost/desk", true).await?;
+        handle
+            .route_iq_request(iq_request("bob@localhost/desk", target).await?, false)
+            .await?;
+        assert_eq!(desk.take_queued().len(), 1);
+        assert_eq!(
+            handle
+                .route_iq_request(iq_request("bob@localhost/phone", target).await?, false)
+                .await,
+            Err(RouterError::NotFound)
+        );
+        directed_grant(&desk, "bob@localhost/desk", false).await?;
+        assert_eq!(
+            handle
+                .route_iq_request(iq_request("bob@localhost/desk", target).await?, false)
+                .await,
+            Err(RouterError::NotFound)
+        );
+        directed_grant(&desk, "bob@localhost", true).await?;
+        handle
+            .route_iq_request(iq_request("bob@localhost/phone", target).await?, false)
+            .await?;
+        assert_eq!(desk.take_queued().len(), 1);
+        directed_grant(&desk, "bob@localhost", false).await?;
+        for priority in [None, Some(-1)] {
+            desk.handle()
+                .set_presence(
+                    priority,
+                    presence("desk").await?,
+                    Some(unavailable_presence("desk").await?),
+                )
+                .await?;
+            handle
+                .route_iq_request(iq_request("bob@localhost/phone", target).await?, true)
+                .await?;
+            assert_eq!(desk.take_queued().len(), 1);
+        }
+        drop((desk, phone));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn iq_requests_do_not_fall_back_on_backpressure_or_reuse_replaced_grants() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let desk = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN.saturating_add(1))
+            .await?;
+        let phone = handle
+            .register(&alice, Some("phone"), NonZeroUsize::MIN.saturating_add(1))
+            .await?;
+        directed_grant(&desk, "bob@localhost/desk", true).await?;
+        let request = iq_request("bob@localhost/desk", "alice@localhost/desk").await?;
+        for _ in 0..64 {
+            handle.route_iq_request(request.clone(), false).await?;
+        }
+        assert_eq!(
+            handle.route_iq_request(request.clone(), false).await,
+            Err(RouterError::Busy)
+        );
+        assert!(phone.take_queued().is_empty());
+        assert_eq!(desk.take_queued().len(), 64);
+        drop(desk);
+        let replacement = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN.saturating_add(1))
+            .await?;
+        assert_eq!(
+            handle.route_iq_request(request.clone(), false).await,
+            Err(RouterError::NotFound)
+        );
+        assert!(replacement.take_queued().is_empty());
+        directed_grant(&replacement, "bob@localhost/desk", true).await?;
+        handle.route_iq_request(request.clone(), false).await?;
+        assert_eq!(replacement.take_queued().len(), 1);
+        handle.retire_account(&alice).await?;
+        assert_eq!(
+            handle.route_iq_request(request, true).await,
+            Err(RouterError::NotFound)
+        );
+        drop((phone, replacement));
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}

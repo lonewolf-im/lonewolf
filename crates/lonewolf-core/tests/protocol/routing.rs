@@ -3,23 +3,25 @@
 use super::support::{C2sSuite, TestResult};
 
 #[test]
-fn full_jid_message_reaches_a_resource_without_presence() -> TestResult {
+fn full_jid_normal_and_chat_reach_unavailable_and_negative_priority_resources() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     suite.create_account("bob", "secret")?;
     let mut alice = suite.connect("alice", "pencil", "desktop")?;
     let mut bob = suite.connect("bob", "secret", "phone")?;
 
-    alice.send(
-        "<message to='bob@localhost/phone' type='chat' id='hello'><body>Hello</body></message>",
-    )?;
-
-    bob.expect_xml(
-        "<message xmlns='jabber:client' from='alice@localhost/desktop'
-                  to='bob@localhost/phone' type='chat' id='hello'>
-            <body>Hello</body>
-         </message>",
-    )?;
+    for priority in [None, Some(-1)] {
+        if let Some(priority) = priority {
+            bob.send(&format!(
+                "<presence><priority>{priority}</priority></presence>"
+            ))?;
+            bob.expect_xml(&format!("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>{priority}</priority></presence>"))?;
+        }
+        for kind in ["normal", "chat"] {
+            alice.send(&format!("<message to='bob@localhost/phone' type='{kind}' id='hello'><body>Hello</body></message>"))?;
+            bob.expect_xml(&format!("<message xmlns='jabber:client' from='alice@localhost/desktop' to='bob@localhost/phone' type='{kind}' id='hello'><body>Hello</body></message>"))?;
+        }
+    }
     alice.close()?;
     bob.close()
 }

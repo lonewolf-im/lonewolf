@@ -142,7 +142,7 @@ pub struct Registration<A: ChunkAllocator> {
     resource: Box<str>,
     token: u64,
     alive: Arc<AtomicBool>,
-    /// Everything whose drop signals another task, deferred as a whole while unwinding.
+    /// Defer these values during panic unwinding because dropping them wakes other tasks.
     links: mem::ManuallyDrop<Links<A>>,
 }
 
@@ -1911,15 +1911,6 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             {
                 self.deliver_bare(stanza, true)
             }
-            Err(RouterError::NotFound)
-                if fallback_chat
-                    && view.stanza_type() == StanzaType::Message(MessageType::Normal)
-                    && !self.accounts.get(account).is_some_and(|sessions| {
-                        sessions.values().any(Session::accepts_bare_message)
-                    }) =>
-            {
-                Err(RouterError::Offline)
-            }
             result => result,
         }
     }
@@ -2775,6 +2766,80 @@ mod tests {
                     .values()
                     .all(|session| session.alive.load(Ordering::Acquire))
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn full_normal_delivery_linearizes_at_exact_resource_binding_and_disconnect()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for sibling_priority in [None, Some(-1), Some(0)] {
+                for closed in [false, true] {
+                    let account = account()?;
+                    let mut shard = Shard::<GlobalChunkAllocator>::new();
+                    let (commands, _) = async_channel::bounded(1);
+                    let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
+                    let (outbound, inbound) = async_channel::bounded(64);
+                    let sibling = shard.register(
+                        account.clone(),
+                        Some("phone".into()),
+                        limit,
+                        outbound,
+                        inbound,
+                        test_router(commands.clone()),
+                    )?;
+                    shard
+                        .accounts
+                        .get_mut(account.as_str())
+                        .ok_or("missing account")?
+                        .get_mut("phone")
+                        .ok_or("missing sibling")?
+                        .priority = sibling_priority;
+                    let stanza =
+                        routed("<message to='alice@localhost/desk' type='normal'/>").await?;
+                    assert_eq!(
+                        shard.deliver(stanza.clone(), true),
+                        Err(RouterError::NotFound)
+                    );
+                    let (outbound, inbound) = async_channel::bounded(64);
+                    let desk = shard.register(
+                        account.clone(),
+                        Some("desk".into()),
+                        limit,
+                        outbound,
+                        inbound,
+                        test_router(commands),
+                    )?;
+                    for priority in [None, Some(-1)] {
+                        shard
+                            .accounts
+                            .get_mut(account.as_str())
+                            .ok_or("missing account")?
+                            .get_mut("desk")
+                            .ok_or("missing resource")?
+                            .priority = priority;
+                        assert_eq!(shard.deliver(stanza.clone(), true), Ok(()));
+                        let delivered = desk.links.inbound.try_recv()?;
+                        assert_eq!(
+                            delivered.resolve()?.to()?.ok_or("missing target")?.as_str(),
+                            "alice@localhost/desk"
+                        );
+                    }
+                    if closed {
+                        desk.links.inbound.close();
+                    } else {
+                        desk.alive.store(false, Ordering::Release);
+                    }
+                    assert_eq!(
+                        shard.deliver(stanza.clone(), true),
+                        Err(RouterError::NotFound)
+                    );
+                    assert_eq!(shard.deliver(stanza, true), Err(RouterError::NotFound));
+                    assert!(sibling.take_queued().is_empty());
+                    assert!(!shard.accounts[account.as_str()].contains_key("desk"));
+                }
+            }
             Ok(())
         })
     }

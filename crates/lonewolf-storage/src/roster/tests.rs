@@ -54,6 +54,26 @@ fn roster_jids_are_owned_normalized_addresses() -> TestResult {
 }
 
 #[test]
+fn canonical_domain_and_resource_roster_keys_survive_storage_reads() -> TestResult {
+    let storage = storage()?;
+    let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    block_on(write(&storage, async |tx| {
+        tx.create_account(account).await?;
+        for contact in ["example.com", "bob@example.com/desktop"] {
+            tx.put_roster_item(&alice, &item(contact, None, &[])?)
+                .await?;
+        }
+        Ok::<(), Box<dyn Error>>(())
+    }))?;
+    let snapshot = block_on(read(&storage, async |tx| tx.roster(&alice).await))?;
+    assert_eq!(snapshot.items.len(), 2);
+    assert_eq!(snapshot.items[0].jid.as_str(), "bob@example.com/desktop");
+    assert_eq!(snapshot.items[1].jid.as_str(), "example.com");
+    Ok(())
+}
+
+#[test]
 fn malformed_item_records_fail_operations_and_stay_unchanged_when_the_transaction_is_dropped()
 -> TestResult {
     let storage = storage()?;

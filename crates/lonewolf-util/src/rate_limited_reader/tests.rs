@@ -4,10 +4,11 @@ use std::error::Error;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use futures_util::future::poll_fn;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, ReadBuf};
 
 use super::*;
@@ -96,34 +97,67 @@ fn transport_upgrade_keeps_rate_allowance() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn refill_keeps_fractional_credit_and_caps_at_burst() {
-    let mut reader = RateLimitedReader::new(
-        SliceReader { bytes: b"" },
-        NonZeroUsize::new(3).unwrap(),
-        NonZeroUsize::new(2).unwrap(),
-    );
-    reader.tokens = 0;
-    let start = reader.updated_at;
-    reader.replenish(start + Duration::from_millis(100));
-    assert_eq!(reader.tokens, 0);
-    assert_eq!(reader.remainder, 300_000_000);
-    reader.replenish(start + Duration::from_millis(400));
-    assert_eq!(reader.tokens, 1);
-    assert_eq!(reader.remainder, 200_000_000);
-    reader.replenish(start + Duration::from_secs(2));
-    assert_eq!(reader.tokens, 2);
-    assert_eq!(reader.remainder, 0);
-    assert_eq!(reader.refill_delay(), Duration::from_nanos(333_333_334));
+fn transport_upgrade_keeps_an_already_pending_refill_timer() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let mut before = RateLimitedReader::new(
+            SliceReader { bytes: b"ab" },
+            NonZeroUsize::new(2).ok_or("invalid rate")?,
+            NonZeroUsize::MIN,
+        );
+        let mut initial = [0; 1];
+        before.read_exact(&mut initial).await?;
+        assert_eq!(&initial, b"a");
+        poll_fn(|cx| {
+            assert!(Pin::new(&mut before).poll_fill_buf(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let timer = before
+            .state
+            .refill_wait
+            .as_ref()
+            .ok_or("missing pending timer")?
+            .as_ref()
+            .get_ref() as *const dyn Future<Output = ()>;
+        let delay = before
+            .state
+            .bucket
+            .refill_delay(before.state.bytes_per_second);
+        let state = before.into_state();
+        assert_eq!(state.bucket.available(), 0);
+        let mut after = RateLimitedReader::from_state(SliceReader { bytes: b"c" }, state);
+        assert_eq!(after.state.bucket.available(), 0);
+        assert_eq!(
+            after
+                .state
+                .bucket
+                .refill_delay(after.state.bytes_per_second),
+            delay
+        );
+        assert!(std::ptr::eq(
+            timer,
+            after
+                .state
+                .refill_wait
+                .as_ref()
+                .ok_or("missing transferred timer")?
+                .as_ref()
+                .get_ref()
+        ));
+        let mut next = [0; 1];
+        timeout(Duration::from_secs(1), after.read_exact(&mut next)).await??;
+        assert_eq!(&next, b"c");
+        Ok::<_, Box<dyn Error>>(())
+    })
 }
 
 #[test]
-fn high_rate_with_small_burst_waits_at_least_one_nanosecond() {
+#[should_panic]
+fn consuming_more_than_the_reader_allowance_panics() {
     let mut reader = RateLimitedReader::new(
-        SliceReader { bytes: b"" },
-        NonZeroUsize::new(usize::MAX).unwrap(),
+        SliceReader { bytes: b"ab" },
+        NonZeroUsize::MIN,
         NonZeroUsize::MIN,
     );
-    reader.tokens = 0;
-    reader.replenish(Instant::now());
-    assert_eq!(reader.refill_delay(), Duration::from_nanos(1));
+    Pin::new(&mut reader).consume(2);
 }

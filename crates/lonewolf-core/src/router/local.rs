@@ -21,10 +21,10 @@ use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_extension::delivery::{SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
-use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator};
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use lonewolf_xmpp::jid::{JidError, JidRef};
-use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaType};
+use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaRef, StanzaType};
 
 use super::{RoutedStanza, RouterError};
 
@@ -500,13 +500,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
-            let to = view
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            to.resourcepart().ok_or(RouterError::InvalidTarget)?;
-            to.localpart().ok_or(RouterError::InvalidTarget)?;
-            self.shard_index(to.bare().as_str())
+            self.full_target_shard(&view)?
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
@@ -529,13 +523,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
-            let to = view
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            to.localpart().ok_or(RouterError::InvalidTarget)?;
-            to.resourcepart().ok_or(RouterError::InvalidTarget)?;
-            self.shard_index(to.bare().as_str())
+            self.full_target_shard(&view)?
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
@@ -553,15 +541,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     pub(crate) async fn deliver_bare(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
-            let to = view
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            to.localpart().ok_or(RouterError::InvalidTarget)?;
-            if to.resourcepart().is_some() {
-                return Err(RouterError::InvalidTarget);
-            }
-            self.shard_index(to.as_str())
+            self.bare_target_shard(&view)?
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
@@ -577,15 +557,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
-            let to = view
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            to.localpart().ok_or(RouterError::InvalidTarget)?;
-            if to.resourcepart().is_some() {
-                return Err(RouterError::InvalidTarget);
-            }
-            self.shard_index(to.as_str())
+            self.bare_target_shard(&view)?
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
@@ -604,15 +576,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             if view.stanza_type() != StanzaType::Presence(PresenceType::Error) {
                 return Err(RouterError::InvalidTarget);
             }
-            let to = view
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            to.localpart().ok_or(RouterError::InvalidTarget)?;
-            if to.resourcepart().is_some() {
-                return Err(RouterError::InvalidTarget);
-            }
-            self.shard_index(to.as_str())
+            self.bare_target_shard(&view)?
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
@@ -629,15 +593,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
-            let to = view
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            to.localpart().ok_or(RouterError::InvalidTarget)?;
-            if to.resourcepart().is_some() {
-                return Err(RouterError::InvalidTarget);
-            }
-            self.shard_index(to.as_str())
+            self.bare_target_shard(&view)?
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
@@ -804,6 +760,34 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
 impl<A: ChunkAllocator> LocalRouterHandle<A> {
     fn shard(&self, bare: &str) -> &Sender<Command<A>> {
         &self.shards[self.shard_index(bare)]
+    }
+
+    fn full_target_shard<R: ArenaRead>(
+        &self,
+        stanza: &StanzaRef<'_, R>,
+    ) -> Result<usize, RouterError> {
+        let to = stanza
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        to.localpart().ok_or(RouterError::InvalidTarget)?;
+        to.resourcepart().ok_or(RouterError::InvalidTarget)?;
+        Ok(self.shard_index(to.bare().as_str()))
+    }
+
+    fn bare_target_shard<R: ArenaRead>(
+        &self,
+        stanza: &StanzaRef<'_, R>,
+    ) -> Result<usize, RouterError> {
+        let to = stanza
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        to.localpart().ok_or(RouterError::InvalidTarget)?;
+        if to.resourcepart().is_some() {
+            return Err(RouterError::InvalidTarget);
+        }
+        Ok(self.shard_index(to.as_str()))
     }
 
     fn shard_index(&self, bare: &str) -> usize {
@@ -2659,6 +2643,76 @@ mod tests {
             Some(StreamEvent::Stanza(parsed)) => Ok(RoutedStanza::from_parsed(parsed)),
             _ => Err("expected a stanza".into()),
         }
+    }
+
+    #[test]
+    fn invalid_target_forms_fail_before_command_submission() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let (sender, receiver) = async_channel::bounded(1);
+            let router = test_router(sender);
+            for target in [
+                "",
+                " to='localhost'",
+                " to='localhost/desk'",
+                " to='alice@localhost'",
+            ] {
+                let xml = format!("<presence type='error'{target}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>");
+                assert_eq!(
+                    router
+                        .deliver_full_or_chat_fallback(routed(&xml).await?, false, None)
+                        .now_or_never(),
+                    Some(Err(RouterError::InvalidTarget))
+                );
+                assert!(receiver.is_empty());
+                assert_eq!(
+                    router
+                        .deliver_iq_request(routed(&xml).await?, false, None)
+                        .now_or_never(),
+                    Some(Err(RouterError::InvalidTarget))
+                );
+                assert!(receiver.is_empty());
+            }
+            for target in [
+                "",
+                " to='localhost'",
+                " to='localhost/desk'",
+                " to='alice@localhost/desk'",
+            ] {
+                let xml = format!("<presence type='error'{target}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>");
+                assert_eq!(
+                    router.deliver_bare(routed(&xml).await?).now_or_never(),
+                    Some(Err(RouterError::InvalidTarget))
+                );
+                assert!(receiver.is_empty());
+                assert_eq!(
+                    router.deliver_presence(routed(&xml).await?).now_or_never(),
+                    Some(Err(RouterError::InvalidTarget))
+                );
+                assert!(receiver.is_empty());
+                assert_eq!(
+                    router
+                        .deliver_presence_error(routed(&xml).await?)
+                        .now_or_never(),
+                    Some(Err(RouterError::InvalidTarget))
+                );
+                assert!(receiver.is_empty());
+                assert_eq!(
+                    router
+                        .deliver_presence_to_tagged(SessionTag::Interested, routed(&xml).await?)
+                        .now_or_never(),
+                    Some(Err(RouterError::InvalidTarget))
+                );
+                assert!(receiver.is_empty());
+            }
+            assert_eq!(
+                router
+                    .deliver_presence_error(routed("<presence to='alice@localhost'/>").await?)
+                    .now_or_never(),
+                Some(Err(RouterError::InvalidTarget))
+            );
+            assert!(receiver.is_empty());
+            Ok(())
+        })
     }
 
     #[test]

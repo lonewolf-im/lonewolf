@@ -327,6 +327,31 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.deliver_presence(stanza).await
     }
 
+    pub(crate) async fn route_presence_error(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        if view.stanza_type() != StanzaType::Presence(PresenceType::Error) {
+            return Err(RouterError::InvalidTarget);
+        }
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !self.hosts.is_local_host(to.domainpart()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        if to.localpart().is_none() {
+            return Err(RouterError::InvalidTarget);
+        }
+        if to.resourcepart().is_some() {
+            self.route_full(stanza).await
+        } else {
+            self.local.deliver_presence_error(stanza).await
+        }
+    }
+
     pub(crate) async fn route_presence_to_tagged(
         &self,
         tag: SessionTag,

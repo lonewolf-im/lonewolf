@@ -81,7 +81,7 @@ struct ReplayAcknowledgement {
 enum Output<A: ChunkAllocator> {
     Routed(RoutedStanza<A>),
     Owned {
-        stanzas: Vec<Stanza>,
+        stanza: Stanza,
         arena: Arena<A>,
     },
     /// Parse each request at write time to keep large backlogs out of memory.
@@ -372,7 +372,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         )?;
         let reply = rejected.error_in(authenticated, &mut arena)?;
         self.outbox.push(Output::Owned {
-            stanzas: vec![reply],
+            stanza: reply,
             arena,
         });
         Ok(())
@@ -446,7 +446,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 None,
             )?;
             self.outbox.push(Output::Owned {
-                stanzas: vec![reply],
+                stanza: reply,
                 arena,
             });
             return Ok(());
@@ -473,7 +473,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             if to.localpart().is_none() {
                 return if matches!(kind, IqType::Get | IqType::Set) {
                     self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
-                        .await
                 } else {
                     Ok(())
                 };
@@ -504,15 +503,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             }
             Err(RouterError::Busy | RouterError::ResourceLimit) => {
                 self.reply_error(&routed, StanzaErrorCondition::ResourceConstraint)
-                    .await
             }
             Err(RouterError::Unavailable | RouterError::Stopped) => {
                 Err(CloseOutcome::InternalError)
             }
-            Err(_) => {
-                self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
-                    .await
-            }
+            Err(_) => self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable),
         }
     }
 
@@ -631,7 +626,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             Err(HandlerError::Stanza(condition)) => {
                 let reply = iq::error_reply(&request, &mut arena, condition, Some(sender))?;
                 self.outbox.push(Output::Owned {
-                    stanzas: vec![reply],
+                    stanza: reply,
                     arena,
                 });
             }
@@ -642,7 +637,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                     iq::result_reply(&stanza, sender, payload, &mut response)?
                 };
                 self.outbox.push(Output::Owned {
-                    stanzas: vec![reply],
+                    stanza: reply,
                     arena: response,
                 });
             }
@@ -791,9 +786,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             return Ok(());
         }
         if bare && kind == MessageType::Groupchat {
-            return self
-                .reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
-                .await;
+            return self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable);
         }
         if let Err(error) = self.router.route_message(routed.clone()).await {
             if kind == MessageType::Error
@@ -821,7 +814,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                     return Err(CloseOutcome::InternalError);
                 }
             };
-            self.reply_error(&routed, condition).await?;
+            self.reply_error(&routed, condition)?;
         }
         Ok(())
     }
@@ -843,9 +836,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 recipient_jid = ?recipient.as_str(),
                 "offline message policy decided"
             );
-            return self
-                .reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
-                .await;
+            return self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable);
         };
         let bytes = if tracing::enabled!(tracing::Level::INFO) {
             stanza_bytes(&routed)?
@@ -873,7 +864,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         match outcome {
             Err(HandlerError::Stanza(condition)) => {
                 drop(transaction);
-                self.reply_error(&routed, condition).await
+                self.reply_error(&routed, condition)
             }
             Ok(StoreOutcome::Discarded) => {
                 drop(transaction);
@@ -913,7 +904,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 Ok(priority) => Some(priority),
                 Err(condition) => {
                     let routed = self.stamp(parsed)?;
-                    return self.reply_error(&routed, condition).await;
+                    return self.reply_error(&routed, condition);
                 }
             }
         } else {
@@ -992,7 +983,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             Ok(result) => result,
             Err(condition) => {
                 let routed = RoutedStanza::from_parts(stamped, arena);
-                return self.reply_error(&routed, condition).await;
+                return self.reply_error(&routed, condition);
             }
         };
         let (routed, unavailable) = match unavailable {
@@ -1077,7 +1068,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 .await
         };
         if let Err(condition) = authorized {
-            return self.reply_error(&source, condition).await;
+            return self.reply_error(&source, condition);
         }
         let received = {
             let (sender, target) = presence_addresses(&routed)?;
@@ -1145,11 +1136,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 self.outbox.routed(queued);
                 Ok(())
             }
-            Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition).await,
+            Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition),
         }
     }
 
-    async fn reply_error(
+    fn reply_error(
         &mut self,
         source: &RoutedStanza<A>,
         condition: StanzaErrorCondition,
@@ -1158,7 +1149,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         let source = source.resolve()?.clone_in(&mut arena)?;
         let reply = source.error_reply_in(&mut arena, condition)?.build()?;
         self.outbox.push(Output::Owned {
-            stanzas: vec![reply],
+            stanza: reply,
             arena,
         });
         Ok(())
@@ -1267,12 +1258,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                     self.check_certificate()?;
                     self.writer.write_routed(&stanza).await?;
                 }
-                Output::Owned { stanzas, arena } => {
-                    for stanza in &stanzas {
-                        let stanza = stanza.resolve(&arena)?;
-                        self.check_certificate()?;
-                        self.writer.write_stanza(&stanza).await?;
-                    }
+                Output::Owned { stanza, arena } => {
+                    let stanza = stanza.resolve(&arena)?;
+                    self.check_certificate()?;
+                    self.writer.write_stanza(&stanza).await?;
                 }
                 Output::Requests(requests) => {
                     for subscription in requests {

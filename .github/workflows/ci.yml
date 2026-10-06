@@ -73,10 +73,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Test default features
-        run: cargo nextest run --workspace --locked --profile ci
-      - name: Test documentation with default features
-        run: cargo test --workspace --doc --locked
       - name: Test all targets and features
         run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
       - name: Test documentation with all features

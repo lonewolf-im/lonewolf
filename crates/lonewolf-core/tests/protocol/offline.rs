@@ -322,7 +322,7 @@ fn offline_only_host_replays_three_messages_after_the_echo_and_a_second_login_ge
     accounts(&suite)?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
     for index in 0..3 {
-        alice.send(&format!("<message to='bob@localhost/old' type='normal' id='stored-{index}'><body>Hello {index}</body></message>"))?;
+        alice.send(&format!("<message to='bob@localhost' type='normal' id='stored-{index}'><body>Hello {index}</body></message>"))?;
     }
     barrier(&mut alice, "alice@localhost/desk")?;
     let mut bob = suite.connect("bob", "secret", "phone")?;
@@ -334,7 +334,7 @@ fn offline_only_host_replays_three_messages_after_the_echo_and_a_second_login_ge
         receive_stored(
             &mut bob,
             &format!(
-                "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/old' type='normal' id='stored-{index}'><body>Hello {index}</body></message>"
+                "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='normal' id='stored-{index}'><body>Hello {index}</body></message>"
             ),
         )?;
     }
@@ -373,12 +373,16 @@ fn negative_initial_priority_defers_replay_until_it_is_raised_to_zero() -> TestR
 }
 
 #[test]
-fn chat_and_missing_full_normal_are_stored_without_a_sender_reply() -> TestResult {
+fn bare_normal_and_missing_full_chat_store_while_missing_full_normal_is_rejected() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
-    alice.send("<message to='bob@localhost' type='chat' id='chat'><body>Hello</body></message>")?;
-    alice.send("<message to='bob@localhost/missing' type='normal' id='normal'><body>Hello</body></message>")?;
+    alice.send(
+        "<message to='bob@localhost' type='normal' id='normal'><body>Hello</body></message>",
+    )?;
+    alice.send(
+        "<message to='bob@localhost/missing' type='chat' id='chat'><body>Hello</body></message>",
+    )?;
     barrier(&mut alice, "alice@localhost/desk")?;
     let mut bob = suite.connect("bob", "secret", "phone")?;
     inspect(
@@ -388,25 +392,74 @@ fn chat_and_missing_full_normal_are_stored_without_a_sender_reply() -> TestResul
         2,
         Some("bob@localhost/missing"),
     )?;
+    alice.send("<message to='bob@localhost/missing' type='normal' id='rejected'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='rejected' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    inspect(
+        &mut bob,
+        "bob@localhost/phone",
+        2,
+        2,
+        Some("bob@localhost/missing"),
+    )?;
+    bob.close()?;
+    let mut bob = suite.connect("bob", "secret", "missing")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/missing' to='bob@localhost'/>",
+    )?;
+    receive_stored(
+        &mut bob,
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='normal' id='normal'><body>Hello</body></message>",
+    )?;
+    receive_stored(
+        &mut bob,
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/missing' type='chat' id='chat'><body>Hello</body></message>",
+    )?;
+    await_empty(&mut bob, "bob@localhost/missing")?;
     bob.close()?;
     alice.close()
 }
 
 #[test]
-fn missing_full_normal_is_rejected_when_another_recipient_resource_is_eligible() -> TestResult {
-    let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
-    accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
-    bob.send("<presence/>")?;
-    bob.expect_xml(
-        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
-    )?;
-    alice.send("<message to='bob@localhost/missing' type='normal' id='missing'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='missing' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
-    inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
-    bob.close()?;
-    alice.close()
+fn missing_full_normal_is_rejected_without_storage_or_replay_for_every_sibling_state() -> TestResult
+{
+    for extensions in [
+        "'offline', 'test-offline-inspect'",
+        "'test-offline-inspect'",
+    ] {
+        for priority in [None, Some(-1), Some(0)] {
+            let suite = C2sSuite::with_extensions(extensions)?;
+            accounts(&suite)?;
+            let mut alice = suite.connect("alice", "pencil", "desk")?;
+            let mut sibling = if let Some(priority) = priority {
+                let mut bob = suite.connect("bob", "secret", "phone")?;
+                bob.send(&format!(
+                    "<presence><priority>{priority}</priority></presence>"
+                ))?;
+                bob.expect_xml(&format!("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>{priority}</priority></presence>"))?;
+                inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
+                Some(bob)
+            } else {
+                None
+            };
+            alice.send("<message to='bob@localhost/missing' from='mallory@localhost' type='normal' id='missing'/>")?;
+            alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='missing' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+            if let Some(bob) = &mut sibling {
+                inspect(bob, "bob@localhost/phone", 0, 0, None)?;
+                bob.close()?;
+            }
+            let mut bob = suite.connect("bob", "secret", "missing")?;
+            inspect(&mut bob, "bob@localhost/missing", 0, 0, None)?;
+            bob.send("<presence/>")?;
+            bob.expect_xml(
+                "<presence xmlns='jabber:client' from='bob@localhost/missing' to='bob@localhost'/>",
+            )?;
+            inspect(&mut bob, "bob@localhost/missing", 0, 0, None)?;
+            bob.close()?;
+            alice.close()?;
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -529,28 +582,25 @@ fn availability_fixed_before_store_commit_gets_the_chat_live_without_a_delay() -
 }
 
 #[test]
-fn full_normal_race_keeps_the_original_target_stored_when_another_resource_becomes_eligible()
--> TestResult {
+fn rejected_full_normal_stays_absent_when_a_sibling_becomes_eligible() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-slow-offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
     let mut bob = suite.connect("bob", "secret", "phone")?;
-    alice.send(
-        "<message to='bob@localhost/missing' type='normal' id='raced'><body>Hello</body></message>",
-    )?;
-    suite.wait_for_log("test offline store waiting")?;
+    alice.send("<message to='bob@localhost/missing' type='normal' id='raced'/>")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
     )?;
-    barrier(&mut alice, "alice@localhost/desk")?;
-    inspect(
-        &mut bob,
-        "bob@localhost/phone",
-        1,
-        1,
-        Some("bob@localhost/missing"),
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='raced' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
+    bob.close()?;
+    let mut bob = suite.connect("bob", "secret", "missing")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/missing' to='bob@localhost'/>",
     )?;
+    inspect(&mut bob, "bob@localhost/missing", 0, 0, None)?;
     bob.close()?;
     alice.close()
 }

@@ -170,7 +170,7 @@ fn absent_account_message_targets_distinguish_offline_from_missing_resources() -
             ("alice@localhost", "normal", RouterError::Offline),
             ("alice@localhost", "chat", RouterError::Offline),
             ("alice@localhost", "headline", RouterError::Offline),
-            ("alice@localhost/missing", "normal", RouterError::Offline),
+            ("alice@localhost/missing", "normal", RouterError::NotFound),
             ("alice@localhost/missing", "chat", RouterError::Offline),
             ("alice@localhost/missing", "headline", RouterError::NotFound),
             ("localhost", "normal", RouterError::NotFound),
@@ -194,7 +194,7 @@ fn absent_account_message_targets_distinguish_offline_from_missing_resources() -
 }
 
 #[test]
-fn unavailable_negative_and_disconnected_resources_produce_offline() -> TestResult {
+fn unavailable_and_negative_siblings_keep_full_normal_targets_missing() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;
         let handle = router.handle();
@@ -211,18 +211,21 @@ fn unavailable_negative_and_disconnected_resources_produce_offline() -> TestResu
                     Some(unavailable_presence("desk").await?),
                 )
                 .await?;
-            for (to, kind) in [
-                ("alice@localhost", "normal"),
-                ("alice@localhost", "chat"),
-                ("alice@localhost", "headline"),
-                ("alice@localhost/missing", "normal"),
-                ("alice@localhost/missing", "chat"),
+            for (to, kind, expected) in [
+                ("alice@localhost", "normal", RouterError::Offline),
+                ("alice@localhost", "chat", RouterError::Offline),
+                ("alice@localhost", "headline", RouterError::Offline),
+                ("alice@localhost/missing", "normal", RouterError::NotFound),
+                ("alice@localhost/missing", "chat", RouterError::Offline),
+                ("alice@localhost/missing", "headline", RouterError::NotFound),
+                (
+                    "alice@localhost/missing",
+                    "groupchat",
+                    RouterError::NotFound,
+                ),
             ] {
                 let stanza = parse_stanza(&format!("<message to='{to}' type='{kind}'/>")).await?;
-                assert_eq!(
-                    handle.route_message(stanza).await,
-                    Err(RouterError::Offline)
-                );
+                assert_eq!(handle.route_message(stanza).await, Err(expected));
             }
             assert!(resource.take_queued().is_empty());
         }

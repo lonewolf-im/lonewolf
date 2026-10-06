@@ -1122,3 +1122,207 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
         fixture.finish().await
     })
 }
+
+#[test]
+fn iq_order_wait_rechecks_directed_grants_replacement_deletion_and_source_retirement() -> TestResult
+{
+    Runtime::new()?.block_on(async {
+        for action in 0..5 {
+            let fixture = Fixture::new(&[]).await?;
+            let router = fixture.router.handle();
+            let mut arena = Arena::try_new(Default::default())?;
+            let to = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+            let target_account = AccountKey::try_from(to.resolve(&arena)?.bare())?;
+            let target = router
+                .register(&target_account, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            target
+                .handle()
+                .directed_presence(
+                    routed_presence(
+                        "alice@localhost/desk",
+                        Some("bob@localhost/phone"),
+                        PresenceType::Available,
+                    )?,
+                    true,
+                )
+                .await?;
+            fixture.registration.take_queued();
+            let from = Jid::parse_in("bob@localhost/phone", &mut arena)?;
+            let query = Element::builder_in("query", "urn:test:iq", &mut arena)?.build()?;
+            let stanza = Stanza::builder_in(
+                StanzaType::Iq(IqType::Get),
+                StanzaNamespace::Client,
+                &mut arena,
+            )
+            .from(Some(from))?
+            .to(Some(to))?
+            .id(Some("waiting"))?
+            .child(query)?
+            .build()?;
+            let ((), mut blocker) = router
+                .order()
+                .fix(vec![target_account.clone()], async {
+                    Ok::<_, RouterError>(())
+                })
+                .await?;
+            blocker.turn().await;
+            let ((), ticket) = router
+                .order()
+                .fix(
+                    vec![
+                        target_account.clone(),
+                        fixture.registration.account().clone(),
+                    ],
+                    async { Ok::<_, RouterError>(()) },
+                )
+                .await?;
+            let work = ResourceIqWork {
+                source: fixture.registration.account().clone(),
+                liveness: fixture.registration.liveness(),
+                router: router.clone(),
+                storage: fixture.storage.clone(),
+                target: target_account.clone(),
+                request: true,
+                stanza: RoutedStanza::from_parts(stanza, arena),
+            };
+            let pending = Pending::spawn(fixture.work.start(), work.admit(false, ticket));
+            let mut replacement = None;
+            match action {
+                1 => {
+                    target
+                        .handle()
+                        .directed_presence(
+                            routed_presence(
+                                "alice@localhost/desk",
+                                Some("bob@localhost/phone"),
+                                PresenceType::Unavailable,
+                            )?,
+                            false,
+                        )
+                        .await?;
+                }
+                2 => {
+                    router.retire_account(&target_account).await?;
+                    replacement = Some(
+                        router
+                            .register(&target_account, Some("desk"), NonZeroUsize::MIN)
+                            .await?,
+                    );
+                }
+                3 => router.retire_account(&target_account).await?,
+                4 => {
+                    router
+                        .retire_account(fixture.registration.account())
+                        .await?
+                }
+                _ => {}
+            }
+            drop(blocker);
+            let result = pending.finished().await.ok_or("missing IQ outcome")?;
+            if action == 0 {
+                result?;
+                assert_eq!(target.take_queued().len(), 1);
+            } else {
+                assert_eq!(
+                    result,
+                    if action == 4 {
+                        Ok(())
+                    } else {
+                        Err(RouterError::NotFound)
+                    }
+                );
+                assert!(target.take_queued().is_empty());
+                if let Some(replacement) = &replacement {
+                    assert!(replacement.take_queued().is_empty());
+                }
+            }
+            drop((target, replacement));
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn iq_visibility_reads_prior_roster_revocation_while_delivery_waits_on_order() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_storage::roster::{
+            RosterItem, RosterSubscription, RosterWrites, SubscriptionState,
+        };
+        let mut fixture = Fixture::new(&[]).await?;
+        let mut catalog = lonewolf_extension::Extensions::default();
+        catalog.register(Arc::new(lonewolf_extension::roster::Roster::new(
+            Default::default(),
+        )))?;
+        fixture.router = fixture
+            .router
+            .with_extensions(std::collections::BTreeMap::from([(
+                "localhost".into(),
+                catalog.enable(["roster"])?,
+            )]));
+        let router = fixture.router.handle();
+        let mut arena = Arena::try_new(Default::default())?;
+        let from = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+        let account = AccountKey::try_from(from.resolve(&arena)?.bare())?;
+        let source = router
+            .register(&account, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let owner = fixture.registration.account().clone();
+        let contact = RosterJid::from(&account);
+        let mut transaction = fixture.storage.begin_write().await?;
+        transaction
+            .put_roster_item(
+                &owner,
+                &RosterItem {
+                    jid: contact.clone(),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::From,
+                        ..Default::default()
+                    },
+                },
+            )
+            .await?;
+        transaction.commit().await?;
+        let to = Jid::parse_in("bob@localhost/phone", &mut arena)?;
+        let query = Element::builder_in("query", "urn:test:iq", &mut arena)?.build()?;
+        let stanza = Stanza::builder_in(
+            StanzaType::Iq(IqType::Get),
+            StanzaNamespace::Client,
+            &mut arena,
+        )
+        .from(Some(from))?
+        .to(Some(to))?
+        .id(Some("revoked"))?
+        .child(query)?
+        .build()?;
+        let work = ResourceIqWork {
+            source: account.clone(),
+            liveness: source.liveness(),
+            router: router.clone(),
+            storage: fixture.storage.clone(),
+            target: owner.clone(),
+            request: true,
+            stanza: RoutedStanza::from_parts(stanza, arena),
+        };
+        let mut transaction = fixture.storage.begin_write().await?;
+        transaction.remove_roster_item(&owner, &contact).await?;
+        let ((), mut blocker) = router
+            .order()
+            .fix(vec![owner, account], transaction.commit())
+            .await?;
+        blocker.turn().await;
+        let (subscribed, ticket) = work.authorize().await?;
+        assert!(!subscribed);
+        let mut admission = std::pin::pin!(work.admit(subscribed, ticket));
+        assert!(poll!(admission.as_mut()).is_pending());
+        drop(blocker);
+        assert_eq!(admission.await, Err(RouterError::NotFound));
+        assert!(fixture.registration.take_queued().is_empty());
+        drop(source);
+        fixture.finish().await?;
+        Ok(())
+    })
+}

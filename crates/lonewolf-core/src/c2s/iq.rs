@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::iq::{IqRequestType, IqScope};
+use lonewolf_extension::iq::IqRequestType;
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::stanza::{
@@ -8,7 +8,7 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::stream::CloseOutcome;
-use crate::router::{Registration, RouterError};
+use crate::router::{Registration, RouterError, RouterHandle};
 
 pub(super) struct ReplyError;
 
@@ -48,19 +48,35 @@ impl From<JidError> for ReplyError {
     }
 }
 
-/// What a request's envelope decides before any handler runs.
-pub(super) struct Route {
-    /// The authenticated full JID, allocated in the request's arena.
-    pub(super) sender: Jid,
-    pub(super) kind: IqRequestType,
-    /// `None` when the destination has a resource, which no handler serves.
-    pub(super) scope: Option<IqScope>,
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum IqDestination {
+    Account,
+    Server,
+    FullResource,
+    Remote,
 }
 
-pub(super) fn route<A: ChunkAllocator>(
+pub(super) struct Route {
+    pub(super) sender: Jid,
+    pub(super) kind: IqType,
+    pub(super) destination: IqDestination,
+}
+
+impl Route {
+    pub(super) fn request_type(&self) -> Option<IqRequestType> {
+        match self.kind {
+            IqType::Get => Some(IqRequestType::Get),
+            IqType::Set => Some(IqRequestType::Set),
+            IqType::Result | IqType::Error => None,
+        }
+    }
+}
+
+pub(super) fn route<A: ChunkAllocator + Clone>(
     request: &Stanza,
     arena: &mut Arena<A>,
     registration: &Registration<A>,
+    router: &RouterHandle<A>,
 ) -> Result<Route, ReplyError> {
     let account = registration.account();
     let sender = Jid::from_trusted_parts_in(
@@ -70,28 +86,25 @@ pub(super) fn route<A: ChunkAllocator>(
         arena,
     )?;
     let stanza = request.resolve(arena)?;
-    let kind = match stanza.stanza_type() {
-        StanzaType::Iq(IqType::Get) => IqRequestType::Get,
-        StanzaType::Iq(IqType::Set) => IqRequestType::Set,
-        _ => return Err(BuildError::NotIqRequest.into()),
+    let StanzaType::Iq(kind) = stanza.stanza_type() else {
+        return Err(BuildError::NotIqRequest.into());
     };
-    let target = stanza.to()?;
-    let scope = match target {
-        None => Some(IqScope::Account),
+    let destination = match stanza.to()? {
+        None => IqDestination::Account,
+        Some(target) if !router.is_local_host(target.domainpart()) => IqDestination::Remote,
         Some(target) => match (target.localpart(), target.resourcepart()) {
-            (None, None) => Some(IqScope::Server),
-            (Some(_), None) => Some(IqScope::Account),
-            (_, Some(_)) => None,
+            (None, None) => IqDestination::Server,
+            (Some(_), None) => IqDestination::Account,
+            (_, Some(_)) => IqDestination::FullResource,
         },
     };
     Ok(Route {
         sender,
         kind,
-        scope,
+        destination,
     })
 }
 
-/// Answers the request with `condition`, addressed to `to` when given.
 pub(super) fn error_reply<A: ChunkAllocator>(
     request: &Stanza,
     arena: &mut Arena<A>,
@@ -101,7 +114,6 @@ pub(super) fn error_reply<A: ChunkAllocator>(
     Ok(request.error_reply_in(arena, condition)?.to(to)?.build()?)
 }
 
-/// Builds the result for `request` in `response`, carrying `payload` when given.
 pub(super) fn result_reply<A: ChunkAllocator>(
     request: &StanzaRef<'_, Arena<A>>,
     sender: JidRef<'_>,

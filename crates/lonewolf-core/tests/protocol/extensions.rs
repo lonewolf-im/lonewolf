@@ -228,7 +228,7 @@ fn full_jid_requests_are_not_consumed_by_account_handlers() -> TestResult {
     suite.create_account("alice", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
     alice.send("<iq type='get' id='resource' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='resource' from='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='get' id='resource' from='alice@localhost/desk' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.close()
 }
 

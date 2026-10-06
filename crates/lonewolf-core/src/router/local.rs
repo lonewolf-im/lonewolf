@@ -24,7 +24,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use lonewolf_xmpp::jid::{JidError, JidRef};
-use lonewolf_xmpp::stanza::{MessageType, PresenceType, StanzaType};
+use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaType};
 
 use super::{RoutedStanza, RouterError};
 
@@ -230,6 +230,13 @@ enum Command<A: ChunkAllocator> {
     Deliver {
         stanza: RoutedStanza<A>,
         fallback_chat: bool,
+        source: Option<SessionLiveness>,
+        reply: oneshot::Sender<Result<(), RouterError>>,
+    },
+    DeliverIqRequest {
+        stanza: RoutedStanza<A>,
+        subscribed: bool,
+        source: Option<SessionLiveness>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
     DeliverBare {
@@ -438,17 +445,28 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     }
 
     pub(crate) async fn deliver_full(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
-        self.deliver_full_or_chat_fallback(stanza, false).await
+        self.deliver_full_or_chat_fallback(stanza, false, None)
+            .await
+    }
+
+    pub(crate) async fn deliver_full_guarded(
+        &self,
+        stanza: RoutedStanza<A>,
+        source: SessionLiveness,
+    ) -> Result<(), RouterError> {
+        self.deliver_full_or_chat_fallback(stanza, false, Some(source))
+            .await
     }
 
     pub(crate) async fn deliver_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
-        self.deliver_full_or_chat_fallback(stanza, true).await
+        self.deliver_full_or_chat_fallback(stanza, true, None).await
     }
 
     async fn deliver_full_or_chat_fallback(
         &self,
         stanza: RoutedStanza<A>,
         fallback_chat: bool,
+        source: Option<SessionLiveness>,
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -465,6 +483,36 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             .send(Command::Deliver {
                 stanza,
                 fallback_chat,
+                source,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
+    pub(crate) async fn deliver_iq_request(
+        &self,
+        stanza: RoutedStanza<A>,
+        subscribed: bool,
+        source: Option<SessionLiveness>,
+    ) -> Result<(), RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            let to = view
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            to.localpart().ok_or(RouterError::InvalidTarget)?;
+            to.resourcepart().ok_or(RouterError::InvalidTarget)?;
+            self.shard_index(to.bare().as_str())
+        };
+        let (reply, result) = oneshot::channel();
+        self.shards[shard]
+            .send(Command::DeliverIqRequest {
+                stanza,
+                subscribed,
+                source,
                 reply,
             })
             .await
@@ -1239,9 +1287,24 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             Command::Deliver {
                 stanza,
                 fallback_chat,
+                source,
                 reply,
             } => {
-                let result = self.deliver(stanza, fallback_chat);
+                let result = match source {
+                    Some(source) => {
+                        self.deliver_with_guard(stanza, fallback_chat, || source.is_alive())
+                    }
+                    None => self.deliver(stanza, fallback_chat),
+                };
+                let _ = reply.send(result);
+            }
+            Command::DeliverIqRequest {
+                stanza,
+                subscribed,
+                source,
+                reply,
+            } => {
+                let result = self.deliver_iq_request(stanza, subscribed, source);
                 let _ = reply.send(result);
             }
             Command::DeliverBare { stanza, reply } => {
@@ -1779,6 +1842,54 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             }
             result => result,
         }
+    }
+
+    fn deliver_iq_request(
+        &mut self,
+        stanza: RoutedStanza<A>,
+        subscribed: bool,
+        source: Option<SessionLiveness>,
+    ) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        if !matches!(
+            view.stanza_type(),
+            StanzaType::Iq(IqType::Get | IqType::Set)
+        ) {
+            return Err(RouterError::InvalidTarget);
+        }
+        let observer = view
+            .from()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let resource = to.resourcepart().ok_or(RouterError::InvalidTarget)?;
+        let session = self
+            .accounts
+            .get(to.bare().as_str())
+            .and_then(|sessions| sessions.get(resource))
+            .ok_or(RouterError::NotFound)?;
+        if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
+            let token = session.token;
+            self.remove(to.bare().as_str(), resource, token, RetireCause::Evicted);
+            return Err(RouterError::NotFound);
+        }
+        if !subscribed
+            && to.bare() != observer.bare()
+            && !session.directed.iter().any(|grant| {
+                grant.live.load(Ordering::Acquire)
+                    && (grant.recipient.as_str() == observer.as_str()
+                        || (!grant.recipient.as_str().contains('/')
+                            && grant.recipient.as_str() == observer.bare().as_str()))
+            })
+        {
+            return Err(RouterError::NotFound);
+        }
+        self.deliver_with_guard(stanza, false, || {
+            source.as_ref().is_none_or(SessionLiveness::is_alive)
+        })
     }
 
     fn deliver_bare(
@@ -2904,6 +3015,65 @@ mod tests {
             inbound,
             router.clone(),
         )?)
+    }
+
+    #[test]
+    fn queued_iq_admission_rechecks_source_retirement_and_replacement() -> Result<(), Box<dyn Error>>
+    {
+        Runtime::new()?.block_on(async {
+            for kind in ["get", "set", "result", "error"] {
+                for action in ["unchanged", "drop", "evict", "replace"] {
+                    let alice = account()?;
+                    let mut arena = Arena::try_new(Default::default())?;
+                    let bob = AccountKey::try_from(
+                        Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?
+                    )?;
+                    let mut source = Shard::<GlobalChunkAllocator>::new();
+                    let mut destination = Shard::<GlobalChunkAllocator>::new();
+                    let (commands, inbox) = async_channel::bounded(1);
+                    let router = test_router(commands);
+                    let origin = register_probe_session(&mut source, &router, &alice, "desk")?;
+                    let target = register_probe_session(&mut destination, &router, &bob, "phone")?;
+                    let token = origin.token;
+                    let liveness = origin.liveness();
+                    let error = if kind == "error" {
+                        "<error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
+                    } else {
+                        ""
+                    };
+                    let stanza = routed(&format!(
+                        "<iq type='{kind}' from='alice@localhost/desk' to='bob@localhost/phone' id='queued'><query xmlns='urn:test:iq'/>{error}</iq>"
+                    )).await?;
+                    let mut admission = pin!(async {
+                        if matches!(kind, "get" | "set") {
+                            router.deliver_iq_request(stanza, true, Some(liveness)).await
+                        } else {
+                            router.deliver_full_guarded(stanza, liveness).await
+                        }
+                    });
+                    assert!(futures_util::poll!(admission.as_mut()).is_pending());
+                    let command = inbox.recv().await?;
+                    let mut replacement = None;
+                    match action {
+                        "drop" => drop(origin),
+                        "evict" => {
+                            source.remove(alice.as_str(), "desk", token, RetireCause::Evicted);
+                        }
+                        "replace" => {
+                            source.remove(alice.as_str(), "desk", token, RetireCause::Evicted);
+                            replacement = Some(register_probe_session(&mut source, &router, &alice, "desk")?);
+                            assert_ne!(replacement.as_ref().ok_or("missing replacement")?.token, token);
+                        }
+                        _ => {}
+                    }
+                    destination.command(command);
+                    admission.await?;
+                    assert_eq!(target.take_queued().len(), usize::from(action == "unchanged"), "{kind} {action}");
+                    drop(replacement);
+                }
+            }
+            Ok(())
+        })
     }
 
     #[test]

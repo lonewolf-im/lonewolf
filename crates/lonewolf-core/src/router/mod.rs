@@ -27,6 +27,7 @@ pub(crate) use local::{DirectedRecipient, PresenceSource};
 pub mod local;
 
 pub use local::Registration;
+use local::SessionLiveness;
 use local::{LocalRouter, LocalRouterHandle};
 pub(crate) use local::{Mailbox, SessionHandle, release_deferred};
 pub use lonewolf_xmpp::stanza::RoutedStanza;
@@ -238,6 +239,52 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             return Err(RouterError::RemoteUnsupported);
         }
         self.local.deliver_full(stanza).await
+    }
+
+    /// Hold the source and target account tickets through admission.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn route_iq_request(
+        &self,
+        stanza: RoutedStanza<A>,
+        subscribed: bool,
+    ) -> Result<(), RouterError> {
+        self.route_iq_request_guarded(stanza, subscribed, None)
+            .await
+    }
+
+    pub(crate) async fn route_iq_request_guarded(
+        &self,
+        stanza: RoutedStanza<A>,
+        subscribed: bool,
+        source: Option<SessionLiveness>,
+    ) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !self.is_local_host(to.domainpart()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        self.local
+            .deliver_iq_request(stanza, subscribed, source)
+            .await
+    }
+
+    pub(crate) async fn route_full_guarded(
+        &self,
+        stanza: RoutedStanza<A>,
+        source: SessionLiveness,
+    ) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if !self.is_local_host(to.domainpart()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        self.local.deliver_full_guarded(stanza, source).await
     }
 
     pub async fn route_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {

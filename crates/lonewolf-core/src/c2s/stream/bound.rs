@@ -39,6 +39,7 @@ use crate::delivery::{
     Pending, RouterDelivery, StoredDelivery, WorkGroup, after_turn, commit_and_deliver,
     commit_and_store,
 };
+use crate::order::Ticket;
 use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
 use crate::router::{Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle};
 
@@ -381,8 +382,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             return Err(CloseOutcome::InvalidNamespace);
         }
         match stanza.stanza_type() {
-            StanzaType::Iq(IqType::Get | IqType::Set) => self.handle_iq(parsed).await,
-            StanzaType::Iq(IqType::Result | IqType::Error) => Ok(()),
+            StanzaType::Iq(_) => self.handle_iq(parsed).await,
             StanzaType::Presence(kind) => {
                 let directed = stanza.to()?.is_some();
                 self.handle_presence(parsed, kind, directed).await
@@ -391,10 +391,22 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         }
     }
 
-    /// Detached work owns commit and delivery, so retiring this session cannot cancel them.
+    /// Committed handler effects outlive this session.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
-        let route = iq::route(&request, &mut arena, &self.registration)?;
+        let route = iq::route(&request, &mut arena, &self.registration, &self.router)?;
+        if route.destination == iq::IqDestination::FullResource {
+            let routed = request
+                .derive_in(&mut arena)?
+                .from(Some(route.sender))?
+                .build()?;
+            return self
+                .route_resource_iq(RoutedStanza::from_parts(routed, arena), route.kind)
+                .await;
+        }
+        let Some(kind) = route.request_type() else {
+            return Ok(());
+        };
         let response = Arena::try_new_in(Default::default(), self.allocator.clone())?;
         let (handler, accounts) = {
             let sender = route.sender.resolve(&arena)?;
@@ -405,15 +417,20 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 .next()
                 .transpose()?
                 .ok_or(CloseOutcome::InternalError)?;
-            let handler = route.scope.and_then(|scope| {
+            let scope = match route.destination {
+                iq::IqDestination::Account => Some(IqScope::Account),
+                iq::IqDestination::Server => Some(IqScope::Server),
+                iq::IqDestination::FullResource | iq::IqDestination::Remote => None,
+            };
+            let handler = scope.and_then(|scope| {
                 self.router.iq_handlers(target.domainpart())?.find(
                     scope,
-                    route.kind,
+                    kind,
                     payload.namespace(),
                     payload.name(),
                 )
             });
-            let accounts = match route.scope {
+            let accounts = match scope {
                 Some(IqScope::Account) => vec![AccountKey::try_from(target.bare())?],
                 Some(IqScope::Server) | None => Vec::new(),
             };
@@ -432,13 +449,66 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             });
             return Ok(());
         };
-        match route.kind {
+        match kind {
             IqRequestType::Get => {
                 self.handle_iq_get(request, route.sender, arena, response, handler, accounts)
                     .await
             }
             IqRequestType::Set => {
                 self.handle_iq_set(request, route.sender, arena, response, handler)
+                    .await
+            }
+        }
+    }
+
+    async fn route_resource_iq(
+        &mut self,
+        routed: RoutedStanza<A>,
+        kind: IqType,
+    ) -> Result<(), CloseOutcome> {
+        let target = {
+            let to = routed.resolve()?.to()?.ok_or(CloseOutcome::InternalError)?;
+            if to.localpart().is_none() {
+                return if matches!(kind, IqType::Get | IqType::Set) {
+                    self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
+                        .await
+                } else {
+                    Ok(())
+                };
+            }
+            AccountKey::try_from(to.bare())?
+        };
+        let request = matches!(kind, IqType::Get | IqType::Set);
+        let work = ResourceIqWork {
+            source: self.registration.account().clone(),
+            liveness: self.registration.liveness(),
+            router: self.router.clone(),
+            storage: self.storage.clone(),
+            target,
+            request,
+            stanza: routed.clone(),
+        };
+        let pending = Pending::spawn(self.outbox.work.start(), work.run());
+        let result = self
+            .outbox
+            .drain_until(&self.registration, pending.finished())
+            .await?
+            .ok_or(CloseOutcome::InternalError)?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if !request => {
+                tracing::debug!(stanza_kind = "iq", outcome = ?error, "IQ response delivery failed");
+                Ok(())
+            }
+            Err(RouterError::Busy | RouterError::ResourceLimit) => {
+                self.reply_error(&routed, StanzaErrorCondition::ResourceConstraint)
+                    .await
+            }
+            Err(RouterError::Unavailable | RouterError::Stopped) => {
+                Err(CloseOutcome::InternalError)
+            }
+            Err(_) => {
+                self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable)
                     .await
             }
         }
@@ -960,7 +1030,6 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         Ok(())
     }
 
-    /// Authorizes on the sender's host, then applies on the target's host.
     async fn handle_subscription(
         &mut self,
         parsed: Parsed<Stanza, A>,
@@ -1746,6 +1815,79 @@ fn presence_priority<R: ArenaRead>(stanza: &StanzaRef<'_, R>) -> Result<i8, Stan
         );
     }
     Ok(priority.unwrap_or(0))
+}
+
+struct ResourceIqWork<A: ChunkAllocator> {
+    source: AccountKey,
+    liveness: SessionLiveness,
+    router: RouterHandle<A>,
+    storage: RedbStorage,
+    target: AccountKey,
+    request: bool,
+    stanza: RoutedStanza<A>,
+}
+
+impl<A: ChunkAllocator + Clone> ResourceIqWork<A> {
+    async fn run(self) -> Result<(), RouterError> {
+        let (subscribed, ticket) = self.authorize().await?;
+        self.admit(subscribed, ticket).await
+    }
+
+    async fn authorize(&self) -> Result<(bool, Ticket), RouterError> {
+        let mut accounts = vec![self.source.clone()];
+        if self.source != self.target {
+            accounts.push(self.target.clone());
+        }
+        if !self.request {
+            let ((), ticket) = self
+                .router
+                .order()
+                .fix(accounts, async { Ok::<_, RouterError>(()) })
+                .await?;
+            return Ok((false, ticket));
+        }
+        let (transaction, ticket) = self
+            .router
+            .order()
+            .fix(accounts, self.storage.begin_read())
+            .await
+            .map_err(|_| RouterError::Unavailable)?;
+        let observer = self
+            .stanza
+            .resolve()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .from()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let subscribed = match self
+            .router
+            .presence_handlers(self.target.domain())
+            .and_then(|handlers| handlers.find(PresenceRequestType::Available))
+        {
+            Some(handler) => handler
+                .visibility(&self.target, observer, &transaction)
+                .await
+                .map_err(|_| RouterError::Unavailable)?,
+            None => false,
+        };
+        Ok((subscribed, ticket))
+    }
+
+    async fn admit(self, subscribed: bool, mut ticket: Ticket) -> Result<(), RouterError> {
+        ticket.turn().await;
+        if !self.liveness.is_alive() {
+            return Ok(());
+        }
+        if self.request {
+            self.router
+                .route_iq_request_guarded(self.stanza, subscribed, Some(self.liveness))
+                .await
+        } else {
+            self.router
+                .route_full_guarded(self.stanza, self.liveness)
+                .await
+        }
+    }
 }
 
 #[cfg(test)]

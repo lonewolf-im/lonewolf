@@ -65,15 +65,20 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a
+        with:
+          tool: nextest@0.9.146
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test default features
-        run: cargo test --workspace --locked
+        run: cargo nextest run --workspace --locked --profile ci
+      - name: Test documentation with default features
+        run: cargo test --workspace --doc --locked
       - name: Test all targets and features
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
       - name: Test documentation with all features
         run: cargo test --workspace --doc --all-features --locked
       - name: Build release binaries

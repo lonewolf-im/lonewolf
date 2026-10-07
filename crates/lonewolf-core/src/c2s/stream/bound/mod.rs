@@ -751,6 +751,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         let session = self.registration.handle();
         let router = self.router.clone();
         let account = self.registration.account().clone();
+        let directed = routed.clone();
         let pending = Pending::spawn(self.outbox.work.start(), async move {
             let mut accounts = vec![account];
             if accounts[0] != target {
@@ -761,13 +762,26 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 .fix(accounts, async { Ok::<_, RouterError>(()) })
                 .await?;
             ticket.turn().await;
-            session.directed_presence(routed, available).await
+            session.directed_presence(directed, available).await
         });
-        self.outbox
+        let result = self
+            .outbox
             .drain_until(&self.registration, pending.finished())
             .await?
-            .ok_or(CloseOutcome::InternalError)?
-            .map_err(|_| CloseOutcome::InternalError)
+            .ok_or(CloseOutcome::InternalError)?;
+        match result {
+            Ok(()) => Ok(()),
+            Err(RouterError::DirectedPresenceLimit) => {
+                tracing::warn!(
+                    account_jid = ?self.registration.account().as_str(),
+                    stanza_kind = "presence",
+                    outcome = "directed_presence_limit",
+                    "directed presence rejected"
+                );
+                self.reply_error(&routed, StanzaErrorCondition::ResourceConstraint)
+            }
+            Err(_) => Err(CloseOutcome::InternalError),
+        }
     }
 
     async fn handle_message(
@@ -801,9 +815,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 return self.store_message(routed).await;
             }
             let condition = match error {
-                RouterError::Busy | RouterError::ResourceLimit => {
-                    StanzaErrorCondition::ResourceConstraint
-                }
+                RouterError::Busy
+                | RouterError::ResourceLimit
+                | RouterError::DirectedPresenceLimit => StanzaErrorCondition::ResourceConstraint,
                 RouterError::InvalidTarget | RouterError::InvalidResource => {
                     StanzaErrorCondition::BadRequest
                 }

@@ -248,6 +248,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                         RouterError::RemoteUnsupported => "remote_unsupported",
                         RouterError::InvalidResource => "invalid_resource",
                         RouterError::ResourceLimit => "resource_limit",
+                        RouterError::DirectedPresenceLimit => "directed_presence_limit",
                         RouterError::NotFound => "not_found",
                         RouterError::Offline => "offline",
                         RouterError::Busy => "busy",

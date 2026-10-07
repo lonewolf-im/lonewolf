@@ -199,9 +199,16 @@ pub fn run_with_extensions(
                 } else {
                     None
                 };
-                let local = LocalRouter::start(&dispatcher.handle(), Arc::clone(&stanza_pool))
-                    .await
-                    .map_err(RunError::Router)?;
+                let local = LocalRouter::start_with_directed_presence_limit(
+                    &dispatcher.handle(),
+                    Arc::clone(&stanza_pool),
+                    config
+                        .limits
+                        .c2s
+                        .max_directed_presence_recipients_per_resource,
+                )
+                .await
+                .map_err(RunError::Router)?;
                 let router_handle = router
                     .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions))
                     .handle();

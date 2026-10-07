@@ -273,24 +273,13 @@ fn tagged_callback_panic_process() -> TestResult {
         .to(Some(target))?
         .build()?;
         let cached = RoutedStanza::from_parts(stanza, arena);
-        old.set_presence(Some(0), cached.clone(), Some(cached.clone()))
+        old.set_presence(Some(0), cached.clone(), Some(cached))
             .await?;
-        let selected = handle
-            .presence_access(
-                &alice,
-                Some("desk".into()),
-                DirectedRecipient::new(recipient.resolve(&recipient_arena)?),
-                false,
-                Box::new(move |_| Ok(Some(cached.clone()))),
-            )
-            .await?;
-        let grant = selected
-            .first()
-            .and_then(|delivery| delivery.grants[0].as_ref())
-            .cloned()
-            .ok_or("missing grant")?;
-        assert!(grant.load(Ordering::Acquire));
-        drop(selected);
+        assert!(
+            handle
+                .has_directed_grant(&alice, "desk", recipient.resolve(&recipient_arena)?)
+                .await?
+        );
         let mut arena = Arena::try_new_in(Default::default(), Arc::clone(&pool))?;
         let target = Jid::parse_in("alice@localhost/desk", &mut arena)?;
         let stanza = Stanza::builder_in(
@@ -353,7 +342,12 @@ fn tagged_callback_panic_process() -> TestResult {
         let failure = router.failure().await;
         assert_eq!(failure.reason, RouterFailureReason::Panicked);
         assert!(!old.liveness.is_alive());
-        assert!(!grant.load(Ordering::Acquire));
+        assert_eq!(
+            handle
+                .has_directed_grant(&alice, "desk", recipient.resolve(&recipient_arena)?)
+                .await,
+            Err(RouterError::Stopped)
+        );
         assert!(registration.recv().await.is_none());
         assert_eq!(
             registration.wait_retired().await?.cause,

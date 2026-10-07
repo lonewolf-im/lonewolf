@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
-use async_channel::{Receiver, Sender, TrySendError};
+use async_channel::{Receiver, Sender, TrySendError, WeakSender};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
@@ -37,10 +37,6 @@ const LAST_UNAVAILABLE_CAPACITY: usize = 1_024;
 
 type TaggedStanzaFactory<A> = Box<dyn FnMut(&str) -> Result<RoutedStanza<A>, RouterError> + Send>;
 type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
-#[cfg(test)]
-pub(crate) type PresenceBuilder<A> = Box<
-    dyn for<'a> FnMut(PresenceSource<'a, A>) -> Result<Option<RoutedStanza<A>>, RouterError> + Send,
->;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DirectedRecipient(Box<str>);
@@ -118,15 +114,6 @@ pub(crate) struct Withdrawal<A: ChunkAllocator> {
     pub(crate) directed: DirectedWithdrawal,
 }
 
-pub(crate) struct PresenceDelivery<A: ChunkAllocator> {
-    pub(crate) stanza: RoutedStanza<A>,
-    source: SessionLiveness,
-    requester: Option<SessionLiveness>,
-    target_token: Option<u64>,
-    ordinary_access: bool,
-    grants: [Option<Arc<AtomicBool>>; 2],
-}
-
 pub struct LocalRouter<A: ChunkAllocator> {
     handle: LocalRouterHandle<A>,
     tasks: FuturesUnordered<ShardTask>,
@@ -154,6 +141,7 @@ struct Links<A: ChunkAllocator> {
     _lease: oneshot::Sender<()>,
     retired: Retirement<A>,
     inbound: Receiver<RoutedStanza<A>>,
+    mailbox: WeakSender<RoutedStanza<A>>,
     shard: Sender<Command<A>>,
     router: LocalRouterHandle<A>,
 }
@@ -207,7 +195,7 @@ enum Command<A: ChunkAllocator> {
         requester: SessionHandle<A>,
         request: RoutedStanza<A>,
         subscribed: bool,
-        reply: oneshot::Sender<Result<Vec<PresenceDelivery<A>>, RouterError>>,
+        reply: oneshot::Sender<Result<Option<RoutedStanza<A>>, RouterError>>,
     },
     DirectedPresence {
         account: AccountKey,
@@ -224,17 +212,9 @@ enum Command<A: ChunkAllocator> {
         observer: DirectedRecipient,
         reply: oneshot::Sender<bool>,
     },
-    #[cfg(test)]
-    PresenceAccess {
-        account: AccountKey,
-        resource: Option<Box<str>>,
-        observer: DirectedRecipient,
-        subscribed: bool,
-        build: PresenceBuilder<A>,
-        reply: oneshot::Sender<Result<Vec<PresenceDelivery<A>>, RouterError>>,
-    },
-    AuthorizedDelivery {
-        delivery: PresenceDelivery<A>,
+    PruneDirected {
+        stanza: RoutedStanza<A>,
+        token: u64,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
     Register {
@@ -826,59 +806,12 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         result.await.map_err(|_| RouterError::Stopped)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn presence_access(
-        &self,
-        account: &AccountKey,
-        resource: Option<Box<str>>,
-        observer: DirectedRecipient,
-        subscribed: bool,
-        build: PresenceBuilder<A>,
-    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
-        let (reply, result) = oneshot::channel();
-        self.shard(account.as_str())
-            .send(Command::PresenceAccess {
-                account: account.clone(),
-                resource,
-                observer,
-                subscribed,
-                build,
-                reply,
-            })
-            .await
-            .map_err(|_| RouterError::Stopped)?;
-        result.await.map_err(|_| RouterError::Stopped)?
-    }
-
-    pub(crate) async fn authorized_delivery(
-        &self,
-        delivery: PresenceDelivery<A>,
-    ) -> Result<(), RouterError> {
-        let shard = {
-            let view = delivery
-                .stanza
-                .resolve()
-                .map_err(|_| RouterError::InvalidTarget)?;
-            let to = view
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            self.shard_index(to.bare().as_str())
-        };
-        let (reply, result) = oneshot::channel();
-        self.shards[shard]
-            .send(Command::AuthorizedDelivery { delivery, reply })
-            .await
-            .map_err(|_| RouterError::Stopped)?;
-        result.await.map_err(|_| RouterError::Stopped)?
-    }
-
-    pub(crate) async fn probe_snapshot(
+    pub(crate) async fn probe(
         &self,
         requester: &SessionHandle<A>,
         request: &RoutedStanza<A>,
         subscribed: bool,
-    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
+    ) -> Result<(), RouterError> {
         let source = request
             .resolve()
             .map_err(|_| RouterError::InvalidTarget)?
@@ -895,7 +828,20 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             })
             .await
             .map_err(|_| RouterError::Stopped)?;
-        result.await.map_err(|_| RouterError::Stopped)?
+        if let Some(stanza) = result.await.map_err(|_| RouterError::Stopped)?? {
+            let (reply, result) = oneshot::channel();
+            requester
+                .shard
+                .send(Command::PruneDirected {
+                    stanza,
+                    token: requester.token,
+                    reply,
+                })
+                .await
+                .map_err(|_| RouterError::Stopped)?;
+            result.await.map_err(|_| RouterError::Stopped)??;
+        }
+        Ok(())
     }
 
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
@@ -1024,6 +970,7 @@ impl<A: ChunkAllocator> Registration<A> {
             retired: self.links.retired.clone(),
             router: self.links.router.clone(),
             liveness: self.liveness(),
+            mailbox: self.links.mailbox.clone(),
         }
     }
 }
@@ -1061,6 +1008,7 @@ pub(crate) struct SessionHandle<A: ChunkAllocator> {
     retired: Retirement<A>,
     router: LocalRouterHandle<A>,
     liveness: SessionLiveness,
+    mailbox: WeakSender<RoutedStanza<A>>,
 }
 
 impl<A: ChunkAllocator + Clone> Clone for SessionHandle<A> {
@@ -1073,6 +1021,7 @@ impl<A: ChunkAllocator + Clone> Clone for SessionHandle<A> {
             retired: self.retired.clone(),
             router: self.router.clone(),
             liveness: self.liveness.clone(),
+            mailbox: self.mailbox.clone(),
         }
     }
 }
@@ -1537,30 +1486,14 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 subscribed,
                 reply,
             } => {
-                reply!(reply, self.probe_snapshot(&requester, &request, subscribed));
+                reply!(reply, self.probe(&requester, &request, subscribed));
             }
-            #[cfg(test)]
-            Command::PresenceAccess {
-                account,
-                resource,
-                observer,
-                subscribed,
-                mut build,
+            Command::PruneDirected {
+                stanza,
+                token,
                 reply,
             } => {
-                reply!(
-                    reply,
-                    self.presence_access(
-                        &account,
-                        resource.as_deref(),
-                        &observer,
-                        subscribed,
-                        &mut build,
-                    )
-                );
-            }
-            Command::AuthorizedDelivery { delivery, reply } => {
-                reply!(reply, self.authorized_delivery(delivery));
+                reply!(reply, self.prune_directed(&stanza, Some(token)));
             }
             Command::Register {
                 account,
@@ -1746,6 +1679,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             }
             .boxed(),
         );
+        let mailbox = outbound.downgrade();
         sessions.insert(
             resource.clone(),
             Session {
@@ -1770,6 +1704,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 _lease: lease,
                 retired: retired_reply.shared(),
                 inbound,
+                mailbox,
                 shard,
                 router,
             }),
@@ -1831,7 +1766,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         build: &mut impl for<'a> FnMut(
             PresenceSource<'a, A>,
         ) -> Result<Option<RoutedStanza<A>>, RouterError>,
-    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
+    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
         let mut deliveries = Vec::new();
         let Some(sessions) = self.accounts.get(account.as_str()) else {
             return Ok(deliveries);
@@ -1843,18 +1778,12 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             {
                 continue;
             }
-            let mut grants = [None, None];
-            for (slot, grant) in grants.iter_mut().zip(
-                session
-                    .directed
-                    .iter()
-                    .filter(|grant| grant.recipient.matches_prepared(observer)),
-            ) {
-                *slot = Some(Arc::clone(&grant.live));
-            }
             let access = PresenceAccess {
                 subscribed,
-                directed: grants.iter().any(Option::is_some),
+                directed: session
+                    .directed
+                    .iter()
+                    .any(|grant| grant.recipient.matches_prepared(observer)),
             };
             let ordinary_access = subscribed || account.as_str() == observer.bare();
             if !ordinary_access && !access.directed {
@@ -1873,29 +1802,20 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 .to()
                 .map_err(|_| RouterError::InvalidTarget)?
                 .ok_or(RouterError::InvalidTarget)?;
-            let to_source =
-                to.bare().as_str() == account.as_str() && to.resourcepart() == Some(name.as_ref());
-            if !to_source && to.as_str() != observer.as_str() {
+            if to.as_str() != observer.as_str() {
                 return Err(RouterError::InvalidTarget);
             }
-            deliveries.push(PresenceDelivery {
-                stanza,
-                source: SessionLiveness(Arc::clone(&session.alive)),
-                requester: None,
-                target_token: to_source.then_some(session.token),
-                ordinary_access,
-                grants,
-            });
+            deliveries.push(stanza);
         }
         Ok(deliveries)
     }
 
-    fn probe_snapshot(
+    fn probe(
         &self,
         requester: &SessionHandle<A>,
         request: &RoutedStanza<A>,
         subscribed: bool,
-    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
+    ) -> Result<Option<RoutedStanza<A>>, RouterError> {
         let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let observer = view
             .from()
@@ -1942,6 +1862,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             subscribed,
             &mut build,
         )?;
+        let mut unavailable = None;
         if deliveries.is_empty() {
             let (from, kind, at) = if ordinary {
                 (
@@ -1961,20 +1882,24 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             };
             let stanza =
                 super::probe_reply(request, from, kind, at, requester.router.allocator.clone())?;
-            deliveries.push(PresenceDelivery {
-                stanza,
-                source: requester.liveness.clone(),
-                requester: None,
-                target_token: Some(requester.token),
-                ordinary_access: true,
-                grants: [None, None],
-            });
+            if kind == PresenceType::Unavailable {
+                unavailable = Some(stanza.clone());
+            }
+            deliveries.push(stanza);
         }
-        for delivery in &mut deliveries {
-            delivery.requester = Some(requester.liveness.clone());
-            delivery.target_token = Some(requester.token);
+        if !requester.liveness.is_alive() {
+            return Ok(None);
         }
-        Ok(deliveries)
+        let Some(sender) = requester.mailbox.upgrade() else {
+            return Ok(None);
+        };
+        for stanza in deliveries {
+            match sender.try_send(stanza) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => return Ok(None),
+            }
+        }
+        Ok(unavailable)
     }
 
     fn has_available(&self, account: &str) -> bool {
@@ -2002,60 +1927,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         ));
     }
 
-    fn authorized_delivery(&mut self, delivery: PresenceDelivery<A>) -> Result<(), RouterError> {
-        let PresenceDelivery {
-            stanza,
-            source,
-            requester,
-            target_token,
-            ordinary_access,
-            grants,
-        } = delivery;
-        let valid = || {
-            source.is_alive()
-                && requester.as_ref().is_none_or(SessionLiveness::is_alive)
-                && (ordinary_access
-                    || grants
-                        .iter()
-                        .flatten()
-                        .any(|grant| grant.load(Ordering::Acquire)))
-        };
-        if !valid() {
-            return Ok(());
-        }
-        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
-        let to = view
-            .to()
-            .map_err(|_| RouterError::InvalidTarget)?
-            .ok_or(RouterError::InvalidTarget)?;
-        let full = to.resourcepart().is_some();
-        if let Some(token) = target_token
-            && self
-                .accounts
-                .get(to.bare().as_str())
-                .and_then(|sessions| {
-                    to.resourcepart()
-                        .and_then(|resource| sessions.get(resource))
-                })
-                .is_none_or(|session| session.token != token)
-        {
-            return Ok(());
-        }
-        if full {
-            self.deliver_with_guard(stanza, false, valid)
-        } else {
-            if !matches!(view.stanza_type(), StanzaType::Presence(_)) {
-                return Err(RouterError::InvalidTarget);
-            }
-            self.deliver_presence_where_with_guard(
-                stanza,
-                |session| session.priority.is_some(),
-                valid,
-            )
-        }
-    }
-
-    fn prune_directed(&mut self, stanza: &RoutedStanza<A>) -> Result<(), RouterError> {
+    fn prune_directed(
+        &mut self,
+        stanza: &RoutedStanza<A>,
+        token: Option<u64>,
+    ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if view.stanza_type() != StanzaType::Presence(PresenceType::Unavailable) {
             return Ok(());
@@ -2074,6 +1950,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             if to
                 .resourcepart()
                 .is_some_and(|target| target != resource.as_ref())
+                || token.is_some_and(|token| session.token != token)
                 || !session.alive.load(Ordering::Acquire)
             {
                 continue;
@@ -2103,7 +1980,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         fallback_chat: bool,
         valid: impl Fn() -> bool,
     ) -> Result<(), RouterError> {
-        self.prune_directed(&stanza)?;
+        self.prune_directed(&stanza, None)?;
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let to = view
             .to()
@@ -2312,7 +2189,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         select: impl Fn(&Session<A>) -> bool,
         valid: impl Fn() -> bool,
     ) -> Result<(), RouterError> {
-        self.prune_directed(&stanza)?;
+        self.prune_directed(&stanza, None)?;
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let account = view
             .to()
@@ -3477,6 +3354,7 @@ mod tests {
                         "<presence from='{sender}' to='alice@localhost/desk' type='unavailable'/>"
                     ))
                     .await?,
+                    None,
                 )?;
                 assert!(!full.load(Ordering::Acquire));
                 assert_eq!(bare.load(Ordering::Acquire), sender.contains('/'));
@@ -3601,97 +3479,6 @@ mod tests {
                     ),
                     Err(RouterError::DirectedPresenceLimit)
                 );
-            }
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn queued_destination_command_rejects_revoked_and_retired_sources() -> Result<(), Box<dyn Error>>
-    {
-        Runtime::new()?.block_on(async {
-            for retire in [false, true] {
-                let alice = account()?;
-                let mut arena = Arena::try_new(Default::default())?;
-                let bob_jid = Jid::parse_in("bob@localhost/desk", &mut arena)?.resolve(&arena)?;
-                let bob = AccountKey::try_from(bob_jid.bare())?;
-                let mut source = Shard::with_directed_presence_limit(NonZeroUsize::MIN);
-                let mut destination = Shard::<GlobalChunkAllocator>::new();
-                let (commands, inbox) = async_channel::bounded(1);
-                let router = test_router(commands);
-                let (outbound, inbound) = async_channel::bounded(64);
-                let desk = source.register(
-                    alice.clone(),
-                    Some("desk".into()),
-                    NonZeroUsize::MIN,
-                    outbound,
-                    inbound,
-                    router.clone(),
-                )?;
-                let (outbound, inbound) = async_channel::bounded(64);
-                let observer = destination.register(
-                    bob,
-                    Some("desk".into()),
-                    NonZeroUsize::MIN,
-                    outbound,
-                    inbound,
-                    router.clone(),
-                )?;
-                source.record_directed_presence(
-                    &alice,
-                    "desk",
-                    desk.token,
-                    DirectedRecipient::new(bob_jid),
-                    true,
-                )?;
-                let response =
-                    routed("<presence from='alice@localhost/desk' to='bob@localhost/desk'/>")
-                        .await?;
-                let mut builder: PresenceBuilder<GlobalChunkAllocator> =
-                    Box::new(move |_| Ok(Some(response.clone())));
-                let mut selected = source.presence_access(
-                    &alice,
-                    Some("desk"),
-                    &DirectedRecipient::new(bob_jid),
-                    false,
-                    &mut builder,
-                )?;
-                let delivery = selected.pop().ok_or("missing selection")?;
-                let mut admitted = pin!(router.authorized_delivery(delivery));
-                assert!(futures_util::poll!(admitted.as_mut()).is_pending());
-                let command = inbox.recv().await?;
-                if retire {
-                    let withdrawal = source.end_presence(&alice, "desk", desk.token)?;
-                    assert!(withdrawal.unavailable.is_none());
-                    let (outbound, inbound) = async_channel::bounded(64);
-                    let replacement = source.register(
-                        alice.clone(),
-                        Some("desk".into()),
-                        NonZeroUsize::MIN,
-                        outbound,
-                        inbound,
-                        router.clone(),
-                    )?;
-                    assert_ne!(replacement.token, desk.token);
-                } else {
-                    source.record_directed_presence(
-                        &alice,
-                        "desk",
-                        desk.token,
-                        DirectedRecipient::new(bob_jid),
-                        false,
-                    )?;
-                    source.record_directed_presence(
-                        &alice,
-                        "desk",
-                        desk.token,
-                        DirectedRecipient::new(bob_jid),
-                        true,
-                    )?;
-                }
-                assert!(destination.command(command).is_ok());
-                admitted.await?;
-                assert!(observer.take_queued().is_empty());
             }
             Ok(())
         })
@@ -3829,45 +3616,128 @@ mod tests {
     }
 
     #[test]
-    fn queued_probe_rechecks_source_and_grant_generations() -> Result<(), Box<dyn Error>> {
+    fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
         Runtime::new()?.block_on(async {
-            for invalidation in ["revoke", "replace", "delete"] {
-                for subscribed in [false, true] {
-                    if subscribed && invalidation == "revoke" { continue; }
-                    let alice = account()?;
-                    let mut arena = Arena::try_new(Default::default())?;
-                    let bob_jid = Jid::parse_in("bob@localhost/desk", &mut arena)?.resolve(&arena)?;
-                    let bob = AccountKey::try_from(bob_jid.bare())?;
-                    let mut source = Shard::with_directed_presence_limit(NonZeroUsize::MIN);
-                    let mut destination = Shard::<GlobalChunkAllocator>::new();
-                    let (commands, inbox) = async_channel::bounded(1);
-                    let router = test_router(commands);
-                    let desk = register_probe_session(&mut source, &router, &alice, "desk")?;
-                    let observer = register_probe_session(&mut destination, &router, &bob, "desk")?;
-                    source.presence(&alice, "desk", desk.token, Some(0), routed("<presence from='alice@localhost/desk' id='old'><status>private</status></presence>").await?, Some(routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?))?;
-                    source.record_directed_presence(&alice, "desk", desk.token, DirectedRecipient::new(bob_jid), true)?;
-                    let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='probe'/>").await?;
-                    let mut selected = source.probe_snapshot(&observer.handle(), &request, subscribed)?;
-                    assert_eq!(selected.len(), 1);
-                    let delivery = selected.pop().ok_or("missing reply")?;
-                    let mut admitted = pin!(router.authorized_delivery(delivery));
-                    assert!(futures_util::poll!(admitted.as_mut()).is_pending());
-                    let command = inbox.recv().await?;
-                    match invalidation {
-                        "revoke" => {
-                            source.record_directed_presence(&alice, "desk", desk.token, DirectedRecipient::new(bob_jid), false)?;
-                            source.record_directed_presence(&alice, "desk", desk.token, DirectedRecipient::new(bob_jid), true)?;
-                        }
-                        "replace" => {
-                            source.end_presence(&alice, "desk", desk.token)?;
-                            let replacement = register_probe_session(&mut source, &router, &alice, "desk")?;
-                            assert_ne!(replacement.token, desk.token);
-                        }
-                        _ => source.retire_account(&alice),
+            let alice = account()?;
+            let mut arena = Arena::try_new(Default::default())?;
+            let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+            let (commands, _) = async_channel::bounded(1);
+            let router = test_router(commands);
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+            let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='none'/>").await?;
+            let unavailable = shard.probe(&observer.handle(), &request, true)?.ok_or("missing unavailable")?;
+            assert_eq!(unavailable.resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
+            let replies = observer.take_queued();
+            assert_eq!(replies.len(), 1);
+            let view = replies[0].resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
+            assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost");
+            assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
+            assert_eq!(view.id()?, Some("none"));
+            assert!(view.child("delay", "urn:xmpp:delay")?.is_none());
+
+            let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+            shard.presence(&alice, "desk", desk.token, Some(0), routed("<presence from='alice@localhost/desk' id='p'><status>here</status></presence>").await?, None)?;
+            let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='bare'/>").await?;
+            assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+            let replies = observer.take_queued();
+            assert_eq!(replies.len(), 1);
+            let view = replies[0].resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
+            assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost/desk");
+            assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
+            assert_eq!(view.child("status", "jabber:client")?.ok_or("missing status")?.text()?, Some("here"));
+
+            let request = routed("<presence from='bob@localhost/desk' to='alice@localhost/desk' type='probe' id='full'/>").await?;
+            assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+            let replies = observer.take_queued();
+            assert_eq!(replies.len(), 1);
+            let view = replies[0].resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
+            assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost/desk");
+            assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
+            assert_eq!(view.id()?, Some("full"));
+            assert!(view.children()?.next().is_none());
+
+            let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='denied'/>").await?;
+            assert!(shard.probe(&observer.handle(), &request, false)?.is_none());
+            let replies = observer.take_queued();
+            assert_eq!(replies.len(), 1);
+            let view = replies[0].resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Unsubscribed));
+            assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost");
+            assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
+            assert_eq!(view.id()?, Some("denied"));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn probe_reply_never_reaches_an_ended_requester_or_its_replacement()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for action in ["end", "evict", "drop", "closed_only"] {
+                let alice = account()?;
+                let mut arena = Arena::try_new(Default::default())?;
+                let bob = AccountKey::try_from(
+                    Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?,
+                )?;
+                let (commands, _) = async_channel::bounded(1);
+                let router = test_router(commands);
+                let mut source = Shard::<GlobalChunkAllocator>::new();
+                let mut destination = Shard::<GlobalChunkAllocator>::new();
+                let desk = register_probe_session(&mut source, &router, &alice, "desk")?;
+                source.presence(
+                    &alice,
+                    "desk",
+                    desk.token,
+                    Some(0),
+                    routed("<presence from='alice@localhost/desk'/>").await?,
+                    None,
+                )?;
+                let observer = register_probe_session(&mut destination, &router, &bob, "desk")?;
+                let old = observer.handle();
+                let old_mailbox = observer.mailbox();
+                let replacement = match action {
+                    "end" => {
+                        destination.end_presence(&bob, "desk", old.token)?;
+                        Some(register_probe_session(
+                            &mut destination,
+                            &router,
+                            &bob,
+                            "desk",
+                        )?)
                     }
-                    assert!(destination.command(command).is_ok());
-                    admitted.await?;
-                    assert!(observer.take_queued().is_empty());
+                    "evict" => {
+                        destination.remove(bob.as_str(), "desk", old.token, RetireCause::Evicted);
+                        Some(register_probe_session(
+                            &mut destination,
+                            &router,
+                            &bob,
+                            "desk",
+                        )?)
+                    }
+                    "drop" => {
+                        drop(observer);
+                        None
+                    }
+                    _ => {
+                        observer.links.inbound.close();
+                        None
+                    }
+                };
+                assert_eq!(old.liveness.is_alive(), action == "closed_only");
+                let request = routed(
+                    "<presence from='bob@localhost/desk' to='alice@localhost' type='probe'/>",
+                )
+                .await?;
+                assert!(source.probe(&old, &request, true)?.is_none());
+                assert!(old_mailbox.take_queued().is_empty());
+                if let Some(replacement) = replacement {
+                    assert_eq!(replacement.resource(), "desk");
+                    assert_ne!(replacement.token, old.token);
+                    assert!(replacement.take_queued().is_empty());
                 }
             }
             Ok(())
@@ -3875,48 +3745,131 @@ mod tests {
     }
 
     #[test]
-    fn queued_probe_never_reaches_a_replacement_requester() -> Result<(), Box<dyn Error>> {
+    fn probe_reads_grants_when_it_runs() -> Result<(), Box<dyn Error>> {
         Runtime::new()?.block_on(async {
-            for reply in ["available", "denial", "offline"] {
-                let alice = account()?;
-                let mut arena = Arena::try_new(Default::default())?;
-                let bob = AccountKey::try_from(
-                    Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?,
-                )?;
-                let mut source = Shard::<GlobalChunkAllocator>::new();
-                let mut destination = Shard::<GlobalChunkAllocator>::new();
-                let (commands, inbox) = async_channel::bounded(1);
-                let router = test_router(commands);
-                let desk = register_probe_session(&mut source, &router, &alice, "desk")?;
-                let observer = register_probe_session(&mut destination, &router, &bob, "desk")?;
-                if reply == "available" {
-                    source.presence(
-                        &alice,
-                        "desk",
-                        desk.token,
-                        Some(0),
-                        routed("<presence from='alice@localhost/desk'/>").await?,
-                        None,
-                    )?;
-                }
-                let request = routed(
-                    "<presence from='bob@localhost/desk' to='alice@localhost' type='probe'/>",
-                )
-                .await?;
-                let mut selected =
-                    source.probe_snapshot(&observer.handle(), &request, reply != "denial")?;
-                assert_eq!(selected.len(), 1);
-                let mut admitted =
-                    pin!(router.authorized_delivery(selected.pop().ok_or("missing reply")?));
-                assert!(futures_util::poll!(admitted.as_mut()).is_pending());
-                let command = inbox.recv().await?;
-                destination.end_presence(&bob, "desk", observer.token)?;
-                let replacement = register_probe_session(&mut destination, &router, &bob, "desk")?;
-                assert!(destination.command(command).is_ok());
-                admitted.await?;
-                assert!(observer.take_queued().is_empty());
-                assert!(replacement.take_queued().is_empty());
+            let alice = account()?;
+            let mut arena = Arena::try_new(Default::default())?;
+            let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+            let (commands, _) = async_channel::bounded(1);
+            let router = test_router(commands);
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+            let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+            let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='directed'/>").await?;
+            for available in [true, false] {
+                shard.record_directed_presence(&alice, "desk", desk.token, directed_recipient("bob@localhost/desk")?, available)?;
+                assert!(shard.probe(&observer.handle(), &request, false)?.is_none());
+                let replies = observer.take_queued();
+                assert_eq!(replies.len(), 1);
+                let view = replies[0].resolve()?;
+                let (kind, from) = if available {
+                    (PresenceType::Available, "alice@localhost/desk")
+                } else {
+                    (PresenceType::Unsubscribed, "alice@localhost")
+                };
+                assert_eq!(view.stanza_type(), StanzaType::Presence(kind));
+                assert_eq!(view.from()?.ok_or("missing source")?.as_str(), from);
+                assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
+                assert_eq!(view.id()?, Some("directed"));
+                assert!(view.children()?.next().is_none());
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn requester_prune_is_limited_to_its_generation() -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let mut arena = Arena::try_new(Default::default())?;
+            let bob =
+                AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+            let (commands, _) = async_channel::bounded(1);
+            let router = test_router(commands);
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+            shard.record_directed_presence(
+                &bob,
+                "desk",
+                observer.token,
+                directed_recipient("alice@localhost")?,
+                true,
+            )?;
+            let stanza = routed(
+                "<presence from='alice@localhost' to='bob@localhost/desk' type='unavailable'/>",
+            )
+            .await?;
+            shard.prune_directed(&stanza, Some(observer.token + 1))?;
+            assert_eq!(shard.accounts[bob.as_str()]["desk"].directed.len(), 1);
+            shard.prune_directed(&stanza, Some(observer.token))?;
+            assert!(shard.accounts[bob.as_str()]["desk"].directed.is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn full_probe_mailbox_preserves_the_requester_and_unavailable_prune()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let alice = account()?;
+            let mut arena = Arena::try_new(Default::default())?;
+            let bob =
+                AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+            let (commands, _) = async_channel::bounded(1);
+            let router = test_router(commands);
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let (outbound, inbound) = async_channel::bounded(1);
+            let observer = shard.register(
+                bob.clone(),
+                Some("desk".into()),
+                NonZeroUsize::MIN,
+                outbound,
+                inbound,
+                router.clone(),
+            )?;
+            let queued = routed(
+                "<presence from='carol@localhost/desk' to='bob@localhost/desk' id='queued'/>",
+            )
+            .await?;
+            shard.accounts[bob.as_str()]["desk"]
+                .outbound
+                .try_send(queued)?;
+            shard.record_directed_presence(
+                &bob,
+                "desk",
+                observer.token,
+                directed_recipient("alice@localhost")?,
+                true,
+            )?;
+            let request =
+                routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe'/>")
+                    .await?;
+            let unavailable = shard
+                .probe(&observer.handle(), &request, true)?
+                .ok_or("missing unavailable prune")?;
+            shard.prune_directed(&unavailable, Some(observer.token + 1))?;
+            assert_eq!(shard.accounts[bob.as_str()]["desk"].directed.len(), 1);
+            shard.prune_directed(&unavailable, Some(observer.token))?;
+            assert!(shard.accounts[bob.as_str()]["desk"].directed.is_empty());
+            let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+            let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
+            for session in [&desk, &phone] {
+                shard.presence(
+                    &alice,
+                    session.resource(),
+                    session.token,
+                    Some(0),
+                    routed(&format!("<presence from='{}'/>", session.full_jid())).await?,
+                    None,
+                )?;
+            }
+            assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+            assert!(observer.liveness().is_alive());
+            assert!(!observer.links.inbound.is_closed());
+            let queued = observer.take_queued();
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].resolve()?.id()?, Some("queued"));
+            assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+            assert_eq!(observer.take_queued().len(), 1);
             Ok(())
         })
     }
@@ -3933,8 +3886,9 @@ mod tests {
             let mut shard = Shard::<GlobalChunkAllocator>::new();
             let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
             let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='offline'/>").await?;
-            let first = shard.probe_snapshot(&observer.handle(), &request, true)?;
-            assert!(first[0].stanza.resolve()?.children()?.next().is_none());
+            shard.probe(&observer.handle(), &request, true)?;
+            let first = observer.take_queued().pop().ok_or("missing reply")?;
+            assert!(first.resolve()?.children()?.next().is_none());
             let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
             let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
             let available = routed("<presence from='alice@localhost/desk'/>").await?;
@@ -3945,14 +3899,16 @@ mod tests {
             assert!(shard.last_unavailable.is_empty());
             shard.end_presence(&alice, "phone", phone.token)?;
             let at = shard.last_unavailable[0].1.at;
-            let offline = shard.probe_snapshot(&observer.handle(), &request, true)?;
-            assert!(offline[0].stanza.resolve()?.child("delay", "urn:xmpp:delay")?.is_some());
+            shard.probe(&observer.handle(), &request, true)?;
+            let offline = observer.take_queued().pop().ok_or("missing reply")?;
+            assert!(offline.resolve()?.child("delay", "urn:xmpp:delay")?.is_some());
             shard.record_last_unavailable(alice.as_str());
             assert_eq!(shard.last_unavailable[0].1.at, at);
             for index in 0..LAST_UNAVAILABLE_CAPACITY { shard.record_last_unavailable(&format!("user{index}@localhost")); }
             assert_eq!(shard.last_unavailable.len(), LAST_UNAVAILABLE_CAPACITY);
-            let evicted = shard.probe_snapshot(&observer.handle(), &request, true)?;
-            assert!(evicted[0].stanza.resolve()?.child("delay", "urn:xmpp:delay")?.is_none());
+            shard.probe(&observer.handle(), &request, true)?;
+            let evicted = observer.take_queued().pop().ok_or("missing reply")?;
+            assert!(evicted.resolve()?.child("delay", "urn:xmpp:delay")?.is_none());
             shard.record_last_unavailable(alice.as_str());
             let replacement = register_probe_session(&mut shard, &router, &alice, "desk")?;
             shard.presence(&alice, "desk", replacement.token, Some(0), available.clone(), Some(unavailable))?;

@@ -1122,3 +1122,208 @@ fn fatal_errors_override_recoverable_envelopes_and_release_the_pool() -> TestRes
         Ok(())
     })
 }
+
+#[test]
+fn buffer_retention_reuses_small_events_and_releases_large_events() -> TestResult {
+    let mut retained_capacities = Vec::new();
+    for chunk in [4096, usize::MAX] {
+        for (name, sizes) in [
+            ("small_repeat", vec![1024; 32]),
+            ("large_then_small", vec![256 * 1024, 1024, 1024]),
+            ("consecutive_large", vec![256 * 1024; 4]),
+        ] {
+            block_on(async {
+                let mut input = String::from(OPEN);
+                for size in &sizes {
+                    input.push_str("<message><body>");
+                    input.extend(std::iter::repeat_n('x', *size));
+                    input.push_str("</body></message>");
+                }
+                input.push_str(CLOSE);
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(512 * 1024)?,
+                    GlobalChunkAllocator,
+                );
+                assert_eq!(parser.scratch.capacity(), 0);
+                assert_eq!(parser.text.capacity(), 0);
+                open(&mut parser).await?;
+                let mut first = None;
+                let mut capacities = Vec::new();
+                for (index, size) in sizes.iter().enumerate() {
+                    let before = (
+                        parser.scratch.as_ptr(),
+                        parser.scratch.capacity(),
+                        parser.text.as_ptr(),
+                        parser.text.capacity(),
+                    );
+                    let parsed = stanza(&mut parser).await?;
+                    let view = parsed.value().resolve(parsed.arena())?;
+                    let text = view
+                        .child("body", CLIENT_NAMESPACE)?
+                        .ok_or("body")?
+                        .text()?
+                        .ok_or("text")?;
+                    assert_eq!(text.len(), *size);
+                    assert!(text.bytes().all(|byte| byte == b'x'));
+                    if index > 0 && *size == 1024 {
+                        assert_eq!(parser.scratch.as_ptr(), before.0);
+                        assert_eq!(parser.scratch.capacity(), before.1);
+                        assert_eq!(parser.text.as_ptr(), before.2);
+                        assert_eq!(parser.text.capacity(), before.3);
+                    }
+                    if *size > super::MAX_RETAINED_BUFFER_BYTES {
+                        assert!(
+                            (super::RETAINED_BUFFER_RESERVE_BYTES
+                                ..=super::MAX_RETAINED_BUFFER_BYTES)
+                                .contains(&parser.scratch.capacity())
+                        );
+                        assert!(
+                            (super::RETAINED_BUFFER_RESERVE_BYTES
+                                ..=super::MAX_RETAINED_BUFFER_BYTES)
+                                .contains(&parser.text.capacity())
+                        );
+                    }
+                    capacities.push((parser.scratch.capacity(), parser.text.capacity()));
+                    if first.is_none() {
+                        first = Some(parsed);
+                    }
+                }
+                let first = first.ok_or("first stanza")?;
+                let view = first.value().resolve(first.arena())?;
+                assert_eq!(
+                    view.child("body", CLIENT_NAMESPACE)?
+                        .ok_or("body")?
+                        .text()?
+                        .ok_or("text")?
+                        .len(),
+                    sizes[0]
+                );
+                assert!(matches!(
+                    parser.next_event().await?,
+                    Some(StreamEvent::StreamEnd)
+                ));
+                eprintln!(
+                    "parser retention case={name} chunk={chunk} payload_bytes={sizes:?} scratch_text_capacities={capacities:?}"
+                );
+                retained_capacities.extend(capacities);
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
+    }
+    assert!(retained_capacities.iter().all(|(scratch, text)| {
+        *scratch <= super::MAX_RETAINED_BUFFER_BYTES && *text <= super::MAX_RETAINED_BUFFER_BYTES
+    }));
+    Ok(())
+}
+
+#[test]
+fn complete_events_trim_each_buffer_independently_above_the_capacity_boundary() -> TestResult {
+    let threshold = super::MAX_RETAINED_BUFFER_BYTES;
+    for (scratch_capacity, text_capacity) in [
+        (threshold, threshold),
+        (threshold + 1, threshold),
+        (threshold, threshold + 1),
+        (threshold + 1, threshold + 1),
+    ] {
+        block_on(async {
+            let input =
+                format!("{OPEN}<presence/><x xmlns='urn:test'/><iq type='unknown'/>{CLOSE}");
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            for event in 0..5 {
+                parser.scratch = Vec::with_capacity(scratch_capacity);
+                parser.text = String::with_capacity(text_capacity);
+                let scratch_pointer = parser.scratch.as_ptr();
+                let text_pointer = parser.text.as_ptr();
+                assert_eq!(parser.scratch.capacity(), scratch_capacity);
+                assert_eq!(parser.text.capacity(), text_capacity);
+                let parsed = parser.next_event().await?;
+                assert!(matches!(
+                    (event, parsed),
+                    (0, Some(StreamEvent::StreamStart { .. }))
+                        | (1, Some(StreamEvent::Stanza(_)))
+                        | (2, Some(StreamEvent::Element(_)))
+                        | (3, Some(StreamEvent::RejectedStanza(_)))
+                        | (4, Some(StreamEvent::StreamEnd))
+                ));
+                assert!(parser.scratch.is_empty());
+                assert!(parser.text.is_empty());
+                if scratch_capacity <= threshold {
+                    assert_eq!(parser.scratch.capacity(), scratch_capacity);
+                    assert_eq!(parser.scratch.as_ptr(), scratch_pointer);
+                } else {
+                    assert!(
+                        (super::RETAINED_BUFFER_RESERVE_BYTES..=super::MAX_RETAINED_BUFFER_BYTES)
+                            .contains(&parser.scratch.capacity())
+                    );
+                }
+                if text_capacity <= threshold {
+                    assert_eq!(parser.text.capacity(), text_capacity);
+                    assert_eq!(parser.text.as_ptr(), text_pointer);
+                } else {
+                    assert!(
+                        (super::RETAINED_BUFFER_RESERVE_BYTES..=super::MAX_RETAINED_BUFFER_BYTES)
+                            .contains(&parser.text.capacity())
+                    );
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn failed_events_keep_the_existing_buffer_cleanup_and_parser_poisoning() -> TestResult {
+    block_on(async {
+        let input = format!("{OPEN}<message><body>x</body><!-- restricted -->");
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let capacity = super::MAX_RETAINED_BUFFER_BYTES + 1;
+        parser.scratch = Vec::with_capacity(capacity);
+        parser.text = String::with_capacity(capacity);
+        assert!(matches!(
+            parser.next_event().await,
+            Err(ParseError::RestrictedXml)
+        ));
+        assert_eq!(parser.scratch.capacity(), capacity);
+        assert_eq!(parser.text.capacity(), capacity);
+        assert!(parser.scratch.is_empty());
+        assert!(parser.text.is_empty());
+        assert!(matches!(
+            parser.next_event().await,
+            Err(ParseError::ParserFailed)
+        ));
+        assert!(matches!(parser.restart(), Err(ParseError::ParserFailed)));
+        Ok(())
+    })
+}
+
+#[test]
+fn cancelling_an_incomplete_large_event_does_not_trim_accumulated_text() -> TestResult {
+    block_on(async {
+        let body = "x".repeat(256 * 1024);
+        let input = format!("{OPEN}<message><body>{body}</bo");
+        let mut source = Fragmented::new(input.as_bytes(), 4096);
+        source.stall_at_end = true;
+        let consumed = source.consumed.clone();
+        let mut parser = XmppParser::new(source, config(512 * 1024)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        {
+            let mut future = pin!(parser.next_event());
+            let mut context = Context::from_waker(Waker::noop());
+            for _ in 0..input.len() / 4096 + 20 {
+                assert!(future.as_mut().poll(&mut context).is_pending());
+            }
+            assert_eq!(consumed.load(Ordering::Relaxed), input.len());
+        }
+        assert_eq!(parser.text, body);
+        assert!(parser.text.capacity() > super::MAX_RETAINED_BUFFER_BYTES);
+        assert!(matches!(
+            parser.next_event().await,
+            Err(ParseError::ParserFailed)
+        ));
+        assert!(matches!(parser.restart(), Err(ParseError::ParserFailed)));
+        Ok(())
+    })
+}

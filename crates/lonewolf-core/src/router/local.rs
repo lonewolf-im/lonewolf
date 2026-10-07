@@ -81,22 +81,10 @@ pub(crate) struct DirectedWithdrawal {
     pub(crate) recipients: Vec<DirectedRecipient>,
 }
 
-struct DirectedGrant {
-    recipient: DirectedRecipient,
-    live: Arc<AtomicBool>,
-}
-
-fn take_directed(grants: &mut Vec<DirectedGrant>, token: u64) -> DirectedWithdrawal {
-    let recipients = mem::take(grants)
-        .into_iter()
-        .map(|grant| {
-            grant.live.store(false, Ordering::Release);
-            grant.recipient
-        })
-        .collect();
+fn take_directed(grants: &mut Vec<DirectedRecipient>, token: u64) -> DirectedWithdrawal {
     DirectedWithdrawal {
         source_token: token,
-        recipients,
+        recipients: mem::take(grants),
     }
 }
 
@@ -323,7 +311,7 @@ struct Session<A: ChunkAllocator> {
     tags: SessionTags,
     presence: Option<RoutedStanza<A>>,
     unavailable: Option<RoutedStanza<A>>,
-    directed: Vec<DirectedGrant>,
+    directed: Vec<DirectedRecipient>,
     retired: oneshot::Sender<Retired<A>>,
 }
 
@@ -1284,9 +1272,6 @@ impl<A: ChunkAllocator> Shard<A> {
         for sessions in self.accounts.values() {
             for session in sessions.values() {
                 session.alive.store(false, Ordering::Release);
-                for grant in &session.directed {
-                    grant.live.store(false, Ordering::Release);
-                }
             }
         }
         let directed = SharedDirectedWithdrawal(Arc::new(Mutex::new(None)));
@@ -1476,7 +1461,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                                 && session
                                     .directed
                                     .iter()
-                                    .any(|grant| grant.recipient.matches_prepared(&observer))
+                                    .any(|grant| grant.matches_prepared(&observer))
                         })
                 );
             }
@@ -1733,24 +1718,17 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         if recipient.bare() == account.as_str() {
             return Ok(());
         }
-        let known = source
-            .directed
-            .iter()
-            .position(|grant| grant.recipient == recipient);
+        let known = source.directed.iter().position(|grant| *grant == recipient);
         match (available, known) {
             (true, None) => {
                 if source.directed.len() >= self.max_directed_presence_recipients_per_resource.get()
                 {
                     return Err(RouterError::DirectedPresenceLimit);
                 }
-                source.directed.push(DirectedGrant {
-                    recipient,
-                    live: Arc::new(AtomicBool::new(true)),
-                });
+                source.directed.push(recipient);
             }
             (false, Some(index)) => {
-                let grant = source.directed.swap_remove(index);
-                grant.live.store(false, Ordering::Release);
+                source.directed.swap_remove(index);
             }
             _ => {}
         }
@@ -1783,7 +1761,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 directed: session
                     .directed
                     .iter()
-                    .any(|grant| grant.recipient.matches_prepared(observer)),
+                    .any(|grant| grant.matches_prepared(observer)),
             };
             let ordinary_access = subscribed || account.as_str() == observer.bare();
             if !ordinary_access && !access.directed {
@@ -1956,15 +1934,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 continue;
             }
             session.directed.retain(|grant| {
-                let remove = if sender.resourcepart().is_some() {
-                    grant.recipient.as_str() == sender.as_str()
+                if sender.resourcepart().is_some() {
+                    grant.as_str() != sender.as_str()
                 } else {
-                    grant.recipient.bare() == sender.as_str()
-                };
-                if remove {
-                    grant.live.store(false, Ordering::Release);
+                    grant.bare() != sender.as_str()
                 }
-                !remove
             });
         }
         Ok(())
@@ -2055,10 +2029,8 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         if !subscribed
             && to.bare() != observer.bare()
             && !session.directed.iter().any(|grant| {
-                grant.live.load(Ordering::Acquire)
-                    && (grant.recipient.as_str() == observer.as_str()
-                        || (!grant.recipient.as_str().contains('/')
-                            && grant.recipient.as_str() == observer.bare().as_str()))
+                grant.as_str() == observer.as_str()
+                    || (!grant.as_str().contains('/') && grant.as_str() == observer.bare().as_str())
             })
         {
             return Err(RouterError::NotFound);
@@ -3257,7 +3229,6 @@ mod tests {
                     true,
                 )?;
             }
-            let old = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[0].live);
             shard.record_directed_presence(
                 &alice,
                 "desk",
@@ -3265,10 +3236,10 @@ mod tests {
                 directed_recipient("bob@localhost")?,
                 true,
             )?;
-            assert!(Arc::ptr_eq(
-                &old,
-                &shard.accounts[alice.as_str()]["desk"].directed[0].live
-            ));
+            assert_eq!(
+                shard.accounts[alice.as_str()]["desk"].directed[0].as_str(),
+                "bob@localhost"
+            );
             assert_eq!(shard.accounts[alice.as_str()]["desk"].directed.len(), 2);
             assert_eq!(
                 shard.record_directed_presence(
@@ -3311,7 +3282,12 @@ mod tests {
                 directed_recipient("bob@localhost")?,
                 false,
             )?;
-            assert!(!old.load(Ordering::Acquire));
+            assert!(
+                shard.accounts[alice.as_str()]["desk"]
+                    .directed
+                    .iter()
+                    .all(|grant| grant.as_str() != "bob@localhost")
+            );
             shard.record_directed_presence(
                 &alice,
                 "desk",
@@ -3319,17 +3295,17 @@ mod tests {
                 directed_recipient("bob@localhost")?,
                 true,
             )?;
-            let fresh = &shard.accounts[alice.as_str()]["desk"].directed[1].live;
-            assert!(fresh.load(Ordering::Acquire));
-            assert!(!Arc::ptr_eq(&old, fresh));
+            assert_eq!(
+                shard.accounts[alice.as_str()]["desk"].directed[1].as_str(),
+                "bob@localhost"
+            );
             assert_eq!(shard.accounts[alice.as_str()]["desk"].directed.len(), 2);
             Ok(())
         })
     }
 
     #[test]
-    fn recipient_unavailable_releases_directed_presence_limit_and_fences_grants()
-    -> Result<(), Box<dyn Error>> {
+    fn recipient_unavailable_releases_directed_presence_limit() -> Result<(), Box<dyn Error>> {
         Runtime::new()?.block_on(async {
             for sender in ["bob@localhost/desk", "bob@localhost"] {
                 let alice = account()?;
@@ -3347,8 +3323,6 @@ mod tests {
                         true,
                     )?;
                 }
-                let bare = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[0].live);
-                let full = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[1].live);
                 shard.prune_directed(
                     &routed(&format!(
                         "<presence from='{sender}' to='alice@localhost/desk' type='unavailable'/>"
@@ -3356,12 +3330,16 @@ mod tests {
                     .await?,
                     None,
                 )?;
-                assert!(!full.load(Ordering::Acquire));
-                assert_eq!(bare.load(Ordering::Acquire), sender.contains('/'));
                 assert_eq!(
                     shard.accounts[alice.as_str()]["desk"].directed.len(),
                     usize::from(sender.contains('/'))
                 );
+                if sender.contains('/') {
+                    assert_eq!(
+                        shard.accounts[alice.as_str()]["desk"].directed[0].as_str(),
+                        "bob@localhost"
+                    );
+                }
                 shard.record_directed_presence(
                     &alice,
                     "desk",
@@ -3369,12 +3347,14 @@ mod tests {
                     directed_recipient("bob@localhost/desk")?,
                     true,
                 )?;
-                let fresh = &shard.accounts[alice.as_str()]["desk"]
-                    .directed
-                    .last()
-                    .ok_or("missing grant")?
-                    .live;
-                assert!(!Arc::ptr_eq(&full, fresh));
+                assert_eq!(
+                    shard.accounts[alice.as_str()]["desk"]
+                        .directed
+                        .last()
+                        .ok_or("missing grant")?
+                        .as_str(),
+                    "bob@localhost/desk"
+                );
             }
             Ok(())
         })
@@ -3398,7 +3378,6 @@ mod tests {
                     directed_recipient("bob@localhost")?,
                     true,
                 )?;
-                let old = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[0].live);
                 let mut held = Some(desk);
                 match action {
                     "unavailable" => {
@@ -3412,16 +3391,14 @@ mod tests {
                             None,
                         )?;
                         assert_eq!(change.directed.recipients.len(), 1);
+                        assert_eq!(change.directed.recipients[0].as_str(), "bob@localhost");
+                        assert!(shard.accounts[alice.as_str()]["desk"].directed.is_empty());
                     }
                     "disconnect" => {
-                        assert_eq!(
-                            shard
-                                .end_presence(&alice, "desk", token)?
-                                .directed
-                                .recipients
-                                .len(),
-                            1
-                        );
+                        let withdrawal = shard.end_presence(&alice, "desk", token)?;
+                        assert_eq!(withdrawal.directed.recipients.len(), 1);
+                        assert_eq!(withdrawal.directed.recipients[0].as_str(), "bob@localhost");
+                        assert!(shard.accounts[alice.as_str()]["desk"].directed.is_empty());
                     }
                     "delete" => shard.retire_account(&alice),
                     "drop" => {
@@ -3432,7 +3409,15 @@ mod tests {
                     }
                     _ => shard.remove(alice.as_str(), "desk", token, RetireCause::Evicted),
                 }
-                assert!(!old.load(Ordering::Acquire), "{action}");
+                if !matches!(action, "unavailable" | "disconnect") {
+                    assert!(
+                        shard
+                            .accounts
+                            .get(alice.as_str())
+                            .is_none_or(|sessions| !sessions.contains_key("desk")),
+                        "{action}"
+                    );
+                }
                 let replacement = if action == "unavailable" {
                     held.take().ok_or("missing registration")?
                 } else {
@@ -3467,8 +3452,7 @@ mod tests {
                 }
                 let grants = &shard.accounts[alice.as_str()]["desk"].directed;
                 assert_eq!(grants.len(), 1);
-                assert_eq!(grants[0].recipient.as_str(), "carol@localhost");
-                assert!(grants[0].live.load(Ordering::Acquire));
+                assert_eq!(grants[0].as_str(), "carol@localhost");
                 assert_eq!(
                     shard.record_directed_presence(
                         &alice,
@@ -3533,8 +3517,7 @@ mod tests {
                 let replacement_state = &source.accounts[alice.as_str()]["desk"];
                 assert_eq!(replacement_state.token, replacement.token);
                 assert_eq!(replacement_state.directed.len(), 1);
-                assert!(replacement_state.directed[0].live.load(Ordering::Acquire));
-                assert_eq!(replacement_state.directed[0].recipient.as_str(), "bob@localhost/desk");
+                assert_eq!(replacement_state.directed[0].as_str(), "bob@localhost/desk");
             }
             Ok(())
         })

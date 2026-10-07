@@ -264,6 +264,7 @@ enum Command<A: ChunkAllocator> {
     },
     DeliverPresence {
         stanza: RoutedStanza<A>,
+        source: Option<SessionLiveness>,
         reply: oneshot::Sender<Result<(), RouterError>>,
     },
     DeliverPresenceError {
@@ -689,7 +690,32 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         };
         let (reply, result) = oneshot::channel();
         self.shards[shard]
-            .send(Command::DeliverPresence { stanza, reply })
+            .send(Command::DeliverPresence {
+                stanza,
+                source: None,
+                reply,
+            })
+            .await
+            .map_err(|_| RouterError::Stopped)?;
+        result.await.map_err(|_| RouterError::Stopped)?
+    }
+
+    pub(crate) async fn deliver_presence_guarded(
+        &self,
+        stanza: RoutedStanza<A>,
+        source: SessionLiveness,
+    ) -> Result<(), RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            self.bare_target_shard(&view)?
+        };
+        let (reply, result) = oneshot::channel();
+        self.shards[shard]
+            .send(Command::DeliverPresence {
+                stanza,
+                source: Some(source),
+                reply,
+            })
             .await
             .map_err(|_| RouterError::Stopped)?;
         result.await.map_err(|_| RouterError::Stopped)?
@@ -1185,21 +1211,19 @@ impl<A: ChunkAllocator + Clone> SessionHandle<A> {
             (DirectedRecipient::new(to), to.resourcepart().is_some())
         };
         self.record_directed_presence(recipient, available).await?;
-        let delivered = if available {
-            self.router
-                .authorized_delivery(PresenceDelivery {
-                    stanza,
-                    source: self.liveness.clone(),
-                    requester: None,
-                    target_token: None,
-                    ordinary_access: true,
-                    grants: [None, None],
-                })
-                .await
-        } else if full {
-            self.router.deliver_full(stanza).await
-        } else {
-            self.router.deliver_presence(stanza).await
+        let delivered = match (full, available) {
+            (true, true) => {
+                self.router
+                    .deliver_full_guarded(stanza, self.liveness.clone())
+                    .await
+            }
+            (true, false) => self.router.deliver_full(stanza).await,
+            (false, true) => {
+                self.router
+                    .deliver_presence_guarded(stanza, self.liveness.clone())
+                    .await
+            }
+            (false, false) => self.router.deliver_presence(stanza).await,
         };
         match delivered {
             Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
@@ -1579,8 +1603,12 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             Command::DeliverBare { stanza, reply } => {
                 reply!(reply, self.deliver_bare(stanza, false));
             }
-            Command::DeliverPresence { stanza, reply } => {
-                reply!(reply, self.deliver_presence(stanza));
+            Command::DeliverPresence {
+                stanza,
+                source,
+                reply,
+            } => {
+                reply!(reply, self.deliver_presence(stanza, source.as_ref()));
             }
             Command::DeliverPresenceError { stanza, reply } => {
                 reply!(
@@ -2219,7 +2247,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         }
     }
 
-    fn deliver_presence(&mut self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+    fn deliver_presence(
+        &mut self,
+        stanza: RoutedStanza<A>,
+        source: Option<&SessionLiveness>,
+    ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let to = view
             .to()
@@ -2240,7 +2272,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         {
             return Err(RouterError::InvalidTarget);
         }
-        self.deliver_presence_where(stanza, |session| session.priority.is_some())
+        self.deliver_presence_where_with_guard(
+            stanza,
+            |session| session.priority.is_some(),
+            || source.is_none_or(SessionLiveness::is_alive),
+        )
     }
 
     fn deliver_presence_to_tagged(

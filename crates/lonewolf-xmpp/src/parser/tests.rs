@@ -1145,6 +1145,8 @@ fn buffer_retention_reuses_small_events_and_releases_large_events() -> TestResul
                     config(512 * 1024)?,
                     GlobalChunkAllocator,
                 );
+                assert_eq!(parser.scratch.capacity(), 0);
+                assert_eq!(parser.text.capacity(), 0);
                 open(&mut parser).await?;
                 let mut first = None;
                 let mut capacities = Vec::new();
@@ -1164,11 +1166,23 @@ fn buffer_retention_reuses_small_events_and_releases_large_events() -> TestResul
                         .ok_or("text")?;
                     assert_eq!(text.len(), *size);
                     assert!(text.bytes().all(|byte| byte == b'x'));
-                    if index > 0 && *size == 1024 && sizes[index - 1] == 1024 {
+                    if index > 0 && *size == 1024 {
                         assert_eq!(parser.scratch.as_ptr(), before.0);
                         assert_eq!(parser.scratch.capacity(), before.1);
                         assert_eq!(parser.text.as_ptr(), before.2);
                         assert_eq!(parser.text.capacity(), before.3);
+                    }
+                    if *size > super::MAX_RETAINED_BUFFER_BYTES {
+                        assert!(
+                            (super::RETAINED_BUFFER_RESERVE_BYTES
+                                ..=super::MAX_RETAINED_BUFFER_BYTES)
+                                .contains(&parser.scratch.capacity())
+                        );
+                        assert!(
+                            (super::RETAINED_BUFFER_RESERVE_BYTES
+                                ..=super::MAX_RETAINED_BUFFER_BYTES)
+                                .contains(&parser.text.capacity())
+                        );
                     }
                     capacities.push((parser.scratch.capacity(), parser.text.capacity()));
                     if first.is_none() {
@@ -1238,13 +1252,19 @@ fn complete_events_trim_each_buffer_independently_above_the_capacity_boundary() 
                     assert_eq!(parser.scratch.capacity(), scratch_capacity);
                     assert_eq!(parser.scratch.as_ptr(), scratch_pointer);
                 } else {
-                    assert_eq!(parser.scratch.capacity(), 0);
+                    assert!(
+                        (super::RETAINED_BUFFER_RESERVE_BYTES..=super::MAX_RETAINED_BUFFER_BYTES)
+                            .contains(&parser.scratch.capacity())
+                    );
                 }
                 if text_capacity <= threshold {
                     assert_eq!(parser.text.capacity(), text_capacity);
                     assert_eq!(parser.text.as_ptr(), text_pointer);
                 } else {
-                    assert_eq!(parser.text.capacity(), 0);
+                    assert!(
+                        (super::RETAINED_BUFFER_RESERVE_BYTES..=super::MAX_RETAINED_BUFFER_BYTES)
+                            .contains(&parser.text.capacity())
+                    );
                 }
             }
             Ok::<_, Box<dyn std::error::Error>>(())

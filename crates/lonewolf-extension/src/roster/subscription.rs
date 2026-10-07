@@ -9,7 +9,7 @@ use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
 use super::state::{self, Cancellation, Removal, RequestOutcome, grants};
-use super::{account_exists, push_removal, push_roster, require_account, xml};
+use super::{account_exists, push_removal, push_roster, require_account, roster_error, xml};
 use crate::Effects;
 use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
 use crate::presence::PresenceRequest;
@@ -46,9 +46,9 @@ impl Parties {
 async fn check_parties(
     transaction: &impl AccountReads,
     parties: &Parties,
-) -> Result<bool, StanzaErrorCondition> {
+) -> Result<bool, HandlerError> {
     require_account(transaction, &parties.sender).await?;
-    account_exists(transaction, &parties.target).await
+    account_exists(transaction, &parties.target, "roster_write").await
 }
 
 pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>(
@@ -82,7 +82,8 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
         request.into_bytes().into_boxed_slice(),
         max_pending_subscription_requests,
     )
-    .await?
+    .await
+    .map_err(|error| roster_error(error, "roster_write"))?
     {
         RequestOutcome::ContactMissing => {
             return Err(StanzaErrorCondition::ServiceUnavailable.into());
@@ -176,16 +177,17 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
         &sender_jid,
         state::approve_pending_out,
     )
-    .await?;
-    let sender_mutation =
-        state::resolve_pending(transaction, &sender, &target_jid, state::grant).await?;
+    .await
+    .map_err(|error| roster_error(error, "roster_write"))?;
+    let sender_mutation = state::resolve_pending(transaction, &sender, &target_jid, state::grant)
+        .await
+        .map_err(|error| roster_error(error, "roster_write"))?;
     // An approval with no request to resolve is kept as a pre-approval and never routed.
     let pre_approval = match sender_mutation {
         Some(_) => None,
-        None => {
-            state::update_subscription(transaction, &sender, &target_jid, state::pre_approve)
-                .await?
-        }
+        None => state::update_subscription(transaction, &sender, &target_jid, state::pre_approve)
+            .await
+            .map_err(|error| roster_error(error, "roster_write"))?,
     };
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
@@ -243,7 +245,8 @@ pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
         &target_jid,
         subscriber_exists.then_some((&target, &sender_jid)),
     )
-    .await?;
+    .await
+    .map_err(|error| roster_error(error, "roster_write"))?;
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
         let item_count =
@@ -297,7 +300,8 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
         &target_jid,
         contact_exists.then_some((&target, &sender_jid)),
     )
-    .await?;
+    .await
+    .map_err(|error| roster_error(error, "roster_write"))?;
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
         let item_count =
@@ -349,7 +353,8 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
         &contact,
         contact_account.as_ref(),
     )
-    .await?
+    .await
+    .map_err(|error| roster_error(error, "roster_write"))?
     .ok_or(StanzaErrorCondition::ItemNotFound)?;
     let mut accounts = vec![owner.clone()];
     accounts.extend(contact_account.clone());
@@ -385,8 +390,15 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
     hosts: &dyn HostLookup,
 ) -> Result<Effects<A>, HandlerError> {
     let account_jid = RosterJid::from(account);
-    let items = transaction.roster(account).await?.items;
-    let requests = transaction.pending_requests(account).await?;
+    let items = transaction
+        .roster(account)
+        .await
+        .map_err(|error| roster_error(error, "roster_write"))?
+        .items;
+    let requests = transaction
+        .pending_requests(account)
+        .await
+        .map_err(|error| roster_error(error, "roster_write"))?;
     let item_count = items.len();
     let pending_count = requests.len();
     let mut removals = Vec::new();
@@ -399,7 +411,8 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
             &item.jid,
             contact.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(|error| roster_error(error, "roster_write"))?;
         if let (Some(removal), Some(contact)) = (removal, contact) {
             removals.push((contact, removal));
         }
@@ -413,12 +426,16 @@ pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
             &request.sender,
             sender.as_ref().map(|sender| (sender, &account_jid)),
         )
-        .await?;
+        .await
+        .map_err(|error| roster_error(error, "roster_write"))?;
         if let Some(sender) = sender {
             cancellations.push((sender, cancellation));
         }
     }
-    transaction.clear_roster(account).await?;
+    transaction
+        .clear_roster(account)
+        .await
+        .map_err(|error| roster_error(error, "roster_write"))?;
     let mut accounts = Vec::with_capacity(1 + removals.len() + cancellations.len());
     accounts.push(account.clone());
     accounts.extend(removals.iter().map(|(contact, _)| contact.clone()));
@@ -460,9 +477,11 @@ async fn stored_local_account(
     transaction: &impl AccountReads,
     jid: &RosterJid,
     hosts: &dyn HostLookup,
-) -> Result<Option<AccountKey>, StanzaErrorCondition> {
+) -> Result<Option<AccountKey>, HandlerError> {
     match local_candidate(jid, hosts) {
-        Some(candidate) if account_exists(transaction, &candidate).await? => Ok(Some(candidate)),
+        Some(candidate) if account_exists(transaction, &candidate, "roster_write").await? => {
+            Ok(Some(candidate))
+        }
         _ => Ok(None),
     }
 }

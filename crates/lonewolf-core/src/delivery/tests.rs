@@ -28,14 +28,14 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
-use super::{StoredDelivery, WorkGroup, commit_and_deliver, commit_and_store};
+use super::{EffectsDiagnostics, StoredDelivery, WorkGroup, commit_and_deliver, commit_and_store};
 use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::order::Order;
 use crate::router::local::LocalRouter;
 use crate::router::{Router, RouterError};
 
-type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 struct AckNotice {
     done: Mutex<Option<oneshot::Sender<()>>>,
@@ -289,7 +289,7 @@ fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgemen
     }))?
 }
 
-struct NoDelivery;
+pub(super) struct NoDelivery;
 
 impl HostLookup for NoDelivery {
     fn is_local_host(&self, _: &str) -> bool {
@@ -340,7 +340,7 @@ impl Delivery<GlobalChunkAllocator> for NoDelivery {
     }
 }
 
-fn account(value: &str) -> TestResult<AccountKey> {
+pub(super) fn account(value: &str) -> TestResult<AccountKey> {
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let jid = Jid::parse_in(value, &mut arena)?;
     Ok(AccountKey::try_from(jid.resolve(&arena)?)?)
@@ -358,7 +358,7 @@ fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> Test
             .await?;
         let ran = Rc::new(Cell::new(false));
         let flag = Rc::clone(&ran);
-        let effects = Effects::new(vec![alice], move |_| {
+        let effects = Effects::new(vec![alice.clone()], move |_| {
             Box::pin(async move {
                 flag.set(true);
                 Ok(())
@@ -372,6 +372,11 @@ fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> Test
             effects,
             NoDelivery,
             None,
+            EffectsDiagnostics {
+                account: alice,
+                commit_operation: "iq_set_commit",
+                delivery_operation: "iq_set_effects",
+            },
         );
         drop(committed);
         compio::time::sleep(Duration::from_millis(20)).await;

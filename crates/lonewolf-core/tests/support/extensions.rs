@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use lonewolf_extension::delivery::{HandlerError, HostLookup, SessionTag};
+use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError, HostLookup, SessionTag};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
@@ -94,6 +94,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(TestIq))?;
     extensions.register(Arc::new(ServerIq))?;
     extensions.register(Arc::new(ErrorIq))?;
+    extensions.register(Arc::new(FailureIq))?;
     extensions.register(Arc::new(TestPresence))?;
     extensions.register(Arc::new(ConflictingPresence))?;
     extensions.register(Arc::new(OfflineInspect))?;
@@ -302,7 +303,15 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for SlowOffline {
                 tracing::info!("test offline acknowledgement waiting");
                 let _ready = self.acknowledge.acquire().await;
                 if self.fail_ack.load(Ordering::Acquire) {
-                    return Err(StanzaErrorCondition::InternalServerError.into());
+                    return Err(HandlerError::Internal {
+                        condition: StanzaErrorCondition::InternalServerError,
+                        failure: Failure {
+                            kind: FailureKind::Storage(
+                                lonewolf_storage::StorageErrorKind::Unavailable,
+                            ),
+                            operation: "offline_acknowledge",
+                        },
+                    });
                 }
             }
             <Offline as MessageHandler<A, RedbStorage>>::acknowledge_one(
@@ -560,7 +569,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestPresence {}
 
 impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for TestPresence {
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
-        Box::pin(async move { verify_authorization(&request).await })
+        Box::pin(async move { verify_authorization(&request).await.map_err(Into::into) })
     }
 }
 
@@ -578,7 +587,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingPresence {}
 
 impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ConflictingPresence {
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
-        Box::pin(async move { verify_authorization(&request).await })
+        Box::pin(async move { verify_authorization(&request).await.map_err(Into::into) })
     }
 }
 
@@ -638,3 +647,73 @@ async fn verify_authorization<A: ChunkAllocator>(
         Err(StanzaErrorCondition::InternalServerError)
     }
 }
+
+struct FailureIq;
+
+const FAILURE_GET: IqRoute = IqRoute {
+    namespace: "urn:lonewolf:test:failure",
+    name: "fail",
+    ..ACCOUNT_GET
+};
+const FAILURE_SET: IqRoute = IqRoute {
+    kind: IqRequestType::Set,
+    ..FAILURE_GET
+};
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for FailureIq {
+    fn name(&self) -> &'static str {
+        "test-failure-iq"
+    }
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[FAILURE_GET, FAILURE_SET]
+    }
+}
+
+fn injected_handler_error(
+    kind: lonewolf_storage::StorageErrorKind,
+    operation: &'static str,
+) -> HandlerError {
+    let error = lonewolf_storage::StorageError::with_source(
+        kind,
+        std::io::Error::other("sensitive-seeded-storage-source"),
+    );
+    HandlerError::Internal {
+        condition: StanzaErrorCondition::InternalServerError,
+        failure: Failure {
+            kind: FailureKind::Storage(error.kind()),
+            operation,
+        },
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for FailureIq {
+    fn get<'a>(
+        &'a self,
+        _request: IqRequest<'a, A>,
+        _transaction: &'a RedbRead,
+        _response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async {
+            Err(injected_handler_error(
+                lonewolf_storage::StorageErrorKind::CorruptData,
+                "roster_read",
+            ))
+        })
+    }
+    fn set<'a>(
+        &'a self,
+        _request: IqRequest<'a, A>,
+        _transaction: &'a mut RedbWrite,
+        _hosts: &'a dyn HostLookup,
+        _response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async {
+            Err(injected_handler_error(
+                lonewolf_storage::StorageErrorKind::Unavailable,
+                "roster_write",
+            ))
+        })
+    }
+}
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for FailureIq {}
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for FailureIq {}

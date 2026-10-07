@@ -11,16 +11,16 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures_util::future::{Either, select};
-use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::message::{Backlog, MessageHandler, StoreOutcome, UndeliverableMessage};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
-use lonewolf_storage::account::{AccountKey, AccountReads};
+use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
-use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, WriteTransaction};
+use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
@@ -36,8 +36,8 @@ use super::outcome::CloseOutcome;
 use super::session::{Reader, Session, Writer, namespace_error, peer_stream_error};
 use crate::c2s::iq;
 use crate::delivery::{
-    Pending, RouterDelivery, StoredDelivery, WorkGroup, after_turn, commit_and_deliver,
-    commit_and_store,
+    EffectsDiagnostics, Pending, RouterDelivery, StoredDelivery, WorkGroup, after_turn,
+    commit_and_deliver, commit_and_store, report_failure, report_handler_failure, storage_failure,
 };
 use crate::order::Ticket;
 use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
@@ -128,6 +128,15 @@ impl From<StoredRecordError> for CloseOutcome {
     fn from(_: StoredRecordError) -> Self {
         Self::InternalError
     }
+}
+
+fn close_storage_failure(
+    error: StorageError,
+    operation: &'static str,
+    account: &AccountKey,
+) -> CloseOutcome {
+    report_failure(storage_failure(error, operation), account);
+    CloseOutcome::InternalError
 }
 
 trait OutboxWriter {
@@ -523,8 +532,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         let (transaction, ticket) = Arc::clone(self.router.order())
             .fix(accounts, self.storage.begin_read())
             .await
-            .map_err(|_| CloseOutcome::InternalError)?;
+            .map_err(|error| {
+                close_storage_failure(error, "iq_get_begin_read", self.registration.account())
+            })?;
         let work = GetWork {
+            account: self.registration.account().clone(),
             transaction,
             handler,
             arena,
@@ -564,11 +576,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         mut response: Arena<A>,
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
     ) -> Result<(), CloseOutcome> {
-        let mut transaction = self
-            .storage
-            .begin_write()
-            .await
-            .map_err(|_| CloseOutcome::InternalError)?;
+        let mut transaction = self.storage.begin_write().await.map_err(|error| {
+            close_storage_failure(error, "iq_set_begin_write", self.registration.account())
+        })?;
         let delivery = self.delivery();
         let reply = {
             let sender = sender.resolve(&arena)?;
@@ -597,6 +607,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                     effects,
                     delivery,
                     Some(self.registration.mailbox()),
+                    EffectsDiagnostics {
+                        account: self.registration.account().clone(),
+                        commit_operation: "iq_set_commit",
+                        delivery_operation: "iq_set_effects",
+                    },
                 );
                 self.outbox
                     .drain_until(&self.registration, committed.turned())
@@ -609,7 +624,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 self.outbox.routed(queued);
                 Ok(payload)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                report_handler_failure(&error, self.registration.account());
+                Err(error)
+            }
         };
         self.queue_iq_reply(request, sender, arena, response, reply)
     }
@@ -623,8 +641,8 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         reply: Result<Option<Element>, HandlerError>,
     ) -> Result<(), CloseOutcome> {
         match reply {
-            Err(HandlerError::Stanza(condition)) => {
-                let reply = iq::error_reply(&request, &mut arena, condition, Some(sender))?;
+            Err(error) => {
+                let reply = iq::error_reply(&request, &mut arena, error.condition(), Some(sender))?;
                 self.outbox.push(Output::Owned {
                     stanza: reply,
                     arena,
@@ -707,7 +725,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 .order()
                 .fix(accounts, storage.begin_read())
                 .await
-                .map_err(|_| RouterError::Unavailable)?;
+                .map_err(|error| {
+                    report_failure(storage_failure(error, "presence_probe_begin_read"), &target);
+                    RouterError::Unavailable
+                })?;
             let observer = routed
                 .resolve()
                 .map_err(|_| RouterError::InvalidTarget)?
@@ -721,7 +742,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 Some(handler) => handler
                     .visibility(&target, observer, &transaction)
                     .await
-                    .map_err(|_| RouterError::Unavailable)?,
+                    .map_err(|error| {
+                        report_handler_failure(&error, &target);
+                        RouterError::Unavailable
+                    })?,
                 None => false,
             };
             ticket.turn().await;
@@ -857,11 +881,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         } else {
             0
         };
-        let mut transaction = self
-            .storage
-            .begin_write()
-            .await
-            .map_err(|_| CloseOutcome::InternalError)?;
+        let mut transaction = self.storage.begin_write().await.map_err(|error| {
+            close_storage_failure(error, "offline_store_begin_write", &recipient)
+        })?;
         let mut scratch = Arena::try_new_in(ArenaConfig::default(), self.allocator.clone())?;
         let outcome = handler
             .store(
@@ -876,9 +898,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             .await;
         drop(scratch);
         match outcome {
-            Err(HandlerError::Stanza(condition)) => {
+            Err(error) => {
                 drop(transaction);
-                self.reply_error(&routed, condition)
+                report_handler_failure(&error, &recipient);
+                self.reply_error(&routed, error.condition())
             }
             Ok(StoreOutcome::Discarded) => {
                 drop(transaction);
@@ -964,7 +987,9 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 let (transaction, ticket) = Arc::clone(self.router.order())
                     .fix(vec![owner.clone()], self.storage.begin_read())
                     .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
+                    .map_err(|error| {
+                        close_storage_failure(error, "presence_snapshot_begin_read", owner)
+                    })?;
                 let sender = from.resolve(&arena)?;
                 let result = async {
                     let audience = match presence_handler {
@@ -995,9 +1020,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             };
         let (audience, backlog) = match result {
             Ok(result) => result,
-            Err(condition) => {
+            Err(error) => {
+                report_handler_failure(&error, self.registration.account());
                 let routed = RoutedStanza::from_parts(stamped, arena);
-                return self.reply_error(&routed, condition);
+                return self.reply_error(&routed, error.condition());
             }
         };
         let (routed, unavailable) = match unavailable {
@@ -1081,16 +1107,19 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 })
                 .await
         };
-        if let Err(condition) = authorized {
-            return self.reply_error(&source, condition);
+        if let Err(error) = authorized {
+            report_handler_failure(&error, self.registration.account());
+            return self.reply_error(&source, error.condition());
         }
         let received = {
             let (sender, target) = presence_addresses(&routed)?;
-            let mut transaction = self
-                .storage
-                .begin_write()
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?;
+            let mut transaction = self.storage.begin_write().await.map_err(|error| {
+                close_storage_failure(
+                    error,
+                    "presence_subscription_begin_write",
+                    self.registration.account(),
+                )
+            })?;
             let (_, original_target) = presence_addresses(&source)?;
             if kind != PresenceRequestType::Subscribe
                 && self.router.is_local_host(original_target.domainpart())
@@ -1128,6 +1157,11 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                             effects,
                             delivery,
                             Some(self.registration.mailbox()),
+                            EffectsDiagnostics {
+                                account: self.registration.account().clone(),
+                                commit_operation: "presence_subscription_commit",
+                                delivery_operation: "presence_subscription_effects",
+                            },
                         )),
                         Err(error) => Err(error),
                     }
@@ -1150,7 +1184,10 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 self.outbox.routed(queued);
                 Ok(())
             }
-            Err(HandlerError::Stanza(condition)) => self.reply_error(&source, condition),
+            Err(error) => {
+                report_handler_failure(&error, self.registration.account());
+                self.reply_error(&source, error.condition())
+            }
         }
     }
 
@@ -1377,7 +1414,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
             let result =
                 acknowledge_backlog(&storage, &account, &liveness, &*handler, &through).await;
             if let Err(error) = result {
-                tracing::error!(error = ?error, "offline backlog acknowledgement failed");
+                report_handler_failure(&error, &account);
             }
         }));
         self.acknowledgement = Some(ReplayAcknowledgement {
@@ -1473,10 +1510,14 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
     watermark: &Cell<OfflineSequence>,
 ) -> Result<(), HandlerError> {
     loop {
-        let mut transaction = storage
-            .begin_write()
-            .await
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        let mut transaction =
+            storage
+                .begin_write()
+                .await
+                .map_err(|error| HandlerError::Internal {
+                    condition: StanzaErrorCondition::InternalServerError,
+                    failure: storage_failure(error, "offline_acknowledge_replay_begin_write"),
+                })?;
         // Check after writer admission so account recreation cannot reset these sequences.
         if !liveness.is_alive() {
             tracing::info!(
@@ -1494,7 +1535,10 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
         transaction
             .commit()
             .await
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            .map_err(|error| HandlerError::Internal {
+                condition: StanzaErrorCondition::InternalServerError,
+                failure: storage_failure(error, "offline_acknowledge_replay_commit"),
+            })?;
         tracing::info!(
             operation = "acknowledge_replay",
             outcome = "committed",
@@ -1508,6 +1552,7 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
 }
 
 struct GetWork<A: ChunkAllocator> {
+    account: AccountKey,
     transaction: RedbRead,
     handler: Arc<dyn IqHandler<A, RedbStorage>>,
     arena: Arena<A>,
@@ -1528,6 +1573,7 @@ struct GetOutcome<A: ChunkAllocator> {
 impl<A: ChunkAllocator + Clone> GetWork<A> {
     async fn run(self, queued: Vec<RoutedStanza<A>>) -> Result<GetOutcome<A>, CloseOutcome> {
         let GetWork {
+            account,
             transaction,
             handler,
             arena,
@@ -1555,12 +1601,22 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
         drop(transaction);
         let reply = match reply {
             Ok(IqReply { payload, effects }) => {
-                (effects.deliver)(&delivery)
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
+                (effects.deliver)(&delivery).await.map_err(|_| {
+                    report_failure(
+                        Failure {
+                            kind: FailureKind::Delivery,
+                            operation: "iq_get_effects",
+                        },
+                        &account,
+                    );
+                    CloseOutcome::InternalError
+                })?;
                 Ok(payload)
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                report_handler_failure(&error, &account);
+                Err(error)
+            }
         };
         Ok(GetOutcome {
             arena,
@@ -1609,12 +1665,13 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
                 .order()
                 .fix(vec![self.account.clone()], async {
                     match handler {
-                        Some(_) => self
-                            .storage
-                            .begin_read()
-                            .await
-                            .map(Some)
-                            .map_err(|_| CloseOutcome::InternalError),
+                        Some(_) => self.storage.begin_read().await.map(Some).map_err(|error| {
+                            close_storage_failure(
+                                error,
+                                "presence_terminal_begin_read",
+                                &self.account,
+                            )
+                        }),
                         None => Ok(None),
                     }
                 })
@@ -1633,7 +1690,10 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
                             transaction,
                         )
                         .await
-                        .map_err(|_| CloseOutcome::InternalError)?
+                        .map_err(|error| {
+                            report_handler_failure(&error, &self.account);
+                            CloseOutcome::InternalError
+                        })?
                 }
                 _ => None,
             };
@@ -1858,7 +1918,15 @@ async fn subscription_target<A: ChunkAllocator + Clone>(
     if transaction
         .account(&account)
         .await
-        .map_err(|_| CloseOutcome::InternalError)?
+        .map_err(|error| {
+            if let AccountError::Storage(error) = error {
+                report_failure(
+                    storage_failure(error, "presence_subscription_account_read"),
+                    &account,
+                );
+            }
+            CloseOutcome::InternalError
+        })?
         .is_none()
     {
         return Ok(None);
@@ -1903,7 +1971,13 @@ impl<A: ChunkAllocator + Clone> ResourceIqWork<A> {
             .order()
             .fix(accounts, self.storage.begin_read())
             .await
-            .map_err(|_| RouterError::Unavailable)?;
+            .map_err(|error| {
+                report_failure(
+                    storage_failure(error, "resource_iq_begin_read"),
+                    &self.target,
+                );
+                RouterError::Unavailable
+            })?;
         let observer = self
             .stanza
             .resolve()
@@ -1919,7 +1993,10 @@ impl<A: ChunkAllocator + Clone> ResourceIqWork<A> {
             Some(handler) => handler
                 .visibility(&self.target, observer, &transaction)
                 .await
-                .map_err(|_| RouterError::Unavailable)?,
+                .map_err(|error| {
+                    report_handler_failure(&error, &self.target);
+                    RouterError::Unavailable
+                })?,
             None => false,
         };
         Ok((subscribed, ticket))

@@ -3,6 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
+use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError};
@@ -78,11 +79,53 @@ impl From<WriteError> for DeliveryError {
     }
 }
 
-/// A handler failure while its transaction is open, answered to the client as a stanza
-/// error; the transaction aborts.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureKind {
+    Storage(StorageErrorKind),
+    Delivery,
+}
+
+impl FailureKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Storage(StorageErrorKind::Unavailable) => "storage_unavailable",
+            Self::Storage(StorageErrorKind::CorruptData) => "storage_corrupt_data",
+            Self::Storage(StorageErrorKind::UnsupportedVersion) => "storage_unsupported_version",
+            Self::Storage(StorageErrorKind::CommitUnknown) => "storage_commit_unknown",
+            Self::Storage(StorageErrorKind::Other) => "storage_other",
+            Self::Delivery => "delivery",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Failure {
+    pub kind: FailureKind,
+    pub operation: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandlerError {
     Stanza(StanzaErrorCondition),
+    Internal {
+        condition: StanzaErrorCondition,
+        failure: Failure,
+    },
+}
+
+impl HandlerError {
+    pub const fn condition(&self) -> StanzaErrorCondition {
+        match self {
+            Self::Stanza(condition) | Self::Internal { condition, .. } => *condition,
+        }
+    }
+
+    pub const fn failure(&self) -> Option<Failure> {
+        match self {
+            Self::Stanza(_) => None,
+            Self::Internal { failure, .. } => Some(*failure),
+        }
+    }
 }
 
 impl From<StanzaErrorCondition> for HandlerError {
@@ -97,19 +140,14 @@ pub type DeliveryFuture<'a> = ExtensionFuture<'a, Result<(), DeliveryError>>;
 pub type StanzaFactory<A> =
     Box<dyn FnMut(Jid, &mut Arena<A>) -> Result<Stanza, DeliveryError> + Send>;
 
-/// Answers which domains this server hosts.
 pub trait HostLookup {
-    /// Whether this server hosts `domain`, so its accounts can be reached locally.
     fn is_local_host(&self, domain: &str) -> bool;
 }
 
-/// Routing and session operations the server performs for a handler's effects.
 /// Every method runs on the connection worker of the request being handled.
 pub trait Delivery<A: ChunkAllocator>: HostLookup {
-    /// Allocates an arena for stanzas the handler builds.
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;
 
-    /// Attaches `tag` to the requesting resource.
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a>;
 
     /// Delivers a presence to the available resources of its bare `to` JID.

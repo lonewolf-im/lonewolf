@@ -78,10 +78,9 @@ pub struct PresenceAudience {
     pub contacts: Vec<AccountKey>,
 }
 
-pub type PresenceFuture<'a, T> = ExtensionFuture<'a, Result<T, StanzaErrorCondition>>;
+pub type PresenceFuture<'a, T> = ExtensionFuture<'a, Result<T, HandlerError>>;
 pub type ReceiveFuture<'a, A> = ExtensionFuture<'a, Result<Effects<A>, HandlerError>>;
 
-/// A stanza error condition is answered to the request sender.
 pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
     fn visibility<'a>(
         &'a self,

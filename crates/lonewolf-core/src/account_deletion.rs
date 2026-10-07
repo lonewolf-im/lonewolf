@@ -12,8 +12,9 @@ use lonewolf_storage::offline::{OfflineError, OfflineWrites};
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 
-use crate::delivery::RouterDelivery;
+use crate::delivery::{RouterDelivery, report_failure, report_handler_failure};
 use crate::router::RouterHandle;
+use lonewolf_extension::delivery::{Failure, FailureKind};
 
 const QUEUE_CAPACITY: usize = 16;
 
@@ -87,11 +88,15 @@ async fn delete<A: ChunkAllocator + Clone>(
             .forget_account(&mut transaction, account, &delivery)
             .await
             .map_err(|error| {
-                tracing::error!(
-                    extension = extension.name(),
-                    error = ?error,
-                    "account deletion aborted"
-                );
+                if error.failure().is_some() {
+                    report_handler_failure(&error, account);
+                } else {
+                    tracing::error!(
+                        extension = extension.name(),
+                        condition = ?error.condition(),
+                        "account deletion aborted"
+                    );
+                }
                 deleter_error("an extension could not forget the account")
             })?;
         accounts.extend(effects.accounts);
@@ -112,12 +117,14 @@ async fn delete<A: ChunkAllocator + Clone>(
         "offline account state cleared"
     );
     ticket.turn().await;
-    for (extension, deliver) in deliveries {
-        if let Err(error) = deliver(&delivery).await {
-            tracing::error!(
-                extension,
-                error = ?error,
-                "account deletion notifications failed"
+    for (_extension, deliver) in deliveries {
+        if deliver(&delivery).await.is_err() {
+            report_failure(
+                Failure {
+                    kind: FailureKind::Delivery,
+                    operation: "account_deletion_effects",
+                },
+                account,
             );
         }
     }

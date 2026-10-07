@@ -1003,3 +1003,120 @@ fn withdrawal_effects_notify_pending_contacts_only_after_commit()
     }
     Ok(())
 }
+
+struct FailingReads(lonewolf_storage::StorageErrorKind);
+
+fn read_failure(kind: lonewolf_storage::StorageErrorKind) -> lonewolf_storage::StorageError {
+    lonewolf_storage::StorageError::with_source(
+        kind,
+        std::io::Error::other("seeded-sensitive-backend-source"),
+    )
+}
+
+impl lonewolf_storage::account::AccountReads for FailingReads {
+    async fn account(
+        &self,
+        _key: &AccountKey,
+    ) -> Result<Option<lonewolf_storage::account::Account>, lonewolf_storage::account::AccountError>
+    {
+        Err(read_failure(self.0).into())
+    }
+    async fn scram(
+        &self,
+        _key: &AccountKey,
+        _hash: lonewolf_auth::scram::ScramHash,
+    ) -> Result<Option<ScramVerifier>, lonewolf_storage::account::AccountError> {
+        unreachable!("failure test does not authenticate")
+    }
+    async fn accounts_after(
+        &self,
+        _after: Option<&AccountKey>,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<lonewolf_storage::account::Account>, lonewolf_storage::account::AccountError>
+    {
+        unreachable!("failure test does not list accounts")
+    }
+}
+
+impl RosterReads for FailingReads {
+    async fn roster(&self, _owner: &AccountKey) -> Result<RosterSnapshot, RosterError> {
+        Err(read_failure(self.0).into())
+    }
+    async fn roster_item(
+        &self,
+        _owner: &AccountKey,
+        _jid: &RosterJid,
+    ) -> Result<Option<RosterItem>, RosterError> {
+        Err(read_failure(self.0).into())
+    }
+    async fn pending_requests(
+        &self,
+        _owner: &AccountKey,
+    ) -> Result<Vec<PendingSubscription>, RosterError> {
+        Err(read_failure(self.0).into())
+    }
+    async fn pending_request(
+        &self,
+        _owner: &AccountKey,
+        _sender: &RosterJid,
+    ) -> Result<Option<PendingSubscription>, RosterError> {
+        Err(read_failure(self.0).into())
+    }
+}
+
+#[test]
+fn roster_read_and_mutation_failures_keep_storage_categories_and_operation() {
+    use crate::delivery::{Failure, FailureKind};
+    use lonewolf_storage::StorageErrorKind;
+    for kind in [
+        StorageErrorKind::Unavailable,
+        StorageErrorKind::CorruptData,
+        StorageErrorKind::UnsupportedVersion,
+        StorageErrorKind::CommitUnknown,
+        StorageErrorKind::Other,
+    ] {
+        let reads = FailingReads(kind);
+        let owner = account("alice@example.com");
+        let read = block_on(super::account_exists(&reads, &owner, "roster_read"))
+            .expect_err("storage must fail");
+        let write =
+            block_on(super::require_account(&reads, &owner)).expect_err("storage must fail");
+        let contact = RosterJid::from(&account("bob@example.com"));
+        let audience = block_on(super::granting_contacts(
+            &reads,
+            contact.clone(),
+            vec![contact],
+        ))
+        .expect_err("storage must fail");
+        for (error, operation) in [
+            (read, "roster_read"),
+            (write, "roster_write"),
+            (audience, "roster_read"),
+        ] {
+            assert_eq!(error.condition(), StanzaErrorCondition::InternalServerError);
+            assert_eq!(
+                error.failure(),
+                Some(Failure {
+                    kind: FailureKind::Storage(kind),
+                    operation
+                })
+            );
+            assert!(!format!("{error:?}").contains("seeded-sensitive-backend-source"));
+        }
+    }
+    for (cause, condition) in [
+        (
+            RosterError::ValueTooLarge,
+            StanzaErrorCondition::NotAcceptable,
+        ),
+        (
+            RosterError::PendingLimitExceeded,
+            StanzaErrorCondition::ResourceConstraint,
+        ),
+        (RosterError::NoAccount, StanzaErrorCondition::Forbidden),
+    ] {
+        let error = super::roster_error(cause, "roster_write");
+        assert_eq!(error.condition(), condition);
+        assert_eq!(error.failure(), None);
+    }
+}

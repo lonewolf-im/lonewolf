@@ -23,8 +23,6 @@ use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, Stan
 
 use crate::hosts::Hosts;
 use crate::order::Order;
-#[cfg(test)]
-pub(crate) use local::DirectedRecipient;
 pub(crate) use local::ResourceMatch;
 
 pub mod local;
@@ -423,17 +421,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         if !self.is_local_host(target.domainpart()) {
             return Err(RouterError::RemoteUnsupported);
         }
-        for delivery in self
-            .local
-            .probe_snapshot(requester, request, subscribed)
-            .await?
-        {
-            match self.local.authorized_delivery(delivery).await {
-                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
+        self.local.probe(requester, request, subscribed).await
     }
 
     pub(crate) async fn current_presence(

@@ -49,14 +49,14 @@ const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 
 /// The parser stays outside this state so stanza handling preserves a pending read.
-struct BoundSession<'w, A: ChunkAllocator> {
+struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
     registration: Registration<A>,
     router: RouterHandle<A>,
     storage: RedbStorage,
     allocator: A,
     available: bool,
     priority: Option<i8>,
-    outbox: Outbox<'w, A>,
+    outbox: Outbox<'w, A, W>,
 }
 
 struct Outbox<'w, A: ChunkAllocator, W = Writer> {
@@ -90,6 +90,15 @@ enum Output<A: ChunkAllocator> {
         backlog: Backlog,
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
     },
+}
+
+enum StorePreparation<A: ChunkAllocator> {
+    Rejected {
+        stanza: RoutedStanza<A>,
+        error: HandlerError,
+    },
+    Discarded,
+    Committed(Pending<Result<(), crate::delivery::EffectsError>>),
 }
 
 enum StoredKind<'a> {
@@ -259,7 +268,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     close::finish(&mut reader, &mut writer, outcome.into(), &close, deadline).await
 }
 
-impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
+impl<A: ChunkAllocator + Clone, W: OutboxWriter> BoundSession<'_, A, W> {
     async fn run(&mut self, reader: &mut Reader<A>) -> CloseOutcome {
         let mut prefer_outbound = true;
         'stream: loop {
@@ -529,28 +538,36 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
         accounts: Vec<AccountKey>,
     ) -> Result<(), CloseOutcome> {
-        let (transaction, ticket) = Arc::clone(self.router.order())
-            .fix(accounts, self.storage.begin_read())
-            .await
-            .map_err(|error| {
-                close_storage_failure(error, "iq_get_begin_read", self.registration.account())
-            })?;
-        let work = GetWork {
-            account: self.registration.account().clone(),
-            transaction,
-            handler,
-            arena,
-            request,
-            sender,
-            response,
-            delivery: self.delivery(),
+        let registration = &self.registration;
+        let storage = &self.storage;
+        let router = &self.router;
+        let work_group = self.outbox.work;
+        let delivery = self.delivery();
+        let prepare = async {
+            let (transaction, ticket) = Arc::clone(router.order())
+                .fix(accounts, storage.begin_read())
+                .await
+                .map_err(|error| {
+                    close_storage_failure(error, "iq_get_begin_read", registration.account())
+                })?;
+            let work = GetWork {
+                account: registration.account().clone(),
+                transaction,
+                handler,
+                arena,
+                request,
+                sender,
+                response,
+                delivery,
+            };
+            Ok::<_, CloseOutcome>(after_turn(
+                work_group.start(),
+                ticket,
+                Some(registration.mailbox()),
+                move |queued| work.run(queued),
+            ))
         };
-        let mut pending = after_turn(
-            self.outbox.work.start(),
-            ticket,
-            Some(self.registration.mailbox()),
-            move |queued| work.run(queued),
-        );
+        let mut pending = self.outbox.drain_until(registration, prepare).await??;
         self.outbox
             .drain_until(&self.registration, pending.turned())
             .await?;
@@ -576,45 +593,66 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         mut response: Arena<A>,
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
     ) -> Result<(), CloseOutcome> {
-        let mut transaction = self.storage.begin_write().await.map_err(|error| {
-            close_storage_failure(error, "iq_set_begin_write", self.registration.account())
-        })?;
+        let registration = &self.registration;
+        let storage = &self.storage;
+        let router = &self.router;
+        let work = self.outbox.work;
         let delivery = self.delivery();
-        let reply = {
-            let sender = sender.resolve(&arena)?;
-            let stanza = request.resolve(&arena)?;
-            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-            let payload = stanza
-                .children()?
-                .next()
-                .transpose()?
-                .ok_or(CloseOutcome::InternalError)?;
-            let iq_request = IqRequest {
-                sender,
-                target,
-                payload,
+        let prepare = async {
+            let mut transaction = storage.begin_write().await.map_err(|error| {
+                close_storage_failure(error, "iq_set_begin_write", registration.account())
+            })?;
+            let reply = {
+                let sender = sender.resolve(&arena)?;
+                let stanza = request.resolve(&arena)?;
+                let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+                let payload = stanza
+                    .children()?
+                    .next()
+                    .transpose()?
+                    .ok_or(CloseOutcome::InternalError)?;
+                handler
+                    .set(
+                        IqRequest {
+                            sender,
+                            target,
+                            payload,
+                        },
+                        &mut transaction,
+                        &delivery,
+                        &mut response,
+                    )
+                    .await
             };
-            handler
-                .set(iq_request, &mut transaction, &delivery, &mut response)
-                .await
+            Ok::<_, CloseOutcome>(match reply {
+                Ok(IqReply { payload, effects }) => Ok((
+                    payload,
+                    commit_and_deliver(
+                        work.start(),
+                        Arc::clone(router.order()),
+                        transaction,
+                        effects,
+                        delivery,
+                        Some(registration.mailbox()),
+                        EffectsDiagnostics {
+                            account: registration.account().clone(),
+                            commit_operation: "iq_set_commit",
+                            delivery_operation: "iq_set_effects",
+                        },
+                    ),
+                )),
+                Err(error) => {
+                    drop(transaction);
+                    report_handler_failure(&error, registration.account());
+                    Err(error)
+                }
+            })
         };
-        let reply = match reply {
-            Ok(IqReply { payload, effects }) => {
-                let mut committed = commit_and_deliver(
-                    self.outbox.work.start(),
-                    Arc::clone(self.router.order()),
-                    transaction,
-                    effects,
-                    delivery,
-                    Some(self.registration.mailbox()),
-                    EffectsDiagnostics {
-                        account: self.registration.account().clone(),
-                        commit_operation: "iq_set_commit",
-                        delivery_operation: "iq_set_effects",
-                    },
-                );
+        let prepared = self.outbox.drain_until(registration, prepare).await??;
+        let reply = match prepared {
+            Ok((payload, mut committed)) => {
                 self.outbox
-                    .drain_until(&self.registration, committed.turned())
+                    .drain_until(registration, committed.turned())
                     .await?;
                 let queued = committed
                     .finished()
@@ -624,10 +662,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 self.outbox.routed(queued);
                 Ok(payload)
             }
-            Err(error) => {
-                report_handler_failure(&error, self.registration.account());
-                Err(error)
-            }
+            Err(error) => Err(error),
         };
         self.queue_iq_reply(request, sender, arena, response, reply)
     }
@@ -881,52 +916,69 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         } else {
             0
         };
-        let mut transaction = self.storage.begin_write().await.map_err(|error| {
-            close_storage_failure(error, "offline_store_begin_write", &recipient)
-        })?;
-        let mut scratch = Arena::try_new_in(ArenaConfig::default(), self.allocator.clone())?;
-        let outcome = handler
-            .store(
-                UndeliverableMessage {
-                    recipient: &recipient,
-                    stanza: &routed,
-                    received_at: SystemTime::now(),
-                },
-                &mut transaction,
-                &mut scratch,
-            )
-            .await;
-        drop(scratch);
-        match outcome {
-            Err(error) => {
-                drop(transaction);
-                report_handler_failure(&error, &recipient);
-                self.reply_error(&routed, error.condition())
-            }
-            Ok(StoreOutcome::Discarded) => {
-                drop(transaction);
-                Ok(())
-            }
-            Ok(StoreOutcome::Stored(sequence)) => {
-                let pending = commit_and_store(
-                    self.outbox.work.start(),
-                    self.router.clone(),
-                    self.storage.clone(),
-                    transaction,
-                    handler,
-                    StoredDelivery {
-                        recipient,
-                        sequence,
-                        stanza: routed,
-                        bytes,
+        let registration = &self.registration;
+        let storage = &self.storage;
+        let router = &self.router;
+        let allocator = &self.allocator;
+        let work = self.outbox.work;
+        let prepare = async {
+            let mut transaction = storage.begin_write().await.map_err(|error| {
+                close_storage_failure(error, "offline_store_begin_write", &recipient)
+            })?;
+            let mut scratch = Arena::try_new_in(ArenaConfig::default(), allocator.clone())?;
+            let outcome = handler
+                .store(
+                    UndeliverableMessage {
+                        recipient: &recipient,
+                        stanza: &routed,
+                        received_at: SystemTime::now(),
                     },
-                );
-                self.outbox
-                    .drain_until(&self.registration, pending.finished())
-                    .await?
-                    .ok_or(CloseOutcome::InternalError)?
-                    .map_err(|_| CloseOutcome::InternalError)
+                    &mut transaction,
+                    &mut scratch,
+                )
+                .await;
+            drop(scratch);
+            Ok::<_, CloseOutcome>(match outcome {
+                Err(error) => {
+                    drop(transaction);
+                    report_handler_failure(&error, &recipient);
+                    StorePreparation::Rejected {
+                        stanza: routed,
+                        error,
+                    }
+                }
+                Ok(StoreOutcome::Discarded) => {
+                    drop(transaction);
+                    StorePreparation::Discarded
+                }
+                Ok(StoreOutcome::Stored(sequence)) => {
+                    StorePreparation::Committed(commit_and_store(
+                        work.start(),
+                        router.clone(),
+                        storage.clone(),
+                        transaction,
+                        handler,
+                        StoredDelivery {
+                            recipient,
+                            sequence,
+                            stanza: routed,
+                            bytes,
+                        },
+                    ))
+                }
+            })
+        };
+        match self.outbox.drain_until(registration, prepare).await?? {
+            StorePreparation::Rejected { stanza, error } => {
+                self.reply_error(&stanza, error.condition())
             }
+            StorePreparation::Discarded => Ok(()),
+            StorePreparation::Committed(pending) => self
+                .outbox
+                .drain_until(registration, pending.finished())
+                .await?
+                .ok_or(CloseOutcome::InternalError)?
+                .map_err(|_| CloseOutcome::InternalError),
         }
     }
 
@@ -981,76 +1033,89 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
             .router
             .message_handler(self.registration.account().domain())
             .cloned();
-        let (result, ticket) =
-            if presence_handler.is_some() || (candidate && message_handler.is_some()) {
-                let owner = self.registration.account();
-                let (transaction, ticket) = Arc::clone(self.router.order())
-                    .fix(vec![owner.clone()], self.storage.begin_read())
-                    .await
-                    .map_err(|error| {
-                        close_storage_failure(error, "presence_snapshot_begin_read", owner)
-                    })?;
-                let sender = from.resolve(&arena)?;
-                let result = async {
-                    let audience = match presence_handler {
-                        Some(handler) => {
-                            handler
-                                .audience(PresenceUpdate { sender, transition }, &transaction)
-                                .await?
-                        }
-                        None => None,
-                    };
-                    let backlog = match message_handler.as_ref().filter(|_| candidate) {
-                        Some(handler) => handler.backlog(owner, &transaction).await?,
-                        None => None,
-                    };
-                    Ok((audience, backlog))
+        let registration = &self.registration;
+        let router = &self.router;
+        let storage = &self.storage;
+        let work_group = self.outbox.work;
+        let prepare = async {
+            let (result, ticket) =
+                if presence_handler.is_some() || (candidate && message_handler.is_some()) {
+                    let owner = registration.account();
+                    let (transaction, ticket) = Arc::clone(router.order())
+                        .fix(vec![owner.clone()], storage.begin_read())
+                        .await
+                        .map_err(|error| {
+                            close_storage_failure(error, "presence_snapshot_begin_read", owner)
+                        })?;
+                    let sender = from.resolve(&arena)?;
+                    let result = async {
+                        let audience = match presence_handler {
+                            Some(handler) => {
+                                handler
+                                    .audience(PresenceUpdate { sender, transition }, &transaction)
+                                    .await?
+                            }
+                            None => None,
+                        };
+                        let backlog = match message_handler.as_ref().filter(|_| candidate) {
+                            Some(handler) => handler.backlog(owner, &transaction).await?,
+                            None => None,
+                        };
+                        Ok((audience, backlog))
+                    }
+                    .await;
+                    drop(transaction);
+                    (result, ticket)
+                } else {
+                    let ((), ticket) = router
+                        .order()
+                        .fix(vec![registration.account().clone()], async {
+                            Ok::<_, CloseOutcome>(())
+                        })
+                        .await?;
+                    (Ok((None, None)), ticket)
+                };
+            let (audience, backlog) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(ticket);
+                    report_handler_failure(&error, registration.account());
+                    return Ok::<_, CloseOutcome>(Err((
+                        RoutedStanza::from_parts(stamped, arena),
+                        error,
+                    )));
                 }
-                .await;
-                (result, ticket)
-            } else {
-                let ((), ticket) = self
-                    .router
-                    .order()
-                    .fix(vec![self.registration.account().clone()], async {
-                        Ok::<_, CloseOutcome>(())
-                    })
-                    .await?;
-                (Ok((None, None)), ticket)
             };
-        let (audience, backlog) = match result {
-            Ok(result) => result,
-            Err(error) => {
-                report_handler_failure(&error, self.registration.account());
-                let routed = RoutedStanza::from_parts(stamped, arena);
-                return self.reply_error(&routed, error.condition());
-            }
+            let (routed, unavailable) = match unavailable {
+                Some(unavailable) => {
+                    let (routed, unavailable) =
+                        RoutedStanza::from_parts_pair(stamped, unavailable, arena);
+                    (routed, Some(unavailable))
+                }
+                None => (RoutedStanza::from_parts(stamped, arena), None),
+            };
+            let work = PresenceWork {
+                session: registration.handle(),
+                router: router.clone(),
+                account: registration.account().clone(),
+                priority,
+                available,
+                routed,
+                unavailable,
+                audience,
+                backlog,
+            };
+            Ok(Ok(after_turn(
+                work_group.start(),
+                ticket,
+                None,
+                move |_: Vec<RoutedStanza<A>>| work.run(),
+            )))
         };
-        let (routed, unavailable) = match unavailable {
-            Some(unavailable) => {
-                let (routed, unavailable) =
-                    RoutedStanza::from_parts_pair(stamped, unavailable, arena);
-                (routed, Some(unavailable))
-            }
-            None => (RoutedStanza::from_parts(stamped, arena), None),
+        let mut pending = match self.outbox.drain_until(registration, prepare).await?? {
+            Ok(pending) => pending,
+            Err((routed, error)) => return self.reply_error(&routed, error.condition()),
         };
-        let work = PresenceWork {
-            session: self.registration.handle(),
-            router: self.router.clone(),
-            account: self.registration.account().clone(),
-            priority,
-            available,
-            routed,
-            unavailable,
-            audience,
-            backlog,
-        };
-        let mut pending = after_turn(
-            self.outbox.work.start(),
-            ticket,
-            None,
-            move |_: Vec<RoutedStanza<A>>| work.run(),
-        );
         self.outbox
             .drain_until(&self.registration, pending.turned())
             .await?;
@@ -1098,46 +1163,59 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
         let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
         let authorized = {
             let (sender, target) = presence_addresses(&source)?;
-            sender_host
-                .authorize(PresenceRequest {
-                    kind,
-                    sender,
-                    target,
-                    stanza: &source,
-                })
-                .await
+            let account = self.registration.account();
+            let authorize = async {
+                let result = sender_host
+                    .authorize(PresenceRequest {
+                        kind,
+                        sender,
+                        target,
+                        stanza: &source,
+                    })
+                    .await;
+                if let Err(error) = &result {
+                    report_handler_failure(error, account);
+                }
+                result
+            };
+            self.outbox
+                .drain_until(&self.registration, authorize)
+                .await?
         };
         if let Err(error) = authorized {
-            report_handler_failure(&error, self.registration.account());
             return self.reply_error(&source, error.condition());
         }
-        let received = {
+        let registration = &self.registration;
+        let storage = &self.storage;
+        let router = &self.router;
+        let work = self.outbox.work;
+        let delivery = self.delivery();
+        let prepare = async {
             let (sender, target) = presence_addresses(&routed)?;
-            let mut transaction = self.storage.begin_write().await.map_err(|error| {
+            let mut transaction = storage.begin_write().await.map_err(|error| {
                 close_storage_failure(
                     error,
                     "presence_subscription_begin_write",
-                    self.registration.account(),
+                    registration.account(),
                 )
             })?;
             let (_, original_target) = presence_addresses(&source)?;
             if kind != PresenceRequestType::Subscribe
-                && self.router.is_local_host(original_target.domainpart())
+                && router.is_local_host(original_target.domainpart())
                 && original_target.resourcepart().is_some()
-                && subscription_target(&self.router, &transaction, original_target)
+                && subscription_target(router, &transaction, original_target)
                     .await?
                     .is_none()
             {
-                return Ok(());
+                drop(transaction);
+                return Ok::<_, CloseOutcome>(None);
             }
-            match self
-                .router
+            let effects = match router
                 .presence_handlers(target.domainpart())
                 .and_then(|handlers| handlers.find(kind))
             {
                 Some(target_host) => {
-                    let delivery = self.delivery();
-                    let effects = target_host
+                    target_host
                         .receive(
                             PresenceRequest {
                                 kind,
@@ -1148,33 +1226,38 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                             &mut transaction,
                             &delivery,
                         )
-                        .await;
-                    match effects {
-                        Ok(effects) => Ok(commit_and_deliver(
-                            self.outbox.work.start(),
-                            Arc::clone(self.router.order()),
-                            transaction,
-                            effects,
-                            delivery,
-                            Some(self.registration.mailbox()),
-                            EffectsDiagnostics {
-                                account: self.registration.account().clone(),
-                                commit_operation: "presence_subscription_commit",
-                                delivery_operation: "presence_subscription_effects",
-                            },
-                        )),
-                        Err(error) => Err(error),
-                    }
+                        .await
                 }
                 None => Err(HandlerError::Stanza(
                     StanzaErrorCondition::ServiceUnavailable,
                 )),
-            }
+            };
+            Ok(Some(match effects {
+                Ok(effects) => Ok(commit_and_deliver(
+                    work.start(),
+                    Arc::clone(router.order()),
+                    transaction,
+                    effects,
+                    delivery,
+                    Some(registration.mailbox()),
+                    EffectsDiagnostics {
+                        account: registration.account().clone(),
+                        commit_operation: "presence_subscription_commit",
+                        delivery_operation: "presence_subscription_effects",
+                    },
+                )),
+                Err(error) => {
+                    drop(transaction);
+                    report_handler_failure(&error, registration.account());
+                    Err(error)
+                }
+            }))
         };
-        match received {
-            Ok(mut committed) => {
+        match self.outbox.drain_until(registration, prepare).await?? {
+            None => Ok(()),
+            Some(Ok(mut committed)) => {
                 self.outbox
-                    .drain_until(&self.registration, committed.turned())
+                    .drain_until(registration, committed.turned())
                     .await?;
                 let queued = committed
                     .finished()
@@ -1184,10 +1267,7 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A> {
                 self.outbox.routed(queued);
                 Ok(())
             }
-            Err(error) => {
-                report_handler_failure(&error, self.registration.account());
-                self.reply_error(&source, error.condition())
-            }
+            Some(Err(error)) => self.reply_error(&source, error.condition()),
         }
     }
 
@@ -1267,6 +1347,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
 
     /// Drain while work is pending to avoid evicting a client that keeps reading.
     /// Poll `until` first to leave deliveries after its cut in the mailbox.
+    /// Local work must transfer or drop shared guards before it returns.
     async fn drain_until<F: Future>(
         &mut self,
         registration: &Registration<A>,
@@ -1284,7 +1365,16 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
             match event {
                 Either::Left(output) => return Ok(output),
                 Either::Right(Some(delivery)) => {
-                    self.drain_mailbox(registration, delivery).await?;
+                    self.push(Output::Routed(delivery));
+                    self.routed(registration.take_queued());
+                    let mut flush = pin!(self.flush());
+                    match select(until.as_mut(), flush.as_mut()).await {
+                        Either::Left((output, flush)) => {
+                            flush.await?;
+                            return Ok(output);
+                        }
+                        Either::Right((flushed, _)) => flushed?,
+                    }
                 }
                 Either::Right(None) => return Err(CloseOutcome::InternalError),
             }
@@ -2019,5 +2109,7 @@ impl<A: ChunkAllocator + Clone> ResourceIqWork<A> {
     }
 }
 
+#[cfg(test)]
+mod preparation_tests;
 #[cfg(test)]
 mod tests;

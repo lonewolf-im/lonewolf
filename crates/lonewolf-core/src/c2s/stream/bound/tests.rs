@@ -32,12 +32,15 @@ const MESSAGE: &[u8] =
     b"<message xmlns='jabber:client' to='bob@localhost/old' type='chat' id='stored'/>";
 
 #[derive(Default)]
-struct ControlledWriter {
-    written: Vec<String>,
+pub(super) struct ControlledWriter {
+    pub(super) written: Vec<String>,
+    pub(super) bytes: String,
+    pub(super) partial_entered: Option<oneshot::Sender<()>>,
+    pub(super) partial_release: Option<oneshot::Receiver<()>>,
     fail_write: bool,
     fail_flush: bool,
-    flush_entered: Option<oneshot::Sender<()>>,
-    flush_release: Option<oneshot::Receiver<()>>,
+    pub(super) flush_entered: Option<oneshot::Sender<()>>,
+    pub(super) flush_release: Option<oneshot::Receiver<()>>,
     pool: Option<Arc<PooledChunkAllocator>>,
     maximum_chunks: usize,
     fail_allocation_after_write: Option<Arc<AtomicBool>>,
@@ -64,6 +67,17 @@ impl OutboxWriter for ControlledWriter {
         stanza
             .write_xml(&mut xml)
             .map_err(|_| CloseOutcome::InternalError)?;
+        if let Some(release) = self.partial_release.take() {
+            let split = xml.len() / 2;
+            self.bytes.push_str(&xml[..split]);
+            if let Some(entered) = self.partial_entered.take() {
+                let _ = entered.send(());
+            }
+            release.await.map_err(|_| CloseOutcome::TransportError)?;
+            self.bytes.push_str(&xml[split..]);
+        } else {
+            self.bytes.push_str(&xml);
+        }
         self.written.push(xml);
         if let Some(failure) = &self.fail_allocation_after_write {
             failure.store(true, Ordering::Release);
@@ -131,13 +145,13 @@ async fn flush_and_ack<A: ChunkAllocator + Clone>(
     Ok(())
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     _directory: tempfile::TempDir,
-    storage: RedbStorage,
-    router: Router<GlobalChunkAllocator>,
+    pub(super) storage: RedbStorage,
+    pub(super) router: Router<GlobalChunkAllocator>,
     dispatcher: CoreDispatcher,
-    registration: Registration<GlobalChunkAllocator>,
-    work: WorkGroup,
+    pub(super) registration: Registration<GlobalChunkAllocator>,
+    pub(super) work: WorkGroup,
 }
 
 fn credentials() -> ScramCredentials {
@@ -150,7 +164,7 @@ fn credentials() -> ScramCredentials {
 }
 
 impl Fixture {
-    async fn new(messages: &[&[u8]]) -> TestResult<Self> {
+    pub(super) async fn new(messages: &[&[u8]]) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
         let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
@@ -187,7 +201,7 @@ impl Fixture {
         })
     }
 
-    fn outbox<A: ChunkAllocator>(
+    pub(super) fn outbox<A: ChunkAllocator>(
         &self,
         allocator: A,
         writer: ControlledWriter,
@@ -214,7 +228,7 @@ impl Fixture {
         Ok(Backlog { messages, through })
     }
 
-    async fn count(&self) -> TestResult<usize> {
+    pub(super) async fn count(&self) -> TestResult<usize> {
         Ok(self
             .storage
             .begin_read()
@@ -223,12 +237,66 @@ impl Fixture {
             .await?)
     }
 
-    async fn finish(self) -> TestResult {
+    pub(super) async fn finish(self) -> TestResult {
         drop(self.registration);
         self.router.shutdown().await?;
         self.dispatcher.shutdown(Duration::from_secs(5)).await?;
         Ok(())
     }
+}
+
+#[test]
+fn cancelling_local_writer_admission_does_not_authorize_a_later_commit() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[]).await?;
+        let held = fixture.storage.begin_write().await?;
+        let authorized = AtomicBool::new(false);
+        let owner = fixture.registration.account();
+        let operation = async {
+            let mut transaction = fixture.storage.begin_write().await?;
+            authorized.store(true, Ordering::Release);
+            transaction.push_offline_message(owner, 0, MESSAGE).await?;
+            transaction.commit().await?;
+            Ok::<_, Box<dyn Error>>(())
+        };
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        let mut pending = Box::pin(outbox.drain_until(&fixture.registration, operation));
+        assert!(poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        drop(held);
+        drop(fixture.storage.begin_write().await?);
+        assert!(!authorized.load(Ordering::Acquire));
+        assert_eq!(fixture.count().await?, 0);
+        assert!(outbox.writer.written.is_empty());
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn ready_local_preparation_leaves_deliveries_after_its_cut_in_the_mailbox() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[]).await?;
+        fixture
+            .router
+            .handle()
+            .route_full(routed_presence(
+                "alice@localhost/desk",
+                Some("bob@localhost/phone"),
+                PresenceType::Available,
+            )?)
+            .await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        let prepared = outbox
+            .drain_until(&fixture.registration, std::future::ready(17))
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(prepared, 17);
+        assert!(outbox.writer.written.is_empty());
+        assert_eq!(fixture.registration.take_queued().len(), 1);
+        drop(outbox);
+        fixture.finish().await
+    })
 }
 
 #[test]
@@ -864,7 +932,7 @@ fn shutdown_interrupts_pending_certificate_revalidation() -> TestResult {
     })
 }
 
-fn routed_presence(
+pub(super) fn routed_presence(
     from: &str,
     to: Option<&str>,
     kind: PresenceType,

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use lonewolf_storage::Storage;
-use lonewolf_storage::account::{AccountKey, AccountReads};
+use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::roster::{
     RosterError, RosterItem, RosterJid, RosterMutation, RosterReads, RosterSnapshot,
     RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
@@ -18,7 +18,9 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
-use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
+use crate::delivery::{
+    Delivery, DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
+};
 use crate::iq::{IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope};
 use crate::message::MessageHandler;
 use crate::presence::{
@@ -78,23 +80,27 @@ impl Roster {
 async fn account_exists(
     transaction: &impl AccountReads,
     account: &AccountKey,
-) -> Result<bool, StanzaErrorCondition> {
+    operation: &'static str,
+) -> Result<bool, HandlerError> {
     transaction
         .account(account)
         .await
         .map(|account| account.is_some())
-        .map_err(|_| StanzaErrorCondition::InternalServerError)
+        .map_err(|error| match error {
+            AccountError::Storage(error) => storage_error(error, operation),
+            _ => StanzaErrorCondition::InternalServerError.into(),
+        })
 }
 
 /// A session that outlives its account must not repopulate roster state.
 async fn require_account(
     transaction: &impl AccountReads,
     account: &AccountKey,
-) -> Result<(), StanzaErrorCondition> {
-    if account_exists(transaction, account).await? {
+) -> Result<(), HandlerError> {
+    if account_exists(transaction, account, "roster_write").await? {
         Ok(())
     } else {
-        Err(StanzaErrorCondition::Forbidden)
+        Err(StanzaErrorCondition::Forbidden.into())
     }
 }
 
@@ -113,7 +119,7 @@ async fn granting_contacts(
     transaction: &impl RosterReads,
     owner: RosterJid,
     watched: Vec<RosterJid>,
-) -> Result<Vec<AccountKey>, StanzaErrorCondition> {
+) -> Result<Vec<AccountKey>, HandlerError> {
     let mut contacts = Vec::with_capacity(watched.len());
     for contact in &watched {
         let Ok(account) = AccountKey::try_from(contact) else {
@@ -122,7 +128,7 @@ async fn granting_contacts(
         let granted = transaction
             .roster_item(&account, &owner)
             .await
-            .map_err(roster_error)?
+            .map_err(|error| roster_error(error, "roster_read"))?
             .is_some_and(|item| state::grants(item.subscription.state));
         if granted {
             contacts.push(account);
@@ -178,7 +184,10 @@ where
         Box::pin(async move {
             let owner = owner_of(&request)?;
             let known = xml::parse_get(request.payload)?;
-            let snapshot = transaction.roster(&owner).await?;
+            let snapshot = transaction
+                .roster(&owner)
+                .await
+                .map_err(|error| roster_error(error, "roster_read"))?;
             let item_count = snapshot.items.len();
             let outcome;
             let payload = match versioning::answer(known, &snapshot) {
@@ -220,7 +229,8 @@ where
                     require_account(transaction, &owner).await?;
                     let subscription = transaction
                         .roster_item(&owner, &update.jid)
-                        .await?
+                        .await
+                        .map_err(|error| roster_error(error, "roster_write"))?
                         .map_or_else(RosterSubscription::default, |item| item.subscription);
                     let item = RosterItem {
                         jid: update.jid,
@@ -228,7 +238,10 @@ where
                         groups: update.groups,
                         subscription,
                     };
-                    let version = transaction.put_roster_item(&owner, &item).await?;
+                    let version = transaction
+                        .put_roster_item(&owner, &item)
+                        .await
+                        .map_err(|error| roster_error(error, "roster_write"))?;
                     let mutation = RosterMutation {
                         version,
                         value: item,
@@ -273,7 +286,7 @@ where
             Ok(transaction
                 .roster_item(owner, &RosterJid::from(observer.bare()))
                 .await
-                .map_err(roster_error)?
+                .map_err(|error| roster_error(error, "roster_read"))?
                 .is_some_and(|item| state::grants(item.subscription.state)))
         })
     }
@@ -286,13 +299,16 @@ where
         Box::pin(async move {
             let owner = AccountKey::try_from(update.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            let snapshot = transaction.roster(&owner).await.map_err(roster_error)?;
+            let snapshot = transaction
+                .roster(&owner)
+                .await
+                .map_err(|error| roster_error(error, "roster_read"))?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
             let (pending, contacts) = if update.transition == PresenceTransition::Initial {
                 let pending = transaction
                     .pending_requests(&owner)
                     .await
-                    .map_err(roster_error)?;
+                    .map_err(|error| roster_error(error, "roster_read"))?;
                 let contacts =
                     granting_contacts(transaction, RosterJid::from(update.sender.bare()), watched)
                         .await?;
@@ -408,18 +424,22 @@ fn split_subscriptions(
     (subscribers, watched)
 }
 
-fn roster_error(error: RosterError) -> StanzaErrorCondition {
-    match error {
-        RosterError::ValueTooLarge => StanzaErrorCondition::NotAcceptable,
-        RosterError::PendingLimitExceeded => StanzaErrorCondition::ResourceConstraint,
-        RosterError::NoAccount => StanzaErrorCondition::Forbidden,
-        RosterError::Storage(_) => StanzaErrorCondition::InternalServerError,
+fn storage_error(error: lonewolf_storage::StorageError, operation: &'static str) -> HandlerError {
+    HandlerError::Internal {
+        condition: StanzaErrorCondition::InternalServerError,
+        failure: Failure {
+            kind: FailureKind::Storage(error.kind()),
+            operation,
+        },
     }
 }
 
-impl From<RosterError> for HandlerError {
-    fn from(error: RosterError) -> Self {
-        Self::Stanza(roster_error(error))
+fn roster_error(error: RosterError, operation: &'static str) -> HandlerError {
+    match error {
+        RosterError::ValueTooLarge => StanzaErrorCondition::NotAcceptable.into(),
+        RosterError::PendingLimitExceeded => StanzaErrorCondition::ResourceConstraint.into(),
+        RosterError::NoAccount => StanzaErrorCondition::Forbidden.into(),
+        RosterError::Storage(error) => storage_error(error, operation),
     }
 }
 

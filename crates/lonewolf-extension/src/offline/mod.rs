@@ -11,7 +11,7 @@ use lonewolf_storage::offline::{OfflineError, OfflineReads, OfflineSequence, Off
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition, StanzaType};
 
-use crate::delivery::{HandlerError, HostLookup};
+use crate::delivery::{Failure, FailureKind, HandlerError, HostLookup};
 use crate::iq::IqHandler;
 use crate::message::{Backlog, MessageHandler, StoreFuture, StoreOutcome, UndeliverableMessage};
 use crate::presence::{PresenceFuture, PresenceHandler};
@@ -67,7 +67,7 @@ impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Offline {
             transaction
                 .clear_offline_messages(account)
                 .await
-                .map_err(offline_error)?;
+                .map_err(|error| offline_error(error, "offline_clear"))?;
             Ok(Effects::none())
         })
     }
@@ -116,7 +116,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             let message_count = transaction
                 .offline_count(message.recipient)
                 .await
-                .map_err(|error| store_error(error, message.recipient))?;
+                .map_err(|error| store_error(error, message.recipient, "offline_count"))?;
             if message_count >= limits.max_messages_per_account.get() as usize {
                 tracing::info!(
                     operation = "store",
@@ -133,7 +133,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             let sequence = transaction
                 .push_offline_message(message.recipient, stored_at, stanza.as_bytes())
                 .await
-                .map_err(|error| store_error(error, message.recipient))?;
+                .map_err(|error| store_error(error, message.recipient, "offline_push"))?;
             Ok(StoreOutcome::Stored(sequence))
         })
     }
@@ -147,7 +147,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             let messages = transaction
                 .offline_messages(account)
                 .await
-                .map_err(offline_error)?;
+                .map_err(|error| offline_error(error, "offline_backlog"))?;
             tracing::info!(
                 operation = "backlog",
                 outcome = if messages.is_empty() {
@@ -177,7 +177,7 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             transaction
                 .remove_offline_messages_through(account, through)
                 .await
-                .map_err(offline_error)?;
+                .map_err(|error| offline_error(error, "offline_acknowledge"))?;
             Ok(())
         })
     }
@@ -192,17 +192,21 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
             transaction
                 .remove_offline_message(account, sequence)
                 .await
-                .map_err(offline_error)?;
+                .map_err(|error| offline_error(error, "offline_acknowledge"))?;
             Ok(())
         })
     }
 }
 
-fn store_error(error: OfflineError, recipient: &AccountKey) -> StanzaErrorCondition {
+fn store_error(
+    error: OfflineError,
+    recipient: &AccountKey,
+    operation: &'static str,
+) -> HandlerError {
     let reason = match &error {
         OfflineError::NoAccount => "no_account",
         OfflineError::ValueTooLarge => "value_too_large",
-        OfflineError::Storage(_) => "internal_error",
+        OfflineError::Storage(_) => return offline_error(error, operation),
     };
     tracing::info!(
         operation = "store",
@@ -211,14 +215,20 @@ fn store_error(error: OfflineError, recipient: &AccountKey) -> StanzaErrorCondit
         recipient_jid = ?recipient.as_str(),
         "offline message policy decided"
     );
-    offline_error(error)
+    offline_error(error, operation)
 }
 
-fn offline_error(error: OfflineError) -> StanzaErrorCondition {
+fn offline_error(error: OfflineError, operation: &'static str) -> HandlerError {
     match error {
-        OfflineError::NoAccount => StanzaErrorCondition::ServiceUnavailable,
-        OfflineError::ValueTooLarge => StanzaErrorCondition::ResourceConstraint,
-        OfflineError::Storage(_) => StanzaErrorCondition::InternalServerError,
+        OfflineError::NoAccount => StanzaErrorCondition::ServiceUnavailable.into(),
+        OfflineError::ValueTooLarge => StanzaErrorCondition::ResourceConstraint.into(),
+        OfflineError::Storage(error) => HandlerError::Internal {
+            condition: StanzaErrorCondition::InternalServerError,
+            failure: Failure {
+                kind: FailureKind::Storage(error.kind()),
+                operation,
+            },
+        },
     }
 }
 

@@ -561,7 +561,16 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ControlledAcknowledge
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.fail.load(Ordering::Acquire) {
-                return Err(StanzaErrorCondition::InternalServerError.into());
+                return Err(HandlerError::Internal {
+                    condition: StanzaErrorCondition::InternalServerError,
+                    failure: storage_failure(
+                        lonewolf_storage::StorageError::with_source(
+                            lonewolf_storage::StorageErrorKind::Unavailable,
+                            std::io::Error::other("sensitive-seeded-storage-source"),
+                        ),
+                        "offline_acknowledge",
+                    ),
+                });
             }
             <Offline as MessageHandler<A, RedbStorage>>::acknowledge(
                 &Offline::new(Default::default()),
@@ -630,11 +639,10 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
         assert_eq!(handler.calls.load(Ordering::Relaxed), 2);
         assert_eq!(fixture.count().await?, 0);
         let logs = std::fs::read_to_string(log.path())?;
-        assert_eq!(
-            logs.matches("offline backlog acknowledgement failed")
-                .count(),
-            1
-        );
+        assert_eq!(logs.matches("internal operation failed").count(), 1);
+        assert!(logs.contains("failure_kind=\"storage_unavailable\""));
+        assert!(logs.contains("operation=\"offline_acknowledge\""));
+        assert!(!logs.contains("sensitive-seeded-storage-source"));
         drop(outbox);
         fixture.finish().await
     })
@@ -1467,6 +1475,11 @@ fn subscription_admission_linearizes_at_lookup_before_or_after_replacement() -> 
                 effects,
                 delivery,
                 None,
+                EffectsDiagnostics {
+                    account: fixture.registration.account().clone(),
+                    commit_operation: "presence_subscription_commit",
+                    delivery_operation: "presence_subscription_effects",
+                },
             );
             assert!(matches!(committed.finished().await, Some(Ok(_))));
             assert_eq!(
@@ -1632,6 +1645,11 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
             effects,
             delivery,
             None,
+            EffectsDiagnostics {
+                account: fixture.registration.account().clone(),
+                commit_operation: "presence_subscription_commit",
+                delivery_operation: "presence_subscription_effects",
+            },
         );
         let mut deletion = deletion.await?;
         let snapshot = fixture.storage.begin_read().await?;
@@ -1775,6 +1793,11 @@ fn admitted_pending_withdrawal_keeps_healthy_effects_under_mailbox_pressure_and_
             effects,
             delivery,
             None,
+            EffectsDiagnostics {
+                account: fixture.registration.account().clone(),
+                commit_operation: "presence_subscription_commit",
+                delivery_operation: "presence_subscription_effects",
+            },
         );
         drop(fixture.storage.begin_write().await?);
         router
@@ -1814,4 +1837,146 @@ fn admitted_pending_withdrawal_keeps_healthy_effects_under_mailbox_pressure_and_
         drop((target, sibling));
         fixture.finish().await
     })
+}
+
+#[test]
+fn core_begin_failure_reports_safe_category_once_and_keeps_stream_close_outcome() -> TestResult {
+    use crate::delivery::failure_tests::{Capture, KINDS, seeded_error};
+    let mut arena = Arena::try_new(Default::default())?;
+    let account =
+        AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+    for kind in KINDS {
+        for operation in [
+            "iq_get_begin_read",
+            "iq_set_begin_write",
+            "resource_iq_begin_read",
+            "presence_probe_begin_read",
+            "presence_snapshot_begin_read",
+            "presence_subscription_begin_write",
+            "presence_terminal_begin_read",
+            "offline_store_begin_write",
+        ] {
+            let capture = Capture::default();
+            let _subscriber = tracing::subscriber::set_default(capture.clone());
+            assert_eq!(
+                close_storage_failure(seeded_error(kind), operation, &account),
+                CloseOutcome::InternalError
+            );
+            capture.assert_one(FailureKind::Storage(kind), operation);
+        }
+    }
+    Ok(())
+}
+
+struct FailedGet {
+    kind: Option<lonewolf_storage::StorageErrorKind>,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl IqHandler<GlobalChunkAllocator, RedbStorage> for FailedGet {
+    fn get<'a>(
+        &'a self,
+        _request: IqRequest<'a, GlobalChunkAllocator>,
+        _transaction: &'a RedbRead,
+        _response: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> lonewolf_extension::iq::IqFuture<'a, GlobalChunkAllocator> {
+        use crate::delivery::failure_tests::seeded_error;
+        Box::pin(async move {
+            if let Some(entered) = self
+                .entered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                let _ = entered.send(());
+            }
+            let blocked = self
+                .release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(blocked) = blocked {
+                let _ = blocked.await;
+            }
+            match self.kind {
+                Some(kind) => Err(HandlerError::Internal {
+                    condition: StanzaErrorCondition::InternalServerError,
+                    failure: storage_failure(seeded_error(kind), "roster_read"),
+                }),
+                None => Ok(IqReply::new(
+                    None,
+                    lonewolf_extension::Effects::new(Vec::new(), |_| {
+                        Box::pin(async { Err(lonewolf_extension::delivery::DeliveryError) })
+                    }),
+                )),
+            }
+        })
+    }
+}
+
+#[test]
+fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellation() -> TestResult
+{
+    use crate::delivery::failure_tests::{Capture, KINDS};
+    for kind in KINDS.into_iter().map(Some).chain([None]) {
+        let capture = Capture::default();
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        Runtime::new()?.block_on(async {
+            let mut fixture = Fixture::new(&[]).await?;
+            let account = fixture.registration.account().clone();
+            let mut arena = Arena::try_new(Default::default())?;
+            let sender = Jid::parse_in("bob@localhost/phone", &mut arena)?;
+            let payload = Element::builder_in("query", "jabber:iq:roster", &mut arena)?.build()?;
+            let request = Stanza::builder_in(
+                StanzaType::Iq(IqType::Get),
+                StanzaNamespace::Client,
+                &mut arena,
+            )
+            .id(Some("private-client-stanza-id"))?
+            .from(Some(sender))?
+            .child(payload)?
+            .build()?;
+            let (entered, started) = oneshot::channel();
+            let (release, blocked) = oneshot::channel();
+            let handler = Arc::new(FailedGet {
+                kind,
+                entered: Mutex::new(Some(entered)),
+                release: Mutex::new(Some(blocked)),
+            });
+            let (transaction, ticket) = fixture
+                .router
+                .handle()
+                .order()
+                .fix(vec![account.clone()], fixture.storage.begin_read())
+                .await?;
+            let work = GetWork {
+                account,
+                transaction,
+                handler,
+                arena,
+                request,
+                sender,
+                response: Arena::try_new(Default::default())?,
+                delivery: RouterDelivery::new(
+                    &fixture.router.handle(),
+                    &GlobalChunkAllocator,
+                    Some(&fixture.registration),
+                ),
+            };
+            let pending = after_turn(fixture.work.start(), ticket, None, move |queued| {
+                work.run(queued)
+            });
+            started.await?;
+            drop(pending);
+            release.send(()).map_err(|_| "IQ get work was cancelled")?;
+            compio::time::timeout(Duration::from_secs(1), fixture.work.drain()).await?;
+            match kind {
+                Some(kind) => capture.assert_one(FailureKind::Storage(kind), "roster_read"),
+                None => capture.assert_one(FailureKind::Delivery, "iq_get_effects"),
+            }
+            fixture.finish().await
+        })?;
+    }
+    Ok(())
 }

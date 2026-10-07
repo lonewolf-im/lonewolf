@@ -550,3 +550,60 @@ fn offline_extension_has_only_message_hooks() {
     assert!(extension.presence_kinds().is_empty());
     assert!(extension.stream_features().is_empty());
 }
+
+#[test]
+fn offline_storage_failure_categories_and_policy_conditions_remain_separate() -> TestResult {
+    use crate::delivery::{Failure, FailureKind};
+    use lonewolf_storage::{StorageError, StorageErrorKind};
+    let mut arena = Arena::try_new(Default::default())?;
+    let recipient =
+        AccountKey::try_from(Jid::parse_in("bob@example.com", &mut arena)?.resolve(&arena)?)?;
+    for kind in [
+        StorageErrorKind::Unavailable,
+        StorageErrorKind::CorruptData,
+        StorageErrorKind::UnsupportedVersion,
+        StorageErrorKind::CommitUnknown,
+        StorageErrorKind::Other,
+    ] {
+        for operation in [
+            "offline_count",
+            "offline_push",
+            "offline_backlog",
+            "offline_acknowledge",
+            "offline_clear",
+        ] {
+            let error = super::store_error(
+                lonewolf_storage::offline::OfflineError::Storage(StorageError::with_source(
+                    kind,
+                    std::io::Error::other("seeded-sensitive-backend-source"),
+                )),
+                &recipient,
+                operation,
+            );
+            assert_eq!(error.condition(), StanzaErrorCondition::InternalServerError);
+            assert_eq!(
+                error.failure(),
+                Some(Failure {
+                    kind: FailureKind::Storage(kind),
+                    operation
+                })
+            );
+            assert!(!format!("{error:?}").contains("seeded-sensitive-backend-source"));
+        }
+    }
+    for (cause, condition) in [
+        (
+            lonewolf_storage::offline::OfflineError::NoAccount,
+            StanzaErrorCondition::ServiceUnavailable,
+        ),
+        (
+            lonewolf_storage::offline::OfflineError::ValueTooLarge,
+            StanzaErrorCondition::ResourceConstraint,
+        ),
+    ] {
+        let error = super::offline_error(cause, "offline_push");
+        assert_eq!(error.condition(), condition);
+        assert_eq!(error.failure(), None);
+    }
+    Ok(())
+}

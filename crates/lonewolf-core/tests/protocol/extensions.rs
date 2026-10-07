@@ -275,3 +275,42 @@ private_key_path = "private-key.pem"
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='enabled-host' from='localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='localhost'/></iq>")?;
     alice.close()
 }
+
+#[test]
+fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() -> TestResult {
+    for (kind, category, operation) in [
+        ("get", "storage_corrupt_data", "roster_read"),
+        ("set", "storage_unavailable", "roster_write"),
+    ] {
+        let suite = C2sSuite::with_extensions("'test-failure-iq'")?;
+        suite.create_account("alice", "password")?;
+        let mut alice = suite.connect("alice", "password", "desk")?;
+        alice.send(&format!("<iq type='{kind}' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail></iq>"))?;
+        alice.expect_xml("<iq xmlns='jabber:client' type='error' to='alice@localhost/desk' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail><error type='wait'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        alice.send("<message to='alice@localhost/desk' id='still-open'/>")?;
+        alice.expect_xml("<message xmlns='jabber:client' to='alice@localhost/desk' from='alice@localhost/desk' id='still-open'/>")?;
+        let logs = suite.wait_for_log("internal operation failed")?;
+        let diagnostics: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("internal operation failed"))
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "{logs}");
+        assert!(
+            diagnostics[0].contains(&format!("failure_kind=\"{category}\"")),
+            "{logs}"
+        );
+        assert!(
+            diagnostics[0].contains(&format!("operation=\"{operation}\"")),
+            "{logs}"
+        );
+        for sensitive in [
+            "sensitive-seeded-storage-source",
+            "private-stanza-id",
+            "private-payload",
+        ] {
+            assert!(!logs.contains(sensitive), "{logs}");
+        }
+        alice.close()?;
+    }
+    Ok(())
+}

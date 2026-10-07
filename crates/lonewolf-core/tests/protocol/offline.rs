@@ -723,12 +723,13 @@ fn failed_live_acknowledgement_retains_the_stored_copy_and_logs_once() -> TestRe
     bob.expect_xml("<iq xmlns='jabber:client' from='localhost' to='bob@localhost/phone' type='result' id='release'><released xmlns='urn:lonewolf:test:offline'/></iq>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
     inspect(&mut bob, "bob@localhost/phone", 1, 1, Some("bob@localhost"))?;
-    let logs = suite.wait_for_log("offline message acknowledgement failed")?;
-    assert_eq!(
-        logs.matches("offline message acknowledgement failed")
-            .count(),
-        1
+    let logs = suite.wait_for_log("internal operation failed")?;
+    assert_eq!(logs.matches("internal operation failed").count(), 1);
+    assert!(
+        logs.contains("failure_kind=\"storage_unavailable\""),
+        "{logs}"
     );
+    assert!(logs.contains("operation=\"offline_acknowledge\""), "{logs}");
     bob.close()?;
     alice.close()
 }

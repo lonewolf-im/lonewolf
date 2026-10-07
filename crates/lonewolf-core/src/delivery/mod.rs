@@ -11,12 +11,13 @@ use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
 use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
+    Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError, HostLookup,
+    SessionTag, StanzaFactory,
 };
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
-use lonewolf_storage::{RedbStorage, RedbWrite, Storage, WriteTransaction};
+use lonewolf_storage::{RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
@@ -169,10 +170,46 @@ where
     Pending { turned, done }
 }
 
+pub(crate) fn storage_failure(error: StorageError, operation: &'static str) -> Failure {
+    Failure {
+        kind: FailureKind::Storage(error.kind()),
+        operation,
+    }
+}
+
+pub(crate) fn report_failure(failure: Failure, account: &AccountKey) {
+    tracing::error!(
+        failure_kind = failure.kind.as_str(),
+        operation = failure.operation,
+        account_jid = ?account.as_str(),
+        "internal operation failed"
+    );
+}
+
+pub(crate) fn report_handler_failure(error: &HandlerError, account: &AccountKey) {
+    if let Some(failure) = error.failure() {
+        report_failure(failure, account);
+    }
+}
+
+pub(crate) struct EffectsDiagnostics {
+    pub(crate) account: AccountKey,
+    pub(crate) commit_operation: &'static str,
+    pub(crate) delivery_operation: &'static str,
+}
+
 #[derive(Debug)]
 pub(crate) enum EffectsError {
-    Commit,
-    Delivery,
+    Commit(Failure),
+    Delivery(Failure),
+}
+
+impl EffectsError {
+    pub(crate) const fn failure(&self) -> Failure {
+        match self {
+            Self::Commit(failure) | Self::Delivery(failure) => *failure,
+        }
+    }
 }
 
 pub(crate) struct StoredDelivery<A: ChunkAllocator> {
@@ -194,12 +231,15 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
     compio::runtime::spawn(guard.run(async move {
-        let result = async {
+        let result: Result<(), EffectsError> = async {
             let ((), mut ticket) = router
                 .order()
                 .fix(vec![stored.recipient.clone()], transaction.commit())
                 .await
-                .map_err(|_| EffectsError::Commit)?;
+                .map_err(|error| {
+                    let failure = storage_failure(error, "offline_store_commit");
+                    EffectsError::Commit(failure)
+                })?;
             tracing::info!(
                 operation = "store",
                 outcome = "stored",
@@ -218,17 +258,25 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                         "offline message rerouted"
                     );
                     let acknowledged: Result<(), HandlerError> = async {
-                        let mut transaction = storage
-                            .begin_write()
-                            .await
-                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                        let mut transaction = storage.begin_write().await.map_err(|error| {
+                            HandlerError::Internal {
+                                condition: StanzaErrorCondition::InternalServerError,
+                                failure: storage_failure(
+                                    error,
+                                    "offline_acknowledge_live_begin_write",
+                                ),
+                            }
+                        })?;
                         handler
                             .acknowledge_one(&stored.recipient, stored.sequence, &mut transaction)
                             .await?;
                         transaction
                             .commit()
                             .await
-                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                            .map_err(|error| HandlerError::Internal {
+                                condition: StanzaErrorCondition::InternalServerError,
+                                failure: storage_failure(error, "offline_acknowledge_live_commit"),
+                            })?;
                         tracing::info!(
                             operation = "acknowledge_live",
                             outcome = "committed",
@@ -239,7 +287,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                     }
                     .await;
                     if let Err(error) = acknowledged {
-                        tracing::error!(error = ?error, "offline message acknowledgement failed");
+                        report_handler_failure(&error, &stored.recipient);
                     }
                 }
                 Err(error) => {
@@ -269,6 +317,9 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
             Ok(())
         }
         .await;
+        if let Err(error) = &result {
+            report_failure(error.failure(), &stored.recipient);
+        }
         let _ = report_done.send(result);
     }))
     .detach();
@@ -284,6 +335,7 @@ pub(crate) fn commit_and_deliver<A, D, W>(
     Effects { accounts, deliver }: Effects<A>,
     delivery: D,
     mailbox: Option<Mailbox<A>>,
+    diagnostics: EffectsDiagnostics,
 ) -> Pending<Result<Vec<RoutedStanza<A>>, EffectsError>>
 where
     A: ChunkAllocator + Clone + 'static,
@@ -294,26 +346,39 @@ where
     let (report_done, done) = oneshot::channel();
     compio::runtime::spawn(guard.run(async move {
         let result = async {
-            let ((), mut ticket) = order
-                .fix(accounts, transaction.commit())
-                .await
-                .map_err(|_| EffectsError::Commit)?;
+            let ((), mut ticket) =
+                order
+                    .fix(accounts, transaction.commit())
+                    .await
+                    .map_err(|error| {
+                        let failure = storage_failure(error, diagnostics.commit_operation);
+                        EffectsError::Commit(failure)
+                    })?;
             ticket.turn().await;
             let _ = report_turned.send(());
             let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
             let delivered = deliver(&delivery).await;
             drop(ticket);
-            delivered
-                .map(|()| queued)
-                .map_err(|_| EffectsError::Delivery)
+            delivered.map(|()| queued).map_err(|_| {
+                let failure = Failure {
+                    kind: FailureKind::Delivery,
+                    operation: diagnostics.delivery_operation,
+                };
+                EffectsError::Delivery(failure)
+            })
         }
         .await;
+        if let Err(error) = &result {
+            report_failure(error.failure(), &diagnostics.account);
+        }
         let _ = report_done.send(result);
     }))
     .detach();
     Pending { turned, done }
 }
 
+#[cfg(test)]
+pub(crate) mod failure_tests;
 #[cfg(test)]
 mod tests;
 

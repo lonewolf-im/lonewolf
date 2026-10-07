@@ -532,3 +532,87 @@ fn ordinary_connection_panic_leaves_router_and_other_connections_serving() -> Te
     );
     suite.stop()
 }
+
+#[test]
+fn diagnostics_fixed_aggregates_follow_connection_routing_and_privacy() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let (status, readiness) = suite.admin_get("/v1/readiness")?;
+    assert_eq!(status, 200);
+    assert_eq!(
+        readiness,
+        serde_json::json!({"schema_version":1,"state":"ready","ready":true})
+    );
+    let (status, before) = suite.admin_get("/v1/diagnostics")?;
+    assert_eq!(status, 200);
+    assert_eq!(before["schema_version"], 1);
+    assert_eq!(before["gauges"]["connections_active"], 0);
+    assert_eq!(before["pool"]["reserved_bytes"], 8 * 1024 * 1024);
+    assert_eq!(
+        before["histograms"]
+            .as_object()
+            .ok_or("missing histograms")?
+            .len(),
+        13
+    );
+    for histogram in before["histograms"]
+        .as_object()
+        .ok_or("missing histograms")?
+        .values()
+    {
+        assert_eq!(
+            histogram["upper_bounds_us"],
+            serde_json::json!([
+                10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000
+            ])
+        );
+        assert_eq!(
+            histogram["buckets"]
+                .as_array()
+                .ok_or("missing buckets")?
+                .len(),
+            13
+        );
+    }
+    suite.create_account("sensitive-account", "sensitive-password")?;
+    let mut client = suite.connect(
+        "sensitive-account",
+        "sensitive-password",
+        "sensitive-resource",
+    )?;
+    client.send("<message to='sensitive-account@localhost/sensitive-resource' type='chat' id='sensitive-id'><body>sensitive-body</body></message>")?;
+    client.receive()?;
+    let (_, during) = suite.admin_get("/v1/diagnostics")?;
+    assert_eq!(during["gauges"]["connections_bound"], 1);
+    assert_eq!(during["gauges"]["connections_active"], 1);
+    assert_eq!(during["counters"]["connections_accepted_total"], 1);
+    assert_eq!(during["counters"]["mailbox_accepted_total"], 1);
+    let serialized = serde_json::to_string(&during)?;
+    for secret in [
+        "sensitive-account",
+        "sensitive-password",
+        "sensitive-resource",
+        "sensitive-id",
+        "sensitive-body",
+        "127.0.0.1",
+    ] {
+        assert!(!serialized.contains(secret));
+    }
+    client.close()?;
+    suite.wait_for_log("stream disconnected")?;
+    let (_, after) = suite.admin_get("/v1/diagnostics")?;
+    assert_eq!(after["gauges"]["connections_active"], 0);
+    assert_eq!(after["counters"]["connections_closed_total"], 1);
+    assert_eq!(
+        suite
+            .admin_get("/v1/readiness?secret=sensitive-password")?
+            .0,
+        400
+    );
+    assert_eq!(
+        suite
+            .admin_get("/v1/diagnostics?secret=sensitive-password")?
+            .0,
+        400
+    );
+    Ok(())
+}

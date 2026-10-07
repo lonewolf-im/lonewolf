@@ -248,7 +248,10 @@ fn zero_sized_requests_do_not_change_the_pool() -> TestResult {
     let (result, trace) = traced(None, || pool.allocate(Layout::new::<()>()));
     assert!(matches!(result, Err(AllocationError::UnsupportedLayout)));
     assert_eq!(trace.attempts, 0);
-    assert_eq!(pool.stats(), before);
+    let mut expected = before;
+    expected.allocation_requests_total += 1;
+    expected.allocation_failures_total += 1;
+    assert_eq!(pool.stats(), expected);
     Ok(())
 }
 
@@ -278,7 +281,11 @@ fn failed_heap_fallback_preserves_pool_state_and_can_be_retried() -> TestResult 
     assert!(matches!(result, Err(AllocationError::Exhausted)));
     assert_eq!(trace.attempts, 1);
     assert_eq!(trace.allocations, 0);
-    assert_eq!(pool.stats(), before);
+    let mut expected = before;
+    expected.allocation_requests_total += 1;
+    expected.allocation_failures_total += 1;
+    expected.requested_bytes_total += layout.size() as u64;
+    assert_eq!(pool.stats(), expected);
     let fallback = pool.allocate(layout)?;
     assert_eq!(pool.stats().heap_allocation_count, 1);
     unsafe {
@@ -468,5 +475,32 @@ fn live_views_survive_neighbor_reuse_and_old_handles_stay_invalid() -> TestResul
         }
     }
     assert!(reused);
+    Ok(())
+}
+
+#[test]
+fn capacity_statistics_distinguish_requests_reserve_fallback_and_failure() -> TestResult {
+    let pool = PooledChunkAllocator::try_new(small_config())?;
+    let invalid = Layout::from_size_align(0, 1)?;
+    assert!(pool.allocate(invalid).is_err());
+    let pooled_layout = Layout::from_size_align(1000, 1)?;
+    let pooled = pool.allocate(pooled_layout)?;
+    let fallback_layout = Layout::from_size_align(1024 * 1024, 1)?;
+    let fallback = pool.allocate(fallback_layout)?;
+    let stats = pool.stats();
+    assert_eq!(stats.reserved_bytes, 8 * 1024 * 1024);
+    assert_eq!(stats.allocation_requests_total, 3);
+    assert_eq!(stats.requested_bytes_total, 1000 + 1024 * 1024);
+    assert_eq!(stats.allocation_failures_total, 1);
+    assert_eq!(stats.heap_allocation_count, 1);
+    assert_eq!(stats.heap_fallback_requested_bytes_total, 1024 * 1024);
+    unsafe {
+        pool.deallocate(pooled);
+        pool.deallocate(fallback);
+    }
+    assert_eq!(
+        pool.stats().requested_bytes_total,
+        stats.requested_bytes_total
+    );
     Ok(())
 }

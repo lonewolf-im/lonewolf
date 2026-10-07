@@ -23,6 +23,7 @@ use compio::net::TcpStream;
 use compio::time::timeout;
 use futures_util::FutureExt;
 use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::capacity::{Capacity, Counter, Gauge, Histogram, Observation};
 use socket2::SockRef;
 
 use authenticate::{SaslMechanism, authenticate, sasl_features};
@@ -40,6 +41,48 @@ use crate::hosts::Hosts;
 use crate::router::{RouterHandle, release_deferred};
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+struct ConnectionCapacity {
+    capacity: Arc<Capacity>,
+    phase: Gauge,
+    observation: Option<Observation>,
+}
+
+impl ConnectionCapacity {
+    fn new(capacity: Arc<Capacity>) -> Self {
+        capacity.add(Counter::ConnectionsAccepted, 1);
+        capacity.enter(Gauge::ConnectionsActive);
+        capacity.enter(Gauge::ConnectionsEstablishing);
+        let observation = Some(capacity.observe(Histogram::ConnectionEstablishment));
+        Self {
+            capacity,
+            phase: Gauge::ConnectionsEstablishing,
+            observation,
+        }
+    }
+    fn transition(&mut self, phase: Gauge, histogram: Histogram) {
+        if let Some(observation) = self.observation.take() {
+            observation.complete();
+        }
+        self.capacity.leave(self.phase);
+        self.phase = phase;
+        self.capacity.enter(phase);
+        self.observation = Some(self.capacity.observe(histogram));
+    }
+    fn finish(&mut self) {
+        if let Some(observation) = self.observation.take() {
+            observation.complete();
+        }
+    }
+}
+
+impl Drop for ConnectionCapacity {
+    fn drop(&mut self) {
+        self.capacity.leave(self.phase);
+        self.capacity.leave(Gauge::ConnectionsActive);
+        self.capacity.add(Counter::ConnectionsClosed, 1);
+    }
+}
 
 struct ConnectionLifecycle {
     connection_id: u64,
@@ -235,6 +278,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             unauthenticated_permit,
             mut lifecycle,
         } = admission;
+        let mut capacity = router.capacity().map(ConnectionCapacity::new);
         let accepted_at = lifecycle.accepted_at;
         let close_control = transport.clone();
         let mut unauthenticated_permit = Some(unauthenticated_permit);
@@ -254,6 +298,12 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             .await?;
             lifecycle.established(established.session.host());
             lifecycle.stream_phase = "authenticating";
+            if let Some(capacity) = &mut capacity {
+                capacity.transition(
+                    Gauge::ConnectionsAuthenticating,
+                    Histogram::ConnectionAuthentication,
+                );
+            }
             context.phase_deadline = established
                 .auth_started_at
                 .checked_add(settings.authentication_timeout);
@@ -280,6 +330,9 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 established.auth_started_at,
             );
             lifecycle.stream_phase = "binding";
+            if let Some(capacity) = &mut capacity {
+                capacity.transition(Gauge::ConnectionsBinding, Histogram::ConnectionBinding);
+            }
             unauthenticated_permit.take();
             let binding_started_at = Instant::now();
             context.phase_deadline = binding_started_at.checked_add(settings.binding_timeout);
@@ -300,6 +353,9 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             )
             .await?;
             lifecycle.bound(bound.resource_requested, binding_started_at);
+            if let Some(capacity) = &mut capacity {
+                capacity.transition(Gauge::ConnectionsBound, Histogram::ConnectionBound);
+            }
             bound.session.close.phase_deadline = None;
             Ok(bound_stream(bound, &mut work).await)
         };
@@ -308,6 +364,9 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         drop(unauthenticated_permit);
         drop(ip_permit);
         lifecycle.outcome = Some(outcome);
+        if let Some(capacity) = &mut capacity {
+            capacity.finish();
+        }
         outcome
     }
 }
@@ -354,3 +413,6 @@ async fn run_phase<T>(
 #[cfg(test)]
 #[path = "../tests/stream.rs"]
 mod tests;
+
+#[cfg(test)]
+mod capacity_tests;

@@ -22,6 +22,7 @@ use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
+use lonewolf_util::capacity::{Capacity, Counter};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
@@ -69,6 +70,7 @@ struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     acknowledgement: Option<ReplayAcknowledgement>,
     work: &'w WorkGroup,
     certificate: Option<&'w CertificateMonitor>,
+    capacity: Option<Arc<Capacity>>,
 }
 
 struct ReplayAcknowledgement {
@@ -211,6 +213,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         acknowledgement: None,
         work,
         certificate: monitor.as_ref(),
+        capacity: router.capacity(),
     };
     let mut session = BoundSession {
         registration,
@@ -1393,6 +1396,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
         let mut messages_written = 0usize;
         let mut messages_skipped = 0usize;
         let mut pending_count = 0usize;
+        let mut subscriptions_bytes = 0u64;
+        let mut offline_bytes = 0u64;
         while let Some(output) = self.queue.pop_front() {
             match output {
                 Output::Routed(stanza) => {
@@ -1415,6 +1420,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                         self.check_certificate()?;
                         self.writer.write_routed(&stanza).await?;
                         pending_count += 1;
+                        subscriptions_bytes =
+                            subscriptions_bytes.saturating_add(subscription.stanza.len() as u64);
                     }
                 }
                 Output::Offline { backlog, handler } => {
@@ -1428,9 +1435,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                                 self.check_certificate()?;
                                 self.writer.write_routed(&stanza).await?;
                                 messages_written += 1;
+                                offline_bytes =
+                                    offline_bytes.saturating_add(message.stanza.len() as u64);
                             }
                             Err(StoredRecordError::InvalidContent) => {
                                 messages_skipped += 1;
+                                if let Some(capacity) = &self.capacity {
+                                    capacity.add(Counter::ReplayInvalidRecords, 1);
+                                }
                                 tracing::error!(
                                     sequence = message.sequence.get(),
                                     "stored offline message rejected"
@@ -1452,6 +1464,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
         }
         self.check_certificate()?;
         self.writer.flush().await?;
+        if let Some(capacity) = &self.capacity {
+            capacity.add(
+                Counter::ReplaySubscriptionsFlushedStoredBytes,
+                subscriptions_bytes,
+            );
+            capacity.add(Counter::ReplayOfflineFlushedStoredBytes, offline_bytes);
+        }
         if pending_count != 0 {
             tracing::info!(
                 operation = "replay",

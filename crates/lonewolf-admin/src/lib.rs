@@ -8,7 +8,12 @@ compile_error!("Lonewolf supports Unix targets only.");
 
 mod api;
 mod deleter;
+mod diagnostics;
 mod server;
 
 pub use deleter::{AccountDeleter, DeleterError, RecordDeleter};
+pub use diagnostics::{
+    DiagnosticsProvider, DiagnosticsSnapshot, HistogramView, PoolBucket, PoolSnapshot, Readiness,
+    ReadinessState,
+};
 pub use server::Server;

@@ -786,3 +786,82 @@ fn reopened_pending_queue_preserves_rows_above_a_lower_limit() -> TestResult {
         TestResult::Ok(())
     })
 }
+
+#[test]
+fn observed_storage_separates_writer_admission_queue_service_and_commit() -> TestResult {
+    use lonewolf_util::capacity::{Capacity, Histogram};
+    use std::sync::Arc;
+    let capacity = Arc::new(Capacity::new());
+    let storage = RedbStorage::observed(
+        database(InMemoryBackend::new(), 1024 * 1024)?,
+        Some(Arc::clone(&capacity)),
+    )?;
+    let held = block_on(storage.begin_write())?;
+    let unpolled = storage.begin_write();
+    drop(unpolled);
+    assert_eq!(
+        capacity
+            .histogram(Histogram::StorageWriterAdmissionWait)
+            .count,
+        1
+    );
+    let mut waiting = Box::pin(storage.begin_write());
+    assert!(poll(waiting.as_mut()).is_pending());
+    assert_eq!(
+        capacity
+            .histogram(Histogram::StorageWriterAdmissionWait)
+            .in_flight,
+        1
+    );
+    drop(waiting);
+    assert_eq!(
+        capacity
+            .histogram(Histogram::StorageWriterAdmissionWait)
+            .abandoned_total,
+        1
+    );
+    drop(held);
+    let mut transaction = block_on(storage.begin_write())?;
+    block_on(transaction.create_account(new_account("alice@localhost", 1)?))?;
+    block_on(transaction.commit())?;
+    let snapshot = block_on(storage.begin_read())?;
+    assert!(block_on(snapshot.account(&key("alice@localhost")?))?.is_some());
+    assert_eq!(
+        capacity
+            .histogram(Histogram::StorageWriterAdmissionWait)
+            .count,
+        2
+    );
+    assert_eq!(capacity.histogram(Histogram::StorageReadQueueWait).count, 2);
+    assert_eq!(
+        capacity.histogram(Histogram::StorageWriteQueueWait).count,
+        3
+    );
+    assert_eq!(
+        capacity.histogram(Histogram::StorageCommitQueueWait).count,
+        1
+    );
+    for (queue, service) in [
+        (
+            Histogram::StorageReadQueueWait,
+            Histogram::StorageReadService,
+        ),
+        (
+            Histogram::StorageWriteQueueWait,
+            Histogram::StorageWriteService,
+        ),
+        (
+            Histogram::StorageCommitQueueWait,
+            Histogram::StorageCommitService,
+        ),
+    ] {
+        assert_eq!(
+            capacity.histogram(queue).count,
+            capacity.histogram(service).count
+        );
+        assert_eq!(capacity.histogram(queue).in_flight, 0);
+        assert_eq!(capacity.histogram(service).in_flight, 0);
+        assert_eq!(capacity.histogram(service).abandoned_total, 0);
+    }
+    Ok(())
+}

@@ -14,6 +14,7 @@ use ::redb::{
 use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_auth::server::ScramDecoy;
 use lonewolf_util::blocking::BlockingExecutor;
+use lonewolf_util::capacity::{Capacity, Histogram};
 
 use crate::storage::{ReadTransaction, Storage, WriteTransaction};
 use crate::{StorageError, StorageErrorKind, account, offline, roster};
@@ -41,6 +42,7 @@ struct Inner {
     /// thread never blocks inside redb's own writer lock while a handle is open.
     writer: Arc<Mutex<()>>,
     decoy: ScramDecoy,
+    capacity: Option<Arc<Capacity>>,
 }
 
 /// One consistent snapshot; every operation runs on the read executor.
@@ -65,14 +67,33 @@ impl RedbStorage {
     /// Returns [`StorageErrorKind::CorruptData`] when the existing tables are
     /// inconsistent with each other, or the backend's failure otherwise.
     pub fn new(database: Database) -> Result<Self, StorageError> {
+        Self::observed(database, None)
+    }
+
+    fn observed(database: Database, capacity: Option<Arc<Capacity>>) -> Result<Self, StorageError> {
         let decoy = initialize(&database)?;
+        let mut reads = BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() });
+        let mut writes = BlockingExecutor::new(NonZeroUsize::MIN);
+        if let Some(capacity) = &capacity {
+            reads = reads.with_observation(
+                Arc::clone(capacity),
+                Histogram::StorageReadQueueWait,
+                Histogram::StorageReadService,
+            );
+            writes = writes.with_observation(
+                Arc::clone(capacity),
+                Histogram::StorageWriteQueueWait,
+                Histogram::StorageWriteService,
+            );
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 database,
-                reads: BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() }),
-                writes: BlockingExecutor::new(NonZeroUsize::MIN),
+                reads,
+                writes,
                 writer: Arc::new(Mutex::new(())),
                 decoy,
+                capacity,
             }),
         })
     }
@@ -89,6 +110,17 @@ impl RedbStorage {
     /// or [`StorageErrorKind::UnsupportedVersion`]. Other backend failures return
     /// [`StorageErrorKind::Other`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_observed(path.as_ref(), None)
+    }
+
+    pub fn open_with_capacity(
+        path: impl AsRef<Path>,
+        capacity: Arc<Capacity>,
+    ) -> Result<Self, StorageError> {
+        Self::open_observed(path.as_ref(), Some(capacity))
+    }
+
+    fn open_observed(path: &Path, capacity: Option<Arc<Capacity>>) -> Result<Self, StorageError> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         options.mode(0o600);
@@ -96,7 +128,7 @@ impl RedbStorage {
         let database = Database::builder()
             .create_file(file)
             .map_err(storage_error)?;
-        Self::new(database)
+        Self::observed(database, capacity)
     }
 }
 
@@ -134,7 +166,15 @@ impl Storage for RedbStorage {
     }
 
     async fn begin_write(&self) -> Result<RedbWrite, StorageError> {
+        let admission = self
+            .inner
+            .capacity
+            .as_ref()
+            .map(|capacity| capacity.observe(Histogram::StorageWriterAdmissionWait));
         let writer = Arc::clone(&self.inner.writer).lock_arc().await;
+        if let Some(admission) = admission {
+            admission.complete();
+        }
         let inner = Arc::clone(&self.inner);
         let transaction = self
             .inner
@@ -188,7 +228,11 @@ impl WriteTransaction for RedbWrite {
         let transaction = Arc::into_inner(transaction)
             .ok_or_else(|| StorageError::new(StorageErrorKind::Other))?;
         writes
-            .run(move || transaction.commit().map_err(commit_error))
+            .run_with_histograms(
+                move || transaction.commit().map_err(commit_error),
+                Histogram::StorageCommitQueueWait,
+                Histogram::StorageCommitService,
+            )
             .await
     }
 }

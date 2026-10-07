@@ -16,6 +16,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_util::capacity::Capacity;
 use lonewolf_xmpp::jid::Jid;
 #[cfg(test)]
 use lonewolf_xmpp::jid::JidRef;
@@ -110,7 +111,10 @@ impl<A: ChunkAllocator + Clone> Router<A> {
             hosts,
             local: local.handle(),
             extensions: Arc::default(),
-            order: Order::new(),
+            order: match local.handle().capacity() {
+                Some(capacity) => Order::with_capacity(Some(capacity)),
+                None => Order::new(),
+            },
         };
         Self { local, handle }
     }
@@ -156,6 +160,9 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
 }
 
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
+    pub(crate) fn capacity(&self) -> Option<Arc<Capacity>> {
+        self.local.capacity()
+    }
     pub(crate) fn state(&self) -> RouterState {
         self.local.state()
     }

@@ -193,3 +193,47 @@ fn tickets_follow_the_order_in_which_views_are_fixed() -> TestResult {
     assert!(is_ready(&mut fast_ticket));
     Ok(())
 }
+
+#[test]
+fn ticket_capacity_observes_eligibility_once_without_polling_turn() -> TestResult {
+    use lonewolf_util::capacity::{Capacity, Histogram};
+    let capacity = Arc::new(Capacity::new());
+    let order = Order::with_capacity(Some(Arc::clone(&capacity)));
+    let alice = account("alice@example.com")?;
+    let first = admit(&order, &[&alice]);
+    let mut second = admit(&order, &[&alice]);
+    assert_eq!(capacity.histogram(Histogram::OrderTicketWait).count, 1);
+    assert!(!is_ready(&mut second));
+    assert!(!is_ready(&mut second));
+    assert_eq!(
+        capacity
+            .histogram(Histogram::OrderTicketWait)
+            .abandoned_total,
+        0
+    );
+    drop(first);
+    assert_eq!(capacity.histogram(Histogram::OrderTicketWait).count, 2);
+    assert_eq!(capacity.histogram(Histogram::OrderTicketWait).in_flight, 0);
+    assert!(is_ready(&mut second));
+    drop(admit(&order, &[&alice]));
+    assert_eq!(
+        capacity
+            .histogram(Histogram::OrderTicketWait)
+            .abandoned_total,
+        1
+    );
+    block_on(async {
+        let _held = order.fixing.lock().await;
+        let unpolled = order.fix(Vec::new(), async { Ok::<_, ()>(()) });
+        drop(unpolled);
+        assert_eq!(capacity.histogram(Histogram::OrderFixWait).in_flight, 0);
+        let mut waiting = Box::pin(order.fix(Vec::new(), async { Ok::<_, ()>(()) }));
+        assert!(poll_once(waiting.as_mut()).is_pending());
+        drop(waiting);
+        assert_eq!(
+            capacity.histogram(Histogram::OrderFixWait).abandoned_total,
+            1
+        );
+    })?;
+    Ok(())
+}

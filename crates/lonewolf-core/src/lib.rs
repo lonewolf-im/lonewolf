@@ -20,6 +20,7 @@ use futures_util::future::{Either, join, select};
 use lonewolf_extension::{Extension, Extensions};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::capacity::Capacity;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
@@ -27,6 +28,7 @@ mod account_deletion;
 mod c2s;
 pub mod config;
 mod delivery;
+mod diagnostics;
 mod error;
 pub mod hosts;
 mod logging;
@@ -86,7 +88,9 @@ pub fn run_with_extensions(
         Hosts::new(&config.hosts, config.xmpp.default_host.as_deref()).map_err(RunError::Hosts)?;
     let worker_count = worker_count().map_err(RunError::WorkerCount)?;
 
-    let _logging_guard = logging::init(config.logging.level).map_err(RunError::Logging)?;
+    let capacity = Arc::new(Capacity::new());
+    let (_logging_guard, log_drops) =
+        logging::init(config.logging.level).map_err(RunError::Logging)?;
     tracing::info!(
         version = build.version,
         branch = build.branch,
@@ -107,8 +111,13 @@ pub fn run_with_extensions(
         "stanza arena pool initialized"
     );
 
+    let diagnostics = Arc::new(diagnostics::Diagnostics::new(
+        Arc::clone(&capacity),
+        Arc::clone(&stanza_pool),
+        log_drops,
+    ));
     {
-        let mut stores = StoreRegistry::new(&config.storage);
+        let mut stores = StoreRegistry::with_capacity(&config.storage, Arc::clone(&capacity));
         let account_store = config
             .account
             .storage
@@ -190,29 +199,32 @@ pub fn run_with_extensions(
                 let (deleter, deletions) = account_deletion::channel();
                 let admin = if config.admin.enabled {
                     Some(
-                        lonewolf_admin::Server::bind(
+                        lonewolf_admin::Server::bind_with_diagnostics(
                             &config.admin.socket_path,
                             storage.clone(),
                             deleter,
+                            diagnostics.clone(),
                         )
                         .map_err(RunError::Admin)?,
                     )
                 } else {
                     None
                 };
-                let local = LocalRouter::start_with_directed_presence_limit(
+                let local = LocalRouter::start_observed(
                     &dispatcher.handle(),
                     Arc::clone(&stanza_pool),
                     config
                         .limits
                         .c2s
                         .max_directed_presence_recipients_per_resource,
+                    Some(Arc::clone(&capacity)),
                 )
                 .await
                 .map_err(RunError::Router)?;
                 let serving_router = router
                     .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions));
                 let router_handle = serving_router.handle();
+                diagnostics.set_router(router_handle.clone());
                 let deletion_router = router_handle.clone();
                 let deletion_storage = storage.clone();
                 let listeners = listeners.insert(
@@ -235,6 +247,7 @@ pub fn run_with_extensions(
                     admin,
                     listeners,
                     serving_router,
+                    &diagnostics,
                     &mut shutdown_deadline,
                     account_deletion::run(
                         deletions,
@@ -246,6 +259,7 @@ pub fn run_with_extensions(
                 .await
             }
             .await;
+            diagnostics.stop(result.is_err());
             let deadline =
                 shutdown_deadline.unwrap_or_else(|| Instant::now() + WORKER_SHUTDOWN_GRACE);
             if let Some(router) = &router {
@@ -290,9 +304,11 @@ async fn run_services<A: ChunkAllocator + Clone>(
     admin: Option<lonewolf_admin::Server>,
     listeners: &mut c2s::Listeners,
     router: &mut Router<A>,
+    diagnostics: &diagnostics::Diagnostics,
     shutdown_deadline: &mut Option<Instant>,
     deletions: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
+    diagnostics.serving();
     let admin_enabled = admin.is_some();
     let (stop_admin, stopped) = oneshot::channel::<()>();
     // The admin service can wait for accepted deletions while it drains.
@@ -342,6 +358,9 @@ async fn run_services<A: ChunkAllocator + Clone>(
         router::RouterState::Failed(failure) => Some(failure),
         _ => None,
     };
+    diagnostics.stop(match &result {
+        Either::Left(result) | Either::Right(result) => result.is_err(),
+    });
     router.stop();
     let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
     *shutdown_deadline = Some(deadline);

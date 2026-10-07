@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_util::capacity::Capacity;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fs::DirBuilder;
 use std::os::unix::fs::DirBuilderExt;
+use std::sync::Arc;
 
 use lonewolf_storage::RedbStorage;
 
@@ -13,13 +15,24 @@ use crate::config::{StorageConfig, StoreConfig};
 pub(crate) struct StoreRegistry<'config> {
     config: &'config StorageConfig,
     stores: BTreeMap<&'config str, RedbStorage>,
+    capacity: Option<Arc<Capacity>>,
 }
 
 impl<'config> StoreRegistry<'config> {
+    #[cfg(test)]
     pub(crate) fn new(config: &'config StorageConfig) -> Self {
         Self {
             config,
             stores: BTreeMap::new(),
+            capacity: None,
+        }
+    }
+
+    pub(crate) fn with_capacity(config: &'config StorageConfig, capacity: Arc<Capacity>) -> Self {
+        Self {
+            config,
+            stores: BTreeMap::new(),
+            capacity: Some(capacity),
         }
     }
 
@@ -49,7 +62,13 @@ impl<'config> StoreRegistry<'config> {
                                 }
                             })?;
                         }
-                        RedbStorage::open(path).map_err(|source| RunError::Storage {
+                        match &self.capacity {
+                            Some(capacity) => {
+                                RedbStorage::open_with_capacity(path, Arc::clone(capacity))
+                            }
+                            None => RedbStorage::open(path),
+                        }
+                        .map_err(|source| RunError::Storage {
                             store: name.clone(),
                             source,
                         })?

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_channel::oneshot;
 use lonewolf_storage::account::AccountKey;
+use lonewolf_util::capacity::{Capacity, Histogram, Observation};
 
 /// Orders deliveries per account by the moment each unit of work fixed its view of
 /// storage, so a client never learns of an older change after a newer one.
@@ -19,6 +20,7 @@ pub(crate) struct Order {
     /// Fixing a view and taking its ticket happen under this lock, so ticket order is
     /// commit order even when the store lets writers commit concurrently.
     fixing: async_lock::Mutex<()>,
+    capacity: Option<Arc<Capacity>>,
 }
 
 #[derive(Default)]
@@ -31,6 +33,7 @@ struct Lines {
 struct Waiting {
     accounts: Vec<AccountKey>,
     ready: Option<oneshot::Sender<()>>,
+    observation: Option<Observation>,
 }
 
 /// A place in the delivery order for a set of accounts; dropping it releases the place.
@@ -42,9 +45,14 @@ pub(crate) struct Ticket {
 
 impl Order {
     pub(crate) fn new() -> Arc<Self> {
+        Self::with_capacity(None)
+    }
+
+    pub(crate) fn with_capacity(capacity: Option<Arc<Capacity>>) -> Arc<Self> {
         Arc::new(Self {
             lines: Mutex::new(Lines::default()),
             fixing: async_lock::Mutex::new(()),
+            capacity,
         })
     }
 
@@ -55,7 +63,14 @@ impl Order {
         accounts: Vec<AccountKey>,
         fix: impl Future<Output = Result<T, E>>,
     ) -> Result<(T, Ticket), E> {
+        let wait = self
+            .capacity
+            .as_ref()
+            .map(|capacity| capacity.observe(Histogram::OrderFixWait));
         let _fixing = self.fixing.lock().await;
+        if let Some(wait) = wait {
+            wait.complete();
+        }
         let value = fix.await?;
         Ok((value, self.admit(accounts)))
     }
@@ -77,6 +92,10 @@ impl Order {
             Waiting {
                 accounts,
                 ready: Some(ready),
+                observation: self
+                    .capacity
+                    .as_ref()
+                    .map(|capacity| capacity.observe(Histogram::OrderTicketWait)),
             },
         );
         lines.wake_if_first(id);
@@ -126,6 +145,9 @@ impl Lines {
         if let Some(waiting) = self.waiting.get_mut(&id)
             && let Some(ready) = waiting.ready.take()
         {
+            if let Some(wait) = waiting.observation.take() {
+                wait.complete();
+            }
             let _ = ready.send(());
         }
     }

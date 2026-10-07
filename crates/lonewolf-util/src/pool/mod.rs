@@ -14,6 +14,7 @@ use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::CachePadded;
 
 use crate::arena::{AllocationError, Chunk, ChunkAllocator, GlobalChunkAllocator};
+use crate::capacity::add_saturating;
 
 pub const BUCKET_SIZES: [usize; 8] = [
     4 * 1024,
@@ -66,6 +67,11 @@ pub struct PoolStats {
     pub buckets: [BucketStats; BUCKET_SIZES.len()],
     /// Excludes pool initialization.
     pub heap_allocation_count: u64,
+    pub reserved_bytes: u64,
+    pub allocation_requests_total: u64,
+    pub requested_bytes_total: u64,
+    pub allocation_failures_total: u64,
+    pub heap_fallback_requested_bytes_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +114,10 @@ pub struct PooledChunkAllocator {
     buckets: [Bucket; BUCKET_SIZES.len()],
     // Alignment separates allocator metadata from an enclosing shared reference count.
     heap_allocation_count: CachePadded<AtomicU64>,
+    requests: CachePadded<AtomicU64>,
+    requested_bytes: CachePadded<AtomicU64>,
+    failures: CachePadded<AtomicU64>,
+    fallback_requested_bytes: CachePadded<AtomicU64>,
 }
 
 impl PooledChunkAllocator {
@@ -141,6 +151,10 @@ impl PooledChunkAllocator {
             storage,
             buckets,
             heap_allocation_count: CachePadded::new(AtomicU64::new(0)),
+            requests: CachePadded::new(AtomicU64::new(0)),
+            requested_bytes: CachePadded::new(AtomicU64::new(0)),
+            failures: CachePadded::new(AtomicU64::new(0)),
+            fallback_requested_bytes: CachePadded::new(AtomicU64::new(0)),
         })
     }
 
@@ -180,6 +194,13 @@ impl PooledChunkAllocator {
                 }
             }),
             heap_allocation_count: self.heap_allocation_count.load(Ordering::Relaxed),
+            reserved_bytes: self.config.total_bytes.get() as u64,
+            allocation_requests_total: self.requests.load(Ordering::Relaxed),
+            requested_bytes_total: self.requested_bytes.load(Ordering::Relaxed),
+            allocation_failures_total: self.failures.load(Ordering::Relaxed),
+            heap_fallback_requested_bytes_total: self
+                .fallback_requested_bytes
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -196,7 +217,10 @@ unsafe impl ChunkAllocator for PooledChunkAllocator {
     /// Returns [`AllocationError::UnsupportedLayout`] for a zero-sized layout
     /// or [`AllocationError::Exhausted`] if heap fallback allocation fails.
     fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        add_saturating(&self.requests, 1);
+        add_saturating(&self.requested_bytes, layout.size() as u64);
         if layout.size() == 0 {
+            add_saturating(&self.failures, 1);
             return Err(AllocationError::UnsupportedLayout);
         }
         let bucket_bytes = self.config.total_bytes.get() / BUCKET_SIZES.len();
@@ -219,7 +243,10 @@ unsafe impl ChunkAllocator for PooledChunkAllocator {
                 });
             }
         }
-        let chunk = GlobalChunkAllocator.allocate(layout)?;
+        let chunk = GlobalChunkAllocator
+            .allocate(layout)
+            .inspect_err(|_| add_saturating(&self.failures, 1))?;
+        add_saturating(&self.fallback_requested_bytes, layout.size() as u64);
         increment_saturating(&self.heap_allocation_count);
         Ok(chunk)
     }

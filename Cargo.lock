@@ -1117,10 +1117,23 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "lonewolf"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
+ "graviola",
+ "hmac",
  "lonewolf-core",
  "nix",
+ "pbkdf2",
+ "quick-xml",
+ "rcgen",
+ "rustls",
+ "rustls-graviola",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2",
+ "socket2",
  "tempfile",
+ "time",
 ]
 
 [[package]]

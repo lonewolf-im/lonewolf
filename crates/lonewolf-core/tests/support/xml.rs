@@ -145,6 +145,11 @@ impl<R: Read> XmlStream<R> {
         self.reader.get_mut().get_mut()
     }
 
+    #[allow(dead_code)]
+    pub fn received_xml_bytes(&self) -> u64 {
+        self.reader.buffer_position()
+    }
+
     pub fn has_buffered_input(&self) -> bool {
         !self.reader.get_ref().buffer().is_empty()
     }

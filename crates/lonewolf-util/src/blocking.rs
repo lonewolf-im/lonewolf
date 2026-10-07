@@ -7,10 +7,13 @@ use std::sync::Arc;
 
 use async_lock::Semaphore;
 
+use crate::capacity::{Capacity, Histogram};
+
 /// Clones share the limit on jobs submitted to the process-wide blocking pool.
 #[derive(Clone)]
 pub struct BlockingExecutor {
     capacity: Arc<Semaphore>,
+    observation: Option<(Arc<Capacity>, Histogram, Histogram)>,
 }
 
 impl BlockingExecutor {
@@ -18,7 +21,18 @@ impl BlockingExecutor {
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
             capacity: Arc::new(Semaphore::new(capacity.get())),
+            observation: None,
         }
+    }
+
+    pub fn with_observation(
+        mut self,
+        capacity: Arc<Capacity>,
+        queue: Histogram,
+        service: Histogram,
+    ) -> Self {
+        self.observation = Some((capacity, queue, service));
+        self
     }
 
     /// Waits for capacity before submitting work to the process-wide pool.
@@ -34,10 +48,40 @@ impl BlockingExecutor {
         &self,
         operation: impl FnOnce() -> T + Send + 'static,
     ) -> T {
+        let timing = self
+            .observation
+            .as_ref()
+            .map(|(_, queue, service)| (*queue, *service));
+        self.run_timed(operation, timing).await
+    }
+    pub async fn run_with_histograms<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> T + Send + 'static,
+        queue: Histogram,
+        service: Histogram,
+    ) -> T {
+        self.run_timed(operation, Some((queue, service))).await
+    }
+
+    async fn run_timed<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> T + Send + 'static,
+        timing: Option<(Histogram, Histogram)>,
+    ) -> T {
+        let observed = self
+            .observation
+            .as_ref()
+            .zip(timing)
+            .map(|((capacity, _, _), (queue, service))| (capacity.observe(queue), service));
         let permit = self.capacity.acquire_arc().await;
         ::blocking::unblock(move || {
             let _permit = permit;
-            operation()
+            let service = observed.map(|(queue, service)| queue.transition(service));
+            let result = operation();
+            if let Some(service) = service {
+                service.complete();
+            }
+            result
         })
         .await
     }
@@ -145,13 +189,105 @@ mod tests {
 
     #[test]
     fn a_panicking_operation_releases_capacity() {
-        let executor = BlockingExecutor::new(NonZeroUsize::MIN);
+        let observations = std::sync::Arc::new(crate::capacity::Capacity::new());
+        let executor = BlockingExecutor::new(NonZeroUsize::MIN).with_observation(
+            std::sync::Arc::clone(&observations),
+            crate::capacity::Histogram::StorageWriteQueueWait,
+            crate::capacity::Histogram::StorageWriteService,
+        );
         let outcome = std::panic::catch_unwind(|| {
             block_on(executor.run(|| panic!("injected panic")));
         });
         assert!(outcome.is_err());
         assert!(executor.capacity.try_acquire_arc().is_some());
+        assert_eq!(
+            observations
+                .histogram(crate::capacity::Histogram::StorageWriteQueueWait)
+                .count,
+            1
+        );
+        assert_eq!(
+            observations
+                .histogram(crate::capacity::Histogram::StorageWriteService)
+                .abandoned_total,
+            1
+        );
+        assert_eq!(
+            observations
+                .histogram(crate::capacity::Histogram::StorageWriteService)
+                .in_flight,
+            0
+        );
         assert_eq!(block_on(executor.run(|| 42)), 42);
+        assert_eq!(
+            observations
+                .histogram(crate::capacity::Histogram::StorageWriteService)
+                .count,
+            1
+        );
+    }
+
+    #[test]
+    fn observations_start_on_poll_and_submitted_service_survives_cancellation() -> TestResult {
+        use crate::capacity::{Capacity, Histogram};
+        use std::sync::Arc;
+        let capacity = Arc::new(Capacity::new());
+        let executor = BlockingExecutor::new(NonZeroUsize::MIN).with_observation(
+            Arc::clone(&capacity),
+            Histogram::StorageReadQueueWait,
+            Histogram::StorageReadService,
+        );
+        let unpolled = executor.run(|| ());
+        drop(unpolled);
+        assert_eq!(
+            capacity
+                .histogram(Histogram::StorageReadQueueWait)
+                .in_flight,
+            0
+        );
+        let permit = executor.capacity.try_acquire_arc().ok_or("no permit")?;
+        let mut waiting = Box::pin(executor.run(|| ()));
+        assert!(poll(waiting.as_mut()).is_pending());
+        assert_eq!(
+            capacity
+                .histogram(Histogram::StorageReadQueueWait)
+                .in_flight,
+            1
+        );
+        drop(waiting);
+        assert_eq!(
+            capacity
+                .histogram(Histogram::StorageReadQueueWait)
+                .abandoned_total,
+            1
+        );
+        drop(permit);
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let mut submitted = Box::pin(executor.run(move || {
+            let _ = entered.send(());
+            released.recv_timeout(TIMEOUT)
+        }));
+        assert!(poll(submitted.as_mut()).is_pending());
+        entering.recv_timeout(TIMEOUT)?;
+        assert_eq!(capacity.histogram(Histogram::StorageReadQueueWait).count, 1);
+        assert_eq!(
+            capacity.histogram(Histogram::StorageReadService).in_flight,
+            1
+        );
+        drop(submitted);
+        assert_eq!(
+            capacity.histogram(Histogram::StorageReadService).in_flight,
+            1
+        );
+        release.send(())?;
+        let _ = block_on(executor.run(|| Err::<(), _>("classified failure")));
+        let service = capacity.histogram(Histogram::StorageReadService);
+        assert_eq!(service.count, 2);
+        assert_eq!(service.abandoned_total, 0);
+        assert_eq!(service.in_flight, 0);
+        assert_eq!(capacity.histogram(Histogram::StorageReadQueueWait).count, 2);
+        Ok(())
     }
 
     fn poll<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {

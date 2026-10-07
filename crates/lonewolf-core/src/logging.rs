@@ -5,15 +5,17 @@ use std::error::Error;
 use std::io::IsTerminal;
 
 use time::macros::format_description;
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_appender::non_blocking::{ErrorCounter, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::time::UtcTime;
 
 use crate::config::LogLevel;
 
-/// Drops excess events when the queue is full instead of blocking callers.
+/// Drops log writes when the queue is full instead of blocking callers.
 /// The caller must retain the guard until all log producers have stopped.
-pub(crate) fn init(level: LogLevel) -> Result<WorkerGuard, Box<dyn Error + Send + Sync>> {
+pub(crate) fn init(
+    level: LogLevel,
+) -> Result<(WorkerGuard, ErrorCounter), Box<dyn Error + Send + Sync>> {
     let filter = match level {
         LogLevel::Off => LevelFilter::OFF,
         LogLevel::Error => LevelFilter::ERROR,
@@ -29,6 +31,7 @@ pub(crate) fn init(level: LogLevel) -> Result<WorkerGuard, Box<dyn Error + Send 
         .buffered_lines_limit(1024)
         .lossy(true)
         .finish(std::io::stderr());
+    let dropped = writer.error_counter();
     tracing_subscriber::fmt()
         .with_timer(UtcTime::new(format_description!(
             "[year]:[month]:[day] [hour]:[minute]:[second]"
@@ -37,5 +40,5 @@ pub(crate) fn init(level: LogLevel) -> Result<WorkerGuard, Box<dyn Error + Send 
         .with_ansi(ansi)
         .with_writer(writer)
         .try_init()?;
-    Ok(guard)
+    Ok((guard, dropped))
 }

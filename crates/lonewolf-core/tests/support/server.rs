@@ -321,6 +321,30 @@ max_resources_per_account = {resources}
         Client::connect(self, username, password, resource)
     }
 
+    pub fn admin_get(&self, path: &str) -> TestResult<(u16, serde_json::Value)> {
+        let mut stream =
+            UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        let (headers, body) = response.split_once("\r\n\r\n").ok_or("missing HTTP body")?;
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("cache-control: no-store")
+        );
+        let status = headers
+            .split_whitespace()
+            .nth(1)
+            .ok_or("missing status")?
+            .parse()?;
+        Ok((status, serde_json::from_str(body)?))
+    }
+
     pub fn create_account(&self, username: &str, password: &str) -> TestResult {
         self.create_account_jid(&format!("{username}@localhost"), password)
     }

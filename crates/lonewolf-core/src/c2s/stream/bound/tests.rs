@@ -216,6 +216,7 @@ impl Fixture {
             acknowledgement: None,
             work: &self.work,
             certificate: None,
+            capacity: None,
         }
     }
 
@@ -2047,4 +2048,68 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
         })?;
     }
     Ok(())
+}
+
+#[test]
+fn replay_capacity_counts_source_bytes_only_after_flush_and_skipped_records_once() -> TestResult {
+    use lonewolf_util::capacity::{Capacity, Counter};
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE, b"not XML", MESSAGE]).await?;
+        let capacity = Arc::new(Capacity::new());
+        let mut outbox = fixture.outbox(
+            GlobalChunkAllocator,
+            ControlledWriter {
+                fail_flush: true,
+                ..Default::default()
+            },
+        );
+        outbox.capacity = Some(Arc::clone(&capacity));
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+        assert_eq!(outbox.flush().await, Err(CloseOutcome::TransportError));
+        assert_eq!(
+            capacity.counter(Counter::ReplayOfflineFlushedStoredBytes),
+            0
+        );
+        assert_eq!(capacity.counter(Counter::ReplayInvalidRecords), 1);
+        outbox.writer.fail_flush = false;
+        flush_and_ack(&fixture, &mut outbox).await?;
+        assert_eq!(
+            capacity.counter(Counter::ReplayOfflineFlushedStoredBytes),
+            (MESSAGE.len() * 2) as u64
+        );
+        assert_eq!(capacity.counter(Counter::ReplayInvalidRecords), 2);
+        assert_eq!(
+            capacity.counter(Counter::ReplaySubscriptionsFlushedStoredBytes),
+            0
+        );
+        assert_eq!(fixture.count().await?, 0);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn subscription_capacity_measures_stored_xml_and_does_not_acknowledge_it() -> TestResult {
+    use lonewolf_util::capacity::{Capacity, Counter};
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let capacity = Arc::new(Capacity::new());
+        let mut arena = Arena::try_new(Default::default())?;
+        let sender = RosterJid::from(Jid::parse_in("alice@localhost",&mut arena)?.resolve(&arena)?);
+        let source = b"<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='subscribe'/>";
+        let mut outbox = fixture.outbox(GlobalChunkAllocator,ControlledWriter::default());
+        outbox.capacity = Some(Arc::clone(&capacity));
+        outbox.push(Output::Requests(vec![PendingSubscription {sender,stanza:source.as_slice().into()}]));
+        outbox.flush().await.map_err(|error|format!("{error:?}"))?;
+        assert_eq!(capacity.counter(Counter::ReplaySubscriptionsFlushedStoredBytes),source.len() as u64);
+        assert_eq!(capacity.counter(Counter::ReplayOfflineFlushedStoredBytes),0);
+        assert_eq!(capacity.counter(Counter::ReplayInvalidRecords),0);
+        assert!(outbox.acknowledgement.is_none());
+        assert_eq!(fixture.count().await?,1);
+        drop(outbox);
+        fixture.finish().await
+    })
 }

@@ -11,6 +11,19 @@ clap.workspace = true
 lonewolf-core.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+graviola.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+quick-xml.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-graviola.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+time.workspace = true
 nix.workspace = true
 tempfile.workspace = true
 
@@ -29,3 +42,7 @@ path = "../lonewolf-core/tests/server/cli.rs"
 [[test]]
 name = "workers"
 path = "../lonewolf-core/tests/server/workers.rs"
+
+[[test]]
+name = "capacity"
+path = "../lonewolf-core/tests/capacity/mod.rs"

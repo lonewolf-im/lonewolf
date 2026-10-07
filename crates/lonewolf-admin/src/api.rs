@@ -28,6 +28,7 @@ use lonewolf_storage::account::{
 use lonewolf_storage::{Storage, StorageError, StorageErrorKind, WriteTransaction};
 
 use crate::deleter::{AccountDeleter, DeleterError};
+use crate::{DiagnosticsProvider, Readiness, ReadinessState};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::blocking::BlockingExecutor;
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
@@ -41,6 +42,16 @@ const MAX_PAGE: usize = 100;
 const DEFAULT_PAGE: usize = 50;
 
 pub(crate) fn router<S: Storage>(storage: S, deleter: Arc<dyn AccountDeleter>) -> Router {
+    router_with_diagnostics(storage, deleter, None)
+}
+
+pub(crate) fn router_with_diagnostics<S: Storage>(
+    storage: S,
+    deleter: Arc<dyn AccountDeleter>,
+    diagnostics: Option<Arc<dyn DiagnosticsProvider>>,
+) -> Router {
+    let mut api = Api::new(storage, deleter);
+    api.diagnostics = diagnostics;
     Router::new()
         .route(
             "/v1/accounts",
@@ -51,12 +62,49 @@ pub(crate) fn router<S: Storage>(storage: S, deleter: Arc<dyn AccountDeleter>) -
             get(get_account::<S>).delete(delete_account::<S>),
         )
         .route("/v1/accounts/{jid}/password", put(change_password::<S>))
+        .route("/v1/diagnostics", get(diagnostics_snapshot::<S>))
+        .route("/v1/readiness", get(readiness::<S>))
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
         .layer(middleware::from_fn(log_request))
-        .with_state(Arc::new(Api::new(storage, deleter)))
+        .with_state(Arc::new(api))
+}
+
+async fn diagnostics_snapshot<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
+    uri: Uri,
+) -> Result<Response, ApiError> {
+    if uri.query().is_some() {
+        return Err(ApiError::bad_request());
+    }
+    let provider = api
+        .diagnostics
+        .as_ref()
+        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "diagnostics_unavailable"))?;
+    json(StatusCode::OK, &provider.snapshot())
+}
+
+async fn readiness<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
+    uri: Uri,
+) -> Result<Response, ApiError> {
+    if uri.query().is_some() {
+        return Err(ApiError::bad_request());
+    }
+    let readiness = api.diagnostics.as_ref().map_or_else(
+        || Readiness::new(ReadinessState::Unknown),
+        |provider| provider.readiness(),
+    );
+    json(
+        if readiness.ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        &readiness,
+    )
 }
 
 async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
@@ -183,6 +231,7 @@ where
 struct Api<S> {
     storage: S,
     deleter: Arc<dyn AccountDeleter>,
+    diagnostics: Option<Arc<dyn DiagnosticsProvider>>,
     passwords: BlockingExecutor,
     /// Serializes creation and deletion of one account on this node, so no account can
     /// bind sessions until a deleted account's sessions are gone.
@@ -195,6 +244,7 @@ impl<S: Storage> Api<S> {
         Self {
             storage,
             deleter,
+            diagnostics: None,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
             lifecycle: [const { Mutex::new(()) }; LIFECYCLE_SHARDS],
             hash_state: RandomState::new(),
@@ -972,6 +1022,43 @@ mod tests {
             format!("{{\"error\":{{\"code\":\"{code}\"}}}}").as_bytes()
         );
         Ok(())
+    }
+
+    #[test]
+    fn absent_diagnostics_provider_returns_unknown_and_preserves_account_api() -> TestResult {
+        compio::runtime::Runtime::new()?.block_on(async {
+            let storage = MemoryStorage::new([]);
+            let api = Arc::new(Api::new(storage.clone(), GatedDeleter::counting(storage)));
+            expect_error(
+                diagnostics_snapshot(State(Arc::clone(&api)), Uri::from_static("/v1/diagnostics"))
+                    .await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "diagnostics_unavailable",
+            )
+            .await?;
+            let response = readiness(State(Arc::clone(&api)), Uri::from_static("/v1/readiness"))
+                .await
+                .map_err(|error| error.code)?;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            let body = response.into_body().collect().await?.to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body)?,
+                json!({"schema_version":1,"state":"unknown","ready":false})
+            );
+            assert!(api.list(None).await.is_ok());
+            expect_error(
+                readiness(
+                    State(Arc::clone(&api)),
+                    Uri::from_static("/v1/readiness?token=secret"),
+                )
+                .await,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     #[test]

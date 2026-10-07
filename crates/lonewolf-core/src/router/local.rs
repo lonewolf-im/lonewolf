@@ -23,6 +23,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_extension::delivery::{SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator};
+use lonewolf_util::capacity::{Capacity, Counter};
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, TaskError, WorkerContext};
 use lonewolf_xmpp::jid::{JidError, JidRef};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaRef, StanzaType};
@@ -138,6 +139,7 @@ pub(super) struct LocalRouterHandle<A: ChunkAllocator> {
     hash_state: RandomState,
     state: Arc<Mutex<RouterState>>,
     allocator: A,
+    capacity: Option<Arc<Capacity>>,
 }
 
 /// Keeps a bound resource registered until this value is dropped.
@@ -333,10 +335,50 @@ struct RetiredPresence<A: ChunkAllocator> {
     stanza: RoutedStanza<A>,
 }
 
+struct ResourceSender<A: ChunkAllocator> {
+    sender: Sender<RoutedStanza<A>>,
+    capacity: Option<Arc<Capacity>>,
+}
+
+impl<A: ChunkAllocator> ResourceSender<A> {
+    fn try_send(&self, stanza: RoutedStanza<A>) -> Result<(), TrySendError<RoutedStanza<A>>> {
+        let result = self.sender.try_send(stanza);
+        if let Some(capacity) = &self.capacity {
+            capacity.add(
+                match &result {
+                    Ok(()) => Counter::MailboxAccepted,
+                    Err(TrySendError::Full(_)) => Counter::MailboxFull,
+                    Err(TrySendError::Closed(_)) => Counter::MailboxClosed,
+                },
+                1,
+            );
+        }
+        result
+    }
+    fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+    fn close(&self) {
+        self.sender.close();
+    }
+    fn retired(&self, cause: RetireCause) {
+        if let Some(capacity) = &self.capacity {
+            capacity.add(
+                match cause {
+                    RetireCause::Evicted => Counter::RetirementsEvicted,
+                    RetireCause::AccountDeleted => Counter::RetirementsAccountDeleted,
+                    RetireCause::RouterStopped => Counter::RetirementsRouterStopped,
+                },
+                1,
+            );
+        }
+    }
+}
+
 struct Session<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
-    outbound: Sender<RoutedStanza<A>>,
+    outbound: ResourceSender<A>,
     inbound: Receiver<RoutedStanza<A>>,
     priority: Option<i8>,
     tags: SessionTags,
@@ -360,6 +402,7 @@ struct LastUnavailable {
 
 struct Shard<A: ChunkAllocator> {
     max_directed_presence_recipients_per_resource: NonZeroUsize,
+    capacity: Option<Arc<Capacity>>,
     last_unavailable: VecDeque<(Box<str>, LastUnavailable)>,
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
     retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
@@ -421,17 +464,34 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
         allocator: A,
         max_directed_presence_recipients_per_resource: NonZeroUsize,
     ) -> io::Result<Self> {
+        Self::start_observed(
+            dispatcher,
+            allocator,
+            max_directed_presence_recipients_per_resource,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_observed(
+        dispatcher: &DispatchHandle,
+        allocator: A,
+        max_directed_presence_recipients_per_resource: NonZeroUsize,
+        capacity: Option<Arc<Capacity>>,
+    ) -> io::Result<Self> {
         let count = dispatcher.worker_count();
         let mut senders = Vec::with_capacity(count);
         let tasks = FuturesUnordered::new();
         for worker in 0..count {
             let (sender, receiver) = async_channel::bounded(SHARD_QUEUE_CAPACITY);
             let receiver = Inbox(receiver);
+            let shard_capacity = capacity.clone();
             let task = dispatcher
                 .dispatch_at(worker, move |context| {
                     Shard::with_directed_presence_limit(
                         max_directed_presence_recipients_per_resource,
                     )
+                    .observed(shard_capacity)
                     .run(receiver, context)
                 })
                 .await?;
@@ -447,6 +507,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
                 hash_state: RandomState::new(),
                 state: Arc::new(Mutex::new(RouterState::Running)),
                 allocator,
+                capacity,
             },
             tasks,
             join_error: None,
@@ -541,11 +602,15 @@ impl<A: ChunkAllocator + Clone> Clone for LocalRouterHandle<A> {
             hash_state: self.hash_state.clone(),
             state: Arc::clone(&self.state),
             allocator: self.allocator.clone(),
+            capacity: self.capacity.clone(),
         }
     }
 }
 
 impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
+    pub(super) fn capacity(&self) -> Option<Arc<Capacity>> {
+        self.capacity.clone()
+    }
     pub(super) fn state(&self) -> RouterState {
         *self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1311,6 +1376,7 @@ impl<A: ChunkAllocator> Shard<A> {
         for sessions in self.accounts.values() {
             for session in sessions.values() {
                 session.alive.store(false, Ordering::Release);
+                session.outbound.retired(RetireCause::RouterStopped);
                 for grant in &session.directed {
                     grant.live.store(false, Ordering::Release);
                 }
@@ -1345,12 +1411,18 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
     ) -> Self {
         Self {
             max_directed_presence_recipients_per_resource,
+            capacity: None,
             last_unavailable: VecDeque::new(),
             accounts: HashMap::new(),
             retiring: HashMap::new(),
             next_token: 0,
             cleanups: FuturesUnordered::new(),
         }
+    }
+
+    fn observed(mut self, capacity: Option<Arc<Capacity>>) -> Self {
+        self.capacity = capacity;
+        self
     }
 
     async fn run(self, inbox: Inbox<A>, context: WorkerContext) {
@@ -1723,7 +1795,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             Session {
                 token,
                 alive: Arc::clone(&alive),
-                outbound,
+                outbound: ResourceSender {
+                    sender: outbound,
+                    capacity: self.capacity.clone(),
+                },
                 inbound: inbound.clone(),
                 priority: None,
                 tags: SessionTags::default(),
@@ -2702,6 +2777,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             return;
         }
         if let Some(mut session) = sessions.remove(resource) {
+            session.outbound.retired(cause);
             session.alive.store(false, Ordering::Release);
             if let Some(unavailable) = session.unavailable.as_ref() {
                 for (recipient_resource, recipient) in sessions.iter() {
@@ -2797,6 +2873,7 @@ mod tests {
             hash_state: Default::default(),
             state: Arc::new(Mutex::new(RouterState::Running)),
             allocator: lonewolf_util::arena::GlobalChunkAllocator,
+            capacity: None,
         }
     }
 
@@ -2951,7 +3028,10 @@ mod tests {
                             Session {
                                 token,
                                 alive: Arc::new(AtomicBool::new(true)),
-                                outbound,
+                                outbound: ResourceSender {
+                                    sender: outbound,
+                                    capacity: None,
+                                },
                                 inbound: inbound.clone(),
                                 priority,
                                 tags: SessionTags::default(),
@@ -2999,7 +3079,10 @@ mod tests {
                     Session {
                         token,
                         alive: Arc::new(AtomicBool::new(true)),
-                        outbound,
+                        outbound: ResourceSender {
+                            sender: outbound,
+                            capacity: None,
+                        },
                         inbound: inbound.clone(),
                         priority: Some(0),
                         tags: SessionTags::default(),
@@ -3934,3 +4017,7 @@ mod tests {
 #[cfg(test)]
 #[path = "local/supervision_tests.rs"]
 mod supervision_tests;
+
+#[cfg(test)]
+#[path = "local/capacity_tests.rs"]
+mod capacity_tests;

@@ -21,6 +21,7 @@ use hyper_util::service::TowerToHyperService;
 use lonewolf_storage::Storage;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
+use crate::DiagnosticsProvider;
 use crate::api;
 use crate::deleter::AccountDeleter;
 
@@ -54,6 +55,24 @@ impl Server {
         path: &Path,
         storage: impl Storage,
         deleter: Arc<dyn AccountDeleter>,
+    ) -> io::Result<Self> {
+        Self::bind_inner(path, storage, deleter, None)
+    }
+
+    pub fn bind_with_diagnostics(
+        path: &Path,
+        storage: impl Storage,
+        deleter: Arc<dyn AccountDeleter>,
+        diagnostics: Arc<dyn DiagnosticsProvider>,
+    ) -> io::Result<Self> {
+        Self::bind_inner(path, storage, deleter, Some(diagnostics))
+    }
+
+    fn bind_inner(
+        path: &Path,
+        storage: impl Storage,
+        deleter: Arc<dyn AccountDeleter>,
+        diagnostics: Option<Arc<dyn DiagnosticsProvider>>,
     ) -> io::Result<Self> {
         let parent = path
             .parent()
@@ -93,7 +112,10 @@ impl Server {
         Ok(Self {
             listener: UnixListener::from_std(listener)?,
             socket,
-            router: api::router(storage, deleter),
+            router: match diagnostics {
+                Some(provider) => api::router_with_diagnostics(storage, deleter, Some(provider)),
+                None => api::router(storage, deleter),
+            },
         })
     }
 

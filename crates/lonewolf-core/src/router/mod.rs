@@ -48,6 +48,49 @@ pub struct RouterHandle<A: ChunkAllocator> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouterFailureReason {
+    Completed,
+    Panicked,
+    Cancelled,
+}
+
+impl RouterFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Panicked => "panicked",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouterFailure {
+    pub shard_id: usize,
+    pub reason: RouterFailureReason,
+}
+
+impl fmt::Display for RouterFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "router shard {} {}",
+            self.shard_id,
+            self.reason.as_str()
+        )
+    }
+}
+
+impl std::error::Error for RouterFailure {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouterState {
+    Running,
+    Stopping,
+    Failed(RouterFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouterError {
     InvalidTarget,
     RemoteUnsupported,
@@ -84,6 +127,18 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         self
     }
 
+    pub(crate) fn state(&self) -> RouterState {
+        self.local.state()
+    }
+
+    pub(crate) fn stop(&self) {
+        self.local.stop();
+    }
+
+    pub(crate) async fn failure(&mut self) -> RouterFailure {
+        self.local.failure().await
+    }
+
     pub async fn shutdown(self) -> io::Result<()> {
         self.local.shutdown().await
     }
@@ -101,6 +156,10 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
 }
 
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
+    pub(crate) fn state(&self) -> RouterState {
+        self.local.state()
+    }
+
     pub(crate) fn is_local_host(&self, domain: &str) -> bool {
         self.hosts.is_local_host(domain)
     }
@@ -175,6 +234,9 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         requested: Option<&str>,
         limit: NonZeroUsize,
     ) -> Result<Registration<A>, RouterError> {
+        if self.state() != RouterState::Running {
+            return Err(RouterError::Stopped);
+        }
         if !self.hosts.is_local_host(account.domain()) {
             return Err(RouterError::RemoteUnsupported);
         }

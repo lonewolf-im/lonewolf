@@ -9,6 +9,7 @@ use lonewolf_util::pool::PoolError;
 
 use crate::config::ConfigError;
 use crate::hosts::HostsError;
+use crate::router::RouterFailure;
 
 #[derive(Debug)]
 pub enum RunError {
@@ -27,6 +28,7 @@ pub enum RunError {
     DispatcherShutdown(io::Error),
     Router(io::Error),
     RouterShutdown(io::Error),
+    RouterFailed(RouterFailure),
     Signal(io::Error),
     Admin(io::Error),
     C2s(io::Error),
@@ -66,6 +68,7 @@ impl fmt::Display for RunError {
                 write!(formatter, "cannot stop core dispatcher: {source}")
             }
             Self::Router(source) => write!(formatter, "cannot start router: {source}"),
+            Self::RouterFailed(failure) => failure.fmt(formatter),
             Self::RouterShutdown(source) => write!(formatter, "cannot stop router: {source}"),
             Self::Admin(source) => write!(formatter, "admin service failed: {source}"),
             Self::C2s(source) => write!(formatter, "c2s listener service failed: {source}"),
@@ -86,6 +89,7 @@ impl Error for RunError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Logging(source) => Some(source.as_ref()),
+            Self::RouterFailed(failure) => Some(failure),
             Self::Config(source) => Some(source),
             Self::Hosts(source) => Some(source),
             Self::Extensions { source, .. } => Some(source),

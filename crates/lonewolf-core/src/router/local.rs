@@ -8,10 +8,11 @@ use std::hash::BuildHasher;
 use std::io;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::pin::pin;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime};
 
 use async_channel::{Receiver, Sender, TrySendError};
@@ -22,11 +23,11 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use lonewolf_extension::delivery::{SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator};
-use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
+use lonewolf_util::core_dispatcher::{DispatchHandle, Task, TaskError, WorkerContext};
 use lonewolf_xmpp::jid::{JidError, JidRef};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaRef, StanzaType};
 
-use super::{RoutedStanza, RouterError};
+use super::{RoutedStanza, RouterError, RouterFailure, RouterFailureReason, RouterState};
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
 
 const SHARD_QUEUE_CAPACITY: usize = 1_024;
@@ -128,12 +129,14 @@ pub(crate) struct PresenceDelivery<A: ChunkAllocator> {
 
 pub struct LocalRouter<A: ChunkAllocator> {
     handle: LocalRouterHandle<A>,
-    tasks: Vec<Task<()>>,
+    tasks: FuturesUnordered<ShardTask>,
+    join_error: Option<TaskError>,
 }
 
 pub(super) struct LocalRouterHandle<A: ChunkAllocator> {
     shards: Arc<[Sender<Command<A>>]>,
     hash_state: RandomState,
+    state: Arc<Mutex<RouterState>>,
     allocator: A,
 }
 
@@ -170,6 +173,7 @@ pub(crate) struct PresenceChange<A: ChunkAllocator> {
 pub(crate) enum RetireCause {
     Evicted,
     AccountDeleted,
+    RouterStopped,
 }
 
 pub(crate) struct Retired<A: ChunkAllocator> {
@@ -189,6 +193,11 @@ impl<A: ChunkAllocator> Clone for Retired<A> {
 }
 
 enum Command<A: ChunkAllocator> {
+    #[cfg(test)]
+    Suspend {
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
     ResourceMatch {
         account: AccountKey,
         resource: Box<str>,
@@ -358,6 +367,35 @@ struct Shard<A: ChunkAllocator> {
     cleanups: FuturesUnordered<BoxFuture<'static, (AccountKey, Box<str>, u64)>>,
 }
 
+struct ShardTask {
+    shard_id: usize,
+    task: Task<()>,
+}
+
+impl Future for ShardTask {
+    type Output = (usize, Result<(), TaskError>);
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.task)
+            .poll(context)
+            .map(|result| (self.shard_id, result))
+    }
+}
+
+struct ShardOwner<A: ChunkAllocator> {
+    shard: Shard<A>,
+    inbox: Inbox<A>,
+}
+
+impl<A: ChunkAllocator> Drop for ShardOwner<A> {
+    fn drop(&mut self) {
+        self.shard.terminate();
+        self.inbox.0.close();
+        while self.inbox.0.try_recv().is_ok() {}
+        release_deferred();
+    }
+}
+
 struct Inbox<A: ChunkAllocator>(Receiver<Command<A>>);
 
 impl<A: ChunkAllocator> Drop for Inbox<A> {
@@ -385,7 +423,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
     ) -> io::Result<Self> {
         let count = dispatcher.worker_count();
         let mut senders = Vec::with_capacity(count);
-        let mut tasks = Vec::with_capacity(count);
+        let tasks = FuturesUnordered::new();
         for worker in 0..count {
             let (sender, receiver) = async_channel::bounded(SHARD_QUEUE_CAPACITY);
             let receiver = Inbox(receiver);
@@ -398,15 +436,20 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
                 })
                 .await?;
             senders.push(sender);
-            tasks.push(task);
+            tasks.push(ShardTask {
+                shard_id: worker,
+                task,
+            });
         }
         Ok(Self {
             handle: LocalRouterHandle {
                 shards: senders.into(),
                 hash_state: RandomState::new(),
+                state: Arc::new(Mutex::new(RouterState::Running)),
                 allocator,
             },
             tasks,
+            join_error: None,
         })
     }
 
@@ -414,14 +457,71 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
         self.handle.clone()
     }
 
-    pub async fn shutdown(self) -> io::Result<()> {
+    pub(crate) fn state(&self) -> RouterState {
+        self.handle.state()
+    }
+
+    pub(crate) fn stop(&self) {
+        let mut state = self
+            .handle
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *state == RouterState::Running {
+            *state = RouterState::Stopping;
+        }
+    }
+
+    pub(crate) async fn failure(&mut self) -> RouterFailure {
+        loop {
+            if let RouterState::Failed(failure) = self.state() {
+                return failure;
+            }
+            let Some((shard_id, result)) = self.tasks.next().await else {
+                return std::future::pending().await;
+            };
+            if let Err(error) = result {
+                self.join_error.get_or_insert(error);
+            }
+            let mut state = self
+                .handle
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if *state == RouterState::Running {
+                let reason = match result {
+                    Ok(()) => RouterFailureReason::Completed,
+                    Err(TaskError::Panicked) => RouterFailureReason::Panicked,
+                    Err(TaskError::Cancelled) => RouterFailureReason::Cancelled,
+                };
+                let failure = RouterFailure { shard_id, reason };
+                *state = RouterState::Failed(failure);
+                for shard in self.handle.shards.iter() {
+                    shard.close();
+                }
+                return failure;
+            }
+        }
+    }
+
+    pub async fn shutdown(mut self) -> io::Result<()> {
+        self.stop();
         for shard in self.handle.shards.iter() {
             shard.close();
         }
-        for task in self.tasks {
-            task.await.map_err(io::Error::other)?;
+        let mut error = match self.state() {
+            RouterState::Failed(failure) => Some(io::Error::other(failure)),
+            _ => self.join_error.map(io::Error::other),
+        };
+        while let Some((_, result)) = self.tasks.next().await {
+            if let Err(failure) = result {
+                error.get_or_insert_with(|| io::Error::other(failure));
+            }
         }
-        Ok(())
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -439,12 +539,17 @@ impl<A: ChunkAllocator + Clone> Clone for LocalRouterHandle<A> {
         Self {
             shards: Arc::clone(&self.shards),
             hash_state: self.hash_state.clone(),
+            state: Arc::clone(&self.state),
             allocator: self.allocator.clone(),
         }
     }
 }
 
 impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
+    pub(super) fn state(&self) -> RouterState {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(super) fn allocator(&self) -> A {
         self.allocator.clone()
     }
@@ -473,6 +578,9 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         limit: NonZeroUsize,
     ) -> Result<Registration<A>, RouterError> {
         release_deferred();
+        if self.state() != RouterState::Running {
+            return Err(RouterError::Stopped);
+        }
         let requested = requested
             .map(|resource| validate_resource(account, resource, self.allocator.clone()))
             .transpose()?;
@@ -1198,6 +1306,34 @@ fn validate_resource<A: ChunkAllocator>(
         .map(Into::into)
 }
 
+impl<A: ChunkAllocator> Shard<A> {
+    fn terminate(&mut self) {
+        for sessions in self.accounts.values() {
+            for session in sessions.values() {
+                session.alive.store(false, Ordering::Release);
+                for grant in &session.directed {
+                    grant.live.store(false, Ordering::Release);
+                }
+            }
+        }
+        let directed = SharedDirectedWithdrawal(Arc::new(Mutex::new(None)));
+        for (_, sessions) in self.accounts.drain() {
+            for (_, session) in sessions {
+                let _ = session.retired.send(Retired {
+                    cause: RetireCause::RouterStopped,
+                    unavailable: None,
+                    directed: directed.clone(),
+                });
+                session.outbound.close();
+                while session.inbound.try_recv().is_ok() {}
+            }
+        }
+        self.retiring.clear();
+        self.last_unavailable.clear();
+        self.cleanups.clear();
+    }
+}
+
 impl<A: ChunkAllocator + Clone> Shard<A> {
     #[cfg(test)]
     fn new() -> Self {
@@ -1217,15 +1353,45 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         }
     }
 
-    async fn run(mut self, receiver: Inbox<A>, context: WorkerContext) {
+    async fn run(self, inbox: Inbox<A>, context: WorkerContext) {
+        let mut owner = ShardOwner { shard: self, inbox };
+        let result = AssertUnwindSafe(owner.shard.run_loop(&owner.inbox.0, context))
+            .catch_unwind()
+            .await;
+        drop(owner);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(payload)) | Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    async fn run_loop(
+        &mut self,
+        receiver: &Receiver<Command<A>>,
+        context: WorkerContext,
+    ) -> Result<(), Box<dyn Any + Send>> {
         let mut processed = 0;
         let mut prefer_cleanup = true;
         loop {
+            if receiver.is_closed() {
+                break;
+            }
             let event = self
-                .next_event(&receiver.0, context.shutdown_requested(), prefer_cleanup)
+                .next_event(receiver, context.shutdown_requested(), prefer_cleanup)
                 .await;
+            if receiver.is_closed() {
+                break;
+            }
             match event {
-                Some(Either::Left(command)) => self.command(command),
+                Some(Either::Left(command)) => {
+                    #[cfg(test)]
+                    if let Command::Suspend { entered, release } = command {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                        continue;
+                    }
+                    self.command(command)?;
+                }
                 Some(Either::Right((account, resource, token))) => {
                     self.remove(account.as_str(), &resource, token, RetireCause::Evicted);
                     self.finish_presence(&account, token);
@@ -1242,6 +1408,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 yield_to_runtime().await;
             }
         }
+        Ok(())
     }
 
     async fn next_event<S: Future<Output = Instant>>(
@@ -1276,24 +1443,34 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         }
     }
 
-    fn command(&mut self, command: Command<A>) {
+    fn command(&mut self, command: Command<A>) -> Result<(), Box<dyn Any + Send>> {
+        macro_rules! reply {
+            ($sender:expr, $operation:expr) => {{
+                // A reply or callback capture can wake tasks when it drops.
+                let result = catch_unwind(AssertUnwindSafe(|| $operation))?;
+                let _ = $sender.send(result);
+            }};
+        }
         match command {
+            #[cfg(test)]
+            Command::Suspend { .. } => unreachable!("suspension belongs to the actor loop"),
             Command::ResourceMatch {
                 account,
                 resource,
                 reply,
             } => {
-                let matched = self
-                    .accounts
-                    .get(account.as_str())
-                    .and_then(|sessions| sessions.get(resource.as_ref()))
-                    .filter(|session| {
-                        session.alive.load(Ordering::Acquire) && !session.outbound.is_closed()
-                    })
-                    .map(|session| ResourceMatch {
-                        token: session.token,
-                    });
-                let _ = reply.send(matched);
+                reply!(
+                    reply,
+                    self.accounts
+                        .get(account.as_str())
+                        .and_then(|sessions| sessions.get(resource.as_ref()))
+                        .filter(|session| {
+                            session.alive.load(Ordering::Acquire) && !session.outbound.is_closed()
+                        })
+                        .map(|session| ResourceMatch {
+                            token: session.token,
+                        })
+                );
             }
             Command::DirectedPresence {
                 account,
@@ -1303,9 +1480,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 available,
                 reply,
             } => {
-                let result =
-                    self.record_directed_presence(&account, &resource, token, recipient, available);
-                let _ = reply.send(result);
+                reply!(
+                    reply,
+                    self.record_directed_presence(&account, &resource, token, recipient, available)
+                );
             }
             #[cfg(test)]
             Command::HasDirectedGrant {
@@ -1314,19 +1492,20 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 observer,
                 reply,
             } => {
-                let granted = self
-                    .accounts
-                    .get(account.as_str())
-                    .and_then(|sessions| sessions.get(resource.as_ref()))
-                    .is_some_and(|session| {
-                        session.alive.load(Ordering::Acquire)
-                            && !session.outbound.is_closed()
-                            && session
-                                .directed
-                                .iter()
-                                .any(|grant| grant.recipient.matches_prepared(&observer))
-                    });
-                let _ = reply.send(granted);
+                reply!(
+                    reply,
+                    self.accounts
+                        .get(account.as_str())
+                        .and_then(|sessions| sessions.get(resource.as_ref()))
+                        .is_some_and(|session| {
+                            session.alive.load(Ordering::Acquire)
+                                && !session.outbound.is_closed()
+                                && session
+                                    .directed
+                                    .iter()
+                                    .any(|grant| grant.recipient.matches_prepared(&observer))
+                        })
+                );
             }
             Command::Probe {
                 requester,
@@ -1334,8 +1513,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 subscribed,
                 reply,
             } => {
-                let result = self.probe_snapshot(&requester, &request, subscribed);
-                let _ = reply.send(result);
+                reply!(reply, self.probe_snapshot(&requester, &request, subscribed));
             }
             #[cfg(test)]
             Command::PresenceAccess {
@@ -1346,18 +1524,19 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 mut build,
                 reply,
             } => {
-                let result = self.presence_access(
-                    &account,
-                    resource.as_deref(),
-                    &observer,
-                    subscribed,
-                    &mut build,
+                reply!(
+                    reply,
+                    self.presence_access(
+                        &account,
+                        resource.as_deref(),
+                        &observer,
+                        subscribed,
+                        &mut build,
+                    )
                 );
-                let _ = reply.send(result);
             }
             Command::AuthorizedDelivery { delivery, reply } => {
-                let result = self.authorized_delivery(delivery);
-                let _ = reply.send(result);
+                reply!(reply, self.authorized_delivery(delivery));
             }
             Command::Register {
                 account,
@@ -1368,8 +1547,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 router,
                 reply,
             } => {
-                let result = self.register(account, requested, limit, outbound, inbound, router);
-                let _ = reply.send(result);
+                reply!(
+                    reply,
+                    self.register(account, requested, limit, outbound, inbound, router)
+                );
             }
             Command::Deliver {
                 stanza,
@@ -1377,13 +1558,15 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 source,
                 reply,
             } => {
-                let result = match source {
-                    Some(source) => {
-                        self.deliver_with_guard(stanza, fallback_chat, || source.is_alive())
+                reply!(
+                    reply,
+                    match source {
+                        Some(source) => {
+                            self.deliver_with_guard(stanza, fallback_chat, || source.is_alive())
+                        }
+                        None => self.deliver(stanza, fallback_chat),
                     }
-                    None => self.deliver(stanza, fallback_chat),
-                };
-                let _ = reply.send(result);
+                );
             }
             Command::DeliverIqRequest {
                 stanza,
@@ -1391,31 +1574,28 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 source,
                 reply,
             } => {
-                let result = self.deliver_iq_request(stanza, subscribed, source);
-                let _ = reply.send(result);
+                reply!(reply, self.deliver_iq_request(stanza, subscribed, source));
             }
             Command::DeliverBare { stanza, reply } => {
-                let result = self.deliver_bare(stanza, false);
-                let _ = reply.send(result);
+                reply!(reply, self.deliver_bare(stanza, false));
             }
             Command::DeliverPresence { stanza, reply } => {
-                let result = self.deliver_presence(stanza);
-                let _ = reply.send(result);
+                reply!(reply, self.deliver_presence(stanza));
             }
             Command::DeliverPresenceError { stanza, reply } => {
-                let result =
-                    self.deliver_presence_where(stanza, |session| session.priority.is_some());
-                let _ = reply.send(result);
+                reply!(
+                    reply,
+                    self.deliver_presence_where(stanza, |session| session.priority.is_some())
+                );
             }
             Command::DeliverPresenceToTagged { tag, stanza, reply } => {
-                let result = self.deliver_presence_to_tagged(tag, stanza);
-                let _ = reply.send(result);
+                reply!(reply, self.deliver_presence_to_tagged(tag, stanza));
             }
             Command::PresenceSnapshot { account, reply } => {
-                let _ = reply.send(self.presence_snapshot(&account));
+                reply!(reply, self.presence_snapshot(&account));
             }
             Command::WithdrawalSnapshot { account, reply } => {
-                let _ = reply.send(self.withdrawal_snapshot(&account));
+                reply!(reply, self.withdrawal_snapshot(&account));
             }
             Command::Tag {
                 account,
@@ -1424,8 +1604,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 tag,
                 reply,
             } => {
-                let result = self.tag(&account, &resource, token, tag);
-                let _ = reply.send(result);
+                reply!(reply, self.tag(&account, &resource, token, tag));
             }
             Command::DeliverToTagged {
                 account,
@@ -1433,8 +1612,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 mut build,
                 reply,
             } => {
-                let result = self.deliver_to_tagged(&account, tag, &mut build);
-                let _ = reply.send(result);
+                reply!(reply, self.deliver_to_tagged(&account, tag, &mut build));
             }
             Command::Presence {
                 account,
@@ -1445,9 +1623,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 unavailable,
                 reply,
             } => {
-                let result =
-                    self.presence(&account, &resource, token, priority, stanza, unavailable);
-                let _ = reply.send(result);
+                reply!(
+                    reply,
+                    self.presence(&account, &resource, token, priority, stanza, unavailable)
+                );
             }
             Command::EndPresence {
                 account,
@@ -1455,8 +1634,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 token,
                 reply,
             } => {
-                let result = self.end_presence(&account, &resource, token);
-                let _ = reply.send(result);
+                reply!(reply, self.end_presence(&account, &resource, token));
             }
             Command::ReplacementAvailable {
                 account,
@@ -1464,22 +1642,23 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 token,
                 reply,
             } => {
-                let result = self.replacement_is_available(&account, &resource, token);
-                let _ = reply.send(result);
+                reply!(
+                    reply,
+                    self.replacement_is_available(&account, &resource, token)
+                );
             }
             Command::FinishPresence {
                 account,
                 token,
                 reply,
             } => {
-                self.finish_presence(&account, token);
-                let _ = reply.send(());
+                reply!(reply, self.finish_presence(&account, token));
             }
             Command::RetireAccount { account, reply } => {
-                self.retire_account(&account);
-                let _ = reply.send(());
+                reply!(reply, self.retire_account(&account));
             }
         }
+        Ok(())
     }
 
     fn register(
@@ -1491,6 +1670,9 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         inbound: Receiver<RoutedStanza<A>>,
         router: LocalRouterHandle<A>,
     ) -> Result<Registration<A>, RouterError> {
+        if router.state() != RouterState::Running {
+            return Err(RouterError::Stopped);
+        }
         let shard = router.shard(account.as_str()).clone();
         if let Some(sessions) = self.accounts.get(account.as_str()) {
             let stale: Vec<_> = sessions
@@ -2613,6 +2795,7 @@ mod tests {
         super::LocalRouterHandle {
             shards: vec![sender].into(),
             hash_state: Default::default(),
+            state: Arc::new(Mutex::new(RouterState::Running)),
             allocator: lonewolf_util::arena::GlobalChunkAllocator,
         }
     }
@@ -2954,11 +3137,15 @@ mod tests {
                     registration.alive.store(false, Ordering::Release);
                 }
                 let (reply, result) = oneshot::channel();
-                shard.command(Command::ResourceMatch {
-                    account,
-                    resource: "desk".into(),
-                    reply,
-                });
+                assert!(
+                    shard
+                        .command(Command::ResourceMatch {
+                            account,
+                            resource: "desk".into(),
+                            reply,
+                        })
+                        .is_ok()
+                );
                 assert_eq!(result.await?, None);
             }
             Ok(())
@@ -3466,7 +3653,7 @@ mod tests {
                         true,
                     )?;
                 }
-                destination.command(command);
+                assert!(destination.command(command).is_ok());
                 admitted.await?;
                 assert!(observer.take_queued().is_empty());
             }
@@ -3496,7 +3683,7 @@ mod tests {
                 let unavailable = routed("<presence from='alice@localhost/desk' to='bob@localhost/desk' type='unavailable'/>").await?;
                 let mut pending = pin!(session.directed_presence(unavailable, false));
                 assert!(futures_util::poll!(pending.as_mut()).is_pending());
-                source.command(inbox.recv().await?);
+                assert!(source.command(inbox.recv().await?).is_ok());
                 assert!(source.accounts[alice.as_str()]["desk"].directed.is_empty());
                 assert!(futures_util::poll!(pending.as_mut()).is_pending());
                 let delivery = inbox.recv().await?;
@@ -3514,7 +3701,7 @@ mod tests {
                 let replacement = source.register(alice.clone(), Some("desk".into()), NonZeroUsize::MIN, outbound, inbound, router.clone())?;
                 assert_ne!(replacement.token, desk.token);
                 source.record_directed_presence(&alice, "desk", replacement.token, DirectedRecipient::new(bob_jid), true)?;
-                destination.command(delivery);
+                assert!(destination.command(delivery).is_ok());
                 pending.await?;
                 let delivered = observer.take_queued();
                 assert_eq!(delivered.len(), 1);
@@ -3595,7 +3782,7 @@ mod tests {
                         }
                         _ => {}
                     }
-                    destination.command(command);
+                    assert!(destination.command(command).is_ok());
                     admission.await?;
                     assert_eq!(target.take_queued().len(), usize::from(action == "unchanged"), "{kind} {action}");
                     drop(replacement);
@@ -3642,7 +3829,7 @@ mod tests {
                         }
                         _ => source.retire_account(&alice),
                     }
-                    destination.command(command);
+                    assert!(destination.command(command).is_ok());
                     admitted.await?;
                     assert!(observer.take_queued().is_empty());
                 }
@@ -3689,7 +3876,7 @@ mod tests {
                 let command = inbox.recv().await?;
                 destination.end_presence(&bob, "desk", observer.token)?;
                 let replacement = register_probe_session(&mut destination, &router, &bob, "desk")?;
-                destination.command(command);
+                assert!(destination.command(command).is_ok());
                 admitted.await?;
                 assert!(observer.take_queued().is_empty());
                 assert!(replacement.take_queued().is_empty());
@@ -3743,3 +3930,7 @@ mod tests {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "local/supervision_tests.rs"]
+mod supervision_tests;

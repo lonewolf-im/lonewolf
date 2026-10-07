@@ -19,6 +19,7 @@ use futures_channel::oneshot;
 use futures_util::future::{Either, join, select};
 use lonewolf_extension::{Extension, Extensions};
 use lonewolf_storage::RedbStorage;
+use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
 
@@ -209,9 +210,9 @@ pub fn run_with_extensions(
                 )
                 .await
                 .map_err(RunError::Router)?;
-                let router_handle = router
-                    .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions))
-                    .handle();
+                let serving_router = router
+                    .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions));
+                let router_handle = serving_router.handle();
                 let deletion_router = router_handle.clone();
                 let deletion_storage = storage.clone();
                 let listeners = listeners.insert(
@@ -233,6 +234,7 @@ pub fn run_with_extensions(
                 run_services(
                     admin,
                     listeners,
+                    serving_router,
                     &mut shutdown_deadline,
                     account_deletion::run(
                         deletions,
@@ -246,6 +248,9 @@ pub fn run_with_extensions(
             .await;
             let deadline =
                 shutdown_deadline.unwrap_or_else(|| Instant::now() + WORKER_SHUTDOWN_GRACE);
+            if let Some(router) = &router {
+                router.stop();
+            }
             let listeners_stopped = match listeners {
                 Some(mut listeners) => {
                     listeners.stop(deadline);
@@ -281,9 +286,10 @@ pub fn run_with_extensions(
     Ok(())
 }
 
-async fn run_services(
+async fn run_services<A: ChunkAllocator + Clone>(
     admin: Option<lonewolf_admin::Server>,
     listeners: &mut c2s::Listeners,
+    router: &mut Router<A>,
     shutdown_deadline: &mut Option<Instant>,
     deletions: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
@@ -308,9 +314,23 @@ async fn run_services(
     });
     let result = {
         let shutdown = async {
-            match select(pin!(shutdown::wait()), pin!(listeners.failure())).await {
-                Either::Left((result, _)) => result.map_err(RunError::Signal),
-                Either::Right((error, _)) => Err(RunError::C2s(error)),
+            let external = async {
+                match select(pin!(shutdown::wait()), pin!(listeners.failure())).await {
+                    Either::Left((result, _)) => result.map_err(RunError::Signal),
+                    Either::Right((error, _)) => Err(RunError::C2s(error)),
+                }
+            };
+            match select(pin!(router.failure()), pin!(external)).await {
+                Either::Left((failure, _)) => {
+                    tracing::error!(
+                        component = "router",
+                        shard_id = failure.shard_id,
+                        reason = failure.reason.as_str(),
+                        "router service failed"
+                    );
+                    Err(RunError::RouterFailed(failure))
+                }
+                Either::Right((result, _)) => result,
             }
         };
         match select(services.as_mut(), pin!(shutdown)).await {
@@ -318,6 +338,11 @@ async fn run_services(
             Either::Right((result, _)) => Either::Left(result),
         }
     };
+    let router_failure = match router.state() {
+        router::RouterState::Failed(failure) => Some(failure),
+        _ => None,
+    };
+    router.stop();
     let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
     *shutdown_deadline = Some(deadline);
     listeners.stop(deadline);
@@ -332,9 +357,22 @@ async fn run_services(
         let (services, listeners) = join(services, listeners.join()).await;
         services.and(listeners.map_err(RunError::C2s))
     };
+    drain_services_until(deadline, router_failure, drain).await
+}
+
+async fn drain_services_until(
+    deadline: Instant,
+    router_failure: Option<router::RouterFailure>,
+    drain: impl Future<Output = Result<(), RunError>>,
+) -> Result<(), RunError> {
     compio::time::timeout_at(deadline, drain)
         .await
-        .unwrap_or_else(|_| Err(RunError::DispatcherShutdown(shutdown_timeout())))
+        .unwrap_or_else(|_| {
+            Err(match router_failure {
+                Some(failure) => RunError::RouterFailed(failure),
+                None => RunError::DispatcherShutdown(shutdown_timeout()),
+            })
+        })
 }
 
 fn shutdown_timeout() -> io::Error {
@@ -357,4 +395,22 @@ fn invalid_worker_count() -> io::Error {
         io::ErrorKind::InvalidInput,
         "LONEWOLF_WORKER_COUNT must be a positive integer",
     )
+}
+
+#[cfg(test)]
+mod supervision_tests {
+    use super::*;
+    use router::{RouterFailure, RouterFailureReason};
+
+    #[test]
+    fn bounded_service_drain_keeps_observed_router_failure_primary() -> io::Result<()> {
+        Runtime::new()?.block_on(async {
+            let failure = RouterFailure { shard_id: 2, reason: RouterFailureReason::Panicked };
+            let result = drain_services_until(Instant::now(), Some(failure), pending()).await;
+            assert!(matches!(result, Err(RunError::RouterFailed(actual)) if actual == failure));
+            let result = drain_services_until(Instant::now(), None, pending()).await;
+            assert!(matches!(result, Err(RunError::DispatcherShutdown(error)) if error.kind() == io::ErrorKind::TimedOut));
+        });
+        Ok(())
+    }
 }

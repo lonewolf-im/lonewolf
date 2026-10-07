@@ -32,6 +32,8 @@ pub const MAX_STREAM_HEADER_BYTES: usize = 16 * 1024;
 /// Includes namespace declarations in the per-element count.
 pub const MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
 
+const MAX_RETAINED_BUFFER_BYTES: usize = 65_536;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ParserConfig {
     /// Counts wire bytes per top-level element, including markup.
@@ -206,6 +208,12 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
         self.text.clear();
         self.frames.clear();
         if result.is_ok() {
+            if self.scratch.capacity() > MAX_RETAINED_BUFFER_BYTES {
+                self.scratch = Vec::new();
+            }
+            if self.text.capacity() > MAX_RETAINED_BUFFER_BYTES {
+                self.text = String::new();
+            }
             self.failed = false;
         }
         result.map(Some)

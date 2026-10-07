@@ -1430,6 +1430,78 @@ fn retirement_transfers_grants_once_and_stale_handles_cannot_change_replacement(
 }
 
 #[test]
+fn guarded_presence_is_dropped_once_its_source_retires() -> TestResult {
+    run_test(async {
+        let (router, dispatcher) = setup().await?;
+        let handle = router.handle();
+        let desk = handle
+            .register(
+                &account("alice@localhost")?,
+                Some("desk"),
+                NonZeroUsize::MIN,
+            )
+            .await?;
+        let bob = handle
+            .register(&account("bob@localhost")?, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        bob.handle()
+            .set_presence(
+                Some(0),
+                parse_stanza("<presence from='bob@localhost/phone'/>").await?,
+                None,
+            )
+            .await?;
+        bob.take_queued();
+        let liveness = desk.liveness();
+        handle
+            .local
+            .deliver_presence_guarded(
+                parse_stanza("<presence from='alice@localhost/desk' to='bob@localhost'/>").await?,
+                liveness.clone(),
+            )
+            .await?;
+        assert_eq!(bob.take_queued().len(), 1);
+        handle
+            .local
+            .deliver_full_guarded(
+                parse_stanza("<presence from='alice@localhost/desk' to='bob@localhost/phone'/>")
+                    .await?,
+                liveness.clone(),
+            )
+            .await?;
+        assert_eq!(bob.take_queued().len(), 1);
+
+        drop(desk);
+        assert!(!liveness.is_alive());
+        assert_eq!(
+            handle
+                .local
+                .deliver_presence_guarded(
+                    parse_stanza("<presence from='alice@localhost/desk' to='bob@localhost'/>")
+                        .await?,
+                    liveness.clone(),
+                )
+                .await,
+            Err(RouterError::NotFound)
+        );
+        assert!(bob.take_queued().is_empty());
+        handle
+            .local
+            .deliver_full_guarded(
+                parse_stanza("<presence from='alice@localhost/desk' to='bob@localhost/phone'/>")
+                    .await?,
+                liveness,
+            )
+            .await?;
+        assert!(bob.take_queued().is_empty());
+        drop(bob);
+        router.shutdown().await?;
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn selected_delivery_dies_on_revocation_regrant_or_source_replacement() -> TestResult {
     run_test(async {
         let (router, dispatcher) = setup().await?;

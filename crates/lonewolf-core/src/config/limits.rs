@@ -27,6 +27,7 @@ pub struct C2sLimits {
     pub max_unauthenticated_connections: NonZeroUsize,
     /// Counts bound resources across all listeners for each account.
     pub max_resources_per_account: NonZeroUsize,
+    pub max_directed_presence_recipients_per_resource: NonZeroUsize,
     /// Replaces the built-in profiles when present in TOML.
     pub profiles: BTreeMap<String, C2sLimitProfile>,
 }
@@ -37,6 +38,8 @@ impl Default for C2sLimits {
             default: "default".into(),
             max_unauthenticated_connections: default_max_unauthenticated_connections(),
             max_resources_per_account: default_max_resources_per_account(),
+            max_directed_presence_recipients_per_resource:
+                default_max_directed_presence_recipients_per_resource(),
             profiles: default_profiles(),
         }
     }
@@ -50,6 +53,8 @@ struct C2sLimitsInput {
     max_unauthenticated_connections: NonZeroUsize,
     #[serde(default = "default_max_resources_per_account")]
     max_resources_per_account: NonZeroUsize,
+    #[serde(default = "default_max_directed_presence_recipients_per_resource")]
+    max_directed_presence_recipients_per_resource: NonZeroUsize,
     #[serde(default = "default_profiles")]
     profiles: BTreeMap<String, C2sLimitProfile>,
 }
@@ -73,6 +78,8 @@ impl TryFrom<C2sLimitsInput> for C2sLimits {
             default,
             max_unauthenticated_connections: input.max_unauthenticated_connections,
             max_resources_per_account: input.max_resources_per_account,
+            max_directed_presence_recipients_per_resource: input
+                .max_directed_presence_recipients_per_resource,
             profiles: input.profiles,
         })
     }
@@ -130,6 +137,10 @@ fn default_profiles() -> BTreeMap<String, C2sLimitProfile> {
 
 const fn default_max_unauthenticated_connections() -> NonZeroUsize {
     nonzero(1_024)
+}
+
+pub(crate) const fn default_max_directed_presence_recipients_per_resource() -> NonZeroUsize {
+    nonzero(256)
 }
 
 const fn default_max_resources_per_account() -> NonZeroUsize {

@@ -27,6 +27,7 @@ use lonewolf_xmpp::jid::{JidError, JidRef};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaRef, StanzaType};
 
 use super::{RoutedStanza, RouterError};
+use crate::config::limits::default_max_directed_presence_recipients_per_resource;
 
 const SHARD_QUEUE_CAPACITY: usize = 1_024;
 const RESOURCE_QUEUE_CAPACITY: usize = 64;
@@ -349,6 +350,7 @@ struct LastUnavailable {
 }
 
 struct Shard<A: ChunkAllocator> {
+    max_directed_presence_recipients_per_resource: NonZeroUsize,
     last_unavailable: VecDeque<(Box<str>, LastUnavailable)>,
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
     retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
@@ -368,6 +370,19 @@ impl<A: ChunkAllocator> Drop for Inbox<A> {
 impl<A: ChunkAllocator + Clone> LocalRouter<A> {
     /// Returns an error if a worker cannot accept its shard actor.
     pub async fn start(dispatcher: &DispatchHandle, allocator: A) -> io::Result<Self> {
+        Self::start_with_directed_presence_limit(
+            dispatcher,
+            allocator,
+            default_max_directed_presence_recipients_per_resource(),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_directed_presence_limit(
+        dispatcher: &DispatchHandle,
+        allocator: A,
+        max_directed_presence_recipients_per_resource: NonZeroUsize,
+    ) -> io::Result<Self> {
         let count = dispatcher.worker_count();
         let mut senders = Vec::with_capacity(count);
         let mut tasks = Vec::with_capacity(count);
@@ -375,7 +390,12 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
             let (sender, receiver) = async_channel::bounded(SHARD_QUEUE_CAPACITY);
             let receiver = Inbox(receiver);
             let task = dispatcher
-                .dispatch_at(worker, move |context| Shard::new().run(receiver, context))
+                .dispatch_at(worker, move |context| {
+                    Shard::with_directed_presence_limit(
+                        max_directed_presence_recipients_per_resource,
+                    )
+                    .run(receiver, context)
+                })
                 .await?;
             senders.push(sender);
             tasks.push(task);
@@ -1179,8 +1199,16 @@ fn validate_resource<A: ChunkAllocator>(
 }
 
 impl<A: ChunkAllocator + Clone> Shard<A> {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_directed_presence_limit(default_max_directed_presence_recipients_per_resource())
+    }
+
+    fn with_directed_presence_limit(
+        max_directed_presence_recipients_per_resource: NonZeroUsize,
+    ) -> Self {
         Self {
+            max_directed_presence_recipients_per_resource,
             last_unavailable: VecDeque::new(),
             accounts: HashMap::new(),
             retiring: HashMap::new(),
@@ -1565,10 +1593,16 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             .iter()
             .position(|grant| grant.recipient == recipient);
         match (available, known) {
-            (true, None) => source.directed.push(DirectedGrant {
-                recipient,
-                live: Arc::new(AtomicBool::new(true)),
-            }),
+            (true, None) => {
+                if source.directed.len() >= self.max_directed_presence_recipients_per_resource.get()
+                {
+                    return Err(RouterError::DirectedPresenceLimit);
+                }
+                source.directed.push(DirectedGrant {
+                    recipient,
+                    live: Arc::new(AtomicBool::new(true)),
+                });
+            }
             (false, Some(index)) => {
                 let grant = source.directed.swap_remove(index);
                 grant.live.store(false, Ordering::Release);
@@ -3096,6 +3130,259 @@ mod tests {
         Ok(())
     }
 
+    fn directed_recipient(text: &str) -> Result<DirectedRecipient, Box<dyn Error>> {
+        let mut arena = Arena::try_new(Default::default())?;
+        Ok(DirectedRecipient::new(
+            Jid::parse_in(text, &mut arena)?.resolve(&arena)?,
+        ))
+    }
+
+    #[test]
+    fn directed_presence_limit_counts_exact_recipients_per_resource() -> Result<(), Box<dyn Error>>
+    {
+        Runtime::new()?.block_on(async {
+            let alice = account()?;
+            let mut shard =
+                Shard::with_directed_presence_limit(NonZeroUsize::new(2).ok_or("zero limit")?);
+            let (commands, _) = async_channel::bounded(1);
+            let router = test_router(commands);
+            let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+            let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
+            for target in ["bob@localhost", "bob@localhost/desk"] {
+                shard.record_directed_presence(
+                    &alice,
+                    "desk",
+                    desk.token,
+                    directed_recipient(target)?,
+                    true,
+                )?;
+            }
+            let old = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[0].live);
+            shard.record_directed_presence(
+                &alice,
+                "desk",
+                desk.token,
+                directed_recipient("bob@localhost")?,
+                true,
+            )?;
+            assert!(Arc::ptr_eq(
+                &old,
+                &shard.accounts[alice.as_str()]["desk"].directed[0].live
+            ));
+            assert_eq!(shard.accounts[alice.as_str()]["desk"].directed.len(), 2);
+            assert_eq!(
+                shard.record_directed_presence(
+                    &alice,
+                    "desk",
+                    desk.token,
+                    directed_recipient("carol@localhost")?,
+                    true
+                ),
+                Err(RouterError::DirectedPresenceLimit)
+            );
+            assert_eq!(shard.accounts[alice.as_str()]["desk"].directed.len(), 2);
+            shard.record_directed_presence(
+                &alice,
+                "phone",
+                phone.token,
+                directed_recipient("carol@localhost")?,
+                true,
+            )?;
+            assert_eq!(shard.accounts[alice.as_str()]["phone"].directed.len(), 1);
+            shard.record_directed_presence(
+                &alice,
+                "desk",
+                desk.token,
+                directed_recipient("alice@localhost/phone")?,
+                true,
+            )?;
+            shard.record_directed_presence(
+                &alice,
+                "desk",
+                desk.token,
+                directed_recipient("unknown@localhost")?,
+                false,
+            )?;
+            assert_eq!(shard.accounts[alice.as_str()]["desk"].directed.len(), 2);
+            shard.record_directed_presence(
+                &alice,
+                "desk",
+                desk.token,
+                directed_recipient("bob@localhost")?,
+                false,
+            )?;
+            assert!(!old.load(Ordering::Acquire));
+            shard.record_directed_presence(
+                &alice,
+                "desk",
+                desk.token,
+                directed_recipient("bob@localhost")?,
+                true,
+            )?;
+            let fresh = &shard.accounts[alice.as_str()]["desk"].directed[1].live;
+            assert!(fresh.load(Ordering::Acquire));
+            assert!(!Arc::ptr_eq(&old, fresh));
+            assert_eq!(shard.accounts[alice.as_str()]["desk"].directed.len(), 2);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn recipient_unavailable_releases_directed_presence_limit_and_fences_grants()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for sender in ["bob@localhost/desk", "bob@localhost"] {
+                let alice = account()?;
+                let mut shard =
+                    Shard::with_directed_presence_limit(NonZeroUsize::new(2).ok_or("zero limit")?);
+                let (commands, _) = async_channel::bounded(1);
+                let router = test_router(commands);
+                let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+                for target in ["bob@localhost", "bob@localhost/desk"] {
+                    shard.record_directed_presence(
+                        &alice,
+                        "desk",
+                        desk.token,
+                        directed_recipient(target)?,
+                        true,
+                    )?;
+                }
+                let bare = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[0].live);
+                let full = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[1].live);
+                shard.prune_directed(
+                    &routed(&format!(
+                        "<presence from='{sender}' to='alice@localhost/desk' type='unavailable'/>"
+                    ))
+                    .await?,
+                )?;
+                assert!(!full.load(Ordering::Acquire));
+                assert_eq!(bare.load(Ordering::Acquire), sender.contains('/'));
+                assert_eq!(
+                    shard.accounts[alice.as_str()]["desk"].directed.len(),
+                    usize::from(sender.contains('/'))
+                );
+                shard.record_directed_presence(
+                    &alice,
+                    "desk",
+                    desk.token,
+                    directed_recipient("bob@localhost/desk")?,
+                    true,
+                )?;
+                let fresh = &shard.accounts[alice.as_str()]["desk"]
+                    .directed
+                    .last()
+                    .ok_or("missing grant")?
+                    .live;
+                assert!(!Arc::ptr_eq(&full, fresh));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn directed_presence_limit_resets_on_withdrawal_and_retirement_without_touching_replacements()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            for action in ["unavailable", "disconnect", "evict", "delete", "drop"] {
+                let alice = account()?;
+                let mut shard = Shard::with_directed_presence_limit(NonZeroUsize::MIN);
+                let (commands, _) = async_channel::bounded(1);
+                let router = test_router(commands);
+                let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+                let token = desk.token;
+                shard.record_directed_presence(
+                    &alice,
+                    "desk",
+                    token,
+                    directed_recipient("bob@localhost")?,
+                    true,
+                )?;
+                let old = Arc::clone(&shard.accounts[alice.as_str()]["desk"].directed[0].live);
+                let mut held = Some(desk);
+                match action {
+                    "unavailable" => {
+                        let change = shard.presence(
+                            &alice,
+                            "desk",
+                            token,
+                            None,
+                            routed("<presence from='alice@localhost/desk' type='unavailable'/>")
+                                .await?,
+                            None,
+                        )?;
+                        assert_eq!(change.directed.recipients.len(), 1);
+                    }
+                    "disconnect" => {
+                        assert_eq!(
+                            shard
+                                .end_presence(&alice, "desk", token)?
+                                .directed
+                                .recipients
+                                .len(),
+                            1
+                        );
+                    }
+                    "delete" => shard.retire_account(&alice),
+                    "drop" => {
+                        drop(held.take());
+                        let (owner, resource, old_token) =
+                            shard.cleanups.next().await.ok_or("missing cleanup")?;
+                        shard.remove(owner.as_str(), &resource, old_token, RetireCause::Evicted);
+                    }
+                    _ => shard.remove(alice.as_str(), "desk", token, RetireCause::Evicted),
+                }
+                assert!(!old.load(Ordering::Acquire), "{action}");
+                let replacement = if action == "unavailable" {
+                    held.take().ok_or("missing registration")?
+                } else {
+                    register_probe_session(&mut shard, &router, &alice, "desk")?
+                };
+                assert!(shard.accounts[alice.as_str()]["desk"].directed.is_empty());
+                shard.record_directed_presence(
+                    &alice,
+                    "desk",
+                    replacement.token,
+                    directed_recipient("carol@localhost")?,
+                    true,
+                )?;
+                if action != "unavailable" {
+                    assert_ne!(token, replacement.token);
+                    assert_eq!(
+                        shard.record_directed_presence(
+                            &alice,
+                            "desk",
+                            token,
+                            directed_recipient("carol@localhost")?,
+                            false
+                        ),
+                        Err(RouterError::NotFound)
+                    );
+                    assert!(matches!(
+                        shard.end_presence(&alice, "desk", token),
+                        Err(RouterError::NotFound)
+                    ));
+                    shard.remove(alice.as_str(), "desk", token, RetireCause::Evicted);
+                    shard.finish_presence(&alice, token);
+                }
+                let grants = &shard.accounts[alice.as_str()]["desk"].directed;
+                assert_eq!(grants.len(), 1);
+                assert_eq!(grants[0].recipient.as_str(), "carol@localhost");
+                assert!(grants[0].live.load(Ordering::Acquire));
+                assert_eq!(
+                    shard.record_directed_presence(
+                        &alice,
+                        "desk",
+                        replacement.token,
+                        directed_recipient("dave@localhost")?,
+                        true
+                    ),
+                    Err(RouterError::DirectedPresenceLimit)
+                );
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn queued_destination_command_rejects_revoked_and_retired_sources() -> Result<(), Box<dyn Error>>
     {
@@ -3105,7 +3392,7 @@ mod tests {
                 let mut arena = Arena::try_new(Default::default())?;
                 let bob_jid = Jid::parse_in("bob@localhost/desk", &mut arena)?.resolve(&arena)?;
                 let bob = AccountKey::try_from(bob_jid.bare())?;
-                let mut source = Shard::<GlobalChunkAllocator>::new();
+                let mut source = Shard::with_directed_presence_limit(NonZeroUsize::MIN);
                 let mut destination = Shard::<GlobalChunkAllocator>::new();
                 let (commands, inbox) = async_channel::bounded(1);
                 let router = test_router(commands);
@@ -3328,7 +3615,7 @@ mod tests {
                     let mut arena = Arena::try_new(Default::default())?;
                     let bob_jid = Jid::parse_in("bob@localhost/desk", &mut arena)?.resolve(&arena)?;
                     let bob = AccountKey::try_from(bob_jid.bare())?;
-                    let mut source = Shard::<GlobalChunkAllocator>::new();
+                    let mut source = Shard::with_directed_presence_limit(NonZeroUsize::MIN);
                     let mut destination = Shard::<GlobalChunkAllocator>::new();
                     let (commands, inbox) = async_channel::bounded(1);
                     let router = test_router(commands);

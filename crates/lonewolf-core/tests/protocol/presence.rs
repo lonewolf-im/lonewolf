@@ -531,3 +531,54 @@ fn a_probe_behind_a_committed_revocation_reads_the_new_authorization() -> TestRe
     slow.close()?;
     requester.close()
 }
+
+#[test]
+fn directed_presence_quota_rejects_without_delivery_or_visibility_and_recovers() -> TestResult {
+    let suite = C2sSuite::with_extensions_limits_and_setup("'roster'", "", |directory| {
+        let path = directory.join("lonewolf.toml");
+        let config = std::fs::read_to_string(&path)?;
+        std::fs::write(
+            path,
+            config.replace(
+                "[limits.c2s]\n",
+                "[limits.c2s]\nmax_directed_presence_recipients_per_resource = 2\n",
+            ),
+        )?;
+        Ok(())
+    })?;
+    for user in ["alice", "bob", "carol"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut phone = suite.connect("alice", "password", "phone")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+
+    alice.send("<presence to='unknown@localhost/desk'/>")?;
+    alice.send("<presence to='bob@localhost/desk' id='first'/>")?;
+    assert_eq!(bob.receive()?.attribute("id"), Some("first"));
+    alice.send("<presence to='bob@localhost/desk' id='updated'><show>chat</show></presence>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' id='updated'><show>chat</show></presence>")?;
+    alice.send("<presence to='carol@localhost/desk' id='rejected' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/></presence>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='carol@localhost/desk' to='alice@localhost/desk' type='error' id='rejected' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    sentinel(&mut alice, &mut carol, "carol@localhost/desk")?;
+    carol.send("<presence to='alice@localhost/desk' type='probe' id='denied'/>")?;
+    carol.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='carol@localhost/desk' type='unsubscribed' id='denied'/>")?;
+
+    phone.send("<presence to='carol@localhost/desk' id='independent'/>")?;
+    assert_eq!(carol.receive()?.attribute("id"), Some("independent"));
+    phone.send("<presence to='carol@localhost/desk' type='unavailable'/>")?;
+    assert_eq!(carol.receive()?.attribute("type"), Some("unavailable"));
+    alice.send("<presence to='unknown@localhost/desk' type='unavailable'/>")?;
+    alice.send("<presence to='carol@localhost/desk' id='admitted'/>")?;
+    assert_eq!(carol.receive()?.attribute("id"), Some("admitted"));
+    carol.send("<presence to='alice@localhost/desk' type='probe' id='granted'/>")?;
+    carol.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='carol@localhost/desk' id='granted'/>")?;
+    alice.send("<presence to='bob@localhost/desk' type='unavailable'/>")?;
+    assert_eq!(bob.receive()?.attribute("type"), Some("unavailable"));
+    alice.close()?;
+    assert_eq!(carol.receive()?.attribute("type"), Some("unavailable"));
+    phone.close()?;
+    bob.close()?;
+    carol.close()
+}

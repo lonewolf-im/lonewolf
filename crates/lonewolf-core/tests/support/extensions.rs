@@ -95,6 +95,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(ServerIq))?;
     extensions.register(Arc::new(ErrorIq))?;
     extensions.register(Arc::new(FailureIq))?;
+    extensions.register(Arc::new(RouterFailureIq))?;
     extensions.register(Arc::new(PrecommitIq {
         release: async_lock::Semaphore::new(0),
     }))?;
@@ -846,3 +847,60 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for FailureIq {
 }
 impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for FailureIq {}
 impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for FailureIq {}
+
+struct RouterFailureIq;
+
+const ROUTER_FAILURE_SET: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: "urn:lonewolf:test:router-failure",
+    name: "crash",
+};
+const CONNECTION_FAILURE_SET: IqRoute = IqRoute {
+    name: "connection",
+    ..ROUTER_FAILURE_SET
+};
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for RouterFailureIq {
+    fn name(&self) -> &'static str {
+        "test-router-failure"
+    }
+
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[ROUTER_FAILURE_SET, CONNECTION_FAILURE_SET]
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn HostLookup,
+        _: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            if request.payload.name() == CONNECTION_FAILURE_SET.name {
+                panic!("seeded-sensitive-connection-payload");
+            }
+            let account = AccountKey::try_from(request.target.bare())
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            let effects = Effects::new(vec![account.clone()], move |delivery| {
+                Box::pin(async move {
+                    delivery
+                        .push_to_tagged(
+                            &account,
+                            SessionTag::Interested,
+                            Box::new(|_, _| panic!("seeded-sensitive-router-payload")),
+                        )
+                        .await?;
+                    Ok(())
+                })
+            });
+            Ok(IqReply::new(None, effects))
+        })
+    }
+}
+
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for RouterFailureIq {}
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for RouterFailureIq {}

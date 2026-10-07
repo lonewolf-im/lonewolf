@@ -467,3 +467,68 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
     }
     Ok(())
 }
+
+#[test]
+fn shared_router_panic_stops_serving_and_reports_one_private_failure() -> TestResult {
+    let mut suite = C2sSuite::with_extensions("'roster', 'test-router-failure'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    alice.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+    alice.receive()?;
+    alice
+        .send("<iq type='set' id='crash'><crash xmlns='urn:lonewolf:test:router-failure'/></iq>")?;
+    alice.expect_stream_error("internal-server-error")?;
+    bob.expect_stream_error("internal-server-error")?;
+    let logs = suite.wait_for_failure()?;
+    assert_eq!(
+        logs.lines()
+            .filter(|line| line.contains("router service failed"))
+            .count(),
+        1,
+        "{logs}"
+    );
+    let failure = logs
+        .lines()
+        .find(|line| line.contains("router service failed"))
+        .ok_or("missing failure event")?;
+    assert!(
+        failure.contains("component=\"router\"")
+            && failure.contains("shard_id=")
+            && failure.contains("reason=\"panicked\""),
+        "{failure}"
+    );
+    assert!(
+        logs.contains("router shard") && logs.contains("panicked"),
+        "{logs}"
+    );
+    assert!(!logs.contains("seeded-sensitive-router-payload"), "{logs}");
+    assert!(std::net::TcpStream::connect(suite.address).is_err());
+    Ok(())
+}
+
+#[test]
+fn ordinary_connection_panic_leaves_router_and_other_connections_serving() -> TestResult {
+    let mut suite = C2sSuite::with_extensions("'test-router-failure'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    alice.send(
+        "<iq type='set' id='crash'><connection xmlns='urn:lonewolf:test:router-failure'/></iq>",
+    )?;
+    alice.drain()?;
+    bob.send("<message to='bob@localhost/phone' type='chat' id='still-serving'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' type='chat' id='still-serving'/>")?;
+    let mut replacement = suite.connect("alice", "password", "desk")?;
+    replacement.close()?;
+    bob.close()?;
+    let logs = suite.wait_for_log("connection task panicked")?;
+    assert!(!logs.contains("router service failed"), "{logs}");
+    assert!(
+        !logs.contains("seeded-sensitive-connection-payload"),
+        "{logs}"
+    );
+    suite.stop()
+}

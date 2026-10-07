@@ -268,6 +268,21 @@ max_resources_per_account = {resources}
         Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
     }
 
+    pub fn wait_for_failure(&mut self) -> TestResult<String> {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
+                assert_eq!(status.code(), Some(101), "status={status} logs={logs}");
+                return Ok(logs);
+            }
+            if Instant::now() >= deadline {
+                return Err("server did not exit after failure".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     pub fn stop(&mut self) -> TestResult {
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(self.child.id().try_into()?),

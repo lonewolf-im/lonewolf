@@ -3,6 +3,159 @@
 use crate::support::{C2sSuite, TestResult};
 
 #[test]
+fn precommit_handler_wait_keeps_healthy_outbound_delivery_progressing() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-precommit-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    alice.send("<iq type='set' id='stalled'><stall xmlns='urn:lonewolf:test:precommit'/></iq>")?;
+    suite.wait_for_log("test precommit handler waiting")?;
+
+    for index in 0..96 {
+        bob.send(&format!(
+            "<message to='alice@localhost/desk' type='chat' id='delivery-{index}'/>"
+        ))?;
+        alice.expect_xml(&format!("<message xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost/desk' type='chat' id='delivery-{index}'/>"))?;
+    }
+    alice.send("<message to='bob@localhost/phone' type='chat' id='after-handler'/>")?;
+    bob.send("<iq type='get' to='localhost' id='release'><release xmlns='urn:lonewolf:test:precommit'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='result' id='release' from='localhost' to='bob@localhost/phone'/>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='stalled' to='alice@localhost/desk'/>",
+    )?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' type='chat' id='after-handler'/>")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn precommit_writer_admission_keeps_healthy_outbound_delivery_progressing() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-precommit-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    suite.create_account("charlie", "password")?;
+    let mut blocker = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    let mut sender = suite.connect("charlie", "password", "desk")?;
+    blocker.send(
+        "<iq type='set' id='holding-writer'><stall xmlns='urn:lonewolf:test:precommit'/></iq>",
+    )?;
+    suite.wait_for_log("test precommit handler waiting")?;
+    bob.send(
+        "<iq type='set' id='waiting-writer'><write xmlns='urn:lonewolf:test:precommit'/></iq>",
+    )?;
+
+    for index in 0..96 {
+        sender.send(&format!(
+            "<message to='bob@localhost/phone' type='chat' id='delivery-{index}'/>"
+        ))?;
+        bob.expect_xml(&format!("<message xmlns='jabber:client' from='charlie@localhost/desk' to='bob@localhost/phone' type='chat' id='delivery-{index}'/>"))?;
+    }
+    sender.send("<iq type='get' to='localhost' id='release'><release xmlns='urn:lonewolf:test:precommit'/></iq>")?;
+    sender.expect_xml("<iq xmlns='jabber:client' type='result' id='release' from='localhost' to='charlie@localhost/desk'/>")?;
+    blocker.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='holding-writer' to='alice@localhost/desk'/>",
+    )?;
+    bob.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='waiting-writer' to='bob@localhost/phone'/>",
+    )?;
+    blocker.close()?;
+    bob.close()?;
+    sender.close()
+}
+
+#[test]
+fn precommit_offline_store_keeps_healthy_outbound_delivery_progressing() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-slow-offline'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    alice.send("<message to='bob@localhost' type='chat' id='stored'/>")?;
+    suite.wait_for_log("test offline store waiting")?;
+    for index in 0..96 {
+        bob.send(&format!(
+            "<message to='alice@localhost/desk' type='chat' id='delivery-{index}'/>"
+        ))?;
+        alice.expect_xml(&format!("<message xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost/desk' type='chat' id='delivery-{index}'/>"))?;
+    }
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='stored'/>")?;
+    alice.send("<message to='alice@localhost/desk' type='chat' id='after-store'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' type='chat' id='after-store'/>")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn precommit_snapshot_preparation_keeps_delivery_ahead_of_the_presence_echo() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-precommit-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "phone")?;
+    alice.send("<presence id='initial'/>")?;
+    for (phase, waiting) in [
+        ("audience", "test precommit audience waiting"),
+        ("backlog", "test precommit backlog waiting"),
+    ] {
+        suite.wait_for_log(waiting)?;
+        for index in 0..96 {
+            bob.send(&format!(
+                "<message to='alice@localhost/desk' type='chat' id='{phase}-{index}'/>"
+            ))?;
+            alice.expect_xml(&format!("<message xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost/desk' type='chat' id='{phase}-{index}'/>"))?;
+        }
+        bob.send(&format!("<iq type='get' to='localhost' id='{phase}'><release xmlns='urn:lonewolf:test:precommit'/></iq>"))?;
+        bob.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='{phase}' from='localhost' to='bob@localhost/phone'/>"))?;
+    }
+    alice.expect_xml("<presence xmlns='jabber:client' id='initial' from='alice@localhost/desk' to='alice@localhost'/>")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn shutdown_cancels_precommit_handler_without_committing_staged_writes() -> TestResult {
+    use compio::runtime::Runtime;
+    use lonewolf_storage::account::AccountKey;
+    use lonewolf_storage::offline::OfflineReads;
+    use lonewolf_storage::{RedbStorage, Storage};
+    use lonewolf_util::arena::{Arena, ArenaConfig};
+    use lonewolf_xmpp::jid::Jid;
+
+    let mut database = std::path::PathBuf::new();
+    let mut suite = C2sSuite::with_extensions_and_setup("'test-precommit-iq'", |directory| {
+        database = directory.join("data/lonewolf.dat");
+        Ok(())
+    })?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice
+        .send("<iq type='set' id='cancelled'><stall xmlns='urn:lonewolf:test:precommit'/></iq>")?;
+    suite.wait_for_log("test precommit handler waiting")?;
+    suite.stop()?;
+    let logs = suite.wait_for_log("test precommit handler cancelled")?;
+    assert!(!logs.contains("test precommit handler completed"), "{logs}");
+    assert!(!logs.contains("test precommit effects delivered"), "{logs}");
+
+    let storage = RedbStorage::open(database)?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let account =
+        AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+    Runtime::new()?.block_on(async {
+        assert_eq!(
+            storage.begin_read().await?.offline_count(&account).await?,
+            0
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn unknown_extensions_prevent_server_startup() -> TestResult {
     let error = C2sSuite::with_extensions("'missing-extension'")
         .err()

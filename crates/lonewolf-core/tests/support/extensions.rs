@@ -95,6 +95,9 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(ServerIq))?;
     extensions.register(Arc::new(ErrorIq))?;
     extensions.register(Arc::new(FailureIq))?;
+    extensions.register(Arc::new(PrecommitIq {
+        release: async_lock::Semaphore::new(0),
+    }))?;
     extensions.register(Arc::new(TestPresence))?;
     extensions.register(Arc::new(ConflictingPresence))?;
     extensions.register(Arc::new(OfflineInspect))?;
@@ -138,6 +141,132 @@ struct SlowOffline {
     block_ack: bool,
     acknowledge: async_lock::Semaphore,
     fail_ack: AtomicBool,
+}
+
+const PRECOMMIT_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: "urn:lonewolf:test:precommit",
+    name: "stall",
+};
+
+struct PrecommitIq {
+    release: async_lock::Semaphore,
+}
+
+struct PrecommitCancellation(bool);
+
+impl Drop for PrecommitCancellation {
+    fn drop(&mut self) {
+        if !self.0 {
+            tracing::info!("test precommit handler cancelled");
+        }
+    }
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for PrecommitIq {
+    fn name(&self) -> &'static str {
+        "test-precommit-iq"
+    }
+
+    fn iq_routes(&self) -> &'static [IqRoute] {
+        &[
+            PRECOMMIT_ROUTE,
+            IqRoute {
+                name: "write",
+                ..PRECOMMIT_ROUTE
+            },
+            IqRoute {
+                scope: IqScope::Server,
+                kind: IqRequestType::Get,
+                name: "release",
+                ..PRECOMMIT_ROUTE
+            },
+        ]
+    }
+
+    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
+        &[PresenceRequestType::Available]
+    }
+
+    fn stores_messages(&self) -> bool {
+        true
+    }
+}
+
+impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for PrecommitIq {
+    fn audience<'a>(
+        &'a self,
+        _update: PresenceUpdate<'a>,
+        _transaction: &'a RedbRead,
+    ) -> PresenceFuture<'a, Option<PresenceAudience>> {
+        Box::pin(async move {
+            tracing::info!("test precommit audience waiting");
+            self.release.acquire().await.forget();
+            Ok(None)
+        })
+    }
+}
+
+impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for PrecommitIq {
+    fn backlog<'a>(
+        &'a self,
+        _account: &'a AccountKey,
+        _transaction: &'a RedbRead,
+    ) -> PresenceFuture<'a, Option<lonewolf_extension::message::Backlog>> {
+        Box::pin(async move {
+            tracing::info!("test precommit backlog waiting");
+            self.release.acquire().await.forget();
+            Ok(None)
+        })
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for PrecommitIq {
+    fn get<'a>(
+        &'a self,
+        _request: IqRequest<'a, A>,
+        _transaction: &'a RedbRead,
+        _response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            self.release.add_permits(1);
+            Ok(IqReply::new(None, Effects::none()))
+        })
+    }
+
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        transaction: &'a mut RedbWrite,
+        _hosts: &'a dyn HostLookup,
+        _response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let account = AccountKey::try_from(request.target.bare())
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            transaction
+                .push_offline_message(&account, 0, b"<message xmlns='jabber:client'/>")
+                .await
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            if request.payload.name() == "stall" {
+                let mut cancellation = PrecommitCancellation(false);
+                tracing::info!(account_jid = ?account.as_str(), "test precommit handler waiting");
+                self.release.acquire().await.forget();
+                cancellation.0 = true;
+            }
+            tracing::info!(account_jid = ?account.as_str(), "test precommit handler completed");
+            Ok(IqReply::new(
+                None,
+                Effects::new(vec![account], |_| {
+                    Box::pin(async {
+                        tracing::info!("test precommit effects delivered");
+                        Ok(())
+                    })
+                }),
+            ))
+        })
+    }
 }
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for OfflineInspect {

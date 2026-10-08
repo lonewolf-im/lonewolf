@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
@@ -215,11 +215,107 @@ fn run_case_with_timeouts(
     }))?
 }
 
+async fn phase_socket_pair() -> io::Result<(TcpStream, StdTcpStream)> {
+    let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let peer = StdTcpStream::connect(listener.local_addr()?)?;
+    peer.set_read_timeout(Some(TIMEOUT))?;
+    let (socket, _) = listener.accept().await?;
+    listener.close().await?;
+    Ok((socket, peer))
+}
+
 #[test]
-fn elapsed_and_overflowed_phase_deadlines_have_no_remaining_time() {
-    let now = Instant::now();
-    assert_eq!(phase_remaining(now, Duration::ZERO), Duration::ZERO);
-    assert_eq!(phase_remaining(now, Duration::MAX), Duration::ZERO);
+fn elapsed_and_overflowed_phase_deadlines_close_without_polling() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        for outcome in [
+            CloseOutcome::EstablishmentTimeout,
+            CloseOutcome::AuthenticationTimeout,
+            CloseOutcome::BindingTimeout,
+        ] {
+            for deadline in [
+                Some(Instant::now()),
+                Instant::now().checked_add(Duration::MAX),
+            ] {
+                let (socket, mut peer) = phase_socket_pair().await?;
+                let polled = Cell::new(false);
+                let result = run_phase(&socket, deadline, outcome, async {
+                    polled.set(true);
+                    Ok(())
+                })
+                .await;
+                assert_eq!(result, Err(outcome));
+                assert!(!polled.get());
+                assert_eq!(peer.read(&mut [0; 1])?, 0);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn phase_work_ready_after_expiry_is_not_polled_again() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        for outcome in [
+            CloseOutcome::EstablishmentTimeout,
+            CloseOutcome::AuthenticationTimeout,
+            CloseOutcome::BindingTimeout,
+        ] {
+            let (socket, mut peer) = phase_socket_pair().await?;
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let ready = Cell::new(false);
+            let polls = Cell::new(0);
+            let mut phase = std::pin::pin!(run_phase(
+                &socket,
+                Some(deadline),
+                outcome,
+                std::future::poll_fn(|_| {
+                    polls.set(polls.get() + 1);
+                    if ready.get() {
+                        std::task::Poll::Ready(Ok(()))
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+            ));
+            assert!(futures_util::poll!(phase.as_mut()).is_pending());
+            assert_eq!(polls.get(), 1);
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            ready.set(true);
+            assert_eq!(phase.await, Err(outcome));
+            assert_eq!(polls.get(), 1);
+            assert_eq!(peer.read(&mut [0; 1])?, 0);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn timely_phase_results_keep_the_socket_open() -> io::Result<()> {
+    use compio::io::AsyncReadExt as _;
+
+    Runtime::new()?.block_on(async {
+        for result in [Ok(42), Err(CloseOutcome::TransportError)] {
+            let (mut socket, mut peer) = phase_socket_pair().await?;
+            let deadline = Instant::now() + TIMEOUT;
+            assert_eq!(
+                run_phase(
+                    &socket,
+                    Some(deadline),
+                    CloseOutcome::BindingTimeout,
+                    std::future::ready(result)
+                )
+                .await,
+                result
+            );
+            peer.write_all(&[42])?;
+            let compio::BufResult(received, byte) = socket.read_exact([0; 1]).await;
+            received?;
+            assert_eq!(byte, [42]);
+        }
+        Ok(())
+    })
 }
 
 fn read_through(stream: &mut impl Read, marker: &[u8]) -> std::io::Result<Vec<u8>> {

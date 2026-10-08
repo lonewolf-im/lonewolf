@@ -15,12 +15,12 @@ use std::future::Future;
 use std::net::Shutdown;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
-use compio::time::timeout;
 use futures_util::FutureExt;
 use lonewolf_util::arena::ChunkAllocator;
 use socket2::SockRef;
@@ -247,7 +247,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         let phases = async {
             let mut established = run_phase(
                 &close_control,
-                phase_remaining(accepted_at, settings.establishment_timeout),
+                context.phase_deadline,
                 CloseOutcome::EstablishmentTimeout,
                 establish(transport, &hosts, &settings, context.clone()),
             )
@@ -260,7 +260,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             established.session.close = context.clone();
             let authenticated = run_phase(
                 &close_control,
-                phase_remaining(established.auth_started_at, settings.authentication_timeout),
+                context.phase_deadline,
                 CloseOutcome::AuthenticationTimeout,
                 context.interrupt(authenticate(
                     &mut established,
@@ -286,7 +286,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             established.session.close = context.clone();
             let mut bound = run_phase(
                 &close_control,
-                phase_remaining(binding_started_at, settings.binding_timeout),
+                context.phase_deadline,
                 CloseOutcome::BindingTimeout,
                 bind_resource(
                     established,
@@ -327,22 +327,15 @@ async fn finish_phases(
     }
 }
 
-fn phase_remaining(started_at: Instant, duration: Duration) -> Duration {
-    started_at
-        .checked_add(duration)
-        .map_or(Duration::ZERO, |deadline| {
-            deadline.saturating_duration_since(Instant::now())
-        })
-}
-
 /// Shuts the socket down on timeout so a phase blocked on I/O observes the end.
 async fn run_phase<T>(
     close_control: &TcpStream,
-    remaining: Duration,
+    deadline: Option<Instant>,
     timeout_outcome: CloseOutcome,
     phase: impl Future<Output = Result<T, CloseOutcome>>,
 ) -> Result<T, CloseOutcome> {
-    match timeout(remaining, phase).await {
+    let mut phase = pin!(phase);
+    match close::before_deadline(deadline.unwrap_or_else(Instant::now), phase.as_mut()).await {
         Ok(result) => result,
         Err(_) => {
             let _ = SockRef::from(close_control).shutdown(Shutdown::Both);

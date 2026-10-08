@@ -189,7 +189,7 @@ where
     completed(result, outcome)
 }
 
-async fn before_deadline<T>(
+pub(super) async fn before_deadline<T>(
     deadline: Instant,
     mut future: std::pin::Pin<&mut impl Future<Output = T>>,
 ) -> Result<T, ()> {

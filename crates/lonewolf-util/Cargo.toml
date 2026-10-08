@@ -23,6 +23,7 @@ nix = { workspace = true, features = ["sched"] }
 [dev-dependencies]
 compio = { workspace = true, features = ["net"] }
 futures-executor.workspace = true
+parking_lot.workspace = true
 
 [[bench]]
 name = "pool"

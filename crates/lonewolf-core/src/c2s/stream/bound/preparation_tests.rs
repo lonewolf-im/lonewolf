@@ -2,7 +2,6 @@
 
 use std::error::Error;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use lonewolf_extension::presence::{PresenceFuture, PresenceHandler};
 use lonewolf_extension::{Effects, Extension, Extensions};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_util::arena::GlobalChunkAllocator;
+use parking_lot::Mutex as PlMutex;
 
 use super::tests::{ControlledWriter, Fixture, routed_presence};
 use super::*;
@@ -38,11 +38,11 @@ enum Workflow {
 }
 
 struct Gate {
-    entered: Mutex<Option<oneshot::Sender<()>>>,
-    release: Mutex<Option<oneshot::Receiver<()>>>,
+    entered: PlMutex<Option<oneshot::Sender<()>>>,
+    release: PlMutex<Option<oneshot::Receiver<()>>>,
     completed: AtomicBool,
     outcome: Outcome,
-    acknowledged: Mutex<Option<oneshot::Sender<()>>>,
+    acknowledged: PlMutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Gate {
@@ -51,11 +51,11 @@ impl Gate {
         let (release, blocked) = oneshot::channel();
         (
             Arc::new(Self {
-                entered: Mutex::new(Some(notice)),
-                release: Mutex::new(Some(blocked)),
+                entered: PlMutex::new(Some(notice)),
+                release: PlMutex::new(Some(blocked)),
                 completed: AtomicBool::new(false),
                 outcome,
-                acknowledged: Mutex::new(None),
+                acknowledged: PlMutex::new(None),
             }),
             entered,
             release,
@@ -63,16 +63,8 @@ impl Gate {
     }
 
     async fn wait(&self) {
-        let entered = self
-            .entered
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let release = self
-            .release
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let entered = self.entered.lock().take();
+        let release = self.release.lock().take();
         if let Some(entered) = entered {
             let _ = entered.send(());
         }
@@ -206,12 +198,7 @@ impl MessageHandler<GlobalChunkAllocator, RedbStorage> for Gate {
                 transaction,
             )
             .await?;
-            if let Some(notice) = self
-                .acknowledged
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
+            if let Some(notice) = self.acknowledged.lock().take() {
                 let _ = notice.send(());
             }
             Ok(())
@@ -406,7 +393,7 @@ fn availability_handoff_releases_ticket_before_blocked_output_and_preserves_repl
         .await?;
         let (gate, entered, release) = Gate::new(Outcome::Commit);
         let (acknowledged, acknowledgement) = oneshot::channel();
-        *gate.acknowledged.lock().unwrap_or_else(|e| e.into_inner()) = Some(acknowledged);
+        *gate.acknowledged.lock() = Some(acknowledged);
         let fixture = enable(fixture, &gate)?;
         let (mut session, output_entered, output_release) = session(&fixture, true).await?;
         let request = parsed("<presence id='echo'/>").await?;

@@ -6,27 +6,24 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use parking_lot::{Condvar as PlCondvar, Mutex as PlMutex};
 use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
 use super::{Client, PlainClient, TIMEOUT, TestResult, tls};
 
-static ACTIVE_SERVERS: Mutex<usize> = Mutex::new(0);
-static SERVER_SLOT: Condvar = Condvar::new();
+static ACTIVE_SERVERS: PlMutex<usize> = PlMutex::new(0);
+static SERVER_SLOT: PlCondvar = PlCondvar::new();
 
 struct C2sSuitePermit;
 
 impl C2sSuitePermit {
     fn acquire() -> Self {
-        let active = ACTIVE_SERVERS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut active = SERVER_SLOT
-            .wait_while(active, |count| *count >= 4)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = ACTIVE_SERVERS.lock();
+        SERVER_SLOT.wait_while(&mut active, |count| *count >= 4);
         *active += 1;
         Self
     }
@@ -34,9 +31,7 @@ impl C2sSuitePermit {
 
 impl Drop for C2sSuitePermit {
     fn drop(&mut self) {
-        let mut active = ACTIVE_SERVERS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = ACTIVE_SERVERS.lock();
         *active -= 1;
         SERVER_SLOT.notify_one();
     }

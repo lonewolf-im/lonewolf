@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
@@ -13,6 +13,7 @@ use lonewolf_storage::offline::*;
 use lonewolf_storage::roster::*;
 use lonewolf_storage::{ReadTransaction, StorageError, StorageErrorKind, WriteTransaction};
 use lonewolf_util::arena::GlobalChunkAllocator;
+use parking_lot::Mutex as PlMutex;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
@@ -35,7 +36,7 @@ pub(crate) fn seeded_error(kind: StorageErrorKind) -> StorageError {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct Capture(Arc<Mutex<Vec<BTreeMap<&'static str, String>>>>);
+pub(crate) struct Capture(Arc<PlMutex<Vec<BTreeMap<&'static str, String>>>>);
 
 struct Fields(BTreeMap<&'static str, String>);
 impl Visit for Fields {
@@ -59,10 +60,7 @@ impl Subscriber for Capture {
     fn event(&self, event: &Event<'_>) {
         let mut fields = Fields(BTreeMap::new());
         event.record(&mut fields);
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(fields.0);
+        self.0.lock().push(fields.0);
     }
     fn enter(&self, _: &Id) {}
     fn exit(&self, _: &Id) {}
@@ -70,10 +68,7 @@ impl Subscriber for Capture {
 
 impl Capture {
     pub(crate) fn assert_one(&self, kind: FailureKind, operation: &str) {
-        let events = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let events = self.0.lock();
         let matching: Vec<_> = events
             .iter()
             .filter(|fields| {

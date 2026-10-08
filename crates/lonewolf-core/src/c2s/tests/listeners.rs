@@ -6,7 +6,6 @@ use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
-use std::sync::Mutex;
 use std::thread;
 
 use compio::io::AsyncRead;
@@ -15,6 +14,7 @@ use compio::time::timeout;
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
+use parking_lot::Mutex as PlMutex;
 use tracing::instrument::WithSubscriber;
 
 use super::*;
@@ -59,17 +59,14 @@ fn auth() -> Result<(Arc<AuthService>, tempfile::TempDir), Box<dyn Error>> {
 
 #[derive(Clone)]
 struct RejectionLog {
-    bytes: Arc<Mutex<Vec<u8>>>,
+    bytes: Arc<PlMutex<Vec<u8>>>,
     unauthenticated: Arc<UnauthenticatedLimiter>,
 }
 
 impl Write for RejectionLog {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         assert_eq!(self.unauthenticated.active_count(), 1);
-        self.bytes
-            .lock()
-            .map_err(|_| io::Error::other("log poisoned"))?
-            .extend_from_slice(bytes);
+        self.bytes.lock().extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -84,7 +81,7 @@ async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, B
     let router = router(&hosts).await?;
     let (auth, _directory) = auth()?;
     let log = RejectionLog {
-        bytes: Arc::new(Mutex::new(Vec::new())),
+        bytes: Arc::new(PlMutex::new(Vec::new())),
         unauthenticated: Arc::clone(&admission.unauthenticated),
     };
     let output = Arc::clone(&log.bytes);
@@ -154,11 +151,7 @@ async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, B
     task.await??;
     dispatcher.shutdown(TIMEOUT).await?;
     router.shutdown().await?;
-    let bytes = std::mem::take(
-        &mut *output
-            .lock()
-            .map_err(|_| io::Error::other("log poisoned"))?,
-    );
+    let bytes = std::mem::take(&mut *output.lock());
     Ok(String::from_utf8(bytes)?)
 }
 

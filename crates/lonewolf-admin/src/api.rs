@@ -538,7 +538,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ops::Bound;
     use std::pin::{Pin, pin};
-    use std::sync::PoisonError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
@@ -552,6 +551,7 @@ mod tests {
         OfflineError, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage,
     };
     use lonewolf_storage::roster::{self, RosterReads, RosterWrites};
+    use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
     use serde_json::{Value, json};
 
     use super::*;
@@ -567,7 +567,7 @@ mod tests {
     }
 
     struct MemoryInner {
-        state: std::sync::Mutex<MemoryState>,
+        state: PlMutex<MemoryState>,
         writer: Arc<Mutex<()>>,
         decoy: ScramDecoy,
     }
@@ -589,7 +589,7 @@ mod tests {
         fn new(keys: impl IntoIterator<Item = AccountKey>) -> Self {
             Self {
                 inner: Arc::new(MemoryInner {
-                    state: std::sync::Mutex::new(MemoryState {
+                    state: PlMutex::new(MemoryState {
                         accounts: keys.into_iter().collect(),
                         ..MemoryState::default()
                     }),
@@ -599,11 +599,8 @@ mod tests {
             }
         }
 
-        fn state(&self) -> std::sync::MutexGuard<'_, MemoryState> {
-            self.inner
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+        fn state(&self) -> PlMutexGuard<'_, MemoryState> {
+            self.inner.state.lock()
         }
 
         fn fail_listing(&self, kind: StorageErrorKind) {
@@ -833,8 +830,8 @@ mod tests {
 
     struct GatedDeleter {
         storage: MemoryStorage,
-        started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
-        release: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        started: PlMutex<Option<oneshot::Sender<()>>>,
+        release: PlMutex<Option<oneshot::Receiver<()>>>,
         failures: AtomicUsize,
         failure_kind: Option<StorageErrorKind>,
         calls: AtomicUsize,
@@ -850,8 +847,8 @@ mod tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 storage,
-                started: std::sync::Mutex::new(started),
-                release: std::sync::Mutex::new(release),
+                started: PlMutex::new(started),
+                release: PlMutex::new(release),
                 failures: AtomicUsize::new(failures),
                 failure_kind,
                 calls: AtomicUsize::new(0),
@@ -893,16 +890,8 @@ mod tests {
             account: &'a AccountKey,
         ) -> Pin<Box<dyn Future<Output = Result<bool, DeleterError>> + Send + 'a>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let started = self
-                .started
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            let release = self
-                .release
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
+            let started = self.started.lock().take();
+            let release = self.release.lock().take();
             let fails = self
                 .failures
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {

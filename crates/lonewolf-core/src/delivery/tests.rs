@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::error::Error;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
@@ -26,6 +26,7 @@ use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
+use parking_lot::Mutex as PlMutex;
 
 use super::{EffectsDiagnostics, StoredDelivery, WorkGroup, commit_and_deliver, commit_and_store};
 use crate::config::Config;
@@ -37,8 +38,8 @@ use crate::router::{Router, RouterError};
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 struct AckNotice {
-    done: Mutex<Option<oneshot::Sender<()>>>,
-    release: Mutex<Option<oneshot::Receiver<()>>>,
+    done: PlMutex<Option<oneshot::Sender<()>>>,
+    release: PlMutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl MessageHandler<GlobalChunkAllocator, RedbStorage> for AckNotice {
@@ -49,19 +50,10 @@ impl MessageHandler<GlobalChunkAllocator, RedbStorage> for AckNotice {
         transaction: &'a mut RedbWrite,
     ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
         Box::pin(async move {
-            if let Some(done) = self
-                .done
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-            {
+            if let Some(done) = self.done.lock().take() {
                 let _ = done.send(());
             }
-            let release = self
-                .release
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            let release = self.release.lock().take();
             if let Some(release) = release {
                 release
                     .await
@@ -141,8 +133,8 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
             .await?;
         let (done, acknowledged) = oneshot::channel();
         let handler = Arc::new(AckNotice {
-            done: Mutex::new(Some(done)),
-            release: Mutex::new(None),
+            done: PlMutex::new(Some(done)),
+            release: PlMutex::new(None),
         });
         let pending = commit_and_store(
             WorkGroup::new().start(),
@@ -226,8 +218,8 @@ fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgemen
             storage.clone(),
             transaction,
             Arc::new(AckNotice {
-                done: Mutex::new(Some(done)),
-                release: Mutex::new(Some(released)),
+                done: PlMutex::new(Some(done)),
+                release: PlMutex::new(Some(released)),
             }),
             StoredDelivery {
                 recipient: owner.clone(),

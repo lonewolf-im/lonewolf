@@ -3,8 +3,10 @@
 use std::alloc::Layout;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
+
+use parking_lot::Mutex as PlMutex;
 
 use crate::arena::{
     AllocationError, Arena, ArenaConfig, ArenaError, Chunk, ChunkAllocator, ChunkAllocatorHandle,
@@ -583,16 +585,12 @@ fn exclusive_arena_can_continue_building_on_another_thread()
 }
 
 #[derive(Default)]
-struct ReusingAllocator(Mutex<Option<Chunk>>);
+struct ReusingAllocator(PlMutex<Option<Chunk>>);
 
 // A cached block has no remaining users. Its original layout is preserved.
 unsafe impl ChunkAllocator for ReusingAllocator {
     fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
-        let cached = self
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        let cached = self.0.lock().take();
         if let Some(chunk) = cached {
             if chunk.capacity() >= layout.size() && chunk.layout().align() >= layout.align() {
                 return Ok(chunk);
@@ -605,11 +603,7 @@ unsafe impl ChunkAllocator for ReusingAllocator {
     }
 
     unsafe fn deallocate(&self, chunk: Chunk) {
-        let previous = self
-            .0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .replace(chunk);
+        let previous = self.0.lock().replace(chunk);
         if let Some(chunk) = previous {
             unsafe { GlobalChunkAllocator.deallocate(chunk) };
         }
@@ -618,12 +612,7 @@ unsafe impl ChunkAllocator for ReusingAllocator {
 
 impl Drop for ReusingAllocator {
     fn drop(&mut self) {
-        if let Some(chunk) = self
-            .0
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
+        if let Some(chunk) = self.0.get_mut().take() {
             unsafe { GlobalChunkAllocator.deallocate(chunk) };
         }
     }

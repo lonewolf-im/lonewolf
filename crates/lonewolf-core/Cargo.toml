@@ -24,6 +24,7 @@ lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
 nix.workspace = true
+parking_lot.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-graviola.workspace = true

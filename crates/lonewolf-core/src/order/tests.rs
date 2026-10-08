@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::future::Future;
 use std::pin::{Pin, pin};
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use compio::runtime::Runtime;
@@ -147,7 +147,7 @@ fn released_tickets_leave_no_lines_behind() -> TestResult {
     let second = admit(&order, &[&alice]);
     drop(first);
     drop(second);
-    let lines = order.lines.lock().unwrap_or_else(PoisonError::into_inner);
+    let lines = order.lines.lock();
     assert!(lines.queues.is_empty());
     assert!(lines.waiting.is_empty());
     Ok(())
@@ -160,7 +160,7 @@ fn a_view_that_cannot_be_fixed_takes_no_ticket() -> TestResult {
     let failed = block_on(order.fix(vec![alice.clone()], async { Err::<(), &str>("no view") }))?;
     assert!(matches!(failed, Err("no view")));
     {
-        let lines = order.lines.lock().unwrap_or_else(PoisonError::into_inner);
+        let lines = order.lines.lock();
         assert!(lines.queues.is_empty());
         assert!(lines.waiting.is_empty());
     }

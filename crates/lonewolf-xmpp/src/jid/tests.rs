@@ -5,8 +5,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
+
+use parking_lot::Mutex as PlMutex;
 
 use crate::jid::{Jid, JidError, JidPart, JidRef, MAX_JID_LEN, MAX_PART_LEN};
 use lonewolf_util::arena::{
@@ -719,7 +721,7 @@ fn wrong_arena_and_expired_jids_are_rejected() -> TestResult {
 
 #[derive(Default)]
 struct PoolAllocator {
-    cached: Mutex<Option<Chunk>>,
+    cached: PlMutex<Option<Chunk>>,
     live_chunks: AtomicUsize,
     returned_chunks: AtomicUsize,
     fail: AtomicBool,
@@ -734,11 +736,7 @@ unsafe impl ChunkAllocator for PoolAllocator {
         if self.fail.load(Ordering::Relaxed) {
             return Err(AllocationError::Exhausted);
         }
-        let cached = self
-            .cached
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
+        let cached = self.cached.lock().take();
         let chunk = match cached {
             Some(chunk)
                 if chunk.capacity() >= layout.size()
@@ -762,11 +760,7 @@ unsafe impl ChunkAllocator for PoolAllocator {
     unsafe fn deallocate(&self, chunk: Chunk) {
         self.live_chunks.fetch_sub(1, Ordering::Relaxed);
         self.returned_chunks.fetch_add(1, Ordering::Relaxed);
-        let previous = self
-            .cached
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .replace(chunk);
+        let previous = self.cached.lock().replace(chunk);
         if let Some(chunk) = previous {
             unsafe { GlobalChunkAllocator.deallocate(chunk) };
         }
@@ -776,12 +770,7 @@ unsafe impl ChunkAllocator for PoolAllocator {
 impl Drop for PoolAllocator {
     fn drop(&mut self) {
         assert_eq!(self.live_chunks.load(Ordering::Relaxed), 0);
-        if let Some(chunk) = self
-            .cached
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
+        if let Some(chunk) = self.cached.get_mut().take() {
             unsafe { GlobalChunkAllocator.deallocate(chunk) };
         }
     }

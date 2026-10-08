@@ -2,10 +2,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use futures_channel::oneshot;
 use lonewolf_storage::account::AccountKey;
+use parking_lot::Mutex as PlMutex;
 
 /// Orders deliveries per account by the moment each unit of work fixed its view of
 /// storage, so a client never learns of an older change after a newer one.
@@ -15,7 +16,7 @@ use lonewolf_storage::account::AccountKey;
 /// is at the head of every account's line. A ticket waits only for smaller tickets, so
 /// waiting can never cycle.
 pub(crate) struct Order {
-    lines: Mutex<Lines>,
+    lines: PlMutex<Lines>,
     /// Fixing a view and taking its ticket happen under this lock, so ticket order is
     /// commit order even when the store lets writers commit concurrently.
     fixing: async_lock::Mutex<()>,
@@ -43,7 +44,7 @@ pub(crate) struct Ticket {
 impl Order {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            lines: Mutex::new(Lines::default()),
+            lines: PlMutex::new(Lines::default()),
             fixing: async_lock::Mutex::new(()),
         })
     }
@@ -62,7 +63,7 @@ impl Order {
 
     fn admit(self: &Arc<Self>, accounts: Vec<AccountKey>) -> Ticket {
         let (ready, readiness) = oneshot::channel();
-        let mut lines = self.lines.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut lines = self.lines.lock();
         let id = lines.next;
         lines.next += 1;
         for account in &accounts {
@@ -88,7 +89,7 @@ impl Order {
     }
 
     fn release(&self, id: u64) {
-        let mut lines = self.lines.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut lines = self.lines.lock();
         let Some(waiting) = lines.waiting.remove(&id) else {
             return;
         };

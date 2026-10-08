@@ -3,8 +3,8 @@
 use std::alloc::Layout;
 use std::error::Error;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use compio::runtime::Runtime;
@@ -19,6 +19,7 @@ use lonewolf_storage::account::{AccountWrites, NewAccount};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_util::arena::{AllocationError, Chunk, GlobalChunkAllocator};
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
+use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
 
 use super::*;
 use crate::config::Config;
@@ -99,7 +100,7 @@ impl OutboxWriter for ControlledWriter {
     }
 }
 
-struct AckNotice(Mutex<Option<oneshot::Sender<()>>>);
+struct AckNotice(PlMutex<Option<oneshot::Sender<()>>>);
 
 impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for AckNotice {
     fn acknowledge<'a>(
@@ -116,12 +117,7 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for AckNotice {
                 transaction,
             )
             .await?;
-            if let Some(done) = self
-                .0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-            {
+            if let Some(done) = self.0.lock().take() {
                 let _ = done.send(());
             }
             Ok(())
@@ -136,7 +132,7 @@ async fn flush_and_ack<A: ChunkAllocator + Clone>(
     let (done, acknowledged) = oneshot::channel();
     outbox.push(Output::Offline {
         backlog: fixture.backlog().await?,
-        handler: Arc::new(AckNotice(Mutex::new(Some(done)))),
+        handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
     });
     outbox.flush().await.map_err(|error| format!("{error:?}"))?;
     acknowledged.await?;
@@ -467,7 +463,7 @@ fn repeated_successful_flushes_coalesce_into_one_worker_and_the_highest_watermar
         let fixture = Fixture::new(&messages).await?;
         let writer = fixture.storage.begin_write().await?;
         let (done, acknowledged) = oneshot::channel();
-        let handler = Arc::new(AckNotice(Mutex::new(Some(done))));
+        let handler = Arc::new(AckNotice(PlMutex::new(Some(done))));
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         let mut identity = None;
         for message in fixture.backlog().await?.messages {
@@ -517,7 +513,7 @@ fn dropping_the_outbox_cancels_its_pending_acknowledgement_and_replay_can_retry(
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
-            handler: Arc::new(AckNotice(Mutex::new(Some(done)))),
+            handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         (&mut outbox
@@ -548,7 +544,7 @@ fn writer_waiting_acknowledgement_does_not_stop_a_healthy_resource_from_draining
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
-            handler: Arc::new(AckNotice(Mutex::new(Some(done)))),
+            handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         for _ in 0..80 {
@@ -595,7 +591,7 @@ fn acknowledgement_preserves_a_message_stored_after_the_replay_snapshot() -> Tes
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         outbox.push(Output::Offline {
             backlog,
-            handler: Arc::new(AckNotice(Mutex::new(Some(done)))),
+            handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         writer.commit().await?;
@@ -646,6 +642,40 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ControlledAcknowledge
     }
 }
 
+struct LogWriter(PlMutex<std::fs::File>);
+
+struct LogWriterGuard<'a>(PlMutexGuard<'a, std::fs::File>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogWriterGuard<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriterGuard(self.0.lock())
+    }
+}
+
+impl std::io::Write for LogWriterGuard<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+
+    fn write_vectored(&mut self, buffers: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+        self.0.write_vectored(buffers)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(bytes)
+    }
+
+    fn write_fmt(&mut self, arguments: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        self.0.write_fmt(arguments)
+    }
+}
+
 #[test]
 fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_later_flush()
 -> TestResult {
@@ -653,7 +683,7 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
     let subscriber = tracing_subscriber::fmt()
         .without_time()
         .with_ansi(false)
-        .with_writer(Mutex::new(log.reopen()?))
+        .with_writer(LogWriter(PlMutex::new(log.reopen()?)))
         .finish();
     let _subscriber = tracing::subscriber::set_default(subscriber);
     Runtime::new()?.block_on(async {
@@ -820,22 +850,13 @@ fn late_certificate_revalidation_cannot_retire_a_replacement_resource() -> TestR
         let (entered, started) = std::sync::mpsc::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         let (done, completed) = oneshot::channel();
-        let blocked = Mutex::new(Some(blocked));
-        let entered = Mutex::new(Some(entered));
-        let done = Mutex::new(Some(done));
+        let blocked = PlMutex::new(Some(blocked));
+        let entered = PlMutex::new(Some(entered));
+        let done = PlMutex::new(Some(done));
         let session = monitor.interrupt(std::future::pending::<Result<(), CloseOutcome>>(), |_| {
-            let blocked = blocked
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            let entered = entered
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            let done = done
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            let blocked = blocked.lock().take();
+            let entered = entered.lock().take();
+            let done = done.lock().take();
             let executor = executor.clone();
             async move {
                 executor
@@ -1933,8 +1954,8 @@ fn core_begin_failure_reports_safe_category_once_and_keeps_stream_close_outcome(
 
 struct FailedGet {
     kind: Option<lonewolf_storage::StorageErrorKind>,
-    entered: Mutex<Option<oneshot::Sender<()>>>,
-    release: Mutex<Option<oneshot::Receiver<()>>>,
+    entered: PlMutex<Option<oneshot::Sender<()>>>,
+    release: PlMutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl IqHandler<GlobalChunkAllocator, RedbStorage> for FailedGet {
@@ -1946,19 +1967,10 @@ impl IqHandler<GlobalChunkAllocator, RedbStorage> for FailedGet {
     ) -> lonewolf_extension::iq::IqFuture<'a, GlobalChunkAllocator> {
         use crate::delivery::failure_tests::seeded_error;
         Box::pin(async move {
-            if let Some(entered) = self
-                .entered
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-            {
+            if let Some(entered) = self.entered.lock().take() {
                 let _ = entered.send(());
             }
-            let blocked = self
-                .release
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
+            let blocked = self.release.lock().take();
             if let Some(blocked) = blocked {
                 let _ = blocked.await;
             }
@@ -2004,8 +2016,8 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
             let (release, blocked) = oneshot::channel();
             let handler = Arc::new(FailedGet {
                 kind,
-                entered: Mutex::new(Some(entered)),
-                release: Mutex::new(Some(blocked)),
+                entered: PlMutex::new(Some(entered)),
+                release: PlMutex::new(Some(blocked)),
             });
             let (transaction, ticket) = fixture
                 .router

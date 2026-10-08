@@ -17,4 +17,5 @@ zeroize.workspace = true
 
 [dev-dependencies]
 futures-executor.workspace = true
+parking_lot.workspace = true
 tempfile.workspace = true

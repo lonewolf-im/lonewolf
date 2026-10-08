@@ -9,8 +9,8 @@ use std::io;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use async_channel::{Receiver, Sender, TrySendError, WeakSender};
@@ -23,6 +23,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::{JidError, JidRef};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaRef, StanzaType};
+use parking_lot::Mutex as PlMutex;
 
 use super::{RoutedStanza, RouterError, RouterFailure, RouterState};
 #[cfg(test)]
@@ -86,11 +87,11 @@ fn take_directed(grants: &mut Vec<DirectedRecipient>, token: u64) -> DirectedWit
 }
 
 #[derive(Clone)]
-struct SharedDirectedWithdrawal(Arc<Mutex<Option<DirectedWithdrawal>>>);
+struct SharedDirectedWithdrawal(Arc<PlMutex<Option<DirectedWithdrawal>>>);
 
 impl SharedDirectedWithdrawal {
     fn take(&self) -> Option<DirectedWithdrawal> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+        self.0.lock().take()
     }
 }
 
@@ -111,13 +112,13 @@ pub(super) struct LocalRouterHandle<A: ChunkAllocator> {
 struct Inner<A: ChunkAllocator> {
     slots: Box<[CachePadded<Slot<A>>]>,
     hash_state: RandomState,
-    lifecycle: Mutex<Lifecycle>,
+    lifecycle: PlMutex<Lifecycle>,
     allocator: A,
 }
 
 struct Slot<A: ChunkAllocator> {
     shard: async_lock::Mutex<Shard<A>>,
-    pending: Mutex<Vec<PendingCleanup>>,
+    pending: PlMutex<Vec<PendingCleanup>>,
 }
 
 struct PendingCleanup {
@@ -243,7 +244,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
                     shard: async_lock::Mutex::new(Shard::with_directed_presence_limit(
                         max_directed_presence_recipients_per_resource,
                     )),
-                    pending: Mutex::new(Vec::new()),
+                    pending: PlMutex::new(Vec::new()),
                 })
             })
             .collect();
@@ -252,7 +253,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
                 inner: Arc::new(Inner {
                     slots,
                     hash_state: RandomState::new(),
-                    lifecycle: Mutex::new(Lifecycle {
+                    lifecycle: PlMutex::new(Lifecycle {
                         state: RouterState::Running,
                         failure: None,
                         notify: Some(notify),
@@ -273,12 +274,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
     }
 
     pub(crate) fn stop(&self) {
-        let mut lifecycle = self
-            .handle
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut lifecycle = self.handle.inner.lifecycle.lock();
         if lifecycle.state == RouterState::Running {
             lifecycle.state = RouterState::Stopping;
         }
@@ -304,14 +300,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
         for slot in &self.handle.inner.slots {
             slot.shard.lock().await.terminate();
         }
-        match self
-            .handle
-            .inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .failure
-        {
+        match self.handle.inner.lifecycle.lock().failure {
             Some(failure) => Err(io::Error::other(failure)),
             None => Ok(()),
         }
@@ -583,11 +572,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
 
 impl<A: ChunkAllocator> LocalRouterHandle<A> {
     pub(super) fn state(&self) -> RouterState {
-        self.inner
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .state
+        self.inner.lifecycle.lock().state
     }
 
     /// The operation must borrow, not own, values whose drop can wake a task.
@@ -619,12 +604,7 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
             return Err(RouterError::Stopped);
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let pending = mem::take(
-                &mut *self.inner.slots[index]
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner),
-            );
+            let pending = mem::take(&mut *self.inner.slots[index].pending.lock());
             for cleanup in pending {
                 shard.cleanup(&cleanup.account, &cleanup.resource, cleanup.token);
             }
@@ -643,11 +623,7 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
 
     fn fail(&self, failure: RouterFailure) {
         let notify = {
-            let mut lifecycle = self
-                .inner
-                .lifecycle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut lifecycle = self.inner.lifecycle.lock();
             let failure = *lifecycle.failure.get_or_insert(failure);
             if lifecycle.state == RouterState::Running {
                 lifecycle.state = RouterState::Failed(failure);
@@ -662,11 +638,7 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
     }
 
     fn defer_cleanup(&self, index: usize, cleanup: PendingCleanup) {
-        self.inner.slots[index]
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(cleanup);
+        self.inner.slots[index].pending.lock().push(cleanup);
     }
 
     #[cfg(test)]
@@ -1153,7 +1125,7 @@ impl<A: ChunkAllocator> Shard<A> {
             let _ = session.retired.send(Retired {
                 cause,
                 unavailable: session.unavailable,
-                directed: SharedDirectedWithdrawal(Arc::new(Mutex::new(Some(take_directed(
+                directed: SharedDirectedWithdrawal(Arc::new(PlMutex::new(Some(take_directed(
                     &mut session.directed,
                     token,
                 ))))),
@@ -1435,7 +1407,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 session.alive.store(false, Ordering::Release);
             }
         }
-        let directed = SharedDirectedWithdrawal(Arc::new(Mutex::new(None)));
+        let directed = SharedDirectedWithdrawal(Arc::new(PlMutex::new(None)));
         for (_, sessions) in self.accounts.drain() {
             for (_, session) in sessions {
                 let _ = session.retired.send(Retired {
@@ -2554,23 +2526,10 @@ mod tests {
             let index = router.shard_index(account.as_str());
             let guard = router.inner.slots[index].shard.lock().await;
             drop(desk);
-            assert_eq!(
-                router.inner.slots[index]
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .len(),
-                1
-            );
+            assert_eq!(router.inner.slots[index].pending.lock().len(), 1);
             drop(guard);
             assert_eq!(router.resource_match(&account, "desk").await?, None);
-            assert!(
-                router.inner.slots[index]
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .is_empty()
-            );
+            assert!(router.inner.slots[index].pending.lock().is_empty());
             assert!(
                 !router
                     .with_shard(index, |shard| shard.accounts.contains_key(account.as_str()))

@@ -3,11 +3,12 @@
 use std::error::Error;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, ThreadId};
 
 use ::redb::StorageBackend;
 use ::redb::backends::InMemoryBackend;
+use parking_lot::Mutex as PlMutex;
 
 use crate::tests::TIMEOUT;
 
@@ -55,8 +56,8 @@ impl StorageBackend for FailingSyncBackend {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ObservedBackend {
     inner: Arc<InMemoryBackend>,
-    threads: Arc<Mutex<Vec<ThreadId>>>,
-    sync_gate: Arc<Mutex<Option<SyncGate>>>,
+    threads: Arc<PlMutex<Vec<ThreadId>>>,
+    sync_gate: Arc<PlMutex<Option<SyncGate>>>,
 }
 
 #[derive(Debug)]
@@ -67,9 +68,7 @@ struct SyncGate {
 
 impl ObservedBackend {
     pub(super) fn take_threads(&self) -> Result<Vec<ThreadId>, Box<dyn Error>> {
-        Ok(std::mem::take(
-            &mut *self.threads.lock().map_err(|_| "thread log poisoned")?,
-        ))
+        Ok(std::mem::take(&mut *self.threads.lock()))
     }
 
     /// Returns a receiver that fires when the sync starts and a sender that lets it finish.
@@ -78,7 +77,7 @@ impl ObservedBackend {
     ) -> Result<(mpsc::Receiver<()>, mpsc::Sender<()>), Box<dyn Error>> {
         let (entered, started) = mpsc::channel();
         let (release, released) = mpsc::channel();
-        *self.sync_gate.lock().map_err(|_| "sync gate poisoned")? = Some(SyncGate {
+        *self.sync_gate.lock() = Some(SyncGate {
             entered,
             release: released,
         });
@@ -86,10 +85,7 @@ impl ObservedBackend {
     }
 
     fn record_thread(&self) -> io::Result<()> {
-        self.threads
-            .lock()
-            .map_err(|_| io::Error::other("thread log poisoned"))?
-            .push(thread::current().id());
+        self.threads.lock().push(thread::current().id());
         Ok(())
     }
 }
@@ -112,11 +108,7 @@ impl StorageBackend for ObservedBackend {
 
     fn sync_data(&self) -> io::Result<()> {
         self.record_thread()?;
-        let gate = self
-            .sync_gate
-            .lock()
-            .map_err(|_| io::Error::other("sync gate poisoned"))?
-            .take();
+        let gate = self.sync_gate.lock().take();
         if let Some(gate) = gate {
             gate.entered.send(()).map_err(io::Error::other)?;
             gate.release

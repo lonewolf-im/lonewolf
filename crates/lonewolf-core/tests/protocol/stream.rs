@@ -166,6 +166,7 @@ fn tcp_eof_after_opening_releases_connection_capacity() -> TestResult {
 
     client.transport().shutdown(std::net::Shutdown::Write)?;
     client.expect_eof()?;
+    suite.wait_for_log("stream disconnected")?;
 
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;
@@ -179,6 +180,7 @@ fn tcp_eof_before_opening_releases_connection_capacity() -> TestResult {
 
     client.transport().shutdown(std::net::Shutdown::Write)?;
     client.expect_eof()?;
+    suite.wait_for_log("stream disconnected")?;
 
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;

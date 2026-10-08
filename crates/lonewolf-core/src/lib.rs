@@ -32,7 +32,7 @@ pub mod hosts;
 mod logging;
 mod order;
 mod panic;
-pub mod router;
+pub(crate) mod router;
 mod shutdown;
 mod storage;
 
@@ -40,6 +40,7 @@ use config::Config;
 pub use error::RunError;
 use hosts::Hosts;
 use router::Router;
+pub use router::RouterFailure;
 use router::local::LocalRouter;
 use storage::StoreRegistry;
 

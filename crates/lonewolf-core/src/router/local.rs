@@ -100,7 +100,7 @@ pub(crate) struct Withdrawal<A: ChunkAllocator> {
     pub(crate) directed: DirectedWithdrawal,
 }
 
-pub struct LocalRouter<A: ChunkAllocator> {
+pub(crate) struct LocalRouter<A: ChunkAllocator> {
     handle: LocalRouterHandle<A>,
     failure: oneshot::Receiver<RouterFailure>,
 }
@@ -134,7 +134,7 @@ struct Lifecycle {
 }
 
 /// Keeps a bound resource registered until this value is dropped.
-pub struct Registration<A: ChunkAllocator> {
+pub(crate) struct Registration<A: ChunkAllocator> {
     account: AccountKey,
     resource: Box<str>,
     token: u64,
@@ -152,13 +152,13 @@ struct Links<A: ChunkAllocator> {
 }
 
 pub(crate) struct PresenceChange<A: ChunkAllocator> {
-    pub became_available: bool,
-    pub became_eligible: bool,
-    pub became_unavailable: bool,
+    pub(crate) became_available: bool,
+    pub(crate) became_eligible: bool,
+    pub(crate) became_unavailable: bool,
     /// Write these deliveries before the update's echo to preserve mailbox order.
-    pub preceding: Vec<RoutedStanza<A>>,
+    pub(crate) preceding: Vec<RoutedStanza<A>>,
     /// Includes sibling presence only when this resource becomes available.
-    pub siblings: Vec<RoutedStanza<A>>,
+    pub(crate) siblings: Vec<RoutedStanza<A>>,
     pub(crate) directed: DirectedWithdrawal,
 }
 
@@ -295,7 +295,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
         failure
     }
 
-    pub async fn shutdown(self) -> io::Result<()> {
+    pub(crate) async fn shutdown(self) -> io::Result<()> {
         self.stop();
         for slot in &self.handle.inner.slots {
             slot.shard.lock().await.terminate();
@@ -686,15 +686,15 @@ impl<A: ChunkAllocator> Registration<A> {
     pub(crate) fn liveness(&self) -> SessionLiveness {
         SessionLiveness(Arc::clone(&self.alive))
     }
-    pub fn account(&self) -> &AccountKey {
+    pub(crate) fn account(&self) -> &AccountKey {
         &self.account
     }
 
-    pub fn resource(&self) -> &str {
+    pub(crate) fn resource(&self) -> &str {
         &self.resource
     }
 
-    pub fn full_jid(&self) -> String {
+    pub(crate) fn full_jid(&self) -> String {
         format!("{}/{}", self.account.as_str(), self.resource)
     }
 
@@ -732,15 +732,6 @@ impl<A: ChunkAllocator> Registration<A> {
         A: Clone,
     {
         self.handle().finish_presence(self.token).await
-    }
-
-    pub async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
-        self.links
-            .router
-            .with_shard(self.links.shard, |shard| {
-                shard.tag(&self.account, &self.resource, self.token, tag)
-            })
-            .await?
     }
 
     pub(crate) fn handle(&self) -> SessionHandle<A>

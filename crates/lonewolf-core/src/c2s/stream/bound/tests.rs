@@ -18,7 +18,6 @@ use lonewolf_extension::offline::Offline;
 use lonewolf_storage::account::{AccountWrites, NewAccount};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_util::arena::{AllocationError, Chunk, GlobalChunkAllocator};
-use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 
 use super::*;
@@ -149,7 +148,6 @@ pub(super) struct Fixture {
     _directory: tempfile::TempDir,
     pub(super) storage: RedbStorage,
     pub(super) router: Router<GlobalChunkAllocator>,
-    dispatcher: CoreDispatcher,
     pub(super) registration: Registration<GlobalChunkAllocator>,
     pub(super) work: WorkGroup,
 }
@@ -167,9 +165,8 @@ impl Fixture {
     pub(super) async fn new(messages: &[&[u8]]) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
-        let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
         let config = Config::default();
-        let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
+        let local = LocalRouter::new(GlobalChunkAllocator);
         let router = Router::new(Hosts::new(&config.hosts, None)?, local);
         let mut arena = Arena::try_new(ArenaConfig::default())?;
         let account =
@@ -195,7 +192,6 @@ impl Fixture {
             _directory: directory,
             storage,
             router,
-            dispatcher,
             registration,
             work: WorkGroup::new(),
         })
@@ -240,7 +236,6 @@ impl Fixture {
     pub(super) async fn finish(self) -> TestResult {
         drop(self.registration);
         self.router.shutdown().await?;
-        self.dispatcher.shutdown(Duration::from_secs(5)).await?;
         Ok(())
     }
 }

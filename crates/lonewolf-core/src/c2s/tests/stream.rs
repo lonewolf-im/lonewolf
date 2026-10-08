@@ -19,7 +19,6 @@ use lonewolf_auth::scram::{
 use lonewolf_storage::account::{AccountWrites, NewAccount};
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::GlobalChunkAllocator;
-use lonewolf_util::core_dispatcher::CoreDispatcher;
 use redb::{ReadableTable, TableDefinition};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -98,12 +97,8 @@ fn hosts() -> Result<Hosts, HostsError> {
     Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
 }
 
-async fn test_router(
-    hosts: &Hosts,
-) -> std::io::Result<(Router<GlobalChunkAllocator>, CoreDispatcher)> {
-    let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
-    let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
-    Ok((Router::new(hosts.clone(), local), dispatcher))
+fn test_router(hosts: &Hosts) -> Router<GlobalChunkAllocator> {
+    Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator))
 }
 
 fn auth() -> std::io::Result<(Arc<AuthService>, tempfile::TempDir)> {
@@ -171,7 +166,7 @@ fn run_case_with_timeouts(
         };
         let hosts = hosts()?;
         let (auth, _directory) = auth()?;
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let started = Instant::now();
         let stream = XmppStream::new(
             transport,
@@ -195,7 +190,6 @@ fn run_case_with_timeouts(
         );
         let outcome = stream.run().await;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         let elapsed = started.elapsed();
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
@@ -321,7 +315,7 @@ fn run_starttls_restart_case_with_timeout(
             return Err("first unauthenticated connection was denied".into());
         };
         let (auth, _directory) = auth()?;
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let stream = XmppStream::new(
             transport,
             StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
@@ -344,7 +338,6 @@ fn run_starttls_restart_case_with_timeout(
         );
         let outcome = stream.run().await;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         let (before_tls, after_tls) = client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         Ok::<_, Box<dyn Error + Send + Sync>>((outcome, before_tls, after_tls))
@@ -473,7 +466,7 @@ where
                 transaction.commit()?;
             }
         }
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let outcome = XmppStream::new(
             transport,
             StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
@@ -497,7 +490,6 @@ where
         .run()
         .await;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(outcome)
@@ -633,7 +625,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         };
         let hosts = hosts()?;
         let (auth, _directory) = auth()?;
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let stream = XmppStream::new(
             transport,
             StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
@@ -669,7 +661,6 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         ));
         listener.close().await?;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         Ok::<_, Box<dyn Error>>(())
     })
 }

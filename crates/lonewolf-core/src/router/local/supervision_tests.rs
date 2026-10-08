@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::error::Error;
-use std::process::Command as ProcessCommand;
+use std::process::Command as Process;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
-use futures_util::future::join;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{Stanza, StanzaNamespace};
+use std::pin::pin;
 
 use super::*;
 
@@ -38,62 +38,41 @@ fn dispatcher() -> io::Result<CoreDispatcher> {
 }
 
 #[test]
-fn unexpected_completion_survives_observer_cancellation_and_closes_every_shard() -> TestResult {
+fn a_panicking_operation_fails_the_router_once_and_retires_every_shard() -> TestResult {
     run(async {
-        let dispatcher = dispatcher()?;
-        let mut router = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
+        let mut router = LocalRouter::new(GlobalChunkAllocator);
         let handle = router.handle();
         let alice = account("alice@localhost")?;
-        let registered = handle
+        let desk = handle
             .register(&alice, Some("desk"), NonZeroUsize::MIN)
             .await?;
-        assert!(router.failure().now_or_never().is_none());
-        let shard = handle.shard(alice.as_str());
-        let (entered, entering) = oneshot::channel();
-        let (release, released) = oneshot::channel();
-        shard
-            .send(Command::Suspend {
-                entered,
-                release: released,
-            })
+        let mut number = 0;
+        let other = loop {
+            let candidate = account(&format!("user{number}@localhost"))?;
+            if handle.shard_index(candidate.as_str()) != handle.shard_index(alice.as_str()) {
+                break candidate;
+            }
+            number += 1;
+        };
+        let other_desk = handle
+            .register(&other, Some("desk"), NonZeroUsize::MIN)
             .await?;
-        entering.await?;
-        let mut replies = Vec::with_capacity(SHARD_QUEUE_CAPACITY);
-        for _ in 0..SHARD_QUEUE_CAPACITY {
-            let (reply, receiver) = oneshot::channel();
-            shard.try_send(Command::ResourceMatch {
-                account: alice.clone(),
-                resource: "desk".into(),
-                reply,
-            })?;
-            replies.push(receiver);
-        }
-        let (reply, result) = oneshot::channel();
-        let mut admission = pin!(shard.send(Command::ResourceMatch {
-            account: alice.clone(),
-            resource: "desk".into(),
-            reply
-        }));
-        assert!(admission.as_mut().now_or_never().is_none());
-        shard.close();
-        assert!(admission.await.is_err());
-        assert!(result.await.is_err());
         assert!(router.failure().now_or_never().is_none());
-        release.send(()).map_err(|_| "actor gate closed")?;
+        assert_eq!(handle.inject_panic(&alice).await, Err(RouterError::Stopped));
         let failure = router.failure().await;
-        assert_eq!(failure.reason, RouterFailureReason::Completed);
-        for reply in replies {
-            assert!(reply.await.is_err());
-        }
+        assert_eq!(failure.shard_id, handle.shard_index(alice.as_str()));
+        assert_eq!(handle.inject_panic(&other).await, Err(RouterError::Stopped));
         assert_eq!(router.state(), RouterState::Failed(failure));
         assert_eq!(handle.state(), RouterState::Failed(failure));
         assert_eq!(router.failure().await, failure);
-        assert!(!registered.liveness().is_alive());
-        assert_eq!(
-            registered.wait_retired().await?.cause,
-            RetireCause::RouterStopped
-        );
-        assert!(handle.shards.iter().all(Sender::is_closed));
+        for registration in [&desk, &other_desk] {
+            assert!(!registration.liveness().is_alive());
+            assert_eq!(
+                registration.wait_retired().await?.cause,
+                RetireCause::RouterStopped
+            );
+            assert!(registration.recv().await.is_none());
+        }
         assert!(matches!(
             handle
                 .register(&alice, Some("phone"), NonZeroUsize::MIN)
@@ -107,25 +86,14 @@ fn unexpected_completion_survives_observer_cancellation_and_closes_every_shard()
         router.stop();
         assert_eq!(router.state(), RouterState::Failed(failure));
         assert!(router.shutdown().await.is_err());
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
 
 #[test]
-fn competing_completions_keep_first_failure_and_normal_stop_is_not_a_failure() -> TestResult {
+fn normal_stop_is_not_a_failure() -> TestResult {
     run(async {
-        let dispatcher = dispatcher()?;
-        let mut router = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
-        for shard in router.handle.shards.iter() {
-            shard.close();
-        }
-        let first = router.failure().await;
-        assert_eq!(first.reason, RouterFailureReason::Completed);
-        assert_eq!(router.failure().await, first);
-        assert!(router.shutdown().await.is_err());
-
-        let mut router = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
+        let mut router = LocalRouter::new(GlobalChunkAllocator);
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let registered = handle
@@ -152,65 +120,25 @@ fn competing_completions_keep_first_failure_and_normal_stop_is_not_a_failure() -
             registered.wait_retired().await?.cause,
             RetireCause::RouterStopped
         );
-        dispatcher.shutdown(TIMEOUT).await?;
+        assert_eq!(
+            handle.resource_match(&alice, "desk").await,
+            Err(RouterError::Stopped)
+        );
         Ok(())
     })
 }
 
 #[test]
-fn cancellation_revokes_ownership_before_reporting_and_wakes_pending_admission() -> TestResult {
+fn a_panic_while_stopping_makes_shutdown_fail_without_changing_state() -> TestResult {
     run(async {
-        let dispatcher = dispatcher()?;
-        let mut router = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
+        let router = LocalRouter::new(GlobalChunkAllocator);
         let handle = router.handle();
-        let alice = account("alice@localhost")?;
-        let registered = handle
-            .register(&alice, Some("desk"), NonZeroUsize::MIN)
-            .await?;
-        let shard = handle.shard(alice.as_str());
-        let (entered, entering) = oneshot::channel();
-        let (_release, released) = oneshot::channel();
-        shard
-            .send(Command::Suspend {
-                entered,
-                release: released,
-            })
-            .await?;
-        entering.await?;
-        let mut replies = Vec::with_capacity(SHARD_QUEUE_CAPACITY);
-        for _ in 0..SHARD_QUEUE_CAPACITY {
-            let (reply, receiver) = oneshot::channel();
-            shard.try_send(Command::ResourceMatch {
-                account: alice.clone(),
-                resource: "desk".into(),
-                reply,
-            })?;
-            replies.push(receiver);
-        }
-        let (reply, result) = oneshot::channel();
-        let mut admission = pin!(shard.send(Command::ResourceMatch {
-            account: alice.clone(),
-            resource: "desk".into(),
-            reply
-        }));
-        assert!(admission.as_mut().now_or_never().is_none());
-        let (stopped, failure) =
-            join(dispatcher.shutdown_at(Instant::now()), router.failure()).await;
+        router.stop();
         assert_eq!(
-            stopped.err().map(|error| error.kind()),
-            Some(io::ErrorKind::TimedOut)
+            handle.inject_panic(&account("alice@localhost")?).await,
+            Err(RouterError::Stopped)
         );
-        assert_eq!(failure.reason, RouterFailureReason::Cancelled);
-        assert!(!registered.liveness().is_alive());
-        assert_eq!(
-            registered.wait_retired().await?.cause,
-            RetireCause::RouterStopped
-        );
-        assert!(admission.await.is_err());
-        assert!(result.await.is_err());
-        for reply in replies {
-            assert!(reply.await.is_err());
-        }
+        assert_eq!(router.state(), RouterState::Stopping);
         assert!(router.shutdown().await.is_err());
         Ok(())
     })
@@ -218,7 +146,7 @@ fn cancellation_revokes_ownership_before_reporting_and_wakes_pending_admission()
 
 #[test]
 fn active_tagged_callback_panic_cleans_up_without_aborting() -> TestResult {
-    let output = ProcessCommand::new(std::env::current_exe()?)
+    let output = Process::new(std::env::current_exe()?)
         .args([
             "router::local::supervision_tests::tagged_callback_panic_process",
             "--exact",
@@ -248,7 +176,7 @@ fn tagged_callback_panic_process() -> TestResult {
             total_bytes: NonZeroUsize::new(8 * 1024 * 1024).ok_or("zero pool")?,
             shards_per_bucket: NonZeroUsize::MIN,
         })?);
-        let mut router = LocalRouter::start(&dispatcher.handle(), Arc::clone(&pool)).await?;
+        let mut router = LocalRouter::new(Arc::clone(&pool));
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let registration = handle
@@ -299,19 +227,23 @@ fn tagged_callback_panic_process() -> TestResult {
         assert!(captured.as_mut().now_or_never().is_none());
         let mut entered = Some(entered);
         let mut capture = Some(capture);
-        let mut caller = pin!(handle.deliver_to_tagged(
-            &alice,
-            SessionTag::Interested,
-            Box::new(move |_: &str| {
-                let _keep_capture = &mut capture;
-                if let Some(entered) = entered.take() {
-                    let _ = entered.send(());
-                }
-                assert!(released.recv().is_ok());
-                panic!("seeded-sensitive-router-payload");
+        let caller_handle = handle.clone();
+        let caller_account = alice.clone();
+        let caller = dispatcher
+            .handle()
+            .dispatch_at(0, move |_| async move {
+                caller_handle
+                    .deliver_to_tagged(&caller_account, SessionTag::Interested, move |_: &str| {
+                        let _keep_capture = &mut capture;
+                        if let Some(entered) = entered.take() {
+                            let _ = entered.send(());
+                        }
+                        assert!(released.recv().is_ok());
+                        panic!("seeded-sensitive-router-payload");
+                    })
+                    .await
             })
-        ));
-        assert!(caller.as_mut().now_or_never().is_none());
+            .await?;
         entering.await?;
         let mut arena = Arena::try_new_in(Default::default(), Arc::clone(&pool))?;
         let target = Jid::parse_in("alice@localhost/desk", &mut arena)?;
@@ -322,14 +254,8 @@ fn tagged_callback_panic_process() -> TestResult {
         )
         .to(Some(target))?
         .build()?;
-        let queued = RoutedStanza::from_parts(stanza, arena);
-        let (reply, replying) = oneshot::channel();
-        handle.shard(alice.as_str()).try_send(Command::Deliver {
-            stanza: queued,
-            fallback_chat: false,
-            source: None,
-            reply,
-        })?;
+        let mut contender = pin!(handle.deliver_full(RoutedStanza::from_parts(stanza, arena)));
+        assert!(futures_util::poll!(contender.as_mut()).is_pending());
         assert!(
             pool.stats()
                 .buckets
@@ -337,10 +263,11 @@ fn tagged_callback_panic_process() -> TestResult {
                 .any(|bucket| bucket.available_chunks < bucket.total_chunks)
         );
         release.send(())?;
-        assert_eq!(caller.await, Err(RouterError::Stopped));
+        assert_eq!(caller.await?, Err(RouterError::Stopped));
+        assert_eq!(contender.await, Err(RouterError::Stopped));
         assert!(captured.await.is_err());
         let failure = router.failure().await;
-        assert_eq!(failure.reason, RouterFailureReason::Panicked);
+        assert_eq!(failure.shard_id, handle.shard_index(alice.as_str()));
         assert!(!old.liveness.is_alive());
         assert_eq!(
             handle
@@ -353,7 +280,6 @@ fn tagged_callback_panic_process() -> TestResult {
             registration.wait_retired().await?.cause,
             RetireCause::RouterStopped
         );
-        assert!(replying.await.is_err());
         assert!(
             pool.stats()
                 .buckets
@@ -362,7 +288,7 @@ fn tagged_callback_panic_process() -> TestResult {
         );
         assert!(router.shutdown().await.is_err());
 
-        let replacement = LocalRouter::start(&dispatcher.handle(), Arc::clone(&pool)).await?;
+        let replacement = LocalRouter::new(Arc::clone(&pool));
         let new = replacement
             .handle()
             .register(&alice, Some("desk"), NonZeroUsize::MIN)
@@ -386,7 +312,7 @@ fn tagged_callback_panic_process() -> TestResult {
         drop(new);
         drop(old);
         replacement.shutdown().await?;
-        assert!(dispatcher.shutdown(TIMEOUT).await.is_err());
+        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }

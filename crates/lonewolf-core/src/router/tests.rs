@@ -35,7 +35,7 @@ fn run_test(test: impl Future<Output = TestResult>) -> TestResult {
 #[test]
 fn presence_errors_keep_exact_and_available_audiences_and_presence_state() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let limit = NonZeroUsize::new(3).ok_or("zero limit")?;
@@ -94,7 +94,6 @@ fn presence_errors_keep_exact_and_available_audiences_and_presence_state() -> Te
         );
         drop((desk, phone));
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -102,7 +101,7 @@ fn presence_errors_keep_exact_and_available_audiences_and_presence_state() -> Te
 #[test]
 fn presence_errors_use_bounded_mailboxes_and_keep_replacement_registrations() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -156,7 +155,6 @@ fn presence_errors_use_bounded_mailboxes_and_keep_replacement_registrations() ->
         assert!(bob.take_queued().is_empty());
         drop((replacement, bob));
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -164,7 +162,7 @@ fn presence_errors_use_bounded_mailboxes_and_keep_replacement_registrations() ->
 #[test]
 fn absent_account_message_targets_distinguish_offline_from_missing_resources() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         for (to, kind, expected) in [
             ("alice@localhost", "normal", RouterError::Offline),
@@ -188,7 +186,6 @@ fn absent_account_message_targets_distinguish_offline_from_missing_resources() -
             Err(RouterError::NotFound)
         );
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -196,7 +193,7 @@ fn absent_account_message_targets_distinguish_offline_from_missing_resources() -
 #[test]
 fn unavailable_and_negative_siblings_keep_full_normal_targets_missing() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let owner = account("alice@localhost")?;
         let resource = handle
@@ -235,7 +232,6 @@ fn unavailable_and_negative_siblings_keep_full_normal_targets_missing() -> TestR
             Err(RouterError::Offline)
         );
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -243,7 +239,7 @@ fn unavailable_and_negative_siblings_keep_full_normal_targets_missing() -> TestR
 #[test]
 fn missing_normal_resource_does_not_fall_back_to_an_eligible_sibling() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let owner = account("alice@localhost")?;
         let resource = handle
@@ -276,7 +272,6 @@ fn missing_normal_resource_does_not_fall_back_to_an_eligible_sibling() -> TestRe
         );
         drop(resource);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -284,7 +279,7 @@ fn missing_normal_resource_does_not_fall_back_to_an_eligible_sibling() -> TestRe
 #[test]
 fn full_eligible_mailboxes_remain_busy_instead_of_offline() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let owner = account("alice@localhost")?;
         let resource = handle
@@ -316,24 +311,14 @@ fn full_eligible_mailboxes_remain_busy_instead_of_offline() -> TestResult {
         );
         drop(resource);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
 
-async fn setup() -> Result<(Router<GlobalChunkAllocator>, CoreDispatcher), Box<dyn Error>> {
-    let two = NonZeroUsize::MIN.saturating_add(1);
-    let dispatcher = match CoreDispatcher::new(two, two) {
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
-            CoreDispatcher::new(NonZeroUsize::MIN, two)?
-        }
-        result => result?,
-    };
+fn setup() -> Result<Router<GlobalChunkAllocator>, Box<dyn Error>> {
     let config = Config::default();
     let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
-    let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
-    let router = Router::new(hosts, local);
-    Ok((router, dispatcher))
+    Ok(Router::new(hosts, LocalRouter::new(GlobalChunkAllocator)))
 }
 
 fn account(value: &str) -> Result<AccountKey, Box<dyn Error>> {
@@ -443,7 +428,7 @@ fn roster_pushes() -> impl FnMut(&str) -> TestRosterPush + Send {
 #[test]
 fn registration_uses_one_account_shard_across_handles() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let alice = account("alice@localhost")?;
         let first = router.handle();
         let second = router.handle();
@@ -480,7 +465,6 @@ fn registration_uses_one_account_shard_across_handles() -> TestResult {
         drop(duplicate);
         drop(reused);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -488,7 +472,7 @@ fn registration_uses_one_account_shard_across_handles() -> TestResult {
 #[test]
 fn retiring_an_account_ends_every_session_and_frees_its_resources() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let alice = account("alice@localhost")?;
         let bob = account("bob@localhost")?;
         let handle = router.handle();
@@ -544,7 +528,6 @@ fn retiring_an_account_ends_every_session_and_frees_its_resources() -> TestResul
         drop(phone);
         drop(bob_desk);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -552,14 +535,13 @@ fn retiring_an_account_ends_every_session_and_frees_its_resources() -> TestResul
 #[test]
 fn resource_validation_uses_router_allocator() -> TestResult {
     run_test(async {
-        let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
         let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
             total_bytes: NonZeroUsize::new(8 * 1024 * 1024).unwrap(),
             shards_per_bucket: NonZeroUsize::MIN,
         })?);
         let config = Config::default();
         let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
-        let local = LocalRouter::start(&dispatcher.handle(), Arc::clone(&pool)).await?;
+        let local = LocalRouter::new(Arc::clone(&pool));
         let router = Router::new(hosts, local);
         let before = pool.stats().buckets[0].allocation_count;
         let alice = account("alice@localhost")?;
@@ -571,7 +553,6 @@ fn resource_validation_uses_router_allocator() -> TestResult {
         assert_eq!(pool.stats().buckets[0].allocation_count, before + 1);
         drop(registration);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -579,7 +560,7 @@ fn resource_validation_uses_router_allocator() -> TestResult {
 #[test]
 fn generated_resources_are_unique_random_identifiers() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let alice = account("alice@localhost")?;
         let handle = router.handle();
         let first = handle
@@ -597,7 +578,6 @@ fn generated_resources_are_unique_random_identifiers() -> TestResult {
         drop(first);
         drop(second);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -605,7 +585,14 @@ fn generated_resources_are_unique_random_identifiers() -> TestResult {
 #[test]
 fn concurrent_registration_on_different_workers_is_atomic() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let two = NonZeroUsize::MIN.saturating_add(1);
+        let dispatcher = match CoreDispatcher::new(two, two) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                CoreDispatcher::new(NonZeroUsize::MIN, two)?
+            }
+            result => result?,
+        };
+        let router = setup()?;
         let workers = dispatcher.handle();
         let alice = account("alice@localhost")?;
         let first_router = router.handle();
@@ -640,7 +627,7 @@ fn concurrent_registration_on_different_workers_is_atomic() -> TestResult {
 #[test]
 fn exact_delivery_respects_mailbox_capacity_and_lease() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let registration = handle
@@ -673,7 +660,6 @@ fn exact_delivery_respects_mailbox_capacity_and_lease() -> TestResult {
         ));
 
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -681,7 +667,7 @@ fn exact_delivery_respects_mailbox_capacity_and_lease() -> TestResult {
 #[test]
 fn roster_push_reaches_only_interested_resources() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
@@ -721,7 +707,6 @@ fn roster_push_reaches_only_interested_resources() -> TestResult {
         drop(phone);
         drop(tablet);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -729,7 +714,7 @@ fn roster_push_reaches_only_interested_resources() -> TestResult {
 #[test]
 fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
@@ -768,7 +753,6 @@ fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResul
         drop(desk);
         drop(phone);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -776,7 +760,7 @@ fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResul
 #[test]
 fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let limit = NonZeroUsize::new(3).ok_or("zero resource limit")?;
 
@@ -814,7 +798,6 @@ fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
         }
 
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -822,7 +805,7 @@ fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
 #[test]
 fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -850,7 +833,6 @@ fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResul
         ));
 
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -858,7 +840,7 @@ fn disconnected_interested_resource_is_removed_before_roster_push() -> TestResul
 #[test]
 fn invalid_and_remote_destinations_are_not_routed_locally() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         assert!(matches!(
@@ -878,7 +860,6 @@ fn invalid_and_remote_destinations_are_not_routed_locally() -> TestResult {
         ));
 
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -886,7 +867,7 @@ fn invalid_and_remote_destinations_are_not_routed_locally() -> TestResult {
 #[test]
 fn presence_eligibility_only_changes_when_a_resource_enters_nonnegative_priority() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let owner = account("alice@localhost")?;
         for (old, new, expected) in [
@@ -914,7 +895,6 @@ fn presence_eligibility_only_changes_when_a_resource_enters_nonnegative_priority
             drop(registration);
         }
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -922,7 +902,7 @@ fn presence_eligibility_only_changes_when_a_resource_enters_nonnegative_priority
 #[test]
 fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -1025,7 +1005,6 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
         drop(phone);
         drop(replacement);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1033,7 +1012,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
 #[test]
 fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let bob_account = account("bob@localhost")?;
@@ -1084,7 +1063,6 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
         drop(alice_desk);
         drop(bob);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1092,7 +1070,7 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
 #[test]
 fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let limit = NonZeroUsize::new(2).ok_or("zero resource limit")?;
@@ -1134,7 +1112,6 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
         drop(desk);
         drop(phone);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1142,7 +1119,7 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
 #[test]
 fn full_unavailable_mailbox_retires_recipient() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -1187,7 +1164,6 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
 
         drop(phone);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1195,14 +1171,14 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
 #[test]
 fn a_panic_while_holding_router_state_unwinds_instead_of_aborting() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
             .register(&alice, Some("desk"), NonZeroUsize::new(2).unwrap())
             .await?;
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _held = (router, dispatcher, handle, desk);
+            let _held = (router, handle, desk);
             panic!("deliberate");
         }));
         assert!(caught.is_err());
@@ -1213,7 +1189,7 @@ fn a_panic_while_holding_router_state_unwinds_instead_of_aborting() -> TestResul
 #[test]
 fn a_panic_while_holding_only_a_registration_unwinds_instead_of_aborting() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -1226,7 +1202,6 @@ fn a_panic_while_holding_only_a_registration_unwinds_instead_of_aborting() -> Te
             panic!("deliberate");
         }));
         assert!(caught.is_err());
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1234,7 +1209,7 @@ fn a_panic_while_holding_only_a_registration_unwinds_instead_of_aborting() -> Te
 #[test]
 fn dropping_an_evicted_registration_clears_its_retained_presence() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -1285,7 +1260,6 @@ fn dropping_an_evicted_registration_clears_its_retained_presence() -> TestResult
 
         drop(desk);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1326,7 +1300,7 @@ async fn has_grant(
 #[test]
 fn directed_grants_keep_exact_recipients_and_source_resources() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
@@ -1345,7 +1319,6 @@ fn directed_grants_keep_exact_recipients_and_source_resources() -> TestResult {
         assert!(!has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
         drop((desk, phone));
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1353,7 +1326,7 @@ fn directed_grants_keep_exact_recipients_and_source_resources() -> TestResult {
 #[test]
 fn incoming_unavailable_prunes_connected_only_grants_by_sender_scope() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
@@ -1385,7 +1358,6 @@ fn incoming_unavailable_prunes_connected_only_grants_by_sender_scope() -> TestRe
         }
         drop((desk, phone));
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1393,7 +1365,7 @@ fn incoming_unavailable_prunes_connected_only_grants_by_sender_scope() -> TestRe
 #[test]
 fn retirement_transfers_grants_once_and_stale_handles_cannot_change_replacement() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -1417,7 +1389,6 @@ fn retirement_transfers_grants_once_and_stale_handles_cannot_change_replacement(
         assert!(has_grant(&handle, &alice, "desk", "carol@localhost/desk").await?);
         drop((desk, replacement));
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1425,7 +1396,7 @@ fn retirement_transfers_grants_once_and_stale_handles_cannot_change_replacement(
 #[test]
 fn guarded_presence_is_dropped_once_its_source_retires() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let desk = handle
             .register(
@@ -1489,7 +1460,6 @@ fn guarded_presence_is_dropped_once_its_source_retires() -> TestResult {
         assert!(bob.take_queued().is_empty());
         drop(bob);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1497,7 +1467,7 @@ fn guarded_presence_is_dropped_once_its_source_retires() -> TestResult {
 #[test]
 fn unavailable_probe_reply_prunes_the_requester_grant() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let bob_account = account("bob@localhost")?;
         let bob = handle
@@ -1541,7 +1511,6 @@ fn unavailable_probe_reply_prunes_the_requester_grant() -> TestResult {
         }
         drop(bob);
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1559,7 +1528,7 @@ async fn iq_request(
 #[test]
 fn iq_requests_authorize_exact_resource_grants_and_same_accounts() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -1625,7 +1594,6 @@ fn iq_requests_authorize_exact_resource_grants_and_same_accounts() -> TestResult
         }
         drop((desk, phone));
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1633,7 +1601,7 @@ fn iq_requests_authorize_exact_resource_grants_and_same_accounts() -> TestResult
 #[test]
 fn iq_requests_do_not_fall_back_on_backpressure_or_reuse_replaced_grants() -> TestResult {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         let desk = handle
@@ -1672,7 +1640,6 @@ fn iq_requests_do_not_fall_back_on_backpressure_or_reuse_replaced_grants() -> Te
         );
         drop((phone, replacement));
         router.shutdown().await?;
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }
@@ -1681,7 +1648,7 @@ fn iq_requests_do_not_fall_back_on_backpressure_or_reuse_replaced_grants() -> Te
 fn resource_match_observes_connected_tokens_without_availability_or_capacity_filters() -> TestResult
 {
     run_test(async {
-        let (router, dispatcher) = setup().await?;
+        let router = setup()?;
         let handle = router.handle();
         let alice = account("alice@localhost")?;
         assert_eq!(handle.resource_match(&alice, "desk").await?, None);
@@ -1730,7 +1697,6 @@ fn resource_match_observes_connected_tokens_without_availability_or_capacity_fil
             handle.resource_match(&alice, "desk").await,
             Err(RouterError::Stopped)
         );
-        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     })
 }

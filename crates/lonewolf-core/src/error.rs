@@ -26,7 +26,6 @@ pub enum RunError {
     WorkerCount(io::Error),
     Dispatcher(io::Error),
     DispatcherShutdown(io::Error),
-    Router(io::Error),
     RouterShutdown(io::Error),
     RouterFailed(RouterFailure),
     Signal(io::Error),
@@ -67,7 +66,6 @@ impl fmt::Display for RunError {
             Self::DispatcherShutdown(source) => {
                 write!(formatter, "cannot stop core dispatcher: {source}")
             }
-            Self::Router(source) => write!(formatter, "cannot start router: {source}"),
             Self::RouterFailed(failure) => failure.fmt(formatter),
             Self::RouterShutdown(source) => write!(formatter, "cannot stop router: {source}"),
             Self::Admin(source) => write!(formatter, "admin service failed: {source}"),
@@ -99,7 +97,6 @@ impl Error for RunError {
             | Self::WorkerCount(source)
             | Self::Dispatcher(source)
             | Self::DispatcherShutdown(source)
-            | Self::Router(source)
             | Self::RouterShutdown(source)
             | Self::Signal(source)
             | Self::Admin(source)

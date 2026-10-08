@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
@@ -19,7 +19,6 @@ use lonewolf_auth::scram::{
 use lonewolf_storage::account::{AccountWrites, NewAccount};
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::GlobalChunkAllocator;
-use lonewolf_util::core_dispatcher::CoreDispatcher;
 use redb::{ReadableTable, TableDefinition};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -98,12 +97,8 @@ fn hosts() -> Result<Hosts, HostsError> {
     Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
 }
 
-async fn test_router(
-    hosts: &Hosts,
-) -> std::io::Result<(Router<GlobalChunkAllocator>, CoreDispatcher)> {
-    let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
-    let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
-    Ok((Router::new(hosts.clone(), local), dispatcher))
+fn test_router(hosts: &Hosts) -> Router<GlobalChunkAllocator> {
+    Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator))
 }
 
 fn auth() -> std::io::Result<(Arc<AuthService>, tempfile::TempDir)> {
@@ -171,7 +166,7 @@ fn run_case_with_timeouts(
         };
         let hosts = hosts()?;
         let (auth, _directory) = auth()?;
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let started = Instant::now();
         let stream = XmppStream::new(
             transport,
@@ -195,7 +190,6 @@ fn run_case_with_timeouts(
         );
         let outcome = stream.run().await;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         let elapsed = started.elapsed();
         assert!(matches!(
             limiter.reserve(peer.ip(), Instant::now()).await,
@@ -221,11 +215,107 @@ fn run_case_with_timeouts(
     }))?
 }
 
+async fn phase_socket_pair() -> io::Result<(TcpStream, StdTcpStream)> {
+    let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let peer = StdTcpStream::connect(listener.local_addr()?)?;
+    peer.set_read_timeout(Some(TIMEOUT))?;
+    let (socket, _) = listener.accept().await?;
+    listener.close().await?;
+    Ok((socket, peer))
+}
+
 #[test]
-fn elapsed_and_overflowed_phase_deadlines_have_no_remaining_time() {
-    let now = Instant::now();
-    assert_eq!(phase_remaining(now, Duration::ZERO), Duration::ZERO);
-    assert_eq!(phase_remaining(now, Duration::MAX), Duration::ZERO);
+fn elapsed_and_overflowed_phase_deadlines_close_without_polling() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        for outcome in [
+            CloseOutcome::EstablishmentTimeout,
+            CloseOutcome::AuthenticationTimeout,
+            CloseOutcome::BindingTimeout,
+        ] {
+            for deadline in [
+                Some(Instant::now()),
+                Instant::now().checked_add(Duration::MAX),
+            ] {
+                let (socket, mut peer) = phase_socket_pair().await?;
+                let polled = Cell::new(false);
+                let result = run_phase(&socket, deadline, outcome, async {
+                    polled.set(true);
+                    Ok(())
+                })
+                .await;
+                assert_eq!(result, Err(outcome));
+                assert!(!polled.get());
+                assert_eq!(peer.read(&mut [0; 1])?, 0);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn phase_work_ready_after_expiry_is_not_polled_again() -> io::Result<()> {
+    Runtime::new()?.block_on(async {
+        for outcome in [
+            CloseOutcome::EstablishmentTimeout,
+            CloseOutcome::AuthenticationTimeout,
+            CloseOutcome::BindingTimeout,
+        ] {
+            let (socket, mut peer) = phase_socket_pair().await?;
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let ready = Cell::new(false);
+            let polls = Cell::new(0);
+            let mut phase = std::pin::pin!(run_phase(
+                &socket,
+                Some(deadline),
+                outcome,
+                std::future::poll_fn(|_| {
+                    polls.set(polls.get() + 1);
+                    if ready.get() {
+                        std::task::Poll::Ready(Ok(()))
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+            ));
+            assert!(futures_util::poll!(phase.as_mut()).is_pending());
+            assert_eq!(polls.get(), 1);
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            ready.set(true);
+            assert_eq!(phase.await, Err(outcome));
+            assert_eq!(polls.get(), 1);
+            assert_eq!(peer.read(&mut [0; 1])?, 0);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn timely_phase_results_keep_the_socket_open() -> io::Result<()> {
+    use compio::io::AsyncReadExt as _;
+
+    Runtime::new()?.block_on(async {
+        for result in [Ok(42), Err(CloseOutcome::TransportError)] {
+            let (mut socket, mut peer) = phase_socket_pair().await?;
+            let deadline = Instant::now() + TIMEOUT;
+            assert_eq!(
+                run_phase(
+                    &socket,
+                    Some(deadline),
+                    CloseOutcome::BindingTimeout,
+                    std::future::ready(result)
+                )
+                .await,
+                result
+            );
+            peer.write_all(&[42])?;
+            let compio::BufResult(received, byte) = socket.read_exact([0; 1]).await;
+            received?;
+            assert_eq!(byte, [42]);
+        }
+        Ok(())
+    })
 }
 
 fn read_through(stream: &mut impl Read, marker: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -321,7 +411,7 @@ fn run_starttls_restart_case_with_timeout(
             return Err("first unauthenticated connection was denied".into());
         };
         let (auth, _directory) = auth()?;
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let stream = XmppStream::new(
             transport,
             StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
@@ -344,7 +434,6 @@ fn run_starttls_restart_case_with_timeout(
         );
         let outcome = stream.run().await;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         let (before_tls, after_tls) = client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         Ok::<_, Box<dyn Error + Send + Sync>>((outcome, before_tls, after_tls))
@@ -473,7 +562,7 @@ where
                 transaction.commit()?;
             }
         }
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let outcome = XmppStream::new(
             transport,
             StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
@@ -497,7 +586,6 @@ where
         .run()
         .await;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         Ok::<_, Box<dyn Error + Send + Sync>>(outcome)
@@ -633,7 +721,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         };
         let hosts = hosts()?;
         let (auth, _directory) = auth()?;
-        let (router, router_dispatcher) = test_router(&hosts).await?;
+        let router = test_router(&hosts);
         let stream = XmppStream::new(
             transport,
             StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
@@ -669,7 +757,6 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         ));
         listener.close().await?;
         router.shutdown().await?;
-        router_dispatcher.shutdown(TIMEOUT).await?;
         Ok::<_, Box<dyn Error>>(())
     })
 }

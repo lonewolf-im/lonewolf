@@ -1173,6 +1173,7 @@ dependencies = [
  "async-lock",
  "base64",
  "compio",
+ "crossbeam-utils",
  "futures-channel",
  "futures-rustls",
  "futures-util",

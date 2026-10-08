@@ -11,6 +11,7 @@ async-channel.workspace = true
 async-lock.workspace = true
 base64.workspace = true
 compio = { workspace = true, features = ["net", "rustls", "time"] }
+crossbeam-utils.workspace = true
 futures-channel.workspace = true
 futures-rustls.workspace = true
 futures-util = { workspace = true, features = ["io"] }

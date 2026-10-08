@@ -200,16 +200,13 @@ pub fn run_with_extensions(
                 } else {
                     None
                 };
-                let local = LocalRouter::start_with_directed_presence_limit(
-                    &dispatcher.handle(),
+                let local = LocalRouter::with_options(
                     Arc::clone(&stanza_pool),
                     config
                         .limits
                         .c2s
                         .max_directed_presence_recipients_per_resource,
-                )
-                .await
-                .map_err(RunError::Router)?;
+                );
                 let serving_router = router
                     .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions));
                 let router_handle = serving_router.handle();
@@ -325,7 +322,7 @@ async fn run_services<A: ChunkAllocator + Clone>(
                     tracing::error!(
                         component = "router",
                         shard_id = failure.shard_id,
-                        reason = failure.reason.as_str(),
+                        reason = "panicked",
                         "router service failed"
                     );
                     Err(RunError::RouterFailed(failure))
@@ -400,12 +397,12 @@ fn invalid_worker_count() -> io::Error {
 #[cfg(test)]
 mod supervision_tests {
     use super::*;
-    use router::{RouterFailure, RouterFailureReason};
+    use router::RouterFailure;
 
     #[test]
     fn bounded_service_drain_keeps_observed_router_failure_primary() -> io::Result<()> {
         Runtime::new()?.block_on(async {
-            let failure = RouterFailure { shard_id: 2, reason: RouterFailureReason::Panicked };
+            let failure = RouterFailure { shard_id: 2 };
             let result = drain_services_until(Instant::now(), Some(failure), pending()).await;
             assert!(matches!(result, Err(RunError::RouterFailed(actual)) if actual == failure));
             let result = drain_services_until(Instant::now(), None, pending()).await;

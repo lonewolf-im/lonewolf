@@ -46,36 +46,13 @@ pub struct RouterHandle<A: ChunkAllocator> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RouterFailureReason {
-    Completed,
-    Panicked,
-    Cancelled,
-}
-
-impl RouterFailureReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Panicked => "panicked",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RouterFailure {
     pub shard_id: usize,
-    pub reason: RouterFailureReason,
 }
 
 impl fmt::Display for RouterFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "router shard {} {}",
-            self.shard_id,
-            self.reason.as_str()
-        )
+        write!(formatter, "router shard {} panicked", self.shard_id)
     }
 }
 
@@ -601,7 +578,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
-    /// The builder must use the supplied full JID and must not block the router worker.
+    /// The builder must use the supplied full JID and must not block the calling thread.
     /// Build failures retire all tagged sessions; mailbox failures retire the affected session.
     pub async fn route_to_tagged(
         &self,

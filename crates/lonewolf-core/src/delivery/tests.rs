@@ -23,7 +23,6 @@ use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
 use lonewolf_storage::offline::{OfflineReads, OfflineSequence, OfflineWrites};
 use lonewolf_storage::{RedbStorage, RedbWrite, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
-use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
@@ -105,10 +104,9 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
-        let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
         let config = Config::default();
         let hosts = Hosts::new(&config.hosts, None)?;
-        let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
+        let local = LocalRouter::new(GlobalChunkAllocator);
         let router = Router::new(hosts, local);
         let handle = router.handle();
         let owner = account("bob@localhost")?;
@@ -181,7 +179,6 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
         drop(committed);
         drop(registration);
         router.shutdown().await?;
-        dispatcher.shutdown(Duration::from_secs(5)).await?;
         Ok(())
     }))?
 }
@@ -191,9 +188,8 @@ fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgemen
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
-        let dispatcher = CoreDispatcher::new(NonZeroUsize::MIN, NonZeroUsize::MIN)?;
         let config = Config::default();
-        let local = LocalRouter::start(&dispatcher.handle(), GlobalChunkAllocator).await?;
+        let local = LocalRouter::new(GlobalChunkAllocator);
         let router = Router::new(Hosts::new(&config.hosts, None)?, local);
         let handle = router.handle();
         let owner = account("bob@localhost")?;
@@ -284,7 +280,6 @@ fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgemen
         drop(snapshot);
         drop(registration);
         router.shutdown().await?;
-        dispatcher.shutdown(Duration::from_secs(5)).await?;
         Ok(())
     }))?
 }

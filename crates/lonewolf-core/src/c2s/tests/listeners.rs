@@ -14,7 +14,7 @@ use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
-use lonewolf_util::core_dispatcher::{CoreDispatcher, DispatchHandle};
+use lonewolf_util::core_dispatcher::CoreDispatcher;
 use tracing::instrument::WithSubscriber;
 
 use super::*;
@@ -46,11 +46,8 @@ fn hosts() -> Result<Hosts, HostsError> {
     Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())
 }
 
-async fn router(
-    dispatcher: &DispatchHandle,
-    hosts: &Hosts,
-) -> io::Result<Router<GlobalChunkAllocator>> {
-    let local = LocalRouter::start(dispatcher, GlobalChunkAllocator).await?;
+async fn router(hosts: &Hosts) -> io::Result<Router<GlobalChunkAllocator>> {
+    let local = LocalRouter::new(GlobalChunkAllocator);
     Ok(Router::new(hosts.clone(), local))
 }
 
@@ -84,7 +81,7 @@ impl Write for RejectionLog {
 async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, Box<dyn Error>> {
     let dispatcher = dispatcher()?;
     let hosts = hosts()?;
-    let router = router(&dispatcher.handle(), &hosts).await?;
+    let router = router(&hosts).await?;
     let (auth, _directory) = auth()?;
     let log = RejectionLog {
         bytes: Arc::new(Mutex::new(Vec::new())),
@@ -251,7 +248,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
         let mut threads = Vec::with_capacity(handle.worker_count());
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
         let hosts = hosts()?;
-        let router = router(&handle, &hosts).await?;
+        let router = router(&hosts).await?;
         let (auth, _directory) = auth()?;
         for index in 0..handle.worker_count() {
             let (ready, readiness) = oneshot::channel();
@@ -349,7 +346,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
         let handle = dispatcher.handle();
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
         let hosts = hosts()?;
-        let router = router(&handle, &hosts).await?;
+        let router = router(&hosts).await?;
         let (auth, _directory) = auth()?;
         let mut addresses = Vec::with_capacity(2);
         let mut tasks = Vec::with_capacity(2);
@@ -469,7 +466,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
         };
         let (auth, _directory) = auth()?;
         let hosts = hosts()?;
-        let router = router(&handle, &hosts).await?;
+        let router = router(&hosts).await?;
         let mut listeners = Listeners::start(
             &config,
             &C2sLimits::default(),
@@ -521,7 +518,7 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
         };
         let (auth, _directory) = auth()?;
         let hosts = hosts()?;
-        let router = router(&dispatcher.handle(), &hosts).await?;
+        let router = router(&hosts).await?;
         let error = Listeners::start(
             &config,
             &C2sLimits::default(),

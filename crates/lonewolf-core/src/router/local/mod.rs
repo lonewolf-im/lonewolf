@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+
+mod registration;
+mod shard;
+mod shards;
+
+pub(crate) use registration::{
+    DirectedWithdrawal, Mailbox, PresenceChange, Registration, ResourceMatch, RetireCause,
+    SessionHandle, SessionLiveness, release_deferred,
+};
+pub(crate) use shards::LocalRouter;
+pub(super) use shards::LocalRouterHandle;

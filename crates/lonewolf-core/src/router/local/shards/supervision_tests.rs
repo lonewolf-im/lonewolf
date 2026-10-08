@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::error::Error;
+use std::future::Future;
+use std::pin::pin;
 use std::process::Command as Process;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
-use lonewolf_util::arena::GlobalChunkAllocator;
+use futures_util::FutureExt;
+use lonewolf_util::arena::{Arena, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
-use lonewolf_xmpp::stanza::{Stanza, StanzaNamespace};
-use std::pin::pin;
+use lonewolf_xmpp::stanza::{MessageType, Stanza, StanzaNamespace};
 
+use super::super::registration::RetireCause;
 use super::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -148,7 +151,7 @@ fn a_panic_while_stopping_makes_shutdown_fail_without_changing_state() -> TestRe
 fn active_tagged_callback_panic_cleans_up_without_aborting() -> TestResult {
     let output = Process::new(std::env::current_exe()?)
         .args([
-            "router::local::supervision_tests::tagged_callback_panic_process",
+            "router::local::shards::supervision_tests::tagged_callback_panic_process",
             "--exact",
             "--ignored",
             "--nocapture",

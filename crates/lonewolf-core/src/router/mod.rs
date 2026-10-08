@@ -25,20 +25,20 @@ use crate::hosts::Hosts;
 use crate::order::Order;
 pub(crate) use local::ResourceMatch;
 
-pub mod local;
+pub(crate) mod local;
 
-pub use local::Registration;
+pub(crate) use local::Registration;
 use local::SessionLiveness;
 use local::{LocalRouter, LocalRouterHandle};
 pub(crate) use local::{Mailbox, SessionHandle, release_deferred};
-pub use lonewolf_xmpp::stanza::RoutedStanza;
+pub(crate) use lonewolf_xmpp::stanza::RoutedStanza;
 
-pub struct Router<A: ChunkAllocator> {
+pub(crate) struct Router<A: ChunkAllocator> {
     local: LocalRouter<A>,
     handle: RouterHandle<A>,
 }
 
-pub struct RouterHandle<A: ChunkAllocator> {
+pub(crate) struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
     local: LocalRouterHandle<A>,
     extensions: Arc<BTreeMap<String, ExtensionRegistry<A, RedbStorage>>>,
@@ -66,7 +66,7 @@ pub(crate) enum RouterState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RouterError {
+pub(crate) enum RouterError {
     InvalidTarget,
     RemoteUnsupported,
     InvalidResource,
@@ -80,7 +80,7 @@ pub enum RouterError {
 }
 
 impl<A: ChunkAllocator + Clone> Router<A> {
-    pub fn new(hosts: Hosts, local: LocalRouter<A>) -> Self {
+    pub(crate) fn new(hosts: Hosts, local: LocalRouter<A>) -> Self {
         let handle = RouterHandle {
             hosts,
             local: local.handle(),
@@ -90,7 +90,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         Self { local, handle }
     }
 
-    pub fn handle(&self) -> RouterHandle<A> {
+    pub(crate) fn handle(&self) -> RouterHandle<A> {
         self.handle.clone()
     }
 
@@ -114,7 +114,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         self.local.failure().await
     }
 
-    pub async fn shutdown(self) -> io::Result<()> {
+    pub(crate) async fn shutdown(self) -> io::Result<()> {
         self.local.shutdown().await
     }
 }
@@ -203,7 +203,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     }
 
     /// Applies the incoming listener's limit to resources on all listeners.
-    pub async fn register(
+    pub(crate) async fn register(
         &self,
         account: &AccountKey,
         requested: Option<&str>,
@@ -219,7 +219,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     }
 
     /// Enqueues a stanza for a connected full JID without waiting for socket I/O.
-    pub async fn route_full(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+    pub(crate) async fn route_full(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let to = view
             .to()
@@ -277,7 +277,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.deliver_full_guarded(stanza, source).await
     }
 
-    pub async fn route_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+    pub(crate) async fn route_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if !matches!(view.stanza_type(), StanzaType::Message(_)) {
             return Err(RouterError::InvalidTarget);
@@ -580,7 +580,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     /// The builder must use the supplied full JID and must not block the calling thread.
     /// Build failures retire all tagged sessions; mailbox failures retire the affected session.
-    pub async fn route_to_tagged(
+    pub(crate) async fn route_to_tagged(
         &self,
         account: &AccountKey,
         tag: SessionTag,

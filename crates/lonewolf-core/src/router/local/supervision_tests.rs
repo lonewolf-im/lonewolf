@@ -182,7 +182,7 @@ fn tagged_callback_panic_process() -> TestResult {
         let registration = handle
             .register(&alice, Some("desk"), NonZeroUsize::MIN)
             .await?;
-        registration.tag(SessionTag::Interested).await?;
+        registration.handle().tag(SessionTag::Interested).await?;
         let old = registration.handle();
         let mut recipient_arena = Arena::try_new(Default::default())?;
         let recipient = Jid::parse_in("bob@localhost/phone", &mut recipient_arena)?;

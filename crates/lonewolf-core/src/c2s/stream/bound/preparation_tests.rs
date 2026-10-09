@@ -288,6 +288,7 @@ async fn session<'a>(
             allocator: GlobalChunkAllocator,
             available: false,
             priority: None,
+            certificate: None,
             outbox,
         },
         entered,

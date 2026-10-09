@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use futures_util::future::{Either, select};
+use futures_util::future::{Either, join, select};
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::message::{Backlog, MessageHandler, StoreOutcome, UndeliverableMessage};
@@ -45,6 +45,7 @@ use crate::router::{
     Registration, ResourceMatch, RoutedStanza, RouterError, RouterHandle, SessionHandle,
 };
 
+mod link;
 mod output;
 
 use output::{Outgoing, OutputSequence, Release};
@@ -60,6 +61,7 @@ struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
     allocator: A,
     available: bool,
     priority: Option<i8>,
+    certificate: Option<&'w CertificateMonitor>,
     outbox: Outbox<'w, A, W>,
 }
 
@@ -74,7 +76,6 @@ struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     liveness: SessionLiveness,
     acknowledgement: Option<ReplayAcknowledgement>,
     work: &'w WorkGroup,
-    certificate: Option<&'w CertificateMonitor>,
 }
 
 struct ReplayAcknowledgement {
@@ -183,11 +184,12 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     work: &mut WorkGroup,
 ) -> CloseOutcome {
     let Bound {
-        session: Session {
-            mut reader,
-            writer,
-            close,
-        },
+        session:
+            Session {
+                mut reader,
+                mut writer,
+                close,
+            },
         monitor,
         registration,
         router,
@@ -195,80 +197,91 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         allocator,
         resource_requested: _,
     } = bound;
-    let outbox = Outbox {
-        queue: VecDeque::new(),
-        writer,
-        written: OutputSequence::default(),
-        releases: VecDeque::new(),
-        allocator: allocator.clone(),
-        account: registration.account().clone(),
-        storage: storage.clone(),
-        liveness: registration.liveness(),
-        acknowledgement: None,
-        work,
-        certificate: monitor.as_ref(),
-    };
-    let mut session = BoundSession {
-        registration,
-        router,
-        storage,
-        allocator,
-        available: false,
-        priority: None,
-        outbox,
-    };
-    let stopped = {
-        let retired = pin!(session.registration.wait_retired());
-        match select(
-            retired,
-            pin!(close.interrupt(async {
-                let operation = async { Ok(session.run(&mut reader).await) };
-                match &monitor {
-                    Some(monitor) => monitor.interrupt(operation).await,
-                    None => operation.await,
+    let (link, transport) = link::link();
+    let serve = async {
+        let outbox = Outbox {
+            queue: VecDeque::new(),
+            writer: link,
+            written: OutputSequence::default(),
+            releases: VecDeque::new(),
+            allocator: allocator.clone(),
+            account: registration.account().clone(),
+            storage: storage.clone(),
+            liveness: registration.liveness(),
+            acknowledgement: None,
+            work: &*work,
+        };
+        let mut session = BoundSession {
+            registration,
+            router,
+            storage,
+            allocator,
+            available: false,
+            priority: None,
+            certificate: monitor.as_ref(),
+            outbox,
+        };
+        let stopped = {
+            let retired = pin!(session.registration.wait_retired());
+            match select(
+                retired,
+                pin!(close.interrupt(async {
+                    let operation = async { Ok(session.run(&mut reader).await) };
+                    match &monitor {
+                        Some(monitor) => monitor.interrupt(operation).await,
+                        None => operation.await,
+                    }
+                })),
+            )
+            .await
+            {
+                Either::Left((retired, _)) => Either::Left(retired.map(|retired| retired.cause)),
+                Either::Right((outcome, _)) => {
+                    Either::Right(outcome.unwrap_or_else(|outcome| outcome))
                 }
-            })),
-        )
-        .await
-        {
-            Either::Left((retired, _)) => Either::Left(retired.map(|retired| retired.cause)),
-            Either::Right((outcome, _)) => Either::Right(outcome.unwrap_or_else(|outcome| outcome)),
-        }
+            }
+        };
+        session.outbox.writer.stop();
+        let outcome = match stopped {
+            Either::Right(outcome) => outcome,
+            Either::Left(Ok(RetireCause::AccountDeleted)) => CloseOutcome::AccountDeleted,
+            Either::Left(_) => CloseOutcome::InternalError,
+        };
+        let deadline = close.deadline();
+        let (acknowledgement, outcome) = close
+            .cleanup(deadline, async {
+                let ended = session.end().await;
+                let outcome = ended.map_or(CloseOutcome::InternalError, |()| outcome);
+                let BoundSession {
+                    registration,
+                    outbox,
+                    ..
+                } = session;
+                drop(registration);
+                let Outbox {
+                    acknowledgement, ..
+                } = outbox;
+                (acknowledgement, outcome)
+            })
+            .await;
+        close.cleanup(deadline, work.drain()).await;
+        (acknowledgement, outcome, deadline)
     };
-    let outcome = match stopped {
-        Either::Right(outcome) => outcome,
-        Either::Left(Ok(RetireCause::AccountDeleted)) => CloseOutcome::AccountDeleted,
-        Either::Left(_) => CloseOutcome::InternalError,
-    };
-    let deadline = close.deadline();
-    let (mut writer, acknowledgement, outcome) = close
-        .cleanup(deadline, async {
-            let ended = session.end().await;
-            let outcome = ended.map_or(CloseOutcome::InternalError, |()| outcome);
-            let BoundSession {
-                registration,
-                outbox,
-                ..
-            } = session;
-            drop(registration);
-            let Outbox {
-                writer,
-                acknowledgement,
-                ..
-            } = outbox;
-            (writer, acknowledgement, outcome)
-        })
-        .await;
-    close.cleanup(deadline, work.drain()).await;
+    let ((acknowledgement, outcome, deadline), ()) =
+        join(serve, transport.run(&mut writer, monitor.as_ref())).await;
     drop(acknowledgement);
     close::finish(&mut reader, &mut writer, outcome.into(), &close, deadline).await
 }
 
 impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
+    fn check_certificate(&self) -> Result<(), CloseOutcome> {
+        self.certificate.map_or(Ok(()), CertificateMonitor::check)
+    }
+
     async fn run(&mut self, reader: &mut Reader<A>) -> CloseOutcome {
         let mut prefer_outbound = true;
         'stream: loop {
-            if let Err(outcome) = self.outbox.check_certificate() {
+            if let Err(outcome) = self.check_certificate() {
                 break outcome;
             }
             let mut next = pin!(reader.next_event());
@@ -302,7 +315,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     Either::Right(None) => break 'stream CloseOutcome::InternalError,
                 }
             };
-            if let Err(outcome) = self.outbox.check_certificate() {
+            if let Err(outcome) = self.check_certificate() {
                 break outcome;
             }
             match event {
@@ -1320,9 +1333,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
 }
 
 impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
-    fn check_certificate(&self) -> Result<(), CloseOutcome> {
-        self.certificate.map_or(Ok(()), CertificateMonitor::check)
-    }
     fn push(&mut self, output: Output<A>) {
         self.queue.push_back(output);
     }
@@ -1397,12 +1407,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         while let Some(output) = self.queue.pop_front() {
             match output {
                 Output::Routed(stanza) => {
-                    self.check_certificate()?;
                     self.written = self.written.next();
                     self.writer.write(Outgoing::Routed(stanza)).await?;
                 }
                 Output::Owned { stanza, arena } => {
-                    self.check_certificate()?;
                     self.written = self.written.next();
                     self.writer.write(Outgoing::Owned { stanza, arena }).await?;
                 }
@@ -1414,7 +1422,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                                 StoredKind::Subscription(&subscription.sender),
                             )
                             .await?;
-                        self.check_certificate()?;
                         self.written = self.written.next();
                         self.writer.write(Outgoing::Routed(stanza)).await?;
                         pending_count += 1;
@@ -1428,7 +1435,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                             .await
                         {
                             Ok(stanza) => {
-                                self.check_certificate()?;
                                 self.written = self.written.next();
                                 self.writer.write(Outgoing::Routed(stanza)).await?;
                                 messages_written += 1;
@@ -1455,7 +1461,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 }
             }
         }
-        self.check_certificate()?;
         self.writer.flush(self.written).await?;
         if pending_count != 0 {
             tracing::info!(

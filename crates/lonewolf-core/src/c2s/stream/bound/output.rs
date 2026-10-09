@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
+use lonewolf_extension::message::MessageHandler;
+use lonewolf_storage::RedbStorage;
+use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::Stanza;
 
@@ -23,4 +28,12 @@ impl OutputSequence {
 pub(super) enum Outgoing<A: ChunkAllocator> {
     Routed(RoutedStanza<A>),
     Owned { stanza: Stanza, arena: Arena<A> },
+}
+
+/// A stored copy that output releases once its last stanza reaches the release stage.
+pub(super) enum Release<A: ChunkAllocator> {
+    Backlog {
+        handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+        through: OfflineSequence,
+    },
 }

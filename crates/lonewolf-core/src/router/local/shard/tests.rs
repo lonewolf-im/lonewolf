@@ -187,14 +187,19 @@ fn headline_prefers_success_then_busy_and_keeps_closed_sessions() -> Result<(), 
             receivers.push(inbound);
         }
         let stanza = routed("<message to='alice@localhost' type='headline'/>").await?;
-        assert!(sessions["full"].outbound.try_send(stanza.clone()).is_ok());
+        assert!(
+            sessions["full"]
+                .outbound
+                .try_send(MailboxEntry::new(stanza.clone()))
+                .is_ok()
+        );
         receivers[2].close();
         shard.accounts.insert(account.as_str().into(), sessions);
 
         assert_eq!(shard.deliver_bare(stanza.clone(), false), Ok(()));
         let delivery = receivers[0].try_recv()?;
         assert_eq!(
-            delivery.resolve()?.stanza_type(),
+            delivery.stanza.resolve()?.stanza_type(),
             StanzaType::Message(MessageType::Headline)
         );
         assert_eq!(receivers[1].len(), 1);
@@ -267,7 +272,12 @@ fn full_normal_delivery_linearizes_at_exact_resource_binding_and_disconnect()
                     assert_eq!(shard.deliver(stanza.clone(), true), Ok(()));
                     let delivered = desk.links.inbound.try_recv()?;
                     assert_eq!(
-                        delivered.resolve()?.to()?.ok_or("missing target")?.as_str(),
+                        delivered
+                            .stanza
+                            .resolve()?
+                            .to()?
+                            .ok_or("missing target")?
+                            .as_str(),
                         "alice@localhost/desk"
                     );
                 }
@@ -436,7 +446,7 @@ fn full_delivery_removes_stale_session_and_broadcasts_unavailable() -> Result<()
                 return Err("missing unavailable".into());
             };
             assert_eq!(
-                unavailable.resolve()?.stanza_type(),
+                unavailable.stanza.resolve()?.stanza_type(),
                 StanzaType::Presence(PresenceType::Unavailable)
             );
             assert!(!shard.accounts[account.as_str()].contains_key("desk"));
@@ -748,7 +758,7 @@ fn committed_directed_unavailable_survives_source_retirement_and_replacement()
             destination.deliver(unavailable, false)?;
             let delivered = observer.take_queued();
             assert_eq!(delivered.len(), 1);
-            assert_eq!(delivered[0].resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
+            assert_eq!(delivered[0].stanza.resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
             source.finish_presence(&alice, desk.token);
             let replacement_state = &source.accounts[alice.as_str()]["desk"];
             assert_eq!(replacement_state.token, replacement.token);
@@ -842,7 +852,7 @@ fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
         assert_eq!(unavailable.resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
         let replies = observer.take_queued();
         assert_eq!(replies.len(), 1);
-        let view = replies[0].resolve()?;
+        let view = replies[0].stanza.resolve()?;
         assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
         assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost");
         assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
@@ -855,7 +865,7 @@ fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
         assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
         let replies = observer.take_queued();
         assert_eq!(replies.len(), 1);
-        let view = replies[0].resolve()?;
+        let view = replies[0].stanza.resolve()?;
         assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
         assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost/desk");
         assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
@@ -865,7 +875,7 @@ fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
         assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
         let replies = observer.take_queued();
         assert_eq!(replies.len(), 1);
-        let view = replies[0].resolve()?;
+        let view = replies[0].stanza.resolve()?;
         assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
         assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost/desk");
         assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
@@ -876,7 +886,7 @@ fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
         assert!(shard.probe(&observer.handle(), &request, false)?.is_none());
         let replies = observer.take_queued();
         assert_eq!(replies.len(), 1);
-        let view = replies[0].resolve()?;
+        let view = replies[0].stanza.resolve()?;
         assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Unsubscribed));
         assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost");
         assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
@@ -980,7 +990,7 @@ fn probe_reads_grants_when_it_runs() -> Result<(), Box<dyn Error>> {
             assert!(shard.probe(&observer.handle(), &request, false)?.is_none());
             let replies = observer.take_queued();
             assert_eq!(replies.len(), 1);
-            let view = replies[0].resolve()?;
+            let view = replies[0].stanza.resolve()?;
             let (kind, from) = if available {
                 (PresenceType::Available, "alice@localhost/desk")
             } else {
@@ -1052,7 +1062,7 @@ fn full_probe_mailbox_preserves_the_requester_and_unavailable_prune() -> Result<
                 .await?;
         shard.accounts[bob.as_str()]["desk"]
             .outbound
-            .try_send(queued)?;
+            .try_send(MailboxEntry::new(queued))?;
         shard.record_directed_presence(
             &bob,
             "desk",
@@ -1087,7 +1097,7 @@ fn full_probe_mailbox_preserves_the_requester_and_unavailable_prune() -> Result<
         assert!(!observer.links.inbound.is_closed());
         let queued = observer.take_queued();
         assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].resolve()?.id()?, Some("queued"));
+        assert_eq!(queued[0].stanza.resolve()?.id()?, Some("queued"));
         assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
         assert_eq!(observer.take_queued().len(), 1);
         Ok(())
@@ -1111,7 +1121,7 @@ fn probe_unavailable_cache_is_bounded_and_does_not_invent_history() -> Result<()
         .await?;
         shard.probe(&observer.handle(), &request, true)?;
         let first = observer.take_queued().pop().ok_or("missing reply")?;
-        assert!(first.resolve()?.children()?.next().is_none());
+        assert!(first.stanza.resolve()?.children()?.next().is_none());
         let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
         let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
         let available = routed("<presence from='alice@localhost/desk'/>").await?;
@@ -1141,6 +1151,7 @@ fn probe_unavailable_cache_is_bounded_and_does_not_invent_history() -> Result<()
         let offline = observer.take_queued().pop().ok_or("missing reply")?;
         assert!(
             offline
+                .stanza
                 .resolve()?
                 .child("delay", "urn:xmpp:delay")?
                 .is_some()
@@ -1155,6 +1166,7 @@ fn probe_unavailable_cache_is_bounded_and_does_not_invent_history() -> Result<()
         let evicted = observer.take_queued().pop().ok_or("missing reply")?;
         assert!(
             evicted
+                .stanza
                 .resolve()?
                 .child("delay", "urn:xmpp:delay")?
                 .is_none()

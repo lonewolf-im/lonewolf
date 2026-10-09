@@ -1192,7 +1192,7 @@ fn cancelled_terminal_owner_keeps_directed_withdrawal_and_replacement_grants() -
         drop(pending);
         let unavailable = observer.recv().await.ok_or("missing terminal withdrawal")?;
         assert_eq!(
-            unavailable.resolve()?.stanza_type(),
+            unavailable.stanza.resolve()?.stanza_type(),
             StanzaType::Presence(PresenceType::Unavailable)
         );
         let replacement = handle
@@ -1280,7 +1280,7 @@ fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() ->
             fixture.work.start(),
             ticket,
             None,
-            move |_: Vec<RoutedStanza<GlobalChunkAllocator>>| work.run(),
+            move |_: Vec<MailboxEntry<GlobalChunkAllocator>>| work.run(),
         ));
         drop(blocker);
         fixture.work.drain().await;
@@ -1368,7 +1368,7 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
             fixture.work.start(),
             ticket,
             None,
-            move |_: Vec<RoutedStanza<GlobalChunkAllocator>>| work.run(),
+            move |_: Vec<MailboxEntry<GlobalChunkAllocator>>| work.run(),
         ));
         Pending::spawn(
             fixture.work.start(),
@@ -1758,11 +1758,12 @@ fn subscription_admission_linearizes_at_lookup_before_or_after_replacement() -> 
                 .await
                 .ok_or("missing bare notification")?;
             assert_eq!(
-                notification.resolve()?.stanza_type(),
+                notification.stanza.resolve()?.stanza_type(),
                 StanzaType::Presence(PresenceType::Unsubscribe)
             );
             assert_eq!(
                 notification
+                    .stanza
                     .resolve()?
                     .to()?
                     .ok_or("missing target")?
@@ -1960,7 +1961,7 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
             .await
             .ok_or("lost withdrawal after requester retirement")?;
         assert_eq!(
-            notification.resolve()?.stanza_type(),
+            notification.stanza.resolve()?.stanza_type(),
             StanzaType::Presence(PresenceType::Unsubscribe)
         );
         (cleanup.deliver)(&RouterDelivery::new(&router, &GlobalChunkAllocator, None)).await?;
@@ -2076,6 +2077,7 @@ fn admitted_pending_withdrawal_keeps_healthy_effects_under_mailbox_pressure_and_
                 .recv()
                 .await
                 .ok_or("lost sibling notification")?
+                .stanza
                 .resolve()?
                 .stanza_type(),
             StanzaType::Presence(PresenceType::Unsubscribe)

@@ -7,6 +7,8 @@ use lonewolf_xmpp::parser::ParseError;
 use lonewolf_xmpp::stanza::BuildError;
 use lonewolf_xmpp::stream::StreamErrorCondition;
 
+use crate::stages::StageFailure;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloseOutcome {
     StreamEnd,
@@ -148,6 +150,12 @@ impl From<JidError> for CloseOutcome {
 
 impl From<AccountKeyError> for CloseOutcome {
     fn from(_: AccountKeyError) -> Self {
+        Self::InternalError
+    }
+}
+
+impl From<StageFailure> for CloseOutcome {
+    fn from(_: StageFailure) -> Self {
         Self::InternalError
     }
 }

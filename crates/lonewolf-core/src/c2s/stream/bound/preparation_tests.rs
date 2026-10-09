@@ -358,7 +358,7 @@ fn guarded_preparations_release_writer_before_blocked_output_resumes() -> TestRe
                         let sender = Jid::parse_in("bob@localhost/preparing", &mut arena)?;
                         session.handle_iq_set(request, sender, arena, Arena::try_new(Default::default())?, gate.clone()).await
                     }
-                    Workflow::Offline => { let (stanza, arena) = request.into_parts(); session.store_message(RoutedStanza::from_parts(stanza, arena)).await }
+                    Workflow::Offline => session.handle_message(request, MessageType::Chat).await,
                     Workflow::Subscription => session.handle_subscription(request, PresenceRequestType::Subscribe).await,
                 }
             });

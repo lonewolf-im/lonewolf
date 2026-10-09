@@ -18,8 +18,9 @@ use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
 use super::registration::{
-    DirectedWithdrawal, Links, PresenceChange, Registration, ResourceMatch, RetireCause, Retired,
-    SessionHandle, SessionLiveness, SharedDirectedWithdrawal, Withdrawal, take_queued,
+    DirectedWithdrawal, Links, MailboxEntry, PresenceChange, Registration, ResourceMatch,
+    RetireCause, Retired, SessionHandle, SessionLiveness, SharedDirectedWithdrawal, Withdrawal,
+    take_queued,
 };
 use super::shards::LocalRouterHandle;
 #[cfg(test)]
@@ -76,8 +77,8 @@ struct RetiredPresence<A: ChunkAllocator> {
 pub(super) struct Session<A: ChunkAllocator> {
     token: u64,
     alive: Arc<AtomicBool>,
-    outbound: Sender<RoutedStanza<A>>,
-    inbound: Receiver<RoutedStanza<A>>,
+    outbound: Sender<MailboxEntry<A>>,
+    inbound: Receiver<MailboxEntry<A>>,
     pub(super) priority: Option<i8>,
     tags: SessionTags,
     presence: Option<RoutedStanza<A>>,
@@ -171,7 +172,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
                         && recipient.priority.is_some()
-                        && recipient.outbound.try_send(unavailable.clone()).is_err()
+                        && recipient
+                            .outbound
+                            .try_send(MailboxEntry::new(unavailable.clone()))
+                            .is_err()
                     {
                         pending.push((recipient_resource.clone(), recipient.token));
                     }
@@ -319,7 +323,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 if session.token != token
                     && session.alive.load(Ordering::Acquire)
                     && session.priority.is_some()
-                    && session.outbound.try_send(stanza.clone()).is_err()
+                    && session
+                        .outbound
+                        .try_send(MailboxEntry::new(stanza.clone()))
+                        .is_err()
                 {
                     failed.push((recipient_resource.clone(), session.token));
                 }
@@ -380,7 +387,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 if recipient.token != token
                     && recipient.alive.load(Ordering::Acquire)
                     && recipient.priority.is_some()
-                    && recipient.outbound.try_send(stanza.clone()).is_err()
+                    && recipient
+                        .outbound
+                        .try_send(MailboxEntry::new(stanza.clone()))
+                        .is_err()
                 {
                     failed.push((recipient_resource.clone(), recipient.token));
                 }
@@ -554,8 +564,8 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         account: AccountKey,
         requested: Option<Box<str>>,
         limit: NonZeroUsize,
-        outbound: Sender<RoutedStanza<A>>,
-        inbound: Receiver<RoutedStanza<A>>,
+        outbound: Sender<MailboxEntry<A>>,
+        inbound: Receiver<MailboxEntry<A>>,
         router: LocalRouterHandle<A>,
     ) -> Result<Registration<A>, RouterError> {
         if router.state() != RouterState::Running {
@@ -768,7 +778,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             return Ok(None);
         };
         for stanza in deliveries {
-            match sender.try_send(stanza) {
+            match sender.try_send(MailboxEntry::new(stanza)) {
                 Ok(()) | Err(TrySendError::Full(_)) => {}
                 Err(TrySendError::Closed(_)) => return Ok(None),
             }
@@ -848,7 +858,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             } else if session.alive.load(Ordering::Acquire) {
                 session
                     .outbound
-                    .try_send(stanza.clone())
+                    .try_send(MailboxEntry::new(stanza.clone()))
                     .map_err(mailbox_error)
             } else {
                 Err(RouterError::NotFound)
@@ -953,7 +963,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                     .values()
                     .filter(|session| session.accepts_bare_message())
                 {
-                    match session.outbound.try_send(stanza.clone()) {
+                    match session.outbound.try_send(MailboxEntry::new(stanza.clone())) {
                         Ok(()) => delivered = true,
                         Err(TrySendError::Full(_)) => busy = true,
                         Err(TrySendError::Closed(_)) => {}
@@ -1058,7 +1068,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             if !valid() {
                 continue;
             }
-            match session.outbound.try_send(stanza.clone()) {
+            match session.outbound.try_send(MailboxEntry::new(stanza.clone())) {
                 Ok(()) => delivered = true,
                 Err(TrySendError::Full(_)) => {
                     busy = true;
@@ -1175,7 +1185,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 };
                 if session.token == token
                     && (!session.alive.load(Ordering::Acquire)
-                        || session.outbound.try_send(stanza).is_err())
+                        || session
+                            .outbound
+                            .try_send(MailboxEntry::new(stanza))
+                            .is_err())
                 {
                     failed.push((resource, token));
                 }
@@ -1237,7 +1250,7 @@ fn enqueue_bare_message<A: ChunkAllocator>(
     recipient: &Session<A>,
     stanza: RoutedStanza<A>,
 ) -> Result<(), RouterError> {
-    match recipient.outbound.try_send(stanza) {
+    match recipient.outbound.try_send(MailboxEntry::new(stanza)) {
         Err(TrySendError::Closed(_)) if !sessions.values().any(Session::accepts_bare_message) => {
             Err(RouterError::Offline)
         }

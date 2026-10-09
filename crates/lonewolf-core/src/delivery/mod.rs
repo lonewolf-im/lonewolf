@@ -24,7 +24,7 @@ use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
 use crate::order::{Order, Ticket};
 use crate::router::{
-    Mailbox, Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle,
+    Mailbox, MailboxEntry, Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle,
 };
 
 pub(crate) struct WorkGroup {
@@ -153,7 +153,7 @@ pub(crate) fn after_turn<A, T, F, Fut>(
 where
     A: ChunkAllocator,
     T: 'static,
-    F: FnOnce(Vec<RoutedStanza<A>>) -> Fut + 'static,
+    F: FnOnce(Vec<MailboxEntry<A>>) -> Fut + 'static,
     Fut: Future<Output = T> + 'static,
 {
     let (report_turned, turned) = oneshot::channel();
@@ -336,7 +336,7 @@ pub(crate) fn commit_and_deliver<A, D, W>(
     delivery: D,
     mailbox: Option<Mailbox<A>>,
     diagnostics: EffectsDiagnostics,
-) -> Pending<Result<Vec<RoutedStanza<A>>, EffectsError>>
+) -> Pending<Result<Vec<MailboxEntry<A>>, EffectsError>>
 where
     A: ChunkAllocator + Clone + 'static,
     D: Delivery<A> + 'static,

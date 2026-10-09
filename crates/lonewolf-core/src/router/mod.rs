@@ -30,7 +30,7 @@ pub(crate) mod local;
 pub(crate) use local::Registration;
 use local::SessionLiveness;
 use local::{LocalRouter, LocalRouterHandle};
-pub(crate) use local::{Mailbox, SessionHandle, release_deferred};
+pub(crate) use local::{Mailbox, MailboxEntry, SessionHandle, release_deferred};
 pub(crate) use lonewolf_xmpp::stanza::RoutedStanza;
 
 pub(crate) struct Router<A: ChunkAllocator> {

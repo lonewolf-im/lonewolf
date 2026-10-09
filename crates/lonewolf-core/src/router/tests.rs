@@ -382,6 +382,7 @@ async fn receive_routed(
     registration
         .recv()
         .await
+        .map(|entry| entry.stanza)
         .ok_or_else(|| "closed resource mailbox".into())
 }
 
@@ -1093,7 +1094,7 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
             .await?;
         assert!(away.became_unavailable);
         assert_eq!(away.preceding.len(), 1);
-        assert_eq!(away.preceding[0].resolve()?.id()?, Some("old"));
+        assert_eq!(away.preceding[0].stanza.resolve()?.id()?, Some("old"));
         phone
             .handle()
             .set_presence(Some(0), identified_presence("phone", "new").await?, None)
@@ -1482,7 +1483,7 @@ fn unavailable_probe_reply_prunes_the_requester_grant() -> TestResult {
         let replies = bob.take_queued();
         assert_eq!(replies.len(), 1);
         assert_eq!(
-            replies[0].resolve()?.stanza_type(),
+            replies[0].stanza.resolve()?.stanza_type(),
             StanzaType::Presence(super::PresenceType::Unavailable)
         );
         assert!(!has_grant(&handle, &bob_account, "desk", "alice@localhost").await?);
@@ -1507,7 +1508,7 @@ fn unavailable_probe_reply_prunes_the_requester_grant() -> TestResult {
         let replies = bob.take_queued();
         assert_eq!(replies.len(), count);
         for reply in replies {
-            assert_eq!(reply.resolve()?.id()?, Some("queued"));
+            assert_eq!(reply.stanza.resolve()?.id()?, Some("queued"));
         }
         drop(bob);
         router.shutdown().await?;

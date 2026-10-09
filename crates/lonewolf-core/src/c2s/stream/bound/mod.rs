@@ -40,7 +40,8 @@ use crate::delivery::{
 use crate::order::Ticket;
 use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
 use crate::router::{
-    Registration, ResourceMatch, RoutedStanza, RouterError, RouterHandle, SessionHandle,
+    MailboxEntry, Registration, ResourceMatch, RoutedStanza, RouterError, RouterHandle,
+    SessionHandle,
 };
 
 mod link;
@@ -86,6 +87,7 @@ struct ReplayAcknowledgement {
 }
 
 enum Output<A: ChunkAllocator> {
+    Delivered(MailboxEntry<A>),
     Routed(RoutedStanza<A>),
     Owned {
         stanza: Stanza,
@@ -571,7 +573,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .finished()
             .await
             .ok_or(CloseOutcome::InternalError)??;
-        self.outbox.routed(outcome.queued);
+        self.outbox.delivered(outcome.queued);
         self.queue_iq_reply(
             request,
             sender,
@@ -655,7 +657,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     .await
                     .ok_or(CloseOutcome::InternalError)?
                     .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.routed(queued);
+                self.outbox.delivered(queued);
                 Ok(payload)
             }
             Err(error) => Err(error),
@@ -1105,7 +1107,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 work_group.start(),
                 ticket,
                 None,
-                move |_: Vec<RoutedStanza<A>>| work.run(),
+                move |_: Vec<MailboxEntry<A>>| work.run(),
             )))
         };
         let mut pending = match self.outbox.drain_until(registration, prepare).await?? {
@@ -1122,7 +1124,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         self.available = priority.is_some();
         self.priority = priority;
         // The router's mailbox cut keeps earlier sibling updates ahead of this echo.
-        self.outbox.routed(outcome.change.preceding);
+        self.outbox.delivered(outcome.change.preceding);
         self.outbox.routed(outcome.change.siblings);
         self.outbox.push(Output::Routed(outcome.echo));
         self.outbox.routed(outcome.replay);
@@ -1260,7 +1262,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     .await
                     .ok_or(CloseOutcome::InternalError)?
                     .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.routed(queued);
+                self.outbox.delivered(queued);
                 Ok(())
             }
             Some(Err(error)) => self.reply_error(&source, error.condition()),
@@ -1328,13 +1330,18 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         self.queue.extend(stanzas.into_iter().map(Output::Routed));
     }
 
+    fn delivered(&mut self, entries: impl IntoIterator<Item = MailboxEntry<A>>) {
+        self.queue
+            .extend(entries.into_iter().map(Output::Delivered));
+    }
+
     async fn drain_mailbox(
         &mut self,
         registration: &Registration<A>,
-        first: RoutedStanza<A>,
+        first: MailboxEntry<A>,
     ) -> Result<(), CloseOutcome> {
-        self.push(Output::Routed(first));
-        self.routed(registration.take_queued());
+        self.push(Output::Delivered(first));
+        self.delivered(registration.take_queued());
         self.flush().await
     }
 
@@ -1358,8 +1365,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
             match event {
                 Either::Left(output) => return Ok(output),
                 Either::Right(Some(delivery)) => {
-                    self.push(Output::Routed(delivery));
-                    self.routed(registration.take_queued());
+                    self.push(Output::Delivered(delivery));
+                    self.delivered(registration.take_queued());
                     let mut flush = pin!(self.flush());
                     match select(until.as_mut(), flush.as_mut()).await {
                         Either::Left((output, flush)) => {
@@ -1393,6 +1400,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         let mut pending_count = 0usize;
         while let Some(output) = self.queue.pop_front() {
             match output {
+                Output::Delivered(entry) => {
+                    self.written = self.written.next();
+                    self.writer.write(Outgoing::Routed(entry.stanza)).await?;
+                }
                 Output::Routed(stanza) => {
                     self.written = self.written.next();
                     self.writer.write(Outgoing::Routed(stanza)).await?;
@@ -1675,11 +1686,11 @@ struct GetOutcome<A: ChunkAllocator> {
     response: Arena<A>,
     reply: Result<Option<Element>, HandlerError>,
     /// Deliveries still queued when the ticket turned, written ahead of the reply.
-    queued: Vec<RoutedStanza<A>>,
+    queued: Vec<MailboxEntry<A>>,
 }
 
 impl<A: ChunkAllocator + Clone> GetWork<A> {
-    async fn run(self, queued: Vec<RoutedStanza<A>>) -> Result<GetOutcome<A>, CloseOutcome> {
+    async fn run(self, queued: Vec<MailboxEntry<A>>) -> Result<GetOutcome<A>, CloseOutcome> {
         let GetWork {
             account,
             transaction,

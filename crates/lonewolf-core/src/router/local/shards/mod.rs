@@ -19,7 +19,7 @@ use lonewolf_xmpp::stanza::{PresenceType, StanzaRef, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
 use super::registration::{
-    Registration, ResourceMatch, SessionHandle, SessionLiveness, release_deferred,
+    MailboxEntry, Registration, ResourceMatch, SessionHandle, SessionLiveness, release_deferred,
     validate_resource,
 };
 #[cfg(test)]
@@ -204,7 +204,8 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         let requested = requested
             .map(|resource| validate_resource(account, resource, self.allocator()))
             .transpose()?;
-        let (outbound, inbound) = async_channel::bounded(RESOURCE_QUEUE_CAPACITY);
+        let (outbound, inbound) =
+            async_channel::bounded::<MailboxEntry<A>>(RESOURCE_QUEUE_CAPACITY);
         self.with_shard(self.shard_index(account.as_str()), |shard| {
             shard.register(
                 account.clone(),

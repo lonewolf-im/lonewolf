@@ -58,8 +58,8 @@ pub(crate) struct Registration<A: ChunkAllocator> {
 
 pub(super) struct Links<A: ChunkAllocator> {
     pub(super) retired: Retirement<A>,
-    pub(super) inbound: Receiver<RoutedStanza<A>>,
-    pub(super) mailbox: WeakSender<RoutedStanza<A>>,
+    pub(super) inbound: Receiver<MailboxEntry<A>>,
+    pub(super) mailbox: WeakSender<MailboxEntry<A>>,
     pub(super) shard: usize,
     pub(super) router: LocalRouterHandle<A>,
 }
@@ -69,7 +69,7 @@ pub(crate) struct PresenceChange<A: ChunkAllocator> {
     pub(crate) became_eligible: bool,
     pub(crate) became_unavailable: bool,
     /// Write these deliveries before the update's echo to preserve mailbox order.
-    pub(crate) preceding: Vec<RoutedStanza<A>>,
+    pub(crate) preceding: Vec<MailboxEntry<A>>,
     /// Includes sibling presence only when this resource becomes available.
     pub(crate) siblings: Vec<RoutedStanza<A>>,
     pub(crate) directed: DirectedWithdrawal,
@@ -114,7 +114,7 @@ impl<A: ChunkAllocator> Registration<A> {
         format!("{}/{}", self.account.as_str(), self.resource)
     }
 
-    pub(crate) async fn recv(&self) -> Option<RoutedStanza<A>> {
+    pub(crate) async fn recv(&self) -> Option<MailboxEntry<A>> {
         self.links.inbound.recv().await.ok()
     }
 
@@ -122,7 +122,7 @@ impl<A: ChunkAllocator> Registration<A> {
         Mailbox(self.links.inbound.clone())
     }
 
-    pub(crate) fn take_queued(&self) -> Vec<RoutedStanza<A>> {
+    pub(crate) fn take_queued(&self) -> Vec<MailboxEntry<A>> {
         take_queued(&self.links.inbound)
     }
 
@@ -176,17 +176,27 @@ impl SessionLiveness {
     }
 }
 
-pub(crate) struct Mailbox<A: ChunkAllocator>(Receiver<RoutedStanza<A>>);
+pub(crate) struct MailboxEntry<A: ChunkAllocator> {
+    pub(crate) stanza: RoutedStanza<A>,
+}
+
+impl<A: ChunkAllocator> MailboxEntry<A> {
+    pub(crate) fn new(stanza: RoutedStanza<A>) -> Self {
+        Self { stanza }
+    }
+}
+
+pub(crate) struct Mailbox<A: ChunkAllocator>(Receiver<MailboxEntry<A>>);
 
 impl<A: ChunkAllocator> Mailbox<A> {
-    pub(crate) fn take_queued(&self) -> Vec<RoutedStanza<A>> {
+    pub(crate) fn take_queued(&self) -> Vec<MailboxEntry<A>> {
         take_queued(&self.0)
     }
 }
 
 pub(super) fn take_queued<A: ChunkAllocator>(
-    inbound: &Receiver<RoutedStanza<A>>,
-) -> Vec<RoutedStanza<A>> {
+    inbound: &Receiver<MailboxEntry<A>>,
+) -> Vec<MailboxEntry<A>> {
     let mut queued = Vec::new();
     while let Ok(delivery) = inbound.try_recv() {
         queued.push(delivery);
@@ -202,7 +212,7 @@ pub(crate) struct SessionHandle<A: ChunkAllocator> {
     retired: Retirement<A>,
     pub(super) router: LocalRouterHandle<A>,
     pub(super) liveness: SessionLiveness,
-    pub(super) mailbox: WeakSender<RoutedStanza<A>>,
+    pub(super) mailbox: WeakSender<MailboxEntry<A>>,
 }
 
 impl<A: ChunkAllocator + Clone> Clone for SessionHandle<A> {

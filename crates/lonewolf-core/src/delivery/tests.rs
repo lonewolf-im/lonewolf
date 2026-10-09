@@ -164,7 +164,7 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
             .await?;
         drop(ahead);
         let delivered = registration.recv().await.ok_or("missing live reroute")?;
-        assert_eq!(delivered.resolve()?.id()?, Some("raced"));
+        assert_eq!(delivered.stanza.resolve()?.id()?, Some("raced"));
         acknowledged.await?;
         let committed = storage.begin_write().await?;
         assert_eq!(committed.offline_count(&owner).await?, 0);
@@ -241,7 +241,7 @@ fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgemen
             .await?;
         drop(ahead);
         let delivered = registration.recv().await.ok_or("missing live reroute")?;
-        assert_eq!(delivered.resolve()?.id()?, Some("raced"));
+        assert_eq!(delivered.stanza.resolve()?.id()?, Some("raced"));
         let ((), mut retirement) = handle
             .order()
             .fix(vec![owner.clone()], deletion.commit())

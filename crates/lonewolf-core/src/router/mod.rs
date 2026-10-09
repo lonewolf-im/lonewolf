@@ -17,9 +17,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
-use lonewolf_xmpp::jid::Jid;
-#[cfg(test)]
-use lonewolf_xmpp::jid::JidRef;
+use lonewolf_xmpp::jid::{Jid, JidRef};
 use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, StanzaType};
 
 use crate::hosts::Hosts;
@@ -44,6 +42,18 @@ pub(crate) struct RouterHandle<A: ChunkAllocator> {
     local: LocalRouterHandle<A>,
     extensions: Arc<BTreeMap<String, ExtensionRegistry<A, RedbStorage>>>,
     order: Arc<Order>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Destination {
+    /// A served domain itself.
+    Server,
+    /// A resource of a served domain, which no session can bind.
+    ServerResource,
+    Account,
+    Resource,
+    /// A domain this server does not serve.
+    Remote,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +148,18 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     pub(crate) fn is_local_host(&self, domain: &str) -> bool {
         self.hosts.is_local_host(domain)
+    }
+
+    pub(crate) fn destination(&self, to: JidRef<'_>) -> Destination {
+        if !self.hosts.is_local_host(to.domainpart()) {
+            return Destination::Remote;
+        }
+        match (to.localpart(), to.resourcepart()) {
+            (None, None) => Destination::Server,
+            (None, Some(_)) => Destination::ServerResource,
+            (Some(_), None) => Destination::Account,
+            (Some(_), Some(_)) => Destination::Resource,
+        }
     }
 
     pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A, RedbStorage>> {
@@ -307,16 +329,12 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .to()
             .map_err(|_| RouterError::InvalidTarget)?
             .ok_or(RouterError::InvalidTarget)?;
-        if !self.hosts.is_local_host(to.domainpart()) {
-            return Err(RouterError::RemoteUnsupported);
-        }
-        if to.localpart().is_none() {
-            return Err(RouterError::NotFound);
-        }
-        if to.resourcepart().is_some() {
-            self.local.deliver_message(stanza, release).await
-        } else {
-            self.local.deliver_bare(stanza, release).await
+        let destination = self.destination(to);
+        match destination {
+            Destination::Remote => Err(RouterError::RemoteUnsupported),
+            Destination::Server | Destination::ServerResource => Err(RouterError::NotFound),
+            Destination::Resource => self.local.deliver_message(stanza, release).await,
+            Destination::Account => self.local.deliver_bare(stanza, release).await,
         }
     }
 
@@ -558,10 +576,13 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
                 .to()
                 .map_err(|_| RouterError::InvalidTarget)?
                 .ok_or(RouterError::InvalidTarget)?;
-            if !self.hosts.is_local_host(to.domainpart()) || to.localpart().is_none() {
-                return Ok(());
+            match self.destination(to) {
+                Destination::Resource => true,
+                Destination::Account => false,
+                Destination::Server | Destination::ServerResource | Destination::Remote => {
+                    return Ok(());
+                }
             }
-            to.resourcepart().is_some()
         };
         let delivered = if full {
             self.local.deliver_full(stanza).await

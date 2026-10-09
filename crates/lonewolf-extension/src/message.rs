@@ -57,7 +57,7 @@ pub trait MessageHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Removes messages through `through` after the client write and flush succeed.
+    /// Removes messages through `through` after a session delivers the replayed copies.
     fn acknowledge<'a>(
         &'a self,
         _account: &'a AccountKey,
@@ -67,7 +67,7 @@ pub trait MessageHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Removes a stored message after live delivery succeeds.
+    /// Removes a stored message after a session delivers its live copy; the row may already be gone.
     fn acknowledge_one<'a>(
         &'a self,
         _account: &'a AccountKey,

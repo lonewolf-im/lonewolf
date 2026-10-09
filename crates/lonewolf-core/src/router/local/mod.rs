@@ -6,7 +6,7 @@ mod shards;
 
 pub(crate) use registration::{
     DirectedWithdrawal, Mailbox, MailboxEntry, PresenceChange, Registration, ResourceMatch,
-    RetireCause, SessionHandle, SessionLiveness, release_deferred,
+    RetireCause, SessionHandle, SessionLiveness, StoredRelease, release_deferred,
 };
 pub(crate) use shards::LocalRouter;
 pub(super) use shards::LocalRouterHandle;

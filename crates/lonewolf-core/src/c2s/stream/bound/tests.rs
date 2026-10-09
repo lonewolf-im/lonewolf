@@ -26,8 +26,8 @@ use super::super::close;
 use super::*;
 use crate::config::Config;
 use crate::hosts::Hosts;
-use crate::router::Router;
 use crate::router::local::LocalRouter;
+use crate::router::{Router, StoredRelease};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const MESSAGE: &[u8] =
@@ -217,6 +217,7 @@ impl Fixture {
             storage: self.storage.clone(),
             liveness: self.registration.liveness(),
             acknowledgement: None,
+            messages: None,
             work: &self.work,
         }
     }
@@ -328,6 +329,199 @@ fn failed_write_or_flush_keeps_backlog_for_a_successful_retry() -> TestResult {
             fixture.finish().await?;
         }
         Ok(())
+    })
+}
+
+#[test]
+fn delivered_release_waits_for_the_covering_flush() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let sequence = fixture.backlog().await?.through;
+        let handler = Arc::new(Offline::new(Default::default()));
+        let mut outbox = fixture.outbox(
+            GlobalChunkAllocator,
+            ControlledWriter {
+                fail_flush: true,
+                ..Default::default()
+            },
+        );
+        let stanza = outbox
+            .parse_stored(MESSAGE, StoredKind::Message)
+            .await
+            .map_err(|_| "invalid stored message")?;
+        outbox.push(Output::Delivered(MailboxEntry {
+            stanza: stanza.clone(),
+            release: Some(StoredRelease {
+                handler: handler.clone(),
+                sequence,
+            }),
+        }));
+        assert!(outbox.flush().await.is_err());
+        assert!(outbox.releases.is_empty());
+        assert!(outbox.messages.is_none());
+        assert_eq!(fixture.count().await?, 1);
+        outbox.writer.fail_flush = false;
+        outbox.push(Output::Delivered(MailboxEntry {
+            stanza,
+            release: Some(StoredRelease { handler, sequence }),
+        }));
+        outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+        (&mut outbox
+            .messages
+            .as_mut()
+            .ok_or("missing release worker")?
+            .task)
+            .await?;
+        assert_eq!(fixture.count().await?, 0);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn unflushed_live_handoff_keeps_the_stored_copy() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let sequence = fixture.backlog().await?.through;
+        let outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        let stanza = outbox
+            .parse_stored(
+                b"<message xmlns='jabber:client' to='bob@localhost/phone' type='chat'/>",
+                StoredKind::Message,
+            )
+            .await
+            .map_err(|_| "invalid live message")?;
+        fixture
+            .router
+            .handle()
+            .route_stored_message(
+                stanza,
+                StoredRelease {
+                    handler: Arc::new(Offline::new(Default::default())),
+                    sequence,
+                },
+            )
+            .await?;
+        assert!(outbox.writer.written.is_empty());
+        drop(outbox);
+        let owner = fixture.registration.account().clone();
+        drop(fixture.registration);
+        assert_eq!(
+            fixture
+                .storage
+                .begin_read()
+                .await?
+                .offline_count(&owner)
+                .await?,
+            1
+        );
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn live_release_waiting_for_a_writer_cannot_delete_a_recreated_accounts_message() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE]).await?;
+        let owner = fixture.registration.account();
+        let sequence = fixture.backlog().await?.through;
+        let mut lifecycle = fixture.storage.begin_write().await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        let stanza = outbox
+            .parse_stored(MESSAGE, StoredKind::Message)
+            .await
+            .map_err(|_| "invalid stored message")?;
+        outbox.push(Output::Delivered(MailboxEntry {
+            stanza,
+            release: Some(StoredRelease {
+                handler: Arc::new(Offline::new(Default::default())),
+                sequence,
+            }),
+        }));
+        outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+        compio::runtime::spawn(async {}).await?;
+        assert!(
+            !outbox
+                .messages
+                .as_ref()
+                .ok_or("missing release worker")?
+                .task
+                .is_finished()
+        );
+        lifecycle.delete_account(owner).await?;
+        lifecycle.clear_offline_messages(owner).await?;
+        fixture.router.handle().retire_account(owner).await?;
+        lifecycle
+            .create_account(NewAccount {
+                key: owner.clone(),
+                credentials: credentials(),
+            })
+            .await?;
+        let fresh = lifecycle.push_offline_message(owner, 1, MESSAGE).await?;
+        assert_eq!(fresh.get(), 1);
+        lifecycle.commit().await?;
+        (&mut outbox
+            .messages
+            .as_mut()
+            .ok_or("missing release worker")?
+            .task)
+            .await?;
+        assert_eq!(fixture.count().await?, 1);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn repeated_live_flushes_coalesce_into_one_worker_and_release_each_sequence() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let messages: Vec<&[u8]> = (0..80).map(|_| MESSAGE).collect();
+        let fixture = Fixture::new(&messages).await?;
+        let writer = fixture.storage.begin_write().await?;
+        let handler = Arc::new(Offline::new(Default::default()));
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        let mut identity = None;
+        for message in fixture.backlog().await?.messages {
+            let stanza = outbox
+                .parse_stored(&message.stanza, StoredKind::Message)
+                .await
+                .map_err(|_| "invalid stored message")?;
+            outbox.push(Output::Delivered(MailboxEntry {
+                stanza,
+                release: Some(StoredRelease {
+                    handler: handler.clone(),
+                    sequence: message.sequence,
+                }),
+            }));
+            outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+            let worker = outbox.messages.as_ref().ok_or("missing release worker")?;
+            assert!(!worker.task.is_finished());
+            let original = identity.get_or_insert_with(|| worker.pending.clone());
+            assert!(Rc::ptr_eq(original, &worker.pending));
+            assert!(Rc::strong_count(&worker.pending) <= 3);
+        }
+        assert_eq!(
+            outbox
+                .messages
+                .as_ref()
+                .ok_or("missing release worker")?
+                .pending
+                .borrow()
+                .len(),
+            80
+        );
+        drop(writer);
+        (&mut outbox
+            .messages
+            .as_mut()
+            .ok_or("missing release worker")?
+            .task)
+            .await?;
+        assert_eq!(fixture.count().await?, 0);
+        assert_eq!(outbox.writer.written.len(), 80);
+        drop(outbox);
+        fixture.finish().await
     })
 }
 

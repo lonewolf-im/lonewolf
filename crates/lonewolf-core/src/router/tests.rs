@@ -11,11 +11,13 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
-use crate::router::{Registration, RoutedStanza, Router, RouterError};
+use crate::router::{Registration, RoutedStanza, Router, RouterError, StoredRelease};
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_extension::delivery::SessionTag;
+use lonewolf_extension::offline::Offline;
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
@@ -271,6 +273,102 @@ fn missing_normal_resource_does_not_fall_back_to_an_eligible_sibling() -> TestRe
             "alice@localhost/missing"
         );
         drop(resource);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn stored_message_release_follows_the_selected_bare_recipient() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("bob@localhost")?;
+        let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        for (resource, priority) in [(&phone, 1), (&desk, 0)] {
+            resource
+                .handle()
+                .set_presence(
+                    Some(priority),
+                    parse_stanza(&format!(
+                        "<presence from='bob@localhost/{}'/>",
+                        resource.resource()
+                    ))
+                    .await?,
+                    None,
+                )
+                .await?;
+        }
+        phone.take_queued();
+        desk.take_queued();
+        let sequence = OfflineSequence::new(7);
+        handle
+            .route_stored_message(
+                stanza("bob@localhost").await?,
+                StoredRelease {
+                    handler: Arc::new(Offline::new(Default::default())),
+                    sequence,
+                },
+            )
+            .await?;
+        let delivered = phone.recv().await.ok_or("missing stored delivery")?;
+        assert_eq!(
+            delivered.release.as_ref().map(|release| release.sequence),
+            Some(sequence)
+        );
+        assert!(phone.take_queued().is_empty());
+        assert!(desk.take_queued().is_empty());
+        drop((phone, desk));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn chat_fallback_keeps_the_release_after_a_missing_full_target() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("bob@localhost")?;
+        let phone = handle
+            .register(&owner, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        phone
+            .handle()
+            .set_presence(
+                Some(0),
+                parse_stanza("<presence from='bob@localhost/phone'/>").await?,
+                None,
+            )
+            .await?;
+        let sequence = OfflineSequence::new(9);
+        handle
+            .route_stored_message(
+                parse_stanza("<message to='bob@localhost/missing' type='chat'/>").await?,
+                StoredRelease {
+                    handler: Arc::new(Offline::new(Default::default())),
+                    sequence,
+                },
+            )
+            .await?;
+        let delivered = phone.recv().await.ok_or("missing stored delivery")?;
+        assert_eq!(
+            delivered.release.as_ref().map(|release| release.sequence),
+            Some(sequence)
+        );
+        assert_eq!(
+            delivered
+                .stanza
+                .resolve()?
+                .to()?
+                .ok_or("missing target")?
+                .as_str(),
+            "bob@localhost/missing"
+        );
+        assert!(phone.take_queued().is_empty());
+        drop(phone);
         router.shutdown().await?;
         Ok(())
     })

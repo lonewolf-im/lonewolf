@@ -8,25 +8,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
-use futures_channel::oneshot;
 use futures_util::FutureExt;
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
 use lonewolf_extension::Effects;
-use lonewolf_extension::ExtensionFuture;
 use lonewolf_extension::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
+    Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionTag, StanzaFactory,
 };
-use lonewolf_extension::message::MessageHandler;
+use lonewolf_extension::offline::Offline;
 use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
-use lonewolf_storage::offline::{OfflineReads, OfflineSequence, OfflineWrites};
-use lonewolf_storage::{RedbStorage, RedbWrite, Storage, WriteTransaction};
+use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
-use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
-use parking_lot::Mutex as PlMutex;
+use lonewolf_xmpp::stanza::RoutedStanza;
 
 use super::{EffectsDiagnostics, StoredDelivery, WorkGroup, commit_and_deliver, commit_and_store};
 use crate::config::Config;
@@ -36,37 +33,6 @@ use crate::router::local::LocalRouter;
 use crate::router::{Router, RouterError};
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-
-struct AckNotice {
-    done: PlMutex<Option<oneshot::Sender<()>>>,
-    release: PlMutex<Option<oneshot::Receiver<()>>>,
-}
-
-impl MessageHandler<GlobalChunkAllocator, RedbStorage> for AckNotice {
-    fn acknowledge_one<'a>(
-        &'a self,
-        account: &'a AccountKey,
-        sequence: OfflineSequence,
-        transaction: &'a mut RedbWrite,
-    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
-        Box::pin(async move {
-            if let Some(done) = self.done.lock().take() {
-                let _ = done.send(());
-            }
-            let release = self.release.lock().take();
-            if let Some(release) = release {
-                release
-                    .await
-                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            }
-            transaction
-                .remove_offline_message(account, sequence)
-                .await
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-            Ok(())
-        })
-    }
-}
 
 async fn parsed(xml: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
     let input = format!(
@@ -131,15 +97,10 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
         let sequence = transaction
             .push_offline_message(&owner, 0, b"<message to='bob@localhost'/>")
             .await?;
-        let (done, acknowledged) = oneshot::channel();
-        let handler = Arc::new(AckNotice {
-            done: PlMutex::new(Some(done)),
-            release: PlMutex::new(None),
-        });
+        let handler = Arc::new(Offline::new(Default::default()));
         let pending = commit_and_store(
             WorkGroup::new().start(),
             handle.clone(),
-            storage.clone(),
             transaction,
             handler,
             StoredDelivery {
@@ -165,111 +126,13 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
         drop(ahead);
         let delivered = registration.recv().await.ok_or("missing live reroute")?;
         assert_eq!(delivered.stanza.resolve()?.id()?, Some("raced"));
-        acknowledged.await?;
-        let committed = storage.begin_write().await?;
-        assert_eq!(committed.offline_count(&owner).await?, 0);
-        drop(committed);
-        drop(registration);
-        router.shutdown().await?;
-        Ok(())
-    }))?
-}
-
-#[test]
-fn committed_deletion_keeps_retirement_and_recreation_behind_live_acknowledgement() -> TestResult {
-    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
-        let directory = tempfile::tempdir()?;
-        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
-        let config = Config::default();
-        let local = LocalRouter::new(GlobalChunkAllocator);
-        let router = Router::new(Hosts::new(&config.hosts, None)?, local);
-        let handle = router.handle();
-        let owner = account("bob@localhost")?;
-        let credentials = ScramCredentials::new(ScramVerifier::Sha1(ScramSha1Verifier::new(
-            [11; 16],
-            SCRAM_POLICY_ITERATIONS,
-            [12; 20],
-            [13; 20],
-        )));
-        let mut transaction = storage.begin_write().await?;
-        transaction
-            .create_account(NewAccount {
-                key: owner.clone(),
-                credentials: credentials.clone(),
-            })
-            .await?;
-        transaction.commit().await?;
-        let registration = handle
-            .register(&owner, Some("phone"), NonZeroUsize::MIN)
-            .await?;
-        let ((), ahead) = handle
-            .order()
-            .fix(vec![owner.clone()], async { Ok::<_, DeliveryError>(()) })
-            .await?;
-        let mut transaction = storage.begin_write().await?;
-        let sequence = transaction
-            .push_offline_message(&owner, 0, b"<message to='bob@localhost'/>")
-            .await?;
-        let (done, acknowledging) = oneshot::channel();
-        let (release, released) = oneshot::channel();
-        let pending = commit_and_store(
-            WorkGroup::new().start(),
-            handle.clone(),
-            storage.clone(),
-            transaction,
-            Arc::new(AckNotice {
-                done: PlMutex::new(Some(done)),
-                release: PlMutex::new(Some(released)),
-            }),
-            StoredDelivery {
-                recipient: owner.clone(),
-                sequence,
-                stanza: parsed("<message to='bob@localhost' type='chat' id='raced'/>").await?,
-                bytes: 0,
-            },
+        assert_eq!(
+            delivered.release.as_ref().map(|release| release.sequence),
+            Some(sequence)
         );
-        let mut deletion = storage.begin_write().await?;
-        deletion.delete_account(&owner).await?;
-        deletion.clear_offline_messages(&owner).await?;
-        registration
-            .handle()
-            .set_presence(
-                Some(0),
-                parsed("<presence from='bob@localhost/phone'/>").await?,
-                Some(parsed("<presence from='bob@localhost/phone' type='unavailable'/>").await?),
-            )
-            .await?;
-        drop(ahead);
-        let delivered = registration.recv().await.ok_or("missing live reroute")?;
-        assert_eq!(delivered.stanza.resolve()?.id()?, Some("raced"));
-        let ((), mut retirement) = handle
-            .order()
-            .fix(vec![owner.clone()], deletion.commit())
-            .await?;
-        acknowledging.await?;
-        assert!(retirement.turn().now_or_never().is_none());
-        release
-            .send(())
-            .map_err(|_| "acknowledgement gate closed")?;
-        assert!(matches!(pending.finished().await, Some(Ok(()))));
-        retirement.turn().await;
-        handle.retire_account(&owner).await?;
-        drop(retirement);
-        let mut recreation = storage.begin_write().await?;
-        recreation
-            .create_account(NewAccount {
-                key: owner.clone(),
-                credentials,
-            })
-            .await?;
-        let fresh = recreation
-            .push_offline_message(&owner, 1, b"<message to='bob@localhost' id='fresh'/>")
-            .await?;
-        assert_eq!(fresh.get(), 1);
-        recreation.commit().await?;
-        let snapshot = storage.begin_read().await?;
-        assert_eq!(snapshot.offline_count(&owner).await?, 1);
-        drop(snapshot);
+        let committed = storage.begin_write().await?;
+        assert_eq!(committed.offline_count(&owner).await?, 1);
+        drop(committed);
         drop(registration);
         router.shutdown().await?;
         Ok(())

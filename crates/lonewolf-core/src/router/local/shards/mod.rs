@@ -19,8 +19,8 @@ use lonewolf_xmpp::stanza::{PresenceType, StanzaRef, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
 use super::registration::{
-    MailboxEntry, Registration, ResourceMatch, SessionHandle, SessionLiveness, release_deferred,
-    validate_resource,
+    MailboxEntry, Registration, ResourceMatch, SessionHandle, SessionLiveness, StoredRelease,
+    release_deferred, validate_resource,
 };
 #[cfg(test)]
 use super::shard::DirectedRecipient;
@@ -220,7 +220,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     }
 
     pub(crate) async fn deliver_full(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
-        self.deliver_full_or_chat_fallback(stanza, false, None)
+        self.deliver_full_or_chat_fallback(stanza, false, None, None)
             .await
     }
 
@@ -229,12 +229,17 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         stanza: RoutedStanza<A>,
         source: SessionLiveness,
     ) -> Result<(), RouterError> {
-        self.deliver_full_or_chat_fallback(stanza, false, Some(source))
+        self.deliver_full_or_chat_fallback(stanza, false, Some(source), None)
             .await
     }
 
-    pub(crate) async fn deliver_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
-        self.deliver_full_or_chat_fallback(stanza, true, None).await
+    pub(crate) async fn deliver_message(
+        &self,
+        stanza: RoutedStanza<A>,
+        release: Option<StoredRelease<A>>,
+    ) -> Result<(), RouterError> {
+        self.deliver_full_or_chat_fallback(stanza, true, None, release)
+            .await
     }
 
     pub(super) async fn deliver_full_or_chat_fallback(
@@ -242,14 +247,17 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         stanza: RoutedStanza<A>,
         fallback_chat: bool,
         source: Option<SessionLiveness>,
+        release: Option<StoredRelease<A>>,
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             self.full_target_shard(&view)?
         };
         self.with_shard(shard, |shard| match &source {
-            Some(source) => shard.deliver_with_guard(stanza, fallback_chat, || source.is_alive()),
-            None => shard.deliver(stanza, fallback_chat),
+            Some(source) => {
+                shard.deliver_with_guard(stanza, fallback_chat, || source.is_alive(), release)
+            }
+            None => shard.deliver(stanza, fallback_chat, release),
         })
         .await?
     }
@@ -270,12 +278,16 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         .await?
     }
 
-    pub(crate) async fn deliver_bare(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+    pub(crate) async fn deliver_bare(
+        &self,
+        stanza: RoutedStanza<A>,
+        release: Option<StoredRelease<A>>,
+    ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             self.bare_target_shard(&view)?
         };
-        self.with_shard(shard, |shard| shard.deliver_bare(stanza, false))
+        self.with_shard(shard, |shard| shard.deliver_bare(stanza, false, release))
             .await?
     }
 

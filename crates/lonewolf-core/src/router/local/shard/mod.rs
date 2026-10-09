@@ -19,8 +19,8 @@ use parking_lot::Mutex as PlMutex;
 
 use super::registration::{
     DirectedWithdrawal, Links, MailboxEntry, PresenceChange, Registration, ResourceMatch,
-    RetireCause, Retired, SessionHandle, SessionLiveness, SharedDirectedWithdrawal, Withdrawal,
-    take_queued,
+    RetireCause, Retired, SessionHandle, SessionLiveness, SharedDirectedWithdrawal, StoredRelease,
+    Withdrawal, take_queued,
 };
 use super::shards::LocalRouterHandle;
 #[cfg(test)]
@@ -829,8 +829,9 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         &mut self,
         stanza: RoutedStanza<A>,
         fallback_chat: bool,
+        release: Option<StoredRelease<A>>,
     ) -> Result<(), RouterError> {
-        self.deliver_with_guard(stanza, fallback_chat, || true)
+        self.deliver_with_guard(stanza, fallback_chat, || true, release)
     }
 
     pub(super) fn deliver_with_guard(
@@ -838,7 +839,9 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         stanza: RoutedStanza<A>,
         fallback_chat: bool,
         valid: impl Fn() -> bool,
+        release: Option<StoredRelease<A>>,
     ) -> Result<(), RouterError> {
+        let mut release = release;
         self.prune_directed(&stanza, None)?;
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let to = view
@@ -858,8 +861,19 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             } else if session.alive.load(Ordering::Acquire) {
                 session
                     .outbound
-                    .try_send(MailboxEntry::new(stanza.clone()))
-                    .map_err(mailbox_error)
+                    .try_send(MailboxEntry {
+                        stanza: stanza.clone(),
+                        release: release.take(),
+                    })
+                    .map_err(|error| {
+                        let closed = error.is_closed();
+                        release = error.into_inner().release;
+                        if closed {
+                            RouterError::NotFound
+                        } else {
+                            RouterError::Busy
+                        }
+                    })
             } else {
                 Err(RouterError::NotFound)
             };
@@ -873,7 +887,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 if fallback_chat
                     && view.stanza_type() == StanzaType::Message(MessageType::Chat) =>
             {
-                self.deliver_bare(stanza, true)
+                self.deliver_bare(stanza, true, release)
             }
             result => result,
         }
@@ -920,15 +934,19 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         {
             return Err(RouterError::NotFound);
         }
-        self.deliver_with_guard(stanza, false, || {
-            source.as_ref().is_none_or(SessionLiveness::is_alive)
-        })
+        self.deliver_with_guard(
+            stanza,
+            false,
+            || source.as_ref().is_none_or(SessionLiveness::is_alive),
+            None,
+        )
     }
 
     pub(super) fn deliver_bare(
         &mut self,
         stanza: RoutedStanza<A>,
         allow_full: bool,
+        release: Option<StoredRelease<A>>,
     ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let to = view
@@ -954,9 +972,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                     .filter(|session| session.accepts_bare_message())
                     .max_by_key(|session| (session.priority, std::cmp::Reverse(session.token)))
                     .ok_or(RouterError::Offline)?;
-                enqueue_bare_message(sessions, recipient, stanza)
+                enqueue_bare_message(sessions, recipient, stanza, release)
             }
             StanzaType::Message(MessageType::Headline) => {
+                debug_assert!(release.is_none());
                 let mut delivered = false;
                 let mut busy = false;
                 for session in sessions
@@ -1249,8 +1268,12 @@ fn enqueue_bare_message<A: ChunkAllocator>(
     sessions: &HashMap<Box<str>, Session<A>>,
     recipient: &Session<A>,
     stanza: RoutedStanza<A>,
+    release: Option<StoredRelease<A>>,
 ) -> Result<(), RouterError> {
-    match recipient.outbound.try_send(MailboxEntry::new(stanza)) {
+    match recipient
+        .outbound
+        .try_send(MailboxEntry { stanza, release })
+    {
         Err(TrySendError::Closed(_)) if !sessions.values().any(Session::accepts_bare_message) => {
             Err(RouterError::Offline)
         }

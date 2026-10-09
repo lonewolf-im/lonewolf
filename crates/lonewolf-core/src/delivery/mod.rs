@@ -15,16 +15,18 @@ use lonewolf_extension::delivery::{
     SessionTag, StanzaFactory,
 };
 use lonewolf_extension::message::MessageHandler;
+#[cfg(test)]
+use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
-use lonewolf_storage::{RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
+use lonewolf_storage::{RedbStorage, RedbWrite, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
-use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
 use crate::order::{Order, Ticket};
 use crate::router::{
     Mailbox, MailboxEntry, Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle,
+    StoredRelease,
 };
 
 pub(crate) struct WorkGroup {
@@ -223,7 +225,6 @@ pub(crate) struct StoredDelivery<A: ChunkAllocator> {
 pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
     guard: WorkGuard,
     router: RouterHandle<A>,
-    storage: RedbStorage,
     transaction: RedbWrite,
     handler: Arc<dyn MessageHandler<A, RedbStorage>>,
     stored: StoredDelivery<A>,
@@ -249,7 +250,16 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
             );
             ticket.turn().await;
             let _ = report_turned.send(());
-            match router.route_message(stored.stanza).await {
+            match router
+                .route_stored_message(
+                    stored.stanza,
+                    StoredRelease {
+                        handler,
+                        sequence: stored.sequence,
+                    },
+                )
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(
                         operation = "reroute",
@@ -257,38 +267,6 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                         recipient_jid = ?stored.recipient.as_str(),
                         "offline message rerouted"
                     );
-                    let acknowledged: Result<(), HandlerError> = async {
-                        let mut transaction = storage.begin_write().await.map_err(|error| {
-                            HandlerError::Internal {
-                                condition: StanzaErrorCondition::InternalServerError,
-                                failure: storage_failure(
-                                    error,
-                                    "offline_acknowledge_live_begin_write",
-                                ),
-                            }
-                        })?;
-                        handler
-                            .acknowledge_one(&stored.recipient, stored.sequence, &mut transaction)
-                            .await?;
-                        transaction
-                            .commit()
-                            .await
-                            .map_err(|error| HandlerError::Internal {
-                                condition: StanzaErrorCondition::InternalServerError,
-                                failure: storage_failure(error, "offline_acknowledge_live_commit"),
-                            })?;
-                        tracing::info!(
-                            operation = "acknowledge_live",
-                            outcome = "committed",
-                            recipient_jid = ?stored.recipient.as_str(),
-                            "offline message acknowledgement handled"
-                        );
-                        Ok(())
-                    }
-                    .await;
-                    if let Err(error) = acknowledged {
-                        report_handler_failure(&error, &stored.recipient);
-                    }
                 }
                 Err(error) => {
                     let reason = match error {
@@ -312,8 +290,6 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                     );
                 }
             }
-            // Keep account recreation behind this acknowledgement.
-            drop(ticket);
             Ok(())
         }
         .await;

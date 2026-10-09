@@ -22,6 +22,7 @@ use lonewolf_util::arena::{AllocationError, Chunk, GlobalChunkAllocator};
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
 
+use super::super::close;
 use super::*;
 use crate::config::Config;
 use crate::hosts::Hosts;
@@ -482,7 +483,7 @@ fn invalid_backlogs_wait_for_transport_flush_before_releasing_stored_rows() -> T
     Runtime::new()?.block_on(async {
         for completion in [Completion::Success, Completion::Failure, Completion::Cancel] {
             let fixture = Fixture::new(&[b"<message"]).await?;
-            let (link, transport) = link::link();
+            let (link, _incoming, transport) = link::link();
             let (notice, entered) = oneshot::channel();
             let (release, blocked) = oneshot::channel();
             let (done, mut acknowledged) = oneshot::channel();
@@ -498,7 +499,7 @@ fn invalid_backlogs_wait_for_transport_flush_before_releasing_stored_rows() -> T
                 handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
             });
             {
-                let mut running = pin!(transport.run(&mut controlled, None));
+                let mut running = pin!(transport.write(&mut controlled, None));
                 let mut release = Some(release);
                 {
                     let mut flushing = pin!(outbox.flush());
@@ -541,6 +542,7 @@ fn invalid_backlogs_wait_for_transport_flush_before_releasing_stored_rows() -> T
                         assert_eq!(fixture.count().await?, 1);
                     }
                 }
+                outbox.writer.close(CloseOutcome::StreamEnd).await;
                 drop(outbox);
                 assert!(poll!(running.as_mut()).is_ready());
             }

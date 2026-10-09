@@ -8,7 +8,7 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::stream::CloseOutcome;
-use crate::router::{Registration, RouterError, RouterHandle};
+use crate::router::{Destination, Registration, RouterError, RouterHandle};
 
 pub(super) struct ReplyError;
 
@@ -48,18 +48,10 @@ impl From<JidError> for ReplyError {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum IqDestination {
-    Account,
-    Server,
-    FullResource,
-    Remote,
-}
-
 pub(super) struct Route {
     pub(super) sender: Jid,
     pub(super) kind: IqType,
-    pub(super) destination: IqDestination,
+    pub(super) destination: Destination,
 }
 
 impl Route {
@@ -90,13 +82,8 @@ pub(super) fn route<A: ChunkAllocator + Clone>(
         return Err(BuildError::NotIqRequest.into());
     };
     let destination = match stanza.to()? {
-        None => IqDestination::Account,
-        Some(target) if !router.is_local_host(target.domainpart()) => IqDestination::Remote,
-        Some(target) => match (target.localpart(), target.resourcepart()) {
-            (None, None) => IqDestination::Server,
-            (Some(_), None) => IqDestination::Account,
-            (_, Some(_)) => IqDestination::FullResource,
-        },
+        None => Destination::Account,
+        Some(target) => router.destination(target),
     };
     Ok(Route {
         sender,

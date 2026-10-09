@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
-use crate::router::{Registration, RoutedStanza, Router, RouterError, StoredRelease};
+use crate::router::{Destination, Registration, RoutedStanza, Router, RouterError, StoredRelease};
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_extension::delivery::SessionTag;
@@ -32,6 +32,28 @@ const STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
 
 fn run_test(test: impl Future<Output = TestResult>) -> TestResult {
     Runtime::new()?.block_on(timeout(TIMEOUT, test))?
+}
+
+#[test]
+fn destination_classifies_each_address_shape() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        for (address, expected) in [
+            ("localhost", Destination::Server),
+            ("localhost/x", Destination::ServerResource),
+            ("alice@localhost", Destination::Account),
+            ("alice@localhost/desk", Destination::Resource),
+            ("example.org", Destination::Remote),
+            ("bob@example.org/x", Destination::Remote),
+        ] {
+            let jid = Jid::parse_in(address, &mut arena)?;
+            assert_eq!(handle.destination(jid.resolve(&arena)?), expected);
+        }
+        router.shutdown().await?;
+        Ok(())
+    })
 }
 
 #[test]

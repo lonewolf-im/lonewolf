@@ -40,8 +40,8 @@ use crate::delivery::{
 use crate::order::Ticket;
 use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
 use crate::router::{
-    MailboxEntry, Registration, ResourceMatch, RoutedStanza, RouterError, RouterHandle,
-    SessionHandle,
+    Destination, MailboxEntry, Registration, ResourceMatch, RoutedStanza, RouterError,
+    RouterHandle, SessionHandle,
 };
 
 mod link;
@@ -421,7 +421,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration, &self.router)?;
-        if route.destination == iq::IqDestination::FullResource {
+        if matches!(
+            route.destination,
+            Destination::Resource | Destination::ServerResource
+        ) {
             let routed = request
                 .derive_in(&mut arena)?
                 .from(Some(route.sender))?
@@ -444,9 +447,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .transpose()?
                 .ok_or(CloseOutcome::InternalError)?;
             let scope = match route.destination {
-                iq::IqDestination::Account => Some(IqScope::Account),
-                iq::IqDestination::Server => Some(IqScope::Server),
-                iq::IqDestination::FullResource | iq::IqDestination::Remote => None,
+                Destination::Account => Some(IqScope::Account),
+                Destination::Server => Some(IqScope::Server),
+                Destination::Resource | Destination::ServerResource | Destination::Remote => None,
             };
             let handler = scope.and_then(|scope| {
                 self.router.iq_handlers(target.domainpart())?.find(
@@ -748,7 +751,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let target = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            if !self.router.is_local_host(to.domainpart()) || to.localpart().is_none() {
+            if !matches!(
+                self.router.destination(to),
+                Destination::Account | Destination::Resource
+            ) {
                 return Ok(());
             }
             AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
@@ -808,7 +814,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let target = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            if !self.router.is_local_host(to.domainpart()) || to.localpart().is_none() {
+            if !matches!(
+                self.router.destination(to),
+                Destination::Account | Destination::Resource
+            ) {
                 return Ok(());
             }
             AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?

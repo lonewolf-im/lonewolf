@@ -45,6 +45,10 @@ use crate::router::{
     Registration, ResourceMatch, RoutedStanza, RouterError, RouterHandle, SessionHandle,
 };
 
+mod output;
+
+use output::{Outgoing, OutputSequence};
+
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 
@@ -62,6 +66,7 @@ struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
 struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     queue: VecDeque<Output<A>>,
     writer: W,
+    written: OutputSequence,
     allocator: A,
     account: AccountKey,
     storage: RedbStorage,
@@ -148,39 +153,27 @@ fn close_storage_failure(
     CloseOutcome::InternalError
 }
 
-trait OutboxWriter {
-    async fn write_stanza<R: ArenaRead>(
-        &mut self,
-        stanza: &StanzaRef<'_, R>,
-    ) -> Result<(), CloseOutcome>;
+trait OutboxWriter<A: ChunkAllocator> {
+    /// The caller must flush buffered output.
+    async fn write(&mut self, output: Outgoing<A>) -> Result<(), CloseOutcome>;
 
-    async fn flush(&mut self) -> Result<(), CloseOutcome>;
-
-    async fn write_routed<A: ChunkAllocator>(
-        &mut self,
-        stanza: &RoutedStanza<A>,
-    ) -> Result<(), CloseOutcome> {
-        self.write_stanza(&stanza.resolve()?).await
-    }
+    /// Flushes every stanza written so far; `through` is the sequence of the last one.
+    async fn flush(&mut self, through: OutputSequence) -> Result<(), CloseOutcome>;
 }
 
-impl OutboxWriter for Writer {
-    async fn write_stanza<R: ArenaRead>(
-        &mut self,
-        stanza: &StanzaRef<'_, R>,
-    ) -> Result<(), CloseOutcome> {
-        Writer::write_stanza(self, stanza).await
+impl<A: ChunkAllocator> OutboxWriter<A> for Writer {
+    async fn write(&mut self, output: Outgoing<A>) -> Result<(), CloseOutcome> {
+        match output {
+            Outgoing::Routed(stanza) => Writer::write_routed(self, &stanza).await,
+            Outgoing::Owned { stanza, arena } => {
+                let stanza = stanza.resolve(&arena)?;
+                Writer::write_stanza(self, &stanza).await
+            }
+        }
     }
 
-    async fn flush(&mut self) -> Result<(), CloseOutcome> {
+    async fn flush(&mut self, _through: OutputSequence) -> Result<(), CloseOutcome> {
         Writer::flush(self).await
-    }
-
-    async fn write_routed<A: ChunkAllocator>(
-        &mut self,
-        stanza: &RoutedStanza<A>,
-    ) -> Result<(), CloseOutcome> {
-        Writer::write_routed(self, stanza).await
     }
 }
 
@@ -204,6 +197,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     let outbox = Outbox {
         queue: VecDeque::new(),
         writer,
+        written: OutputSequence::default(),
         allocator: allocator.clone(),
         account: registration.account().clone(),
         storage: storage.clone(),
@@ -268,7 +262,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     close::finish(&mut reader, &mut writer, outcome.into(), &close, deadline).await
 }
 
-impl<A: ChunkAllocator + Clone, W: OutboxWriter> BoundSession<'_, A, W> {
+impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     async fn run(&mut self, reader: &mut Reader<A>) -> CloseOutcome {
         let mut prefer_outbound = true;
         'stream: loop {
@@ -1323,7 +1317,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> BoundSession<'_, A, W> {
     }
 }
 
-impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
+impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
     fn check_certificate(&self) -> Result<(), CloseOutcome> {
         self.certificate.map_or(Ok(()), CertificateMonitor::check)
     }
@@ -1397,12 +1391,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
             match output {
                 Output::Routed(stanza) => {
                     self.check_certificate()?;
-                    self.writer.write_routed(&stanza).await?;
+                    self.written = self.written.next();
+                    self.writer.write(Outgoing::Routed(stanza)).await?;
                 }
                 Output::Owned { stanza, arena } => {
-                    let stanza = stanza.resolve(&arena)?;
                     self.check_certificate()?;
-                    self.writer.write_stanza(&stanza).await?;
+                    self.written = self.written.next();
+                    self.writer.write(Outgoing::Owned { stanza, arena }).await?;
                 }
                 Output::Requests(requests) => {
                     for subscription in requests {
@@ -1413,7 +1408,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                             )
                             .await?;
                         self.check_certificate()?;
-                        self.writer.write_routed(&stanza).await?;
+                        self.written = self.written.next();
+                        self.writer.write(Outgoing::Routed(stanza)).await?;
                         pending_count += 1;
                     }
                 }
@@ -1426,7 +1422,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
                         {
                             Ok(stanza) => {
                                 self.check_certificate()?;
-                                self.writer.write_routed(&stanza).await?;
+                                self.written = self.written.next();
+                                self.writer.write(Outgoing::Routed(stanza)).await?;
                                 messages_written += 1;
                             }
                             Err(StoredRecordError::InvalidContent) => {
@@ -1451,7 +1448,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter> Outbox<'_, A, W> {
             }
         }
         self.check_certificate()?;
-        self.writer.flush().await?;
+        self.writer.flush(self.written).await?;
         if pending_count != 0 {
             tracing::info!(
                 operation = "replay",

@@ -5,6 +5,7 @@ use std::error::Error;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
@@ -38,7 +39,7 @@ pub(super) struct ControlledWriter {
     pub(super) bytes: String,
     pub(super) partial_entered: Option<oneshot::Sender<()>>,
     pub(super) partial_release: Option<oneshot::Receiver<()>>,
-    fail_write: bool,
+    pub(super) fail_write: bool,
     fail_flush: bool,
     pub(super) flush_entered: Option<oneshot::Sender<()>>,
     pub(super) flush_release: Option<oneshot::Receiver<()>>,
@@ -204,11 +205,7 @@ impl Fixture {
         })
     }
 
-    pub(super) fn outbox<A: ChunkAllocator>(
-        &self,
-        allocator: A,
-        writer: ControlledWriter,
-    ) -> Outbox<'_, A, ControlledWriter> {
+    pub(super) fn outbox<A: ChunkAllocator, W>(&self, allocator: A, writer: W) -> Outbox<'_, A, W> {
         Outbox {
             queue: VecDeque::new(),
             writer,
@@ -220,7 +217,6 @@ impl Fixture {
             liveness: self.registration.liveness(),
             acknowledgement: None,
             work: &self.work,
-            certificate: None,
         }
     }
 
@@ -472,6 +468,90 @@ fn corrupt_records_are_skipped_but_whitespace_and_original_full_targets_are_pres
         assert_eq!(fixture.count().await?, 0);
         drop(outbox);
         fixture.finish().await
+    })
+}
+
+#[test]
+fn invalid_backlogs_wait_for_transport_flush_before_releasing_stored_rows() -> TestResult {
+    enum Completion {
+        Success,
+        Failure,
+        Cancel,
+    }
+
+    Runtime::new()?.block_on(async {
+        for completion in [Completion::Success, Completion::Failure, Completion::Cancel] {
+            let fixture = Fixture::new(&[b"<message"]).await?;
+            let (link, transport) = link::link();
+            let (notice, entered) = oneshot::channel();
+            let (release, blocked) = oneshot::channel();
+            let (done, mut acknowledged) = oneshot::channel();
+            let mut controlled = ControlledWriter {
+                fail_flush: matches!(completion, Completion::Failure),
+                flush_entered: Some(notice),
+                flush_release: Some(blocked),
+                ..Default::default()
+            };
+            let mut outbox = fixture.outbox(GlobalChunkAllocator, link);
+            outbox.push(Output::Offline {
+                backlog: fixture.backlog().await?,
+                handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
+            });
+            {
+                let mut running = pin!(transport.run(&mut controlled, None));
+                let mut release = Some(release);
+                {
+                    let mut flushing = pin!(outbox.flush());
+                    assert!(poll!(flushing.as_mut()).is_pending());
+                    assert!(poll!(running.as_mut()).is_pending());
+                    entered.await?;
+                    assert!(poll!(flushing.as_mut()).is_pending());
+                    assert!(acknowledged.try_recv()?.is_none());
+                    assert_eq!(fixture.count().await?, 1);
+                    if !matches!(completion, Completion::Cancel) {
+                        release
+                            .take()
+                            .ok_or("missing flush release")?
+                            .send(())
+                            .map_err(|_| "transport flush cancelled")?;
+                        assert!(poll!(running.as_mut()).is_pending());
+                        let expected = if matches!(completion, Completion::Failure) {
+                            Err(CloseOutcome::TransportError)
+                        } else {
+                            Ok(())
+                        };
+                        assert_eq!(poll!(flushing.as_mut()), Poll::Ready(expected));
+                    }
+                }
+                match completion {
+                    Completion::Success => {
+                        acknowledged.await?;
+                        drop(fixture.storage.begin_write().await?);
+                        assert_eq!(fixture.count().await?, 0);
+                    }
+                    Completion::Failure => {
+                        assert!(outbox.acknowledgement.is_none());
+                        assert_eq!(fixture.count().await?, 1);
+                    }
+                    Completion::Cancel => {
+                        outbox.writer.stop();
+                        assert!(poll!(running.as_mut()).is_pending());
+                        assert!(release.ok_or("missing flush release")?.send(()).is_err());
+                        assert!(outbox.acknowledgement.is_none());
+                        assert_eq!(fixture.count().await?, 1);
+                    }
+                }
+                drop(outbox);
+                assert!(poll!(running.as_mut()).is_ready());
+            }
+            assert!(controlled.written.is_empty());
+            assert_eq!(
+                controlled.flushed.len(),
+                usize::from(matches!(completion, Completion::Success))
+            );
+            fixture.finish().await?;
+        }
+        Ok(())
     })
 }
 

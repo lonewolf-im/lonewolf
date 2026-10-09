@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::error::Error;
+use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Command as Process;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,12 +11,14 @@ use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::join;
 use futures_util::{FutureExt, poll};
-use lonewolf_util::arena::GlobalChunkAllocator;
+use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
+use lonewolf_xmpp::parser::{ParserConfig, XmppParser};
 use lonewolf_xmpp::stanza::PresenceType;
 
 use super::super::tests::{ControlledWriter, routed_presence};
 use super::*;
+use crate::c2s::stream::stanza_rate::StanzaLimiter;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -27,19 +30,178 @@ fn presence() -> TestResult<Outgoing<GlobalChunkAllocator>> {
     )?))
 }
 
+async fn reader(input: &'static [u8]) -> TestResult<Reader<GlobalChunkAllocator, &'static [u8]>> {
+    let mut reader = Reader::new(
+        XmppParser::new(
+            input,
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(10_000).ok_or("invalid stanza size")?,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        ),
+        StanzaLimiter::new(
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(8).ok_or("invalid burst")?,
+        ),
+    );
+    assert!(matches!(
+        reader.next_event().await,
+        Ok(Some(StreamEvent::StreamStart { .. }))
+    ));
+    Ok(reader)
+}
+
+#[test]
+fn transport_forwards_the_next_stanza_only_after_the_session_accepts() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut reader = reader(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'><message/><message/></stream:stream>").await?;
+        let (link, incoming, transport) = link();
+        let mut reading = pin!(transport.read(&mut reader, None));
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(matches!(incoming.recv().await, Ok(Incoming::Stanza(_))));
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(poll!(pin!(incoming.recv())).is_pending());
+        link.accept();
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(matches!(incoming.recv().await, Ok(Incoming::Stanza(_))));
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(poll!(pin!(incoming.recv())).is_pending());
+        link.accept();
+        assert!(poll!(reading.as_mut()).is_ready());
+        assert!(matches!(incoming.recv().await, Ok(Incoming::Ended(CloseOutcome::StreamEnd))));
+        Ok(())
+    })
+}
+
+#[test]
+fn transport_forwards_the_next_rejected_stanza_only_after_the_session_accepts() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut reader = reader(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'><iq type='unknown'/><iq type='unknown'/></stream:stream>").await?;
+        let (link, incoming, transport) = link();
+        let mut reading = pin!(transport.read(&mut reader, None));
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(matches!(incoming.recv().await, Ok(Incoming::Rejected(_))));
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(poll!(pin!(incoming.recv())).is_pending());
+        link.accept();
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(matches!(incoming.recv().await, Ok(Incoming::Rejected(_))));
+        assert!(poll!(reading.as_mut()).is_pending());
+        assert!(poll!(pin!(incoming.recv())).is_pending());
+        link.accept();
+        assert!(poll!(reading.as_mut()).is_ready());
+        assert!(matches!(incoming.recv().await, Ok(Incoming::Ended(CloseOutcome::StreamEnd))));
+        Ok(())
+    })
+}
+
+#[test]
+fn transport_stops_reading_when_the_session_stops() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut reader = reader(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'><message/></stream:stream>").await?;
+        let (link, incoming, transport) = link();
+        link.stop();
+        transport.read(&mut reader, None).await;
+        assert!(incoming.is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn write_returns_the_close_outcome_and_drops_writes_after_stop() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for failed in [false, true] {
+            let (mut link, _incoming, transport) = link();
+            let mut controlled = ControlledWriter::default();
+            assert_eq!(link.write(presence()?).await, Ok(()));
+            link.commands
+                .send(Command::Flush {
+                    through: OutputSequence::new(1),
+                    request: 1,
+                })
+                .await?;
+            link.stop();
+            if failed {
+                transport.fail(CloseOutcome::TransportError);
+            }
+            link.close(CloseOutcome::StreamEnd).await;
+            drop(link);
+            assert_eq!(
+                transport.write(&mut controlled, None).await,
+                CloseOutcome::StreamEnd
+            );
+            assert!(controlled.written.is_empty());
+            assert!(controlled.flushed.is_empty());
+            let progress = transport.state.progress.lock();
+            assert_eq!(progress.flushed, OutputSequence::default());
+            assert_eq!(progress.completed_flush, 0);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_the_link_writer_stops_the_transport() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (mut link, _incoming, transport) = link();
+        let mut controlled = ControlledWriter::default();
+        assert_eq!(link.write(presence()?).await, Ok(()));
+        link.commands
+            .send(Command::Flush {
+                through: OutputSequence::new(1),
+                request: 1,
+            })
+            .await?;
+        let mut stopped = pin!(transport.stopped());
+        assert!(poll!(stopped.as_mut()).is_pending());
+        drop(link);
+        assert!(poll!(stopped.as_mut()).is_ready());
+        assert_eq!(
+            transport.write(&mut controlled, None).await,
+            CloseOutcome::InternalError
+        );
+        assert!(controlled.written.is_empty());
+        assert!(controlled.flushed.is_empty());
+        let progress = transport.state.progress.lock();
+        assert_eq!(progress.flushed, OutputSequence::default());
+        assert_eq!(progress.completed_flush, 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn link_failure_wakes_the_session_watch() {
+    let (link, _incoming, transport) = link::<GlobalChunkAllocator>();
+    let watch = link.watch();
+    let count = Arc::new(WakeCount::default());
+    let waker = Waker::from(Arc::clone(&count));
+    let mut context = Context::from_waker(&waker);
+    let mut failed = pin!(watch.failed());
+    assert!(failed.as_mut().poll(&mut context).is_pending());
+    transport.fail(CloseOutcome::CertificateInvalid);
+    assert_eq!(count.0.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        failed.as_mut().poll(&mut context),
+        Poll::Ready(CloseOutcome::CertificateInvalid)
+    );
+}
+
 #[test]
 fn flush_returns_after_the_transport_flushes_through_the_sequence() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (mut link, transport) = link();
+        let (mut link, _incoming, transport) = link();
         let mut controlled = ControlledWriter::default();
         let session = async move {
             assert_eq!(link.write(presence()?).await, Ok(()));
             let flushed = link.flush(OutputSequence::new(1)).await;
+            link.close(CloseOutcome::StreamEnd).await;
             drop(link);
             Ok::<_, Box<dyn Error>>(flushed)
         };
-        let (flushed, ()) = join(session, transport.run(&mut controlled, None)).await;
+        let (flushed, outcome) = join(session, transport.write(&mut controlled, None)).await;
         assert_eq!(flushed?, Ok(()));
+        assert_eq!(outcome, CloseOutcome::StreamEnd);
         assert_eq!(controlled.written.len(), 1);
         assert_eq!(controlled.flushed, [OutputSequence::new(1)]);
         Ok(())
@@ -49,7 +211,7 @@ fn flush_returns_after_the_transport_flushes_through_the_sequence() -> TestResul
 #[test]
 fn write_failure_fails_the_next_flush_with_the_writer_outcome() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (mut link, transport) = link();
+        let (mut link, _incoming, transport) = link();
         let mut controlled = ControlledWriter::default();
         controlled.fail_write = true;
         let session = async move {
@@ -64,10 +226,12 @@ fn write_failure_fails_the_next_flush_with_the_writer_outcome() -> TestResult {
                 Err(CloseOutcome::TransportError)
             );
             assert_eq!(link.commands.len(), queued);
+            link.close(CloseOutcome::StreamEnd).await;
             Ok::<_, Box<dyn Error>>(())
         };
-        let (result, ()) = join(session, transport.run(&mut controlled, None)).await;
+        let (result, outcome) = join(session, transport.write(&mut controlled, None)).await;
         result?;
+        assert_eq!(outcome, CloseOutcome::StreamEnd);
         assert!(controlled.written.is_empty());
         assert!(controlled.flushed.is_empty());
         Ok(())
@@ -77,7 +241,7 @@ fn write_failure_fails_the_next_flush_with_the_writer_outcome() -> TestResult {
 #[test]
 fn stopped_link_drops_queued_writes_and_flushes() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (mut link, transport) = link();
+        let (mut link, _incoming, transport) = link();
         let mut controlled = ControlledWriter::default();
         assert_eq!(link.write(presence()?).await, Ok(()));
         assert_eq!(link.write(presence()?).await, Ok(()));
@@ -88,8 +252,12 @@ fn stopped_link_drops_queued_writes_and_flushes() -> TestResult {
             })
             .await?;
         link.stop();
+        link.close(CloseOutcome::StreamEnd).await;
         drop(link);
-        transport.run(&mut controlled, None).await;
+        assert_eq!(
+            transport.write(&mut controlled, None).await,
+            CloseOutcome::StreamEnd
+        );
         assert!(controlled.written.is_empty());
         assert!(controlled.flushed.is_empty());
         Ok(())
@@ -100,6 +268,8 @@ fn stopped_link_drops_queued_writes_and_flushes() -> TestResult {
 fn link_items_are_send() {
     fn assert_send<T: Send>() {}
     assert_send::<Command<Arc<PooledChunkAllocator>>>();
+    assert_send::<Incoming<Arc<PooledChunkAllocator>>>();
+    assert_send::<LinkWatch>();
     assert_send::<LinkWriter<Arc<PooledChunkAllocator>>>();
     assert_send::<LinkTransport<Arc<PooledChunkAllocator>>>();
 }
@@ -158,12 +328,12 @@ enum FlushOutcome {
 
 async fn verify_flush_completion(outcome: FlushOutcome) -> TestResult {
     for through in [OutputSequence::default(), OutputSequence::new(1)] {
-        let (mut link, transport) = link();
+        let (mut link, _incoming, transport) = link();
         let state = Arc::clone(&link.state);
         let (mut writer, entered, release) = GatedWriter::new();
         let mut completed = 0;
         {
-            let mut running = pin!(transport.run(&mut writer, None));
+            let mut running = pin!(transport.write(&mut writer, None));
             if through != OutputSequence::default() {
                 assert_eq!(link.write(presence()?).await, Ok(()));
                 let mut first = pin!(link.flush(through));
@@ -213,6 +383,7 @@ async fn verify_flush_completion(outcome: FlushOutcome) -> TestResult {
                     matches!(outcome, FlushOutcome::Fail).then_some(CloseOutcome::TransportError)
                 );
             }
+            link.close(CloseOutcome::StreamEnd).await;
             drop(link);
             assert!(poll!(running.as_mut()).is_ready());
         }
@@ -239,7 +410,7 @@ fn stopping_zero_and_repeated_sequence_flushes_does_not_publish_completion() -> 
 #[test]
 fn a_cancelled_waiters_late_flush_does_not_complete_the_next_request() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (mut link, transport) = link::<GlobalChunkAllocator>();
+        let (mut link, _incoming, transport) = link::<GlobalChunkAllocator>();
         let state = Arc::clone(&link.state);
         let (mut writer, entered, release) = GatedWriter::new();
         {
@@ -247,7 +418,7 @@ fn a_cancelled_waiters_late_flush_does_not_complete_the_next_request() -> TestRe
             assert!(poll!(first.as_mut()).is_pending());
         }
         {
-            let mut running = pin!(transport.run(&mut writer, None));
+            let mut running = pin!(transport.write(&mut writer, None));
             {
                 let mut second = pin!(link.flush(OutputSequence::default()));
                 assert!(poll!(second.as_mut()).is_pending());
@@ -263,6 +434,7 @@ fn a_cancelled_waiters_late_flush_does_not_complete_the_next_request() -> TestRe
                 assert_eq!(poll!(second.as_mut()), Poll::Ready(Ok(())));
             }
             assert_eq!(state.progress.lock().completed_flush, 2);
+            link.close(CloseOutcome::StreamEnd).await;
             drop(link);
             assert!(poll!(running.as_mut()).is_ready());
         }
@@ -274,7 +446,7 @@ fn a_cancelled_waiters_late_flush_does_not_complete_the_next_request() -> TestRe
 #[test]
 fn exhausted_flush_requests_fail_without_enqueuing_a_command() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (mut link, transport) = link::<GlobalChunkAllocator>();
+        let (mut link, _incoming, transport) = link::<GlobalChunkAllocator>();
         link.requested_flush = u64::MAX;
         assert_eq!(
             link.flush(OutputSequence::default()).await,
@@ -290,7 +462,7 @@ fn exhausted_flush_requests_fail_without_enqueuing_a_command() -> TestResult {
 #[test]
 fn stopping_cancels_a_pending_write_and_drops_queued_output() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (mut link, transport) = link();
+        let (mut link, _incoming, transport) = link();
         let commands = transport.commands.clone();
         let state = Arc::clone(&link.state);
         let (notice, entered) = oneshot::channel();
@@ -307,13 +479,14 @@ fn stopping_cancels_a_pending_write_and_drops_queued_output() -> TestResult {
             })
             .await?;
         {
-            let mut running = pin!(transport.run(&mut controlled, None));
+            let mut running = pin!(transport.write(&mut controlled, None));
             assert!(poll!(running.as_mut()).is_pending());
             entered.await?;
             link.stop();
             assert!(poll!(running.as_mut()).is_pending());
             assert!(release.send(()).is_err());
             assert!(commands.is_empty());
+            link.close(CloseOutcome::StreamEnd).await;
             drop(link);
             assert!(poll!(running.as_mut()).is_ready());
         }
@@ -331,7 +504,7 @@ fn stopping_cancels_a_pending_write_and_drops_queued_output() -> TestResult {
 #[test]
 fn stopping_cancels_a_pending_flush_without_advancing_the_watermark() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (mut link, transport) = link();
+        let (mut link, _incoming, transport) = link();
         let commands = transport.commands.clone();
         let state = Arc::clone(&link.state);
         let (notice, entered) = oneshot::channel();
@@ -354,13 +527,14 @@ fn stopping_cancels_a_pending_flush_without_advancing_the_watermark() -> TestRes
             })
             .await?;
         {
-            let mut running = pin!(transport.run(&mut controlled, None));
+            let mut running = pin!(transport.write(&mut controlled, None));
             assert!(poll!(running.as_mut()).is_pending());
             entered.await?;
             link.stop();
             assert!(poll!(running.as_mut()).is_pending());
             assert!(release.send(()).is_err());
             assert!(commands.is_empty());
+            link.close(CloseOutcome::StreamEnd).await;
             drop(link);
             assert!(poll!(running.as_mut()).is_ready());
         }
@@ -388,25 +562,39 @@ impl Wake for WakeCount {
 }
 
 #[test]
-fn dropping_the_writer_while_unwinding_does_not_wake_the_transport() {
-    let (link, transport) = link::<GlobalChunkAllocator>();
+fn dropping_the_writer_while_unwinding_does_not_wake_the_transport() -> TestResult {
+    let (link, incoming, transport) = link::<GlobalChunkAllocator>();
     let state = Arc::downgrade(&link.state);
     let count = Arc::new(WakeCount::default());
     let waker = Waker::from(Arc::clone(&count));
     let mut context = Context::from_waker(&waker);
     let mut controlled = ControlledWriter::default();
     {
-        let mut transport = pin!(transport.run(&mut controlled, None));
-        assert!(transport.as_mut().poll(&mut context).is_pending());
+        transport
+            .incoming
+            .try_send(Incoming::Ended(CloseOutcome::StreamEnd))?;
+        let mut sending = pin!(
+            transport
+                .incoming
+                .send(Incoming::Ended(CloseOutcome::StreamEnd))
+        );
+        assert!(sending.as_mut().poll(&mut context).is_pending());
+        let mut writing = pin!(transport.write(&mut controlled, None));
+        assert!(writing.as_mut().poll(&mut context).is_pending());
+        let mut stopped = pin!(transport.stopped());
+        assert!(stopped.as_mut().poll(&mut context).is_pending());
         assert_eq!(count.0.load(Ordering::Relaxed), 0);
         let result = catch_unwind(AssertUnwindSafe(move || {
             let _link = link;
+            let _incoming = incoming;
             panic!("session panic");
         }));
         assert!(result.is_err());
         assert_eq!(count.0.load(Ordering::Relaxed), 0);
     }
+    drop(transport);
     assert!(state.upgrade().is_none());
+    Ok(())
 }
 
 fn run_panic_process(test: &str) -> TestResult {
@@ -434,6 +622,13 @@ fn a_hosted_transport_panic_cleans_up_a_blocked_sender_without_aborting() -> Tes
 }
 
 #[test]
+fn a_hosted_transport_panic_cleans_up_a_waiting_session_without_aborting() -> TestResult {
+    run_panic_process(
+        "c2s::stream::bound::link::tests::hosted_transport_panic_with_waiting_session_process",
+    )
+}
+
+#[test]
 #[ignore = "subprocess entry point for the link panic fixture"]
 fn hosted_session_panic_process() -> TestResult {
     if std::env::var_os("LONEWOLF_LINK_PANIC_TEST").is_none() {
@@ -441,7 +636,7 @@ fn hosted_session_panic_process() -> TestResult {
     }
     Runtime::new()?.block_on(async {
         compio::runtime::spawn(async {
-            let (link, transport) = link::<GlobalChunkAllocator>();
+            let (link, _incoming, transport) = link::<GlobalChunkAllocator>();
             let state = Arc::downgrade(&link.state);
             let (release, entered) = oneshot::channel();
             let mut controlled = ControlledWriter::default();
@@ -451,13 +646,14 @@ fn hosted_session_panic_process() -> TestResult {
                     let _ = entered.await;
                     panic!("hosted session panic");
                 };
-                let joined = AssertUnwindSafe(join(serve, transport.run(&mut controlled, None)))
+                let joined = AssertUnwindSafe(join(serve, transport.write(&mut controlled, None)))
                     .catch_unwind();
                 let mut joined = pin!(joined);
                 assert!(poll!(joined.as_mut()).is_pending());
                 assert!(release.send(()).is_ok());
                 assert!(joined.await.is_err());
             }
+            drop(transport);
             assert!(state.upgrade().is_none());
         })
         .await
@@ -493,7 +689,7 @@ fn hosted_transport_panic_process() -> TestResult {
             .map(|_| presence())
             .collect::<TestResult<Vec<_>>>()?;
         compio::runtime::spawn(async {
-            let (mut link, transport) = link();
+            let (mut link, _incoming, transport) = link();
             let state = Arc::downgrade(&link.state);
             let mut writer = PanickingWriter;
             {
@@ -505,11 +701,50 @@ fn hosted_transport_panic_process() -> TestResult {
                 let mut serve = pin!(serve);
                 assert!(poll!(serve.as_mut()).is_pending());
                 assert_eq!(transport.commands.len(), COMMAND_CAPACITY);
-                let result = AssertUnwindSafe(join(serve, transport.run(&mut writer, None)))
+                let result = AssertUnwindSafe(join(serve, transport.write(&mut writer, None)))
                     .catch_unwind()
                     .await;
                 assert!(result.is_err());
             }
+            drop(transport);
+            assert!(state.upgrade().is_none());
+        })
+        .await
+        .map_err(|_| "hosted task panicked")?;
+        let value = compio::runtime::spawn(async { 42 })
+            .await
+            .map_err(|_| "recovery task panicked")?;
+        assert_eq!(value, 42);
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "subprocess entry point for the incoming channel panic fixture"]
+fn hosted_transport_panic_with_waiting_session_process() -> TestResult {
+    if std::env::var_os("LONEWOLF_LINK_PANIC_TEST").is_none() {
+        return Ok(());
+    }
+    Runtime::new()?.block_on(async {
+        let output = presence()?;
+        compio::runtime::spawn(async {
+            let (mut link, incoming, transport) = link();
+            let state = Arc::downgrade(&link.state);
+            let mut writer = PanickingWriter;
+            assert_eq!(link.write(output).await, Ok(()));
+            {
+                let serve = async move {
+                    let _link = link;
+                    let _ = incoming.recv().await;
+                };
+                let mut serve = pin!(serve);
+                assert!(poll!(serve.as_mut()).is_pending());
+                let result = AssertUnwindSafe(join(serve, transport.write(&mut writer, None)))
+                    .catch_unwind()
+                    .await;
+                assert!(result.is_err());
+            }
+            drop(transport);
             assert!(state.upgrade().is_none());
         })
         .await

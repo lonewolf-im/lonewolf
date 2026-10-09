@@ -30,10 +30,8 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::bind::Bound;
-use super::certificate::CertificateMonitor;
-use super::close;
 use super::outcome::CloseOutcome;
-use super::session::{Reader, Session, Writer, namespace_error, peer_stream_error};
+use super::session::{Session, Writer};
 use crate::c2s::iq;
 use crate::delivery::{
     EffectsDiagnostics, Pending, RouterDelivery, StoredDelivery, WorkGroup, after_turn,
@@ -47,13 +45,15 @@ use crate::router::{
 
 mod link;
 mod output;
+mod transport;
 
+use link::{Incoming, LinkWriter};
 use output::{Outgoing, OutputSequence, Release};
+use transport::Transport;
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 
-/// The parser stays outside this state so stanza handling preserves a pending read.
 struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
     registration: Registration<A>,
     router: RouterHandle<A>,
@@ -61,7 +61,7 @@ struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
     allocator: A,
     available: bool,
     priority: Option<i8>,
-    certificate: Option<&'w CertificateMonitor>,
+    incoming: async_channel::Receiver<Incoming<A>>,
     outbox: Outbox<'w, A, W>,
 }
 
@@ -184,12 +184,11 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     work: &mut WorkGroup,
 ) -> CloseOutcome {
     let Bound {
-        session:
-            Session {
-                mut reader,
-                mut writer,
-                close,
-            },
+        session: Session {
+            reader,
+            writer,
+            close,
+        },
         monitor,
         registration,
         router,
@@ -197,158 +196,146 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         allocator,
         resource_requested: _,
     } = bound;
-    let (link, transport) = link::link();
-    let serve = async {
-        let outbox = Outbox {
-            queue: VecDeque::new(),
-            writer: link,
-            written: OutputSequence::default(),
-            releases: VecDeque::new(),
-            allocator: allocator.clone(),
-            account: registration.account().clone(),
-            storage: storage.clone(),
-            liveness: registration.liveness(),
-            acknowledgement: None,
-            work: &*work,
-        };
-        let mut session = BoundSession {
-            registration,
-            router,
-            storage,
-            allocator,
-            available: false,
-            priority: None,
-            certificate: monitor.as_ref(),
-            outbox,
-        };
-        let stopped = {
-            let retired = pin!(session.registration.wait_retired());
-            match select(
-                retired,
-                pin!(close.interrupt(async {
-                    let operation = async { Ok(session.run(&mut reader).await) };
-                    match &monitor {
-                        Some(monitor) => monitor.interrupt(operation).await,
-                        None => operation.await,
-                    }
-                })),
-            )
-            .await
-            {
-                Either::Left((retired, _)) => Either::Left(retired.map(|retired| retired.cause)),
-                Either::Right((outcome, _)) => {
-                    Either::Right(outcome.unwrap_or_else(|outcome| outcome))
-                }
-            }
-        };
-        session.outbox.writer.stop();
-        let outcome = match stopped {
-            Either::Right(outcome) => outcome,
-            Either::Left(Ok(RetireCause::AccountDeleted)) => CloseOutcome::AccountDeleted,
-            Either::Left(_) => CloseOutcome::InternalError,
-        };
-        let deadline = close.deadline();
-        let (acknowledgement, outcome) = close
-            .cleanup(deadline, async {
-                let ended = session.end().await;
-                let outcome = ended.map_or(CloseOutcome::InternalError, |()| outcome);
-                let BoundSession {
-                    registration,
-                    outbox,
-                    ..
-                } = session;
-                drop(registration);
-                let Outbox {
-                    acknowledgement, ..
-                } = outbox;
-                (acknowledgement, outcome)
-            })
-            .await;
-        close.cleanup(deadline, work.drain()).await;
-        (acknowledgement, outcome, deadline)
+    let (link, incoming, transport_link) = link::link();
+    let watch = link.watch();
+    let shutdown = close.shutdown.clone();
+    let mut transport = Transport {
+        reader,
+        writer,
+        close,
+        monitor,
+        link: transport_link,
     };
-    let ((acknowledgement, outcome, deadline), ()) =
-        join(serve, transport.run(&mut writer, monitor.as_ref())).await;
-    drop(acknowledgement);
-    close::finish(&mut reader, &mut writer, outcome.into(), &close, deadline).await
-}
-
-impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
-    fn check_certificate(&self) -> Result<(), CloseOutcome> {
-        self.certificate.map_or(Ok(()), CertificateMonitor::check)
-    }
-
-    async fn run(&mut self, reader: &mut Reader<A>) -> CloseOutcome {
-        let mut prefer_outbound = true;
-        'stream: loop {
-            if let Err(outcome) = self.check_certificate() {
-                break outcome;
-            }
-            let mut next = pin!(reader.next_event());
-            let event = loop {
-                let selected = {
-                    let receive = pin!(self.registration.recv());
-                    if prefer_outbound {
-                        match select(receive, next.as_mut()).await {
-                            Either::Left((stanza, _)) => Either::Right(stanza),
-                            Either::Right((event, _)) => Either::Left(event),
-                        }
-                    } else {
-                        match select(next.as_mut(), receive).await {
-                            Either::Left((event, _)) => Either::Left(event),
-                            Either::Right((stanza, _)) => Either::Right(stanza),
-                        }
+    {
+        let serve = async {
+            let outbox = Outbox {
+                queue: VecDeque::new(),
+                writer: link,
+                written: OutputSequence::default(),
+                releases: VecDeque::new(),
+                allocator: allocator.clone(),
+                account: registration.account().clone(),
+                storage: storage.clone(),
+                liveness: registration.liveness(),
+                acknowledgement: None,
+                work: &*work,
+            };
+            let mut session = BoundSession {
+                registration,
+                router,
+                storage,
+                allocator,
+                available: false,
+                priority: None,
+                incoming,
+                outbox,
+            };
+            let stopped = {
+                // Retirement takes precedence over shutdown, link failure, and session completion.
+                let retired = pin!(session.registration.wait_retired());
+                let shutdown = pin!(shutdown);
+                let failed = pin!(watch.failed());
+                let running = pin!(session.run());
+                match select(
+                    retired,
+                    pin!(select(shutdown, pin!(select(failed, running)))),
+                )
+                .await
+                {
+                    Either::Left((retired, _)) => {
+                        Either::Left(retired.map(|retired| retired.cause))
                     }
-                };
-                prefer_outbound = !prefer_outbound;
-                match selected {
-                    Either::Left(event) => break event,
-                    Either::Right(Some(delivery)) => {
-                        if let Err(outcome) = self
-                            .outbox
-                            .drain_mailbox(&self.registration, delivery)
-                            .await
-                        {
-                            break 'stream outcome;
-                        }
+                    Either::Right((Either::Left(_), _)) => {
+                        Either::Right(CloseOutcome::SystemShutdown)
                     }
-                    Either::Right(None) => break 'stream CloseOutcome::InternalError,
+                    Either::Right((Either::Right((Either::Left((outcome, _)), _)), _))
+                    | Either::Right((Either::Right((Either::Right((outcome, _)), _)), _)) => {
+                        Either::Right(outcome)
+                    }
                 }
             };
-            if let Err(outcome) = self.check_certificate() {
-                break outcome;
-            }
-            match event {
-                Ok(Some(StreamEvent::StreamEnd) | None) => break CloseOutcome::StreamEnd,
-                Ok(Some(StreamEvent::Stanza(parsed))) => {
+            session.outbox.writer.stop();
+            let outcome = match stopped {
+                Either::Right(outcome) => outcome,
+                Either::Left(Ok(RetireCause::AccountDeleted)) => CloseOutcome::AccountDeleted,
+                Either::Left(_) => CloseOutcome::InternalError,
+            };
+            let ended = session.end().await;
+            let outcome = ended.map_or(CloseOutcome::InternalError, |()| outcome);
+            let BoundSession {
+                registration,
+                outbox,
+                ..
+            } = session;
+            drop(registration);
+            let Outbox {
+                writer: link,
+                acknowledgement,
+                ..
+            } = outbox;
+            work.drain().await;
+            drop(acknowledgement);
+            link.close(outcome).await;
+        };
+        let ((), outcome) = join(serve, transport.run()).await;
+        outcome
+    }
+}
+
+impl<A: ChunkAllocator + Clone> BoundSession<'_, A, LinkWriter<A>> {
+    async fn run(&mut self) -> CloseOutcome {
+        let mut prefer_outbound = true;
+        loop {
+            let selected = {
+                let receive = pin!(self.registration.recv());
+                let incoming = pin!(self.incoming.recv());
+                if prefer_outbound {
+                    match select(receive, incoming).await {
+                        Either::Left((delivery, _)) => Either::Right(delivery),
+                        Either::Right((incoming, _)) => Either::Left(incoming),
+                    }
+                } else {
+                    match select(incoming, receive).await {
+                        Either::Left((incoming, _)) => Either::Left(incoming),
+                        Either::Right((delivery, _)) => Either::Right(delivery),
+                    }
+                }
+            };
+            prefer_outbound = !prefer_outbound;
+            match selected {
+                Either::Right(Some(delivery)) => {
+                    if let Err(outcome) = self
+                        .outbox
+                        .drain_mailbox(&self.registration, delivery)
+                        .await
+                    {
+                        break outcome;
+                    }
+                }
+                Either::Right(None) | Either::Left(Err(_)) => break CloseOutcome::InternalError,
+                Either::Left(Ok(Incoming::Stanza(parsed))) => {
                     let handled = self.handle_stanza(parsed).await;
                     let flushed = self.outbox.flush().await;
                     if let Err(outcome) = handled.and(flushed) {
                         break outcome;
                     }
+                    self.outbox.writer.accept();
                 }
-                Ok(Some(StreamEvent::RejectedStanza(parsed))) => {
+                Either::Left(Ok(Incoming::Rejected(parsed))) => {
                     let handled = self.handle_rejected(parsed);
                     let flushed = self.outbox.flush().await;
                     if let Err(outcome) = handled.and(flushed) {
                         break outcome;
                     }
+                    self.outbox.writer.accept();
                 }
-                Ok(Some(event)) => {
-                    match peer_stream_error(&event) {
-                        Ok(Some(condition)) => break CloseOutcome::PeerError(condition),
-                        Err(outcome) => break outcome,
-                        Ok(None) => {}
-                    }
-                    let outcome =
-                        namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType);
-                    break outcome;
-                }
-                Err(outcome) => break outcome,
+                Either::Left(Ok(Incoming::Ended(outcome))) => break outcome,
             }
         }
     }
+}
 
+impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     async fn end(&mut self) -> Result<(), CloseOutcome> {
         let work = TerminalPresenceWork {
             session: self.registration.handle(),

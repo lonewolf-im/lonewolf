@@ -288,7 +288,7 @@ async fn session<'a>(
             allocator: GlobalChunkAllocator,
             available: false,
             priority: None,
-            certificate: None,
+            incoming: async_channel::bounded(1).1,
             outbox,
         },
         entered,

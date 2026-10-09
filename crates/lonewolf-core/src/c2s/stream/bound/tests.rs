@@ -34,6 +34,7 @@ const MESSAGE: &[u8] =
 #[derive(Default)]
 pub(super) struct ControlledWriter {
     pub(super) written: Vec<String>,
+    pub(super) flushed: Vec<OutputSequence>,
     pub(super) bytes: String,
     pub(super) partial_entered: Option<oneshot::Sender<()>>,
     pub(super) partial_release: Option<oneshot::Receiver<()>>,
@@ -46,7 +47,7 @@ pub(super) struct ControlledWriter {
     fail_allocation_after_write: Option<Arc<AtomicBool>>,
 }
 
-impl OutboxWriter for ControlledWriter {
+impl ControlledWriter {
     async fn write_stanza<R: ArenaRead>(
         &mut self,
         stanza: &StanzaRef<'_, R>,
@@ -84,8 +85,17 @@ impl OutboxWriter for ControlledWriter {
         }
         Ok(())
     }
+}
 
-    async fn flush(&mut self) -> Result<(), CloseOutcome> {
+impl<A: ChunkAllocator> OutboxWriter<A> for ControlledWriter {
+    async fn write(&mut self, output: Outgoing<A>) -> Result<(), CloseOutcome> {
+        match output {
+            Outgoing::Routed(stanza) => self.write_stanza(&stanza.resolve()?).await,
+            Outgoing::Owned { stanza, arena } => self.write_stanza(&stanza.resolve(&arena)?).await,
+        }
+    }
+
+    async fn flush(&mut self, through: OutputSequence) -> Result<(), CloseOutcome> {
         if let Some(entered) = self.flush_entered.take() {
             let _ = entered.send(());
         }
@@ -95,6 +105,7 @@ impl OutboxWriter for ControlledWriter {
         if self.fail_flush {
             Err(CloseOutcome::TransportError)
         } else {
+            self.flushed.push(through);
             Ok(())
         }
     }
@@ -201,6 +212,7 @@ impl Fixture {
         Outbox {
             queue: VecDeque::new(),
             writer,
+            written: OutputSequence::default(),
             allocator,
             account: self.registration.account().clone(),
             storage: self.storage.clone(),
@@ -345,6 +357,34 @@ fn replay_parses_only_one_arena_at_a_time_beyond_mailbox_capacity() -> TestResul
         );
         assert_eq!(pool.stats().heap_allocation_count, 0);
         assert_eq!(fixture.count().await?, 0);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn flush_reports_the_sequence_of_the_last_written_stanza() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE, b"<message", MESSAGE]).await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        for _ in 0..2 {
+            outbox.push(Output::Routed(routed_presence(
+                "alice@localhost/desk",
+                Some("bob@localhost"),
+                PresenceType::Available,
+            )?));
+        }
+        outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+        assert_eq!(outbox.writer.flushed, [OutputSequence::new(2)]);
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+        outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            outbox.writer.flushed,
+            [OutputSequence::new(2), OutputSequence::new(4)]
+        );
         drop(outbox);
         fixture.finish().await
     })

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_executor::block_on;
@@ -18,13 +19,16 @@ use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
 use super::{Offline, OfflineLimits};
-use crate::Extension;
+use crate::account::AccountHandler;
 use crate::delivery::{HandlerError, HostLookup};
 use crate::message::{Backlog, MessageHandler, StoreOutcome, UndeliverableMessage};
+use crate::presence::PresenceRequestType;
+use crate::{Extension, Extensions};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type TestHandler = dyn MessageHandler<GlobalChunkAllocator, RedbStorage>;
 type TestExtension = dyn Extension<GlobalChunkAllocator, RedbStorage>;
+type TestAccountHandler = dyn AccountHandler<GlobalChunkAllocator, RedbStorage>;
 
 const RECEIVED_SECONDS: u64 = 1_700_000_000;
 const MESSAGE: &str =
@@ -477,7 +481,7 @@ fn forgetting_account_clears_messages_and_the_sequence_in_the_deletion_transacti
         let other = key("carol@example.org")?;
         test.store(&owner, MESSAGE).await?;
         test.store(&other, MESSAGE).await?;
-        let extension: &TestExtension = &test.offline;
+        let extension: &TestAccountHandler = &test.offline;
         let mut transaction = test.storage.begin_write().await?;
         transaction.delete_account(&owner).await?;
         let effects = extension
@@ -541,14 +545,27 @@ fn hosts_without_configured_limits_enforce_the_default_quota() -> TestResult {
 }
 
 #[test]
-fn offline_extension_has_only_message_hooks() {
-    let offline = Offline::new(BTreeMap::new());
-    let extension: &TestExtension = &offline;
+fn offline_registers_message_and_account_handlers() -> TestResult {
+    let offline = Arc::new(Offline::new(BTreeMap::new()));
+    let extension: &TestExtension = offline.as_ref();
     assert_eq!(extension.name(), super::NAME);
-    assert!(extension.stores_messages());
-    assert!(extension.iq_routes().is_empty());
-    assert!(extension.presence_kinds().is_empty());
-    assert!(extension.stream_features().is_empty());
+    let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
+    catalog.register(offline.clone())?;
+    let registry = catalog.enable_host("example.com", ["offline"])?;
+    assert!(registry.messages().is_some());
+    assert!(registry.iq().is_empty());
+    assert!(
+        PresenceRequestType::ALL
+            .into_iter()
+            .all(|kind| registry.presence().find(kind).is_none())
+    );
+    assert!(registry.stream_features().is_empty());
+    let handlers = registry.account_handlers();
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].0, "offline");
+    let handler: Arc<TestAccountHandler> = offline;
+    assert!(Arc::ptr_eq(&handlers[0].1, &handler));
+    Ok(())
 }
 
 #[test]

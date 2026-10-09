@@ -147,15 +147,4 @@ impl<A: ChunkAllocator, S: Storage> PresenceRegistry<A, S> {
     pub fn find(&self, kind: PresenceRequestType) -> Option<&dyn PresenceHandler<A, S>> {
         self.handlers[kind as usize].as_deref()
     }
-
-    pub(crate) fn registrations(
-        &self,
-    ) -> impl Iterator<Item = (PresenceRequestType, Arc<dyn PresenceHandler<A, S>>)> + '_ {
-        PresenceRequestType::ALL
-            .into_iter()
-            .zip(&self.handlers)
-            .filter_map(|(kind, handler)| {
-                handler.as_ref().map(|handler| (kind, Arc::clone(handler)))
-            })
-    }
 }

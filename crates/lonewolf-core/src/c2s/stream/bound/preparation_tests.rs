@@ -12,7 +12,7 @@ use lonewolf_extension::delivery::{FailureKind, HostLookup};
 use lonewolf_extension::iq::IqFuture;
 use lonewolf_extension::message::StoreFuture;
 use lonewolf_extension::presence::{PresenceFuture, PresenceHandler};
-use lonewolf_extension::{Effects, Extension, Extensions};
+use lonewolf_extension::{Effects, Extension, Extensions, RegistrationError, Slots};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use parking_lot::Mutex as PlMutex;
@@ -106,14 +106,18 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for Gate {
     fn name(&self) -> &'static str {
         "controlled-preparation"
     }
-    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
-        &[
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for kind in [
             PresenceRequestType::Subscribe,
             PresenceRequestType::Available,
-        ]
-    }
-    fn stores_messages(&self) -> bool {
-        true
+        ] {
+            slots.presence(kind, self.clone())?;
+        }
+        slots.offline(self)
     }
 }
 
@@ -303,7 +307,7 @@ fn enable(mut fixture: Fixture, gate: &Arc<Gate>) -> TestResult<Fixture> {
         .router
         .with_extensions(std::collections::BTreeMap::from([(
             "localhost".into(),
-            catalog.enable(["controlled-preparation"])?,
+            catalog.enable_host("localhost", ["controlled-preparation"])?,
         )]));
     Ok(fixture)
 }

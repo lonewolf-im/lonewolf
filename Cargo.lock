@@ -1221,6 +1221,7 @@ dependencies = [
  "lonewolf-storage",
  "lonewolf-util",
  "lonewolf-xmpp",
+ "parking_lot",
  "tempfile",
  "time",
  "tracing",

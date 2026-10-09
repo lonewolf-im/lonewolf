@@ -73,7 +73,7 @@ async fn delete<A: ChunkAllocator + Clone>(
     router: &RouterHandle<A>,
     allocator: &A,
 ) -> Result<bool, DeleterError> {
-    let extensions = router.extensions(account.domain());
+    let handlers = router.account_handlers(account.domain());
     let delivery = RouterDelivery::new(router, allocator, None);
     let mut transaction = storage.begin_write().await?;
     let existed = match transaction.delete_account(account).await {
@@ -82,9 +82,9 @@ async fn delete<A: ChunkAllocator + Clone>(
         Err(error) => return Err(error.into()),
     };
     let mut accounts = vec![account.clone()];
-    let mut deliveries = Vec::with_capacity(extensions.len());
-    for extension in extensions {
-        let effects = extension
+    let mut deliveries = Vec::with_capacity(handlers.len());
+    for (name, handler) in handlers {
+        let effects = handler
             .forget_account(&mut transaction, account, &delivery)
             .await
             .map_err(|error| {
@@ -92,7 +92,7 @@ async fn delete<A: ChunkAllocator + Clone>(
                     report_handler_failure(&error, account);
                 } else {
                     tracing::error!(
-                        extension = extension.name(),
+                        extension = name,
                         condition = ?error.condition(),
                         "account deletion aborted"
                     );
@@ -100,7 +100,7 @@ async fn delete<A: ChunkAllocator + Clone>(
                 deleter_error("an extension could not forget the account")
             })?;
         accounts.extend(effects.accounts);
-        deliveries.push((extension.name(), effects.deliver));
+        deliveries.push((name, effects.deliver));
     }
     transaction
         .clear_offline_messages(account)

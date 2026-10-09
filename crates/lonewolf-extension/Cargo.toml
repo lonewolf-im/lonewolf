@@ -10,7 +10,9 @@ publish.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
+serde.workspace = true
 time.workspace = true
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

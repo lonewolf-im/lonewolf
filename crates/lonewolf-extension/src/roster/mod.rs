@@ -18,6 +18,7 @@ use lonewolf_storage::roster::{
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
+use serde::Deserialize;
 
 use crate::account::AccountHandler;
 use crate::delivery::{
@@ -28,7 +29,10 @@ use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate, ReceiveFuture,
 };
-use crate::{Effects, Extension, ExtensionFuture, RegistrationError, Slots};
+use crate::{
+    Effects, Extension, ExtensionFactory, ExtensionFuture, HostOptions, OptionsError,
+    RegistrationError, Slots,
+};
 use subscription::Parties;
 
 pub const NAME: &str = "roster";
@@ -63,6 +67,53 @@ impl Default for RosterLimits {
         Self {
             max_pending_subscription_requests: DEFAULT_MAX_PENDING_SUBSCRIPTION_REQUESTS,
         }
+    }
+}
+
+pub struct RosterFactory;
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RosterOptions {
+    max_pending_subscription_requests: NonZeroUsize,
+}
+
+impl Default for RosterOptions {
+    fn default() -> Self {
+        Self {
+            max_pending_subscription_requests: RosterLimits::default()
+                .max_pending_subscription_requests,
+        }
+    }
+}
+
+impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for RosterFactory {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn build(&self, hosts: &[HostOptions<'_>]) -> Result<Arc<dyn Extension<A, S>>, OptionsError> {
+        let mut limits = BTreeMap::new();
+        for host in hosts {
+            if let Some(table) = host.options {
+                let options =
+                    table
+                        .clone()
+                        .try_into::<RosterOptions>()
+                        .map_err(|error| OptionsError {
+                            domain: host.domain.into(),
+                            reason: error.to_string(),
+                        })?;
+                limits.insert(
+                    host.domain.into(),
+                    RosterLimits {
+                        max_pending_subscription_requests: options
+                            .max_pending_subscription_requests,
+                    },
+                );
+            }
+        }
+        Ok(Arc::new(Roster::new(limits)))
     }
 }
 

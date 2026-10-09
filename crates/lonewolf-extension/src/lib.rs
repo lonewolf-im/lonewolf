@@ -67,12 +67,53 @@ pub trait Extension<A: ChunkAllocator, S: Storage>: Send + Sync {
         &[]
     }
 
-    /// Adds this extension's handlers for one host.
     fn register(
         self: Arc<Self>,
         host: &str,
         slots: &mut Slots<'_, A, S>,
     ) -> Result<(), RegistrationError>;
+}
+
+pub struct HostOptions<'a> {
+    pub domain: &'a str,
+    pub options: Option<&'a toml::Table>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct OptionsError {
+    pub domain: String,
+    pub reason: String,
+}
+
+pub trait ExtensionFactory<A: ChunkAllocator, S: Storage>: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    /// Builds the instance shared by every host in `hosts`.
+    fn build(&self, hosts: &[HostOptions<'_>]) -> Result<Arc<dyn Extension<A, S>>, OptionsError>;
+}
+
+pub struct HostSelection<'a> {
+    pub domain: &'a str,
+    pub extensions: &'a [String],
+    pub options: &'a BTreeMap<String, toml::Table>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct EnableError {
+    pub host: String,
+    pub source: RegistrationError,
+}
+
+impl fmt::Display for EnableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for EnableError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -87,6 +128,12 @@ pub enum RegistrationError {
         extension: &'static str,
         dependency: &'static str,
     },
+    InvalidOptions {
+        extension: &'static str,
+        reason: String,
+    },
+    OptionsWithoutExtension(String),
+    UnknownOptions(String),
 }
 
 impl fmt::Display for RegistrationError {
@@ -111,6 +158,16 @@ impl fmt::Display for RegistrationError {
                 formatter,
                 "extension {extension:?} requires extension {dependency:?}"
             ),
+            Self::InvalidOptions { extension, reason } => {
+                write!(formatter, "invalid {extension} options: {reason}")
+            }
+            Self::OptionsWithoutExtension(name) => {
+                write!(
+                    formatter,
+                    "options for {name:?} require enabling that extension"
+                )
+            }
+            Self::UnknownOptions(name) => write!(formatter, "unknown host setting {name:?}"),
         }
     }
 }
@@ -168,7 +225,32 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
 }
 
 pub struct Extensions<A: ChunkAllocator, S: Storage> {
-    available: BTreeMap<&'static str, Arc<dyn Extension<A, S>>>,
+    available: BTreeMap<&'static str, Box<dyn ExtensionFactory<A, S>>>,
+}
+
+struct Shared<A: ChunkAllocator, S: Storage>(Arc<dyn Extension<A, S>>);
+
+impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for Shared<A, S> {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn build(&self, hosts: &[HostOptions<'_>]) -> Result<Arc<dyn Extension<A, S>>, OptionsError> {
+        if let Some(host) = hosts.iter().find(|host| host.options.is_some()) {
+            return Err(OptionsError {
+                domain: host.domain.into(),
+                reason: "this extension has no options".into(),
+            });
+        }
+        Ok(Arc::clone(&self.0))
+    }
+}
+
+pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 2] {
+    [
+        Box::new(roster::RosterFactory),
+        Box::new(offline::OfflineFactory),
+    ]
 }
 
 impl<A: ChunkAllocator, S: Storage> Default for Extensions<A, S> {
@@ -184,53 +266,139 @@ impl<A: ChunkAllocator, S: Storage> Extensions<A, S> {
         &mut self,
         extension: Arc<dyn Extension<A, S>>,
     ) -> Result<(), RegistrationError> {
-        let name = extension.name();
+        self.register_factory(Box::new(Shared(extension)))
+    }
+
+    pub fn register_factory(
+        &mut self,
+        factory: Box<dyn ExtensionFactory<A, S>>,
+    ) -> Result<(), RegistrationError> {
+        let name = factory.name();
         if name.is_empty() || name.trim() != name {
             return Err(RegistrationError::InvalidExtensionName);
         }
         if self.available.contains_key(name) {
             return Err(RegistrationError::DuplicateExtension(name));
         }
-        self.available.insert(name, extension);
+        self.available.insert(name, factory);
         Ok(())
     }
 
-    /// Handler instances are shared across every host that enables the extension.
+    pub fn enable(
+        &self,
+        hosts: &[HostSelection<'_>],
+    ) -> Result<BTreeMap<String, ExtensionRegistry<A, S>>, EnableError> {
+        for host in hosts {
+            for name in host.options.keys() {
+                let source = if !self.available.contains_key(name.as_str()) {
+                    RegistrationError::UnknownOptions(name.clone())
+                } else if !host.extensions.contains(name) {
+                    RegistrationError::OptionsWithoutExtension(name.clone())
+                } else {
+                    continue;
+                };
+                return Err(EnableError {
+                    host: host.domain.into(),
+                    source,
+                });
+            }
+        }
+        let names = hosts
+            .iter()
+            .flat_map(|host| host.extensions.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>();
+        let mut built = BTreeMap::new();
+        for name in names {
+            let selected = hosts
+                .iter()
+                .filter(|host| host.extensions.iter().any(|enabled| enabled == name))
+                .map(|host| HostOptions {
+                    domain: host.domain,
+                    options: host.options.get(name),
+                })
+                .collect::<Vec<_>>();
+            let (name, factory) =
+                self.available
+                    .get_key_value(name)
+                    .ok_or_else(|| EnableError {
+                        host: selected[0].domain.into(),
+                        source: RegistrationError::UnknownExtension(name.into()),
+                    })?;
+            let extension = factory.build(&selected).map_err(|error| EnableError {
+                host: error.domain,
+                source: RegistrationError::InvalidOptions {
+                    extension: name,
+                    reason: error.reason,
+                },
+            })?;
+            built.insert(*name, extension);
+        }
+        hosts
+            .iter()
+            .map(|host| {
+                enable_host(
+                    &built,
+                    host.domain,
+                    host.extensions.iter().map(String::as_str),
+                )
+                .map(|registry| (host.domain.into(), registry))
+                .map_err(|source| EnableError {
+                    host: host.domain.into(),
+                    source,
+                })
+            })
+            .collect()
+    }
+
     pub fn enable_host<'a>(
         &self,
         host: &str,
         names: impl IntoIterator<Item = &'a str>,
     ) -> Result<ExtensionRegistry<A, S>, RegistrationError> {
-        let mut selected = Vec::new();
-        let mut selected_names = BTreeSet::new();
-        for name in names {
-            let (name, extension) = self
-                .available
-                .get_key_value(name)
-                .ok_or_else(|| RegistrationError::UnknownExtension(name.into()))?;
-            if !selected_names.insert(*name) {
-                return Err(RegistrationError::DuplicateExtension(name));
-            }
-            selected.push(extension);
-        }
-        for extension in &selected {
-            for dependency in extension.depends() {
-                if !selected_names.contains(dependency) {
-                    return Err(RegistrationError::MissingDependency {
-                        extension: extension.name(),
-                        dependency,
-                    });
-                }
-            }
-        }
-        let mut registry = ExtensionRegistry::default();
-        for extension in selected {
-            Arc::clone(extension)
-                .register(host, &mut Slots::new(&mut registry, extension.name()))?;
-            registry.enabled.push(extension.name());
-        }
-        Ok(registry)
+        let names = names.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let mut enabled = self
+            .enable(&[HostSelection {
+                domain: host,
+                extensions: &names,
+                options: &BTreeMap::new(),
+            }])
+            .map_err(|error| error.source)?;
+        Ok(enabled.remove(host).unwrap_or_default())
     }
+}
+
+fn enable_host<'a, A: ChunkAllocator, S: Storage>(
+    available: &BTreeMap<&'static str, Arc<dyn Extension<A, S>>>,
+    host: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<ExtensionRegistry<A, S>, RegistrationError> {
+    let mut selected = Vec::new();
+    let mut selected_names = BTreeSet::new();
+    for name in names {
+        let (name, extension) = available
+            .get_key_value(name)
+            .ok_or_else(|| RegistrationError::UnknownExtension(name.into()))?;
+        if !selected_names.insert(*name) {
+            return Err(RegistrationError::DuplicateExtension(name));
+        }
+        selected.push(extension);
+    }
+    for extension in &selected {
+        for dependency in extension.depends() {
+            if !selected_names.contains(dependency) {
+                return Err(RegistrationError::MissingDependency {
+                    extension: extension.name(),
+                    dependency,
+                });
+            }
+        }
+    }
+    let mut registry = ExtensionRegistry::default();
+    for extension in selected {
+        Arc::clone(extension).register(host, &mut Slots::new(&mut registry, extension.name()))?;
+        registry.enabled.push(extension.name());
+    }
+    Ok(registry)
 }
 
 #[cfg(test)]

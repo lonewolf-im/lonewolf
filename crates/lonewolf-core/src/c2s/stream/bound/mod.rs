@@ -47,7 +47,7 @@ use crate::router::{
 
 mod output;
 
-use output::{Outgoing, OutputSequence};
+use output::{Outgoing, OutputSequence, Release};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
@@ -67,6 +67,7 @@ struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     queue: VecDeque<Output<A>>,
     writer: W,
     written: OutputSequence,
+    releases: VecDeque<(OutputSequence, Release<A>)>,
     allocator: A,
     account: AccountKey,
     storage: RedbStorage,
@@ -198,6 +199,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         queue: VecDeque::new(),
         writer,
         written: OutputSequence::default(),
+        releases: VecDeque::new(),
         allocator: allocator.clone(),
         account: registration.account().clone(),
         storage: storage.clone(),
@@ -1376,13 +1378,18 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
     }
 
     async fn flush(&mut self) -> Result<(), CloseOutcome> {
+        let flushed = self.write_queue().await;
+        if flushed.is_err() {
+            // Failed writes may not have reached the client, so their copies stay stored.
+            self.releases.clear();
+        }
+        flushed
+    }
+
+    async fn write_queue(&mut self) -> Result<(), CloseOutcome> {
         if self.queue.is_empty() {
             return Ok(());
         }
-        let mut acknowledgement: Option<(
-            Arc<dyn MessageHandler<A, RedbStorage>>,
-            OfflineSequence,
-        )> = None;
         let mut offline_replay = false;
         let mut messages_written = 0usize;
         let mut messages_skipped = 0usize;
@@ -1438,12 +1445,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                             }
                         }
                     }
-                    let through = acknowledgement
-                        .as_ref()
-                        .map_or(backlog.through, |(_, through)| {
-                            (*through).max(backlog.through)
-                        });
-                    acknowledgement = Some((handler, through));
+                    self.releases.push_back((
+                        self.written,
+                        Release::Backlog {
+                            handler,
+                            through: backlog.through,
+                        },
+                    ));
                 }
             }
         }
@@ -1468,10 +1476,31 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 "offline replay flushed"
             );
         }
-        if let Some((handler, through)) = acknowledgement {
+        self.release_through(self.written);
+        Ok(())
+    }
+
+    fn release_through(&mut self, flushed: OutputSequence) {
+        let mut backlog: Option<(Arc<dyn MessageHandler<A, RedbStorage>>, OfflineSequence)> = None;
+        while let Some((sequence, _)) = self.releases.front() {
+            if *sequence > flushed {
+                break;
+            }
+            let Some((_, release)) = self.releases.pop_front() else {
+                break;
+            };
+            match release {
+                Release::Backlog { handler, through } => {
+                    let through = backlog
+                        .as_ref()
+                        .map_or(through, |(_, previous)| (*previous).max(through));
+                    backlog = Some((handler, through));
+                }
+            }
+        }
+        if let Some((handler, through)) = backlog {
             self.acknowledge(handler, through);
         }
-        Ok(())
     }
 
     fn acknowledge(

@@ -213,6 +213,7 @@ impl Fixture {
             queue: VecDeque::new(),
             writer,
             written: OutputSequence::default(),
+            releases: VecDeque::new(),
             allocator,
             account: self.registration.account().clone(),
             storage: self.storage.clone(),
@@ -320,6 +321,7 @@ fn failed_write_or_flush_keeps_backlog_for_a_successful_retry() -> TestResult {
                 handler: Arc::new(Offline::new(Default::default())),
             });
             assert_eq!(outbox.flush().await, Err(CloseOutcome::TransportError));
+            assert!(outbox.releases.is_empty());
             assert_eq!(fixture.count().await?, 2);
             outbox.writer.fail_write = false;
             outbox.writer.fail_flush = false;
@@ -329,6 +331,61 @@ fn failed_write_or_flush_keeps_backlog_for_a_successful_retry() -> TestResult {
             fixture.finish().await?;
         }
         Ok(())
+    })
+}
+
+#[test]
+fn release_through_releases_only_entries_up_to_the_flushed_sequence() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[MESSAGE, MESSAGE]).await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        let offline = Arc::new(Offline::new(Default::default()));
+        outbox.releases.push_back((
+            OutputSequence::new(2),
+            Release::Backlog {
+                handler: offline.clone(),
+                through: OfflineSequence::new(1),
+            },
+        ));
+        outbox.releases.push_back((
+            OutputSequence::new(5),
+            Release::Backlog {
+                handler: offline,
+                through: OfflineSequence::new(2),
+            },
+        ));
+        outbox.release_through(OutputSequence::new(3));
+        assert_eq!(outbox.releases.len(), 1);
+        assert_eq!(
+            outbox
+                .acknowledgement
+                .as_ref()
+                .ok_or("missing acknowledgement worker")?
+                .through
+                .get(),
+            OfflineSequence::new(1)
+        );
+        outbox.release_through(OutputSequence::new(5));
+        assert!(outbox.releases.is_empty());
+        assert_eq!(
+            outbox
+                .acknowledgement
+                .as_ref()
+                .ok_or("missing acknowledgement worker")?
+                .through
+                .get(),
+            OfflineSequence::new(2)
+        );
+        compio::time::timeout(Duration::from_secs(1), async {
+            while fixture.count().await? != 0 {
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Ok::<_, Box<dyn Error>>(())
+        })
+        .await??;
+        assert_eq!(fixture.count().await?, 0);
+        drop(outbox);
+        fixture.finish().await
     })
 }
 

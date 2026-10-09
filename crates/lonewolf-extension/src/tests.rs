@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod options;
 use std::sync::Arc;
 
 use lonewolf_storage::account::AccountKey;

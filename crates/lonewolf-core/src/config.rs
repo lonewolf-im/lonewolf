@@ -8,12 +8,10 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use lonewolf_auth::server::Mechanism;
-use lonewolf_extension::offline::OfflineLimits;
-use lonewolf_extension::roster::RosterLimits;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
 use lonewolf_xmpp::jid::Jid;
@@ -28,7 +26,7 @@ pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 const MEBIBYTE: usize = 1024 * 1024;
 
 /// [`Self::load`] also validates value constraints; direct deserialization does not.
-#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub logging: LoggingConfig,
@@ -136,26 +134,6 @@ impl Config {
             _ => {}
         }
         for (domain, host) in &self.hosts {
-            if host.roster.is_some()
-                && !host
-                    .extensions
-                    .iter()
-                    .any(|name| name == lonewolf_extension::roster::NAME)
-            {
-                return Err(format!(
-                    "hosts.{domain}.roster requires the roster extension"
-                ));
-            }
-            if host.offline.is_some()
-                && !host
-                    .extensions
-                    .iter()
-                    .any(|name| name == lonewolf_extension::offline::NAME)
-            {
-                return Err(format!(
-                    "hosts.{domain}.offline requires the offline extension"
-                ));
-            }
             let mut arena = Arena::try_new(ArenaConfig::default())
                 .map_err(|error| format!("cannot validate hosts.{domain}: {error}"))?;
             let jid = Jid::from_parts_in(None, domain, None, &mut arena)
@@ -205,13 +183,13 @@ fn default_hosts() -> BTreeMap<String, HostConfig> {
     BTreeMap::from([(String::from("localhost"), HostConfig::default())])
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct HostConfig {
     pub tls: Option<HostTlsConfig>,
     pub extensions: Vec<String>,
-    pub offline: Option<OfflineHostConfig>,
-    pub roster: Option<RosterHostConfig>,
+    #[serde(flatten)]
+    pub options: BTreeMap<String, toml::Table>,
 }
 
 impl Default for HostConfig {
@@ -222,37 +200,7 @@ impl Default for HostConfig {
                 lonewolf_extension::roster::NAME.into(),
                 lonewolf_extension::offline::NAME.into(),
             ],
-            offline: None,
-            roster: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct RosterHostConfig {
-    pub max_pending_subscription_requests: NonZeroUsize,
-}
-
-impl Default for RosterHostConfig {
-    fn default() -> Self {
-        Self {
-            max_pending_subscription_requests: RosterLimits::default()
-                .max_pending_subscription_requests,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
-pub struct OfflineHostConfig {
-    pub max_messages_per_account: NonZeroU32,
-}
-
-impl Default for OfflineHostConfig {
-    fn default() -> Self {
-        Self {
-            max_messages_per_account: OfflineLimits::default().max_messages_per_account,
+            options: BTreeMap::new(),
         }
     }
 }

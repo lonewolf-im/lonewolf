@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod options;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::num::{NonZeroU32, NonZeroUsize};

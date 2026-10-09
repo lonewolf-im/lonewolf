@@ -11,12 +11,16 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::{OfflineError, OfflineReads, OfflineSequence, OfflineWrites};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition, StanzaType};
+use serde::Deserialize;
 
 use crate::account::AccountHandler;
 use crate::delivery::{Failure, FailureKind, HandlerError, HostLookup};
 use crate::message::{Backlog, MessageHandler, StoreFuture, StoreOutcome, UndeliverableMessage};
 use crate::presence::PresenceFuture;
-use crate::{Effects, Extension, ExtensionFuture, RegistrationError, Slots};
+use crate::{
+    Effects, Extension, ExtensionFactory, ExtensionFuture, HostOptions, OptionsError,
+    RegistrationError, Slots,
+};
 
 pub const NAME: &str = "offline";
 const DEFAULT_MAX_MESSAGES_PER_ACCOUNT: NonZeroU32 = NonZeroU32::new(100).unwrap();
@@ -31,6 +35,50 @@ impl Default for OfflineLimits {
         Self {
             max_messages_per_account: DEFAULT_MAX_MESSAGES_PER_ACCOUNT,
         }
+    }
+}
+
+pub struct OfflineFactory;
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OfflineOptions {
+    max_messages_per_account: NonZeroU32,
+}
+
+impl Default for OfflineOptions {
+    fn default() -> Self {
+        Self {
+            max_messages_per_account: OfflineLimits::default().max_messages_per_account,
+        }
+    }
+}
+
+impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for OfflineFactory {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn build(&self, hosts: &[HostOptions<'_>]) -> Result<Arc<dyn Extension<A, S>>, OptionsError> {
+        let mut limits = BTreeMap::new();
+        for host in hosts {
+            if let Some(table) = host.options {
+                let options = table
+                    .clone()
+                    .try_into::<OfflineOptions>()
+                    .map_err(|error| OptionsError {
+                        domain: host.domain.into(),
+                        reason: error.to_string(),
+                    })?;
+                limits.insert(
+                    host.domain.into(),
+                    OfflineLimits {
+                        max_messages_per_account: options.max_messages_per_account,
+                    },
+                );
+            }
+        }
+        Ok(Arc::new(Offline::new(limits)))
     }
 }
 

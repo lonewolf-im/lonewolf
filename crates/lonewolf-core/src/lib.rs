@@ -3,7 +3,6 @@
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 
-use std::collections::BTreeSet;
 use std::env;
 use std::future::{Future, pending};
 use std::io;
@@ -17,7 +16,7 @@ use std::time::{Duration, Instant};
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::{Either, join, select};
-use lonewolf_extension::{Extension, Extensions};
+use lonewolf_extension::{Extensions, HostSelection};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
@@ -73,8 +72,8 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     run_with_extensions(config_path, build, Extensions::default())
 }
 
-/// Uses the lifecycle and process-wide side effects of [`run`].
-/// Enabled extensions must exist in the supplied catalog and have disjoint stanza routes.
+/// Adds the built-in extensions to the supplied catalog.
+/// Enabled extensions must have disjoint stanza routes.
 pub fn run_with_extensions(
     config_path: Option<&Path>,
     build: BuildInfo,
@@ -125,69 +124,27 @@ pub fn run_with_extensions(
             let mut shutdown_deadline = None;
             let result = async {
                 let storage = stores.storage(account_store)?;
-                let referenced = config
-                    .hosts
-                    .values()
-                    .flat_map(|host| host.extensions.iter().map(String::as_str))
-                    .collect::<BTreeSet<_>>();
-                for name in referenced {
-                    let extension: Arc<dyn Extension<Arc<PooledChunkAllocator>, RedbStorage>> =
-                        match name {
-                            lonewolf_extension::roster::NAME => {
-                                let limits = config
-                                    .hosts
-                                    .iter()
-                                    .filter_map(|(domain, host)| {
-                                        host.roster.map(|roster| {
-                                            (
-                                                domain.as_str().into(),
-                                                lonewolf_extension::roster::RosterLimits {
-                                                    max_pending_subscription_requests: roster
-                                                        .max_pending_subscription_requests,
-                                                },
-                                            )
-                                        })
-                                    })
-                                    .collect();
-                                Arc::new(lonewolf_extension::roster::Roster::new(limits))
-                            }
-                            lonewolf_extension::offline::NAME => {
-                                let limits = config
-                                    .hosts
-                                    .iter()
-                                    .filter_map(|(domain, host)| {
-                                        host.offline.map(|offline| {
-                                            (
-                                                domain.as_str().into(),
-                                                lonewolf_extension::offline::OfflineLimits {
-                                                    max_messages_per_account: offline
-                                                        .max_messages_per_account,
-                                                },
-                                            )
-                                        })
-                                    })
-                                    .collect();
-                                Arc::new(lonewolf_extension::offline::Offline::new(limits))
-                            }
-                            _ => continue,
-                        };
+                for factory in lonewolf_extension::builtin() {
                     extensions
-                        .register(extension)
+                        .register_factory(factory)
                         .map_err(RunError::ExtensionCatalog)?;
                 }
-                let enabled_extensions = config
+                let selections: Vec<HostSelection<'_>> = config
                     .hosts
                     .iter()
-                    .map(|(domain, host)| {
-                        extensions
-                            .enable_host(domain, host.extensions.iter().map(String::as_str))
-                            .map(|registry| (domain.clone(), registry))
-                            .map_err(|source| RunError::Extensions {
-                                host: domain.clone(),
-                                source,
-                            })
+                    .map(|(domain, host)| HostSelection {
+                        domain,
+                        extensions: &host.extensions,
+                        options: &host.options,
                     })
-                    .collect::<Result<_, _>>()?;
+                    .collect();
+                let enabled_extensions =
+                    extensions
+                        .enable(&selections)
+                        .map_err(|error| RunError::Extensions {
+                            host: error.host,
+                            source: error.source,
+                        })?;
                 let (deleter, deletions) = account_deletion::channel();
                 let admin = if config.admin.enabled {
                     Some(

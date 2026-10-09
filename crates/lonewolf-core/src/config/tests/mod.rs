@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
@@ -10,9 +11,12 @@ use std::process::Command;
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
     AccountConfig, ClientCertificateConfig, Config, ConfigError, HostConfig, HostTlsConfig,
-    OfflineHostConfig, RosterHostConfig, StoreConfig, TcpListenerConfig, XmppConfig,
+    StoreConfig, TcpListenerConfig, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
+use lonewolf_extension::{Extensions, HostSelection};
+use lonewolf_storage::RedbStorage;
+use lonewolf_util::arena::GlobalChunkAllocator;
 
 mod hosts;
 mod limits;
@@ -80,83 +84,6 @@ fn no_configuration_file_enables_roster_and_offline() -> TestResult {
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8(output.stdout)?.contains("1 passed;"));
     }
-    Ok(())
-}
-
-#[test]
-fn offline_limits_are_optional_and_default_to_one_hundred_messages() -> TestResult {
-    assert!(Config::default().hosts["localhost"].offline.is_none());
-    let file =
-        config_file("[hosts.localhost]\nextensions = ['offline']\n[hosts.localhost.offline]")?;
-    let config = Config::load(Some(file.path()))?;
-    assert_eq!(
-        config.hosts["localhost"].offline,
-        Some(OfflineHostConfig::default())
-    );
-    assert_eq!(
-        OfflineHostConfig::default().max_messages_per_account.get(),
-        100
-    );
-    Ok(())
-}
-
-#[test]
-fn offline_limits_use_the_configured_message_count() -> TestResult {
-    let file = config_file("[hosts.localhost.offline]\nmax_messages_per_account = 7")?;
-    let config = Config::load(Some(file.path()))?;
-    assert_eq!(config.hosts["localhost"].extensions, ["roster", "offline"]);
-    assert_eq!(
-        config.hosts["localhost"]
-            .offline
-            .ok_or("missing offline limit")?
-            .max_messages_per_account
-            .get(),
-        7
-    );
-    Ok(())
-}
-
-#[test]
-fn invalid_offline_limits_are_rejected() -> TestResult {
-    for setting in [
-        "max_messages_per_account = 0",
-        "max_messages_per_account = -1",
-        "max_messages_per_account = 4294967296",
-        "max_messages = 7",
-    ] {
-        let contents = format!(
-            "[hosts.localhost]\nextensions = ['offline']\n[hosts.localhost.offline]\n{setting}"
-        );
-        let file = config_file(&contents)?;
-        assert!(
-            matches!(
-                Config::load(Some(file.path())),
-                Err(ConfigError::Parse { .. })
-            ),
-            "{setting}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn offline_limits_require_the_enabled_extension() -> TestResult {
-    for extensions in ["[]", "['roster']"] {
-        let contents =
-            format!("[hosts.localhost]\nextensions = {extensions}\n[hosts.localhost.offline]");
-        let file = config_file(&contents)?;
-        assert!(
-            matches!(Config::load(Some(file.path())), Err(ConfigError::Invalid { reason, .. }) if reason == "hosts.localhost.offline requires the offline extension")
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn offline_extension_can_use_the_default_without_a_limits_section() -> TestResult {
-    let file = config_file("[hosts.localhost]\nextensions = ['offline']")?;
-    let config = Config::load(Some(file.path()))?;
-    assert!(config.hosts["localhost"].offline.is_none());
     Ok(())
 }
 
@@ -703,8 +630,22 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         "example.com".into(),
         HostConfig {
             extensions: vec!["roster".into(), "offline".into()],
-            offline: Some(OfflineHostConfig::default()),
-            roster: Some(RosterHostConfig::default()),
+            options: BTreeMap::from([
+                (
+                    "roster".into(),
+                    toml::Table::from_iter([(
+                        "max_pending_subscription_requests".into(),
+                        toml::Value::Integer(100),
+                    )]),
+                ),
+                (
+                    "offline".into(),
+                    toml::Table::from_iter([(
+                        "max_messages_per_account".into(),
+                        toml::Value::Integer(100),
+                    )]),
+                ),
+            ]),
             tls: Some(HostTlsConfig {
                 certificate_chain_path: PathBuf::from("./certs/example.com.crt"),
                 private_key_path: PathBuf::from("./certs/example.com.key"),
@@ -729,7 +670,22 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
             ..C2sLimitProfile::default()
         },
     );
-    assert_eq!(Config::load(Some(file.path()))?, expected);
+    let loaded = Config::load(Some(file.path()))?;
+    assert_eq!(loaded, expected);
+    let mut extensions = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
+    for factory in lonewolf_extension::builtin() {
+        extensions.register_factory(factory)?;
+    }
+    let selections = loaded
+        .hosts
+        .iter()
+        .map(|(domain, host)| HostSelection {
+            domain,
+            extensions: &host.extensions,
+            options: &host.options,
+        })
+        .collect::<Vec<_>>();
+    extensions.enable(&selections)?;
     Ok(())
 }
 

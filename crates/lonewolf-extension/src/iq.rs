@@ -38,7 +38,6 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
-/// The result payload and the deliveries that follow a handled IQ.
 pub struct IqReply<A> {
     pub payload: Option<Element>,
     pub effects: Effects<A>,
@@ -53,8 +52,7 @@ impl<A: ChunkAllocator> IqReply<A> {
 pub type IqFuture<'a, A> = ExtensionFuture<'a, Result<IqReply<A>, HandlerError>>;
 
 /// Every future runs on the connection worker and can be cancelled on shutdown.
-/// Handlers authorize `request.target` against `request.sender` themselves. The
-/// defaults answer `service-unavailable` for extensions without IQ routes.
+/// Handlers authorize `request.target` against `request.sender` themselves.
 pub trait IqHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
     /// Answers a `get` from one consistent snapshot. The result payload is allocated in
     /// `response`; the effects may address only the target account.
@@ -126,11 +124,8 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
         Some(&self.handlers[index].1)
     }
 
-    pub(crate) fn registrations(
-        &self,
-    ) -> impl Iterator<Item = (IqRoute, Arc<dyn IqHandler<A, S>>)> + '_ {
-        self.handlers
-            .iter()
-            .map(|(route, handler)| (*route, Arc::clone(handler)))
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
     }
 }

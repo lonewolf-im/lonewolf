@@ -1724,7 +1724,7 @@ fn iq_visibility_reads_prior_roster_revocation_while_delivery_waits_on_order() -
             .router
             .with_extensions(std::collections::BTreeMap::from([(
                 "localhost".into(),
-                catalog.enable(["roster"])?,
+                catalog.enable_host("localhost", ["roster"])?,
             )]));
         let router = fixture.router.handle();
         let mut arena = Arena::try_new(Default::default())?;
@@ -2132,17 +2132,18 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
         drop(committed);
         assert!(target.take_queued().is_empty());
         deletion.delete_account(target.account()).await?;
-        let cleanup = <lonewolf_extension::roster::Roster as lonewolf_extension::Extension<
-            GlobalChunkAllocator,
-            RedbStorage,
-        >>::forget_account(
-            &Default::default(),
-            &mut deletion,
-            target.account(),
-            &RouterDelivery::new(&router, &GlobalChunkAllocator, None),
-        )
-        .await
-        .map_err(|error| format!("{error:?}"))?;
+        let cleanup =
+            <lonewolf_extension::roster::Roster as lonewolf_extension::account::AccountHandler<
+                GlobalChunkAllocator,
+                RedbStorage,
+            >>::forget_account(
+                &Default::default(),
+                &mut deletion,
+                target.account(),
+                &RouterDelivery::new(&router, &GlobalChunkAllocator, None),
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?;
         let ((), mut retirement) = router
             .order()
             .fix(cleanup.accounts, deletion.commit())

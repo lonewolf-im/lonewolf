@@ -180,7 +180,7 @@ pub fn run_with_extensions(
                     .iter()
                     .map(|(domain, host)| {
                         extensions
-                            .enable(host.extensions.iter().map(String::as_str))
+                            .enable_host(domain, host.extensions.iter().map(String::as_str))
                             .map(|registry| (domain.clone(), registry))
                             .map_err(|source| RunError::Extensions {
                                 host: domain.clone(),

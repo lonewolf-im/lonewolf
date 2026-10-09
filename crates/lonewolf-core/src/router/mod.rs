@@ -7,11 +7,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lonewolf_extension::ExtensionRegistry;
+use lonewolf_extension::account::AccountHandler;
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_extension::presence::PresenceRegistry;
-use lonewolf_extension::{Extension, ExtensionRegistry};
 use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
@@ -169,10 +170,14 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self.order
     }
 
-    pub(crate) fn extensions(&self, domain: &str) -> &[Arc<dyn Extension<A, RedbStorage>>] {
+    #[expect(clippy::type_complexity)]
+    pub(crate) fn account_handlers(
+        &self,
+        domain: &str,
+    ) -> &[(&'static str, Arc<dyn AccountHandler<A, RedbStorage>>)] {
         self.extensions
             .get(domain)
-            .map_or(&[], ExtensionRegistry::extensions)
+            .map_or(&[], ExtensionRegistry::account_handlers)
     }
 
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {

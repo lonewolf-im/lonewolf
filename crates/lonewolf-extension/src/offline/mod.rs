@@ -4,6 +4,7 @@ mod xml;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
@@ -11,11 +12,11 @@ use lonewolf_storage::offline::{OfflineError, OfflineReads, OfflineSequence, Off
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition, StanzaType};
 
+use crate::account::AccountHandler;
 use crate::delivery::{Failure, FailureKind, HandlerError, HostLookup};
-use crate::iq::IqHandler;
 use crate::message::{Backlog, MessageHandler, StoreFuture, StoreOutcome, UndeliverableMessage};
-use crate::presence::{PresenceFuture, PresenceHandler};
-use crate::{Effects, Extension, ExtensionFuture};
+use crate::presence::PresenceFuture;
+use crate::{Effects, Extension, ExtensionFuture, RegistrationError, Slots};
 
 pub const NAME: &str = "offline";
 const DEFAULT_MAX_MESSAGES_PER_ACCOUNT: NonZeroU32 = NonZeroU32::new(100).unwrap();
@@ -44,19 +45,22 @@ impl Offline {
     }
 }
 
-impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Offline {}
-
-impl<A: ChunkAllocator, S: Storage> PresenceHandler<A, S> for Offline {}
-
 impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Offline {
     fn name(&self) -> &'static str {
         NAME
     }
 
-    fn stores_messages(&self) -> bool {
-        true
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, S>,
+    ) -> Result<(), RegistrationError> {
+        slots.account(self.clone());
+        slots.offline(self)
     }
+}
 
+impl<A: ChunkAllocator, S: Storage> AccountHandler<A, S> for Offline {
     fn forget_account<'a>(
         &'a self,
         transaction: &'a mut S::Write,

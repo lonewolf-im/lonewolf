@@ -14,7 +14,7 @@ use lonewolf_extension::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate,
 };
-use lonewolf_extension::{Effects, Extension, Extensions};
+use lonewolf_extension::{Effects, Extension, Extensions, RegistrationError, Slots};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_storage::roster::{RosterJid, RosterWrites};
@@ -170,8 +170,12 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for PrecommitIq {
         "test-precommit-iq"
     }
 
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for route in [
             PRECOMMIT_ROUTE,
             IqRoute {
                 name: "write",
@@ -183,15 +187,11 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for PrecommitIq {
                 name: "release",
                 ..PRECOMMIT_ROUTE
             },
-        ]
-    }
-
-    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
-        &[PresenceRequestType::Available]
-    }
-
-    fn stores_messages(&self) -> bool {
-        true
+        ] {
+            slots.iq(route, self.clone())?;
+        }
+        slots.presence(PresenceRequestType::Available, self.clone())?;
+        slots.offline(self)
     }
 }
 
@@ -274,13 +274,19 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for OfflineInspect {
     fn name(&self) -> &'static str {
         "test-offline-inspect"
     }
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[OFFLINE_ROUTE, OFFLINE_PUSH]
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for route in [OFFLINE_ROUTE, OFFLINE_PUSH] {
+            slots.iq(route, self.clone())?;
+        }
+        Ok(())
     }
 }
 
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for OfflineInspect {}
-impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for OfflineInspect {}
 impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for OfflineInspect {
     fn get<'a>(
         &'a self,
@@ -329,18 +335,19 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for SlowOffline {
             "test-slow-offline"
         }
     }
-    fn iq_routes(&self) -> &'static [IqRoute] {
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
         if self.block_ack {
-            &[OFFLINE_ROUTE, OFFLINE_RELEASE]
-        } else {
-            &[]
+            for route in [OFFLINE_ROUTE, OFFLINE_RELEASE] {
+                slots.iq(route, self.clone())?;
+            }
         }
-    }
-    fn stores_messages(&self) -> bool {
-        true
-    }
-    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
-        &[PresenceRequestType::Available]
+        slots.presence(PresenceRequestType::Available, self.clone())?;
+        slots.offline(self)
     }
 }
 impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for SlowOffline {
@@ -519,8 +526,12 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for ConflictingIq {
         "test-conflicting-iq"
     }
 
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[ACCOUNT_GET]
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(ACCOUNT_GET, self)
     }
 }
 
@@ -535,27 +546,20 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingIq {
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ConflictingIq {}
-
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ConflictingIq {}
-
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for TestIq {}
-
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ServerIq {}
-
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ErrorIq {}
-
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for TestPresence {}
-
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ConflictingPresence {}
-
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
     fn name(&self) -> &'static str {
         "test-iq"
     }
 
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[ACCOUNT_GET, ACCOUNT_SET, ACCOUNT_SLOW]
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for route in [ACCOUNT_GET, ACCOUNT_SET, ACCOUNT_SLOW] {
+            slots.iq(route, self.clone())?;
+        }
+        Ok(())
     }
 }
 
@@ -636,15 +640,17 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for TestIq {}
-
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for ServerIq {
     fn name(&self) -> &'static str {
         "test-server-iq"
     }
 
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[SERVER_GET]
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(SERVER_GET, self)
     }
 }
 
@@ -659,15 +665,17 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ServerIq {
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ServerIq {}
-
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for ErrorIq {
     fn name(&self) -> &'static str {
         "test-error-iq"
     }
 
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[ACCOUNT_DENY]
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(ACCOUNT_DENY, self)
     }
 }
 
@@ -683,19 +691,22 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ErrorIq {
     }
 }
 
-impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ErrorIq {}
-
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPresence {
     fn name(&self) -> &'static str {
         "test-presence"
     }
 
-    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
-        &SUBSCRIPTION_KINDS
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for kind in SUBSCRIPTION_KINDS {
+            slots.presence(kind, self.clone())?;
+        }
+        Ok(())
     }
 }
-
-impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestPresence {}
 
 impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for TestPresence {
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
@@ -708,12 +719,14 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for ConflictingPresence {
         "test-conflicting-presence"
     }
 
-    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
-        &[PresenceRequestType::Subscribe]
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.presence(PresenceRequestType::Subscribe, self)
     }
 }
-
-impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingPresence {}
 
 impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for ConflictingPresence {
     fn authorize<'a>(&'a self, request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
@@ -794,8 +807,16 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for FailureIq {
     fn name(&self) -> &'static str {
         "test-failure-iq"
     }
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[FAILURE_GET, FAILURE_SET]
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for route in [FAILURE_GET, FAILURE_SET] {
+            slots.iq(route, self.clone())?;
+        }
+        Ok(())
     }
 }
 
@@ -845,8 +866,6 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for FailureIq {
         })
     }
 }
-impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for FailureIq {}
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for FailureIq {}
 
 struct RouterFailureIq;
 
@@ -866,8 +885,15 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for RouterFailureIq {
         "test-router-failure"
     }
 
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &[ROUTER_FAILURE_SET, CONNECTION_FAILURE_SET]
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for route in [ROUTER_FAILURE_SET, CONNECTION_FAILURE_SET] {
+            slots.iq(route, self.clone())?;
+        }
+        Ok(())
     }
 }
 
@@ -901,6 +927,3 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
         })
     }
 }
-
-impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for RouterFailureIq {}
-impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for RouterFailureIq {}

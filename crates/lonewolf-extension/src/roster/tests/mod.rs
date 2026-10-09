@@ -3,6 +3,7 @@
 mod state;
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use futures_executor::block_on;
 use lonewolf_auth::scram::{
@@ -21,6 +22,7 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::{NAMESPACE, Roster};
+use crate::account::AccountHandler;
 use crate::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
 };
@@ -29,11 +31,11 @@ use crate::presence::{
     PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceTransition,
     PresenceUpdate,
 };
-use crate::{Effects, Extension};
+use crate::{Effects, Extensions};
 
 type TestIqHandler = dyn IqHandler<GlobalChunkAllocator, RedbStorage>;
 type TestPresenceHandler = dyn PresenceHandler<GlobalChunkAllocator, RedbStorage>;
-type TestExtension = dyn Extension<GlobalChunkAllocator, RedbStorage>;
+type TestAccountHandler = dyn AccountHandler<GlobalChunkAllocator, RedbStorage>;
 
 struct TestRoster {
     storage: RedbStorage,
@@ -733,10 +735,14 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
     let effects = block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
         transaction.delete_account(alice).await?;
-        let effects =
-            TestExtension::forget_account(&Roster::default(), &mut transaction, alice, &delivery)
-                .await
-                .map_err(|error| format!("{error:?}"))?;
+        let effects = TestAccountHandler::forget_account(
+            &Roster::default(),
+            &mut transaction,
+            alice,
+            &delivery,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
         transaction.commit().await?;
         Ok::<_, Box<dyn std::error::Error>>(effects)
     })
@@ -869,8 +875,14 @@ fn probe_visibility_preserves_pending_requests_preapproval_and_versions()
         let transaction = roster.storage.begin_read().await?;
         let before = transaction.roster(&owner).await?;
         let pending = transaction.pending_requests(&owner).await?;
+        let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
+        catalog.register(Arc::new(Roster::default()))?;
+        let registry = catalog.enable_host("example.com", ["roster"])?;
         assert!(
-            TestExtension::presence_kinds(&Roster::default()).contains(&PresenceRequestType::Probe)
+            registry
+                .presence()
+                .find(PresenceRequestType::Probe)
+                .is_some()
         );
         assert!(
             !TestPresenceHandler::visibility(

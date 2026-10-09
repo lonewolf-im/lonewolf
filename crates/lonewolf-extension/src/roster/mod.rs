@@ -7,6 +7,7 @@ mod xml;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
@@ -18,16 +19,16 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::StanzaErrorCondition;
 
+use crate::account::AccountHandler;
 use crate::delivery::{
     Delivery, DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
 };
 use crate::iq::{IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope};
-use crate::message::MessageHandler;
 use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate, ReceiveFuture,
 };
-use crate::{Effects, Extension, ExtensionFuture};
+use crate::{Effects, Extension, ExtensionFuture, RegistrationError, Slots};
 use subscription::Parties;
 
 pub const NAME: &str = "roster";
@@ -146,18 +147,25 @@ where
         NAME
     }
 
-    fn iq_routes(&self) -> &'static [IqRoute] {
-        &IQ_ROUTES
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, S>,
+    ) -> Result<(), RegistrationError> {
+        for route in IQ_ROUTES {
+            slots.iq(route, self.clone())?;
+        }
+        for kind in PresenceRequestType::ALL {
+            slots.presence(kind, self.clone())?;
+        }
+        slots.stream_feature(VERSIONING_FEATURE);
+        slots.stream_feature(PRE_APPROVAL_FEATURE);
+        slots.account(self);
+        Ok(())
     }
+}
 
-    fn presence_kinds(&self) -> &'static [PresenceRequestType] {
-        &PresenceRequestType::ALL
-    }
-
-    fn stream_features(&self) -> &'static [&'static str] {
-        &[VERSIONING_FEATURE, PRE_APPROVAL_FEATURE]
-    }
-
+impl<A: ChunkAllocator, S: Storage> AccountHandler<A, S> for Roster {
     fn forget_account<'a>(
         &'a self,
         transaction: &'a mut S::Write,
@@ -167,8 +175,6 @@ where
         Box::pin(subscription::forget_account(transaction, account, hosts))
     }
 }
-
-impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Roster {}
 
 impl<A, S> IqHandler<A, S> for Roster
 where

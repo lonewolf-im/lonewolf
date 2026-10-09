@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Stores server state behind one transaction domain per store.
+//! Its traits serve this workspace and are not a stable API for independent backends.
 
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");

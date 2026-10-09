@@ -569,7 +569,7 @@ fn availability_fixed_before_store_commit_gets_the_chat_live_without_a_delay() -
     )?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='raced'><body>Hello</body></message>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
-    inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
+    await_empty(&mut bob, "bob@localhost/phone")?;
     bob.close()?;
     let mut bob = suite.connect("bob", "secret", "tablet")?;
     bob.send("<presence/>")?;
@@ -699,7 +699,7 @@ fn sender_drains_more_than_mailbox_capacity_while_live_acknowledgement_is_blocke
     bob.send("<iq to='localhost' type='get' id='release'><release xmlns='urn:lonewolf:test:offline'/></iq>")?;
     bob.expect_xml("<iq xmlns='jabber:client' from='localhost' to='bob@localhost/phone' type='result' id='release'><released xmlns='urn:lonewolf:test:offline'/></iq>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
-    inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
+    await_empty(&mut bob, "bob@localhost/phone")?;
     charlie.close()?;
     bob.close()?;
     alice.close()

@@ -30,7 +30,7 @@ pub(crate) mod local;
 pub(crate) use local::Registration;
 use local::SessionLiveness;
 use local::{LocalRouter, LocalRouterHandle};
-pub(crate) use local::{Mailbox, MailboxEntry, SessionHandle, release_deferred};
+pub(crate) use local::{Mailbox, MailboxEntry, SessionHandle, StoredRelease, release_deferred};
 pub(crate) use lonewolf_xmpp::stanza::RoutedStanza;
 
 pub(crate) struct Router<A: ChunkAllocator> {
@@ -278,6 +278,22 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     }
 
     pub(crate) async fn route_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+        self.route_message_with(stanza, None).await
+    }
+
+    pub(crate) async fn route_stored_message(
+        &self,
+        stanza: RoutedStanza<A>,
+        release: StoredRelease<A>,
+    ) -> Result<(), RouterError> {
+        self.route_message_with(stanza, Some(release)).await
+    }
+
+    async fn route_message_with(
+        &self,
+        stanza: RoutedStanza<A>,
+        release: Option<StoredRelease<A>>,
+    ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if !matches!(view.stanza_type(), StanzaType::Message(_)) {
             return Err(RouterError::InvalidTarget);
@@ -293,9 +309,9 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             return Err(RouterError::NotFound);
         }
         if to.resourcepart().is_some() {
-            self.local.deliver_message(stanza).await
+            self.local.deliver_message(stanza, release).await
         } else {
-            self.local.deliver_bare(stanza).await
+            self.local.deliver_bare(stanza, release).await
         }
     }
 

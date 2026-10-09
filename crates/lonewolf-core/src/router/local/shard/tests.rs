@@ -59,7 +59,7 @@ fn invalid_target_forms_fail_without_touching_a_shard() -> Result<(), Box<dyn Er
             let xml = format!("<presence type='error'{target}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>");
             assert_eq!(
                 router
-                    .deliver_full_or_chat_fallback(routed(&xml).await?, false, None)
+                    .deliver_full_or_chat_fallback(routed(&xml).await?, false, None, None)
                     .now_or_never(),
                 Some(Err(RouterError::InvalidTarget))
             );
@@ -78,7 +78,7 @@ fn invalid_target_forms_fail_without_touching_a_shard() -> Result<(), Box<dyn Er
         ] {
             let xml = format!("<presence type='error'{target}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>");
             assert_eq!(
-                router.deliver_bare(routed(&xml).await?).now_or_never(),
+                router.deliver_bare(routed(&xml).await?, None).now_or_never(),
                 Some(Err(RouterError::InvalidTarget))
             );
             assert_eq!(
@@ -145,7 +145,7 @@ fn closing_selected_bare_recipient_rechecks_eligibility_without_retrying_a_sibli
                 let stanza =
                     routed(&format!("<message to='alice@localhost' type='{kind}'/>")).await?;
                 assert_eq!(
-                    enqueue_bare_message(&sessions, selected, stanza),
+                    enqueue_bare_message(&sessions, selected, stanza, None),
                     Err(if eligible_sibling {
                         RouterError::NotFound
                     } else {
@@ -196,7 +196,7 @@ fn headline_prefers_success_then_busy_and_keeps_closed_sessions() -> Result<(), 
         receivers[2].close();
         shard.accounts.insert(account.as_str().into(), sessions);
 
-        assert_eq!(shard.deliver_bare(stanza.clone(), false), Ok(()));
+        assert_eq!(shard.deliver_bare(stanza.clone(), false, None), Ok(()));
         let delivery = receivers[0].try_recv()?;
         assert_eq!(
             delivery.stanza.resolve()?.stanza_type(),
@@ -205,11 +205,14 @@ fn headline_prefers_success_then_busy_and_keeps_closed_sessions() -> Result<(), 
         assert_eq!(receivers[1].len(), 1);
         receivers[0].close();
         assert_eq!(
-            shard.deliver_bare(stanza.clone(), false),
+            shard.deliver_bare(stanza.clone(), false, None),
             Err(RouterError::Busy)
         );
         receivers[1].close();
-        assert_eq!(shard.deliver_bare(stanza, false), Err(RouterError::Offline));
+        assert_eq!(
+            shard.deliver_bare(stanza, false, None),
+            Err(RouterError::Offline)
+        );
         let sessions = &shard.accounts[account.as_str()];
         assert_eq!(sessions.len(), 3);
         assert!(
@@ -249,7 +252,7 @@ fn full_normal_delivery_linearizes_at_exact_resource_binding_and_disconnect()
                     .priority = sibling_priority;
                 let stanza = routed("<message to='alice@localhost/desk' type='normal'/>").await?;
                 assert_eq!(
-                    shard.deliver(stanza.clone(), true),
+                    shard.deliver(stanza.clone(), true, None),
                     Err(RouterError::NotFound)
                 );
                 let (outbound, inbound) = async_channel::bounded(64);
@@ -269,7 +272,7 @@ fn full_normal_delivery_linearizes_at_exact_resource_binding_and_disconnect()
                         .get_mut("desk")
                         .ok_or("missing resource")?
                         .priority = priority;
-                    assert_eq!(shard.deliver(stanza.clone(), true), Ok(()));
+                    assert_eq!(shard.deliver(stanza.clone(), true, None), Ok(()));
                     let delivered = desk.links.inbound.try_recv()?;
                     assert_eq!(
                         delivered
@@ -287,10 +290,13 @@ fn full_normal_delivery_linearizes_at_exact_resource_binding_and_disconnect()
                     desk.alive.store(false, Ordering::Release);
                 }
                 assert_eq!(
-                    shard.deliver(stanza.clone(), true),
+                    shard.deliver(stanza.clone(), true, None),
                     Err(RouterError::NotFound)
                 );
-                assert_eq!(shard.deliver(stanza, true), Err(RouterError::NotFound));
+                assert_eq!(
+                    shard.deliver(stanza, true, None),
+                    Err(RouterError::NotFound)
+                );
                 assert!(sibling.take_queued().is_empty());
                 assert!(!shard.accounts[account.as_str()].contains_key("desk"));
             }
@@ -439,7 +445,7 @@ fn full_delivery_removes_stale_session_and_broadcasts_unavailable() -> Result<()
 
             drop(desk);
             assert_eq!(
-                shard.deliver(routed(xml).await?, false),
+                shard.deliver(routed(xml).await?, false, None),
                 Err(RouterError::NotFound)
             );
             let Some(unavailable) = phone.recv().await else {
@@ -755,7 +761,7 @@ fn committed_directed_unavailable_survives_source_retirement_and_replacement()
             let replacement = source.register(alice.clone(), Some("desk".into()), NonZeroUsize::MIN, outbound, inbound, router.clone())?;
             assert_ne!(replacement.token, desk.token);
             source.record_directed_presence(&alice, "desk", replacement.token, DirectedRecipient::new(bob_jid), true)?;
-            destination.deliver(unavailable, false)?;
+            destination.deliver(unavailable, false, None)?;
             let delivered = observer.take_queued();
             assert_eq!(delivered.len(), 1);
             assert_eq!(delivered[0].stanza.resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
@@ -827,7 +833,7 @@ fn iq_admission_checks_source_liveness_at_delivery() -> Result<(), Box<dyn Error
                 if matches!(kind, "get" | "set") {
                     destination.deliver_iq_request(stanza, true, Some(liveness))?;
                 } else {
-                    destination.deliver_with_guard(stanza, false, || liveness.is_alive())?;
+                    destination.deliver_with_guard(stanza, false, || liveness.is_alive(), None)?;
                 }
                 assert_eq!(target.take_queued().len(), usize::from(action == "unchanged"), "{kind} {action}");
                 drop(replacement);

@@ -11,7 +11,10 @@ use async_channel::{Receiver, WeakSender};
 use futures_channel::oneshot;
 use futures_util::future::Shared;
 use lonewolf_extension::delivery::SessionTag;
+use lonewolf_extension::message::MessageHandler;
+use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{JidError, JidRef};
 use parking_lot::Mutex as PlMutex;
@@ -176,13 +179,23 @@ impl SessionLiveness {
     }
 }
 
+/// A stored copy that the receiving session removes once it flushes the delivery.
+pub(crate) struct StoredRelease<A: ChunkAllocator> {
+    pub(crate) handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+    pub(crate) sequence: OfflineSequence,
+}
+
 pub(crate) struct MailboxEntry<A: ChunkAllocator> {
     pub(crate) stanza: RoutedStanza<A>,
+    pub(crate) release: Option<StoredRelease<A>>,
 }
 
 impl<A: ChunkAllocator> MailboxEntry<A> {
     pub(crate) fn new(stanza: RoutedStanza<A>) -> Self {
-        Self { stanza }
+        Self {
+            stanza,
+            release: None,
+        }
     }
 }
 

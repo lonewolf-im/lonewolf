@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::mem;
@@ -76,6 +76,7 @@ struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     storage: RedbStorage,
     liveness: SessionLiveness,
     acknowledgement: Option<ReplayAcknowledgement>,
+    messages: Option<MessageRelease>,
     work: &'w WorkGroup,
 }
 
@@ -84,6 +85,11 @@ struct ReplayAcknowledgement {
     task: compio::runtime::JoinHandle<()>,
     #[cfg(test)]
     entered: futures_channel::oneshot::Receiver<()>,
+}
+
+struct MessageRelease {
+    pending: Rc<RefCell<Vec<OfflineSequence>>>,
+    task: compio::runtime::JoinHandle<()>,
 }
 
 enum Output<A: ChunkAllocator> {
@@ -220,6 +226,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
                 storage: storage.clone(),
                 liveness: registration.liveness(),
                 acknowledgement: None,
+                messages: None,
                 work: &*work,
             };
             let mut session = BoundSession {
@@ -273,10 +280,11 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
             let Outbox {
                 writer: link,
                 acknowledgement,
+                messages,
                 ..
             } = outbox;
             work.drain().await;
-            drop(acknowledgement);
+            drop((acknowledgement, messages));
             link.close(outcome).await;
         };
         let ((), outcome) = join(serve, transport.run()).await;
@@ -953,7 +961,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     StorePreparation::Committed(commit_and_store(
                         work.start(),
                         router.clone(),
-                        storage.clone(),
                         transaction,
                         handler,
                         StoredDelivery {
@@ -1403,6 +1410,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 Output::Delivered(entry) => {
                     self.written = self.written.next();
                     self.writer.write(Outgoing::Routed(entry.stanza)).await?;
+                    if let Some(release) = entry.release {
+                        self.releases.push_back((
+                            self.written,
+                            Release::Message {
+                                handler: release.handler,
+                                sequence: release.sequence,
+                            },
+                        ));
+                    }
                 }
                 Output::Routed(stanza) => {
                     self.written = self.written.next();
@@ -1485,6 +1501,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
 
     fn release_through(&mut self, flushed: OutputSequence) {
         let mut backlog: Option<(Arc<dyn MessageHandler<A, RedbStorage>>, OfflineSequence)> = None;
+        let mut messages = Vec::new();
+        let mut message_handler = None;
         while let Some((sequence, _)) = self.releases.front() {
             if *sequence > flushed {
                 break;
@@ -1493,6 +1511,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 break;
             };
             match release {
+                Release::Message { handler, sequence } => {
+                    messages.push(sequence);
+                    message_handler = Some(handler);
+                }
                 Release::Backlog { handler, through } => {
                     let through = backlog
                         .as_ref()
@@ -1504,6 +1526,37 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         if let Some((handler, through)) = backlog {
             self.acknowledge(handler, through);
         }
+        if let Some(handler) = message_handler {
+            self.release_messages(handler, messages);
+        }
+    }
+
+    fn release_messages(
+        &mut self,
+        handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+        sequences: Vec<OfflineSequence>,
+    ) {
+        let pending = if let Some(messages) = &self.messages {
+            messages.pending.borrow_mut().extend(sequences);
+            if !messages.task.is_finished() {
+                return;
+            }
+            messages.pending.clone()
+        } else {
+            Rc::new(RefCell::new(sequences))
+        };
+        let batch = pending.clone();
+        let storage = self.storage.clone();
+        let account = self.account.clone();
+        let liveness = self.liveness.clone();
+        let task = compio::runtime::spawn(self.work.start().run(async move {
+            if let Err(error) =
+                acknowledge_messages(&storage, &account, &liveness, &*handler, &batch).await
+            {
+                report_handler_failure(&error, &account);
+            }
+        }));
+        self.messages = Some(MessageRelease { pending, task });
     }
 
     fn acknowledge(
@@ -1618,6 +1671,57 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
             }
         }
         Ok(RoutedStanza::from_parts(stanza, arena))
+    }
+}
+
+async fn acknowledge_messages<A: ChunkAllocator>(
+    storage: &RedbStorage,
+    account: &AccountKey,
+    liveness: &SessionLiveness,
+    handler: &dyn MessageHandler<A, RedbStorage>,
+    pending: &RefCell<Vec<OfflineSequence>>,
+) -> Result<(), HandlerError> {
+    loop {
+        let mut transaction =
+            storage
+                .begin_write()
+                .await
+                .map_err(|error| HandlerError::Internal {
+                    condition: StanzaErrorCondition::InternalServerError,
+                    failure: storage_failure(error, "offline_acknowledge_live_begin_write"),
+                })?;
+        // Check after writer admission so account recreation cannot reset these sequences.
+        if !liveness.is_alive() {
+            tracing::info!(
+                operation = "acknowledge_live",
+                outcome = "skipped_stale_session",
+                recipient_jid = ?account.as_str(),
+                "offline message acknowledgement handled"
+            );
+            return Ok(());
+        }
+        let batch = mem::take(&mut *pending.borrow_mut());
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for sequence in batch {
+            handler
+                .acknowledge_one(account, sequence, &mut transaction)
+                .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| HandlerError::Internal {
+                condition: StanzaErrorCondition::InternalServerError,
+                failure: storage_failure(error, "offline_acknowledge_live_commit"),
+            })?;
+        tracing::info!(
+            operation = "acknowledge_live",
+            outcome = "committed",
+            recipient_jid = ?account.as_str(),
+            "offline message acknowledgement handled"
+        );
     }
 }
 

@@ -32,6 +32,10 @@ pub(super) enum Outgoing<A: ChunkAllocator> {
 
 /// A stored copy that output releases once its last stanza reaches the release stage.
 pub(super) enum Release<A: ChunkAllocator> {
+    Message {
+        handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+        sequence: OfflineSequence,
+    },
     Backlog {
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
         through: OfflineSequence,

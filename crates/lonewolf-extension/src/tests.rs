@@ -5,7 +5,7 @@ use std::sync::Arc;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::{RedbStorage, RedbWrite};
 use lonewolf_util::arena::GlobalChunkAllocator;
-use parking_lot::Mutex;
+use parking_lot::Mutex as PlMutex;
 
 use super::account::AccountHandler;
 use super::delivery::{HandlerError, HostLookup};
@@ -30,7 +30,7 @@ struct Fake {
     presence: &'static [PresenceRequestType],
     features: &'static [&'static str],
     messages: bool,
-    hosts: Mutex<Vec<String>>,
+    hosts: PlMutex<Vec<String>>,
     dependencies: &'static [&'static str],
     accounts: bool,
 }

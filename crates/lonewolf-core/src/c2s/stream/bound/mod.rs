@@ -8,12 +8,15 @@ use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::SystemTime;
 
 use futures_util::future::{Either, join, select};
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
-use lonewolf_extension::message::{Backlog, MessageHandler, StoreOutcome, UndeliverableMessage};
+use lonewolf_extension::message::{Backlog, MessageHandler};
+#[cfg(test)]
+use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
@@ -34,8 +37,8 @@ use super::outcome::CloseOutcome;
 use super::session::{Session, Writer};
 use crate::c2s::iq;
 use crate::delivery::{
-    EffectsDiagnostics, Pending, RouterDelivery, StoredDelivery, WorkGroup, after_turn,
-    commit_and_deliver, commit_and_store, report_failure, report_handler_failure, storage_failure,
+    EffectsDiagnostics, Pending, RouterDelivery, WorkGroup, after_turn, commit_and_deliver,
+    report_failure, report_handler_failure, storage_failure,
 };
 use crate::order::Ticket;
 use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
@@ -43,6 +46,9 @@ use crate::router::{
     Destination, MailboxEntry, Registration, ResourceMatch, RoutedStanza, RouterError,
     RouterHandle, SessionHandle,
 };
+
+use crate::stages::Stage;
+use crate::stages::message::{self, DeliveryOutcome};
 
 mod link;
 mod output;
@@ -105,15 +111,6 @@ enum Output<A: ChunkAllocator> {
         backlog: Backlog,
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
     },
-}
-
-enum StorePreparation<A: ChunkAllocator> {
-    Rejected {
-        stanza: RoutedStanza<A>,
-        error: HandlerError,
-    },
-    Discarded,
-    Committed(Pending<Result<(), crate::delivery::EffectsError>>),
 }
 
 enum StoredKind<'a> {
@@ -864,135 +861,21 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         kind: MessageType,
     ) -> Result<(), CloseOutcome> {
         let routed = self.stamp(parsed)?;
-        let bare = routed
-            .resolve()?
-            .to()?
-            .ok_or(CloseOutcome::InternalError)?
-            .resourcepart()
-            .is_none();
-        if bare && kind == MessageType::Error {
-            return Ok(());
-        }
-        if bare && kind == MessageType::Groupchat {
-            return self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable);
-        }
-        if let Err(error) = self.router.route_message(routed.clone()).await {
-            if kind == MessageType::Error
-                || (bare && kind == MessageType::Headline && error == RouterError::NotFound)
-                || (kind == MessageType::Headline && error == RouterError::Offline)
-            {
-                return Ok(());
-            }
-            if error == RouterError::Offline
-                && matches!(kind, MessageType::Normal | MessageType::Chat)
-            {
-                return self.store_message(routed).await;
-            }
-            let condition = match error {
-                RouterError::Busy
-                | RouterError::ResourceLimit
-                | RouterError::DirectedPresenceLimit => StanzaErrorCondition::ResourceConstraint,
-                RouterError::InvalidTarget | RouterError::InvalidResource => {
-                    StanzaErrorCondition::BadRequest
-                }
-                RouterError::NotFound | RouterError::Offline | RouterError::RemoteUnsupported => {
-                    StanzaErrorCondition::ServiceUnavailable
-                }
-                RouterError::Unavailable | RouterError::Stopped => {
-                    return Err(CloseOutcome::InternalError);
-                }
-            };
-            self.reply_error(&routed, condition)?;
-        }
-        Ok(())
-    }
-
-    async fn store_message(&mut self, routed: RoutedStanza<A>) -> Result<(), CloseOutcome> {
-        let recipient = AccountKey::try_from(
-            routed
-                .resolve()?
-                .to()?
-                .ok_or(CloseOutcome::InternalError)?
-                .bare(),
-        )
-        .map_err(|_| CloseOutcome::InternalError)?;
-        let Some(handler) = self.router.message_handler(recipient.domain()).cloned() else {
-            tracing::info!(
-                operation = "store",
-                outcome = "rejected",
-                reason = "missing_handler",
-                recipient_jid = ?recipient.as_str(),
-                "offline message policy decided"
-            );
-            return self.reply_error(&routed, StanzaErrorCondition::ServiceUnavailable);
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: self.outbox.work,
         };
-        let bytes = if tracing::enabled!(tracing::Level::INFO) {
-            stanza_bytes(&routed)?
-        } else {
-            0
-        };
-        let registration = &self.registration;
-        let storage = &self.storage;
-        let router = &self.router;
-        let allocator = &self.allocator;
-        let work = self.outbox.work;
-        let prepare = async {
-            let mut transaction = storage.begin_write().await.map_err(|error| {
-                close_storage_failure(error, "offline_store_begin_write", &recipient)
-            })?;
-            let mut scratch = Arena::try_new_in(ArenaConfig::default(), allocator.clone())?;
-            let outcome = handler
-                .store(
-                    UndeliverableMessage {
-                        recipient: &recipient,
-                        stanza: &routed,
-                        received_at: SystemTime::now(),
-                    },
-                    &mut transaction,
-                    &mut scratch,
-                )
-                .await;
-            drop(scratch);
-            Ok::<_, CloseOutcome>(match outcome {
-                Err(error) => {
-                    drop(transaction);
-                    report_handler_failure(&error, &recipient);
-                    StorePreparation::Rejected {
-                        stanza: routed,
-                        error,
-                    }
-                }
-                Ok(StoreOutcome::Discarded) => {
-                    drop(transaction);
-                    StorePreparation::Discarded
-                }
-                Ok(StoreOutcome::Stored(sequence)) => {
-                    StorePreparation::Committed(commit_and_store(
-                        work.start(),
-                        router.clone(),
-                        transaction,
-                        handler,
-                        StoredDelivery {
-                            recipient,
-                            sequence,
-                            stanza: routed,
-                            bytes,
-                        },
-                    ))
-                }
-            })
-        };
-        match self.outbox.drain_until(registration, prepare).await?? {
-            StorePreparation::Rejected { stanza, error } => {
-                self.reply_error(&stanza, error.condition())
+        let outcome = self
+            .outbox
+            .drain_until(&self.registration, message::deliver(&stage, routed, kind))
+            .await??;
+        match outcome {
+            DeliveryOutcome::Rejected { stanza, condition } => self.reply_error(&stanza, condition),
+            DeliveryOutcome::Routed | DeliveryOutcome::Stored | DeliveryOutcome::Discarded => {
+                Ok(())
             }
-            StorePreparation::Discarded => Ok(()),
-            StorePreparation::Committed(pending) => self
-                .outbox
-                .drain_until(registration, pending.finished())
-                .await?
-                .ok_or(CloseOutcome::InternalError)?
-                .map_err(|_| CloseOutcome::InternalError),
         }
     }
 
@@ -2076,22 +1959,6 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             backlog,
         })
     }
-}
-
-fn stanza_bytes<A: ChunkAllocator>(stanza: &RoutedStanza<A>) -> Result<usize, CloseOutcome> {
-    struct Counter(usize);
-    impl std::fmt::Write for Counter {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            self.0 = self.0.checked_add(text.len()).ok_or(std::fmt::Error)?;
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    stanza
-        .resolve()?
-        .write_xml(&mut counter)
-        .map_err(|_| CloseOutcome::InternalError)?;
-    Ok(counter.0)
 }
 
 fn presence_addresses<A: ChunkAllocator>(

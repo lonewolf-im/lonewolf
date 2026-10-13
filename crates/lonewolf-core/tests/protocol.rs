@@ -20,6 +20,9 @@ mod services;
 #[path = "protocol/stream.rs"]
 mod stream;
 
+#[path = "protocol/tls_hosts.rs"]
+mod tls_hosts;
+
 #[path = "protocol/routing.rs"]
 mod routing;
 

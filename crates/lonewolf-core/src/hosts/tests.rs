@@ -15,6 +15,127 @@ use tempfile::TempDir;
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
+fn idn_host_initializes_with_an_alabel_certificate() -> TestResult {
+    assert_host_identity("bücher.example", "xn--bcher-kva.example")
+}
+
+#[test]
+fn ipv4_host_initializes_with_an_ip_certificate() -> TestResult {
+    assert_host_identity("192.0.2.1", "192.0.2.1")
+}
+
+#[test]
+fn ipv6_host_initializes_with_an_ip_certificate() -> TestResult {
+    assert_host_identity("[2001:db8::1]", "2001:db8::1")
+}
+
+fn assert_host_identity(domain: &str, certificate_identity: &str) -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let tls = test_tls_files(&directory, certificate_identity, "identity")?;
+    let configured = BTreeMap::from([(
+        domain.into(),
+        HostConfig {
+            tls: Some(tls),
+            ..HostConfig::default()
+        },
+    )]);
+    let hosts = Hosts::new(&configured, None)?;
+    assert_eq!(hosts.default_host_name(), domain);
+    assert!(hosts.is_local_host(domain));
+    assert!(hosts.certified_key(domain).is_some());
+    assert_eq!(
+        hosts.tls_server_end_point(domain).map(<[u8]>::len),
+        Some(32)
+    );
+    Ok(())
+}
+
+#[test]
+fn tls_identities_use_ascii_dns_and_typed_ip_addresses() -> TestResult {
+    use rustls::pki_types::ServerName;
+    assert_eq!(
+        super::tls_identity("bücher.example")?,
+        ServerName::try_from("xn--bcher-kva.example")?
+    );
+    assert_eq!(
+        super::tls_identity("localhost")?,
+        ServerName::try_from("localhost")?
+    );
+    assert_eq!(
+        super::tls_identity("192.0.2.1")?,
+        ServerName::try_from("192.0.2.1")?
+    );
+    assert_eq!(
+        super::tls_identity("[2001:db8::1]")?,
+        ServerName::try_from("2001:db8::1")?
+    );
+    for domain in [
+        "",
+        "[not-ip]",
+        "[192.0.2.1]",
+        "[2001:db8::1",
+        "2001:db8::1",
+        "[fe80::1%eth0]",
+        "[fe80::1%25eth0]",
+        "bad_domain.example",
+        "-bad.example",
+        "192.0.2.999",
+    ] {
+        assert!(super::tls_identity(domain).is_err(), "{domain}");
+    }
+    Ok(())
+}
+
+#[test]
+fn dns_and_ip_san_mismatches_are_rejected() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    for (domain, san) in [
+        (
+            "bücher.example",
+            rcgen::SanType::DnsName("other.example".try_into()?),
+        ),
+        ("192.0.2.1", rcgen::SanType::IpAddress("192.0.2.2".parse()?)),
+        (
+            "[2001:db8::1]",
+            rcgen::SanType::IpAddress("2001:db8::2".parse()?),
+        ),
+        (
+            "192.0.2.1",
+            rcgen::SanType::DnsName("192.0.2.1".try_into()?),
+        ),
+        (
+            "[2001:db8::1]",
+            rcgen::SanType::DnsName("2001:db8::1".try_into()?),
+        ),
+    ] {
+        let mut parameters = CertificateParams::new(Vec::<String>::new())?;
+        parameters.subject_alt_names.push(san);
+        let tls = test_tls_parameters(&directory, parameters, "mismatch")?;
+        let configured = BTreeMap::from([(
+            domain.into(),
+            HostConfig {
+                tls: Some(tls),
+                ..HostConfig::default()
+            },
+        )]);
+        assert!(
+            matches!(
+                Hosts::new(&configured, None),
+                Err(HostsError::InvalidCertificate {
+                    source: rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidForName
+                            | rustls::CertificateError::NotValidForNameContext { .. }
+                    ),
+                    ..
+                })
+            ),
+            "{domain}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn single_host_is_the_default_and_has_generated_tls() -> TestResult {
     let config = Config::default();
     let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
@@ -344,8 +465,19 @@ fn test_tls_files(
     domain: &str,
     suffix: &str,
 ) -> Result<HostTlsConfig, Box<dyn Error>> {
+    test_tls_parameters(
+        directory,
+        CertificateParams::new(vec![domain.into()])?,
+        suffix,
+    )
+}
+
+fn test_tls_parameters(
+    directory: &TempDir,
+    mut parameters: CertificateParams,
+    suffix: &str,
+) -> Result<HostTlsConfig, Box<dyn Error>> {
     let signer = TestSigner::new()?;
-    let mut parameters = CertificateParams::new(vec![domain.into()])?;
     parameters.serial_number = Some(rcgen::SerialNumber::from(1_u64));
     let certificate = parameters.self_signed(&signer)?;
     let mut private_key = [0_u8; 512];

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_util::arena::{Arena, ChunkAllocator, Handle};
+use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator, Handle, HandleError};
 
 use super::element::ElementFrame;
 use super::namespace::NamespaceContext;
@@ -9,7 +9,7 @@ use super::{
     STANZA_ERROR_NAMESPACE, SliceBuilder, Stanza, StanzaBuilder, StanzaErrorCondition, StanzaKind,
     StanzaNamespace, StanzaType, XML_NAMESPACE, store_text, xml,
 };
-use crate::jid::{Jid, JidError};
+use crate::jid::{Jid, JidError, JidRef};
 
 pub(crate) enum Frame {
     Element(ElementFrame),
@@ -34,11 +34,14 @@ pub struct RejectedStanza {
     namespace: StanzaNamespace,
     reason: StanzaRejection,
     can_reply: bool,
+    invalid_from: bool,
+    invalid_to: bool,
     envelope: Handle<RejectedEnvelope>,
 }
 
 #[derive(Clone, Copy)]
 struct RejectedEnvelope {
+    from: Option<Jid>,
     to: Option<Jid>,
     id: Option<Handle<str>>,
     lang: Option<Handle<str>>,
@@ -59,6 +62,38 @@ impl RejectedStanza {
 
     pub fn can_reply(&self) -> bool {
         self.can_reply
+    }
+
+    pub fn invalid_from(&self) -> bool {
+        self.invalid_from
+    }
+
+    pub fn invalid_to(&self) -> bool {
+        self.invalid_to
+    }
+
+    pub fn from<'a>(&self, arena: &'a impl ArenaRead) -> Result<Option<JidRef<'a>>, HandleError> {
+        arena
+            .get(self.envelope)?
+            .from
+            .map(|jid| jid.resolve(arena))
+            .transpose()
+    }
+
+    pub fn to<'a>(&self, arena: &'a impl ArenaRead) -> Result<Option<JidRef<'a>>, HandleError> {
+        arena
+            .get(self.envelope)?
+            .to
+            .map(|jid| jid.resolve(arena))
+            .transpose()
+    }
+
+    pub fn id<'a>(&self, arena: &'a impl ArenaRead) -> Result<Option<&'a str>, HandleError> {
+        arena
+            .get(self.envelope)?
+            .id
+            .map(|id| arena.get(id))
+            .transpose()
     }
 
     /// Both the rejection and authenticated JID must belong to `arena`.
@@ -290,7 +325,10 @@ impl StanzaFrame {
             namespace: self.namespace,
             reason,
             can_reply,
+            invalid_from,
+            invalid_to,
             envelope: arena.try_alloc(RejectedEnvelope {
+                from,
                 to,
                 id: self.id,
                 lang: self.lang,

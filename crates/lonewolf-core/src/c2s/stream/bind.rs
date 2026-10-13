@@ -9,8 +9,8 @@ use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::parser::StreamEvent;
 use lonewolf_xmpp::stanza::{
-    CLIENT_NAMESPACE, IqType, NodeRef, STANZA_ERROR_NAMESPACE, StanzaNamespace, StanzaRef,
-    StanzaType,
+    CLIENT_NAMESPACE, IqType, NodeRef, STANZA_ERROR_NAMESPACE, StanzaKind, StanzaNamespace,
+    StanzaRef, StanzaType,
 };
 
 use super::certificate::CertificateMonitor;
@@ -127,6 +127,39 @@ async fn bind_session<A: ChunkAllocator + Clone>(
         }
         let parsed = match session.next_event().await? {
             Some(StreamEvent::Stanza(parsed)) => parsed,
+            Some(StreamEvent::RejectedStanza(parsed)) => {
+                let rejected = parsed.value();
+                if rejected.namespace() != StanzaNamespace::Client {
+                    return Err(CloseOutcome::InvalidNamespace);
+                }
+                if rejected.kind() != StanzaKind::Iq || !rejected.can_reply() {
+                    return Err(CloseOutcome::UnsupportedInput);
+                }
+                let from = rejected
+                    .from(parsed.arena())
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                if rejected.invalid_from()
+                    || from.is_some_and(|from| from.as_str() != account.as_str())
+                {
+                    return Err(CloseOutcome::InvalidFrom);
+                }
+                let to = rejected
+                    .to(parsed.arena())
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                if rejected.invalid_to() || to.is_some_and(|to| to.as_str() != session.host()) {
+                    return Err(CloseOutcome::UnsupportedInput);
+                }
+                let id = rejected
+                    .id(parsed.arena())
+                    .map_err(|_| CloseOutcome::InternalError)?
+                    .unwrap_or("");
+                send_bind_error(&mut session.writer, id, "modify", "bad-request").await?;
+                invalid_attempts += 1;
+                if invalid_attempts == MAX_BIND_FAILURES {
+                    return Err(CloseOutcome::BindingAttemptsExceeded);
+                }
+                continue;
+            }
             Some(StreamEvent::StreamEnd) | None => return Err(CloseOutcome::StreamEnd),
             Some(event) => {
                 let outcome = namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedInput);

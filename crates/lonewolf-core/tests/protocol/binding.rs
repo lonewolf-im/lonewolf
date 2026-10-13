@@ -65,6 +65,142 @@ fn conflicting_resource_gets_a_new_identifier_without_replacing_the_first_client
 }
 
 #[test]
+fn rejected_iq_envelopes_return_bad_request_and_allow_binding_on_the_same_connection() -> TestResult
+{
+    for (envelope, id) in [
+        ("type='bogus' id='a&amp;b'", "a&amp;b"),
+        ("id='absent-type'", "absent-type"),
+        ("type='' id='empty-type'", "empty-type"),
+        ("type='set'", ""),
+        (
+            "type='bogus' id='addressed' from='alice@localhost' to='localhost'",
+            "addressed",
+        ),
+    ] {
+        let suite = C2sSuite::resource_limit(1)?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+        client.send(&format!("<iq {envelope}><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>"))?;
+        client.expect_xml(&format!(
+            "<iq xmlns='jabber:client' type='error' id='{id}'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"
+        ))?;
+
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_iq_child_counts_return_bad_request_and_allow_binding_retry() -> TestResult {
+    for children in [
+        "",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/><other/>",
+    ] {
+        let suite = C2sSuite::resource_limit(1)?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+
+        client.send(&format!("<iq type='set' id='bad'>{children}</iq>"))?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_iq_envelopes_preserve_binding_authorization_and_namespace_gates() -> TestResult {
+    for (attributes, condition) in [
+        ("from='bob@localhost'", "invalid-from"),
+        ("from='alice@localhost/desk'", "invalid-from"),
+        ("from='bad@'", "invalid-from"),
+        ("from=''", "invalid-from"),
+        ("to='bob@localhost'", "not-authorized"),
+        ("to='localhost/desk'", "not-authorized"),
+        ("to='remote.example'", "not-authorized"),
+        ("to='bad@'", "not-authorized"),
+        ("to=''", "not-authorized"),
+        (
+            "xmlns='jabber:server' from='alice@localhost' to='localhost'",
+            "invalid-namespace",
+        ),
+    ] {
+        let suite = C2sSuite::start()?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+
+        client.send(&format!("<iq type='bogus' id='bad' {attributes}><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>"))?;
+        client.expect_stream_error(condition)?;
+
+        let mut replacement = suite.authenticated_client("alice", "pencil")?;
+        assert_eq!(replacement.bind(Some("desk"))?, "alice@localhost/desk");
+        replacement.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_iq_responses_close_binding_without_an_iq_error_reply() -> TestResult {
+    for input in [
+        "<iq type='result'/>",
+        "<iq type='result' id='bad'><first/><second/></iq>",
+        "<iq type='error' id='bad'/>",
+        "<iq type='error'><error/></iq>",
+    ] {
+        let suite = C2sSuite::start()?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+
+        client.send(input)?;
+        client.expect_stream_error("not-authorized")?;
+
+        let mut replacement = suite.authenticated_client("alice", "pencil")?;
+        assert_eq!(replacement.bind(Some("desk"))?, "alice@localhost/desk");
+        replacement.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn fifth_rejected_iq_envelope_still_allows_success() -> TestResult {
+    let suite = C2sSuite::resource_limit(1)?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    for _ in 0..5 {
+        client.send("<iq type='bogus' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    }
+
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn rejected_iq_envelopes_share_the_binding_failure_limit() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    for attempt in 0..6 {
+        let input = if attempt % 2 == 0 {
+            "<iq type='bogus' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>"
+        } else {
+            "<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>"
+        };
+        client.send(input)?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    }
+    client.expect_stream_error("policy-violation")?;
+
+    let mut replacement = suite.authenticated_client("alice", "pencil")?;
+    assert_eq!(replacement.bind(Some("desk"))?, "alice@localhost/desk");
+    replacement.close()
+}
+
+#[test]
 fn empty_resource_returns_bad_request_and_allows_retry() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;

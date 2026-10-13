@@ -140,6 +140,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     }
     extensions.register(Arc::new(ConflictingIq))?;
     extensions.register(Arc::new(TestIq))?;
+    extensions.register(Arc::new(TestIqResults))?;
     extensions.register(Arc::new(ServerIq))?;
     extensions.register(Arc::new(ErrorIq))?;
     extensions.register(Arc::new(FailureIq))?;
@@ -881,6 +882,88 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingIq {
         _: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async { Ok(IqReply::new(None, Effects::none())) })
+    }
+}
+
+struct TestIqResults;
+
+const RESULTS_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Get,
+    namespace: "urn:lonewolf:test:results",
+    name: "query",
+};
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIqResults {
+    fn name(&self) -> &'static str {
+        "test-iq-results"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(RESULTS_ROUTE, self)
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIqResults {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let condition = StanzaErrorCondition::InternalServerError;
+            let misaddressed = request
+                .payload
+                .attribute("misaddressed", "")
+                .map_err(|_| condition)?
+                == Some("true");
+            let count = if misaddressed {
+                1
+            } else {
+                request
+                    .payload
+                    .attribute("count", "")
+                    .map_err(|_| condition)?
+                    .and_then(|count| count.parse::<usize>().ok())
+                    .ok_or(StanzaErrorCondition::BadRequest)?
+            };
+            let from =
+                Jid::parse_in(request.sender.domainpart(), response).map_err(|_| condition)?;
+            let to = Jid::parse_in(
+                if misaddressed {
+                    "nobody@localhost/x"
+                } else {
+                    request.sender.as_str()
+                },
+                response,
+            )
+            .map_err(|_| condition)?;
+            let mut results = Vec::new();
+            for index in 0..count {
+                let result = Element::builder_in("result", RESULTS_ROUTE.namespace, response)
+                    .and_then(|builder| builder.attribute("index", "", &index.to_string()))
+                    .and_then(|builder| builder.build())
+                    .map_err(|_| condition)?;
+                results.push(
+                    Stanza::builder_in(
+                        StanzaType::Message(MessageType::Normal),
+                        StanzaNamespace::Client,
+                        response,
+                    )
+                    .from(Some(from))
+                    .and_then(|builder| builder.to(Some(to)))
+                    .and_then(|builder| builder.child(result))
+                    .and_then(|builder| builder.build())
+                    .map_err(|_| condition)?,
+                );
+            }
+            Ok(IqReply::new(None, Effects::none()).with_results(results))
+        })
     }
 }
 

@@ -3,6 +3,39 @@
 use crate::support::{C2sSuite, TestResult};
 
 #[test]
+fn iq_results_arrive_in_order_before_the_reply() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq-results'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send(
+        "<iq type='get' id='results'><query xmlns='urn:lonewolf:test:results' count='3'/></iq>",
+    )?;
+    for index in 0..3 {
+        alice.expect_xml(&format!("<message xmlns='jabber:client' from='localhost' to='alice@localhost/desk'><result xmlns='urn:lonewolf:test:results' index='{index}'/></message>"))?;
+    }
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='results' to='alice@localhost/desk'/>",
+    )?;
+    alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.close()
+}
+
+#[test]
+fn misaddressed_iq_results_become_an_internal_error() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq-results'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+
+    alice.send("<iq type='get' id='misaddressed'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='misaddressed' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/><error type='wait'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.close()
+}
+
+#[test]
 fn iq_handlers_read_their_hosts_discovery_data() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-discovery', 'test-service'")?;
     suite.create_account("alice", "password")?;

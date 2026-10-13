@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::error::Error as _;
+use std::io;
+use std::sync::Arc;
+
 use lonewolf_storage::account::AccountKeyError;
 use lonewolf_util::arena::{ArenaError, HandleError};
 use lonewolf_xmpp::jid::JidError;
@@ -56,8 +60,23 @@ impl CloseOutcome {
         )
     }
 
+    pub(super) fn from_io_error(error: &io::Error) -> Self {
+        if super::renegotiation::is_detected(error) {
+            Self::TlsFailure
+        } else {
+            Self::TransportError
+        }
+    }
+
     pub(super) fn from_parse_error(error: &ParseError) -> Self {
         if error.is_transport_error() {
+            if let ParseError::Xml(xml) = error
+                && let Some(error) = xml
+                    .source()
+                    .and_then(|source| source.downcast_ref::<Arc<io::Error>>())
+            {
+                return Self::from_io_error(error);
+            }
             return Self::TransportError;
         }
         match error {

@@ -25,13 +25,15 @@ use super::header::{
     response_version_from_header, validate_header,
 };
 use super::outcome::CloseOutcome;
+use super::renegotiation::RecordGuard;
 use super::stanza_rate::StanzaLimiter;
 use crate::hosts::Hosts;
 use crate::router::RoutedStanza;
 
 pub(super) const IO_BUFFER_BYTES: usize = 4_096;
 
-pub(super) type TlsTransport = futures_rustls::server::TlsStream<Pin<Box<AsyncStream<TcpStream>>>>;
+pub(super) type TlsTransport =
+    futures_rustls::server::TlsStream<RecordGuard<Pin<Box<AsyncStream<TcpStream>>>>>;
 pub(super) type TlsReader = ReadHalf<TlsTransport>;
 pub(super) type TlsWriter = WriteHalf<TlsTransport>;
 pub(super) type XmlInput = ClosingInput<BufReader<tokio_util::compat::Compat<TlsReader>>>;
@@ -201,15 +203,17 @@ impl<A: ChunkAllocator + Clone> Session<A> {
                 }
             }
             Err(ParseError::UnexpectedEof) => Err(CloseOutcome::Eof),
-            Err(error) => Err(self
-                .writer
-                .reject_header(
-                    None,
-                    false,
-                    ResponseVersion::Current,
-                    CloseOutcome::from_parse_error(&error),
-                )
-                .await),
+            Err(error) => {
+                let outcome = CloseOutcome::from_parse_error(&error);
+                if outcome == CloseOutcome::TlsFailure {
+                    Err(outcome)
+                } else {
+                    Err(self
+                        .writer
+                        .reject_header(None, false, ResponseVersion::Current, outcome)
+                        .await)
+                }
+            }
             Ok(_) => Err(self
                 .writer
                 .reject_header(
@@ -370,7 +374,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             .ok_or(CloseOutcome::TransportError)?
             .write_all(xml.as_bytes())
             .await
-            .map_err(|_| CloseOutcome::TransportError)?;
+            .map_err(|error| CloseOutcome::from_io_error(&error))?;
         self.flush().await?;
         self.intact = true;
         Ok(())
@@ -387,7 +391,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             .await
             .map_err(|error| match error {
                 AsyncWriteError::Access(_) => CloseOutcome::InternalError,
-                AsyncWriteError::Output(_) => CloseOutcome::TransportError,
+                AsyncWriteError::Output(error) => CloseOutcome::from_io_error(&error),
             })?;
         self.intact = true;
         Ok(())
@@ -424,24 +428,23 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             Ok(header) => header,
             Err(outcome) => return outcome,
         };
-        if self.send(&header).await.is_err() {
-            return CloseOutcome::TransportError;
+        if let Err(outcome) = self.send(&header).await {
+            return outcome;
         }
         self.open = true;
         outcome
     }
 
     pub(super) async fn flush(&mut self) -> Result<(), CloseOutcome> {
-        if self
+        if let Err(error) = self
             .output
             .as_mut()
             .ok_or(CloseOutcome::TransportError)?
             .flush()
             .await
-            .is_err()
         {
             self.intact = false;
-            return Err(CloseOutcome::TransportError);
+            return Err(CloseOutcome::from_io_error(&error));
         }
         Ok(())
     }

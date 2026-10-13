@@ -10,14 +10,14 @@ use futures_util::task::AtomicWaker;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::parser::{Parsed, StreamEvent};
 use lonewolf_xmpp::stanza::{RejectedStanza, Stanza};
-use parking_lot::Mutex;
+use parking_lot::Mutex as PlMutex;
 use tokio::io::AsyncBufRead;
 
 use super::super::certificate::CertificateMonitor;
 use super::super::session::{Reader, namespace_error, peer_stream_error};
 use super::{CloseOutcome, OutboxWriter, Outgoing, OutputSequence};
 
-// Queued outputs already sit in memory, so this only limits how far the session runs ahead of socket writes.
+// Bound session progress because queued stanzas already own their memory.
 const COMMAND_CAPACITY: usize = 16;
 
 pub(super) enum Incoming<A: ChunkAllocator> {
@@ -46,7 +46,7 @@ struct Progress {
 
 /// Each waker belongs to one half; only futures that run in that half may wait on it.
 struct LinkState {
-    progress: Mutex<Progress>,
+    progress: PlMutex<Progress>,
     session: AtomicWaker,
     transport: AtomicWaker,
 }
@@ -65,7 +65,6 @@ pub(super) struct LinkTransport<A: ChunkAllocator> {
     _incoming_keepalive: async_channel::Receiver<Incoming<A>>,
 }
 
-/// Observes a link without borrowing the session's writer.
 pub(super) struct LinkWatch {
     state: Arc<LinkState>,
 }
@@ -78,7 +77,7 @@ pub(super) fn link<A: ChunkAllocator>() -> (
     let (sender, receiver) = async_channel::bounded(COMMAND_CAPACITY);
     let (incoming_sender, incoming_receiver) = async_channel::bounded(1);
     let state = Arc::new(LinkState {
-        progress: Mutex::new(Progress {
+        progress: PlMutex::new(Progress {
             flushed: OutputSequence::default(),
             completed_flush: 0,
             failure: None,
@@ -291,6 +290,10 @@ impl<A: ChunkAllocator> LinkTransport<A> {
                         namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType)
                     }
                 }),
+                Err(CloseOutcome::TlsFailure) => {
+                    self.fail(CloseOutcome::TlsFailure);
+                    return;
+                }
                 Err(outcome) => Incoming::Ended(outcome),
             };
             let ended = matches!(incoming, Incoming::Ended(_));

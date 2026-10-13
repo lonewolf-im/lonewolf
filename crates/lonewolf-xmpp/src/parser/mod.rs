@@ -228,36 +228,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
         let mut declaration_allowed = false;
         if self.phase == Phase::Initial {
             let input = self.reader.get_mut();
-            if input
-                .fill_buf()
-                .await
-                .map_err(quick_xml::Error::from)?
-                .first()
-                == Some(&0xef)
-            {
-                if input.whitespace_skipped {
-                    return Err(ParseError::UnexpectedEvent);
-                }
-                let mut bom = [0; 3];
-                input
-                    .read_exact(&mut bom)
-                    .await
-                    .map_err(quick_xml::Error::from)?;
-                if bom != [0xef, 0xbb, 0xbf] {
-                    return Err(ParseError::UnsupportedEncoding);
-                }
-                input.skip_whitespace();
-            }
-            match input
-                .fill_buf()
-                .await
-                .map_err(quick_xml::Error::from)?
-                .first()
-            {
-                Some(b'<') => {}
-                None => return Err(ParseError::UnexpectedEof),
-                _ => return Err(ParseError::UnexpectedEvent),
-            }
+            validate_stream_start(input).await?;
             declaration_allowed = !input.whitespace_skipped;
         }
         loop {
@@ -507,6 +478,41 @@ fn has_explicit_attributes(start: &BytesStart<'_>) -> Result<bool, ParseError> {
         }
     }
     Ok(false)
+}
+
+async fn validate_stream_start<R: AsyncBufRead + Unpin>(
+    input: &mut LimitedReader<R>,
+) -> Result<(), ParseError> {
+    // quick-xml removes a leading UTF-8 BOM unless the opening bytes are checked first.
+    match input
+        .fill_buf()
+        .await
+        .map_err(quick_xml::Error::from)?
+        .first()
+    {
+        Some(b'<') => return Ok(()),
+        None => return Err(ParseError::UnexpectedEof),
+        _ => {}
+    }
+    let mut scalar = [0; 4];
+    for index in 0..scalar.len() {
+        if input
+            .read(&mut scalar[index..=index])
+            .await
+            .map_err(quick_xml::Error::from)?
+            == 0
+        {
+            return Err(ParseError::UnsupportedEncoding);
+        }
+        match std::str::from_utf8(&scalar[..=index]) {
+            Ok(_) => return Err(ParseError::NotWellFormed),
+            Err(error) if error.error_len().is_some() => {
+                return Err(ParseError::UnsupportedEncoding);
+            }
+            Err(_) => {}
+        }
+    }
+    Err(ParseError::UnsupportedEncoding)
 }
 
 fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {

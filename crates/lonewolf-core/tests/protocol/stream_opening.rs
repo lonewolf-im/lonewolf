@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::support::{C2sSuite, TestResult};
+use super::support::{C2sSuite, OPEN, TestResult};
 
 #[test]
 fn initial_opening_selects_the_served_host() -> TestResult {
@@ -187,26 +187,50 @@ fn opening_preserves_a_prefix_free_content_namespace() -> TestResult {
 }
 
 #[test]
-fn utf8_bom_and_declaration_are_accepted() -> TestResult {
+fn leading_feff_is_rejected_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
+    for prefix in [
+        "\u{feff}",
+        "\u{feff}<?xml version='1.0' encoding='UTF-8'?>",
+        "\u{feff}\u{feff}",
+        "\u{feff} \r\n",
+        " \r\n\u{feff}",
+        "\u{fffd}",
+    ] {
+        let mut client = suite.tcp_client()?;
+        let header = client.open_with(&format!("{prefix}{OPEN}"))?;
+        assert_eq!(header.attribute("from"), Some("localhost"));
+        assert_eq!(header.attribute("version"), Some("1.0"));
+        client.expect_stream_error("not-well-formed")?;
+    }
     let mut client = suite.tcp_client()?;
+    client.open_with("\u{feff}")?;
+    client.expect_stream_error("not-well-formed")
+}
 
-    let header = client.open_with("\u{feff}<?xml version='1.0' encoding='UTF-8'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>")?;
-    assert_eq!(header.attribute("from"), Some("localhost"));
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    assert_eq!(header.attribute("xml:lang"), Some("en"));
-    assert_eq!(header.attribute("to"), None);
-    assert_eq!(header.attribute("xmlns"), Some("jabber:client"));
-    let id = header.attribute("id").ok_or("missing stream id")?;
-    assert_eq!(id.len(), 32);
-    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+#[test]
+fn leading_feff_is_rejected_after_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for prefix in ["\u{feff}", "\u{feff}<?xml version='1.0' encoding='UTF-8'?>"] {
+        let mut client = suite.tls_client()?;
+        client.open_with(&format!("{prefix}{OPEN}"))?;
+        client.expect_stream_error("not-well-formed")?;
+    }
+    Ok(())
+}
 
-    client.features()?.assert_xml(
-        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>
-        <starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls>
-    </stream:features>",
-    )?;
-    client.close()
+#[test]
+fn leading_feff_is_rejected_after_authentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for prefix in ["\u{feff}", "\u{feff}<?xml version='1.0' encoding='UTF-8'?>"] {
+        let mut client = suite.unauthenticated_client()?;
+        client.authenticate("alice", "pencil")?;
+        let mut client = client.restart();
+        client.open_with(&format!("{prefix}{OPEN}"))?;
+        client.expect_stream_error("not-well-formed")?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -390,7 +414,7 @@ fn non_xml_opening_is_rejected_before_tls() -> TestResult {
     let mut client = suite.tcp_client()?;
 
     client.open_with("!")?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -548,7 +572,7 @@ fn non_xml_opening_is_rejected_after_tls() -> TestResult {
     let mut client = suite.tls_client()?;
 
     client.open_with("!")?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -757,7 +781,7 @@ fn non_xml_opening_is_rejected_after_authentication() -> TestResult {
     let mut client = client.restart();
 
     client.open_with("!")?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]

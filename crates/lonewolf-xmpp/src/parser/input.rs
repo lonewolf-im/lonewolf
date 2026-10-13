@@ -48,10 +48,6 @@ impl<R> LimitedReader<R> {
         self.whitespace_skipped = false;
         self.opening_bracket = false;
     }
-
-    pub(super) fn skip_whitespace(&mut self) {
-        self.skip_whitespace = true;
-    }
 }
 
 impl<R: AsyncBufRead + Unpin> AsyncBufRead for LimitedReader<R> {

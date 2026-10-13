@@ -28,6 +28,21 @@ fn scram_sha256_authenticates() -> TestResult {
 }
 
 #[test]
+fn authenticated_message_preserves_feff_and_replacement_characters() -> TestResult {
+    let suite = C2sSuite::with_extensions("")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desk")?;
+    client.send("<message to='alice@localhost/desk' type='chat'><body>\u{feff}a\u{feff}\u{fffd}</body></message>")?;
+    let received = client.receive()?;
+    received.assert_name("jabber:client", "message");
+    assert_eq!(
+        received.child("jabber:client", "body")?.text,
+        "\u{feff}a\u{feff}\u{fffd}"
+    );
+    client.close()
+}
+
+#[test]
 fn tls12_exporter_authenticates_both_plus_mechanisms() -> TestResult {
     exporter_authenticates_both_plus_mechanisms(&version::TLS12)
 }

@@ -172,7 +172,7 @@ trait OutboxWriter<A: ChunkAllocator> {
     /// The caller must flush buffered output.
     async fn write(&mut self, output: Outgoing<A>) -> Result<(), CloseOutcome>;
 
-    /// Flushes every stanza written so far; `through` is the sequence of the last one.
+    /// `through` is the last stanza sequence the writer must flush.
     async fn flush(&mut self, through: OutputSequence) -> Result<(), CloseOutcome>;
 }
 
@@ -1015,6 +1015,43 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     })?,
                 None => false,
             };
+            if observer.bare().as_str() != target.as_str()
+                && (!router.policies(observer.domainpart()).is_empty()
+                    || !router.policies(target.domain()).is_empty())
+            {
+                let prober = AccountKey::try_from(observer.bare())
+                    .map_err(|_| RouterError::InvalidTarget)?;
+                let peer = routed
+                    .resolve()
+                    .map_err(|_| RouterError::InvalidTarget)?
+                    .to()
+                    .map_err(|_| RouterError::InvalidTarget)?
+                    .ok_or(RouterError::InvalidTarget)?;
+                let checks = [
+                    policy::Check {
+                        account: &prober,
+                        direction: Direction::Outbound,
+                        peer,
+                    },
+                    policy::Check {
+                        account: &target,
+                        direction: Direction::Inbound,
+                        peer: observer,
+                    },
+                ];
+                if policy::evaluate_in(
+                    &router,
+                    &transaction,
+                    StanzaType::Presence(PresenceType::Probe),
+                    &checks,
+                )
+                .await
+                .map_err(|_| RouterError::Unavailable)?
+                    != Verdict::Allow
+                {
+                    return Ok(());
+                }
+            }
             ticket.turn().await;
             router.probe_presence(&session, &routed, subscribed).await
         });
@@ -1042,6 +1079,38 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             }
             AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
         };
+        if &target != self.registration.account() {
+            let stage = Stage {
+                router: &self.router,
+                storage: &self.storage,
+                allocator: &self.allocator,
+                work: &self.work,
+            };
+            let view = routed.resolve()?;
+            let checks = [
+                policy::Check {
+                    account: self.registration.account(),
+                    direction: Direction::Outbound,
+                    peer: view.to()?.ok_or(CloseOutcome::InternalError)?,
+                },
+                policy::Check {
+                    account: &target,
+                    direction: Direction::Inbound,
+                    peer: view.from()?.ok_or(CloseOutcome::InternalError)?,
+                },
+            ];
+            if self
+                .outbox
+                .drain_until(
+                    &self.registration,
+                    policy::evaluate(&stage, view.stanza_type(), &checks),
+                )
+                .await??
+                != Verdict::Allow
+            {
+                return Ok(());
+            }
+        }
         let session = self.registration.handle();
         let router = self.router.clone();
         let account = self.registration.account().clone();
@@ -1222,7 +1291,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                             close_storage_failure(error, "presence_snapshot_begin_read", owner)
                         })?;
                     let sender = from.resolve(&arena)?;
-                    let result = async {
+                    let mut result = async {
                         let audience = match presence_handler {
                             Some(handler) => {
                                 handler
@@ -1238,6 +1307,24 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         Ok((audience, backlog))
                     }
                     .await;
+                    if let Ok((Some(audience), _)) = &mut result {
+                        let sender = from.resolve(&arena)?;
+                        policy::filter_audience(
+                            router,
+                            &transaction,
+                            &self.allocator,
+                            owner,
+                            sender,
+                            StanzaType::Presence(if available {
+                                PresenceType::Available
+                            } else {
+                                PresenceType::Unavailable
+                            }),
+                            audience,
+                        )
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                    }
                     drop(transaction);
                     (result, ticket)
                 } else {
@@ -1340,6 +1427,51 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .bare_to()
             .build()?;
         let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
+        {
+            let (sender, target) = presence_addresses(&routed)?;
+            let account = self.registration.account();
+            let local_recipient = self.router.destination(target) == Destination::Account;
+            if target.as_str() != account.as_str()
+                && (!self.router.policies(account.domain()).is_empty()
+                    || (local_recipient && !self.router.policies(target.domainpart()).is_empty()))
+            {
+                let recipient = if local_recipient {
+                    Some(AccountKey::try_from(target)?)
+                } else {
+                    None
+                };
+                let checks = [
+                    policy::Check {
+                        account,
+                        direction: Direction::Outbound,
+                        peer: target,
+                    },
+                    policy::Check {
+                        account: recipient.as_ref().unwrap_or(account),
+                        direction: Direction::Inbound,
+                        peer: sender,
+                    },
+                ];
+                let checks = &checks[..if recipient.is_some() { 2 } else { 1 }];
+                let stage = Stage {
+                    router: &self.router,
+                    storage: &self.storage,
+                    allocator: &self.allocator,
+                    work: &self.work,
+                };
+                if self
+                    .outbox
+                    .drain_until(
+                        &self.registration,
+                        policy::evaluate(&stage, routed.resolve()?.stanza_type(), checks),
+                    )
+                    .await??
+                    != Verdict::Allow
+                {
+                    return Ok(());
+                }
+            }
+        }
         let authorized = {
             let (sender, target) = presence_addresses(&source)?;
             let account = self.registration.account();
@@ -2128,7 +2260,7 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
                     })
                     .await?;
                 ticket = Some(admitted);
-                let audience = match (handler, transaction.as_ref()) {
+                let mut audience = match (handler, transaction.as_ref()) {
                     (Some(handler), Some(transaction)) => {
                         let view = notice.resolve()?;
                         let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
@@ -2148,6 +2280,23 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
                     }
                     _ => None,
                 };
+                if let (Some(audience), Some(transaction)) =
+                    (audience.as_mut(), transaction.as_ref())
+                {
+                    let view = notice.resolve()?;
+                    let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
+                    policy::filter_audience(
+                        &self.router,
+                        transaction,
+                        &self.allocator,
+                        &self.account,
+                        sender,
+                        StanzaType::Presence(PresenceType::Unavailable),
+                        audience,
+                    )
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                }
                 if let Some(ticket) = ticket.as_mut() {
                     ticket.turn().await;
                 }

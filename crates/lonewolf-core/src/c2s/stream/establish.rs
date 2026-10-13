@@ -85,7 +85,13 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                 Ok(Some(StreamEvent::StreamStart {
                     header,
                     content_namespace,
-                })) => match validate_header(&header, &content_namespace, hosts) {
+                    extra_header_namespaces,
+                })) => match validate_header(
+                    &header,
+                    &content_namespace,
+                    extra_header_namespaces,
+                    hosts,
+                ) {
                     Ok(header) => header,
                     Err(outcome) => {
                         return Err(writer

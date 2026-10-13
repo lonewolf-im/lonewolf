@@ -190,17 +190,20 @@ impl<A: ChunkAllocator + Clone> Session<A> {
             Ok(Some(StreamEvent::StreamStart {
                 header,
                 content_namespace,
-            })) => match validate_header(&header, &content_namespace, hosts) {
-                Ok(header) => Ok(header),
-                Err(outcome) => Err(self
-                    .writer
-                    .reject_header(
-                        response_to_from_header(&header).as_deref(),
-                        content_namespace == CLIENT_NAMESPACE,
-                        outcome,
-                    )
-                    .await),
-            },
+                extra_header_namespaces,
+            })) => {
+                match validate_header(&header, &content_namespace, extra_header_namespaces, hosts) {
+                    Ok(header) => Ok(header),
+                    Err(outcome) => Err(self
+                        .writer
+                        .reject_header(
+                            response_to_from_header(&header).as_deref(),
+                            content_namespace == CLIENT_NAMESPACE,
+                            outcome,
+                        )
+                        .await),
+                }
+            }
             Err(ParseError::UnexpectedEof) => Err(CloseOutcome::Eof),
             Err(error) => Err(self
                 .writer

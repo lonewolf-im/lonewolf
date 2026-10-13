@@ -77,6 +77,136 @@ fn opening_stream_exposes_content_namespace() -> TestResult {
 }
 
 #[test]
+fn stream_start_flags_extra_normalized_header_namespaces() -> TestResult {
+    block_on(async {
+        for chunk in [1, usize::MAX] {
+            for (root, declarations, expected) in [
+                (
+                    "stream:stream",
+                    "xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'",
+                    false,
+                ),
+                (
+                    "s:stream",
+                    "xmlns:s='http://etherx.jabber.org/streams'",
+                    false,
+                ),
+                (
+                    "s:stream",
+                    "xmlns:s='http://etherx.jabber.org/streams' xmlns=''",
+                    false,
+                ),
+                (
+                    "s:stream",
+                    "xmlns:s='http://etherx.jabber.org/streams' xmlns='http://etherx.jabber.org/streams'",
+                    false,
+                ),
+                ("stream", "xmlns='http://etherx.jabber.org/streams'", false),
+                (
+                    "stream",
+                    "xmlns='http://etherx.jabber.org/streams' xmlns:s='http://etherx.jabber.org/streams'",
+                    false,
+                ),
+                (
+                    "s:stream",
+                    "xmlns:s='http://etherx.jabber.org/strea&#109;s' xmlns:xml='http://www.w3.org/XML/1998/na&#109;espace'",
+                    false,
+                ),
+                (
+                    "stream:stream",
+                    "xmlns:stream='http://etherx.jabber.org/streams' xmlns:w='urn:x'",
+                    true,
+                ),
+                (
+                    "stream:stream",
+                    "xmlns:stream='http://etherx.jabber.org/streams' xmlns:c='jabber:cl&#105;ent'",
+                    true,
+                ),
+                (
+                    "stream:stream",
+                    "xmlns:stream='http://etherx.jabber.org/streams' xmlns:s='http://etherx.jabber.org/strea&#109;s'",
+                    true,
+                ),
+                (
+                    "stream",
+                    "xmlns='http://etherx.jabber.org/streams' xmlns:s='http://etherx.jabber.org/streams' xmlns:w='http://etherx.jabber.org/streams'",
+                    true,
+                ),
+            ] {
+                let input = format!("<{root} {declarations}>");
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                let Some(StreamEvent::StreamStart {
+                    extra_header_namespaces,
+                    ..
+                }) = parser.next_event().await?
+                else {
+                    return Err("expected stream start".into());
+                };
+                assert_eq!(
+                    extra_header_namespaces, expected,
+                    "input={input:?}, chunk={chunk}"
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn stanza_writers_omit_header_aliases_and_preserve_stanza_namespace_bindings() -> TestResult {
+    block_on(async {
+        for chunk in [1, usize::MAX] {
+            for opening in [
+                OPEN,
+                "<s:stream xmlns:s='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:xml='http://www.w3.org/XML/1998/namespace'>",
+            ] {
+                let input = format!(
+                    "{opening}<message xmlns:w='urn:types'><payload xmlns='urn:x' type='w:Example'/></message>"
+                );
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                open(&mut parser).await?;
+                let parsed = stanza(&mut parser).await?;
+                let view = parsed.value().resolve(parsed.arena())?;
+                let mut output = String::new();
+                view.write_xml(&mut output)?;
+                assert!(!output.contains("xmlns:stream="), "{output}");
+                assert!(!output.contains("xmlns:s="), "{output}");
+                assert!(!output.contains("xmlns:xml="), "{output}");
+                assert!(output.contains("xmlns:w=\"urn:types\""), "{output}");
+                assert!(output.contains("xmlns=\"jabber:client\""), "{output}");
+                let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
+                view.write_xml_async(&mut asynchronous).await?;
+                assert_eq!(asynchronous.into_inner(), output.as_bytes());
+
+                let stored = format!("{OPEN}{output}{CLOSE}");
+                let mut replay = XmppParser::new(
+                    Fragmented::new(stored.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                open(&mut replay).await?;
+                let parsed = stanza(&mut replay).await?;
+                let mut replayed = String::new();
+                parsed
+                    .value()
+                    .resolve(parsed.arena())?
+                    .write_xml(&mut replayed)?;
+                assert_eq!(replayed, output);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn explicit_attributes_exclude_inherited_stream_language() -> TestResult {
     block_on(async {
         let input = format!(
@@ -1813,7 +1943,7 @@ fn assert_opaque_qname_context(output: &str) -> TestResult {
                 let expected = match local.as_ref() {
                     "payload" => "urn:types",
                     "inherited" => "urn:ancestor",
-                    "stream-inherited" => "urn:stream-types",
+                    "root-inherited" => "urn:root-types",
                     "nested" => "urn:nested",
                     "collision" => "urn:reserved",
                     "prefixed" => "urn:default",
@@ -1886,9 +2016,8 @@ fn assert_opaque_qname_context(output: &str) -> TestResult {
 #[test]
 fn opaque_qnames_keep_namespace_context_through_writers_and_copies() -> TestResult {
     block_on(async {
-        let opening = OPEN.replace('>', " xmlns:w='urn:stream-types'>");
         let input = format!(
-            "{opening}<message xmlns:a='urn:ancestor'><payload xmlns='urn:payload' xmlns:t='urn:ty&#112;es' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='t:Example'><inherited type='a:Example'/><stream-inherited type='w:Example'/><nested xmlns:a='urn:nested' type='a:Example'/><collision xmlns:ns0='urn:reserved' xsi:type='ns0:Example'/><textual>t:Example</textual><p:prefixed xmlns:p='urn:element' xmlns='urn:default' type='Example'/><reset xmlns='' type='Example'/></payload><discard xmlns='urn:discard'/></message>"
+            "{OPEN}<message xmlns:a='urn:ancestor' xmlns:w='urn:root-types'><payload xmlns='urn:payload' xmlns:t='urn:ty&#112;es' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='t:Example'><inherited type='a:Example'/><root-inherited type='w:Example'/><nested xmlns:a='urn:nested' type='a:Example'/><collision xmlns:ns0='urn:reserved' xsi:type='ns0:Example'/><textual>t:Example</textual><p:prefixed xmlns:p='urn:element' xmlns='urn:default' type='Example'/><reset xmlns='' type='Example'/></payload><discard xmlns='urn:discard'/></message>"
         );
         let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
         open(&mut parser).await?;

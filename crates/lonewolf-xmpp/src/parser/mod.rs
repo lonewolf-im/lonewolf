@@ -73,6 +73,7 @@ pub enum StreamEvent<A: ChunkAllocator> {
     StreamStart {
         header: Parsed<Element, A>,
         content_namespace: String,
+        extra_header_namespaces: bool,
     },
     Stanza(Parsed<Stanza, A>),
     RejectedStanza(Parsed<RejectedStanza, A>),
@@ -296,6 +297,9 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                                 explicit_attributes,
                             },
                             content_namespace,
+                            extra_header_namespaces: names::has_extra_header_namespaces(
+                                &self.namespaces,
+                            ),
                         });
                     }
                     if matches!(self.frames.last(), Some(Frame::Stanza(_)))

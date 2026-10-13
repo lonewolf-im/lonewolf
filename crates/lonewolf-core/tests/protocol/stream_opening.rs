@@ -2,6 +2,131 @@
 
 use super::support::{C2sSuite, OPEN, TestResult};
 
+const HEADER_NAMESPACE_REJECTIONS: [(&str, &str); 6] = [
+    ("xmlns:w='urn:x'", "invalid-namespace"),
+    ("xmlns:c='jabber:cl&#105;ent'", "invalid-namespace"),
+    (
+        "xmlns:s='http://etherx.jabber.org/strea&#109;s'",
+        "invalid-namespace",
+    ),
+    ("xmlns:xml='urn:bad'", "not-well-formed"),
+    ("xmlns:w='urn:x' xmlns:w='urn:x'", "not-well-formed"),
+    (
+        "xmlns:p='http://www.w3.org/XML/1998/namespace'",
+        "not-well-formed",
+    ),
+];
+
+#[test]
+fn allowed_header_namespaces_work_before_tls_after_tls_and_after_authentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for (root, declarations) in [
+        (
+            "stream:stream",
+            "xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'",
+        ),
+        (
+            "s:stream",
+            "xmlns:s='http://etherx.jabber.org/streams' xmlns='jabber:client'",
+        ),
+        ("s:stream", "xmlns:s='http://etherx.jabber.org/streams'"),
+        (
+            "s:stream",
+            "xmlns:s='http://etherx.jabber.org/streams' xmlns=''",
+        ),
+        (
+            "s:stream",
+            "xmlns:s='http://etherx.jabber.org/streams' xmlns='http://etherx.jabber.org/streams'",
+        ),
+        ("stream", "xmlns='http://etherx.jabber.org/streams'"),
+        (
+            "stream",
+            "xmlns='http://etherx.jabber.org/streams' xmlns:s='http://etherx.jabber.org/streams'",
+        ),
+        (
+            "s:stream",
+            "xmlns:s='http://etherx.jabber.org/strea&#109;s' xmlns='jabber:cl&#105;ent'",
+        ),
+    ] {
+        for xml in ["", "xmlns:xml='http://www.w3.org/XML/1998/na&#109;espace'"] {
+            let opening = format!("<{root} {declarations} {xml} to='localhost' version='1.0'>");
+            let footer = format!("</{root}>");
+            let mut plain = suite.tcp_client()?;
+            assert_eq!(
+                plain.open_with(&opening)?.attribute("from"),
+                Some("localhost")
+            );
+            plain.features()?;
+            plain.close_with_footer(&footer)?;
+
+            let mut encrypted = suite.tls_client()?;
+            assert_eq!(
+                encrypted.open_with(&opening)?.attribute("from"),
+                Some("localhost")
+            );
+            encrypted.features()?;
+            encrypted.close_with_footer(&footer)?;
+
+            let mut authenticated = suite.unauthenticated_client()?;
+            authenticated.authenticate("alice", "pencil")?;
+            let mut authenticated = authenticated.restart();
+            assert_eq!(
+                authenticated.open_with(&opening)?.attribute("from"),
+                Some("localhost")
+            );
+            authenticated.features()?;
+            authenticated.close_with_footer(&footer)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn extra_header_namespaces_are_rejected_before_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for (declarations, condition) in HEADER_NAMESPACE_REJECTIONS {
+        let opening = OPEN.replace('>', &format!(" {declarations}>"));
+        let mut client = suite.tcp_client()?;
+        let header = client.open_with(&opening)?;
+        header.assert_name("http://etherx.jabber.org/streams", "stream");
+        assert_eq!(header.attribute("from"), Some("localhost"));
+        client.expect_stream_error(condition)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn extra_header_namespaces_are_rejected_after_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for (declarations, condition) in HEADER_NAMESPACE_REJECTIONS {
+        let opening = OPEN.replace('>', &format!(" {declarations}>"));
+        let mut client = suite.tls_client()?;
+        let header = client.open_with(&opening)?;
+        header.assert_name("http://etherx.jabber.org/streams", "stream");
+        assert_eq!(header.attribute("from"), Some("localhost"));
+        client.expect_stream_error(condition)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn extra_header_namespaces_are_rejected_after_authentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for (declarations, condition) in HEADER_NAMESPACE_REJECTIONS {
+        let opening = OPEN.replace('>', &format!(" {declarations}>"));
+        let mut client = suite.unauthenticated_client()?;
+        client.authenticate("alice", "pencil")?;
+        let mut client = client.restart();
+        let header = client.open_with(&opening)?;
+        header.assert_name("http://etherx.jabber.org/streams", "stream");
+        assert_eq!(header.attribute("from"), Some("localhost"));
+        client.expect_stream_error(condition)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn initial_opening_selects_the_served_host() -> TestResult {
     let suite = C2sSuite::start()?;

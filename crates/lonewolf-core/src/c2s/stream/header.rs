@@ -23,9 +23,12 @@ pub(super) struct ClientHeader {
 pub(super) fn validate_header<A: ChunkAllocator>(
     header: &Parsed<Element, A>,
     content_namespace: &str,
+    extra_header_namespaces: bool,
     hosts: &Hosts,
 ) -> Result<ClientHeader, CloseOutcome> {
-    if !matches!(content_namespace, "" | CLIENT_NAMESPACE | STREAM_NAMESPACE) {
+    if extra_header_namespaces
+        || !matches!(content_namespace, "" | CLIENT_NAMESPACE | STREAM_NAMESPACE)
+    {
         return Err(CloseOutcome::InvalidNamespace);
     }
     let header = header.value().resolve(header.arena())?;

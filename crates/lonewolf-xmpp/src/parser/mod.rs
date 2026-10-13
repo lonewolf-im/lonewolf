@@ -18,8 +18,8 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 use crate::stanza::incoming::{Completed, Frame};
 use crate::stanza::{
-    BuildError, Element, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, RejectedStanza, STREAM_NAMESPACE,
-    Stanza, XML_NAMESPACE, xml,
+    BuildError, CLIENT_NAMESPACE, Element, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, RejectedStanza,
+    STREAM_NAMESPACE, Stanza, XML_NAMESPACE, xml,
 };
 
 mod input;
@@ -89,6 +89,7 @@ pub enum ParseError {
     InvalidXml,
     NotWellFormed,
     InvalidNamespace,
+    BadNamespacePrefix,
     UnboundNamespacePrefix,
     UnsupportedEncoding,
     UnsupportedVersion,
@@ -296,6 +297,12 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                             },
                             content_namespace,
                         });
+                    }
+                    if matches!(self.frames.last(), Some(Frame::Stanza(_)))
+                        && start.name().prefix().is_some()
+                        && names::element(&self.namespaces, start)?.1 == CLIENT_NAMESPACE
+                    {
+                        return Err(ParseError::BadNamespacePrefix);
                     }
                     if self.frames.is_empty() {
                         let (name, namespace) = names::element(&self.namespaces, start)?;
@@ -636,6 +643,7 @@ impl fmt::Display for ParseError {
             Self::SizeLimitExceeded { .. } => "XML input exceeds the byte limit",
             Self::TooManyAttributes => "too many XML attributes",
             Self::InvalidNamespace => "invalid XML namespace",
+            Self::BadNamespacePrefix => "content namespace element uses a prefix",
             Self::UnboundNamespacePrefix => "unbound XML namespace prefix",
             Self::UnsupportedEncoding => "XMPP requires UTF-8 input",
             Self::UnsupportedVersion => "XMPP requires XML 1.0",

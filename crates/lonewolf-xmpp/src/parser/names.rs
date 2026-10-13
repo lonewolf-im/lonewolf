@@ -76,6 +76,9 @@ pub(super) fn frame<A: ChunkAllocator>(
         && matches!(name, "message" | "presence" | "iq")
         && let Some(namespace) = stanza_namespace
     {
+        if start.name().prefix().is_some() {
+            return Err(ParseError::BadNamespacePrefix);
+        }
         let kind = match name {
             "message" => StanzaKind::Message,
             "presence" => StanzaKind::Presence,

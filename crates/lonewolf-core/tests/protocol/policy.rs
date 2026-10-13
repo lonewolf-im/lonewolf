@@ -27,7 +27,7 @@ fn outbound_rejection_carries_the_application_condition() -> TestResult {
 }
 
 #[test]
-fn inbound_drop_discards_without_a_reply() -> TestResult {
+fn inbound_drop_replies_to_iq_and_discards_messages() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
     suite.create_account("alice", "password")?;
     suite.create_account("spammer", "password")?;
@@ -36,8 +36,10 @@ fn inbound_drop_discards_without_a_reply() -> TestResult {
     let mut spammer = suite.connect("spammer", "password", "res")?;
     let mut bob = suite.connect("bob", "password", "res")?;
 
-    spammer.send("<message type='chat' to='alice@localhost/res' id='drop'/><iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
+    spammer.send("<message type='chat' to='alice@localhost/res' id='drop'/><iq type='get' to='alice@localhost/res' id='drop-iq'><query xmlns='urn:test:iq'/></iq><iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
+    spammer.expect_xml("<iq xmlns='jabber:client' from='alice@localhost/res' type='error' id='drop-iq'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     spammer.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_no_tls_input()?;
     bob.send("<message type='chat' to='alice@localhost/res' id='first'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
     alice.close()?;

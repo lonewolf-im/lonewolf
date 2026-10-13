@@ -50,7 +50,7 @@ pub(crate) struct DetachedGuard {
 impl DetachedWork {
     pub(crate) fn try_start(&self) -> Option<DetachedGuard> {
         self.active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
                 (active < MAX_DETACHED).then_some(active + 1)
             })
             .ok()

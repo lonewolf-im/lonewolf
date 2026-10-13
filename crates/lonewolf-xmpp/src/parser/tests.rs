@@ -839,6 +839,34 @@ fn distinguishes_transport_errors_from_invalid_xml() {
 }
 
 #[test]
+fn failed_restart_returns_the_unchanged_parser_and_unread_transport() -> TestResult {
+    block_on(async {
+        let input = format!("{OPEN}<presence/>{CLOSE}");
+        let parser = XmppParser::new(
+            Fragmented::new(input.as_bytes(), 1),
+            config(4096)?,
+            GlobalChunkAllocator,
+        );
+        let mut parser = match parser.try_restart() {
+            Err((parser, ParseError::UnexpectedEvent)) => parser,
+            _ => return Err("expected initial restart rejection".into()),
+        };
+        open(&mut parser).await?;
+        stanza(&mut parser).await?;
+        assert!(matches!(
+            parser.next_event().await?,
+            Some(StreamEvent::StreamEnd)
+        ));
+        let mut parser = match parser.try_restart() {
+            Err((parser, ParseError::UnexpectedEvent)) => parser,
+            _ => return Err("expected closed restart rejection".into()),
+        };
+        assert!(parser.next_event().await?.is_none());
+        Ok(())
+    })
+}
+
+#[test]
 fn xml_one_x_declarations_keep_xml_one_zero_character_rules_and_events() -> TestResult {
     block_on(async {
         for chunk in [1, usize::MAX] {

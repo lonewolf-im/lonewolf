@@ -23,8 +23,8 @@ use super::header::{
 };
 use super::outcome::CloseOutcome;
 use super::session::{
-    ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, Writer, namespace_error,
-    peer_stream_error,
+    ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, TlsTransport, Writer,
+    namespace_error, peer_stream_error,
 };
 use super::stanza_rate::StanzaLimiter;
 use crate::hosts::Hosts;
@@ -81,8 +81,10 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         Box::pin(AsyncStream::new(transport.clone())),
         hosts.default_host_name().to_owned(),
     );
-    let plain = context
-        .interrupt(async {
+    let plain = super::run_phase(
+        context.phase_deadline,
+        CloseOutcome::EstablishmentTimeout,
+        context.interrupt(async {
             let header = match reader.next_event().await {
                 Ok(Some(StreamEvent::StreamStart {
                     header,
@@ -138,8 +140,9 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                     Err(namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedInput))
                 }
             }
-        })
-        .await;
+        }),
+    )
+    .await;
     let selected_host = match plain {
         Ok(host) => host,
         Err(outcome) => {
@@ -148,10 +151,24 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             );
         }
     };
-    let rate_state = reader.take_input().await?.into_rate_limited().into_state();
+    let rate_state = match super::run_phase(
+        context.phase_deadline,
+        CloseOutcome::EstablishmentTimeout,
+        reader.take_input(),
+    )
+    .await
+    {
+        Ok(input) => input.into_rate_limited().into_state(),
+        Err(outcome) => {
+            context.abort();
+            return Err(outcome);
+        }
+    };
     drop(writer);
-    let transport = context
-        .interrupt(async {
+    let transport = super::run_phase(
+        context.phase_deadline,
+        CloseOutcome::EstablishmentTimeout,
+        context.interrupt(async {
             let tls_config = hosts
                 .tls_server_config(&selected_host)
                 .await
@@ -161,32 +178,40 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                 .accept(Box::pin(AsyncStream::new(transport)))
                 .await
                 .map_err(|_| CloseOutcome::TlsFailure)
-        })
-        .await?;
-    let client = match transport.get_ref().1.peer_certificates() {
-        Some(chain) if !chain.is_empty() => {
-            let policy = hosts
-                .client_certificate_policy(&selected_host)
-                .ok_or(CloseOutcome::TlsFailure)?;
-            Some(
-                context
-                    .interrupt(async {
-                        policy
-                            .verify_client(chain.iter().cloned().collect())
-                            .await
-                            .map_err(|_| CloseOutcome::TlsFailure)
-                    })
-                    .await?,
-            )
+        }),
+    )
+    .await;
+    let mut transport = match transport {
+        Ok(transport) => transport,
+        Err(outcome) => {
+            context.abort();
+            return Err(outcome);
         }
-        _ => None,
     };
-    let mut exporter = [0_u8; 32];
-    transport
-        .get_ref()
-        .1
-        .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", Some(&[]))
-        .map_err(|_| CloseOutcome::TlsFailure)?;
+    let (client, exporter) = prepare_tls(&mut transport, &context, async |transport| {
+        let client = match transport.get_ref().1.peer_certificates() {
+            Some(chain) if !chain.is_empty() => {
+                let policy = hosts
+                    .client_certificate_policy(&selected_host)
+                    .ok_or(CloseOutcome::TlsFailure)?;
+                Some(
+                    policy
+                        .verify_client(chain.iter().cloned().collect())
+                        .await
+                        .map_err(|_| CloseOutcome::TlsFailure)?,
+                )
+            }
+            _ => None,
+        };
+        let mut exporter = [0_u8; 32];
+        transport
+            .get_ref()
+            .1
+            .export_keying_material(&mut exporter, b"EXPORTER-Channel-Binding", Some(&[]))
+            .map_err(|_| CloseOutcome::TlsFailure)?;
+        Ok((client, exporter))
+    })
+    .await?;
     let (read, write) = transport.split();
     let closing = Rc::new(Cell::new(ReadMode::Open));
     let parser = XmppParser::new(
@@ -211,8 +236,10 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         closing,
         context.clone(),
     );
-    let opened = context
-        .interrupt(async {
+    let opened = super::run_phase(
+        context.phase_deadline,
+        CloseOutcome::EstablishmentTimeout,
+        context.interrupt(async {
             let header = session.read_header(hosts).await?;
             if header.host != session.host() {
                 return Err(session
@@ -236,8 +263,9 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             };
             session.writer.send(features).await?;
             Ok(header)
-        })
-        .await;
+        }),
+    )
+    .await;
     let header = match opened {
         Ok(header) => header,
         Err(outcome) => return Err(session.finish(outcome).await),
@@ -250,6 +278,23 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         binding: TlsBinding { exporter },
         auth_started_at: Instant::now(),
     })
+}
+
+pub(super) async fn prepare_tls<T>(
+    transport: &mut TlsTransport,
+    context: &CloseContext,
+    preparation: impl AsyncFnOnce(&TlsTransport) -> Result<T, CloseOutcome>,
+) -> Result<T, CloseOutcome> {
+    let result = super::run_phase(
+        context.phase_deadline,
+        CloseOutcome::EstablishmentTimeout,
+        context.interrupt(preparation(transport)),
+    )
+    .await;
+    match result {
+        Ok(prepared) => Ok(prepared),
+        Err(outcome) => Err(close::finish_tls(transport, outcome, context).await),
+    }
 }
 
 fn is_starttls<A: ChunkAllocator>(element: &Parsed<Element, A>) -> bool {

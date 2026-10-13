@@ -54,24 +54,39 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
 ) -> Result<Bound<A>, CloseOutcome> {
     drop(established.client);
     let monitor = established.monitor;
-    let mut session = established.session.restart().await?;
+    let mut session = established.session;
+    let restart = session.restart();
     let context = session.close.clone();
-    let operation = bind_session(
-        &mut session,
-        hosts,
-        account,
-        router,
-        max_resources_per_account,
-        monitor.as_ref().map(|monitor| (&storage, monitor)),
-    );
-    let result = context
-        .interrupt(async {
+    let result = super::run_phase(
+        context.phase_deadline,
+        CloseOutcome::BindingTimeout,
+        context.interrupt(async {
+            if restart.is_err() {
+                return Err(session
+                    .writer
+                    .reject_header(
+                        None,
+                        false,
+                        ResponseVersion::Current,
+                        CloseOutcome::ParserError,
+                    )
+                    .await);
+            }
+            let operation = bind_session(
+                &mut session,
+                hosts,
+                account,
+                router,
+                max_resources_per_account,
+                monitor.as_ref().map(|monitor| (&storage, monitor)),
+            );
             match &monitor {
                 Some(monitor) => monitor.interrupt(operation).await,
                 None => operation.await,
             }
-        })
-        .await;
+        }),
+    )
+    .await;
     let (registration, resource_requested) = match result {
         Ok(bound) => bound,
         Err(outcome) => return Err(session.finish(outcome).await),

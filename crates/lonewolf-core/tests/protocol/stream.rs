@@ -141,8 +141,17 @@ fn idle_authentication_closes_at_the_configured_deadline() -> TestResult {
     let started = Instant::now();
     let mut client = suite.unauthenticated_client()?;
 
-    client.expect_eof()?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(4)).contains(&started.elapsed()));
+    client
+        .receive()?
+        .child("urn:ietf:params:xml:ns:xmpp-streams", "policy-violation")?;
+    client.expect_footer()?;
+    client.send("</stream:stream>")?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()?;
+    suite.wait_for_log("outcome=\"authentication_timeout\"")?;
+    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
     Ok(())
 }
 
@@ -153,8 +162,92 @@ fn idle_resource_binding_closes_at_the_configured_deadline() -> TestResult {
     let started = Instant::now();
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
+    client
+        .receive()?
+        .child("urn:ietf:params:xml:ns:xmpp-streams", "policy-violation")?;
+    client.expect_footer()?;
+    client.send("</stream:stream>")?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()?;
+    suite.wait_for_log("outcome=\"binding_timeout\"")?;
+    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
+    Ok(())
+}
+
+#[test]
+fn idle_plaintext_after_features_closes_with_policy_violation() -> TestResult {
+    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 1")?;
+    let started = Instant::now();
+    let mut client = suite.tcp_client()?;
+    client.open()?;
+    client.expect_stream_error("policy-violation")?;
+    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
+    Ok(())
+}
+
+#[test]
+fn completed_tls_without_a_restart_header_closes_tls_without_synthetic_xml() -> TestResult {
+    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 1")?;
+    let started = Instant::now();
+    let mut client = suite.tls_client()?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()?;
+    suite.wait_for_log("outcome=\"establishment_timeout\"")?;
+    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
+    Ok(())
+}
+
+#[test]
+fn sasl_success_without_a_restart_header_closes_tls_without_synthetic_xml() -> TestResult {
+    let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 1")?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+    client.authenticate("alice", "pencil")?;
+    let started = Instant::now();
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()?;
+    suite.wait_for_log("outcome=\"binding_timeout\"")?;
+    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
+    Ok(())
+}
+
+#[test]
+fn incomplete_tls_negotiation_times_out_without_appending_plaintext_xml() -> TestResult {
+    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 1")?;
+    let started = Instant::now();
+    let mut client = suite.tcp_client()?;
+    client.open()?;
+    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+    client.receive()?.assert_name(TLS_NAMESPACE, "proceed");
     client.expect_eof()?;
+    suite.wait_for_log("outcome=\"establishment_timeout\"")?;
     assert!((Duration::from_secs(1)..Duration::from_secs(4)).contains(&started.elapsed()));
+    Ok(())
+}
+
+#[test]
+fn nonreading_timeout_peer_releases_connection_capacity_within_one_grace_budget() -> TestResult {
+    let suite = C2sSuite::with_limits(
+        "connection_establishment_timeout_secs = 1\nmax_connections_per_ip = 1",
+    )?;
+    let started = Instant::now();
+    let mut silent = suite.tcp_client()?;
+    silent.open()?;
+    let logs = suite.wait_for_log("outcome=\"establishment_timeout\"")?;
+    assert!((Duration::from_secs(5)..Duration::from_secs(7)).contains(&started.elapsed()));
+    assert_eq!(logs.matches("phase timeout close failed").count(), 1);
+    assert!(logs.contains("close_outcome=\"closing_timeout\""));
+    assert!(logs.contains("close_stage=\"xml\""));
+    let mut replacement = suite.tcp_client()?;
+    replacement.open()?;
+    replacement.close()?;
+    drop(silent);
     Ok(())
 }
 

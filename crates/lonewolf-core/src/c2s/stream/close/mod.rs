@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::Shutdown;
@@ -17,7 +18,7 @@ use tokio::io::AsyncBufRead;
 
 use super::header::{STREAM_FOOTER, stream_error_xml};
 use super::outcome::CloseOutcome;
-use super::session::{Reader, Writer};
+use super::session::{Reader, TlsTransport, Writer};
 
 pub(super) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;
@@ -69,6 +70,16 @@ impl CloseContext {
         let deadline = Instant::now() + CLOSE_TIMEOUT;
         self.phase_deadline
             .map_or(deadline, |phase| deadline.min(phase))
+    }
+
+    pub(super) fn deadline_for(&self, outcome: CloseOutcome) -> Instant {
+        if outcome.is_phase_timeout() {
+            self.phase_deadline
+                .and_then(|deadline| deadline.checked_add(CLOSE_TIMEOUT))
+                .unwrap_or_else(|| Instant::now() + CLOSE_TIMEOUT)
+        } else {
+            self.deadline()
+        }
     }
 
     pub(super) fn abort(&self) {
@@ -132,6 +143,7 @@ pub(super) async fn finish<A: ChunkAllocator + Clone>(
     deadline: Instant,
 ) -> CloseOutcome {
     let outcome = reason.outcome();
+    let stage = Cell::new("xml");
     let result = context
         .until(deadline, async {
             let mut state = CloseState::Open;
@@ -139,6 +151,7 @@ pub(super) async fn finish<A: ChunkAllocator + Clone>(
                 return Ok(outcome);
             }
             transition(&mut state, CloseState::FooterSent);
+            stage.set("transport");
             let input = reader.take_input().await?;
             let read = input.into_inner().into_inner().into_inner();
             let write = writer.take_output()?;
@@ -146,26 +159,46 @@ pub(super) async fn finish<A: ChunkAllocator + Clone>(
                 .reunite(write)
                 .map_err(|_| CloseOutcome::InternalError)?;
             transition(&mut state, CloseState::TlsClosing);
-            transport.get_mut().1.send_close_notify();
-            transport
-                .flush()
-                .await
-                .map_err(|_| CloseOutcome::TransportError)?;
-            let mut buffer = [0; 4096];
-            loop {
-                match transport.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Ok(_) => yield_once().await,
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(_) => return Err(CloseOutcome::TransportError),
-                }
-            }
+            stage.set("tls");
+            shutdown_tls(&mut transport).await?;
             transition(&mut state, CloseState::Closed);
             Ok(outcome)
         })
         .await;
     context.abort();
-    completed(result, outcome)
+    completed(result, outcome, stage.get())
+}
+
+pub(super) async fn finish_tls(
+    transport: &mut TlsTransport,
+    outcome: CloseOutcome,
+    context: &CloseContext,
+) -> CloseOutcome {
+    let deadline = context.deadline_for(outcome);
+    let result = context
+        .until(deadline, async {
+            shutdown_tls(transport).await.map(|()| outcome)
+        })
+        .await;
+    context.abort();
+    completed(result, outcome, "tls")
+}
+
+async fn shutdown_tls(transport: &mut TlsTransport) -> Result<(), CloseOutcome> {
+    transport.get_mut().1.send_close_notify();
+    transport
+        .flush()
+        .await
+        .map_err(|_| CloseOutcome::TransportError)?;
+    let mut buffer = [0; 4096];
+    loop {
+        match transport.read(&mut buffer).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => yield_once().await,
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(_) => return Err(CloseOutcome::TransportError),
+        }
+    }
 }
 
 pub(super) async fn finish_plain<A, R, W>(
@@ -180,13 +213,14 @@ where
     W: AsyncWrite + Unpin,
 {
     let outcome = reason.outcome();
+    let deadline = context.deadline_for(outcome);
     let result = context
-        .until(context.deadline(), async {
+        .until(deadline, async {
             xml(reader, writer, reason).await.map(|_| outcome)
         })
         .await;
     context.abort();
-    completed(result, outcome)
+    completed(result, outcome, "xml")
 }
 
 pub(super) async fn before_deadline<T>(
@@ -210,7 +244,25 @@ pub(super) async fn before_deadline<T>(
 fn completed(
     result: Result<Result<CloseOutcome, CloseOutcome>, ()>,
     outcome: CloseOutcome,
+    stage: &str,
 ) -> CloseOutcome {
+    if outcome.is_phase_timeout() {
+        let failure = match result {
+            Ok(Err(failure)) => Some(failure),
+            Ok(Ok(failure)) if failure != outcome => Some(failure),
+            Err(()) => Some(CloseOutcome::ClosingTimeout),
+            _ => None,
+        };
+        if let Some(failure) = failure {
+            tracing::error!(
+                outcome = outcome.as_str(),
+                close_outcome = failure.as_str(),
+                close_stage = stage,
+                "phase timeout close failed"
+            );
+        }
+        return outcome;
+    }
     match result {
         Ok(Ok(result) | Err(result)) => result,
         Err(()) if matches!(outcome, CloseOutcome::StreamEnd | CloseOutcome::LocalClose) => {

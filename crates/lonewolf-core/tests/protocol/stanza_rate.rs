@@ -172,10 +172,19 @@ fn stanza_shaping_does_not_extend_the_resource_binding_deadline() -> TestResult 
     let suite = C2sSuite::with_limits(&format!("{STRICT}\nresource_binding_timeout_secs = 1",))?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.authenticated_client("alice", "pencil")?;
+    let started = Instant::now();
     alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
-    alice.expect_eof()?;
+    alice
+        .receive()?
+        .child("urn:ietf:params:xml:ns:xmpp-streams", "policy-violation")?;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    alice.expect_footer()?;
+    alice.send("</stream:stream>")?;
+    alice.expect_tls_close()?;
+    alice.send_tls_close()?;
+    alice.expect_tcp_eof()?;
     let mut replacement = suite.connect("alice", "pencil", "desk")?;
     replacement.close()
 }

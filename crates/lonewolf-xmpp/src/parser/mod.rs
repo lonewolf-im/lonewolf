@@ -158,12 +158,21 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
     ///
     /// Returns [`ParseError::ParserFailed`] after a failed or cancelled read.
     /// Returns [`ParseError::UnexpectedEvent`] if the stream is not open.
-    pub fn restart(mut self) -> Result<Self, ParseError> {
+    pub fn restart(self) -> Result<Self, ParseError> {
+        self.try_restart().map_err(|(_, error)| error)
+    }
+
+    /// Returns the unchanged parser if its stream cannot restart.
+    #[allow(
+        clippy::result_large_err,
+        reason = "Failures retain the parser without allocating."
+    )]
+    pub fn try_restart(mut self) -> Result<Self, (Self, ParseError)> {
         if self.failed {
-            return Err(ParseError::ParserFailed);
+            return Err((self, ParseError::ParserFailed));
         }
         if self.phase != Phase::Open {
-            return Err(ParseError::UnexpectedEvent);
+            return Err((self, ParseError::UnexpectedEvent));
         }
         let mut input = self.reader.into_inner();
         input.reset(MAX_STREAM_HEADER_BYTES);

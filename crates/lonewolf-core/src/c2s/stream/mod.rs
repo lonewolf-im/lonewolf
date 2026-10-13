@@ -245,13 +245,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         };
         let mut work = crate::delivery::WorkGroup::new();
         let phases = async {
-            let mut established = run_phase(
-                &close_control,
-                context.phase_deadline,
-                CloseOutcome::EstablishmentTimeout,
-                establish(transport, &hosts, &settings, context.clone()),
-            )
-            .await?;
+            let mut established = establish(transport, &hosts, &settings, context.clone()).await?;
             lifecycle.established(established.session.host());
             lifecycle.stream_phase = "authenticating";
             context.phase_deadline = established
@@ -259,7 +253,6 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 .checked_add(settings.authentication_timeout);
             established.session.close = context.clone();
             let authenticated = run_phase(
-                &close_control,
                 context.phase_deadline,
                 CloseOutcome::AuthenticationTimeout,
                 context.interrupt(authenticate(
@@ -284,19 +277,14 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             let binding_started_at = Instant::now();
             context.phase_deadline = binding_started_at.checked_add(settings.binding_timeout);
             established.session.close = context.clone();
-            let mut bound = run_phase(
-                &close_control,
-                context.phase_deadline,
-                CloseOutcome::BindingTimeout,
-                bind_resource(
-                    established,
-                    &hosts,
-                    &account,
-                    &router,
-                    auth.storage.clone(),
-                    settings.max_resources_per_account,
-                    settings.allocator.clone(),
-                ),
+            let mut bound = bind_resource(
+                established,
+                &hosts,
+                &account,
+                &router,
+                auth.storage.clone(),
+                settings.max_resources_per_account,
+                settings.allocator.clone(),
             )
             .await?;
             lifecycle.bound(bound.resource_requested, binding_started_at);
@@ -327,9 +315,7 @@ async fn finish_phases(
     }
 }
 
-/// Shuts the socket down on timeout so a phase blocked on I/O observes the end.
 async fn run_phase<T>(
-    close_control: &TcpStream,
     deadline: Option<Instant>,
     timeout_outcome: CloseOutcome,
     phase: impl Future<Output = Result<T, CloseOutcome>>,
@@ -337,10 +323,7 @@ async fn run_phase<T>(
     let mut phase = pin!(phase);
     match close::before_deadline(deadline.unwrap_or_else(Instant::now), phase.as_mut()).await {
         Ok(result) => result,
-        Err(_) => {
-            let _ = SockRef::from(close_control).shutdown(Shutdown::Both);
-            Err(timeout_outcome)
-        }
+        Err(_) => Err(timeout_outcome),
     }
 }
 

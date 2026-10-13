@@ -1339,6 +1339,80 @@ fn external_shutdown_cancels_blocked_revalidation() -> TestResult {
 }
 
 #[test]
+fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_original_deadline()
+-> TestResult {
+    use super::support::tls::{
+        ClientCertificates, block_crl_reads, wait_for_crl_reader, with_client_certificate,
+    };
+    use std::io::Write as _;
+    let mut certificates = None;
+    let mut path = None;
+    let suite = C2sSuite::with_extensions_limits_and_setup(
+        "",
+        "connection_establishment_timeout_secs = 1",
+        |directory| {
+            certificates = Some(ClientCertificates::configure(directory)?);
+            path = Some(directory.join("client-crls.pem"));
+            Ok(())
+        },
+    )?;
+    let certificates = certificates.ok_or("missing client certificate fixtures")?;
+    let path = path.ok_or("missing CRL path")?;
+    suite.create_account("alice", "pencil")?;
+    let material = block_crl_reads(&path)?;
+    let started = std::time::Instant::now();
+    let mut plain = suite.tcp_client()?;
+    plain.open()?;
+    let mut client = plain.start_tls_with_config(with_client_certificate(
+        &suite.tls,
+        std::sync::Arc::clone(&certificates.trusted),
+    ))?;
+    let mut handshake_release = wait_for_crl_reader(&path)?;
+    handshake_release.write_all(&material)?;
+    drop(handshake_release);
+    let mut verification_release = std::thread::scope(|scope| -> TestResult<std::fs::File> {
+        let (handshake_complete, completed) = std::sync::mpsc::channel();
+        let closed = scope.spawn(move || -> Result<(), String> {
+            let tls = client.transport();
+            while tls.conn.is_handshaking() {
+                tls.conn
+                    .complete_io(&mut tls.sock)
+                    .map_err(|error| format!("TLS handshake: {error}"))?;
+            }
+            tls.flush()
+                .map_err(|error| format!("TLS handshake flush: {error}"))?;
+            handshake_complete
+                .send(())
+                .map_err(|_| "handshake observer dropped".to_owned())?;
+            client
+                .expect_tls_close()
+                .map_err(|error| format!("post-handshake TLS close: {error}"))?;
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            client.send_tls_close().map_err(|error| error.to_string())?;
+            client.expect_tcp_eof().map_err(|error| error.to_string())
+        });
+        completed.recv_timeout(std::time::Duration::from_secs(2))?;
+        let release = wait_for_crl_reader(&path)?;
+        closed
+            .join()
+            .map_err(|_| "client thread panicked")?
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        Ok(release)
+    })?;
+    suite.wait_for_log("outcome=\"establishment_timeout\"")?;
+    std::fs::remove_file(&path)?;
+    std::fs::write(&path, &material)?;
+    verification_release.write_all(&material)?;
+    drop(verification_release);
+    let mut client = certificate_client(&suite, certificates.trusted, None)?;
+    client.authenticate("alice", "pencil")?;
+    let mut client = client.restart();
+    client.open()?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
 fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
     use super::support::tls::{block_crl_reads, wait_for_crl_reader};
     use std::io::Write as _;
@@ -1359,10 +1433,17 @@ fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
     let path = path.ok_or("missing CRL path")?;
     suite.create_account("alice", "pencil")?;
     let mut client = certificate_client(&suite, certificates.trusted, None)?;
+    let started = std::time::Instant::now();
     let material = block_crl_reads(&path)?;
     client.send_external_auth(Some(""))?;
     let mut release = wait_for_crl_reader(&path)?;
-    assert!(client.receive().is_err());
+    client.receive()?.child(STREAM_ERRORS, "policy-violation")?;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    client.expect_footer()?;
+    client.send("</stream:stream>")?;
+    client.expect_tls_close()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()?;
     suite.wait_for_log("outcome=\"authentication_timeout\"")?;
     std::fs::remove_file(&path)?;
     std::fs::write(&path, &material)?;

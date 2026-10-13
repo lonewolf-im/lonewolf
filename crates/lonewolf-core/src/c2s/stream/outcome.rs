@@ -47,6 +47,13 @@ pub(crate) enum CloseOutcome {
 }
 
 impl CloseOutcome {
+    pub(super) fn is_phase_timeout(self) -> bool {
+        matches!(
+            self,
+            Self::EstablishmentTimeout | Self::AuthenticationTimeout | Self::BindingTimeout
+        )
+    }
+
     pub(super) fn from_parse_error(error: &ParseError) -> Self {
         if error.is_transport_error() {
             return Self::TransportError;
@@ -74,6 +81,9 @@ impl CloseOutcome {
             Self::SystemShutdown => Some(StreamErrorCondition::SystemShutdown),
             Self::UnsupportedInput => Some(StreamErrorCondition::NotAuthorized),
             Self::SizeLimitExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::EstablishmentTimeout | Self::AuthenticationTimeout | Self::BindingTimeout => {
+                Some(StreamErrorCondition::PolicyViolation)
+            }
             Self::ParserLimitExceeded => Some(StreamErrorCondition::PolicyViolation),
             Self::ParserError | Self::InvalidLanguage | Self::InvalidTo => {
                 Some(StreamErrorCondition::BadFormat)
@@ -266,6 +276,24 @@ mod tests {
             (ParseError::ParserFailed, CloseOutcome::ParserError),
         ] {
             assert_eq!(CloseOutcome::from_parse_error(&error), outcome, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn negotiation_timeouts_keep_distinct_log_names_and_share_policy_violation() {
+        for (outcome, name) in [
+            (CloseOutcome::EstablishmentTimeout, "establishment_timeout"),
+            (
+                CloseOutcome::AuthenticationTimeout,
+                "authentication_timeout",
+            ),
+            (CloseOutcome::BindingTimeout, "binding_timeout"),
+        ] {
+            assert_eq!(
+                outcome.stream_condition(),
+                Some(StreamErrorCondition::PolicyViolation)
+            );
+            assert_eq!(outcome.as_str(), name);
         }
     }
 

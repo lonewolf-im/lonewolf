@@ -1353,3 +1353,45 @@ fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
     alice.close()?;
     bob.close()
 }
+
+#[test]
+fn opaque_extension_qnames_retain_namespace_context_after_authenticated_routing() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    alice.send("<message to='alice@localhost/desk' id='namespace-qname' xmlns:a='urn:ancestor'><payload xmlns='urn:example:payload' xmlns:t='urn:example:types' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='t:Example'><inherited xsi:type='a:Example'/><nested xmlns:a='urn:nested' xsi:type='a:Example'/><collision xmlns:ns0='urn:reserved' xsi:type='ns0:Example'/><textual>t:Example</textual><p:prefixed xmlns:p='urn:element' xmlns='urn:default' xsi:type='Example'/></payload></message>")?;
+    let delivered = alice.receive()?;
+    delivered.assert_name("jabber:client", "message");
+    assert_eq!(delivered.attribute("from"), Some("alice@localhost/desk"));
+    assert_eq!(delivered.attribute("to"), Some("alice@localhost/desk"));
+    assert_eq!(delivered.attribute("id"), Some("namespace-qname"));
+    let payload = delivered.child("urn:example:payload", "payload")?;
+    let xsi = "http://www.w3.org/2001/XMLSchema-instance";
+    for (element, expected) in [
+        (payload, "urn:example:types"),
+        (
+            payload.child("urn:example:payload", "inherited")?,
+            "urn:ancestor",
+        ),
+        (
+            payload.child("urn:example:payload", "nested")?,
+            "urn:nested",
+        ),
+        (
+            payload.child("urn:example:payload", "collision")?,
+            "urn:reserved",
+        ),
+        (payload.child("urn:element", "prefixed")?, "urn:default"),
+    ] {
+        let value = element
+            .attribute_in("type", xsi)?
+            .ok_or("missing xsi:type")?;
+        assert_eq!(element.resolve_qname(value)?, (expected, "Example"));
+    }
+    let textual = payload.child("urn:example:payload", "textual")?;
+    assert_eq!(
+        textual.resolve_qname(&textual.text)?,
+        ("urn:example:types", "Example")
+    );
+    alice.close()
+}

@@ -14,6 +14,7 @@ use crate::jid::{Jid, JidError, JidRef};
 
 mod element;
 pub(crate) mod incoming;
+pub(crate) mod namespace;
 mod routed;
 mod storage;
 pub(crate) mod xml;
@@ -23,6 +24,7 @@ pub use incoming::{RejectedStanza, StanzaRejection};
 pub use routed::RoutedStanza;
 
 use element::{Attribute, AttributesBuilder};
+use namespace::{NamespaceContext, NamespaceCopies};
 use storage::{SliceBuilder, StoredSlice};
 
 pub const CLIENT_NAMESPACE: &str = "jabber:client";
@@ -239,6 +241,7 @@ struct Header {
 #[derive(Clone, Copy)]
 struct StanzaData {
     header: Header,
+    namespaces: NamespaceContext,
     attributes: StoredSlice<Attribute>,
     children: StoredSlice<Element>,
 }
@@ -278,6 +281,7 @@ pub struct StanzaRef<'a, R: ArenaRead> {
 pub struct StanzaBuilder<'a, A: ChunkAllocator> {
     arena: &'a mut Arena<A>,
     header: Header,
+    namespaces: NamespaceContext,
     attributes: AttributesBuilder,
     children: SliceBuilder<Element>,
 }
@@ -299,6 +303,7 @@ impl Stanza {
                 id: None,
                 lang: None,
             },
+            namespaces: NamespaceContext::default(),
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::new(),
         }
@@ -329,6 +334,7 @@ impl Stanza {
         Ok(StanzaBuilder {
             arena,
             header: data.header,
+            namespaces: data.namespaces,
             attributes: AttributesBuilder::from_slice(data.attributes),
             children: SliceBuilder::from_slice(data.children),
         })
@@ -360,6 +366,7 @@ impl Stanza {
         Ok(StanzaBuilder {
             arena,
             header,
+            namespaces: NamespaceContext::default(),
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::new(),
         })
@@ -416,6 +423,7 @@ impl Stanza {
         StanzaBuilder {
             arena,
             header,
+            namespaces: NamespaceContext::default(),
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::from_slice(children),
         }
@@ -554,17 +562,23 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
                 .map(|lang| arena.try_alloc_str(lang))
                 .transpose()?,
         };
+        let mut copies = NamespaceCopies::default();
+        let namespaces = self
+            .data
+            .namespaces
+            .clone_in(self.arena, arena, &mut copies)?;
         let attributes = AttributesBuilder::copy_from(self.data.attributes, self.arena, arena)?;
         let mut children = SliceBuilder::new();
         for child in self.children()? {
             let child = child?;
             if keep(&child)? {
-                children.push(child.clone_in(arena)?, arena)?;
+                children.push(child.clone_with_namespaces(arena, &mut copies)?, arena)?;
             }
         }
         Ok(StanzaBuilder {
             arena,
             header,
+            namespaces,
             attributes,
             children,
         })
@@ -588,8 +602,21 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
     /// can leave partial XML in `output`.
     pub fn write_xml(&self, output: &mut impl fmt::Write) -> Result<(), WriteError> {
         let name = self.kind().as_str();
-        write!(output, "<{name}")?;
-        xml::attribute(output, "xmlns", self.namespace().as_str())?;
+        let prefix = self
+            .data
+            .namespaces
+            .element_prefix(self.namespace().as_str(), self.arena)?;
+        output.write_char('<')?;
+        prefix.write(output)?;
+        output.write_str(name)?;
+        self.data.namespaces.write(
+            self.arena,
+            output,
+            prefix,
+            self.namespace().as_str(),
+            None,
+            None,
+        )?;
         if let Some(jid) = self.from()? {
             xml::attribute(output, "from", jid.as_str())?;
         }
@@ -605,16 +632,30 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         if let Some(lang) = self.lang()? {
             xml::attribute(output, "xml:lang", lang)?;
         }
-        element::write_attributes(self.data.attributes, self.arena, output)?;
+        element::write_attributes(
+            self.data.attributes,
+            self.data.namespaces,
+            prefix,
+            self.arena,
+            output,
+        )?;
         if self.data.children.get(self.arena)?.is_empty() {
             output.write_str("/>")?;
             return Ok(());
         }
         output.write_char('>')?;
+        let namespace = self.data.namespaces.child_default(
+            prefix,
+            self.namespace().as_str(),
+            None,
+            self.arena,
+        )?;
         for child in self.children()? {
-            child?.write_in(output, Some(self.namespace().as_str()))?;
+            child?.write_in(output, namespace, Some(self.data.namespaces))?;
         }
-        write!(output, "</{name}>")?;
+        output.write_str("</")?;
+        prefix.write(output)?;
+        write!(output, "{name}>")?;
         Ok(())
     }
 
@@ -628,9 +669,24 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         output: &mut W,
     ) -> Result<(), AsyncWriteError> {
         let name = self.kind().as_str();
+        let prefix = self
+            .data
+            .namespaces
+            .element_prefix(self.namespace().as_str(), self.arena)?;
         output.write_all(b"<").await?;
+        prefix.write_async(output).await?;
         output.write_all(name.as_bytes()).await?;
-        xml::attribute_async(output, "xmlns", self.namespace().as_str()).await?;
+        self.data
+            .namespaces
+            .write_async(
+                self.arena,
+                output,
+                prefix,
+                self.namespace().as_str(),
+                None,
+                None,
+            )
+            .await?;
         if let Some(jid) = self.from()? {
             xml::attribute_async(output, "from", jid.as_str()).await?;
         }
@@ -646,18 +702,32 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         if let Some(lang) = self.lang()? {
             xml::attribute_async(output, "xml:lang", lang).await?;
         }
-        element::write_attributes_async(self.data.attributes, self.arena, output).await?;
+        element::write_attributes_async(
+            self.data.attributes,
+            self.data.namespaces,
+            prefix,
+            self.arena,
+            output,
+        )
+        .await?;
         if self.data.children.get(self.arena)?.is_empty() {
             output.write_all(b"/>").await?;
             return Ok(());
         }
         output.write_all(b">").await?;
+        let namespace = self.data.namespaces.child_default(
+            prefix,
+            self.namespace().as_str(),
+            None,
+            self.arena,
+        )?;
         for child in self.children()? {
             child?
-                .write_in_async(output, Some(self.namespace().as_str()))
+                .write_in_async(output, namespace, Some(self.data.namespaces))
                 .await?;
         }
         output.write_all(b"</").await?;
+        prefix.write_async(output).await?;
         output.write_all(name.as_bytes()).await?;
         output.write_all(b">").await?;
         Ok(())
@@ -818,6 +888,7 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(Stanza {
             data: self.arena.try_alloc(StanzaData {
                 header: self.header,
+                namespaces: self.namespaces,
                 attributes: self.attributes.finish(),
                 children: self.children.finish(),
             })?,

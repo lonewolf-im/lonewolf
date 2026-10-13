@@ -290,9 +290,15 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                         let mut header_arena =
                             Arena::try_new_in(self.config.arena, self.allocator.clone())
                                 .map_err(BuildError::from)?;
-                        let header =
-                            names::frame(&self.namespaces, start, &mut header_arena, false, "")?
-                                .finish(&mut header_arena, &mut self.text)?;
+                        let header = names::frame(
+                            &self.namespaces,
+                            start,
+                            &mut header_arena,
+                            false,
+                            "",
+                            None,
+                        )?
+                        .finish(&mut header_arena, &mut self.text)?;
                         let Completed::Element(value) = header else {
                             return Err(ParseError::UnexpectedEvent);
                         };
@@ -339,6 +345,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                         current,
                         self.frames.is_empty(),
                         &self.stream_lang,
+                        self.frames.last().map(Frame::namespaces),
                     )?;
                     if empty {
                         self.namespaces.pop();

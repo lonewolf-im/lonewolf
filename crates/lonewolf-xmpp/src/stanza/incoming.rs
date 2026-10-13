@@ -3,6 +3,7 @@
 use lonewolf_util::arena::{Arena, ChunkAllocator, Handle};
 
 use super::element::ElementFrame;
+use super::namespace::NamespaceContext;
 use super::{
     AttributesBuilder, BuildError, Element, Header, IqType, MessageType, PresenceType,
     STANZA_ERROR_NAMESPACE, SliceBuilder, Stanza, StanzaBuilder, StanzaErrorCondition, StanzaKind,
@@ -102,6 +103,7 @@ impl RejectedStanza {
                 id,
                 lang: envelope.lang,
             },
+            namespaces: NamespaceContext::default(),
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::new(),
         }
@@ -119,6 +121,7 @@ pub(crate) struct StanzaFrame {
     id: Option<Handle<str>>,
     lang: Option<Handle<str>>,
     invalid_text: bool,
+    namespaces: NamespaceContext,
     attributes: AttributesBuilder,
     children: SliceBuilder<Element>,
 }
@@ -142,9 +145,24 @@ impl Frame {
             id: None,
             lang: None,
             invalid_text: false,
+            namespaces: NamespaceContext::default(),
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::new(),
         })
+    }
+
+    pub(crate) fn namespaces(&self) -> NamespaceContext {
+        match self {
+            Self::Element(frame) => frame.namespaces(),
+            Self::Stanza(frame) => frame.namespaces,
+        }
+    }
+
+    pub(crate) fn set_namespaces(&mut self, namespaces: NamespaceContext) {
+        match self {
+            Self::Element(frame) => frame.set_namespaces(namespaces),
+            Self::Stanza(frame) => frame.namespaces = namespaces,
+        }
     }
 
     pub(crate) fn attribute<A: ChunkAllocator>(
@@ -246,6 +264,7 @@ impl StanzaFrame {
         let builder = StanzaBuilder {
             arena,
             header,
+            namespaces: self.namespaces,
             attributes: self.attributes,
             children: self.children,
         };

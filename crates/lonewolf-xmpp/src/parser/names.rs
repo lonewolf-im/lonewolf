@@ -7,6 +7,7 @@ use quick_xml::name::{Namespace, NamespaceResolver, PrefixDeclaration, QName, Re
 
 use super::{MAX_ATTRIBUTES_PER_ELEMENT, ParseError};
 use crate::stanza::incoming::Frame;
+use crate::stanza::namespace::NamespaceContext;
 use crate::stanza::{
     CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaKind, StanzaNamespace, XML_NAMESPACE, xml,
 };
@@ -64,6 +65,7 @@ pub(super) fn frame<A: ChunkAllocator>(
     arena: &mut Arena<A>,
     root: bool,
     stream_lang: &str,
+    parent_namespaces: Option<NamespaceContext>,
 ) -> Result<Frame, ParseError> {
     let (name, namespace) = element(resolver, start)?;
     let stanza_namespace = match namespace {
@@ -84,6 +86,27 @@ pub(super) fn frame<A: ChunkAllocator>(
     } else {
         Frame::element(name, namespace, arena)?
     };
+    let mut namespaces = parent_namespaces.unwrap_or_default();
+    if parent_namespaces.is_none() {
+        namespaces.bind("", content_namespace(resolver)?, arena)?;
+        for (prefix, namespace) in resolver.bindings() {
+            if let PrefixDeclaration::Named(prefix) = prefix {
+                namespaces.bind(prefix, namespace.into_inner(), arena)?;
+            }
+        }
+    } else {
+        for attribute in start.attributes() {
+            let attribute = attribute.map_err(quick_xml::Error::from)?;
+            if let Some(prefix) = attribute.key.as_namespace_binding() {
+                let prefix = match prefix {
+                    PrefixDeclaration::Default => "",
+                    PrefixDeclaration::Named(prefix) => prefix,
+                };
+                namespaces.bind(prefix, &normalized(&attribute)?, arena)?;
+            }
+        }
+    }
+    frame.set_namespaces(namespaces);
     let mut has_lang = false;
     for attribute in start.attributes() {
         let attribute = attribute.map_err(quick_xml::Error::from)?;

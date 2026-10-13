@@ -700,8 +700,42 @@ fn stanza_pool_shard_count_matches_worker_count() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
-fn external_only_listener_preserves_scram_bits() -> TestResult {
+fn external_only_listener_requires_client_auth_for_every_host() -> TestResult {
     let file = config_file("[[c2s.listeners]]\nauth_mechanisms = ['EXTERNAL']\n")?;
+    assert!(
+        matches!(Config::load(Some(file.path())), Err(ConfigError::Invalid { reason, .. })
+        if reason == "c2s.listeners[0].auth_mechanisms offers only EXTERNAL, but host \"localhost\" does not configure tls.client_auth")
+    );
+
+    for missing in ["localhost", "example.com"] {
+        let mut contents = String::from(
+            "[xmpp]\ndefault_host = 'localhost'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nauth_mechanisms = ['SCRAM-SHA-256']\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nauth_mechanisms = ['EXTERNAL']\n",
+        );
+        for host in ["localhost", "example.com"] {
+            contents.push_str(&format!("[hosts.'{host}'.tls]\ncertificate_chain_path = 'server.pem'\nprivate_key_path = 'server.key'\n"));
+            if host != missing {
+                contents.push_str(&format!("[hosts.'{host}'.tls.client_auth]\ntrust_anchors_path = 'roots.pem'\ncrls_path = 'crls.pem'\n"));
+            }
+        }
+        let file = config_file(&contents)?;
+        assert!(
+            matches!(Config::load(Some(file.path())), Err(ConfigError::Invalid { reason, .. })
+            if reason == format!("c2s.listeners[1].auth_mechanisms offers only EXTERNAL, but host {missing:?} does not configure tls.client_auth"))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn external_only_listener_accepts_client_auth_for_every_host_and_preserves_scram_bits() -> TestResult
+{
+    let mut contents = String::from(
+        "[xmpp]\ndefault_host = 'localhost'\n[[c2s.listeners]]\nauth_mechanisms = ['EXTERNAL']\n",
+    );
+    for host in ["localhost", "example.com"] {
+        contents.push_str(&format!("[hosts.'{host}'.tls]\ncertificate_chain_path = 'server.pem'\nprivate_key_path = 'server.key'\n[hosts.'{host}'.tls.client_auth]\ntrust_anchors_path = 'roots.pem'\ncrls_path = 'crls.pem'\n"));
+    }
+    let file = config_file(&contents)?;
     let config = Config::load(Some(file.path()))?;
     let mechanisms = config.c2s.listeners[0].auth_mechanisms;
     assert!(mechanisms.allows_external());

@@ -1,15 +1,11 @@
 # Copy this file to lonewolf.toml and uncomment the settings you want to change.
 # The values shown are the defaults unless a comment identifies an example.
 
-# ------------------------------------ Logging --------------------------------------------------
-
 # [logging]
 
 # Choose how much detail Lonewolf writes to standard error.
 # Use "off", "error", "warn", "info", "debug", or "trace".
 # level = "info"
-
-# ------------------------------------ XMPP -----------------------------------------------------
 
 # [xmpp]
 
@@ -21,8 +17,6 @@
 # Choose a power of two of at least 8 MiB. Lonewolf can use additional heap
 # memory when the pool is exhausted.
 # stanza_pool_size_mib = 256
-
-# ------------------------------------ Hosts ----------------------------------------------------
 
 # Add one section for each XMPP domain served by Lonewolf.
 # Defining hosts replaces the built-in host map.
@@ -67,8 +61,6 @@
 # [hosts."example.com".tls.client_auth]
 # trust_anchors_path = "./certs/client-roots.pem"
 # crls_path = "./certs/client-crls.pem"
-
-# ------------------------------------ Limits ---------------------------------------------------
 
 # All numeric limits are positive integers.
 # [limits.c2s]
@@ -134,8 +126,6 @@
 # [limits.c2s.profiles.internal]
 # max_stanza_bytes = 524_288
 
-# ------------------------------------ C2S ------------------------------------------------------
-
 # Add one section per TCP endpoint. These sections replace the default endpoint.
 # Lonewolf requires at least one client endpoint.
 # [[c2s.listeners]]
@@ -149,6 +139,7 @@
 # Choose the SASL mechanisms this endpoint offers and accepts after TLS.
 # Include at least one mechanism.
 # EXTERNAL requires a verified client certificate for the selected host.
+# Listeners that offer only EXTERNAL need client certificate trust configured for every host.
 # auth_mechanisms = ["EXTERNAL", "SCRAM-SHA-256-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-1-PLUS", "SCRAM-SHA-1"]
 
 # Select a named limit profile for this endpoint.
@@ -159,8 +150,6 @@
 # [[c2s.listeners]]
 # address = "127.0.0.1:5223"
 # limits = "internal"
-
-# ------------------------------------ Storage --------------------------------------------------
 
 # [storage]
 
@@ -180,8 +169,6 @@
 # where Lonewolf was launched.
 # path = "./data/lonewolf.dat"
 
-# ------------------------------------ Admin ----------------------------------------------------
-
 # [admin]
 
 # Enable the local HTTP API used to manage accounts.
@@ -193,8 +180,6 @@
 # Lonewolf will not replace an existing file at this path. The parent directory
 # must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
-
-# ------------------------------------ Account --------------------------------------------------
 
 # [account]
 

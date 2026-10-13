@@ -530,7 +530,10 @@ fn authentication_deadline_starts_after_sasl_offer() -> Result<(), Box<dyn Error
         run_starttls_restart_case_with_timeout(PSI_OPEN, Duration::from_millis(50), true)?;
     assert_eq!(outcome, CloseOutcome::AuthenticationTimeout);
     assert!(before_tls.contains(STARTTLS_FEATURES));
-    assert!(after_tls.contains(sasl_features(AuthMechanisms::ALL, false).as_str()));
+    assert!(
+        after_tls
+            .contains(&sasl_features(AuthMechanisms::ALL, false).ok_or("missing SCRAM offer")?)
+    );
     Ok(())
 }
 
@@ -929,12 +932,32 @@ fn panicking_phase_closes_its_socket_before_waiting_for_tracked_work() -> Result
 }
 
 #[test]
-fn external_features_require_connection_candidates_and_precede_scram() {
-    let absent = sasl_features(AuthMechanisms::ALL, false);
+fn external_features_require_connection_candidates_and_precede_scram()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    let absent = sasl_features(AuthMechanisms::ALL, false).ok_or("missing SCRAM offer")?;
     assert!(!absent.contains("EXTERNAL"));
-    let present = sasl_features(AuthMechanisms::ALL, true);
+    let present = sasl_features(AuthMechanisms::ALL, true).ok_or("missing EXTERNAL offer")?;
     assert!(
         present
             .contains("<mechanism>EXTERNAL</mechanism><mechanism>SCRAM-SHA-256-PLUS</mechanism>")
     );
+    Ok(())
+}
+
+#[test]
+fn external_only_features_require_a_usable_certificate() -> Result<(), Box<dyn Error + Send + Sync>>
+{
+    let listener: crate::config::TcpListenerConfig =
+        toml::from_str("auth_mechanisms = ['EXTERNAL']")?;
+    assert!(sasl_features(listener.auth_mechanisms, false).is_none());
+    assert_eq!(
+        sasl_features(listener.auth_mechanisms, true).as_deref(),
+        Some(
+            "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>"
+        )
+    );
+    let empty: crate::config::TcpListenerConfig = toml::from_str("auth_mechanisms = []")?;
+    assert!(sasl_features(empty.auth_mechanisms, false).is_none());
+    assert!(sasl_features(empty.auth_mechanisms, true).is_none());
+    Ok(())
 }

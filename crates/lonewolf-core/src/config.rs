@@ -96,6 +96,20 @@ impl Config {
         self.c2s.validate()?;
         self.limits.validate()?;
         for (index, listener) in self.c2s.listeners.iter().enumerate() {
+            if !listener.auth_mechanisms.has_scram() {
+                for (domain, host) in &self.hosts {
+                    if host
+                        .tls
+                        .as_ref()
+                        .and_then(|tls| tls.client_auth.as_ref())
+                        .is_none()
+                    {
+                        return Err(format!(
+                            "c2s.listeners[{index}].auth_mechanisms offers only EXTERNAL, but host {domain:?} does not configure tls.client_auth"
+                        ));
+                    }
+                }
+            }
             if let Some(profile) = &listener.limits
                 && !self.limits.c2s.profiles.contains_key(profile)
             {
@@ -316,6 +330,10 @@ impl AuthMechanisms {
 
     pub fn has_plus(self) -> bool {
         self.allows(Mechanism::Sha1Plus) || self.allows(Mechanism::Sha256Plus)
+    }
+
+    pub fn has_scram(self) -> bool {
+        self.0 & !Self::EXTERNAL != 0
     }
 
     pub fn is_empty(self) -> bool {

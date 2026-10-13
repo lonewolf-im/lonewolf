@@ -1327,3 +1327,281 @@ fn cancelling_an_incomplete_large_event_does_not_trim_accumulated_text() -> Test
         Ok(())
     })
 }
+
+fn assert_opaque_qname_context(output: &str) -> TestResult {
+    use quick_xml::events::Event;
+    use quick_xml::name::{QName, ResolveResult};
+    let mut reader = quick_xml::NsReader::from_str(output);
+    let mut observed = 0;
+    loop {
+        match reader.read_event()? {
+            Event::Start(start) | Event::Empty(start) => {
+                let (element_namespace, local) = reader.resolver().resolve_element(start.name());
+                let expected = match local.as_ref() {
+                    "payload" => "urn:types",
+                    "inherited" => "urn:ancestor",
+                    "stream-inherited" => "urn:stream-types",
+                    "nested" => "urn:nested",
+                    "collision" => "urn:reserved",
+                    "prefixed" => "urn:default",
+                    "reset" => "",
+                    _ => continue,
+                };
+                let expected_element_namespace = match local.as_ref() {
+                    "prefixed" => "urn:element",
+                    "reset" => "",
+                    _ => "urn:payload",
+                };
+                match element_namespace {
+                    ResolveResult::Bound(namespace) => {
+                        assert_eq!(namespace.as_ref(), expected_element_namespace)
+                    }
+                    ResolveResult::Unbound => assert_eq!(expected_element_namespace, ""),
+                    ResolveResult::Unknown(_) => return Err("unbound element namespace".into()),
+                }
+                let attribute = start
+                    .attributes()
+                    .find_map(|attribute| match attribute {
+                        Ok(attribute)
+                            if attribute.key.as_namespace_binding().is_none()
+                                && attribute.key.local_name().as_ref() == "type" =>
+                        {
+                            Some(Ok(attribute))
+                        }
+                        Err(error) => Some(Err(error)),
+                        _ => None,
+                    })
+                    .ok_or("missing QName attribute")??;
+                let (attribute_namespace, _) = reader.resolver().resolve_attribute(attribute.key);
+                if matches!(local.as_ref(), "payload" | "collision") {
+                    assert!(
+                        matches!(attribute_namespace, ResolveResult::Bound(namespace) if namespace.as_ref() == "http://www.w3.org/2001/XMLSchema-instance")
+                    );
+                } else {
+                    assert!(matches!(attribute_namespace, ResolveResult::Unbound));
+                }
+                let value = attribute.normalized_value(quick_xml::XmlVersion::Explicit1_0)?;
+                let name = QName(value.as_ref());
+                let prefix = name.prefix();
+                let local = name.local_name();
+                assert_eq!(local.as_ref(), "Example");
+                let resolved = reader.resolver().resolve_prefix(prefix, true);
+                let namespace = match resolved {
+                    ResolveResult::Bound(namespace) => namespace.into_inner(),
+                    ResolveResult::Unbound => "",
+                    ResolveResult::Unknown(_) => {
+                        return Err(format!("unbound QName in {output}").into());
+                    }
+                };
+                assert_eq!(namespace, expected, "{output}");
+                observed += 1;
+            }
+            Event::Text(text) if text.as_ref() == "t:Example" => {
+                assert!(
+                    matches!(reader.resolver().resolve_prefix(QName("t:Example").prefix(), true), ResolveResult::Bound(namespace) if namespace.as_ref() == "urn:types")
+                );
+                observed += 1;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    assert_eq!(observed, 8, "{output}");
+    Ok(())
+}
+
+#[test]
+fn opaque_qnames_keep_namespace_context_through_writers_and_copies() -> TestResult {
+    block_on(async {
+        let opening = OPEN.replace('>', " xmlns:w='urn:stream-types'>");
+        let input = format!(
+            "{opening}<message xmlns:a='urn:ancestor'><payload xmlns='urn:payload' xmlns:t='urn:ty&#112;es' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='t:Example'><inherited type='a:Example'/><stream-inherited type='w:Example'/><nested xmlns:a='urn:nested' type='a:Example'/><collision xmlns:ns0='urn:reserved' xsi:type='ns0:Example'/><textual>t:Example</textual><p:prefixed xmlns:p='urn:element' xmlns='urn:default' type='Example'/><reset xmlns='' type='Example'/></payload><discard xmlns='urn:discard'/></message>"
+        );
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let (original, mut arena) = stanza(&mut parser).await?.into_parts();
+        let mut output = String::new();
+        original.resolve(&arena)?.write_xml(&mut output)?;
+        assert_opaque_qname_context(&output)?;
+        let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
+        original
+            .resolve(&arena)?
+            .write_xml_async(&mut asynchronous)
+            .await?;
+        assert_opaque_qname_context(std::str::from_utf8(asynchronous.get_ref())?)?;
+        let mut copied_arena = Arena::try_new(ArenaConfig::default())?;
+        let copied = original.resolve(&arena)?.clone_in(&mut copied_arena)?;
+        let filtered = original
+            .resolve(&arena)?
+            .to_builder_in_filtered(&mut copied_arena, |child| {
+                Ok(child.namespace() != "urn:discard")
+            })?
+            .build()?;
+        let derived = original.derive_in(&mut arena)?.build()?;
+        let error = original
+            .error_reply_in(&mut arena, StanzaErrorCondition::ServiceUnavailable)?
+            .build()?;
+        for stanza in [derived, error] {
+            output.clear();
+            stanza.resolve(&arena)?.write_xml(&mut output)?;
+            assert_opaque_qname_context(&output)?;
+        }
+        output.clear();
+        copied.resolve(&copied_arena)?.write_xml(&mut output)?;
+        assert_opaque_qname_context(&output)?;
+        output.clear();
+        filtered.resolve(&copied_arena)?.write_xml(&mut output)?;
+        assert_opaque_qname_context(&output)?;
+        assert!(
+            filtered
+                .resolve(&copied_arena)?
+                .child("discard", "urn:discard")?
+                .is_none()
+        );
+        let payload = original
+            .resolve(&arena)?
+            .child("payload", "urn:payload")?
+            .ok_or("payload")?
+            .handle();
+        let detached = payload.resolve(&arena)?.clone_in(&mut copied_arena)?;
+        let detached_derived = payload.derive_in(&mut arena)?.build()?;
+        output.clear();
+        detached_derived.resolve(&arena)?.write_xml(&mut output)?;
+        assert_opaque_qname_context(&output)?;
+        drop(arena);
+        output.clear();
+        detached.resolve(&copied_arena)?.write_xml(&mut output)?;
+        assert_opaque_qname_context(&output)?;
+        asynchronous.get_mut().clear();
+        detached
+            .resolve(&copied_arena)?
+            .write_xml_async(&mut asynchronous)
+            .await?;
+        assert_opaque_qname_context(std::str::from_utf8(asynchronous.get_ref())?)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn derived_attributes_generate_prefixes_without_changing_opaque_values() -> TestResult {
+    block_on(async {
+        let input = format!(
+            "{OPEN}<message><p:payload xmlns:p='urn:element' xmlns='urn:default' xmlns:ns0='urn:types' type='ns0:Example'/></message>"
+        );
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let (original, mut arena) = stanza(&mut parser).await?.into_parts();
+        let payload = original
+            .resolve(&arena)?
+            .child("payload", "urn:element")?
+            .ok_or("payload")?
+            .handle();
+        let derived = payload
+            .derive_in(&mut arena)?
+            .attribute("flag", "urn:new", "<&\"\t")?
+            .attribute("other", "urn:other", "kept")?
+            .build()?;
+        let mut synchronous = String::new();
+        derived.resolve(&arena)?.write_xml(&mut synchronous)?;
+        let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
+        derived
+            .resolve(&arena)?
+            .write_xml_async(&mut asynchronous)
+            .await?;
+        for output in [
+            synchronous.as_str(),
+            std::str::from_utf8(asynchronous.get_ref())?,
+        ] {
+            let mut reader = quick_xml::NsReader::from_str(output);
+            let quick_xml::events::Event::Empty(start) = reader.read_event()? else {
+                return Err("expected payload".into());
+            };
+            assert!(
+                matches!(reader.resolver().resolve_prefix(quick_xml::name::QName("ns0:Example").prefix(), true), quick_xml::name::ResolveResult::Bound(namespace) if namespace.as_ref() == "urn:types")
+            );
+            assert!(
+                matches!(reader.resolver().resolve_element(start.name()), (quick_xml::name::ResolveResult::Bound(namespace), local) if namespace.as_ref() == "urn:element" && local.as_ref() == "payload")
+            );
+            assert_eq!(
+                start
+                    .try_get_attribute("type")?
+                    .ok_or("type")?
+                    .value
+                    .as_ref(),
+                "ns0:Example"
+            );
+            assert!(
+                matches!(reader.resolver().resolve_prefix(None, true), quick_xml::name::ResolveResult::Bound(namespace) if namespace.as_ref() == "urn:default")
+            );
+            let mut checked = 0;
+            for attribute in start.attributes() {
+                let attribute = attribute?;
+                let (namespace, local) = reader.resolver().resolve_attribute(attribute.key);
+                let expected = match local.as_ref() {
+                    "flag" => Some(("urn:new", "<&\"\t")),
+                    "other" => Some(("urn:other", "kept")),
+                    _ => None,
+                };
+                if let Some((expected_namespace, expected_value)) = expected {
+                    assert!(
+                        matches!(namespace, quick_xml::name::ResolveResult::Bound(namespace) if namespace.as_ref() == expected_namespace)
+                    );
+                    assert_eq!(
+                        attribute.normalized_value(quick_xml::XmlVersion::Explicit1_0)?,
+                        expected_value
+                    );
+                    checked += 1;
+                }
+            }
+            assert_eq!(checked, 2);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn prefixed_stanza_keeps_a_different_default_namespace() -> TestResult {
+    block_on(async {
+        let input = format!(
+            "{OPEN}<c:message xmlns:c='jabber:client' xmlns='urn:types' value='Example'><c:body>kept</c:body></c:message>"
+        );
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let parsed = stanza(&mut parser).await?;
+        let mut synchronous = String::new();
+        parsed
+            .value()
+            .resolve(parsed.arena())?
+            .write_xml(&mut synchronous)?;
+        let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
+        parsed
+            .value()
+            .resolve(parsed.arena())?
+            .write_xml_async(&mut asynchronous)
+            .await?;
+        for output in [
+            synchronous.as_str(),
+            std::str::from_utf8(asynchronous.get_ref())?,
+        ] {
+            let mut reader = quick_xml::NsReader::from_str(output);
+            let quick_xml::events::Event::Start(start) = reader.read_event()? else {
+                return Err("expected stanza".into());
+            };
+            assert!(
+                matches!(reader.resolver().resolve_element(start.name()), (quick_xml::name::ResolveResult::Bound(namespace), local) if namespace.as_ref() == CLIENT_NAMESPACE && local.as_ref() == "message")
+            );
+            assert!(
+                matches!(reader.resolver().resolve_prefix(None, true), quick_xml::name::ResolveResult::Bound(namespace) if namespace.as_ref() == "urn:types")
+            );
+            assert_eq!(
+                start
+                    .try_get_attribute("value")?
+                    .ok_or("value")?
+                    .value
+                    .as_ref(),
+                "Example"
+            );
+        }
+        Ok(())
+    })
+}

@@ -33,6 +33,7 @@ pub struct Element {
     pub name: String,
     pub namespace: String,
     attributes: BTreeMap<String, String>,
+    namespace_bindings: BTreeMap<String, String>,
     pub children: Vec<Element>,
     pub text: String,
 }
@@ -55,7 +56,19 @@ impl Element {
                     .into_owned(),
             );
         }
+        let namespace_bindings = reader
+            .resolver()
+            .bindings()
+            .map(|(prefix, namespace)| {
+                let prefix = match prefix {
+                    quick_xml::name::PrefixDeclaration::Default => "",
+                    quick_xml::name::PrefixDeclaration::Named(prefix) => prefix,
+                };
+                (prefix.into(), namespace.into_inner().into())
+            })
+            .collect();
         Ok(Self {
+            namespace_bindings,
             name: name.as_ref().into(),
             namespace,
             attributes,
@@ -102,6 +115,34 @@ impl Element {
 
     pub fn attribute(&self, name: &str) -> Option<&str> {
         self.attributes.get(name).map(String::as_str)
+    }
+
+    pub fn resolve_qname<'a>(&'a self, value: &'a str) -> TestResult<(&'a str, &'a str)> {
+        let (prefix, local) = value.split_once(':').unwrap_or(("", value));
+        let namespace = if prefix == "xml" {
+            "http://www.w3.org/XML/1998/namespace"
+        } else {
+            match self.namespace_bindings.get(prefix) {
+                Some(namespace) => namespace.as_str(),
+                None if prefix.is_empty() => "",
+                None => return Err(format!("unbound QName prefix {prefix}").into()),
+            }
+        };
+        Ok((namespace, local))
+    }
+
+    pub fn attribute_in(&self, name: &str, namespace: &str) -> TestResult<Option<&str>> {
+        for (key, value) in self.content_attributes() {
+            let (actual_namespace, actual_name) = if key.contains(':') {
+                self.resolve_qname(key)?
+            } else {
+                ("", key.as_str())
+            };
+            if actual_namespace == namespace && actual_name == name {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     pub fn child(&self, namespace: &str, name: &str) -> TestResult<&Self> {

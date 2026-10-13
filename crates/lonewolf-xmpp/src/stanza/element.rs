@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Preserves mixed-content order and namespace URIs in immutable element trees.
-
 use std::fmt;
 
 use futures_util::io::{AsyncWrite, AsyncWriteExt};
 use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator, Handle, HandleError};
 use smallvec::SmallVec;
 
+use super::namespace::{NamespaceContext, NamespaceCopies, Prefix};
 use super::storage::{SliceBuilder, StoredSlice};
-use super::{
-    AsyncWriteError, BuildError, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, STREAM_NAMESPACE,
-    WriteError, xml,
-};
+use super::{AsyncWriteError, BuildError, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, WriteError, xml};
 
 #[derive(Clone, Copy)]
 struct Name {
@@ -83,6 +79,7 @@ pub enum NodeRef<'a, R: ArenaRead> {
 #[derive(Clone, Copy)]
 struct ElementData {
     name: Name,
+    namespaces: NamespaceContext,
     attributes: StoredSlice<Attribute>,
     children: StoredSlice<Node>,
     depth: usize,
@@ -106,6 +103,7 @@ pub struct ElementRef<'a, R: ArenaRead> {
 struct WriteFrame<'a> {
     element: Element,
     namespace: Option<&'a str>,
+    namespaces: NamespaceContext,
     next_child: usize,
 }
 
@@ -115,12 +113,14 @@ struct WriteFrame<'a> {
 pub struct ElementBuilder<'a, A: ChunkAllocator> {
     arena: &'a mut Arena<A>,
     name: Name,
+    pub(super) namespaces: NamespaceContext,
     attributes: AttributesBuilder,
     children: SliceBuilder<Node>,
 }
 
 pub(crate) struct ElementFrame {
     name: Name,
+    pub(super) namespaces: NamespaceContext,
     attributes: AttributesBuilder,
     children: SliceBuilder<Node>,
 }
@@ -133,9 +133,18 @@ impl ElementFrame {
     ) -> Result<Self, BuildError> {
         Ok(Self {
             name: Name::new(name, namespace, false, arena)?,
+            namespaces: NamespaceContext::default(),
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::new(),
         })
+    }
+
+    pub(crate) fn namespaces(&self) -> NamespaceContext {
+        self.namespaces
+    }
+
+    pub(crate) fn set_namespaces(&mut self, namespaces: NamespaceContext) {
+        self.namespaces = namespaces;
     }
 
     pub(super) fn attribute<A: ChunkAllocator>(
@@ -176,6 +185,7 @@ impl ElementFrame {
         ElementBuilder {
             arena,
             name: self.name,
+            namespaces: self.namespaces,
             attributes: self.attributes,
             children: self.children,
         }
@@ -201,6 +211,7 @@ impl Element {
         Ok(ElementBuilder {
             arena,
             name,
+            namespaces: NamespaceContext::default(),
             attributes: AttributesBuilder::new(),
             children: SliceBuilder::new(),
         })
@@ -238,6 +249,7 @@ impl Element {
         Ok(ElementBuilder {
             arena,
             name: data.name,
+            namespaces: data.namespaces,
             attributes: AttributesBuilder::from_slice(data.attributes),
             children: SliceBuilder::from_slice(data.children),
         })
@@ -326,12 +338,31 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         &self,
         arena: &'b mut Arena<A>,
     ) -> Result<ElementBuilder<'b, A>, BuildError> {
+        self.to_builder_with_namespaces(arena, &mut NamespaceCopies::default())
+    }
+
+    pub(super) fn clone_with_namespaces<A: ChunkAllocator>(
+        &self,
+        arena: &mut Arena<A>,
+        copies: &mut NamespaceCopies,
+    ) -> Result<Element, BuildError> {
+        self.to_builder_with_namespaces(arena, copies)?.build()
+    }
+
+    fn to_builder_with_namespaces<'b, A: ChunkAllocator>(
+        &self,
+        arena: &'b mut Arena<A>,
+        copies: &mut NamespaceCopies,
+    ) -> Result<ElementBuilder<'b, A>, BuildError> {
+        let namespaces = self.data.namespaces.clone_in(self.arena, arena, copies)?;
         let name = Name::new(self.name, self.namespace, false, arena)?;
         let attributes = AttributesBuilder::copy_from(self.data.attributes, self.arena, arena)?;
         let mut children = SliceBuilder::new();
         for node in self.children()? {
             let node = match node? {
-                NodeRef::Element(element) => Node::Element(element.clone_in(arena)?),
+                NodeRef::Element(element) => {
+                    Node::Element(element.clone_with_namespaces(arena, copies)?)
+                }
                 NodeRef::Text(text) => Node::Text(arena.try_alloc_str(text)?),
             };
             children.push(node, arena)?;
@@ -339,6 +370,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         Ok(ElementBuilder {
             arena,
             name,
+            namespaces,
             attributes,
             children,
         })
@@ -352,7 +384,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
     /// [`WriteError::Output`] if the destination rejects a write. Either error
     /// can leave partial XML in `output`.
     pub fn write_xml(&self, output: &mut impl fmt::Write) -> Result<(), WriteError> {
-        self.write_in(output, None)
+        self.write_in(output, None, None)
     }
 
     /// Writes XML without flushing the destination.
@@ -364,7 +396,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         &self,
         output: &mut W,
     ) -> Result<(), AsyncWriteError> {
-        self.write_in_async(output, None).await
+        self.write_in_async(output, None, None).await
     }
 
     pub(super) fn size(&self) -> (usize, usize) {
@@ -375,36 +407,52 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         &self,
         output: &mut impl fmt::Write,
         parent_namespace: Option<&str>,
+        parent_context: Option<NamespaceContext>,
     ) -> Result<(), WriteError> {
-        let prefix = namespace_prefix(self.namespace);
+        let prefix = self
+            .data
+            .namespaces
+            .element_prefix(self.namespace, self.arena)?;
         output.write_char('<')?;
-        output.write_str(prefix)?;
+        prefix.write(output)?;
         output.write_str(self.name)?;
-        if prefix.is_empty() && Some(self.namespace) != parent_namespace {
-            xml::attribute(output, "xmlns", self.namespace)?;
-        } else if self.namespace == STREAM_NAMESPACE {
-            xml::attribute(output, "xmlns:stream", STREAM_NAMESPACE)?;
-        }
-        write_attributes(self.data.attributes, self.arena, output)?;
+        self.data.namespaces.write(
+            self.arena,
+            output,
+            prefix,
+            self.namespace,
+            parent_namespace,
+            parent_context,
+        )?;
+        write_attributes(
+            self.data.attributes,
+            self.data.namespaces,
+            prefix,
+            self.arena,
+            output,
+        )?;
         let children = self.data.children.get(self.arena)?;
         if children.is_empty() {
             output.write_str("/>")?;
             return Ok(());
         }
         output.write_char('>')?;
-        let namespace = if prefix.is_empty() {
-            Some(self.namespace)
-        } else {
-            parent_namespace
-        };
+        let namespace = self.data.namespaces.child_default(
+            prefix,
+            self.namespace,
+            parent_namespace,
+            self.arena,
+        )?;
         for child in self.children()? {
             match child? {
-                NodeRef::Element(element) => element.write_in(output, namespace)?,
+                NodeRef::Element(element) => {
+                    element.write_in(output, namespace, Some(self.data.namespaces))?
+                }
                 NodeRef::Text(text) => xml::escape(output, text, false)?,
             }
         }
         output.write_str("</")?;
-        output.write_str(prefix)?;
+        prefix.write(output)?;
         output.write_str(self.name)?;
         output.write_char('>')?;
         Ok(())
@@ -414,14 +462,17 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         &self,
         output: &mut W,
         parent_namespace: Option<&'a str>,
+        parent_context: Option<NamespaceContext>,
     ) -> Result<(), AsyncWriteError> {
         let mut frames = SmallVec::<[WriteFrame<'a>; 8]>::new();
         let root = self.handle.resolve(self.arena)?;
-        let (has_children, namespace) = write_start_async(&root, output, parent_namespace).await?;
+        let (has_children, namespace) =
+            write_start_async(&root, output, parent_namespace, parent_context).await?;
         if has_children {
             frames.push(WriteFrame {
                 element: self.handle,
                 namespace,
+                namespaces: root.data.namespaces,
                 next_child: 0,
             });
         }
@@ -435,11 +486,13 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
                     Node::Element(child) => {
                         let view = child.resolve(self.arena)?;
                         let (has_children, child_namespace) =
-                            write_start_async(&view, output, namespace).await?;
+                            write_start_async(&view, output, namespace, Some(frame.namespaces))
+                                .await?;
                         if has_children {
                             frames.push(WriteFrame {
                                 element: *child,
                                 namespace: child_namespace,
+                                namespaces: view.data.namespaces,
                                 next_child: 0,
                             });
                         }
@@ -457,39 +510,50 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
     }
 }
 
-fn namespace_prefix(namespace: &str) -> &'static str {
-    match namespace {
-        xml::XML_NAMESPACE => "xml:",
-        STREAM_NAMESPACE => "stream:",
-        _ => "",
-    }
-}
-
 async fn write_start_async<'a, R: ArenaRead, W: AsyncWrite + Unpin>(
     element: &ElementRef<'a, R>,
     output: &mut W,
     parent_namespace: Option<&'a str>,
+    parent_context: Option<NamespaceContext>,
 ) -> Result<(bool, Option<&'a str>), AsyncWriteError> {
-    let prefix = namespace_prefix(element.namespace);
+    let prefix = element
+        .data
+        .namespaces
+        .element_prefix(element.namespace, element.arena)?;
     output.write_all(b"<").await?;
-    output.write_all(prefix.as_bytes()).await?;
+    prefix.write_async(output).await?;
     output.write_all(element.name.as_bytes()).await?;
-    if prefix.is_empty() && Some(element.namespace) != parent_namespace {
-        xml::attribute_async(output, "xmlns", element.namespace).await?;
-    } else if element.namespace == STREAM_NAMESPACE {
-        xml::attribute_async(output, "xmlns:stream", STREAM_NAMESPACE).await?;
-    }
-    write_attributes_async(element.data.attributes, element.arena, output).await?;
+    element
+        .data
+        .namespaces
+        .write_async(
+            element.arena,
+            output,
+            prefix,
+            element.namespace,
+            parent_namespace,
+            parent_context,
+        )
+        .await?;
+    write_attributes_async(
+        element.data.attributes,
+        element.data.namespaces,
+        prefix,
+        element.arena,
+        output,
+    )
+    .await?;
     if element.data.children.get(element.arena)?.is_empty() {
         output.write_all(b"/>").await?;
         return Ok((false, None));
     }
     output.write_all(b">").await?;
-    let namespace = if prefix.is_empty() {
-        Some(element.namespace)
-    } else {
-        parent_namespace
-    };
+    let namespace = element.data.namespaces.child_default(
+        prefix,
+        element.namespace,
+        parent_namespace,
+        element.arena,
+    )?;
     Ok((true, namespace))
 }
 
@@ -498,8 +562,11 @@ async fn write_end_async<R: ArenaRead, W: AsyncWrite + Unpin>(
     output: &mut W,
 ) -> Result<(), AsyncWriteError> {
     output.write_all(b"</").await?;
-    output
-        .write_all(namespace_prefix(element.namespace).as_bytes())
+    element
+        .data
+        .namespaces
+        .element_prefix(element.namespace, element.arena)?
+        .write_async(output)
         .await?;
     output.write_all(element.name.as_bytes()).await?;
     output.write_all(b">").await?;
@@ -606,6 +673,7 @@ impl<A: ChunkAllocator> ElementBuilder<'_, A> {
         Ok(Element {
             data: self.arena.try_alloc(ElementData {
                 name: self.name,
+                namespaces: self.namespaces,
                 attributes: self.attributes.finish(),
                 children: self.children.finish(),
                 depth,
@@ -716,60 +784,62 @@ pub(super) fn attributes<'a>(
 
 pub(super) fn write_attributes(
     values: StoredSlice<Attribute>,
+    namespaces: NamespaceContext,
+    element_prefix: Prefix<'_>,
     arena: &impl ArenaRead,
     output: &mut impl fmt::Write,
 ) -> Result<(), WriteError> {
+    let mut generated = match element_prefix {
+        Prefix::Generated(index) => index + 1,
+        _ => 0,
+    };
     for (index, value) in attributes(values, arena)?.enumerate() {
         let value = value?;
-        match value.namespace {
-            "" => xml::attribute(output, value.name, value.value)?,
-            xml::XML_NAMESPACE => {
-                write!(output, " xml:{}=\"", value.name)?;
-                xml::escape(output, value.value, true)?;
-                output.write_char('"')?;
-            }
-            namespace => {
-                write!(output, " xmlns:ns{index}=\"")?;
-                xml::escape(output, namespace, true)?;
-                write!(output, "\" ns{index}:{}=\"", value.name)?;
-                xml::escape(output, value.value, true)?;
-                output.write_char('"')?;
-            }
+        generated = generated.max(index);
+        let prefix = namespaces.attribute_prefix(value.namespace, &mut generated, arena)?;
+        if let Prefix::Generated(index) = prefix {
+            write!(output, " xmlns:ns{index}=\"")?;
+            xml::escape(output, value.namespace, true)?;
+            output.write_char('"')?;
         }
+        output.write_char(' ')?;
+        prefix.write(output)?;
+        output.write_str(value.name)?;
+        output.write_str("=\"")?;
+        xml::escape(output, value.value, true)?;
+        output.write_char('"')?;
     }
     Ok(())
 }
 
 pub(super) async fn write_attributes_async<W: AsyncWrite + Unpin>(
     values: StoredSlice<Attribute>,
+    namespaces: NamespaceContext,
+    element_prefix: Prefix<'_>,
     arena: &impl ArenaRead,
     output: &mut W,
 ) -> Result<(), AsyncWriteError> {
+    let mut generated = match element_prefix {
+        Prefix::Generated(index) => index + 1,
+        _ => 0,
+    };
     for (index, value) in attributes(values, arena)?.enumerate() {
         let value = value?;
-        match value.namespace {
-            "" => xml::attribute_async(output, value.name, value.value).await?,
-            xml::XML_NAMESPACE => {
-                output.write_all(b" xml:").await?;
-                output.write_all(value.name.as_bytes()).await?;
-                output.write_all(b"=\"").await?;
-                xml::escape_async(output, value.value, true).await?;
-                output.write_all(b"\"").await?;
-            }
-            namespace => {
-                output.write_all(b" xmlns:ns").await?;
-                xml::number_async(output, index).await?;
-                output.write_all(b"=\"").await?;
-                xml::escape_async(output, namespace, true).await?;
-                output.write_all(b"\" ns").await?;
-                xml::number_async(output, index).await?;
-                output.write_all(b":").await?;
-                output.write_all(value.name.as_bytes()).await?;
-                output.write_all(b"=\"").await?;
-                xml::escape_async(output, value.value, true).await?;
-                output.write_all(b"\"").await?;
-            }
+        generated = generated.max(index);
+        let prefix = namespaces.attribute_prefix(value.namespace, &mut generated, arena)?;
+        if let Prefix::Generated(index) = prefix {
+            output.write_all(b" xmlns:ns").await?;
+            xml::number_async(output, index).await?;
+            output.write_all(b"=\"").await?;
+            xml::escape_async(output, value.namespace, true).await?;
+            output.write_all(b"\"").await?;
         }
+        output.write_all(b" ").await?;
+        prefix.write_async(output).await?;
+        output.write_all(value.name.as_bytes()).await?;
+        output.write_all(b"=\"").await?;
+        xml::escape_async(output, value.value, true).await?;
+        output.write_all(b"\"").await?;
     }
     Ok(())
 }

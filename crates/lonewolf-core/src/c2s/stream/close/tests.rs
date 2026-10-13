@@ -175,6 +175,184 @@ fn interrupted_stanza_serialization_never_appends_or_flushes_a_footer() -> TestR
 }
 
 #[test]
+fn blocked_phase_writes_cancel_before_timeout_close_discards_application_buffering() -> TestResult {
+    use futures_util::FutureExt as _;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
+    Runtime::new()?.block_on(async {
+        let stanza = format!("<message><body>{}</body></message>", "x".repeat(8192));
+        for outcome in [
+            CloseOutcome::EstablishmentTimeout,
+            CloseOutcome::AuthenticationTimeout,
+            CloseOutcome::BindingTimeout,
+        ] {
+            let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+            let _peer = StdTcpStream::connect(listener.local_addr()?)?;
+            let (socket, _) = listener.accept().await?;
+            let bytes = Rc::new(RefCell::new(Vec::new()));
+            let allowance = Rc::new(Cell::new(usize::MAX));
+            let mut writer = Writer::new(
+                PartialWriter {
+                    bytes: Rc::clone(&bytes),
+                    allowance: Rc::clone(&allowance),
+                },
+                "localhost".into(),
+            );
+            writer
+                .send_header(&header())
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            allowance.set(64);
+            let deadline = Instant::now() + Duration::from_millis(20);
+            assert_eq!(
+                crate::c2s::stream::run_phase(Some(deadline), outcome, writer.send(&stanza)).await,
+                Err(outcome)
+            );
+            assert!(!writer.is_intact());
+            let accepted = bytes.borrow().len();
+            allowance.set(usize::MAX);
+            let context = CloseContext {
+                socket,
+                shutdown: std::future::pending::<Instant>().boxed_local().shared(),
+                phase_deadline: Some(deadline),
+            };
+            let mut input = reader(HEADER.into())?;
+            assert_eq!(
+                finish_plain(&mut input, &mut writer, outcome.into(), &context).await,
+                outcome
+            );
+            assert_eq!(bytes.borrow().len(), accepted);
+            assert!(!String::from_utf8_lossy(&bytes.borrow()).contains("</stream:stream>"));
+            assert!(!String::from_utf8_lossy(&bytes.borrow()).contains("policy-violation"));
+            listener.close().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed() -> TestResult {
+    use futures_util::FutureExt as _;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
+    Runtime::new()?.block_on(async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let _peer = StdTcpStream::connect(listener.local_addr()?)?;
+        let (socket, _) = listener.accept().await?;
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let allowance = Rc::new(Cell::new(usize::MAX));
+        let mut writer = Writer::new(
+            PartialWriter {
+                bytes: Rc::clone(&bytes),
+                allowance: Rc::clone(&allowance),
+            },
+            "localhost".into(),
+        );
+        writer
+            .send_header(&header())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        let header_bytes = bytes.borrow().len();
+        allowance.set(1);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert_eq!(
+            crate::c2s::stream::run_phase(
+                Some(deadline),
+                CloseOutcome::EstablishmentTimeout,
+                writer.send(crate::c2s::stream::establish::STARTTLS_PROCEED)
+            )
+            .await,
+            Err(CloseOutcome::EstablishmentTimeout)
+        );
+        assert_eq!(bytes.borrow().len(), header_bytes + 1);
+        let accepted = bytes.borrow().len();
+        allowance.set(usize::MAX);
+        let context = CloseContext {
+            socket,
+            shutdown: std::future::pending::<Instant>().boxed_local().shared(),
+            phase_deadline: Some(deadline),
+        };
+        let mut input = reader(format!("{HEADER}</stream:stream>"))?;
+        assert_eq!(
+            finish_plain(
+                &mut input,
+                &mut writer,
+                CloseOutcome::EstablishmentTimeout.into(),
+                &context
+            )
+            .await,
+            CloseOutcome::EstablishmentTimeout
+        );
+        drop(writer);
+        {
+            let output = bytes.borrow();
+            assert_eq!(output.len(), accepted);
+            assert!(!String::from_utf8_lossy(&output).contains("policy-violation"));
+            assert!(!String::from_utf8_lossy(&output).contains("</stream:stream>"));
+        }
+        listener.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn phase_timeouts_survive_every_secondary_close_failure() {
+    for outcome in [
+        CloseOutcome::EstablishmentTimeout,
+        CloseOutcome::AuthenticationTimeout,
+        CloseOutcome::BindingTimeout,
+    ] {
+        for failure in [
+            CloseOutcome::TransportError,
+            CloseOutcome::InternalError,
+            CloseOutcome::SystemShutdown,
+        ] {
+            assert_eq!(completed(Ok(Err(failure)), outcome, "test"), outcome);
+        }
+        assert_eq!(completed(Err(()), outcome, "test"), outcome);
+    }
+    assert_eq!(
+        completed(
+            Ok(Err(CloseOutcome::TransportError)),
+            CloseOutcome::InvalidXml,
+            "test"
+        ),
+        CloseOutcome::TransportError
+    );
+}
+
+#[test]
+fn timeout_grace_is_anchored_to_the_original_phase_deadline() -> TestResult {
+    use futures_util::FutureExt as _;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
+    Runtime::new()?.block_on(async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let _peer = StdTcpStream::connect(listener.local_addr()?)?;
+        let (socket, _) = listener.accept().await?;
+        let expired = Instant::now() - Duration::from_secs(1);
+        let mut context = CloseContext {
+            socket,
+            shutdown: std::future::pending::<Instant>().boxed_local().shared(),
+            phase_deadline: Some(expired),
+        };
+        for outcome in [
+            CloseOutcome::EstablishmentTimeout,
+            CloseOutcome::AuthenticationTimeout,
+            CloseOutcome::BindingTimeout,
+        ] {
+            assert_eq!(context.deadline_for(outcome), expired + CLOSE_TIMEOUT);
+        }
+        assert_eq!(context.deadline_for(CloseOutcome::InternalError), expired);
+        context.phase_deadline = None;
+        let started = Instant::now();
+        let fallback = context.deadline_for(CloseOutcome::BindingTimeout);
+        assert!(fallback >= started + CLOSE_TIMEOUT);
+        assert!(fallback <= Instant::now() + CLOSE_TIMEOUT);
+        context.abort();
+        listener.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn shutdown_shortens_a_close_already_waiting_on_its_original_deadline() -> TestResult {
     use futures_util::FutureExt as _;
     use std::io::Read as _;
@@ -230,12 +408,12 @@ fn elapsed_close_budgets_preserve_the_phase_timeout_without_polling_network_work
             let context = CloseContext {
                 socket,
                 shutdown,
-                phase_deadline: None,
+                phase_deadline: Some(expired - CLOSE_TIMEOUT),
             };
             let deadline = if expired_shutdown {
                 expired + Duration::from_secs(1)
             } else {
-                expired
+                context.deadline_for(CloseOutcome::AuthenticationTimeout)
             };
             let polled = Cell::new(false);
             let result = context
@@ -245,7 +423,7 @@ fn elapsed_close_budgets_preserve_the_phase_timeout_without_polling_network_work
                 })
                 .await;
             assert_eq!(
-                completed(result, CloseOutcome::AuthenticationTimeout),
+                completed(result, CloseOutcome::AuthenticationTimeout, "test"),
                 CloseOutcome::AuthenticationTimeout
             );
             assert!(!polled.get());
@@ -289,7 +467,7 @@ fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestRes
         compio::time::sleep(Duration::from_millis(30)).await;
         ready.set(true);
         assert_eq!(
-            completed(close.await, CloseOutcome::AuthenticationTimeout),
+            completed(close.await, CloseOutcome::AuthenticationTimeout, "test"),
             CloseOutcome::AuthenticationTimeout
         );
         assert_eq!(polls.get(), 1);

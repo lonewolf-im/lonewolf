@@ -225,7 +225,9 @@ async fn phase_socket_pair() -> io::Result<(TcpStream, StdTcpStream)> {
 }
 
 #[test]
-fn elapsed_and_overflowed_phase_deadlines_close_without_polling() -> io::Result<()> {
+fn elapsed_and_overflowed_phase_deadlines_leave_transport_with_the_close_owner() -> io::Result<()> {
+    use compio::io::AsyncReadExt as _;
+
     Runtime::new()?.block_on(async {
         for outcome in [
             CloseOutcome::EstablishmentTimeout,
@@ -236,16 +238,19 @@ fn elapsed_and_overflowed_phase_deadlines_close_without_polling() -> io::Result<
                 Some(Instant::now()),
                 Instant::now().checked_add(Duration::MAX),
             ] {
-                let (socket, mut peer) = phase_socket_pair().await?;
+                let (mut socket, mut peer) = phase_socket_pair().await?;
                 let polled = Cell::new(false);
-                let result = run_phase(&socket, deadline, outcome, async {
+                let result = run_phase(deadline, outcome, async {
                     polled.set(true);
                     Ok(())
                 })
                 .await;
                 assert_eq!(result, Err(outcome));
                 assert!(!polled.get());
-                assert_eq!(peer.read(&mut [0; 1])?, 0);
+                peer.write_all(&[42])?;
+                let compio::BufResult(received, byte) = socket.read_exact([0; 1]).await;
+                received?;
+                assert_eq!(byte, [42]);
             }
         }
         Ok(())
@@ -254,18 +259,19 @@ fn elapsed_and_overflowed_phase_deadlines_close_without_polling() -> io::Result<
 
 #[test]
 fn phase_work_ready_after_expiry_is_not_polled_again() -> io::Result<()> {
+    use compio::io::AsyncReadExt as _;
+
     Runtime::new()?.block_on(async {
         for outcome in [
             CloseOutcome::EstablishmentTimeout,
             CloseOutcome::AuthenticationTimeout,
             CloseOutcome::BindingTimeout,
         ] {
-            let (socket, mut peer) = phase_socket_pair().await?;
+            let (mut socket, mut peer) = phase_socket_pair().await?;
             let deadline = Instant::now() + Duration::from_millis(20);
             let ready = Cell::new(false);
             let polls = Cell::new(0);
             let mut phase = std::pin::pin!(run_phase(
-                &socket,
                 Some(deadline),
                 outcome,
                 std::future::poll_fn(|_| {
@@ -285,7 +291,10 @@ fn phase_work_ready_after_expiry_is_not_polled_again() -> io::Result<()> {
             ready.set(true);
             assert_eq!(phase.await, Err(outcome));
             assert_eq!(polls.get(), 1);
-            assert_eq!(peer.read(&mut [0; 1])?, 0);
+            peer.write_all(&[42])?;
+            let compio::BufResult(received, byte) = socket.read_exact([0; 1]).await;
+            received?;
+            assert_eq!(byte, [42]);
         }
         Ok(())
     })
@@ -301,7 +310,6 @@ fn timely_phase_results_keep_the_socket_open() -> io::Result<()> {
             let deadline = Instant::now() + TIMEOUT;
             assert_eq!(
                 run_phase(
-                    &socket,
                     Some(deadline),
                     CloseOutcome::BindingTimeout,
                     std::future::ready(result)
@@ -375,12 +383,9 @@ fn run_starttls_restart_case_with_timeout(
                 tls.write_all(restart_open.as_bytes())?;
                 let mut after_tls = if restart_open == PSI_OPEN {
                     let features = read_through(&mut tls, b"</stream:features>")?;
-                    if wait_for_timeout {
-                        let mut buffer = [0; 256];
-                        while tls.sock.read(&mut buffer)? != 0 {}
-                        return Ok((before_tls, String::from_utf8(features)?));
+                    if !wait_for_timeout {
+                        tls.write_all(CLOSE.as_bytes())?;
                     }
-                    tls.write_all(CLOSE.as_bytes())?;
                     String::from_utf8(features)?
                 } else {
                     String::new()
@@ -389,7 +394,7 @@ fn run_starttls_restart_case_with_timeout(
                     &mut tls,
                     CLOSE.as_bytes(),
                 )?)?);
-                if restart_open != PSI_OPEN {
+                if restart_open != PSI_OPEN || wait_for_timeout {
                     tls.write_all(CLOSE.as_bytes())?;
                 }
                 tls.conn.send_close_notify();
@@ -437,6 +442,80 @@ fn run_starttls_restart_case_with_timeout(
         let (before_tls, after_tls) = client.join().map_err(|_| "client thread panicked")??;
         listener.close().await?;
         Ok::<_, Box<dyn Error + Send + Sync>>((outcome, before_tls, after_tls))
+    }))?
+}
+
+#[test]
+fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    use compio::io::compat::AsyncStream;
+    use futures_rustls::TlsAcceptor;
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(timeout(TIMEOUT, async {
+        let hosts = hosts()?;
+        let mut roots = RootCertStore::empty();
+        roots.add(
+            hosts
+                .certified_key("localhost")
+                .ok_or("no certificate")?
+                .cert[0]
+                .clone(),
+        )?;
+        let client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let address = listener.local_addr()?;
+        let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
+            let socket = StdTcpStream::connect(address)?;
+            socket.set_read_timeout(Some(TIMEOUT))?;
+            socket.set_write_timeout(Some(TIMEOUT))?;
+            let connection =
+                ClientConnection::new(Arc::new(client_config), ServerName::try_from("localhost")?)?;
+            let mut tls = StreamOwned::new(connection, socket);
+            assert_eq!(tls.read(&mut [0; 1])?, 0);
+            assert!(!tls.conn.is_handshaking());
+            tls.conn.send_close_notify();
+            tls.flush()?;
+            assert_eq!(tls.sock.read(&mut [0; 1])?, 0);
+            Ok(())
+        });
+        let (socket, _) = listener.accept().await?;
+        let mut transport = TlsAcceptor::from(
+            hosts
+                .tls_server_config("localhost")
+                .await
+                .ok_or("no TLS config")?,
+        )
+        .accept(Box::pin(AsyncStream::new(socket.clone())))
+        .await?;
+        let context = close::CloseContext {
+            socket,
+            shutdown: std::future::pending::<Instant>().boxed_local().shared(),
+            phase_deadline: Some(Instant::now() + Duration::from_millis(20)),
+        };
+        let entered = Cell::new(false);
+        let cancelled = Cell::new(false);
+        struct Cancellation<'a>(&'a Cell<bool>);
+        impl Drop for Cancellation<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let result = establish::prepare_tls(&mut transport, &context, async |_| {
+            entered.set(true);
+            let _cancellation = Cancellation(&cancelled);
+            std::future::pending::<Result<(), CloseOutcome>>().await
+        })
+        .await;
+        assert_eq!(result, Err(CloseOutcome::EstablishmentTimeout));
+        assert!(entered.get());
+        assert!(cancelled.get());
+        client.join().map_err(|_| "client thread panicked")??;
+        listener.close().await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>(())
     }))?
 }
 

@@ -147,7 +147,7 @@ impl<A: ChunkAllocator + Clone> Session<A> {
             &mut self.writer,
             outcome.into(),
             &self.close,
-            self.close.deadline(),
+            self.close.deadline_for(outcome),
         )
         .await
     }
@@ -156,28 +156,9 @@ impl<A: ChunkAllocator + Clone> Session<A> {
         &self.writer.host
     }
 
-    pub(super) async fn restart(self) -> Result<Self, CloseOutcome> {
-        let Self {
-            reader,
-            mut writer,
-            close,
-        } = self;
-        writer.open = false;
-        match reader.restart() {
-            Ok(reader) => Ok(Self {
-                reader,
-                writer,
-                close,
-            }),
-            Err(_) => Err(writer
-                .reject_header(
-                    None,
-                    false,
-                    ResponseVersion::Current,
-                    CloseOutcome::ParserError,
-                )
-                .await),
-        }
+    pub(super) fn restart(&mut self) -> Result<(), ParseError> {
+        self.writer.open = false;
+        self.reader.restart()
     }
 
     pub(super) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, CloseOutcome> {
@@ -261,15 +242,20 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
         }
     }
 
-    fn restart(mut self) -> Result<Self, ParseError> {
+    fn restart(&mut self) -> Result<(), ParseError> {
         let Some(state) = self.ready.take() else {
             return Err(ParseError::ParserFailed);
         };
+        let (parser, result) = match state.parser.try_restart() {
+            Ok(parser) => (parser, Ok(())),
+            Err((parser, error)) => (parser, Err(error)),
+        };
         self.ready = Some(ReadState {
-            parser: state.parser.restart()?,
+            parser,
             stanzas: state.stanzas,
         });
-        Ok(self)
+        self.failed |= result.is_err();
+        result
     }
 
     async fn read_event(&mut self) -> Result<Option<StreamEvent<A>>, ParseError> {
@@ -385,8 +371,9 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             .write_all(xml.as_bytes())
             .await
             .map_err(|_| CloseOutcome::TransportError)?;
+        self.flush().await?;
         self.intact = true;
-        self.flush().await
+        Ok(())
     }
 
     /// The caller must flush buffered output.

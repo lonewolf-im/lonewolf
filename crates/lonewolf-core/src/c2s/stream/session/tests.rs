@@ -58,6 +58,23 @@ fn only_complete_stanzas_consume_tokens_including_all_iq_types_and_server_namesp
 }
 
 #[test]
+fn rejected_reader_restart_keeps_transport_available_for_close() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let input = format!("{HEADER}<message/>");
+        let mut reader = reader(input.as_bytes(), 1)?;
+        assert!(matches!(reader.restart(), Err(ParseError::UnexpectedEvent)));
+        assert!(reader.is_failed());
+        let retained = reader
+            .take_input()
+            .await
+            .map_err(|outcome| format!("{outcome:?}"))?;
+        assert_eq!(retained.get_ref().as_slice(), input.as_bytes());
+        assert_eq!(retained.position(), 0);
+        Ok(())
+    })
+}
+
+#[test]
 fn stream_restart_preserves_depleted_allowance_and_does_not_charge_the_header() -> TestResult {
     Runtime::new()?.block_on(async {
         let input = format!("{HEADER}<message/>{HEADER}<message/>");
@@ -70,7 +87,7 @@ fn stream_restart_preserves_depleted_allowance_and_does_not_charge_the_header() 
             reader.next_event().await,
             Ok(Some(StreamEvent::Stanza(_)))
         ));
-        let mut reader = reader.restart().map_err(|error| format!("{error:?}"))?;
+        reader.restart().map_err(|error| format!("{error:?}"))?;
         assert!(matches!(
             reader.next_event().await,
             Ok(Some(StreamEvent::StreamStart { .. }))

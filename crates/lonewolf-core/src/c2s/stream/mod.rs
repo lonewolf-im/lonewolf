@@ -8,6 +8,7 @@ mod close;
 mod establish;
 mod header;
 mod outcome;
+mod renegotiation;
 mod session;
 mod stanza_rate;
 

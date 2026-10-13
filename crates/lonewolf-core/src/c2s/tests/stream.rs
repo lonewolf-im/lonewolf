@@ -489,8 +489,13 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
                 .await
                 .ok_or("no TLS config")?,
         )
-        .accept(Box::pin(AsyncStream::new(socket.clone())))
+        .accept(super::renegotiation::RecordGuard::new(
+            Box::pin(AsyncStream::new(socket.clone())),
+            socket.clone(),
+        ))
         .await?;
+        let version = transport.get_ref().1.protocol_version();
+        transport.get_mut().0.handshake_complete(version);
         let context = close::CloseContext {
             socket,
             shutdown: std::future::pending::<Instant>().boxed_local().shared(),

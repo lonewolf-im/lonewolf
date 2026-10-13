@@ -189,14 +189,14 @@ async fn shutdown_tls(transport: &mut TlsTransport) -> Result<(), CloseOutcome> 
     transport
         .flush()
         .await
-        .map_err(|_| CloseOutcome::TransportError)?;
+        .map_err(|error| CloseOutcome::from_io_error(&error))?;
     let mut buffer = [0; 4096];
     loop {
         match transport.read(&mut buffer).await {
             Ok(0) => return Ok(()),
             Ok(_) => yield_once().await,
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(_) => return Err(CloseOutcome::TransportError),
+            Err(error) => return Err(CloseOutcome::from_io_error(&error)),
         }
     }
 }
@@ -337,6 +337,7 @@ where
             match reader.next_event().await {
                 Ok(Some(StreamEvent::StreamEnd) | None) => break,
                 Ok(Some(_)) => yield_once().await,
+                Err(CloseOutcome::TlsFailure) => return Err(CloseOutcome::TlsFailure),
                 Err(CloseOutcome::Eof | CloseOutcome::TransportError) => return Ok(false),
                 Err(_) => break,
             }

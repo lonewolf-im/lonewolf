@@ -22,6 +22,7 @@ use super::header::{
     ResponseVersion, response_to_from_header, response_version_from_header, validate_header,
 };
 use super::outcome::CloseOutcome;
+use super::renegotiation::RecordGuard;
 use super::session::{
     ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, TlsTransport, Writer,
     namespace_error, peer_stream_error,
@@ -175,7 +176,10 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                 .ok_or(CloseOutcome::InternalError)?;
             let acceptor = TlsAcceptor::from(tls_config);
             acceptor
-                .accept(Box::pin(AsyncStream::new(transport)))
+                .accept(RecordGuard::new(
+                    Box::pin(AsyncStream::new(transport.clone())),
+                    transport,
+                ))
                 .await
                 .map_err(|_| CloseOutcome::TlsFailure)
         }),
@@ -188,6 +192,8 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             return Err(outcome);
         }
     };
+    let version = transport.get_ref().1.protocol_version();
+    transport.get_mut().0.handshake_complete(version);
     let (client, exporter) = prepare_tls(&mut transport, &context, async |transport| {
         let client = match transport.get_ref().1.peer_certificates() {
             Some(chain) if !chain.is_empty() => {

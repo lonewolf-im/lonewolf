@@ -756,3 +756,58 @@ fn hosted_transport_panic_with_waiting_session_process() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn renegotiation_aborts_and_wakes_failure_watch_while_output_is_blocked() -> TestResult {
+    use crate::c2s::stream::renegotiation::RecordGuard;
+    use std::io::Cursor;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
+    use tokio::io::AsyncReadExt as _;
+    use tokio_util::compat::FuturesAsyncReadCompatExt as _;
+    Runtime::new()?.block_on(async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let mut peer = StdTcpStream::connect(listener.local_addr()?)?;
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+        let (socket, _) = listener.accept().await?;
+        let mut guard = RecordGuard::new(futures_util::io::Cursor::new(vec![22]), socket);
+        guard.handshake_complete(Some(rustls::ProtocolVersion::TLSv1_2));
+        let input = Cursor::new(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>")
+            .chain(guard.compat());
+        let mut reader = Reader::new(XmppParser::new(
+            tokio::io::BufReader::new(input),
+            ParserConfig { max_stanza_bytes: NonZeroUsize::new(10_000).ok_or("invalid size")?, arena: ArenaConfig::default() },
+            GlobalChunkAllocator,
+        ), StanzaLimiter::new(NonZeroUsize::MIN, NonZeroUsize::MIN));
+        assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::StreamStart { .. }))));
+        let (mut link, incoming, transport) = link();
+        let watch = link.watch();
+        let mut failure = pin!(watch.failed());
+        assert!(poll!(failure.as_mut()).is_pending());
+        let (notice, entered) = oneshot::channel();
+        let (release, blocked) = oneshot::channel();
+        let mut controlled = ControlledWriter::default();
+        controlled.partial_entered = Some(notice);
+        controlled.partial_release = Some(blocked);
+        assert_eq!(link.write(presence()?).await, Ok(()));
+        {
+            let mut writing = pin!(transport.write(&mut controlled, None));
+            assert!(poll!(writing.as_mut()).is_pending());
+            entered.await?;
+            transport.read(&mut reader, None).await;
+            assert_eq!(poll!(failure.as_mut()), Poll::Ready(CloseOutcome::TlsFailure));
+            assert!(incoming.is_empty());
+            assert_eq!(std::io::Read::read(&mut peer, &mut [0; 1])?, 0);
+            assert_eq!(link.write(presence()?).await, Err(CloseOutcome::TlsFailure));
+            link.stop();
+            assert!(poll!(writing.as_mut()).is_pending());
+            assert!(release.send(()).is_err());
+            link.close(CloseOutcome::AccountDeleted).await;
+            assert_eq!(writing.await, CloseOutcome::AccountDeleted);
+        }
+        assert!(!controlled.bytes.is_empty());
+        assert!(controlled.written.is_empty());
+        assert!(controlled.flushed.is_empty());
+        assert_eq!(transport.state.progress.lock().failure, Some(CloseOutcome::TlsFailure));
+        Ok(())
+    })
+}

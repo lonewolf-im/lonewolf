@@ -120,34 +120,36 @@ fn authentication_deadline_ends_at_sasl_success() -> TestResult {
 }
 
 #[test]
-fn failed_exporter_proof_requires_a_fresh_tls_connection() -> TestResult {
+fn failed_exporter_proof_allows_non_exporter_retries_on_the_same_connection() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     for version in [&version::TLS12, &version::TLS13] {
         for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
-            let mut client = Client::secure_with_versions(&suite, &[version])?;
-            client
+            for (retry_mechanism, binding) in [
+                ("SCRAM-SHA-256", None),
+                ("SCRAM-SHA-256-PLUS", Some("tls-server-end-point")),
+            ] {
+                let mut client = Client::secure_with_versions(&suite, &[version])?;
+                client
                 .scram("alice", "wrong", mechanism, Some("tls-exporter"))?
                 .assert_xml(
                     "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
                 )?;
-            client.expect_end()?;
-
-            let mut fresh = Client::secure_with_versions(&suite, &[version])?;
-            fresh
-                .scram("alice", "pencil", mechanism, Some("tls-exporter"))?
-                .assert_name(SASL_NAMESPACE, "success");
-            let mut fresh = fresh.restart();
-            fresh.open()?;
-            assert_eq!(fresh.bind(Some("desk"))?, "alice@localhost/desk");
-            fresh.close()?;
+                client
+                    .scram("alice", "pencil", retry_mechanism, binding)?
+                    .assert_name(SASL_NAMESPACE, "success");
+                let mut client = client.restart();
+                client.open()?;
+                assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+                client.close()?;
+            }
         }
     }
     Ok(())
 }
 
 #[test]
-fn rejected_exporter_identity_closes_after_the_sasl_failure() -> TestResult {
+fn rejected_exporter_identity_allows_a_non_exporter_retry() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     for (username, authzid, condition) in [
@@ -165,13 +167,19 @@ fn rejected_exporter_identity_closes_after_the_sasl_failure() -> TestResult {
         client.finish_scram(exchange)?.assert_xml(&format!(
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><{condition}/></failure>"
         ))?;
-        client.expect_end()?;
+        client
+            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
     }
     Ok(())
 }
 
 #[test]
-fn exporter_abort_and_malformed_final_close_after_the_sasl_failure() -> TestResult {
+fn exporter_abort_and_malformed_final_allow_a_non_exporter_retry() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     for (response, condition) in [
@@ -202,32 +210,178 @@ fn exporter_abort_and_malformed_final_close_after_the_sasl_failure() -> TestResu
             client.expect_xml(&format!(
                 "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><{condition}/></failure>"
             ))?;
-            client.expect_end()?;
+            client
+                .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+                .assert_name(SASL_NAMESPACE, "success");
+            let mut client = client.restart();
+            client.open()?;
+            assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+            client.close()?;
         }
     }
     Ok(())
 }
 
 #[test]
-fn replacing_an_exporter_attempt_closes_without_starting_another_mechanism() -> TestResult {
+fn replacing_an_exporter_attempt_authenticates_without_the_exporter() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     for version in [&version::TLS12, &version::TLS13] {
-        for (mechanism, first) in [
-            ("SCRAM-SHA-1-PLUS", "p=tls-exporter,,n=alice,r=next"),
-            (
-                "SCRAM-SHA-256-PLUS",
-                "p=tls-server-end-point,,n=alice,r=next",
-            ),
-            ("SCRAM-SHA-256", "n,,n=alice,r=next"),
+        for (mechanism, binding) in [
+            ("SCRAM-SHA-256-PLUS", Some("tls-server-end-point")),
+            ("SCRAM-SHA-256", None),
         ] {
             let mut client = Client::secure_with_versions(&suite, &[version])?;
             client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice,r=nonce")?;
             assert!(client.receive_sasl_challenge()?.starts_with("r=nonce"));
-            client.send_sasl_auth(mechanism, first)?;
-            client.expect_end()?;
+            client
+                .scram("alice", "pencil", mechanism, binding)?
+                .assert_name(SASL_NAMESPACE, "success");
+            let mut client = client.restart();
+            client.open()?;
+            assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+            client.close()?;
         }
     }
+    Ok(())
+}
+
+#[test]
+fn failed_exporter_proof_refuses_exporter_reuse_and_allows_a_fresh_connection() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for version in [&version::TLS12, &version::TLS13] {
+        for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
+            let mut client = Client::secure_with_versions(&suite, &[version])?;
+            client
+                .scram("alice", "wrong", mechanism, Some("tls-exporter"))?
+                .assert_xml(
+                    "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+                )?;
+            client.send_sasl_auth(mechanism, "p=tls-exporter,,n=alice,r=next")?;
+            client.expect_stream_error("policy-violation")?;
+
+            let mut fresh = Client::secure_with_versions(&suite, &[version])?;
+            fresh
+                .scram("alice", "pencil", mechanism, Some("tls-exporter"))?
+                .assert_name(SASL_NAMESPACE, "success");
+            let mut fresh = fresh.restart();
+            fresh.open()?;
+            assert_eq!(fresh.bind(Some("desk"))?, "alice@localhost/desk");
+            fresh.close()?;
+        }
+    }
+    suite.wait_for_log("outcome=\"channel_binding_reused\"")?;
+    Ok(())
+}
+
+#[test]
+fn reusing_exporter_after_failure_abort_or_replacement_is_a_policy_violation() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for version in [&version::TLS12, &version::TLS13] {
+        for username in ["alice", "missing"] {
+            for ending in ["proof", "abort", "replacement"] {
+                let mut client = Client::secure_with_versions(&suite, &[version])?;
+                if ending == "proof" {
+                    client
+                        .scram(username, "wrong", "SCRAM-SHA-256-PLUS", Some("tls-exporter"))?
+                        .assert_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>")?;
+                } else {
+                    client.send_sasl_auth(
+                        "SCRAM-SHA-256-PLUS",
+                        &format!("p=tls-exporter,,n={username},r=nonce"),
+                    )?;
+                    assert!(client.receive_sasl_challenge()?.starts_with("r=nonce"));
+                    if ending == "abort" {
+                        client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+                        client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
+                    }
+                }
+                client
+                    .scram(username, "wrong", "SCRAM-SHA-256", None)?
+                    .assert_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>")?;
+                client.send_sasl_auth(
+                    "SCRAM-SHA-1-PLUS",
+                    &format!("p=tls-exporter,,n={username},r=next"),
+                )?;
+                client.expect_stream_error("policy-violation")?;
+            }
+        }
+    }
+    let logs = suite.wait_for_log("outcome=\"channel_binding_reused\"")?;
+    assert!(
+        !logs.contains("outcome=\"authentication_attempts_exceeded\""),
+        "{logs}"
+    );
+    Ok(())
+}
+
+#[test]
+fn replacing_an_exporter_attempt_with_exporter_is_a_policy_violation() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for initial_response in [true, false] {
+        let mut client = suite.unauthenticated_client()?;
+        client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice,r=nonce")?;
+        assert!(client.receive_sasl_challenge()?.starts_with("r=nonce"));
+        if initial_response {
+            client.send_sasl_auth("SCRAM-SHA-1-PLUS", "p=tls-exporter,,n=alice,r=next")?;
+        } else {
+            client.send_sasl_auth("SCRAM-SHA-1-PLUS", "")?;
+            assert!(client.receive_sasl_challenge()?.is_empty());
+            client.send_sasl_response("p=tls-exporter,,n=alice,r=next")?;
+        }
+        client.expect_stream_error("policy-violation")?;
+    }
+    suite.wait_for_log("outcome=\"channel_binding_reused\"")?;
+    Ok(())
+}
+
+#[test]
+fn mixed_exporter_and_non_exporter_failures_share_the_retry_budget() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for username in ["alice", "missing"] {
+        let mut client = suite.unauthenticated_client()?;
+        for (mechanism, binding) in [
+            ("SCRAM-SHA-256-PLUS", Some("tls-exporter")),
+            ("SCRAM-SHA-256", None),
+            ("SCRAM-SHA-256-PLUS", Some("tls-server-end-point")),
+        ] {
+            client
+                .scram(username, "wrong", mechanism, binding)?
+                .assert_xml(
+                    "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+                )?;
+        }
+        client.expect_stream_error("policy-violation")?;
+    }
+    suite.wait_for_log("outcome=\"authentication_attempts_exceeded\"")?;
+    Ok(())
+}
+
+#[test]
+fn replacing_exporter_and_non_exporter_attempts_shares_the_retry_budget() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+    client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice,r=first")?;
+    assert!(client.receive_sasl_challenge()?.starts_with("r=first"));
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=second")?;
+    assert!(client.receive_sasl_challenge()?.starts_with("r=second"));
+    client
+        .scram(
+            "alice",
+            "wrong",
+            "SCRAM-SHA-256-PLUS",
+            Some("tls-server-end-point"),
+        )?
+        .assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+        )?;
+    client.expect_stream_error("policy-violation")?;
+    suite.wait_for_log("outcome=\"authentication_attempts_exceeded\"")?;
     Ok(())
 }
 

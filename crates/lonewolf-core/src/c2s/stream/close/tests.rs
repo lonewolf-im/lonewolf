@@ -690,7 +690,6 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
             (CloseOutcome::AuthenticationTimeout, Tail::Ready),
             (CloseOutcome::AuthenticationTimeout, Tail::Error),
             (CloseOutcome::AuthenticationTimeout, Tail::Eof),
-            (CloseOutcome::LocalClose, Tail::Ready),
         ] {
             let deadline = Instant::now() + Duration::from_millis(30);
             let phase = if outcome.is_phase_timeout() {
@@ -726,12 +725,76 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
             let result = finish_plain(&mut input, &mut writer, outcome.into(), &context).await;
             let expected = match tail {
                 Tail::Error if !outcome.is_phase_timeout() => CloseOutcome::TransportError,
-                Tail::Ready if outcome == CloseOutcome::LocalClose => CloseOutcome::ClosingTimeout,
                 _ => outcome,
             };
             assert_eq!(result, expected);
             assert_eq!(parser_polls.get(), polls);
             assert!(reads.get() > 0);
+            if matches!(tail, Tail::Ready) {
+                assert!(Instant::now() >= deadline);
+                assert!(Instant::now() < deadline + Duration::from_secs(1));
+            }
+            listener.close().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn peer_footer_plaintext_drain_preserves_outcome_and_deadline() -> TestResult {
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(async {
+        for tail in [Tail::Eof, Tail::Error, Tail::Ready] {
+            let (mut input, reads, parser_polls) =
+                probe_reader(format!("{HEADER}</stream:stream>").into_bytes(), tail);
+            assert!(matches!(
+                input
+                    .next_event()
+                    .await
+                    .map_err(|error| format!("{error:?}"))?,
+                Some(StreamEvent::StreamStart { .. })
+            ));
+            assert!(matches!(
+                input
+                    .next_event()
+                    .await
+                    .map_err(|error| format!("{error:?}"))?,
+                Some(StreamEvent::StreamEnd)
+            ));
+            assert!(!input.is_failed());
+            let polls = parser_polls.get();
+            let mut writer = Writer::new(Vec::new(), "localhost".into());
+            writer
+                .send_header(&header())
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            let deadline = Instant::now() + Duration::from_millis(30);
+            let (context, listener, _peer) = test_context(
+                Some(deadline),
+                std::future::pending::<Instant>().boxed_local().shared(),
+            )
+            .await?;
+            assert_eq!(context.deadline_for(CloseOutcome::StreamEnd), deadline);
+            let result = finish_plain(
+                &mut input,
+                &mut writer,
+                CloseOutcome::StreamEnd.into(),
+                &context,
+            )
+            .await;
+            let expected = match tail {
+                Tail::Eof => CloseOutcome::StreamEnd,
+                Tail::Error => CloseOutcome::TransportError,
+                Tail::Ready => CloseOutcome::ClosingTimeout,
+                Tail::Panic => return Err("unexpected probe tail".into()),
+            };
+            assert_eq!(result, expected);
+            assert_eq!(parser_polls.get(), polls);
+            assert!(reads.get() > 0);
+            let output =
+                String::from_utf8(writer.take_output().map_err(|error| format!("{error:?}"))?)?;
+            assert_eq!(output.matches("</stream:stream>").count(), 1);
+            assert!(!output.contains("<stream:error"));
             if matches!(tail, Tail::Ready) {
                 assert!(Instant::now() >= deadline);
                 assert!(Instant::now() < deadline + Duration::from_secs(1));

@@ -109,7 +109,13 @@ fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
         client.finish_scram(exchange)?.assert_xml(
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
         )?;
-        client.expect_end()?;
+        client
+            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut client = client.restart();
+        client.open()?;
+        assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+        client.close()?;
     }
     Ok(())
 }
@@ -142,8 +148,43 @@ fn wrong_exporter_data_rejects_both_plus_mechanisms_on_each_tls_version() -> Tes
             client.finish_scram(exchange)?.assert_xml(
                 "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
             )?;
-            client.expect_end()?;
+            client
+                .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+                .assert_name(SASL_NAMESPACE, "success");
+            let mut client = client.restart();
+            client.open()?;
+            assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+            client.close()?;
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_and_known_accounts_share_challenge_parameters_across_binding_retries() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut expected_parameters = None;
+    for username in ["alice", "missing"] {
+        let mut client = suite.unauthenticated_client()?;
+        for (mechanism, flag) in [
+            ("SCRAM-SHA-256-PLUS", "p=tls-exporter"),
+            ("SCRAM-SHA-256-PLUS", "p=tls-server-end-point"),
+            ("SCRAM-SHA-256", "n"),
+        ] {
+            client.send_sasl_auth(mechanism, &format!("{flag},,n={username},r=nonce"))?;
+            let challenge = client.receive_sasl_challenge()?;
+            assert!(challenge.starts_with("r=nonce"));
+            let (_, parameters) = challenge.split_once(",s=").ok_or("missing salt")?;
+            let (salt, iterations) = parameters.split_once(",i=").ok_or("missing iterations")?;
+            let parameters = (salt.len(), iterations.parse::<u32>()?);
+            assert_eq!(parameters, *expected_parameters.get_or_insert(parameters));
+            client.send("<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+            client.expect_xml(
+                "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>",
+            )?;
+        }
+        client.expect_stream_error("policy-violation")?;
     }
     Ok(())
 }

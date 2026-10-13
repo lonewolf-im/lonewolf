@@ -49,14 +49,21 @@ impl SaslMechanism {
     }
 }
 
-pub(super) fn sasl_features(mechanisms: AuthMechanisms, external_available: bool) -> String {
+pub(super) fn sasl_features(
+    mechanisms: AuthMechanisms,
+    external_available: bool,
+) -> Option<String> {
+    let offer_external = mechanisms.allows_external() && external_available;
+    if !mechanisms.has_scram() && !offer_external {
+        return None;
+    }
     let mut features = String::with_capacity(480);
     features.push_str("<stream:features>");
     if mechanisms.has_plus() {
         features.push_str("<sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/><channel-binding type='tls-exporter'/></sasl-channel-binding>");
     }
     features.push_str("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>");
-    if mechanisms.allows_external() && external_available {
+    if offer_external {
         features.push_str("<mechanism>EXTERNAL</mechanism>");
     }
     for mechanism in [
@@ -72,7 +79,7 @@ pub(super) fn sasl_features(mechanisms: AuthMechanisms, external_available: bool
         }
     }
     features.push_str("</mechanisms></stream:features>");
-    features
+    Some(features)
 }
 
 /// A rejected request, an aborted exchange and a replaced request each cost one attempt.

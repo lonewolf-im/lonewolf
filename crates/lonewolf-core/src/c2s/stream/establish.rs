@@ -267,6 +267,9 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             } else {
                 &settings.sasl_features
             };
+            let features = features
+                .as_deref()
+                .ok_or(CloseOutcome::NoAuthenticationMechanism)?;
             session.writer.send(features).await?;
             Ok(header)
         }),

@@ -69,8 +69,8 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
 #[derive(Clone)]
 pub(super) struct StreamSettings<A: ChunkAllocator> {
     auth_mechanisms: AuthMechanisms,
-    sasl_features: Arc<str>,
-    external_sasl_features: Arc<str>,
+    sasl_features: Option<Arc<str>>,
+    external_sasl_features: Option<Arc<str>>,
     max_stanza_bytes: NonZeroUsize,
     stanzas_per_second: NonZeroUsize,
     stanza_burst: NonZeroUsize,
@@ -102,8 +102,8 @@ impl<A: ChunkAllocator> StreamSettings<A> {
     ) -> Self {
         Self {
             auth_mechanisms,
-            sasl_features: sasl_features(auth_mechanisms, false).into(),
-            external_sasl_features: sasl_features(auth_mechanisms, true).into(),
+            sasl_features: sasl_features(auth_mechanisms, false).map(Arc::from),
+            external_sasl_features: sasl_features(auth_mechanisms, true).map(Arc::from),
             max_stanza_bytes,
             stanzas_per_second: stanza_rate.per_second,
             stanza_burst: stanza_rate.burst,

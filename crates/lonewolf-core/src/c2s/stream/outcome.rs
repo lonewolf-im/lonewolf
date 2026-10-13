@@ -40,6 +40,7 @@ pub(crate) enum CloseOutcome {
     StartTlsRejected,
     TlsFailure,
     CertificateInvalid,
+    NoAuthenticationMechanism,
     AuthenticationTimeout,
     BindingTimeout,
     BindingAttemptsExceeded,
@@ -119,6 +120,7 @@ impl CloseOutcome {
             Self::RestrictedXml => Some(StreamErrorCondition::RestrictedXml),
             Self::UnsupportedEncoding => Some(StreamErrorCondition::UnsupportedEncoding),
             Self::AuthenticationAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::NoAuthenticationMechanism => Some(StreamErrorCondition::PolicyViolation),
             Self::ChannelBindingReused => Some(StreamErrorCondition::PolicyViolation),
             Self::BindingAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
             Self::UnsupportedStanzaType => Some(StreamErrorCondition::UnsupportedStanzaType),
@@ -156,6 +158,7 @@ impl CloseOutcome {
             Self::StartTlsRejected => "starttls_rejected",
             Self::TlsFailure => "tls_failure",
             Self::CertificateInvalid => "certificate_invalid",
+            Self::NoAuthenticationMechanism => "no_authentication_mechanism",
             Self::AuthenticationTimeout => "authentication_timeout",
             Self::BindingTimeout => "binding_timeout",
             Self::BindingAttemptsExceeded => "binding_attempts_exceeded",
@@ -220,6 +223,19 @@ impl From<StageFailure> for CloseOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_authentication_mechanism_is_policy_violation_and_has_a_distinct_name() {
+        assert_eq!(
+            CloseOutcome::NoAuthenticationMechanism.stream_condition(),
+            Some(StreamErrorCondition::PolicyViolation)
+        );
+        assert_eq!(
+            CloseOutcome::NoAuthenticationMechanism.as_str(),
+            "no_authentication_mechanism"
+        );
+        assert!(!CloseOutcome::NoAuthenticationMechanism.is_phase_timeout());
+    }
 
     #[test]
     fn exporter_reuse_is_policy_violation_and_has_a_distinct_name() {

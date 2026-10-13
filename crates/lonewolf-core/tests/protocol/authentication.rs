@@ -1086,6 +1086,48 @@ fn certificate_client(
 }
 
 #[test]
+fn external_only_listener_closes_without_usable_certificate_and_authenticates_with_one()
+-> TestResult {
+    let mut material = None;
+    let suite = C2sSuite::with_extensions_and_setup("", |directory| {
+        material = Some(super::support::tls::ClientCertificates::configure(
+            directory,
+        )?);
+        let path = directory.join("lonewolf.toml");
+        let config = std::fs::read_to_string(&path)?.replace(
+            "[[c2s.listeners]]",
+            "[[c2s.listeners]]\nauth_mechanisms = ['EXTERNAL']",
+        );
+        std::fs::write(path, config)?;
+        Ok(())
+    })?;
+    let certificates = material.ok_or("missing certificate fixtures")?;
+    let other_host = certificates.identity_key(
+        &["alice@other.localhost"],
+        time::OffsetDateTime::now_utc() + time::Duration::days(1),
+    )?;
+    for key in [None, Some(certificates.without_xmpp_addr), Some(other_host)] {
+        let mut plain = super::support::PlainClient::tcp(&suite)?;
+        plain.open()?;
+        let config = key.map_or_else(
+            || std::sync::Arc::clone(&suite.tls),
+            |key| super::support::tls::with_client_certificate(&suite.tls, key),
+        );
+        let mut client = plain.start_tls_with_config(config)?;
+        client.open_with(OPEN)?;
+        client.expect_stream_error("policy-violation")?;
+    }
+    suite.create_account("alice", "pencil")?;
+    let mut client = certificate_client(&suite, certificates.trusted, None)?;
+    client.send_external_auth(Some(""))?;
+    client.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    let mut client = client.restart();
+    client.open()?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
 fn external_explicit_empty_and_omitted_responses_bind_and_route() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
     suite.create_account("alice", "pencil")?;

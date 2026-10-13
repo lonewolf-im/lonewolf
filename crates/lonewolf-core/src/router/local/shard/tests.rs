@@ -902,67 +902,199 @@ fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn probe_reply_never_reaches_an_ended_requester_or_its_replacement() -> Result<(), Box<dyn Error>> {
+fn full_probes_find_connected_resources_without_making_them_available() -> Result<(), Box<dyn Error>>
+{
     Runtime::new()?.block_on(async {
-        for action in ["end", "evict", "drop", "closed_only"] {
+        let alice = account()?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+        let router = test_router();
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+        let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+        for (target, subscribed, kind, from) in [
+            ("alice@localhost/desk", true, PresenceType::Available, "alice@localhost/desk"),
+            ("alice@localhost", true, PresenceType::Unavailable, "alice@localhost"),
+            ("alice@localhost/desk", false, PresenceType::Unsubscribed, "alice@localhost"),
+        ] {
+            let request = routed(&format!("<presence from='bob@localhost/desk' to='{target}' type='probe'/>")).await?;
+            assert_eq!(shard.probe(&observer.handle(), &request, subscribed)?.is_some(), kind == PresenceType::Unavailable);
+            let replies = observer.take_queued();
+            assert_eq!(replies.len(), 1);
+            let view = replies[0].stanza.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(kind));
+            assert_eq!(view.from()?.ok_or("missing source")?.as_str(), from);
+            assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
+            assert!(view.id()?.is_none());
+            assert!(view.children()?.next().is_none());
+        }
+        let request = routed("<presence from='alice@localhost/desk' to='alice@localhost/desk' type='probe'/>").await?;
+        assert!(shard.probe(&desk.handle(), &request, false)?.is_none());
+        let replies = desk.take_queued();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].stanza.resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Available));
+
+        let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
+        shard.presence(&alice, "phone", phone.token, Some(2), routed("<presence from='alice@localhost/phone'><status>private</status><priority>2</priority><x xmlns='urn:test'/></presence>").await?, None)?;
+        for target in ["alice@localhost/desk", "alice@localhost"] {
+            let request = routed(&format!("<presence from='bob@localhost/desk' to='{target}' type='probe'/>")).await?;
+            assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+            let replies = observer.take_queued();
+            assert_eq!(replies.len(), 1);
+            let view = replies[0].stanza.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
+            if target.contains('/') {
+                assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost/desk");
+                assert!(view.children()?.next().is_none());
+            } else {
+                assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost/phone");
+                assert!(view.child("status", "jabber:client")?.is_some());
+            }
+        }
+        let session = &shard.accounts[alice.as_str()]["desk"];
+        assert!(session.presence.is_none());
+        assert!(session.priority.is_none());
+        assert!(session.directed.is_empty());
+        assert!(!session.accepts_bare_message());
+        assert!(desk.take_queued().is_empty());
+        assert!(phone.take_queued().is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn full_probes_skip_missing_retired_and_closed_sources() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        for action in ["missing", "end", "evict", "drop", "closed", "replace"] {
             let alice = account()?;
             let mut arena = Arena::try_new(Default::default())?;
             let bob =
                 AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
-
             let router = test_router();
-            let mut source = Shard::<GlobalChunkAllocator>::new();
-            let mut destination = Shard::<GlobalChunkAllocator>::new();
-            let desk = register_probe_session(&mut source, &router, &alice, "desk")?;
-            source.presence(
-                &alice,
-                "desk",
-                desk.token,
-                Some(0),
-                routed("<presence from='alice@localhost/desk'/>").await?,
-                None,
-            )?;
-            let observer = register_probe_session(&mut destination, &router, &bob, "desk")?;
-            let old = observer.handle();
-            let old_mailbox = observer.mailbox();
-            let replacement = match action {
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+            let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+            let old = desk.handle();
+            let mut replacement = None;
+            match action {
+                "missing" => shard.cleanup(&alice, "desk", desk.token),
                 "end" => {
-                    destination.end_presence(&bob, "desk", old.token)?;
-                    Some(register_probe_session(
-                        &mut destination,
-                        &router,
-                        &bob,
-                        "desk",
-                    )?)
+                    shard.end_presence(&alice, "desk", desk.token)?;
                 }
-                "evict" => {
-                    destination.remove(bob.as_str(), "desk", old.token, RetireCause::Evicted);
-                    Some(register_probe_session(
-                        &mut destination,
-                        &router,
-                        &bob,
-                        "desk",
-                    )?)
+                "evict" => shard.remove(alice.as_str(), "desk", desk.token, RetireCause::Evicted),
+                "drop" => drop(desk),
+                "closed" => {
+                    desk.links.inbound.close();
                 }
-                "drop" => {
-                    drop(observer);
-                    None
+                "replace" => {
+                    shard.remove(alice.as_str(), "desk", desk.token, RetireCause::Evicted);
+                    replacement =
+                        Some(register_probe_session(&mut shard, &router, &alice, "desk")?);
+                    assert_ne!(
+                        replacement.as_ref().ok_or("missing replacement")?.token,
+                        old.token
+                    );
                 }
-                _ => {
-                    observer.links.inbound.close();
-                    None
-                }
+                _ => unreachable!(),
+            }
+            let request = routed(
+                "<presence from='bob@localhost/desk' to='alice@localhost/desk' type='probe'/>",
+            )
+            .await?;
+            assert_eq!(
+                shard.probe(&observer.handle(), &request, true)?.is_some(),
+                action != "replace"
+            );
+            let replies = observer.take_queued();
+            assert_eq!(replies.len(), 1, "{action}");
+            let view = replies[0].stanza.resolve()?;
+            let kind = if action == "replace" {
+                PresenceType::Available
+            } else {
+                PresenceType::Unavailable
             };
-            assert_eq!(old.liveness.is_alive(), action == "closed_only");
-            let request =
-                routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe'/>")
-                    .await?;
-            assert!(source.probe(&old, &request, true)?.is_none());
-            assert!(old_mailbox.take_queued().is_empty());
+            assert_eq!(view.stanza_type(), StanzaType::Presence(kind), "{action}");
+            assert_eq!(
+                view.from()?.ok_or("missing source")?.as_str(),
+                "alice@localhost/desk"
+            );
+            assert!(view.children()?.next().is_none());
             if let Some(replacement) = replacement {
-                assert_eq!(replacement.resource(), "desk");
-                assert_ne!(replacement.token, old.token);
                 assert!(replacement.take_queued().is_empty());
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn probe_reply_never_reaches_an_ended_requester_or_its_replacement() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        for target in ["alice@localhost", "alice@localhost/desk"] {
+            for action in ["end", "evict", "drop", "closed_only"] {
+                let alice = account()?;
+                let mut arena = Arena::try_new(Default::default())?;
+                let bob = AccountKey::try_from(
+                    Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?,
+                )?;
+
+                let router = test_router();
+                let mut source = Shard::<GlobalChunkAllocator>::new();
+                let mut destination = Shard::<GlobalChunkAllocator>::new();
+                let desk = register_probe_session(&mut source, &router, &alice, "desk")?;
+                if target == "alice@localhost" {
+                    source.presence(
+                        &alice,
+                        "desk",
+                        desk.token,
+                        Some(0),
+                        routed("<presence from='alice@localhost/desk'/>").await?,
+                        None,
+                    )?;
+                }
+                let observer = register_probe_session(&mut destination, &router, &bob, "desk")?;
+                let old = observer.handle();
+                let old_mailbox = observer.mailbox();
+                let replacement = match action {
+                    "end" => {
+                        destination.end_presence(&bob, "desk", old.token)?;
+                        Some(register_probe_session(
+                            &mut destination,
+                            &router,
+                            &bob,
+                            "desk",
+                        )?)
+                    }
+                    "evict" => {
+                        destination.remove(bob.as_str(), "desk", old.token, RetireCause::Evicted);
+                        Some(register_probe_session(
+                            &mut destination,
+                            &router,
+                            &bob,
+                            "desk",
+                        )?)
+                    }
+                    "drop" => {
+                        drop(observer);
+                        None
+                    }
+                    _ => {
+                        observer.links.inbound.close();
+                        None
+                    }
+                };
+                assert_eq!(old.liveness.is_alive(), action == "closed_only");
+                let request = routed(&format!(
+                    "<presence from='bob@localhost/desk' to='{target}' type='probe'/>"
+                ))
+                .await?;
+                assert!(source.probe(&old, &request, true)?.is_none());
+                assert!(old_mailbox.take_queued().is_empty());
+                if let Some(replacement) = replacement {
+                    assert_eq!(replacement.resource(), "desk");
+                    assert_ne!(replacement.token, old.token);
+                    assert!(replacement.take_queued().is_empty());
+                }
             }
         }
         Ok(())
@@ -1106,6 +1238,36 @@ fn full_probe_mailbox_preserves_the_requester_and_unavailable_prune() -> Result<
         assert_eq!(queued[0].stanza.resolve()?.id()?, Some("queued"));
         assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
         assert_eq!(observer.take_queued().len(), 1);
+        let quiet = register_probe_session(&mut shard, &router, &alice, "quiet")?;
+        let queued =
+            routed("<presence from='carol@localhost/desk' to='bob@localhost/desk' id='queued'/>")
+                .await?;
+        shard.accounts[bob.as_str()]["desk"]
+            .outbound
+            .try_send(MailboxEntry::new(queued))?;
+        let request =
+            routed("<presence from='bob@localhost/desk' to='alice@localhost/quiet' type='probe'/>")
+                .await?;
+        assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+        assert!(observer.liveness().is_alive());
+        assert!(!observer.links.inbound.is_closed());
+        let queued = observer.take_queued();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].stanza.resolve()?.id()?, Some("queued"));
+        assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+        let replies = observer.take_queued();
+        assert_eq!(replies.len(), 1);
+        let view = replies[0].stanza.resolve()?;
+        assert_eq!(
+            view.stanza_type(),
+            StanzaType::Presence(PresenceType::Available)
+        );
+        assert_eq!(
+            view.from()?.ok_or("missing source")?.as_str(),
+            "alice@localhost/quiet"
+        );
+        assert!(view.children()?.next().is_none());
+        assert!(quiet.take_queued().is_empty());
         Ok(())
     })
 }

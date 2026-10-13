@@ -726,7 +726,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                     })
                     .transpose();
             }
-            if source.presence.is_none() && !source.access.directed {
+            if source.presence.is_none() && !source.access.directed && !(full && ordinary) {
                 return Ok(None);
             }
             let from = format!("{}/{}", owner.as_str(), source.resource);

@@ -141,24 +141,36 @@ fn rejected_iq_envelopes_preserve_binding_authorization_and_namespace_gates() ->
     Ok(())
 }
 
+const PRE_BIND_RESPONSES: &[&str] = &[
+    "type='result' id='reply'",
+    "type='error' id='reply'",
+    "type='result'",
+    "type='error'",
+];
+
 #[test]
-fn rejected_iq_responses_close_binding_without_an_iq_error_reply() -> TestResult {
-    for input in [
-        "<iq type='result'/>",
-        "<iq type='result' id='bad'><first/><second/></iq>",
-        "<iq type='error' id='bad'/>",
-        "<iq type='error'><error/></iq>",
+fn iq_responses_are_ignored_before_binding_for_permitted_addresses() -> TestResult {
+    for response in [
+        "<iq type='result' id='reply'{address}/>",
+        "<iq type='error' id='reply'{address}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+        "<iq type='result'{address}/>",
+        "<iq type='result' id='bad'{address}><first/><second/></iq>",
+        "<iq type='error' id='bad'{address}/>",
+        "<iq type='error'{address}><error/></iq>",
     ] {
-        let suite = C2sSuite::start()?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        for address in [
+            "",
+            " to='localhost'",
+            " from='alice@localhost' to='alice@localhost'",
+        ] {
+            let suite = C2sSuite::resource_limit(1)?;
+            suite.create_account("alice", "pencil")?;
+            let mut client = suite.authenticated_client("alice", "pencil")?;
 
-        client.send(input)?;
-        client.expect_stream_error("not-authorized")?;
-
-        let mut replacement = suite.authenticated_client("alice", "pencil")?;
-        assert_eq!(replacement.bind(Some("desk"))?, "alice@localhost/desk");
-        replacement.close()?;
+            client.send(&response.replace("{address}", address))?;
+            assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+            client.close()?;
+        }
     }
     Ok(())
 }
@@ -654,4 +666,206 @@ fn mixed_resource_children_close_at_the_retry_limit() -> TestResult {
         client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     }
     client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn pre_bind_disco_without_destination_returns_service_unavailable_then_binds() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    client.send(
+        "<iq type='get' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>",
+    )?;
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id='disco'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
+fn pre_bind_requests_to_permitted_destinations_return_service_unavailable() -> TestResult {
+    for attributes in [
+        "",
+        " to='localhost'",
+        " from='alice@localhost' to='alice@localhost'",
+    ] {
+        for (kind, payload) in [
+            ("get", "<ping xmlns='urn:xmpp:ping'/>"),
+            ("get", "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>"),
+            ("set", "<query xmlns='urn:test:unsupported'/>"),
+            ("set", "<bind xmlns='urn:test:unsupported'/>"),
+        ] {
+            let suite = C2sSuite::start()?;
+            suite.create_account("alice", "pencil")?;
+            let mut client = suite.authenticated_client("alice", "pencil")?;
+
+            client.send(&format!(
+                "<iq type='{kind}' id='a&amp;b'{attributes}>{payload}</iq>"
+            ))?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='a&amp;b'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+            client.close()?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn own_bare_destination_accepts_binding_and_rejected_request_recovery() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    client.send("<iq type='get' id='bad' to='alice@localhost'><first/><second/></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    client.send("<iq type='set' id='bind' to='alice@localhost'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='result' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/desk</jid></bind></iq>")?;
+    client.close()
+}
+
+#[test]
+fn pre_bind_iqs_to_other_entities_close_before_request_or_response_handling() -> TestResult {
+    for destination in [
+        "bob@localhost",
+        "alice@localhost/desk",
+        "localhost/desk",
+        "remote.example",
+        "bob@remote.example",
+    ] {
+        for stanza in [
+            "type='get' id='query'><ping xmlns='urn:xmpp:ping'/></iq>",
+            "type='set' id='query'><query xmlns='urn:test:unsupported'/></iq>",
+            "type='result' id='reply'/>",
+            "type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+            "type='result'/>",
+            "type='error'/>",
+        ] {
+            let suite = C2sSuite::start()?;
+            suite.create_account("alice", "pencil")?;
+            let mut client = suite.authenticated_client("alice", "pencil")?;
+
+            client.send(&format!("<iq to='{destination}' {stanza}"))?;
+            client.expect_stream_error("not-authorized")?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn pre_bind_responses_preserve_namespace_and_address_gate_precedence() -> TestResult {
+    for envelope in PRE_BIND_RESPONSES {
+        for (address, condition) in [
+            (
+                "xmlns='jabber:server' from='bob@localhost' to='bob@localhost'",
+                "invalid-namespace",
+            ),
+            ("from='bob@localhost' to='bob@localhost'", "invalid-from"),
+            ("from='localhost'", "invalid-from"),
+            ("from='alice@localhost/desk'", "invalid-from"),
+            ("from='bad@'", "invalid-from"),
+            ("from=''", "invalid-from"),
+            ("to='bad@'", "not-authorized"),
+            ("to=''", "not-authorized"),
+        ] {
+            let suite = C2sSuite::start()?;
+            suite.create_account("alice", "pencil")?;
+            let mut client = suite.authenticated_client("alice", "pencil")?;
+
+            let payload = if envelope.starts_with("type='error' id=") {
+                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
+            } else {
+                ""
+            };
+            client.send(&format!("<iq {envelope} {address}>{payload}</iq>"))?;
+            client.expect_stream_error(condition)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ignored_pre_bind_responses_do_not_increment_or_reset_the_failure_count() -> TestResult {
+    for bind_after_responses in [true, false] {
+        let suite = C2sSuite::start()?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+
+        for _ in 0..5 {
+            client.send("<iq type='set' id='bad'><query xmlns='urn:test:unsupported'/></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        }
+        for _ in 0..7 {
+            client.send("<iq type='result' id='reply'/>")?;
+            client.send("<iq type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.send("<iq type='result'/>")?;
+            client.send("<iq type='error'/>")?;
+        }
+        if bind_after_responses {
+            assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+            client.close()?;
+        } else {
+            client.send("<iq type='get' id='sixth'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='sixth'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.expect_stream_error("policy-violation")?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_pre_bind_requests_close_at_default_and_configured_retry_limits() -> TestResult {
+    for (retries, max_failures) in [(5, 6), (7, 8)] {
+        let suite = C2sSuite::with_profile_settings(
+            "custom",
+            &format!("[limits.c2s.profiles.custom]\nresource_binding_retries = {retries}"),
+        )?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+
+        for attempt in 0..max_failures {
+            let kind = if attempt % 2 == 0 { "get" } else { "set" };
+            client.send(&format!(
+                "<iq type='{kind}' id='bad'><query xmlns='urn:test:unsupported'/></iq>"
+            ))?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        }
+        client.expect_stream_error("policy-violation")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn unsupported_malformed_and_resource_limit_failures_share_the_pre_bind_budget() -> TestResult {
+    let suite = C2sSuite::resource_limit(1)?;
+    suite.create_account("alice", "pencil")?;
+    let mut desktop = suite.connect("alice", "pencil", "desk")?;
+    let mut phone = suite.authenticated_client("alice", "pencil")?;
+
+    for _ in 0..2 {
+        phone.send("<iq type='set' id='unsupported'><query xmlns='urn:test:unsupported'/></iq>")?;
+        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='unsupported'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        phone.send("<iq type='set' id='malformed'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
+        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='malformed'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
+        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    }
+    phone.expect_stream_error("policy-violation")?;
+    desktop.close()
+}
+
+#[test]
+fn ignored_pre_bind_responses_do_not_extend_the_shaped_binding_deadline() -> TestResult {
+    let suite = C2sSuite::with_limits(
+        "incoming_stanzas_per_connection = { per_second = 1, burst = 1 }\nresource_binding_timeout_secs = 1",
+    )?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+    let started = std::time::Instant::now();
+
+    client.send("<iq type='result' id='reply'/><iq type='result'/><iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
+    client.expect_stream_error("policy-violation")?;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    suite.wait_for_log("outcome=\"binding_timeout\"")?;
+    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    replacement.close()
 }

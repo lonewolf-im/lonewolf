@@ -152,7 +152,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                 if rejected.namespace() != StanzaNamespace::Client {
                     return Err(CloseOutcome::InvalidNamespace);
                 }
-                if rejected.kind() != StanzaKind::Iq || !rejected.can_reply() {
+                if rejected.kind() != StanzaKind::Iq {
                     return Err(CloseOutcome::UnsupportedInput);
                 }
                 let from = rejected
@@ -166,8 +166,15 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                 let to = rejected
                     .to(parsed.arena())
                     .map_err(|_| CloseOutcome::InternalError)?;
-                if rejected.invalid_to() || to.is_some_and(|to| to.as_str() != session.host()) {
+                if rejected.invalid_to()
+                    || to.is_some_and(|to| {
+                        to.as_str() != session.host() && to.as_str() != account.as_str()
+                    })
+                {
                     return Err(CloseOutcome::UnsupportedInput);
+                }
+                if !rejected.can_reply() {
+                    continue;
                 }
                 let id = rejected
                     .id(parsed.arena())
@@ -196,13 +203,8 @@ async fn bind_session<A: ChunkAllocator + Clone>(
         if stanza.namespace() != StanzaNamespace::Client {
             return Err(CloseOutcome::InvalidNamespace);
         }
-        if stanza.stanza_type() != StanzaType::Iq(IqType::Set) {
+        let StanzaType::Iq(iq_type) = stanza.stanza_type() else {
             return Err(CloseOutcome::UnsupportedInput);
-        }
-        let id = match stanza.id() {
-            Ok(Some(id)) => id,
-            Ok(None) => return Err(CloseOutcome::ParserError),
-            Err(_) => return Err(CloseOutcome::InternalError),
         };
         let Ok(from) = stanza.from() else {
             return Err(CloseOutcome::InternalError);
@@ -213,8 +215,38 @@ async fn bind_session<A: ChunkAllocator + Clone>(
         let Ok(to) = stanza.to() else {
             return Err(CloseOutcome::InternalError);
         };
-        if to.is_some_and(|to| to.as_str() != session.host()) {
+        if to.is_some_and(|to| to.as_str() != session.host() && to.as_str() != account.as_str()) {
             return Err(CloseOutcome::UnsupportedInput);
+        }
+        if matches!(iq_type, IqType::Result | IqType::Error) {
+            continue;
+        }
+        let id = match stanza.id() {
+            Ok(Some(id)) => id,
+            Ok(None) => return Err(CloseOutcome::ParserError),
+            Err(_) => return Err(CloseOutcome::InternalError),
+        };
+        let payload = stanza
+            .children()
+            .map_err(|_| CloseOutcome::InternalError)?
+            .next()
+            .transpose()
+            .map_err(|_| CloseOutcome::InternalError)?;
+        if iq_type != IqType::Set
+            || !payload.is_some_and(|payload| {
+                payload.name() == "bind" && payload.namespace() == BIND_NAMESPACE
+            })
+        {
+            reject_bind(
+                &mut session.writer,
+                id,
+                "cancel",
+                "service-unavailable",
+                &mut invalid_attempts,
+                max_failures,
+            )
+            .await?;
+            continue;
         }
         let mut requested = match requested_resource(&stanza) {
             Ok(requested) => requested,

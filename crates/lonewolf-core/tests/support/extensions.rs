@@ -14,6 +14,7 @@ use lonewolf_extension::iq::{
 };
 use lonewolf_extension::message::{MessageHandler, StoreFuture, UndeliverableMessage};
 use lonewolf_extension::offline::Offline;
+use lonewolf_extension::policy::{Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate,
@@ -30,8 +31,8 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
-    Element, IqType, MessageType, PresenceType, RoutedStanza, Stanza, StanzaErrorCondition,
-    StanzaNamespace, StanzaType,
+    ApplicationCondition, Element, IqType, MessageType, PresenceType, RoutedStanza, Stanza,
+    StanzaErrorCondition, StanzaNamespace, StanzaType,
 };
 use parking_lot::Mutex as PlMutex;
 
@@ -111,6 +112,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     }))?;
     extensions.register(Arc::new(TestHostService))?;
     extensions.register(Arc::new(TestDiscovery))?;
+    extensions.register(Arc::new(TestPolicy))?;
     for kind in [
         ServiceLifecycleKind::OfflineWithdrawal,
         ServiceLifecycleKind::DelayedAvailable,
@@ -1249,6 +1251,54 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
                 })
             });
             Ok(IqReply::new(None, effects))
+        })
+    }
+}
+
+struct TestPolicy;
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPolicy {
+    fn name(&self) -> &'static str {
+        "test-policy"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self);
+        Ok(())
+    }
+}
+
+impl PolicyHandler<RedbStorage> for TestPolicy {
+    fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
+        Box::pin(async move {
+            Ok(match (request.peer.localpart(), request.direction) {
+                (Some("blocked"), Direction::Outbound) => Verdict::Reject {
+                    condition: StanzaErrorCondition::NotAcceptable,
+                    application: Some(ApplicationCondition {
+                        name: "blocked",
+                        namespace: "urn:lonewolf:test:policy",
+                    }),
+                },
+                (Some("spammer"), Direction::Inbound) => Verdict::Drop,
+                (Some("rejecter"), Direction::Inbound) => Verdict::Reject {
+                    condition: StanzaErrorCondition::ServiceUnavailable,
+                    application: None,
+                },
+                (Some("broken"), _) => {
+                    return Err(HandlerError::Internal {
+                        condition: StanzaErrorCondition::InternalServerError,
+                        failure: Failure {
+                            kind: FailureKind::Delivery,
+                            operation: "test_policy",
+                        },
+                    });
+                }
+                _ => Verdict::Allow,
+            })
         })
     }
 }

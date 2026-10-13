@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::delivery::{DeliveryError, DeliveryFuture, HostLookup};
+use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_extension::service::{ServiceContext, ServiceOutbound};
 use lonewolf_storage::RedbStorage;
+use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaErrorCondition, StanzaType};
 
 use super::message::{self, DeliveryOutcome};
-use super::{Stage, StageFailure};
+use super::{Stage, StageFailure, policy};
 use crate::delivery::WorkHandle;
 use crate::router::{Destination, RoutedStanza, RouterError, RouterHandle, ServiceRoute};
 
@@ -103,6 +105,30 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
             }
             let to = view.to()?.ok_or(DeliveryError)?;
             let destination = self.router.destination(to);
+            if matches!(destination, Destination::Account | Destination::Resource)
+                && !self.router.policies(to.domainpart()).is_empty()
+            {
+                let account = AccountKey::try_from(to.bare()).map_err(|_| DeliveryError)?;
+                let checks = [policy::Check {
+                    account: &account,
+                    direction: Direction::Inbound,
+                    peer: view.from()?.ok_or(DeliveryError)?,
+                }];
+                let stage = Stage {
+                    router: self.router,
+                    storage: self.storage,
+                    allocator: self.allocator,
+                    work: self.work,
+                };
+                match policy::evaluate(&stage, view.stanza_type(), &checks)
+                    .await
+                    .map_err(|_| DeliveryError)?
+                {
+                    Verdict::Allow => {}
+                    Verdict::Drop => return Ok(()),
+                    Verdict::Reject { .. } => return Err(DeliveryError),
+                }
+            }
             match destination {
                 Destination::Account | Destination::Resource => match view.stanza_type() {
                     StanzaType::Message(kind) => {

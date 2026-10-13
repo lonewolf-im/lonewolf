@@ -13,6 +13,7 @@ use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
+use lonewolf_extension::policy::PolicyHandler;
 use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_extension::service::ServiceHandler;
 use lonewolf_storage::RedbStorage;
@@ -206,6 +207,15 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A, RedbStorage>> {
         self.extensions.get(domain).map(ExtensionRegistry::iq)
+    }
+
+    pub(crate) fn policies(
+        &self,
+        domain: &str,
+    ) -> &[(&'static str, Arc<dyn PolicyHandler<RedbStorage>>)] {
+        self.extensions
+            .get(domain)
+            .map_or(&[], ExtensionRegistry::policies)
     }
 
     pub(crate) fn discovery(&self, domain: &str) -> Option<&Arc<Discovery>> {

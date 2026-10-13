@@ -4,7 +4,8 @@ use lonewolf_extension::iq::IqRequestType;
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::stanza::{
-    BuildError, Element, IqType, Stanza, StanzaErrorCondition, StanzaRef, StanzaType,
+    ApplicationCondition, BuildError, Element, IqType, Stanza, StanzaErrorCondition, StanzaRef,
+    StanzaType,
 };
 
 use super::stream::CloseOutcome;
@@ -98,7 +99,20 @@ pub(super) fn error_reply<A: ChunkAllocator>(
     condition: StanzaErrorCondition,
     to: Option<Jid>,
 ) -> Result<Stanza, ReplyError> {
-    Ok(request.error_reply_in(arena, condition)?.to(to)?.build()?)
+    error_reply_with(request, arena, condition, None, to)
+}
+
+pub(super) fn error_reply_with<A: ChunkAllocator>(
+    request: &Stanza,
+    arena: &mut Arena<A>,
+    condition: StanzaErrorCondition,
+    application: Option<ApplicationCondition>,
+    to: Option<Jid>,
+) -> Result<Stanza, ReplyError> {
+    Ok(request
+        .error_reply_with_in(arena, condition, application)?
+        .to(to)?
+        .build()?)
 }
 
 pub(super) fn result_reply<A: ChunkAllocator>(

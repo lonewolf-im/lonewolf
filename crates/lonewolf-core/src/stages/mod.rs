@@ -10,6 +10,7 @@ use crate::delivery::WorkHandle;
 use crate::router::RouterHandle;
 
 pub(crate) mod message;
+pub(crate) mod policy;
 pub(crate) mod service;
 
 pub(crate) struct Stage<'s, A: ChunkAllocator> {

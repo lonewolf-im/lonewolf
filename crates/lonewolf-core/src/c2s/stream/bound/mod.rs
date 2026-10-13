@@ -20,6 +20,7 @@ use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqSco
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
+use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
@@ -31,8 +32,8 @@ use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, Handle
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    BuildError, CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType, RejectedStanza,
-    Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
+    ApplicationCondition, BuildError, CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType,
+    RejectedStanza, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
 };
 
 use super::bind::Bound;
@@ -50,9 +51,9 @@ use crate::router::{
     RouterHandle, ServiceRoute, SessionHandle,
 };
 
-use crate::stages::Stage;
 use crate::stages::message::{self, DeliveryOutcome};
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
+use crate::stages::{Stage, policy};
 
 mod link;
 mod output;
@@ -440,6 +441,35 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         route: ServiceRoute<A>,
     ) -> Result<(), CloseOutcome> {
         let routed = self.stamp(parsed)?;
+        let verdict = {
+            let view = routed.resolve()?;
+            let peer = view.to()?.ok_or(CloseOutcome::InternalError)?;
+            let checks = [policy::Check {
+                account: self.registration.account(),
+                direction: Direction::Outbound,
+                peer,
+            }];
+            let stage = Stage {
+                router: &self.router,
+                storage: &self.storage,
+                allocator: &self.allocator,
+                work: &self.work,
+            };
+            self.outbox
+                .drain_until(
+                    &self.registration,
+                    policy::evaluate(&stage, view.stanza_type(), &checks),
+                )
+                .await??
+        };
+        match verdict {
+            Verdict::Allow => {}
+            Verdict::Reject {
+                condition,
+                application,
+            } => return self.reply_rejection(&routed, condition, application),
+            Verdict::Drop => return Ok(()),
+        }
         let presence = {
             let view = routed.resolve()?;
             matches!(
@@ -523,6 +553,65 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration, &self.router)?;
+        let verdict = {
+            let view = request.resolve(&arena)?;
+            match view.to()? {
+                Some(to)
+                    if matches!(
+                        route.destination,
+                        Destination::Resource | Destination::Account
+                    ) && to.bare().as_str() != self.registration.account().as_str()
+                        && (!self
+                            .router
+                            .policies(self.registration.account().domain())
+                            .is_empty()
+                            || !self.router.policies(to.domainpart()).is_empty()) =>
+                {
+                    let recipient = AccountKey::try_from(to.bare())?;
+                    let checks = [
+                        policy::Check {
+                            account: self.registration.account(),
+                            direction: Direction::Outbound,
+                            peer: to,
+                        },
+                        policy::Check {
+                            account: &recipient,
+                            direction: Direction::Inbound,
+                            peer: route.sender.resolve(&arena)?,
+                        },
+                    ];
+                    let stage = Stage {
+                        router: &self.router,
+                        storage: &self.storage,
+                        allocator: &self.allocator,
+                        work: &self.work,
+                    };
+                    self.outbox
+                        .drain_until(
+                            &self.registration,
+                            policy::evaluate(&stage, view.stanza_type(), &checks),
+                        )
+                        .await??
+                }
+                _ => Verdict::Allow,
+            }
+        };
+        match verdict {
+            Verdict::Allow => {}
+            Verdict::Reject {
+                condition,
+                application,
+            } => {
+                let reply =
+                    iq::error_reply_with(&request, &mut arena, condition, application, None)?;
+                self.outbox.push(Output::Owned {
+                    stanza: reply,
+                    arena,
+                });
+                return Ok(());
+            }
+            Verdict::Drop => return Ok(()),
+        }
         if matches!(
             route.destination,
             Destination::Resource | Destination::ServerResource
@@ -1001,6 +1090,55 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             allocator: &self.allocator,
             work: &self.work,
         };
+        let verdict = {
+            let view = routed.resolve()?;
+            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
+            let from = view.from()?.ok_or(CloseOutcome::InternalError)?;
+            let sender = self.registration.account();
+            let local_recipient = matches!(
+                self.router.destination(to),
+                Destination::Account | Destination::Resource
+            );
+            if to.bare().as_str() == sender.as_str()
+                || (self.router.policies(sender.domain()).is_empty()
+                    && (!local_recipient || self.router.policies(to.domainpart()).is_empty()))
+            {
+                Verdict::Allow
+            } else {
+                let recipient = if local_recipient {
+                    Some(AccountKey::try_from(to.bare())?)
+                } else {
+                    None
+                };
+                let checks = [
+                    policy::Check {
+                        account: sender,
+                        direction: Direction::Outbound,
+                        peer: to,
+                    },
+                    policy::Check {
+                        account: recipient.as_ref().unwrap_or(sender),
+                        direction: Direction::Inbound,
+                        peer: from,
+                    },
+                ];
+                let checks = &checks[..if recipient.is_some() { 2 } else { 1 }];
+                self.outbox
+                    .drain_until(
+                        &self.registration,
+                        policy::evaluate(&stage, view.stanza_type(), checks),
+                    )
+                    .await??
+            }
+        };
+        match verdict {
+            Verdict::Allow => {}
+            Verdict::Reject {
+                condition,
+                application,
+            } => return self.reply_rejection(&routed, condition, application),
+            Verdict::Drop => return Ok(()),
+        }
         let outcome = self
             .outbox
             .drain_until(&self.registration, message::deliver(&stage, routed, kind))
@@ -1317,9 +1455,20 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         source: &RoutedStanza<A>,
         condition: StanzaErrorCondition,
     ) -> Result<(), CloseOutcome> {
+        self.reply_rejection(source, condition, None)
+    }
+
+    fn reply_rejection(
+        &mut self,
+        source: &RoutedStanza<A>,
+        condition: StanzaErrorCondition,
+        application: Option<ApplicationCondition>,
+    ) -> Result<(), CloseOutcome> {
         let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
         let source = source.resolve()?.clone_in(&mut arena)?;
-        let reply = source.error_reply_in(&mut arena, condition)?.build()?;
+        let reply = source
+            .error_reply_with_in(&mut arena, condition, application)?
+            .build()?;
         self.outbox.push(Output::Owned {
             stanza: reply,
             arena,

@@ -53,7 +53,7 @@ impl CloseOutcome {
             ParseError::SizeLimitExceeded { .. } => Self::SizeLimitExceeded,
             ParseError::InvalidNamespace => Self::InvalidNamespace,
             ParseError::InvalidXml => Self::InvalidXml,
-            ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
+            ParseError::NotWellFormed | ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
             ParseError::RestrictedXml => Self::RestrictedXml,
             ParseError::UnsupportedEncoding => Self::UnsupportedEncoding,
             ParseError::UnsupportedVersion => Self::UnsupportedVersion,
@@ -157,5 +157,57 @@ impl From<AccountKeyError> for CloseOutcome {
 impl From<StageFailure> for CloseOutcome {
     fn from(_: StageFailure) -> Self {
         Self::InternalError
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_errors_preserve_distinct_close_categories() {
+        for (error, outcome) in [
+            (ParseError::NotWellFormed, CloseOutcome::NotWellFormed),
+            (
+                ParseError::UnboundNamespacePrefix,
+                CloseOutcome::NotWellFormed,
+            ),
+            (ParseError::RestrictedXml, CloseOutcome::RestrictedXml),
+            (
+                ParseError::UnsupportedEncoding,
+                CloseOutcome::UnsupportedEncoding,
+            ),
+            (
+                ParseError::UnsupportedVersion,
+                CloseOutcome::UnsupportedVersion,
+            ),
+            (
+                ParseError::SizeLimitExceeded { limit: 1 },
+                CloseOutcome::SizeLimitExceeded,
+            ),
+            (ParseError::InvalidNamespace, CloseOutcome::InvalidNamespace),
+            (ParseError::InvalidXml, CloseOutcome::InvalidXml),
+            (ParseError::UnexpectedEvent, CloseOutcome::ParserError),
+            (ParseError::UnexpectedEof, CloseOutcome::ParserError),
+            (ParseError::TooManyAttributes, CloseOutcome::ParserError),
+            (
+                ParseError::Build(BuildError::InvalidText),
+                CloseOutcome::ParserError,
+            ),
+            (
+                ParseError::Build(BuildError::TreeLimitExceeded),
+                CloseOutcome::ParserError,
+            ),
+            (
+                ParseError::Build(BuildError::Allocation(ArenaError::ArenaLimitExceeded)),
+                CloseOutcome::ParserError,
+            ),
+            (
+                ParseError::from(quick_xml::Error::from(std::io::Error::other("transport"))),
+                CloseOutcome::TransportError,
+            ),
+        ] {
+            assert_eq!(CloseOutcome::from_parse_error(&error), outcome, "{error:?}");
+        }
     }
 }

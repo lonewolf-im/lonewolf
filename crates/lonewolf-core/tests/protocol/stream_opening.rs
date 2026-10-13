@@ -344,7 +344,7 @@ fn duplicate_attribute_is_rejected_before_tls() -> TestResult {
     let mut client = suite.tcp_client()?;
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -502,7 +502,7 @@ fn duplicate_attribute_is_rejected_after_tls() -> TestResult {
     let mut client = suite.tls_client()?;
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -696,7 +696,7 @@ fn duplicate_attribute_is_rejected_after_authentication() -> TestResult {
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]

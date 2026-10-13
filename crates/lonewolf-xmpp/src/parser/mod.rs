@@ -19,7 +19,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 use crate::stanza::incoming::{Completed, Frame};
 use crate::stanza::{
     BuildError, Element, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, RejectedStanza, STREAM_NAMESPACE,
-    Stanza, XML_NAMESPACE,
+    Stanza, XML_NAMESPACE, xml,
 };
 
 mod input;
@@ -87,6 +87,7 @@ pub enum ParseError {
     SizeLimitExceeded { limit: usize },
     TooManyAttributes,
     InvalidXml,
+    NotWellFormed,
     InvalidNamespace,
     UnboundNamespacePrefix,
     UnsupportedEncoding,
@@ -265,7 +266,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
             match event {
                 Event::Decl(declaration) => {
                     if self.phase != Phase::Initial || declaration_seen || !declaration_allowed {
-                        return Err(ParseError::UnexpectedEvent);
+                        return Err(ParseError::NotWellFormed);
                     }
                     validate_declaration(&declaration)?;
                     declaration_seen = true;
@@ -371,25 +372,32 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                     }
                 }
                 Event::Text(text) => {
-                    if self.frames.is_empty() {
-                        return Err(ParseError::UnexpectedEvent);
-                    }
                     if text.contains("]]>") {
-                        return Err(ParseError::InvalidXml);
+                        return Err(ParseError::NotWellFormed);
+                    }
+                    if self.frames.is_empty() {
+                        xml::validate_text(&text).map_err(|_| ParseError::NotWellFormed)?;
+                        return Err(ParseError::UnexpectedEvent);
                     }
                     self.text.push_str(&text.xml10_content());
                 }
                 Event::CData(text) => {
                     if self.frames.is_empty() {
+                        xml::validate_text(&text).map_err(|_| ParseError::NotWellFormed)?;
                         return Err(ParseError::UnexpectedEvent);
                     }
                     self.text.push_str(&text.xml10_content());
                 }
                 Event::GeneralRef(reference) => {
+                    let character = reference.resolve_char_ref()?;
                     if self.frames.is_empty() {
+                        if let Some(ch) = character {
+                            xml::validate_text(ch.encode_utf8(&mut [0; 4]))
+                                .map_err(|_| ParseError::NotWellFormed)?;
+                        }
                         return Err(ParseError::UnexpectedEvent);
                     }
-                    if let Some(ch) = reference.resolve_char_ref()? {
+                    if let Some(ch) = character {
                         self.text.push(ch);
                     } else {
                         let replacement = quick_xml::escape::resolve_predefined_entity(&reference)
@@ -415,7 +423,15 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
         }
         count_node(nodes)?;
         let frame = self.frames.last_mut().ok_or(ParseError::UnexpectedEvent)?;
-        frame.text(&self.text, arena.ok_or(ParseError::UnexpectedEvent)?)?;
+        frame
+            .text(&self.text, arena.ok_or(ParseError::UnexpectedEvent)?)
+            .map_err(|error| {
+                if matches!(error, BuildError::InvalidText) {
+                    ParseError::NotWellFormed
+                } else {
+                    error.into()
+                }
+            })?;
         self.text.clear();
         Ok(())
     }
@@ -496,23 +512,54 @@ fn has_explicit_attributes(start: &BytesStart<'_>) -> Result<bool, ParseError> {
 fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {
     let start = BytesStart::from_content(declaration.as_ref(), 3);
     let mut previous = 0;
+    let mut unsupported_version = false;
+    let mut unsupported_encoding = false;
     for attribute in start.attributes() {
         let attribute = attribute.map_err(quick_xml::Error::from)?;
         let order = match attribute.key.as_ref() {
-            "version" if attribute.value.as_ref() == "1.0" => 1,
-            "version" => return Err(ParseError::UnsupportedVersion),
-            "encoding" if attribute.value.eq_ignore_ascii_case("UTF-8") => 2,
-            "encoding" => return Err(ParseError::UnsupportedEncoding),
-            "standalone" if matches!(attribute.value.as_ref(), "yes" | "no") => 3,
-            _ => return Err(ParseError::InvalidXml),
+            "version" => 1,
+            "encoding" => 2,
+            "standalone" => 3,
+            _ => return Err(ParseError::NotWellFormed),
         };
         if order <= previous || (previous == 0 && order != 1) {
-            return Err(ParseError::InvalidXml);
+            return Err(ParseError::NotWellFormed);
+        }
+        match order {
+            1 => {
+                if !attribute.value.strip_prefix("1.").is_some_and(|minor| {
+                    !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())
+                }) {
+                    return Err(ParseError::NotWellFormed);
+                }
+                unsupported_version = attribute.value.as_ref() != "1.0";
+            }
+            2 => {
+                let mut bytes = attribute.value.bytes();
+                if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+                    || !bytes.all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                {
+                    return Err(ParseError::NotWellFormed);
+                }
+                unsupported_encoding = !attribute.value.eq_ignore_ascii_case("UTF-8");
+            }
+            _ if !matches!(attribute.value.as_ref(), "yes" | "no") => {
+                return Err(ParseError::NotWellFormed);
+            }
+            _ => {}
         }
         previous = order;
     }
     if previous == 0 {
-        return Err(ParseError::InvalidXml);
+        return Err(ParseError::NotWellFormed);
+    }
+    if unsupported_version {
+        return Err(ParseError::UnsupportedVersion);
+    }
+    if unsupported_encoding {
+        return Err(ParseError::UnsupportedEncoding);
     }
     Ok(())
 }
@@ -521,6 +568,15 @@ impl From<quick_xml::Error> for ParseError {
     fn from(error: quick_xml::Error) -> Self {
         if matches!(error, quick_xml::Error::Encoding(_)) {
             return Self::UnsupportedEncoding;
+        }
+        if matches!(
+            error,
+            quick_xml::Error::Syntax(_)
+                | quick_xml::Error::IllFormed(_)
+                | quick_xml::Error::InvalidAttr(_)
+                | quick_xml::Error::Escape(_)
+        ) {
+            return Self::NotWellFormed;
         }
         if let quick_xml::Error::Io(error) = &error
             && let Some(limit) = error
@@ -543,6 +599,7 @@ impl fmt::Display for ParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Xml(_) | Self::InvalidXml => "invalid XML input",
+            Self::NotWellFormed => "XML input is not well-formed",
             Self::Build(_) => "cannot build incoming XML element",
             Self::SizeLimitExceeded { .. } => "XML input exceeds the byte limit",
             Self::TooManyAttributes => "too many XML attributes",

@@ -1149,10 +1149,10 @@ fn fatal_errors_override_recoverable_envelopes_and_release_the_pool() -> TestRes
             assert!(
                 matches!(
                     (&error, expected),
-                    (ParseError::Xml(_), "xml")
+                    (ParseError::NotWellFormed, "xml")
                         | (ParseError::RestrictedXml, "restricted")
                         | (ParseError::InvalidNamespace, "namespace")
-                        | (ParseError::Build(BuildError::InvalidText), "text")
+                        | (ParseError::NotWellFormed, "text")
                         | (ParseError::Build(BuildError::TreeLimitExceeded), "tree")
                         | (ParseError::SizeLimitExceeded { .. }, "size")
                         | (ParseError::Build(BuildError::Allocation(_)), "allocation")
@@ -1653,4 +1653,160 @@ fn prefixed_stanza_keeps_a_different_default_namespace() -> TestResult {
         }
         Ok(())
     })
+}
+
+#[test]
+fn xml_grammar_errors_are_not_well_formed_and_poison_the_parser() -> TestResult {
+    for chunk in [1, usize::MAX] {
+        block_on(async {
+            for malformed in [
+                "<message><body></message>",
+                "<message id='a' id='b'/>",
+                "<message id='a<b'/>",
+                "<message><body>]]></body></message>",
+                "<message xmlns:a='urn:x' xmlns:b='urn:x' a:x='1' b:x='2'/>",
+                "<message><1bad/></message>",
+                "<message><a:b:c/></message>",
+                "<message 1bad='x'/>",
+                "<message id=unquoted/>",
+                "<message",
+                "<message id='unterminated",
+                "<message id='&#invalid;'/>",
+                "<message id='\0'/>",
+                "<message xmlns:x='urn:\0'/>",
+                "<message><body>\0</body></message>",
+                "<message><body><![CDATA[\0]]></body></message>",
+                "<message><body>&#0;</body></message>",
+                "<message><body>&#x110000;</body></message>",
+                "<message><body>&#invalid;</body></message>",
+                "<?xml version='1.0'?><message/>",
+                "<message><?xml version='1.0'?></message>",
+            ] {
+                let input = format!("{OPEN}{malformed}<presence/>{CLOSE}");
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                open(&mut parser).await?;
+                let error = parser
+                    .next_event()
+                    .await
+                    .err()
+                    .ok_or("expected grammar error")?;
+                assert!(
+                    matches!(error, ParseError::NotWellFormed),
+                    "{malformed:?}: {error:?}"
+                );
+                assert!(matches!(
+                    parser.next_event().await,
+                    Err(ParseError::ParserFailed)
+                ));
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn xml_declaration_grammar_and_position_errors_are_not_well_formed() -> TestResult {
+    for chunk in [1, usize::MAX] {
+        block_on(async {
+            for declaration in [
+                "<?xml?>",
+                "<?xml encoding='UTF-8'?>",
+                "<?xml encoding='ISO-8859-1'?>",
+                "<?xml version='1.1' unexpected='yes'?>",
+                "<?xml version='1.0' unexpected='yes'?>",
+                "<?xml version='1.0' standalone='invalid'?>",
+                "<?xml version='1.0' standalone='yes' encoding='UTF-8'?>",
+                "<?xml version='1.0' version='1.0'?>",
+                "<?xml version='invalid'?>",
+                "<?xml version='1.'?>",
+                "<?xml version='1.0' encoding='9invalid'?>",
+                " <?xml version='1.0'?>",
+                "<?xml version='1.0'?><?xml version='1.0'?>",
+            ] {
+                let input = format!("{declaration}{OPEN}");
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                let error = parser
+                    .next_event()
+                    .await
+                    .err()
+                    .ok_or("expected declaration error")?;
+                assert!(
+                    matches!(error, ParseError::NotWellFormed),
+                    "{declaration:?}: {error:?}"
+                );
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn stream_character_data_checks_grammar_before_xmpp_structure() -> TestResult {
+    for chunk in [1, usize::MAX] {
+        block_on(async {
+            for (text, malformed) in [
+                ("]]>", true),
+                ("\0", true),
+                ("\u{1}", true),
+                ("<![CDATA[\u{1}]]>", true),
+                ("<![CDATA[\u{fffe}]]>", true),
+                ("&#0;", true),
+                ("&#1;", true),
+                ("&#xFFFE;", true),
+                ("&#x110000;", true),
+                ("&#invalid;", true),
+                ("ordinary text", false),
+                ("<![CDATA[ordinary text]]>", false),
+                ("&#65;", false),
+                ("&unknown;", false),
+            ] {
+                let input = format!("{OPEN}{text}{CLOSE}");
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                open(&mut parser).await?;
+                let error = parser
+                    .next_event()
+                    .await
+                    .err()
+                    .ok_or("expected stream text error")?;
+                assert!(
+                    matches!(
+                        (&error, malformed),
+                        (ParseError::NotWellFormed, true) | (ParseError::UnexpectedEvent, false)
+                    ),
+                    "{text:?}: {error:?}"
+                );
+            }
+            for text in [
+                "ordinary text",
+                "<![CDATA[ordinary text]]>",
+                "&#65;",
+                "]]&gt;",
+            ] {
+                let input = format!("{OPEN}<message><body>{text}</body></message>{CLOSE}");
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                open(&mut parser).await?;
+                stanza(&mut parser).await?;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
 }

@@ -206,6 +206,43 @@ mod tests {
                 ParseError::from(quick_xml::Error::from(std::io::Error::other("transport"))),
                 CloseOutcome::TransportError,
             ),
+            (
+                ParseError::from(quick_xml::Error::Namespace(
+                    quick_xml::name::NamespaceError::UnknownPrefix("p".to_owned()),
+                )),
+                CloseOutcome::NotWellFormed,
+            ),
+            (
+                ParseError::from(quick_xml::Error::Namespace(
+                    quick_xml::name::NamespaceError::InvalidXmlPrefixBind("urn:bad".to_owned()),
+                )),
+                CloseOutcome::NotWellFormed,
+            ),
+            (
+                ParseError::from(quick_xml::Error::Namespace(
+                    quick_xml::name::NamespaceError::InvalidXmlnsPrefixBind("urn:bad".to_owned()),
+                )),
+                CloseOutcome::NotWellFormed,
+            ),
+            (
+                ParseError::from(quick_xml::Error::Namespace(
+                    quick_xml::name::NamespaceError::InvalidPrefixForXml("p".to_owned()),
+                )),
+                CloseOutcome::NotWellFormed,
+            ),
+            (
+                ParseError::from(quick_xml::Error::Namespace(
+                    quick_xml::name::NamespaceError::InvalidPrefixForXmlns("p".to_owned()),
+                )),
+                CloseOutcome::NotWellFormed,
+            ),
+            (
+                ParseError::from(quick_xml::Error::Namespace(
+                    quick_xml::name::NamespaceError::TooManyBindings(1),
+                )),
+                CloseOutcome::ParserError,
+            ),
+            (ParseError::ParserFailed, CloseOutcome::ParserError),
         ] {
             assert_eq!(CloseOutcome::from_parse_error(&error), outcome, "{error:?}");
         }

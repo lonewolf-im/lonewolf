@@ -447,6 +447,79 @@ fn rejects_malformed_and_restricted_xml() -> TestResult {
 }
 
 #[test]
+fn invalid_namespace_declarations_are_not_well_formed_errors() -> TestResult {
+    const INVALID_DECLARATIONS: [&str; 6] = [
+        "xmlns:p=''",
+        "xmlns:p='http://www.w3.org/2000/xmlns/'",
+        "xmlns:p='http://www.w3.org/XML/1998/namespace'",
+        "xmlns='http://www.w3.org/XML/1998/namespace'",
+        "xmlns:xml='urn:bad'",
+        "xmlns:xmlns='urn:bad'",
+    ];
+
+    block_on(async {
+        for declaration in INVALID_DECLARATIONS {
+            let input = format!("{OPEN}<message {declaration}/>{CLOSE}");
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            assert!(
+                matches!(parser.next_event().await, Err(ParseError::NotWellFormed)),
+                "accepted or misclassified {declaration:?}"
+            );
+
+            let stream = format!(
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' {declaration}>"
+            );
+            let mut parser =
+                XmppParser::new(stream.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            assert!(
+                matches!(parser.next_event().await, Err(ParseError::NotWellFormed)),
+                "accepted or misclassified stream declaration {declaration:?}"
+            );
+        }
+
+        let input = format!(
+            "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:xml='http://www.w3.org/XML/1998/namespace'><message xmlns:xml='http://www.w3.org/XML/1998/namespace'/>{CLOSE}"
+        );
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        assert!(matches!(
+            parser.next_event().await?,
+            Some(StreamEvent::Stanza(_))
+        ));
+        Ok(())
+    })
+}
+
+#[test]
+fn quick_xml_namespace_errors_preserve_well_formedness_classification() {
+    use quick_xml::name::NamespaceError;
+
+    for error in [
+        NamespaceError::UnknownPrefix("p".to_owned()),
+        NamespaceError::InvalidXmlPrefixBind("urn:bad".to_owned()),
+        NamespaceError::InvalidXmlnsPrefixBind("urn:bad".to_owned()),
+        NamespaceError::InvalidPrefixForXml("p".to_owned()),
+        NamespaceError::InvalidPrefixForXmlns("p".to_owned()),
+    ] {
+        assert!(matches!(
+            ParseError::from(quick_xml::Error::Namespace(error)),
+            ParseError::NotWellFormed
+        ));
+    }
+
+    for error in [
+        NamespaceError::TooManyBindings(1),
+        NamespaceError::TooDeeplyNested(1),
+    ] {
+        assert!(matches!(
+            ParseError::from(quick_xml::Error::Namespace(error)),
+            ParseError::Xml(quick_xml::Error::Namespace(_))
+        ));
+    }
+}
+
+#[test]
 fn unbound_prefix_remains_fatal() -> TestResult {
     block_on(async {
         let input = format!("{OPEN}<x:message/>");
@@ -1336,7 +1409,7 @@ fn fatal_errors_override_recoverable_envelopes_and_release_the_pool() -> TestRes
                     (&error, expected),
                     (ParseError::NotWellFormed, "xml")
                         | (ParseError::RestrictedXml, "restricted")
-                        | (ParseError::InvalidNamespace, "namespace")
+                        | (ParseError::NotWellFormed, "namespace")
                         | (ParseError::NotWellFormed, "text")
                         | (ParseError::Build(BuildError::TreeLimitExceeded), "tree")
                         | (ParseError::SizeLimitExceeded { .. }, "size")

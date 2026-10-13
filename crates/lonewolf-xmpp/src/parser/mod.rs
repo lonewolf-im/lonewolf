@@ -576,6 +576,18 @@ impl From<quick_xml::Error> for ParseError {
             return Self::UnsupportedEncoding;
         }
         if matches!(
+            &error,
+            quick_xml::Error::Namespace(
+                quick_xml::name::NamespaceError::UnknownPrefix(_)
+                    | quick_xml::name::NamespaceError::InvalidXmlPrefixBind(_)
+                    | quick_xml::name::NamespaceError::InvalidXmlnsPrefixBind(_)
+                    | quick_xml::name::NamespaceError::InvalidPrefixForXml(_)
+                    | quick_xml::name::NamespaceError::InvalidPrefixForXmlns(_)
+            )
+        ) {
+            return Self::NotWellFormed;
+        }
+        if matches!(
             error,
             quick_xml::Error::Syntax(_)
                 | quick_xml::Error::IllFormed(_)

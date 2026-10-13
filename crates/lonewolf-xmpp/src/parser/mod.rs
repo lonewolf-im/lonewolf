@@ -361,10 +361,17 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                 }
                 Event::GeneralRef(reference) => {
                     let character = reference.resolve_char_ref()?;
+                    if character.is_none() {
+                        xml::validate_name(&reference, "", false)
+                            .map_err(|_| ParseError::NotWellFormed)?;
+                    }
                     if self.frames.is_empty() {
                         if let Some(ch) = character {
                             xml::validate_text(ch.encode_utf8(&mut [0; 4]))
                                 .map_err(|_| ParseError::NotWellFormed)?;
+                        } else if quick_xml::escape::resolve_predefined_entity(&reference).is_none()
+                        {
+                            return Err(ParseError::RestrictedXml);
                         }
                         return Err(ParseError::UnexpectedEvent);
                     }
@@ -574,6 +581,13 @@ impl From<quick_xml::Error> for ParseError {
     fn from(error: quick_xml::Error) -> Self {
         if matches!(error, quick_xml::Error::Encoding(_)) {
             return Self::UnsupportedEncoding;
+        }
+        if matches!(
+            &error,
+            quick_xml::Error::Escape(quick_xml::escape::EscapeError::UnrecognizedEntity(_, name))
+                if xml::validate_name(name, "", false).is_ok()
+        ) {
+            return Self::RestrictedXml;
         }
         if matches!(
             &error,

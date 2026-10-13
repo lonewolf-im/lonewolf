@@ -20,6 +20,7 @@ pub(crate) enum CloseOutcome {
     UnsupportedInput,
     UnsupportedStanzaType,
     SizeLimitExceeded,
+    ParserLimitExceeded,
     ParserError,
     HostUnknown,
     InvalidTo,
@@ -51,6 +52,12 @@ impl CloseOutcome {
         }
         match error {
             ParseError::SizeLimitExceeded { .. } => Self::SizeLimitExceeded,
+            ParseError::TooManyAttributes
+            | ParseError::Build(BuildError::TreeLimitExceeded)
+            | ParseError::Build(BuildError::Allocation(ArenaError::ArenaLimitExceeded)) => {
+                Self::ParserLimitExceeded
+            }
+            ParseError::Build(BuildError::Allocation(_)) => Self::InternalError,
             ParseError::InvalidNamespace => Self::InvalidNamespace,
             ParseError::InvalidXml => Self::InvalidXml,
             ParseError::NotWellFormed | ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
@@ -66,6 +73,7 @@ impl CloseOutcome {
             Self::SystemShutdown => Some(StreamErrorCondition::SystemShutdown),
             Self::UnsupportedInput => Some(StreamErrorCondition::NotAuthorized),
             Self::SizeLimitExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::ParserLimitExceeded => Some(StreamErrorCondition::PolicyViolation),
             Self::ParserError | Self::InvalidLanguage | Self::InvalidTo => {
                 Some(StreamErrorCondition::BadFormat)
             }
@@ -97,6 +105,7 @@ impl CloseOutcome {
             Self::UnsupportedInput => "unsupported_input",
             Self::UnsupportedStanzaType => "unsupported_stanza_type",
             Self::SizeLimitExceeded => "size_limit_exceeded",
+            Self::ParserLimitExceeded => "parser_limit_exceeded",
             Self::ParserError => "parser_error",
             Self::HostUnknown => "host_unknown",
             Self::InvalidTo => "invalid_to",
@@ -189,18 +198,27 @@ mod tests {
             (ParseError::InvalidXml, CloseOutcome::InvalidXml),
             (ParseError::UnexpectedEvent, CloseOutcome::ParserError),
             (ParseError::UnexpectedEof, CloseOutcome::ParserError),
-            (ParseError::TooManyAttributes, CloseOutcome::ParserError),
+            (
+                ParseError::TooManyAttributes,
+                CloseOutcome::ParserLimitExceeded,
+            ),
             (
                 ParseError::Build(BuildError::InvalidText),
                 CloseOutcome::ParserError,
             ),
             (
                 ParseError::Build(BuildError::TreeLimitExceeded),
-                CloseOutcome::ParserError,
+                CloseOutcome::ParserLimitExceeded,
             ),
             (
                 ParseError::Build(BuildError::Allocation(ArenaError::ArenaLimitExceeded)),
-                CloseOutcome::ParserError,
+                CloseOutcome::ParserLimitExceeded,
+            ),
+            (
+                ParseError::Build(BuildError::Allocation(ArenaError::Allocation(
+                    lonewolf_util::arena::AllocationError::Exhausted,
+                ))),
+                CloseOutcome::InternalError,
             ),
             (
                 ParseError::from(quick_xml::Error::from(std::io::Error::other("transport"))),
@@ -246,5 +264,17 @@ mod tests {
         ] {
             assert_eq!(CloseOutcome::from_parse_error(&error), outcome, "{error:?}");
         }
+    }
+
+    #[test]
+    fn parser_limit_outcome_is_policy_violation_and_has_a_distinct_name() {
+        assert_eq!(
+            CloseOutcome::ParserLimitExceeded.stream_condition(),
+            Some(StreamErrorCondition::PolicyViolation)
+        );
+        assert_eq!(
+            CloseOutcome::ParserLimitExceeded.as_str(),
+            "parser_limit_exceeded"
+        );
     }
 }

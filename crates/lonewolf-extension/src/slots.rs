@@ -11,9 +11,9 @@ use crate::archive::ArchiveHandler;
 use crate::discovery::{DiscoScope, Identity};
 use crate::iq::{IqHandler, IqRoute};
 use crate::message::MessageHandler;
-use crate::observer::MessageObserver;
+use crate::observer::{MessageObserver, SessionObserver};
 use crate::policy::PolicyHandler;
-use crate::presence::{PresenceHandler, PresenceRequestType};
+use crate::presence::{PresenceDecorator, PresenceHandler, PresenceRequestType};
 use crate::service::ServiceHandler;
 use crate::{ExtensionRegistry, RegistrationError};
 
@@ -102,6 +102,32 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
         self.registry
             .message_observers
             .push((self.extension, handler));
+    }
+
+    pub fn session_observer(&mut self, handler: Arc<dyn SessionObserver<A, S>>) {
+        self.registry
+            .session_observers
+            .push((self.extension, handler));
+    }
+
+    /// Claims the broadcast presence child for this host.
+    pub fn presence_decoration(
+        &mut self,
+        name: &'static str,
+        namespace: &'static str,
+        handler: Arc<dyn PresenceDecorator<A, S>>,
+    ) -> Result<(), RegistrationError> {
+        if self.registry.presence_decorations.iter().any(
+            |(_, registered_name, registered_namespace, _)| {
+                *registered_name == name && *registered_namespace == namespace
+            },
+        ) {
+            return Err(RegistrationError::DuplicatePresenceDecoration { name, namespace });
+        }
+        self.registry
+            .presence_decorations
+            .push((self.extension, name, namespace, handler));
+        Ok(())
     }
 
     pub fn policy(&mut self, handler: Arc<dyn PolicyHandler<S>>) {

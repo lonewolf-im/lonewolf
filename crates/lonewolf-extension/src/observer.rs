@@ -3,10 +3,12 @@
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::RoutedStanza;
 
 use crate::archive::ArchiveId;
 use crate::delivery::{Delivery, DeliveryFuture};
+use crate::presence::PresenceTransition;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageRole {
@@ -29,7 +31,6 @@ pub enum MessageOutcome {
 }
 
 pub struct MessageEvent<'a, A: ChunkAllocator> {
-    /// The local account the event concerns.
     pub account: &'a AccountKey,
     pub role: MessageRole,
     /// The message as routed, including its stanza ID.
@@ -53,6 +54,48 @@ pub trait MessageObserver<A: ChunkAllocator, S: Storage>: Send + Sync {
     fn observe<'a>(
         &'a self,
         event: MessageEvent<'a, A>,
+        storage: &'a S,
+        delivery: &'a dyn Delivery<A>,
+    ) -> DeliveryFuture<'a>;
+}
+
+pub enum SessionEvent<'a, A: ChunkAllocator> {
+    /// The resource is bound and can receive stanzas.
+    Bound,
+    Presence {
+        transition: PresenceTransition,
+        stanza: &'a RoutedStanza<A>,
+    },
+    Ended,
+}
+
+impl<A: ChunkAllocator> Copy for SessionEvent<'_, A> {}
+
+impl<A: ChunkAllocator> Clone for SessionEvent<'_, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub struct SessionChange<'a, A: ChunkAllocator> {
+    /// The resource's full JID.
+    pub session: JidRef<'a>,
+    pub event: SessionEvent<'a, A>,
+}
+
+impl<A: ChunkAllocator> Copy for SessionChange<'_, A> {}
+
+impl<A: ChunkAllocator> Clone for SessionChange<'_, A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub trait SessionObserver<A: ChunkAllocator, S: Storage>: Send + Sync {
+    /// Runs after the change and cannot change the session.
+    fn session_changed<'a>(
+        &'a self,
+        change: SessionChange<'a, A>,
         storage: &'a S,
         delivery: &'a dyn Delivery<A>,
     ) -> DeliveryFuture<'a>;

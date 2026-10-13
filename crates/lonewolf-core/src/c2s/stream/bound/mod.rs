@@ -20,7 +20,9 @@ use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqSco
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
-use lonewolf_extension::observer::{MessageEvent, MessageOutcome, MessageRole};
+use lonewolf_extension::observer::{
+    MessageEvent, MessageOutcome, MessageRole, SessionChange, SessionEvent,
+};
 use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
@@ -303,6 +305,9 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
 
 impl<A: ChunkAllocator + Clone> BoundSession<'_, A, LinkWriter<A>> {
     async fn run(&mut self) -> CloseOutcome {
+        if let Err(outcome) = self.announce_bound().await {
+            return outcome;
+        }
         let mut prefer_outbound = true;
         loop {
             let selected = {
@@ -355,6 +360,40 @@ impl<A: ChunkAllocator + Clone> BoundSession<'_, A, LinkWriter<A>> {
 }
 
 impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
+    async fn announce_bound(&mut self) -> Result<(), CloseOutcome> {
+        let account = self.registration.account();
+        if self.router.session_observers(account.domain()).is_empty() {
+            return Ok(());
+        }
+        let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+        let session = Jid::from_trusted_parts_in(
+            Some(account.username()),
+            account.domain(),
+            Some(self.registration.resource()),
+            &mut arena,
+        )?;
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: &self.work,
+        };
+        let delivery = self.delivery();
+        self.outbox
+            .drain_until(
+                &self.registration,
+                observe::session(
+                    &stage,
+                    &delivery,
+                    SessionChange {
+                        session: session.resolve(&arena)?,
+                        event: SessionEvent::Bound,
+                    },
+                ),
+            )
+            .await
+    }
+
     async fn end(&mut self) -> Result<(), CloseOutcome> {
         let work = TerminalPresenceWork {
             session: self.registration.handle(),
@@ -370,7 +409,34 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         Pending::spawn(self.outbox.work.start(), work.run())
             .finished()
             .await
-            .ok_or(CloseOutcome::InternalError)?
+            .ok_or(CloseOutcome::InternalError)??;
+        let account = self.registration.account();
+        if !self.router.session_observers(account.domain()).is_empty() {
+            let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+            let session = Jid::from_trusted_parts_in(
+                Some(account.username()),
+                account.domain(),
+                Some(self.registration.resource()),
+                &mut arena,
+            )?;
+            let stage = Stage {
+                router: &self.router,
+                storage: &self.storage,
+                allocator: &self.allocator,
+                work: &self.work,
+            };
+            let delivery = RouterDelivery::new(&self.router, &self.allocator, None);
+            observe::session(
+                &stage,
+                &delivery,
+                SessionChange {
+                    session: session.resolve(&arena)?,
+                    event: SessionEvent::Ended,
+                },
+            )
+            .await;
+        }
+        Ok(())
     }
 
     fn unavailable_notice(&self) -> Result<RoutedStanza<A>, CloseOutcome> {
@@ -1455,7 +1521,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             None
         };
         let (source, mut arena) = parsed.into_parts();
-        let (stamped, from, to) = self.stamp_in(source, &mut arena, true)?;
+        let (mut stamped, from, to) = self.stamp_in(source, &mut arena, true)?;
         let unavailable = if available {
             Some(
                 Stanza::builder_in(
@@ -1488,66 +1554,101 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .router
             .message_handler(self.registration.account().domain())
             .cloned();
+        let decorations = self
+            .router
+            .presence_decorations(self.registration.account().domain());
+        let decorate = available && !decorations.is_empty();
         let registration = &self.registration;
         let router = &self.router;
         let storage = &self.storage;
         let work_group = self.outbox.work;
         let prepare = async {
-            let (result, ticket) =
-                if presence_handler.is_some() || (candidate && message_handler.is_some()) {
-                    let owner = registration.account();
-                    let (transaction, ticket) = Arc::clone(router.order())
-                        .fix(vec![owner.clone()], storage.begin_read())
-                        .await
-                        .map_err(|error| {
-                            close_storage_failure(error, "presence_snapshot_begin_read", owner)
-                        })?;
+            let (result, ticket) = if presence_handler.is_some()
+                || (candidate && message_handler.is_some())
+                || decorate
+            {
+                let owner = registration.account();
+                let (transaction, ticket) = Arc::clone(router.order())
+                    .fix(vec![owner.clone()], storage.begin_read())
+                    .await
+                    .map_err(|error| {
+                        close_storage_failure(error, "presence_snapshot_begin_read", owner)
+                    })?;
+                let sender = from.resolve(&arena)?;
+                let mut result = async {
+                    let audience = match presence_handler {
+                        Some(handler) => {
+                            handler
+                                .audience(PresenceUpdate { sender, transition }, &transaction)
+                                .await?
+                        }
+                        None => None,
+                    };
+                    let backlog = match message_handler.as_ref().filter(|_| candidate) {
+                        Some(handler) => handler.backlog(owner, &transaction).await?,
+                        None => None,
+                    };
+                    Ok((audience, backlog))
+                }
+                .await;
+                if let Ok((Some(audience), _)) = &mut result {
                     let sender = from.resolve(&arena)?;
-                    let mut result = async {
-                        let audience = match presence_handler {
-                            Some(handler) => {
-                                handler
-                                    .audience(PresenceUpdate { sender, transition }, &transaction)
-                                    .await?
+                    policy::filter_audience(
+                        router,
+                        &transaction,
+                        &self.allocator,
+                        owner,
+                        sender,
+                        StanzaType::Presence(if available {
+                            PresenceType::Available
+                        } else {
+                            PresenceType::Unavailable
+                        }),
+                        audience,
+                    )
+                    .await
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                }
+                if decorate {
+                    let mut children = Vec::with_capacity(decorations.len());
+                    for (extension, name, namespace, handler) in decorations {
+                        match handler.decorate(owner, &transaction, &mut arena).await {
+                            Ok(Some(element)) => {
+                                let child = element.resolve(&arena)?;
+                                if child.name() == *name && child.namespace() == *namespace {
+                                    children.push((*name, *namespace, element));
+                                } else {
+                                    tracing::error!(
+                                        extension,
+                                        operation = "presence_decoration",
+                                        outcome = "misnamed",
+                                        "internal operation failed"
+                                    );
+                                }
                             }
-                            None => None,
-                        };
-                        let backlog = match message_handler.as_ref().filter(|_| candidate) {
-                            Some(handler) => handler.backlog(owner, &transaction).await?,
-                            None => None,
-                        };
-                        Ok((audience, backlog))
+                            Ok(None) => {}
+                            Err(error) => report_handler_failure(&error, owner),
+                        }
                     }
-                    .await;
-                    if let Ok((Some(audience), _)) = &mut result {
-                        let sender = from.resolve(&arena)?;
-                        policy::filter_audience(
-                            router,
-                            &transaction,
-                            &self.allocator,
-                            owner,
-                            sender,
-                            StanzaType::Presence(if available {
-                                PresenceType::Available
-                            } else {
-                                PresenceType::Unavailable
-                            }),
-                            audience,
-                        )
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
+                    if !children.is_empty() {
+                        let mut builder = stamped.derive_in(&mut arena)?;
+                        for (name, namespace, element) in children {
+                            builder = builder.remove_children(name, namespace)?.child(element)?;
+                        }
+                        stamped = builder.build()?;
                     }
-                    drop(transaction);
-                    (result, ticket)
-                } else {
-                    let ((), ticket) = router
-                        .order()
-                        .fix(vec![registration.account().clone()], async {
-                            Ok::<_, CloseOutcome>(())
-                        })
-                        .await?;
-                    (Ok((None, None)), ticket)
-                };
+                }
+                drop(transaction);
+                (result, ticket)
+            } else {
+                let ((), ticket) = router
+                    .order()
+                    .fix(vec![registration.account().clone()], async {
+                        Ok::<_, CloseOutcome>(())
+                    })
+                    .await?;
+                (Ok((None, None)), ticket)
+            };
             let (audience, backlog) = match result {
                 Ok(result) => result,
                 Err(error) => {
@@ -1606,6 +1707,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         // The router's mailbox cut keeps earlier sibling updates ahead of this echo.
         self.outbox.delivered(outcome.change.preceding);
         self.outbox.routed(outcome.change.siblings);
+        let echo = (!self
+            .router
+            .session_observers(self.registration.account().domain())
+            .is_empty())
+        .then(|| outcome.echo.clone());
         self.outbox.push(Output::Routed(outcome.echo));
         self.outbox.routed(outcome.replay);
         if !outcome.requests.is_empty() {
@@ -1615,6 +1721,39 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             && let Some(handler) = message_handler
         {
             self.outbox.push(Output::Offline { backlog, handler });
+        }
+        if let Some(echo) = echo {
+            let account = self.registration.account();
+            let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+            let session = Jid::from_trusted_parts_in(
+                Some(account.username()),
+                account.domain(),
+                Some(self.registration.resource()),
+                &mut arena,
+            )?;
+            let stage = Stage {
+                router: &self.router,
+                storage: &self.storage,
+                allocator: &self.allocator,
+                work: &self.work,
+            };
+            let delivery = self.delivery();
+            self.outbox
+                .drain_until(
+                    &self.registration,
+                    observe::session(
+                        &stage,
+                        &delivery,
+                        SessionChange {
+                            session: session.resolve(&arena)?,
+                            event: SessionEvent::Presence {
+                                transition,
+                                stanza: &echo,
+                            },
+                        },
+                    ),
+                )
+                .await?;
         }
         Ok(())
     }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::observer::{MessageEvent, MessageOutcome};
+use lonewolf_extension::observer::{MessageEvent, MessageOutcome, SessionChange};
 use lonewolf_util::arena::ChunkAllocator;
 
 use super::Stage;
@@ -24,6 +24,28 @@ pub(crate) async fn message<A: ChunkAllocator + Clone>(
                 operation = "message_observer",
                 extension = name,
                 account_jid = ?event.account.as_str(),
+                "internal operation failed"
+            );
+        }
+    }
+}
+
+pub(crate) async fn session<A: ChunkAllocator + Clone>(
+    stage: &Stage<'_, A>,
+    delivery: &RouterDelivery<A>,
+    change: SessionChange<'_, A>,
+) {
+    for (name, observer) in stage.router.session_observers(change.session.domainpart()) {
+        if observer
+            .session_changed(change, stage.storage, delivery)
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                failure_kind = "delivery",
+                operation = "session_observer",
+                extension = name,
+                account_jid = ?change.session.bare().as_str(),
                 "internal operation failed"
             );
         }
@@ -59,7 +81,9 @@ mod tests {
     use compio::runtime::Runtime;
     use lonewolf_extension::archive::ArchiveId;
     use lonewolf_extension::delivery::{Delivery, DeliveryError, DeliveryFuture, FailureKind};
-    use lonewolf_extension::observer::{MessageObserver, MessageRole};
+    use lonewolf_extension::observer::{
+        MessageObserver, MessageRole, SessionEvent, SessionObserver,
+    };
     use lonewolf_extension::{Extension, Extensions, RegistrationError, Slots};
     use lonewolf_storage::RedbStorage;
     use lonewolf_storage::account::AccountKey;
@@ -231,6 +255,116 @@ mod tests {
                         MessageOutcome::Routed,
                         Some(ArchiveId::new(8))
                     ),
+                ]
+            );
+            router.shutdown().await?;
+            Ok(())
+        })
+    }
+
+    struct RecordingSessionObserver {
+        name: &'static str,
+        fail: bool,
+        calls: Arc<PlMutex<Vec<(&'static str, String)>>>,
+    }
+
+    impl Extension<GlobalChunkAllocator, RedbStorage> for RecordingSessionObserver {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn register(
+            self: Arc<Self>,
+            _: &str,
+            slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+        ) -> Result<(), RegistrationError> {
+            slots.session_observer(self);
+            Ok(())
+        }
+    }
+
+    impl SessionObserver<GlobalChunkAllocator, RedbStorage> for RecordingSessionObserver {
+        fn session_changed<'a>(
+            &'a self,
+            change: SessionChange<'a, GlobalChunkAllocator>,
+            _: &'a RedbStorage,
+            _: &'a dyn Delivery<GlobalChunkAllocator>,
+        ) -> DeliveryFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .push((self.name, change.session.as_str().into()));
+                if self.fail {
+                    Err(DeliveryError)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn session_observers_keep_host_enable_order_and_continue_after_failure() -> TestResult {
+        Runtime::new()?.block_on(async {
+            let directory = tempfile::tempdir()?;
+            let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+            let config = Config::default();
+            let hosts = Hosts::new(&config.hosts, None)?;
+            let calls = Arc::new(PlMutex::new(Vec::new()));
+            let mut extensions = Extensions::default();
+            for (name, fail) in [("z-first", true), ("a-second", false)] {
+                extensions.register(Arc::new(RecordingSessionObserver {
+                    name,
+                    fail,
+                    calls: Arc::clone(&calls),
+                }))?;
+            }
+            let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator))
+                .with_extensions(BTreeMap::from([
+                    (
+                        "localhost".into(),
+                        extensions.enable_host("localhost", ["z-first", "a-second"])?,
+                    ),
+                    (
+                        "other.localhost".into(),
+                        extensions.enable_host("other.localhost", ["a-second"])?,
+                    ),
+                ]));
+            let handle = router.handle();
+            assert!(handle.session_observers("unknown.localhost").is_empty());
+            let work = WorkGroup::new().handle();
+            let stage = Stage {
+                router: &handle,
+                storage: &storage,
+                allocator: &GlobalChunkAllocator,
+                work: &work,
+            };
+            let delivery = RouterDelivery::new(&handle, &GlobalChunkAllocator, None);
+            let mut arena = Arena::try_new(Default::default())?;
+            let first = Jid::parse_in("alice@localhost/a", &mut arena)?;
+            let second = Jid::parse_in("bob@other.localhost/b", &mut arena)?;
+            let unknown = Jid::parse_in("carol@unknown.localhost/c", &mut arena)?;
+            let capture = Capture::default();
+            let subscriber = tracing::subscriber::set_default(capture.clone());
+            for session_jid in [first, second, unknown] {
+                session(
+                    &stage,
+                    &delivery,
+                    SessionChange {
+                        session: session_jid.resolve(&arena)?,
+                        event: SessionEvent::Bound,
+                    },
+                )
+                .await;
+            }
+            drop(subscriber);
+            capture.assert_one(FailureKind::Delivery, "session_observer");
+            assert_eq!(
+                *calls.lock(),
+                [
+                    ("z-first", "alice@localhost/a".into()),
+                    ("a-second", "alice@localhost/a".into()),
+                    ("a-second", "bob@other.localhost/b".into()),
                 ]
             );
             router.shutdown().await?;

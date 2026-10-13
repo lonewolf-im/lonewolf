@@ -18,12 +18,15 @@ use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
 use lonewolf_extension::message::{MessageHandler, StoreFuture, UndeliverableMessage};
-use lonewolf_extension::observer::{MessageEvent, MessageObserver, MessageOutcome, MessageRole};
+use lonewolf_extension::observer::{
+    MessageEvent, MessageObserver, MessageOutcome, MessageRole, SessionChange, SessionEvent,
+    SessionObserver,
+};
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::policy::{Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
 use lonewolf_extension::presence::{
-    PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
-    PresenceTransition, PresenceUpdate,
+    PresenceAudience, PresenceDecorator, PresenceFuture, PresenceHandler, PresenceRequest,
+    PresenceRequestType, PresenceTransition, PresenceUpdate,
 };
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_extension::{
@@ -124,6 +127,16 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(TestMessageObserver {
         events: PlMutex::new(Vec::new()),
     }))?;
+    extensions.register(Arc::new(TestSessionObserver {
+        events: PlMutex::new(Vec::new()),
+    }))?;
+    for kind in [
+        DecorationKind::Valid,
+        DecorationKind::Failing,
+        DecorationKind::Conflicting,
+    ] {
+        extensions.register(Arc::new(TestDecoration(kind)))?;
+    }
     extensions.register(Arc::new(TestSecondArchive))?;
     extensions.register(Arc::new(TestDiscovery))?;
     extensions.register(Arc::new(TestPolicy {
@@ -1742,6 +1755,158 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestMessageObserver {
                 ),
                 Effects::none(),
             ))
+        })
+    }
+}
+
+const SESSION_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Server,
+    kind: IqRequestType::Get,
+    namespace: "urn:lonewolf:test:sessions",
+    name: "events",
+};
+
+struct TestSessionObserver {
+    events: PlMutex<Vec<(String, &'static str)>>,
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestSessionObserver {
+    fn name(&self) -> &'static str {
+        "test-session-observer"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(SESSION_ROUTE, self.clone())?;
+        slots.session_observer(self);
+        Ok(())
+    }
+}
+
+impl<A: ChunkAllocator> SessionObserver<A, RedbStorage> for TestSessionObserver {
+    fn session_changed<'a>(
+        &'a self,
+        change: SessionChange<'a, A>,
+        _: &'a RedbStorage,
+        _: &'a dyn Delivery<A>,
+    ) -> DeliveryFuture<'a> {
+        Box::pin(async move {
+            let kind = match change.event {
+                SessionEvent::Bound => "bound",
+                SessionEvent::Presence {
+                    transition: PresenceTransition::Initial,
+                    ..
+                } => "presence:initial",
+                SessionEvent::Presence {
+                    transition: PresenceTransition::Update,
+                    ..
+                } => "presence:update",
+                SessionEvent::Presence {
+                    transition: PresenceTransition::Unavailable,
+                    ..
+                } => "presence:unavailable",
+                SessionEvent::Ended => "ended",
+            };
+            self.events
+                .lock()
+                .push((change.session.as_str().into(), kind));
+            Ok(())
+        })
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestSessionObserver {
+    fn get<'a>(
+        &'a self,
+        _: IqRequest<'a, A>,
+        _: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let result = (|| {
+                let children = self
+                    .events
+                    .lock()
+                    .iter()
+                    .map(|(session, kind)| {
+                        Element::builder_in("event", SESSION_ROUTE.namespace, response)?
+                            .attribute("session", "", session)?
+                            .attribute("kind", "", kind)?
+                            .build()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut builder =
+                    Element::builder_in(SESSION_ROUTE.name, SESSION_ROUTE.namespace, response)?;
+                for child in children {
+                    builder = builder.child(child)?;
+                }
+                builder.build()
+            })();
+            result
+                .map(|payload| IqReply::new(Some(payload), Effects::none()))
+                .map_err(|_| StanzaErrorCondition::InternalServerError.into())
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DecorationKind {
+    Valid,
+    Failing,
+    Conflicting,
+}
+
+struct TestDecoration(DecorationKind);
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestDecoration {
+    fn name(&self) -> &'static str {
+        match self.0 {
+            DecorationKind::Valid => "test-decoration",
+            DecorationKind::Failing => "test-failing-decoration",
+            DecorationKind::Conflicting => "test-conflicting-decoration",
+        }
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        let (name, namespace) = match self.0 {
+            DecorationKind::Valid | DecorationKind::Conflicting => {
+                ("x", "urn:lonewolf:test:decoration")
+            }
+            DecorationKind::Failing => ("y", "urn:lonewolf:test:failing"),
+        };
+        slots.presence_decoration(name, namespace, self)
+    }
+}
+
+impl<A: ChunkAllocator> PresenceDecorator<A, RedbStorage> for TestDecoration {
+    fn decorate<'a>(
+        &'a self,
+        _: &'a AccountKey,
+        _: &'a RedbRead,
+        arena: &'a mut Arena<A>,
+    ) -> PresenceFuture<'a, Option<Element>> {
+        Box::pin(async move {
+            if matches!(self.0, DecorationKind::Failing) {
+                return Err(HandlerError::Internal {
+                    condition: StanzaErrorCondition::InternalServerError,
+                    failure: Failure {
+                        kind: FailureKind::Delivery,
+                        operation: "test_decoration",
+                    },
+                });
+            }
+            Element::builder_in("x", "urn:lonewolf:test:decoration", arena)
+                .and_then(|builder| builder.attribute("n", "", "1"))
+                .and_then(|builder| builder.build())
+                .map(Some)
+                .map_err(|_| StanzaErrorCondition::InternalServerError.into())
         })
     }
 }

@@ -916,6 +916,55 @@ fn complete_stanza_rejections_preserve_ids_and_allow_the_next_stanza() -> TestRe
 }
 
 #[test]
+fn rejected_iq_envelopes_preserve_address_validity_and_borrowed_metadata() -> TestResult {
+    block_on(async {
+        for (attributes, from, to, invalid_from, invalid_to) in [
+            ("", None, None, false, false),
+            (
+                "from='Alice@Example.org' to='Example.org'",
+                Some("alice@example.org"),
+                Some("example.org"),
+                false,
+                false,
+            ),
+            ("from='bad@'", None, None, true, false),
+            ("to='@bad'", None, None, false, true),
+            ("from='' to=''", None, None, true, true),
+        ] {
+            let input = format!("{OPEN}<iq type='bogus' id='a&amp;b' {attributes}/>{CLOSE}");
+            let mut parser = XmppParser::new(
+                Fragmented::new(input.as_bytes(), 1),
+                config(4096)?,
+                GlobalChunkAllocator,
+            );
+            open(&mut parser).await?;
+            let Some(StreamEvent::RejectedStanza(parsed)) = parser.next_event().await? else {
+                return Err("expected rejection".into());
+            };
+            let rejected = parsed.value();
+            assert_eq!(rejected.reason(), StanzaRejection::BadRequest);
+            assert_eq!(rejected.invalid_from(), invalid_from);
+            assert_eq!(rejected.invalid_to(), invalid_to);
+            assert_eq!(rejected.from(parsed.arena())?.map(|jid| jid.as_str()), from);
+            assert_eq!(rejected.to(parsed.arena())?.map(|jid| jid.as_str()), to);
+            assert_eq!(rejected.id(parsed.arena())?, Some("a&b"));
+
+            let foreign = Arena::try_new(ArenaConfig::default())?;
+            assert!(matches!(
+                rejected.from(&foreign),
+                Err(HandleError::WrongArena)
+            ));
+            assert!(matches!(
+                rejected.to(&foreign),
+                Err(HandleError::WrongArena)
+            ));
+            assert_eq!(rejected.id(&foreign), Err(HandleError::WrongArena));
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn rejected_stanza_error_checks_both_arena_owners_without_optional_metadata() -> TestResult {
     block_on(async {
         let input = format!("{OPEN}<iq/>");

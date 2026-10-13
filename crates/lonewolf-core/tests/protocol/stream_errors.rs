@@ -232,13 +232,15 @@ fn server_namespace_element_returns_invalid_namespace_before_binding() -> TestRe
 }
 
 #[test]
-fn rejected_iq_is_not_authorized_before_binding() -> TestResult {
+fn rejected_iq_allows_correction_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
     client.send(r#"<iq type='subscribe'/>"#)?;
-    client.expect_stream_error("not-authorized")
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id=''><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    assert_eq!(client.bind(Some("desktop"))?, "alice@localhost/desktop");
+    client.close()
 }
 
 #[test]
@@ -726,7 +728,14 @@ fn malformed_source_cannot_bypass_binding_identity_validation() -> TestResult {
     suite.create_account("alice", "pencil")?;
     let mut client = suite.authenticated_client("alice", "pencil")?;
     client.send("<iq type='set' id='bind' from='bad@'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desktop</resource></bind></iq>")?;
-    client.expect_stream_error("not-authorized")
+    client.expect_stream_error("invalid-from")?;
+
+    let mut replacement = suite.authenticated_client("alice", "pencil")?;
+    assert_eq!(
+        replacement.bind(Some("desktop"))?,
+        "alice@localhost/desktop"
+    );
+    replacement.close()
 }
 
 #[test]

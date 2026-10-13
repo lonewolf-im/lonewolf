@@ -434,6 +434,29 @@ fn malformed_and_resource_limit_bind_failures_share_the_retry_limit() -> TestRes
 }
 
 #[test]
+fn invalid_resource_and_resource_limit_bind_failures_share_the_retry_limit() -> TestResult {
+    let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 20")?;
+    suite.create_account("alice", "pencil")?;
+    let mut desktops = Vec::with_capacity(10);
+    for index in 0..10 {
+        desktops.push(suite.connect("alice", "pencil", &format!("desktop-{index}"))?);
+    }
+    let mut phone = suite.authenticated_client("alice", "pencil")?;
+    let overlong_resource = "a".repeat(1024);
+
+    for attempt in 0..6 {
+        if attempt % 2 == 0 {
+            phone.send(&format!("<iq type='set' id='invalid'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{overlong_resource}</resource></bind></iq>"))?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        } else {
+            phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        }
+    }
+    phone.expect_stream_error("policy-violation")
+}
+
+#[test]
 fn prefix_free_stream_returns_client_namespace_binding_and_iq_replies() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;

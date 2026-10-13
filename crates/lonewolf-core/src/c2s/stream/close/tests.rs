@@ -153,7 +153,7 @@ fn interrupted_stanza_serialization_never_appends_or_flushes_a_footer() -> TestR
         assert!(!writer.is_intact());
         let accepted = bytes.borrow().len();
         allowance.set(usize::MAX);
-        let mut input = reader(HEADER.into())?;
+        let (mut input, _, _) = probe_reader(HEADER.as_bytes().to_vec(), Tail::Panic);
         assert!(
             xml(
                 &mut input,
@@ -215,7 +215,7 @@ fn blocked_phase_writes_cancel_before_timeout_close_discards_application_bufferi
                 shutdown: std::future::pending::<Instant>().boxed_local().shared(),
                 phase_deadline: Some(deadline),
             };
-            let mut input = reader(HEADER.into())?;
+            let (mut input, _, _) = probe_reader(HEADER.as_bytes().to_vec(), Tail::Panic);
             assert_eq!(
                 finish_plain(&mut input, &mut writer, outcome.into(), &context).await,
                 outcome
@@ -270,7 +270,10 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
             shutdown: std::future::pending::<Instant>().boxed_local().shared(),
             phase_deadline: Some(deadline),
         };
-        let mut input = reader(format!("{HEADER}</stream:stream>"))?;
+        let (mut input, _, _) = probe_reader(
+            format!("{HEADER}</stream:stream>").into_bytes(),
+            Tail::Panic,
+        );
         assert_eq!(
             finish_plain(
                 &mut input,
@@ -471,6 +474,382 @@ fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestRes
             CloseOutcome::AuthenticationTimeout
         );
         assert_eq!(polls.get(), 1);
+        listener.close().await?;
+        Ok(())
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Tail {
+    Eof,
+    Error,
+    Ready,
+    Panic,
+}
+
+struct ProbeInput {
+    bytes: Cursor<Vec<u8>>,
+    reads: Rc<Cell<usize>>,
+    parser_polls: Rc<Cell<usize>>,
+    tail: Tail,
+}
+
+impl tokio::io::AsyncRead for ProbeInput {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.reads.set(self.reads.get() + 1);
+        if self.bytes.position() < self.bytes.get_ref().len() as u64 {
+            return Pin::new(&mut self.bytes).poll_read(cx, buffer);
+        }
+        match self.tail {
+            Tail::Eof => Poll::Ready(Ok(())),
+            Tail::Error => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+            Tail::Ready => {
+                buffer.put_slice(&[b'x'; 4096]);
+                Poll::Ready(Ok(()))
+            }
+            Tail::Panic => panic!("ineligible close polled its input"),
+        }
+    }
+}
+
+impl AsyncBufRead for ProbeInput {
+    fn poll_fill_buf(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let this = self.get_mut();
+        this.parser_polls.set(this.parser_polls.get() + 1);
+        if matches!(this.tail, Tail::Panic) {
+            panic!("ineligible close polled its parser");
+        }
+        let position = this.bytes.position() as usize;
+        Poll::Ready(Ok(&this.bytes.get_ref()[position..]))
+    }
+
+    fn consume(mut self: Pin<&mut Self>, count: usize) {
+        let position = self.bytes.position();
+        self.bytes.set_position(position + count as u64);
+    }
+}
+
+type ProbeReader = Reader<GlobalChunkAllocator, ProbeInput>;
+
+fn probe_reader(bytes: Vec<u8>, tail: Tail) -> (ProbeReader, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+    let reads = Rc::new(Cell::new(0));
+    let parser_polls = Rc::new(Cell::new(0));
+    let reader = Reader::new(
+        XmppParser::new(
+            ProbeInput {
+                bytes: Cursor::new(bytes),
+                reads: Rc::clone(&reads),
+                parser_polls: Rc::clone(&parser_polls),
+                tail,
+            },
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::MAX,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        ),
+        StanzaLimiter::new(NonZeroUsize::MIN, NonZeroUsize::MIN),
+    );
+    (reader, reads, parser_polls)
+}
+
+async fn test_context(
+    phase_deadline: Option<Instant>,
+    shutdown: ShutdownSignal,
+) -> TestResult<(CloseContext, compio::net::TcpListener, std::net::TcpStream)> {
+    let listener = crate::c2s::bind(std::net::SocketAddr::from((
+        std::net::Ipv4Addr::LOCALHOST,
+        0,
+    )))
+    .await?;
+    let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+    let (socket, _) = listener.accept().await?;
+    Ok((
+        CloseContext {
+            socket,
+            shutdown,
+            phase_deadline,
+        },
+        listener,
+        peer,
+    ))
+}
+
+#[test]
+fn plaintext_drain_yields_after_each_positive_read_and_maps_eof_and_errors() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for tail in [Tail::Eof, Tail::Error] {
+            let mut input = ProbeInput {
+                bytes: Cursor::new(vec![b'x'; 8192]),
+                reads: Rc::new(Cell::new(0)),
+                parser_polls: Rc::new(Cell::new(0)),
+                tail,
+            };
+            let reads = Rc::clone(&input.reads);
+            let mut drain = Box::pin(drain_plain(&mut input));
+            assert!(poll!(drain.as_mut()).is_pending());
+            assert_eq!(reads.get(), 1);
+            assert!(poll!(drain.as_mut()).is_pending());
+            assert_eq!(reads.get(), 2);
+            let expected = match tail {
+                Tail::Eof => Ok(()),
+                _ => Err(CloseOutcome::TransportError),
+            };
+            assert_eq!(drain.await, expected);
+            assert_eq!(reads.get(), 3);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn plaintext_drain_deadline_bounds_always_ready_input_and_stops_polls_after_expiry() -> TestResult {
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(async {
+        for expired in [false, true] {
+            let (context, listener, _peer) = test_context(
+                None,
+                std::future::pending::<Instant>().boxed_local().shared(),
+            )
+            .await?;
+            let mut input = ProbeInput {
+                bytes: Cursor::new(Vec::new()),
+                reads: Rc::new(Cell::new(0)),
+                parser_polls: Rc::new(Cell::new(0)),
+                tail: Tail::Ready,
+            };
+            let reads = Rc::clone(&input.reads);
+            let deadline = Instant::now()
+                + if expired {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(20)
+                };
+            let started = Instant::now();
+            assert_eq!(
+                context.until(deadline, drain_plain(&mut input)).await,
+                Err(())
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(reads.get() == 0, expired);
+            let polls = reads.get();
+            assert_eq!(
+                context.until(deadline, drain_plain(&mut input)).await,
+                Err(())
+            );
+            assert_eq!(reads.get(), polls);
+            listener.close().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn shutdown_expiry_prevents_another_plaintext_drain_read() -> TestResult {
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(async {
+        let (stop, stopped) = futures_channel::oneshot::channel();
+        let (context, listener, _peer) = test_context(
+            None,
+            async move { stopped.await.unwrap_or_else(|_| Instant::now()) }
+                .boxed_local()
+                .shared(),
+        )
+        .await?;
+        let mut input = ProbeInput {
+            bytes: Cursor::new(Vec::new()),
+            reads: Rc::new(Cell::new(0)),
+            parser_polls: Rc::new(Cell::new(0)),
+            tail: Tail::Ready,
+        };
+        let reads = Rc::clone(&input.reads);
+        let mut drain = Box::pin(context.until(context.deadline(), drain_plain(&mut input)));
+        assert!(poll!(drain.as_mut()).is_pending());
+        assert_eq!(reads.get(), 1);
+        stop.send(Instant::now())
+            .map_err(|_| "close stopped listening")?;
+        assert_eq!(drain.await, Err(()));
+        assert_eq!(reads.get(), 1);
+        listener.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome() -> TestResult {
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(async {
+        for (outcome, tail) in [
+            (CloseOutcome::NotWellFormed, Tail::Eof),
+            (CloseOutcome::NotWellFormed, Tail::Error),
+            (CloseOutcome::NotWellFormed, Tail::Ready),
+            (CloseOutcome::AuthenticationTimeout, Tail::Ready),
+            (CloseOutcome::AuthenticationTimeout, Tail::Error),
+            (CloseOutcome::AuthenticationTimeout, Tail::Eof),
+            (CloseOutcome::LocalClose, Tail::Ready),
+        ] {
+            let deadline = Instant::now() + Duration::from_millis(30);
+            let phase = if outcome.is_phase_timeout() {
+                deadline - CLOSE_TIMEOUT
+            } else {
+                deadline
+            };
+            let (context, listener, _peer) = test_context(
+                Some(phase),
+                std::future::pending::<Instant>().boxed_local().shared(),
+            )
+            .await?;
+            let (mut input, reads, parser_polls) = probe_reader(
+                format!("{HEADER}<message><body></message>trailing bytes").into_bytes(),
+                tail,
+            );
+            input
+                .next_event()
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            assert_eq!(
+                input.next_event().await.err(),
+                Some(CloseOutcome::NotWellFormed)
+            );
+            assert!(input.is_failed());
+            let polls = parser_polls.get();
+            let mut writer = Writer::new(Vec::new(), "localhost".into());
+            writer
+                .send_header(&header())
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            assert_eq!(context.deadline_for(outcome), deadline);
+            let result = finish_plain(&mut input, &mut writer, outcome.into(), &context).await;
+            let expected = match tail {
+                Tail::Error if !outcome.is_phase_timeout() => CloseOutcome::TransportError,
+                Tail::Ready if outcome == CloseOutcome::LocalClose => CloseOutcome::ClosingTimeout,
+                _ => outcome,
+            };
+            assert_eq!(result, expected);
+            assert_eq!(parser_polls.get(), polls);
+            assert!(reads.get() > 0);
+            if matches!(tail, Tail::Ready) {
+                assert!(Instant::now() >= deadline);
+                assert!(Instant::now() < deadline + Duration::from_secs(1));
+            }
+            listener.close().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn unopened_and_disconnected_plaintext_closes_never_poll_input() -> TestResult {
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(async {
+        for outcome in [
+            CloseOutcome::AuthenticationTimeout,
+            CloseOutcome::Eof,
+            CloseOutcome::TransportError,
+            CloseOutcome::TlsFailure,
+        ] {
+            let (context, listener, _peer) = test_context(
+                None,
+                std::future::pending::<Instant>().boxed_local().shared(),
+            )
+            .await?;
+            let (mut input, _, _) = probe_reader(Vec::new(), Tail::Panic);
+            let mut writer = Writer::new(Vec::new(), "localhost".into());
+            if outcome != CloseOutcome::AuthenticationTimeout {
+                writer
+                    .send_header(&header())
+                    .await
+                    .map_err(|error| format!("{error:?}"))?;
+            }
+            assert_eq!(
+                finish_plain(&mut input, &mut writer, outcome.into(), &context).await,
+                outcome
+            );
+            listener.close().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn plaintext_drain_ready_after_expiry_is_not_polled_again() -> TestResult {
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(async {
+        let (context, listener, _peer) = test_context(
+            None,
+            std::future::pending::<Instant>().boxed_local().shared(),
+        )
+        .await?;
+        let mut input = ProbeInput {
+            bytes: Cursor::new(Vec::new()),
+            reads: Rc::new(Cell::new(0)),
+            parser_polls: Rc::new(Cell::new(0)),
+            tail: Tail::Ready,
+        };
+        let reads = Rc::clone(&input.reads);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut drain = Box::pin(context.until(deadline, drain_plain(&mut input)));
+        assert!(poll!(drain.as_mut()).is_pending());
+        assert_eq!(reads.get(), 1);
+        compio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(drain.await, Err(()));
+        assert_eq!(reads.get(), 1);
+        listener.close().await?;
+        Ok(())
+    })
+}
+
+struct FlushFailure(Rc<Cell<bool>>);
+
+impl AsyncWrite for FlushFailure {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.0.get() {
+            Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        panic!("XML close must not finalize the transport")
+    }
+}
+
+#[test]
+fn failed_plaintext_footer_flush_never_polls_input() -> TestResult {
+    use futures_util::FutureExt as _;
+    Runtime::new()?.block_on(async {
+        let (context, listener, _peer) = test_context(
+            None,
+            std::future::pending::<Instant>().boxed_local().shared(),
+        )
+        .await?;
+        let failure = Rc::new(Cell::new(false));
+        let mut writer = Writer::new(FlushFailure(Rc::clone(&failure)), "localhost".into());
+        writer
+            .send_header(&header())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        failure.set(true);
+        let (mut input, reads, parser_polls) = probe_reader(Vec::new(), Tail::Panic);
+        assert_eq!(
+            finish_plain(&mut input, &mut writer, CloseReason::PeerFooter, &context).await,
+            CloseOutcome::TransportError
+        );
+        assert_eq!(reads.get(), 0);
+        assert_eq!(parser_polls.get(), 0);
         listener.close().await?;
         Ok(())
     })

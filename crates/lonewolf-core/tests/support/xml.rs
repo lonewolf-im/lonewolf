@@ -15,7 +15,7 @@ pub trait CloseTransport: Read + Write {
 
 impl CloseTransport for std::net::TcpStream {
     fn close_notify(&mut self) -> std::io::Result<()> {
-        Ok(())
+        self.shutdown(std::net::Shutdown::Write)
     }
 }
 

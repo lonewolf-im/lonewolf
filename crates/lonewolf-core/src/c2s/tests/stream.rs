@@ -770,7 +770,7 @@ fn stream_whitespace_consumes_xml_allowance() -> Result<(), Box<dyn Error>> {
         burst_bytes: NonZeroUsize::new(OPEN.len() + CLOSE.len()).ok_or("invalid burst")?,
     };
     let (outcome, elapsed, _) =
-        run_case_with_rate(input.as_bytes(), false, MAX_STANZA_BYTES, &rate)?;
+        run_case_with_rate(input.as_bytes(), true, MAX_STANZA_BYTES, &rate)?;
     assert_eq!(outcome, CloseOutcome::StreamEnd);
     assert!(elapsed >= Duration::from_millis(50));
     Ok(())

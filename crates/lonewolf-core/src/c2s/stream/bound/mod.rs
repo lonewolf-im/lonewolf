@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 #[cfg(test)]
 use std::time::SystemTime;
 
@@ -41,6 +42,7 @@ use lonewolf_xmpp::stanza::{
 
 use super::bind::Bound;
 use super::outcome::CloseOutcome;
+use super::recipient_rate::RecipientLimiter;
 use super::session::{Session, Writer};
 use crate::c2s::iq;
 use crate::delivery::{
@@ -77,6 +79,7 @@ struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
     work: WorkHandle,
     service_presence: Option<Arc<ServicePresenceLease>>,
     service_pending: Option<Shared<oneshot::Receiver<()>>>,
+    recipients: RecipientLimiter,
     available: bool,
     priority: Option<i8>,
     incoming: async_channel::Receiver<Incoming<A>>,
@@ -198,6 +201,7 @@ impl<A: ChunkAllocator> OutboxWriter<A> for Writer {
 pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     bound: Bound<A>,
     work: &mut WorkGroup,
+    recipients: RecipientLimiter,
 ) -> CloseOutcome {
     let Bound {
         session: Session {
@@ -245,6 +249,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
                 work: work.handle(),
                 service_presence: None,
                 service_pending: None,
+                recipients,
                 available: false,
                 priority: None,
                 incoming,
@@ -689,6 +694,19 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration, &self.router)?;
+        if !self.admit_recipient(&request.resolve(&arena)?)? {
+            let reply = iq::error_reply(
+                &request,
+                &mut arena,
+                StanzaErrorCondition::PolicyViolation,
+                Some(route.sender),
+            )?;
+            self.outbox.push(Output::Owned {
+                stanza: reply,
+                arena,
+            });
+            return Ok(());
+        }
         let verdict = {
             let view = request.resolve(&arena)?;
             match view.to()? {
@@ -1160,6 +1178,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
 
     async fn handle_probe(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let routed = self.stamp(parsed)?;
+        if !self.admit_routed(&routed)? {
+            return Ok(());
+        }
         let target = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
@@ -1261,6 +1282,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         available: bool,
     ) -> Result<(), CloseOutcome> {
         let routed = self.stamp(parsed)?;
+        if !self.admit_routed(&routed)? {
+            return Ok(());
+        }
         let target = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
@@ -1347,6 +1371,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         kind: MessageType,
     ) -> Result<(), CloseOutcome> {
         let routed = self.stamp(parsed)?;
+        if !self.admit_routed(&routed)? {
+            return Ok(());
+        }
         let stage = Stage {
             router: &self.router,
             storage: &self.storage,
@@ -1790,13 +1817,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             let target = stanza.to()?.ok_or(CloseOutcome::InternalError)?;
             self.router.destination(target) == Destination::Remote
         };
-        let sender_host = self
-            .router
-            .presence_handlers(self.registration.account().domain())
-            .and_then(|handlers| handlers.find(kind));
-        if sender_host.is_none() && !remote {
-            return Ok(());
-        }
         let (source, mut arena) = parsed.into_parts();
         let (source, sender, _) = self.stamp_in(source, &mut arena, false)?;
         let routed = source
@@ -1805,6 +1825,17 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .bare_to()
             .build()?;
         let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
+        if !self.admit_routed(&source)? {
+            return Ok(());
+        }
+        let sender_host = self
+            .router
+            .presence_handlers(self.registration.account().domain())
+            .and_then(|handlers| handlers.find(kind));
+        if sender_host.is_none() && !remote {
+            return Ok(());
+        }
+
         {
             let (sender, target) = presence_addresses(&routed)?;
             let account = self.registration.account();
@@ -1993,6 +2024,54 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
 
     fn delivery(&self) -> RouterDelivery<A> {
         RouterDelivery::new(&self.router, &self.allocator, Some(&self.registration))
+    }
+
+    fn admit_recipient<R: ArenaRead>(
+        &mut self,
+        stanza: &StanzaRef<'_, R>,
+    ) -> Result<bool, CloseOutcome> {
+        if matches!(
+            stanza.stanza_type(),
+            StanzaType::Iq(IqType::Result | IqType::Error)
+                | StanzaType::Message(MessageType::Error)
+                | StanzaType::Presence(PresenceType::Error)
+        ) {
+            return Ok(true);
+        }
+        let Some(to) = stanza.to()? else {
+            return Ok(true);
+        };
+        let destination = self.router.destination(to);
+        if matches!(
+            destination,
+            Destination::Server | Destination::ServerResource | Destination::Service
+        ) || to.bare().as_str() == self.registration.account().as_str()
+            || self.recipients.admit(to.bare().as_str(), Instant::now())
+        {
+            return Ok(true);
+        }
+        tracing::debug!(
+            outcome = "rejected",
+            reason = "recipient_rate",
+            "stanza rejected"
+        );
+        Ok(false)
+    }
+
+    fn admit_routed(&mut self, routed: &RoutedStanza<A>) -> Result<bool, CloseOutcome> {
+        let view = routed.resolve()?;
+        if self.admit_recipient(&view)? {
+            return Ok(true);
+        }
+        if !matches!(
+            view.stanza_type(),
+            StanzaType::Presence(
+                PresenceType::Available | PresenceType::Unavailable | PresenceType::Probe
+            )
+        ) {
+            self.reply_error(routed, StanzaErrorCondition::PolicyViolation)?;
+        }
+        Ok(false)
     }
 
     fn stamp(&self, parsed: Parsed<Stanza, A>) -> Result<RoutedStanza<A>, CloseOutcome> {

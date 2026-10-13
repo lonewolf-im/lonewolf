@@ -136,6 +136,11 @@ async fn session(fixture: &Fixture) -> TestResult<TestSession<'_>> {
         work: fixture.work.handle(),
         service_presence: None,
         service_pending: None,
+        recipients: RecipientLimiter::new(
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(100).ok_or("zero burst")?,
+            Instant::now(),
+        ),
         available: false,
         priority: None,
         incoming: async_channel::bounded(1).1,

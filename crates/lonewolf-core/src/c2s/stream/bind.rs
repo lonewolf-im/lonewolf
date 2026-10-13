@@ -341,12 +341,19 @@ fn requested_resource<'a, R: ArenaRead>(
                 {
                     return Err(BindRequestError::Malformed);
                 }
-                resource = Some(
-                    element
-                        .text()
+                let text = element.text().map_err(|_| BindRequestError::Internal)?;
+                if text.is_none()
+                    && element
+                        .children()
                         .map_err(|_| BindRequestError::Internal)?
-                        .unwrap_or(""),
-                );
+                        .next()
+                        .transpose()
+                        .map_err(|_| BindRequestError::Internal)?
+                        .is_some()
+                {
+                    return Err(BindRequestError::Malformed);
+                }
+                resource = Some(text.unwrap_or(""));
             }
             _ => return Err(BindRequestError::Malformed),
         }

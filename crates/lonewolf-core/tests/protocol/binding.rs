@@ -570,8 +570,8 @@ fn fifth_structural_failure_still_allows_unusable_resource_fallback() -> TestRes
         let mut client = suite.authenticated_client("alice", "pencil")?;
 
         for payload in [
-            "<resource/><resource>phone</resource>",
-            "<resource>desk</resource><resource/>",
+            "<resource><other/></resource>",
+            "<resource>desk<other/></resource>",
             "<other/>",
             "<resource attr='1'/>",
             "text",
@@ -628,4 +628,30 @@ fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
         client.expect_stream_error("policy-violation")?;
     }
     Ok(())
+}
+
+#[test]
+fn nested_resource_children_close_at_the_retry_limit() -> TestResult {
+    let suite = C2sSuite::resource_limit(1)?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    for _ in 0..6 {
+        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource><other/></resource></bind></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
+fn mixed_resource_children_close_at_the_retry_limit() -> TestResult {
+    let suite = C2sSuite::resource_limit(1)?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    for _ in 0..6 {
+        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk<other/></resource></bind></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    }
+    client.expect_stream_error("policy-violation")
 }

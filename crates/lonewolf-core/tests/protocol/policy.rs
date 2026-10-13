@@ -81,7 +81,7 @@ fn failing_policy_rejects_with_its_condition() -> TestResult {
     let mut alice = suite.connect("alice", "password", "res")?;
 
     alice.send("<message type='chat' to='broken@localhost' id='failure'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='broken@localhost' to='alice@localhost/res' type='error' id='failure'><error type='wait'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='broken@localhost' to='alice@localhost/res' type='error' id='failure'><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
     alice.close()
 }
 

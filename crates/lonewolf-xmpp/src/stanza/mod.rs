@@ -143,7 +143,8 @@ impl StanzaErrorCondition {
                 "cancel"
             }
             Self::Forbidden => "auth",
-            Self::InternalServerError | Self::ResourceConstraint => "wait",
+            Self::InternalServerError => "cancel",
+            Self::ResourceConstraint => "wait",
         }
     }
 }

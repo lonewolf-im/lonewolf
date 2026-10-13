@@ -1196,6 +1196,7 @@ dependencies = [
  "redb",
  "rustls",
  "rustls-graviola",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha1 0.11.0",

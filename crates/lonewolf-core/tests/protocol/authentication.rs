@@ -1399,6 +1399,39 @@ fn external_expiry_after_binding_sends_directed_unavailable() -> TestResult {
 }
 
 #[test]
+fn external_anchor_expiry_after_binding_sends_directed_unavailable() -> TestResult {
+    let mut certificates = None;
+    let suite = C2sSuite::with_extensions_and_setup("'roster'", |directory| {
+        certificates = Some(
+            super::support::tls::ClientCertificates::configure_with_anchor_expiry(
+                directory,
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(5),
+            )?,
+        );
+        Ok(())
+    })?;
+    let certificates = certificates.ok_or("missing certificate fixtures")?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let mut bob = Client::authenticated(&suite, "bob", "pencil")?;
+    bob.bind(Some("desk"))?;
+    let mut alice = certificate_client(&suite, certificates.trusted, None)?;
+    alice.send_external_auth(Some(""))?;
+    alice.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    let mut alice = alice.restart();
+    alice.open()?;
+    alice.bind(Some("phone"))?;
+    alice.send("<presence to='bob@localhost/desk'/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/phone' to='bob@localhost/desk'/>",
+    )?;
+    alice.receive()?.child(STREAM_ERRORS, "reset")?;
+    alice.expect_end()?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='bob@localhost/desk' type='unavailable'/>")?;
+    bob.close()
+}
+
+#[test]
 fn external_account_deletion_before_and_after_binding_retires_only_its_session() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
     for bound in [false, true] {

@@ -33,11 +33,16 @@ pub(in crate::hosts) struct Fixture {
 
 impl Fixture {
     pub(in crate::hosts) fn new() -> TestResult<Self> {
+        Self::with_anchor_expiry(time::OffsetDateTime::now_utc() + time::Duration::days(30))
+    }
+
+    fn with_anchor_expiry(expires: time::OffsetDateTime) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let now = SystemTime::now();
         let time = time::OffsetDateTime::from(now);
-        let root =
-            CertifiedIssuer::self_signed(ca_parameters("Root", time, 1)?, TestSigner::new()?)?;
+        let mut parameters = ca_parameters("Root", time, 1)?;
+        parameters.not_after = expires;
+        let root = CertifiedIssuer::self_signed(parameters, TestSigner::new()?)?;
         let config = ClientCertificateConfig {
             trust_anchors_path: directory.path().join("roots.pem"),
             crls_path: directory.path().join("crls.pem"),
@@ -86,6 +91,572 @@ impl Fixture {
             .der()
             .clone())
     }
+}
+
+#[test]
+fn issuing_anchor_caps_validity_and_recheck() -> TestResult {
+    let fixture =
+        Fixture::with_anchor_expiry(time::OffsetDateTime::now_utc() + time::Duration::minutes(10))?;
+    let policy = fixture.policy()?;
+    let root = Certificate::from_der(fixture.root.der())?;
+    let expires = UNIX_EPOCH
+        + root
+            .tbs_certificate()
+            .validity()
+            .not_after
+            .to_unix_duration();
+    let validity = policy.validate_at(&fixture.chain, fixture.now)?;
+    assert_eq!(validity.valid_until, expires);
+    assert_eq!(validity.recheck_at, expires);
+    Ok(())
+}
+
+fn write_material<'a>(
+    path: &std::path::Path,
+    label: &str,
+    values: impl IntoIterator<Item = &'a [u8]>,
+) -> TestResult {
+    let mut material = String::new();
+    for value in values {
+        material.push_str(&pem(label, value)?);
+    }
+    fs::write(path, material)?;
+    Ok(())
+}
+
+#[test]
+fn equivalent_anchor_renewals_share_the_latest_expiration_in_either_order() -> TestResult {
+    for earlier_expired in [false, true] {
+        let now = time::OffsetDateTime::now_utc();
+        let earlier = now + time::Duration::seconds(if earlier_expired { -1 } else { 600 });
+        let fixture = Fixture::with_anchor_expiry(earlier)?;
+        let mut params = ca_parameters("Root", fixture.now.into(), 1)?;
+        params.not_after = now + time::Duration::minutes(20);
+        let renewal = params.self_signed(fixture.root.key())?;
+        let expires = certificate_expiration(renewal.der())?;
+        for roots in [
+            [fixture.root.der(), renewal.der()],
+            [renewal.der(), fixture.root.der()],
+        ] {
+            write_material(
+                &fixture.config.trust_anchors_path,
+                "CERTIFICATE",
+                roots.map(|certificate| certificate.as_ref()),
+            )?;
+            let policy = fixture.policy()?;
+            assert_eq!(policy.roots.roots[0], policy.roots.roots[1]);
+            assert_eq!(policy.anchor_expirations.as_ref(), &[expires, expires]);
+            assert_eq!(
+                policy.validate_at(&fixture.chain, fixture.now)?.valid_until,
+                expires
+            );
+            let presented_renewal = [fixture.chain[0].clone(), fixture.root.der().clone()];
+            assert_eq!(
+                policy
+                    .validate_at(&presented_renewal, fixture.now)?
+                    .valid_until,
+                expires
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn same_subject_wrong_key_cannot_extend_the_issuing_anchor_deadline() -> TestResult {
+    let fixture =
+        Fixture::with_anchor_expiry(time::OffsetDateTime::now_utc() + time::Duration::minutes(10))?;
+    let other = CertifiedIssuer::self_signed(
+        ca_parameters("Root", fixture.now.into(), 1)?,
+        TestSigner::new()?,
+    )?;
+    let expires = certificate_expiration(fixture.root.der())?;
+    for roots in [
+        [fixture.root.der(), other.der()],
+        [other.der(), fixture.root.der()],
+    ] {
+        write_material(
+            &fixture.config.trust_anchors_path,
+            "CERTIFICATE",
+            roots.map(|certificate| certificate.as_ref()),
+        )?;
+        let policy = fixture.policy()?;
+        assert_eq!(policy.roots.roots[0].subject, policy.roots.roots[1].subject);
+        assert_ne!(policy.roots.roots[0], policy.roots.roots[1]);
+        assert_eq!(
+            policy.validate_at(&fixture.chain, fixture.now)?.valid_until,
+            expires
+        );
+        assert!(matches!(
+            policy.validate_at(&fixture.chain, expires),
+            Err(ClientIdentityError::Expired)
+        ));
+    }
+    fs::write(
+        &fixture.config.trust_anchors_path,
+        pem("CERTIFICATE", other.der())?,
+    )?;
+    assert!(matches!(
+        fixture.policy()?.validate_at(&fixture.chain, fixture.now),
+        Err(ClientIdentityError::Verification(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn different_name_constraints_do_not_share_anchor_expiration() -> TestResult {
+    let fixture =
+        Fixture::with_anchor_expiry(time::OffsetDateTime::now_utc() + time::Duration::minutes(10))?;
+    let mut params = ca_parameters("Root", fixture.now.into(), 1)?;
+    params.name_constraints = Some(rcgen::NameConstraints {
+        permitted_subtrees: vec![],
+        excluded_subtrees: vec![rcgen::GeneralSubtree::DnsName("localhost".into())],
+    });
+    let constrained = params.self_signed(fixture.root.key())?;
+    let mut params = leaf_parameters(
+        &["alice@localhost"],
+        fixture.now.into(),
+        (fixture.now + Duration::from_secs(86400)).into(),
+    )?;
+    params
+        .subject_alt_names
+        .push(SanType::DnsName("client.localhost".try_into()?));
+    let leaf = params.signed_by(&TestSigner::new()?, &fixture.root)?;
+    let expires = certificate_expiration(fixture.root.der())?;
+    for roots in [
+        [fixture.root.der(), constrained.der()],
+        [constrained.der(), fixture.root.der()],
+    ] {
+        write_material(
+            &fixture.config.trust_anchors_path,
+            "CERTIFICATE",
+            roots.map(|certificate| certificate.as_ref()),
+        )?;
+        let policy = fixture.policy()?;
+        assert_eq!(
+            policy.roots.roots[0].subject_public_key_info,
+            policy.roots.roots[1].subject_public_key_info
+        );
+        assert_ne!(policy.roots.roots[0], policy.roots.roots[1]);
+        assert_eq!(
+            policy
+                .validate_at(std::slice::from_ref(leaf.der()), fixture.now)?
+                .valid_until,
+            expires
+        );
+    }
+    fs::write(
+        &fixture.config.trust_anchors_path,
+        pem("CERTIFICATE", constrained.der())?,
+    )?;
+    assert!(matches!(
+        fixture
+            .policy()?
+            .validate_at(std::slice::from_ref(leaf.der()), fixture.now),
+        Err(ClientIdentityError::Verification(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn authenticated_path_ignores_presented_order_root_and_unused_certificate_expiry() -> TestResult {
+    let fixture =
+        Fixture::with_anchor_expiry(time::OffsetDateTime::now_utc() + time::Duration::minutes(20))?;
+    let upper = CertifiedIssuer::signed_by(
+        ca_parameters("Upper", fixture.now.into(), 2)?,
+        TestSigner::new()?,
+        &fixture.root,
+    )?;
+    let lower = CertifiedIssuer::signed_by(
+        ca_parameters("Lower", fixture.now.into(), 3)?,
+        TestSigner::new()?,
+        &upper,
+    )?;
+    let leaf = leaf_parameters(
+        &["alice@localhost"],
+        fixture.now.into(),
+        (fixture.now + Duration::from_secs(86400)).into(),
+    )?
+    .signed_by(&TestSigner::new()?, &lower)?;
+    let crls = [&fixture.root, &upper, &lower]
+        .map(|issuer| {
+            crl(
+                issuer,
+                fixture.now,
+                (fixture.now + Duration::from_secs(7200)).into(),
+                false,
+            )
+        })
+        .into_iter()
+        .collect::<TestResult<Vec<_>>>()?;
+    write_material(
+        &fixture.config.crls_path,
+        "X509 CRL",
+        crls.iter().map(|crl| crl.der().as_ref()),
+    )?;
+    let policy = fixture.policy()?;
+    let expires = certificate_expiration(fixture.root.der())?;
+    let ordered = [leaf.der().clone(), lower.der().clone(), upper.der().clone()];
+    let included = [
+        leaf.der().clone(),
+        lower.der().clone(),
+        upper.der().clone(),
+        fixture.root.der().clone(),
+    ];
+    let reversed = [leaf.der().clone(), upper.der().clone(), lower.der().clone()];
+    for chain in [&ordered[..], &included, &reversed] {
+        assert_eq!(policy.validate_at(chain, fixture.now)?.valid_until, expires);
+        assert_verifier_parity(&fixture, chain, fixture.now, true)?;
+    }
+    for unused_expiry in [
+        fixture.now + Duration::from_secs(60),
+        fixture.now - Duration::from_secs(1),
+    ] {
+        let mut params = ca_parameters("Unused", fixture.now.into(), 4)?;
+        params.not_after = unused_expiry.into();
+        let unused = CertifiedIssuer::self_signed(params, TestSigner::new()?)?;
+        let last = [
+            leaf.der().clone(),
+            lower.der().clone(),
+            upper.der().clone(),
+            unused.der().clone(),
+        ];
+        let between = [
+            leaf.der().clone(),
+            upper.der().clone(),
+            unused.der().clone(),
+            lower.der().clone(),
+        ];
+        for chain in [&last, &between] {
+            assert_eq!(policy.validate_at(chain, fixture.now)?.valid_until, expires);
+            assert_verifier_parity(&fixture, chain, fixture.now, true)?;
+        }
+    }
+    let missing = [leaf.der().clone(), upper.der().clone()];
+    assert!(matches!(
+        policy.validate_at(&missing, fixture.now),
+        Err(ClientIdentityError::Verification(_))
+    ));
+    assert_verifier_parity(&fixture, &missing, fixture.now, false)?;
+    Ok(())
+}
+
+#[test]
+fn revocation_selects_the_path_used_for_expiration() -> TestResult {
+    let fixture =
+        Fixture::with_anchor_expiry(time::OffsetDateTime::now_utc() + time::Duration::minutes(10))?;
+    let mut params = ca_parameters("Second Root", fixture.now.into(), 2)?;
+    params.not_after = (fixture.now + Duration::from_secs(3600)).into();
+    let second_root = CertifiedIssuer::self_signed(params, TestSigner::new()?)?;
+    write_material(
+        &fixture.config.trust_anchors_path,
+        "CERTIFICATE",
+        [fixture.root.der().as_ref(), second_root.der().as_ref()],
+    )?;
+    let mut params = ca_parameters("Cross Signed", fixture.now.into(), 42)?;
+    params.not_after = (fixture.now + Duration::from_secs(900)).into();
+    let first = CertifiedIssuer::signed_by(params, TestSigner::new()?, &fixture.root)?;
+    let mut params = ca_parameters("Cross Signed", fixture.now.into(), 42)?;
+    params.not_after = (fixture.now + Duration::from_secs(1800)).into();
+    let second = params.signed_by(first.key(), &second_root)?;
+    let leaf = leaf_parameters(
+        &["alice@localhost"],
+        fixture.now.into(),
+        (fixture.now + Duration::from_secs(86400)).into(),
+    )?
+    .signed_by(&TestSigner::new()?, &first)?;
+    let next_update = (fixture.now + Duration::from_secs(7200)).into();
+    let first_crl = crl(&fixture.root, fixture.now, next_update, true)?;
+    let second_crl = crl(&second_root, fixture.now, next_update, false)?;
+    let leaf_crl = crl(&first, fixture.now, next_update, false)?;
+    write_material(
+        &fixture.config.crls_path,
+        "X509 CRL",
+        [
+            first_crl.der().as_ref(),
+            second_crl.der().as_ref(),
+            leaf_crl.der().as_ref(),
+        ],
+    )?;
+    let policy = fixture.policy()?;
+    let chain = [
+        leaf.der().clone(),
+        first.der().clone(),
+        second.der().clone(),
+    ];
+    assert_eq!(
+        policy.validate_at(&chain, fixture.now)?.valid_until,
+        certificate_expiration(second.der())?
+    );
+    assert_verifier_parity(&fixture, &chain, fixture.now, true)?;
+    let revoked_path = [leaf.der().clone(), first.der().clone()];
+    assert_verifier_parity(&fixture, &revoked_path, fixture.now, false)?;
+    let first_crl = crl(&fixture.root, fixture.now, next_update, false)?;
+    write_material(
+        &fixture.config.crls_path,
+        "X509 CRL",
+        [
+            first_crl.der().as_ref(),
+            second_crl.der().as_ref(),
+            leaf_crl.der().as_ref(),
+        ],
+    )?;
+    assert_eq!(
+        policy.validate_at(&chain, fixture.now)?.valid_until,
+        certificate_expiration(fixture.root.der())?
+    );
+    assert!(matches!(
+        policy.validate_at(&chain, certificate_expiration(fixture.root.der())?),
+        Err(ClientIdentityError::Expired)
+    ));
+    Ok(())
+}
+
+#[test]
+fn expired_anchor_loads_and_verifies_but_fails_authentication_at_its_boundary() -> TestResult {
+    for offset in [-1, 0, 600] {
+        let fixture = Fixture::with_anchor_expiry(
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(offset),
+        )?;
+        let policy = fixture.policy()?;
+        let expires = certificate_expiration(fixture.root.der())?;
+        let now = if offset > 0 { expires } else { fixture.now };
+        let time = UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH)?);
+        policy
+            .verifier()
+            .verify_client_cert(&fixture.chain[0], &[], time)?;
+        assert!(matches!(
+            policy.validate_at(&fixture.chain, now),
+            Err(ClientIdentityError::Expired)
+        ));
+        assert_verifier_parity(&fixture, &fixture.chain, now, true)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn anchor_cache_survives_file_replacement_and_removal_while_crls_refresh() -> TestResult {
+    let fixture =
+        Fixture::with_anchor_expiry(time::OffsetDateTime::now_utc() + time::Duration::minutes(10))?;
+    let policy = fixture.policy()?;
+    let expires = certificate_expiration(fixture.root.der())?;
+    fs::write(&fixture.config.trust_anchors_path, "unusable replacement")?;
+    assert_eq!(
+        policy.validate_at(&fixture.chain, fixture.now)?.valid_until,
+        expires
+    );
+    fs::remove_file(&fixture.config.trust_anchors_path)?;
+    assert_eq!(
+        policy.validate_at(&fixture.chain, fixture.now)?.valid_until,
+        expires
+    );
+    let earlier_crl = fixture.now + Duration::from_secs(300);
+    fixture.write_crl(false, earlier_crl.into())?;
+    let validity = policy.validate_at(&fixture.chain, fixture.now)?;
+    assert_eq!(
+        validity.valid_until,
+        UNIX_EPOCH + Duration::from_secs(earlier_crl.duration_since(UNIX_EPOCH)?.as_secs())
+    );
+    fixture.write_crl(true, (fixture.now + Duration::from_secs(7200)).into())?;
+    assert!(matches!(
+        policy.validate_at(&fixture.chain, fixture.now),
+        Err(ClientIdentityError::Verification(
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked)
+        ))
+    ));
+    Ok(())
+}
+
+fn assert_verifier_parity(
+    fixture: &Fixture,
+    chain: &[CertificateDer<'_>],
+    now: SystemTime,
+    succeeds: bool,
+) -> TestResult {
+    let policy = fixture.policy()?;
+    let crls = CertificateRevocationListDer::pem_file_iter(&fixture.config.crls_path)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let upstream = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::clone(&policy.roots),
+        Arc::clone(&policy.provider),
+    )
+    .allow_unauthenticated()
+    .with_crls(crls)
+    .enforce_revocation_expiration()
+    .build()?;
+    let (adapter, _) = load_verifier(
+        &policy.roots,
+        &policy.provider,
+        &fixture.config.crls_path,
+        now,
+    )?;
+    assert_eq!(adapter.offer_client_auth(), upstream.offer_client_auth());
+    assert_eq!(
+        adapter.client_auth_mandatory(),
+        upstream.client_auth_mandatory()
+    );
+    assert!(
+        adapter
+            .root_hint_subjects()
+            .iter()
+            .map(AsRef::<[u8]>::as_ref)
+            .eq(upstream
+                .root_hint_subjects()
+                .iter()
+                .map(AsRef::<[u8]>::as_ref))
+    );
+    assert_eq!(
+        adapter.supported_verify_schemes(),
+        upstream.supported_verify_schemes()
+    );
+    assert_eq!(
+        adapter.requires_raw_public_keys(),
+        upstream.requires_raw_public_keys()
+    );
+    let (leaf, intermediates) = chain.split_first().ok_or("empty parity chain")?;
+    let time = UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH)?);
+    let actual = adapter
+        .verify_client_cert(leaf, intermediates, time)
+        .map(|_| ());
+    let expected = upstream
+        .verify_client_cert(leaf, intermediates, time)
+        .and_then(|_| validate_key_usage(leaf, intermediates));
+    match (&actual, &expected) {
+        (
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(actual))),
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(expected))),
+        ) => {
+            let actual = actual
+                .0
+                .downcast_ref::<webpki::Error>()
+                .ok_or("non-webpki adapter error")?;
+            let expected = expected
+                .0
+                .downcast_ref::<webpki::Error>()
+                .ok_or("non-webpki upstream error")?;
+            assert_eq!(actual, expected);
+        }
+        _ => assert_eq!(actual, expected),
+    }
+    assert_eq!(actual.is_ok(), succeeds, "{actual:?}");
+    Ok(())
+}
+
+#[test]
+fn adapter_matches_upstream_certificate_errors_and_optional_authentication() -> TestResult {
+    let fixture = Fixture::new()?;
+    assert_verifier_parity(&fixture, &fixture.chain, fixture.now, true)?;
+    let mut params = ca_parameters("Unused", fixture.now.into(), 2)?;
+    params.key_usages = vec![KeyUsagePurpose::CrlSign];
+    let prohibited = CertifiedIssuer::self_signed(params, TestSigner::new()?)?;
+    let chain = [fixture.chain[0].clone(), prohibited.der().clone()];
+    assert_verifier_parity(&fixture, &chain, fixture.now, false)?;
+    for kind in [
+        "expired",
+        "not yet valid",
+        "server auth",
+        "prohibited key usage",
+        "absent key usage",
+    ] {
+        let mut params = leaf_parameters(
+            &["alice@localhost"],
+            fixture.now.into(),
+            (fixture.now + Duration::from_secs(86400)).into(),
+        )?;
+        match kind {
+            "expired" => params.not_after = (fixture.now - Duration::from_secs(1)).into(),
+            "not yet valid" => params.not_before = (fixture.now + Duration::from_secs(3600)).into(),
+            "server auth" => params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth],
+            "prohibited key usage" => params.key_usages = vec![KeyUsagePurpose::KeyEncipherment],
+            "absent key usage" => params.key_usages.clear(),
+            _ => unreachable!(),
+        }
+        let leaf = params.signed_by(&TestSigner::new()?, &fixture.root)?;
+        assert_verifier_parity(
+            &fixture,
+            std::slice::from_ref(leaf.der()),
+            fixture.now,
+            kind == "absent key usage",
+        )?;
+    }
+    let other = CertifiedIssuer::self_signed(
+        ca_parameters("Other", fixture.now.into(), 2)?,
+        TestSigner::new()?,
+    )?;
+    let untrusted = leaf_parameters(
+        &["alice@localhost"],
+        fixture.now.into(),
+        (fixture.now + Duration::from_secs(86400)).into(),
+    )?
+    .signed_by(&TestSigner::new()?, &other)?;
+    assert_verifier_parity(
+        &fixture,
+        std::slice::from_ref(untrusted.der()),
+        fixture.now,
+        false,
+    )?;
+    let mut invalid_signature = fixture.chain[0].as_ref().to_vec();
+    let last = invalid_signature
+        .last_mut()
+        .ok_or("empty signature fixture")?;
+    *last ^= 1;
+    assert_verifier_parity(&fixture, &[invalid_signature.into()], fixture.now, false)?;
+    assert_verifier_parity(
+        &fixture,
+        &[CertificateDer::from(&b"not DER"[..])],
+        fixture.now,
+        false,
+    )?;
+    for usage in [vec![0x04, 0x01, 0x80], vec![0x03, 0x01, 0x00]] {
+        let mut params = leaf_parameters(
+            &["alice@localhost"],
+            fixture.now.into(),
+            (fixture.now + Duration::from_secs(86400)).into(),
+        )?;
+        params.key_usages.clear();
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 15],
+                usage,
+            ));
+        let leaf = params.signed_by(&TestSigner::new()?, &fixture.root)?;
+        assert_verifier_parity(
+            &fixture,
+            std::slice::from_ref(leaf.der()),
+            fixture.now,
+            false,
+        )?;
+    }
+    fixture.write_crl(true, (fixture.now + Duration::from_secs(7200)).into())?;
+    assert_verifier_parity(&fixture, &fixture.chain, fixture.now, false)?;
+    let unrelated_crl = crl(
+        &other,
+        fixture.now,
+        (fixture.now + Duration::from_secs(7200)).into(),
+        false,
+    )?;
+    fs::write(
+        &fixture.config.crls_path,
+        pem("X509 CRL", unrelated_crl.der())?,
+    )?;
+    assert_verifier_parity(&fixture, &fixture.chain, fixture.now, false)?;
+    let wrong_key = CertifiedIssuer::self_signed(
+        ca_parameters("Root", fixture.now.into(), 1)?,
+        TestSigner::new()?,
+    )?;
+    let invalid_crl = crl(
+        &wrong_key,
+        fixture.now,
+        (fixture.now + Duration::from_secs(7200)).into(),
+        false,
+    )?;
+    fs::write(
+        &fixture.config.crls_path,
+        pem("X509 CRL", invalid_crl.der())?,
+    )?;
+    assert_verifier_parity(&fixture, &fixture.chain, fixture.now, false)?;
+    Ok(())
 }
 
 fn leaf_parameters(

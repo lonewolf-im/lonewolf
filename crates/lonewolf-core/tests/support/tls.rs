@@ -159,6 +159,16 @@ impl ClientCertificates {
     }
 
     pub fn configure(directory: &Path) -> TestResult<Self> {
+        Self::configure_with_anchor_expiry(
+            directory,
+            time::OffsetDateTime::now_utc() + time::Duration::days(30),
+        )
+    }
+
+    pub fn configure_with_anchor_expiry(
+        directory: &Path,
+        expires: time::OffsetDateTime,
+    ) -> TestResult<Self> {
         use rcgen::{
             BasicConstraints, CertifiedIssuer, DnType, IsCa, KeyIdMethod, KeyUsagePurpose,
         };
@@ -174,7 +184,7 @@ impl ClientCertificates {
         parameters.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         parameters.key_identifier_method = KeyIdMethod::PreSpecified(vec![1]);
         parameters.not_before = now - time::Duration::days(1);
-        parameters.not_after = now + time::Duration::days(30);
+        parameters.not_after = expires;
         let root = CertifiedIssuer::self_signed(parameters.clone(), TestSigner::new()?)?;
         fs::write(
             directory.join("client-roots.pem"),

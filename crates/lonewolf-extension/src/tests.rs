@@ -11,6 +11,7 @@ use parking_lot::Mutex as PlMutex;
 
 use super::account::AccountHandler;
 use super::delivery::{HandlerError, HostLookup};
+use super::discovery::{DiscoScope, Discovery, Identity};
 use super::iq::{IqHandler, IqRequestType, IqRoute, IqScope};
 use super::message::MessageHandler;
 use super::presence::{PresenceHandler, PresenceRequestType};
@@ -32,6 +33,9 @@ struct Fake {
     iq: &'static [IqRoute],
     presence: &'static [PresenceRequestType],
     features: &'static [&'static str],
+    disco_features: &'static [(DiscoScope, &'static str)],
+    disco_identities: &'static [(DiscoScope, Identity)],
+    services: &'static [&'static str],
     messages: bool,
     hosts: PlMutex<Vec<String>>,
     dependencies: &'static [&'static str],
@@ -74,6 +78,7 @@ fn service_domains_must_be_normalized_and_unique() -> Result<(), RegistrationErr
     );
     assert_eq!(registry.services().len(), 1);
     assert_eq!(registry.services()[0].0, "svc.example.com");
+    assert_eq!(registry.discovery().services(), ["svc.example.com"]);
     Ok(())
 }
 
@@ -100,6 +105,15 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
         }
         for feature in self.features {
             slots.stream_feature(feature);
+        }
+        for &(scope, feature) in self.disco_features {
+            slots.disco_feature(scope, feature);
+        }
+        for &(scope, identity) in self.disco_identities {
+            slots.disco_identity(scope, identity);
+        }
+        for domain in self.services {
+            slots.service(domain, self.clone())?;
         }
         if self.accounts {
             slots.account(self.clone());
@@ -141,6 +155,98 @@ fn featured(name: &'static str, features: &'static [&'static str]) -> Arc<Fake> 
         features,
         ..Fake::default()
     })
+}
+
+#[test]
+fn discovery_merges_features_and_identities_per_scope() -> Result<(), RegistrationError> {
+    const SERVER: Identity = Identity {
+        category: "server",
+        kind: "im",
+        name: None,
+    };
+    const NAMED_SERVER: Identity = Identity {
+        name: Some("Example"),
+        ..SERVER
+    };
+    const ACCOUNT: Identity = Identity {
+        category: "account",
+        kind: "registered",
+        name: None,
+    };
+    const NAMED_ACCOUNT: Identity = Identity {
+        name: Some("Example"),
+        ..ACCOUNT
+    };
+    let mut extensions = TestExtensions::default();
+    extensions.register(Arc::new(Fake {
+        name: "first",
+        disco_features: &[
+            (DiscoScope::Server, "urn:test:b"),
+            (DiscoScope::Server, "urn:test:a"),
+            (DiscoScope::Account, "urn:test:c"),
+            (DiscoScope::Account, "urn:test:a"),
+        ],
+        disco_identities: &[
+            (DiscoScope::Server, NAMED_SERVER),
+            (DiscoScope::Server, SERVER),
+            (DiscoScope::Account, NAMED_ACCOUNT),
+            (DiscoScope::Account, ACCOUNT),
+        ],
+        ..Fake::default()
+    }))?;
+    extensions.register(Arc::new(Fake {
+        name: "second",
+        disco_features: &[
+            (DiscoScope::Account, "urn:test:a"),
+            (DiscoScope::Account, "urn:test:c"),
+            (DiscoScope::Server, "urn:test:a"),
+            (DiscoScope::Server, "urn:test:b"),
+        ],
+        disco_identities: &[
+            (DiscoScope::Account, ACCOUNT),
+            (DiscoScope::Account, NAMED_ACCOUNT),
+            (DiscoScope::Server, SERVER),
+            (DiscoScope::Server, NAMED_SERVER),
+        ],
+        ..Fake::default()
+    }))?;
+    for names in [["first", "second"], ["second", "first"]] {
+        let enabled = extensions.enable_host("example.com", names)?;
+        let discovery = enabled.discovery();
+        assert_eq!(
+            discovery.features(DiscoScope::Server),
+            ["urn:test:a", "urn:test:b"]
+        );
+        assert_eq!(
+            discovery.features(DiscoScope::Account),
+            ["urn:test:a", "urn:test:c"]
+        );
+        assert_eq!(
+            discovery.identities(DiscoScope::Server),
+            [SERVER, NAMED_SERVER]
+        );
+        assert_eq!(
+            discovery.identities(DiscoScope::Account),
+            [ACCOUNT, NAMED_ACCOUNT]
+        );
+        assert!(discovery.services().is_empty());
+    }
+    let disabled = extensions.enable_host("other.example", [])?;
+    assert_eq!(disabled.discovery().as_ref(), &Discovery::default());
+    Ok(())
+}
+
+#[test]
+fn discovery_lists_registered_services() -> Result<(), RegistrationError> {
+    let mut extensions = TestExtensions::default();
+    extensions.register(Arc::new(Fake {
+        name: "services",
+        services: &["b.example", "a.example"],
+        ..Fake::default()
+    }))?;
+    let enabled = extensions.enable_host("example", ["services"])?;
+    assert_eq!(enabled.discovery().services(), ["a.example", "b.example"]);
+    Ok(())
 }
 
 fn message_extension(name: &'static str) -> Arc<Fake> {

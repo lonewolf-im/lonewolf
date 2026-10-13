@@ -8,6 +8,7 @@ use std::time::Duration;
 use lonewolf_extension::delivery::{
     DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
 };
+use lonewolf_extension::discovery::{DiscoScope, Identity};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
@@ -32,11 +33,18 @@ use lonewolf_xmpp::stanza::{
     Element, IqType, MessageType, PresenceType, RoutedStanza, Stanza, StanzaErrorCondition,
     StanzaNamespace, StanzaType,
 };
+use parking_lot::Mutex as PlMutex;
 
 use super::TestResult;
 
 const NAMESPACE: &str = "urn:lonewolf:test:iq";
 const SERVICE_NAMESPACE: &str = "urn:lonewolf:test:service";
+const DISCOVERY_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Server,
+    kind: IqRequestType::Get,
+    namespace: "urn:lonewolf:test:discovery",
+    name: "query",
+};
 const OFFLINE_ROUTE: IqRoute = IqRoute {
     scope: IqScope::Account,
     kind: IqRequestType::Get,
@@ -99,9 +107,10 @@ const SUBSCRIPTION_KINDS: [PresenceRequestType; 4] = [
 pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage>> {
     let mut extensions = Extensions::default();
     extensions.register(Arc::new(TestService {
-        joined: parking_lot::Mutex::new(BTreeSet::new()),
+        joined: PlMutex::new(BTreeSet::new()),
     }))?;
     extensions.register(Arc::new(TestHostService))?;
+    extensions.register(Arc::new(TestDiscovery))?;
     for kind in [
         ServiceLifecycleKind::OfflineWithdrawal,
         ServiceLifecycleKind::DelayedAvailable,
@@ -109,7 +118,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     ] {
         extensions.register(Arc::new(ServiceLifecycle {
             inner: TestService {
-                joined: parking_lot::Mutex::new(BTreeSet::new()),
+                joined: PlMutex::new(BTreeSet::new()),
             },
             kind,
             delay: AtomicBool::new(true),
@@ -148,7 +157,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
 }
 
 struct TestService {
-    joined: parking_lot::Mutex<BTreeSet<String>>,
+    joined: PlMutex<BTreeSet<String>>,
 }
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestService {
@@ -230,6 +239,71 @@ impl<A: ChunkAllocator> ServiceHandler<A, RedbStorage> for TestService {
 }
 
 struct TestHostService;
+
+struct TestDiscovery;
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestDiscovery {
+    fn name(&self) -> &'static str {
+        "test-discovery"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.disco_feature(DiscoScope::Server, "urn:lonewolf:test:b");
+        slots.disco_feature(DiscoScope::Server, "urn:lonewolf:test:a");
+        slots.disco_identity(
+            DiscoScope::Server,
+            Identity {
+                category: "server",
+                kind: "im",
+                name: None,
+            },
+        );
+        slots.iq(DISCOVERY_ROUTE, self)
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestDiscovery {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _transaction: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let result = (|| {
+                let features = request.discovery.features(DiscoScope::Server);
+                let services = request.discovery.services();
+                let mut children = Vec::with_capacity(features.len() + services.len());
+                for feature in features {
+                    children.push(
+                        Element::builder_in("feature", DISCOVERY_ROUTE.namespace, response)?
+                            .attribute("var", "", feature)?
+                            .build()?,
+                    );
+                }
+                for service in services {
+                    children.push(
+                        Element::builder_in("service", DISCOVERY_ROUTE.namespace, response)?
+                            .attribute("jid", "", service)?
+                            .build()?,
+                    );
+                }
+                let mut query = Element::builder_in("query", DISCOVERY_ROUTE.namespace, response)?;
+                for child in children {
+                    query = query.child(child)?;
+                }
+                query.build()
+            })();
+            result
+                .map(|payload| IqReply::new(Some(payload), Effects::none()))
+                .map_err(|_| StanzaErrorCondition::InternalServerError.into())
+        })
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ServiceLifecycleKind {
@@ -366,7 +440,7 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestHostService {
         slots.service(
             host,
             Arc::new(TestService {
-                joined: parking_lot::Mutex::new(BTreeSet::new()),
+                joined: PlMutex::new(BTreeSet::new()),
             }),
         )
     }

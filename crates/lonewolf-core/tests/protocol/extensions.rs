@@ -3,6 +3,16 @@
 use crate::support::{C2sSuite, TestResult};
 
 #[test]
+fn iq_handlers_read_their_hosts_discovery_data() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-discovery', 'test-service'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<iq type='get' to='localhost' id='discovery'><query xmlns='urn:lonewolf:test:discovery'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='discovery' from='localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:discovery'><feature var='urn:lonewolf:test:a'/><feature var='urn:lonewolf:test:b'/><service jid='echo.localhost'/></query></iq>")?;
+    alice.close()
+}
+
+#[test]
 fn precommit_handler_wait_keeps_healthy_outbound_delivery_progressing() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-precommit-iq'")?;
     suite.create_account("alice", "password")?;

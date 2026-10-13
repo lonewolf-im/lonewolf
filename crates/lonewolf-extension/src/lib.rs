@@ -15,6 +15,7 @@ use lonewolf_util::arena::ChunkAllocator;
 
 pub mod account;
 pub mod delivery;
+pub mod discovery;
 pub mod iq;
 pub mod message;
 pub mod offline;
@@ -29,6 +30,7 @@ pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use account::AccountHandler;
 use delivery::{Delivery, DeliveryFuture};
+use discovery::Discovery;
 use iq::{IqRegistry, IqRoute};
 use message::MessageHandler;
 use presence::{PresenceRegistry, PresenceRequestType};
@@ -188,6 +190,7 @@ pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     presence: PresenceRegistry<A, S>,
     messages: Option<Arc<dyn MessageHandler<A, S>>>,
     services: Vec<(String, Arc<dyn ServiceHandler<A, S>>)>,
+    discovery: Arc<Discovery>,
     #[expect(clippy::type_complexity)]
     accounts: Vec<(&'static str, Arc<dyn AccountHandler<A, S>>)>,
     stream_features: String,
@@ -201,6 +204,7 @@ impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
             presence: PresenceRegistry::default(),
             messages: None,
             services: Vec::new(),
+            discovery: Arc::new(Discovery::default()),
             accounts: Vec::new(),
             stream_features: String::new(),
             enabled: Vec::new(),
@@ -224,6 +228,10 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
     #[expect(clippy::type_complexity)]
     pub fn services(&self) -> &[(String, Arc<dyn ServiceHandler<A, S>>)] {
         &self.services
+    }
+
+    pub fn discovery(&self) -> &Arc<Discovery> {
+        &self.discovery
     }
 
     #[expect(clippy::type_complexity)]

@@ -15,6 +15,7 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{Either, Shared, join, select};
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
+use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
@@ -656,6 +657,16 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let router = &self.router;
         let work_group = self.outbox.work;
         let delivery = self.delivery();
+        let discovery = {
+            let sender = sender.resolve(&arena)?;
+            let stanza = request.resolve(&arena)?;
+            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+            Arc::clone(
+                router
+                    .discovery(target.domainpart())
+                    .ok_or(CloseOutcome::InternalError)?,
+            )
+        };
         let prepare = async {
             let (transaction, ticket) = Arc::clone(router.order())
                 .fix(accounts, storage.begin_read())
@@ -667,6 +678,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 account: registration.account().clone(),
                 transaction,
                 handler,
+                discovery,
                 arena,
                 request,
                 sender,
@@ -715,6 +727,16 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let router = &self.router;
         let work = self.outbox.work;
         let delivery = self.delivery();
+        let discovery = {
+            let sender = sender.resolve(&arena)?;
+            let stanza = request.resolve(&arena)?;
+            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+            Arc::clone(
+                router
+                    .discovery(target.domainpart())
+                    .ok_or(CloseOutcome::InternalError)?,
+            )
+        };
         let prepare = async {
             let mut transaction = storage.begin_write().await.map_err(|error| {
                 close_storage_failure(error, "iq_set_begin_write", registration.account())
@@ -733,6 +755,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         IqRequest {
                             sender,
                             target,
+                            discovery: &discovery,
                             payload,
                         },
                         &mut transaction,
@@ -1791,6 +1814,7 @@ struct GetWork<A: ChunkAllocator> {
     account: AccountKey,
     transaction: RedbRead,
     handler: Arc<dyn IqHandler<A, RedbStorage>>,
+    discovery: Arc<Discovery>,
     arena: Arena<A>,
     request: Stanza,
     sender: Jid,
@@ -1812,6 +1836,7 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
             account,
             transaction,
             handler,
+            discovery,
             arena,
             request,
             sender,
@@ -1830,6 +1855,7 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
             let iq_request = IqRequest {
                 sender,
                 target,
+                discovery: &discovery,
                 payload,
             };
             handler.get(iq_request, &transaction, &mut response).await

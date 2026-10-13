@@ -17,7 +17,6 @@ use crate::stages::StageFailure;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloseOutcome {
     StreamEnd,
-    LocalClose,
     PeerError(StreamErrorCondition),
     ClosingTimeout,
     SystemShutdown,
@@ -46,6 +45,7 @@ pub(crate) enum CloseOutcome {
     BindingAttemptsExceeded,
     EstablishmentTimeout,
     AuthenticationAttemptsExceeded,
+    ChannelBindingReused,
     AccountDeleted,
     MailboxOverflow,
     InternalError,
@@ -119,6 +119,7 @@ impl CloseOutcome {
             Self::RestrictedXml => Some(StreamErrorCondition::RestrictedXml),
             Self::UnsupportedEncoding => Some(StreamErrorCondition::UnsupportedEncoding),
             Self::AuthenticationAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
+            Self::ChannelBindingReused => Some(StreamErrorCondition::PolicyViolation),
             Self::BindingAttemptsExceeded => Some(StreamErrorCondition::PolicyViolation),
             Self::UnsupportedStanzaType => Some(StreamErrorCondition::UnsupportedStanzaType),
             Self::CertificateInvalid => Some(StreamErrorCondition::Reset),
@@ -131,7 +132,7 @@ impl CloseOutcome {
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::StreamEnd | Self::LocalClose => "stream_end",
+            Self::StreamEnd => "stream_end",
             Self::PeerError(_) => "peer_stream_error",
             Self::ClosingTimeout => "closing_timeout",
             Self::SystemShutdown => "system_shutdown",
@@ -160,6 +161,7 @@ impl CloseOutcome {
             Self::BindingAttemptsExceeded => "binding_attempts_exceeded",
             Self::EstablishmentTimeout => "establishment_timeout",
             Self::AuthenticationAttemptsExceeded => "authentication_attempts_exceeded",
+            Self::ChannelBindingReused => "channel_binding_reused",
             Self::AccountDeleted => "account_deleted",
             Self::MailboxOverflow => "mailbox_overflow",
             Self::InternalError => "internal_error",
@@ -218,6 +220,19 @@ impl From<StageFailure> for CloseOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exporter_reuse_is_policy_violation_and_has_a_distinct_name() {
+        assert_eq!(
+            CloseOutcome::ChannelBindingReused.stream_condition(),
+            Some(StreamErrorCondition::PolicyViolation)
+        );
+        assert_eq!(
+            CloseOutcome::ChannelBindingReused.as_str(),
+            "channel_binding_reused"
+        );
+        assert!(!CloseOutcome::ChannelBindingReused.is_phase_timeout());
+    }
 
     #[test]
     fn retirement_causes_preserve_policy_deletion_and_fault_outcomes() {

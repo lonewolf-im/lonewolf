@@ -116,8 +116,7 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
             },
         };
         let attempt = authentication.attempt(request).await?;
-        let exporter_finished = matches!(authentication.exporter_use, ExporterUse::InUse);
-        if exporter_finished {
+        if matches!(authentication.exporter_use, ExporterUse::InUse) {
             authentication.exporter_use = ExporterUse::Finished;
         }
         match attempt {
@@ -131,7 +130,6 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
                 }
                 return Ok((account, mechanism));
             }
-            _ if exporter_finished => return Err(CloseOutcome::LocalClose),
             Attempt::Rejected => {}
             Attempt::Replaced(request) => replacement = Some(request),
         }
@@ -247,7 +245,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             match self.exporter_use {
                 ExporterUse::Unused => self.exporter_use = ExporterUse::InUse,
                 ExporterUse::InUse | ExporterUse::Finished => {
-                    return Err(CloseOutcome::LocalClose);
+                    return Err(CloseOutcome::ChannelBindingReused);
                 }
             }
         }

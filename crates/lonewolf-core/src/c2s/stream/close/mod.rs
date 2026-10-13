@@ -288,9 +288,7 @@ fn completed(
     }
     match result {
         Ok(Ok(result) | Err(result)) => result,
-        Err(()) if matches!(outcome, CloseOutcome::StreamEnd | CloseOutcome::LocalClose) => {
-            CloseOutcome::ClosingTimeout
-        }
+        Err(()) if outcome == CloseOutcome::StreamEnd => CloseOutcome::ClosingTimeout,
         Err(()) => outcome,
     }
 }

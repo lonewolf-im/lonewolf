@@ -17,7 +17,7 @@ fn ipv6_zone_destinations_return_recoverable_jid_malformed_errors() -> TestResul
             alice.send(&format!(
                 "<{kind} {attributes} to='{destination}' id='scoped'>{payload}</{kind}>"
             ))?;
-            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' id='scoped' to='alice@localhost/desktop'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></{kind}>"))?;
+            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' from='localhost' type='error' id='scoped' to='alice@localhost/desktop'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></{kind}>"))?;
             alice.send("<message to='alice@localhost/desktop' type='chat' id='sentinel'/>")?;
             alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost/desktop' type='chat' id='sentinel'/>")?;
         }

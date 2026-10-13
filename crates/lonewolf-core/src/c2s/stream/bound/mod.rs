@@ -815,12 +815,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             (handler.map(Arc::clone), accounts)
         };
         let Some(handler) = handler else {
-            let reply = iq::error_reply(
-                &request,
-                &mut arena,
-                StanzaErrorCondition::ServiceUnavailable,
-                None,
-            )?;
+            let condition = if route.destination == Destination::Remote {
+                StanzaErrorCondition::RemoteServerNotFound
+            } else {
+                StanzaErrorCondition::ServiceUnavailable
+            };
+            let reply = iq::error_reply(&request, &mut arena, condition, None)?;
             self.outbox.push(Output::Owned {
                 stanza: reply,
                 arena,
@@ -1163,11 +1163,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let target = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            if !matches!(
-                self.router.destination(to),
-                Destination::Account | Destination::Resource
-            ) {
-                return Ok(());
+            match self.router.destination(to) {
+                Destination::Account | Destination::Resource => {}
+                Destination::Remote => {
+                    return self.reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
+                }
+                _ => return Ok(()),
             }
             AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
         };
@@ -1263,11 +1264,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let target = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            if !matches!(
-                self.router.destination(to),
-                Destination::Account | Destination::Resource
-            ) {
-                return Ok(());
+            match self.router.destination(to) {
+                Destination::Account | Destination::Resource => {}
+                Destination::Remote => {
+                    return self.reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
+                }
+                _ => return Ok(()),
             }
             AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
         };
@@ -1783,13 +1785,18 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         parsed: Parsed<Stanza, A>,
         kind: PresenceRequestType,
     ) -> Result<(), CloseOutcome> {
-        let Some(sender_host) = self
+        let remote = {
+            let stanza = parsed.value().resolve(parsed.arena())?;
+            let target = stanza.to()?.ok_or(CloseOutcome::InternalError)?;
+            self.router.destination(target) == Destination::Remote
+        };
+        let sender_host = self
             .router
             .presence_handlers(self.registration.account().domain())
-            .and_then(|handlers| handlers.find(kind))
-        else {
+            .and_then(|handlers| handlers.find(kind));
+        if sender_host.is_none() && !remote {
             return Ok(());
-        };
+        }
         let (source, mut arena) = parsed.into_parts();
         let (source, sender, _) = self.stamp_in(source, &mut arena, false)?;
         let routed = source
@@ -1843,29 +1850,34 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 }
             }
         }
-        let authorized = {
-            let (sender, target) = presence_addresses(&source)?;
-            let account = self.registration.account();
-            let authorize = async {
-                let result = sender_host
-                    .authorize(PresenceRequest {
-                        kind,
-                        sender,
-                        target,
-                        stanza: &source,
-                    })
-                    .await;
-                if let Err(error) = &result {
-                    report_handler_failure(error, account);
-                }
-                result
+        if let Some(sender_host) = sender_host {
+            let authorized = {
+                let (sender, target) = presence_addresses(&source)?;
+                let account = self.registration.account();
+                let authorize = async {
+                    let result = sender_host
+                        .authorize(PresenceRequest {
+                            kind,
+                            sender,
+                            target,
+                            stanza: &source,
+                        })
+                        .await;
+                    if let Err(error) = &result {
+                        report_handler_failure(error, account);
+                    }
+                    result
+                };
+                self.outbox
+                    .drain_until(&self.registration, authorize)
+                    .await?
             };
-            self.outbox
-                .drain_until(&self.registration, authorize)
-                .await?
-        };
-        if let Err(error) = authorized {
-            return self.reply_error(&source, error.condition());
+            if let Err(error) = authorized {
+                return self.reply_error(&source, error.condition());
+            }
+        }
+        if remote {
+            return self.reply_error(&source, StanzaErrorCondition::RemoteServerNotFound);
         }
         let registration = &self.registration;
         let storage = &self.storage;

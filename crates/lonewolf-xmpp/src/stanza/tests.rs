@@ -1129,6 +1129,7 @@ fn stanza_error_conditions_have_expected_names_and_types() {
         StanzaErrorCondition::JidMalformed,
         StanzaErrorCondition::NotAcceptable,
         StanzaErrorCondition::NotAllowed,
+        StanzaErrorCondition::RemoteServerNotFound,
         StanzaErrorCondition::ResourceConstraint,
         StanzaErrorCondition::ServiceUnavailable,
     ] {
@@ -1141,6 +1142,7 @@ fn stanza_error_conditions_have_expected_names_and_types() {
             StanzaErrorCondition::JidMalformed => ("jid-malformed", "modify"),
             StanzaErrorCondition::NotAcceptable => ("not-acceptable", "modify"),
             StanzaErrorCondition::NotAllowed => ("not-allowed", "cancel"),
+            StanzaErrorCondition::RemoteServerNotFound => ("remote-server-not-found", "cancel"),
             StanzaErrorCondition::ResourceConstraint => ("resource-constraint", "wait"),
             StanzaErrorCondition::ServiceUnavailable => ("service-unavailable", "cancel"),
         };

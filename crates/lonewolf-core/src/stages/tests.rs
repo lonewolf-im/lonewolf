@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
+use lonewolf_extension::ExtensionFuture;
+use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
@@ -18,7 +23,7 @@ use crate::config::Config;
 use crate::delivery::{WorkGroup, WorkHandle};
 use crate::hosts::Hosts;
 use crate::router::local::LocalRouter;
-use crate::router::{RoutedStanza, Router, RouterHandle};
+use crate::router::{RoutedStanza, Router, RouterHandle, ServiceRoute};
 use crate::stages::Stage;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -134,6 +139,90 @@ fn deliver_rejects_a_bare_groupchat_message() -> TestResult {
                 ..
             })
         ));
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+struct UncalledService;
+
+impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for UncalledService {
+    fn route<'a>(
+        &'a self,
+        _: RoutedStanza<GlobalChunkAllocator>,
+        _: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async { panic!("message stage must not call service handlers") })
+    }
+}
+
+#[test]
+fn deliver_keeps_service_fallback_errors_separate_from_remote_errors() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new()?;
+        fixture.router = fixture.router.with_services(BTreeMap::from([(
+            "echo.localhost".into(),
+            ServiceRoute {
+                domain: Arc::from("echo.localhost"),
+                handler: Arc::new(UncalledService),
+            },
+        )]));
+        fixture.handle = fixture.router.handle();
+        for target in ["room@echo.localhost", "room@echo.localhost/nick"] {
+            for (kind, attribute) in [
+                (MessageType::Chat, "chat"),
+                (MessageType::Groupchat, "groupchat"),
+            ] {
+                let stanza = parsed(&format!(
+                    "<message from='alice@localhost/laptop' to='{target}' type='{}'/>",
+                    attribute
+                ))
+                .await?;
+                assert!(matches!(
+                    deliver(&fixture.stage(), stanza, kind).await,
+                    Ok(DeliveryOutcome::Rejected {
+                        condition: StanzaErrorCondition::ServiceUnavailable,
+                        ..
+                    })
+                ));
+            }
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+#[test]
+fn deliver_rejects_remote_bare_and_full_groupchat_messages() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new()?;
+        for target in ["bob@remote.example", "bob@remote.example/phone"] {
+            let stanza = parsed(&format!(
+                "<message from='alice@localhost/laptop' to='{target}' type='groupchat'/>"
+            ))
+            .await?;
+            let outcome = deliver(&fixture.stage(), stanza, MessageType::Groupchat).await;
+            assert!(matches!(
+                outcome,
+                Ok(DeliveryOutcome::Rejected {
+                    condition: StanzaErrorCondition::RemoteServerNotFound,
+                    ..
+                })
+            ));
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+#[test]
+fn deliver_discards_remote_bare_and_full_error_messages() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new()?;
+        for target in ["bob@remote.example", "bob@remote.example/phone"] {
+            let stanza = parsed(&format!("<message from='alice@localhost/laptop' to='{target}' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>" )).await?;
+            assert!(matches!(deliver(&fixture.stage(), stanza, MessageType::Error).await, Ok(DeliveryOutcome::Discarded)));
+        }
         fixture.router.shutdown().await?;
         Ok(())
     }))?

@@ -482,19 +482,57 @@ fn missing_full_jid_without_fallback_returns_service_unavailable_with_the_origin
 }
 
 #[test]
-fn remote_account_returns_service_unavailable_with_the_original_payload() -> TestResult {
+fn remote_messages_return_remote_server_not_found_with_the_original_payload() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 
-    alice.send(
-        r#"<message to='alice@remote.example' from='mallory@localhost' type='chat' id='failed'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra>
-     </message>"#,
-    )?;
-    alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='failed' from='alice@remote.example' to='alice@localhost/desk'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
-     </message>"#)?;
+    for target in [
+        "alice@remote.example",
+        "alice@remote.example/phone",
+        "remote.example",
+        "remote.example/phone",
+    ] {
+        for kind in ["normal", "chat", "headline", "groupchat"] {
+            alice.send(&format!("<message to='{target}' from='mallory@localhost/spy' type='{kind}' id='failed'><body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra></message>"))?;
+            alice.expect_xml(&format!("<message xmlns='jabber:client' type='error' id='failed' from='{target}' to='alice@localhost/desk'><body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))?;
+        }
+    }
+    alice.close()
+}
+
+#[test]
+fn remote_error_stanzas_and_iq_results_are_silent_in_a_mixed_sequence() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    for target in [
+        "bob@remote.example",
+        "bob@remote.example/phone",
+        "remote.example",
+        "remote.example/phone",
+    ] {
+        alice.send(&format!("<message type='error' to='{target}' id='silent'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message><presence type='error' to='{target}' id='silent'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence><iq type='result' to='{target}' id='silent'/><iq type='error' to='{target}' id='silent'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq><message type='chat' to='{target}' id='message'/><iq type='get' to='{target}' id='iq'><query xmlns='urn:test'/></iq><presence to='{target}' id='presence'/>"))?;
+        for (kind, id, payload, to) in [
+            ("message", "message", "", " to='alice@localhost/desk'"),
+            ("iq", "iq", "<query xmlns='urn:test'/>", ""),
+            ("presence", "presence", "", " to='alice@localhost/desk'"),
+        ] {
+            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' from='{target}' id='{id}'{to}>{payload}<error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></{kind}>"))?;
+        }
+    }
+    alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
+    alice.close()
+}
+
+#[test]
+fn remote_bare_groupchat_keeps_policy_rejections() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-policy'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<message type='groupchat' to='blocked@remote.example' id='blocked'><body>Keep</body></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' type='error' id='blocked' from='blocked@remote.example' to='alice@localhost/desk'><body>Keep</body><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
     alice.close()
 }
 
@@ -1011,7 +1049,7 @@ fn unsupported_server_iq_get_returns_service_unavailable() -> TestResult {
 }
 
 #[test]
-fn unsupported_remote_server_iq_get_returns_service_unavailable() -> TestResult {
+fn unsupported_remote_server_iq_get_returns_remote_server_not_found() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
@@ -1022,7 +1060,7 @@ fn unsupported_remote_server_iq_get_returns_service_unavailable() -> TestResult 
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='remote.example'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1096,7 +1134,7 @@ fn unsupported_server_iq_set_returns_service_unavailable() -> TestResult {
 }
 
 #[test]
-fn unsupported_remote_server_iq_set_returns_service_unavailable() -> TestResult {
+fn unsupported_remote_server_iq_set_returns_remote_server_not_found() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
@@ -1107,7 +1145,7 @@ fn unsupported_remote_server_iq_set_returns_service_unavailable() -> TestResult 
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='remote.example'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
      </iq>"#)?;
     alice.close()
 }

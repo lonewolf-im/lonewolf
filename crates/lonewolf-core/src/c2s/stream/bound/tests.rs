@@ -248,6 +248,71 @@ impl Fixture {
 }
 
 #[test]
+fn remote_presence_without_roster_rejects_before_writer_admission_and_keeps_state() -> TestResult {
+    use lonewolf_storage::roster::{
+        RosterItem, RosterJid, RosterReads, RosterSubscription, RosterWrites, SubscriptionState,
+    };
+    use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let router = fixture.router.handle();
+        let owner = fixture.registration.account();
+        let registration = router.register(owner, Some("desk"), NonZeroUsize::new(2).ok_or("invalid resource limit")?).await?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let contact = RosterJid::from(Jid::parse_in("alice@remote.example", &mut arena)?.resolve(&arena)?);
+        let mut transaction = fixture.storage.begin_write().await?;
+        transaction.put_roster_item(owner, &RosterItem {
+            jid: contact,
+            name: Some("Alice".into()),
+            groups: Vec::new(),
+            subscription: RosterSubscription { state: SubscriptionState::Both, pending_out: true, approved: true },
+        }).await?;
+        transaction.commit().await?;
+        let before = fixture.storage.begin_read().await?.roster(owner).await?;
+        let held = fixture.storage.begin_write().await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        outbox.liveness = registration.liveness();
+        let (_sender, incoming) = async_channel::bounded(1);
+        let mut session = BoundSession {
+            registration,
+            router,
+            storage: fixture.storage.clone(),
+            allocator: GlobalChunkAllocator,
+            work: fixture.work.handle(),
+            service_presence: None,
+            service_pending: None,
+            available: false,
+            priority: None,
+            incoming,
+            outbox,
+        };
+        for target in ["alice@remote.example", "alice@remote.example/phone", "remote.example", "remote.example/phone"] {
+            for kind in [" type='subscribe'", " type='subscribed'", " type='unsubscribe'", " type='unsubscribed'", "", " type='unavailable'", " type='probe'"] {
+                let input = format!("<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'><presence{kind} to='{target}' from='mallory@localhost/spy' id='remote'/>");
+                let mut parser = XmppParser::new(input.as_bytes(), ParserConfig { max_stanza_bytes: NonZeroUsize::new(4096).ok_or("invalid stanza limit")?, arena: ArenaConfig::default() }, GlobalChunkAllocator);
+                assert!(matches!(parser.next_event().await?, Some(StreamEvent::StreamStart { .. })));
+                let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else { return Err("expected presence stanza".into()); };
+                session.handle_stanza(parsed).await.map_err(|error| format!("{error:?}"))?;
+                assert!(!session.available);
+                assert_eq!(session.priority, None);
+                session.outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+                let reply = session.outbox.writer.written.pop().ok_or("missing remote error")?;
+                assert!(reply.contains("remote-server-not-found"), "{reply}");
+                assert!(reply.contains(target), "{reply}");
+                assert!(reply.contains("bob@localhost/desk"), "{reply}");
+            }
+        }
+        drop(session);
+        drop(held);
+        let after = fixture.storage.begin_read().await?.roster(owner).await?;
+        assert_eq!(after, before);
+        assert_eq!(fixture.count().await?, 0);
+        fixture.finish().await
+    }))?
+}
+
+#[test]
 fn cancelling_local_writer_admission_does_not_authorize_a_later_commit() -> TestResult {
     Runtime::new()?.block_on(async {
         let fixture = Fixture::new(&[]).await?;

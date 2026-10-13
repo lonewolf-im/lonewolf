@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::account::AccountKey;
@@ -9,7 +10,7 @@ use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::stanza::{BuildError, RoutedStanza, Stanza, StanzaErrorCondition, WriteError};
 
-use crate::ExtensionFuture;
+use crate::{Deliver, ExtensionFuture};
 
 /// A marker a handler attaches to a bound resource to select it for later deliveries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +136,7 @@ impl From<StanzaErrorCondition> for HandlerError {
 }
 
 pub type DeliveryFuture<'a> = ExtensionFuture<'a, Result<(), DeliveryError>>;
+pub type IqResponseFuture<'a, A> = ExtensionFuture<'a, Result<RoutedStanza<A>, DeliveryError>>;
 
 /// Builds the stanza for one recipient resource, addressed to the supplied full JID.
 pub type StanzaFactory<A> =
@@ -147,6 +149,23 @@ pub trait HostLookup {
 /// Every method runs on the connection worker of the request being handled.
 pub trait Delivery<A: ChunkAllocator>: HostLookup {
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;
+
+    /// Sends an IQ get or set from a served domain to a bound resource and waits for its result or error.
+    /// Never await the session whose stanza is being handled: it reads its next stanza only after the current one.
+    fn request_iq<'a>(
+        &'a self,
+        request: RoutedStanza<A>,
+        timeout: Duration,
+    ) -> IqResponseFuture<'a, A> {
+        let _ = (request, timeout);
+        Box::pin(async { Err(DeliveryError) })
+    }
+
+    /// Runs work independently on this worker with its own delivery handle; shutdown cancels it.
+    fn detach(&self, work: Deliver<A>) -> Result<(), DeliveryError> {
+        let _ = work;
+        Err(DeliveryError)
+    }
 
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a>;
 

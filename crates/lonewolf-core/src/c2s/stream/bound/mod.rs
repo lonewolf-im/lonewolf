@@ -760,6 +760,25 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .await;
         }
         let Some(kind) = route.request_type() else {
+            if route.destination == Destination::Server {
+                let id = request
+                    .resolve(&arena)?
+                    .id()?
+                    .filter(|id| id.starts_with(crate::router::iq_requests::ID_PREFIX))
+                    .map(Box::<str>::from);
+                if let Some(id) = id {
+                    let routed = request
+                        .derive_in(&mut arena)?
+                        .from(Some(route.sender))?
+                        .build()?;
+                    let sender_text = Box::<str>::from(route.sender.resolve(&arena)?.as_str());
+                    self.router.iq_requests().complete(
+                        &id,
+                        &sender_text,
+                        RoutedStanza::from_parts(routed, arena),
+                    );
+                }
+            }
             return Ok(());
         };
         let response = Arena::try_new_in(Default::default(), self.allocator.clone())?;

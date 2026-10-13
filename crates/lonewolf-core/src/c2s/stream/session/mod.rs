@@ -20,7 +20,10 @@ use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamErrorCondition};
 use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
 
 use super::close::CloseContext;
-use super::header::{ClientHeader, response_header_xml, response_to_from_header, validate_header};
+use super::header::{
+    ClientHeader, ResponseVersion, response_header_xml, response_to_from_header,
+    response_version_from_header, validate_header,
+};
 use super::outcome::CloseOutcome;
 use super::stanza_rate::StanzaLimiter;
 use crate::hosts::Hosts;
@@ -167,7 +170,12 @@ impl<A: ChunkAllocator + Clone> Session<A> {
                 close,
             }),
             Err(_) => Err(writer
-                .reject_header(None, false, CloseOutcome::ParserError)
+                .reject_header(
+                    None,
+                    false,
+                    ResponseVersion::Current,
+                    CloseOutcome::ParserError,
+                )
                 .await),
         }
     }
@@ -194,24 +202,41 @@ impl<A: ChunkAllocator + Clone> Session<A> {
             })) => {
                 match validate_header(&header, &content_namespace, extra_header_namespaces, hosts) {
                     Ok(header) => Ok(header),
-                    Err(outcome) => Err(self
-                        .writer
-                        .reject_header(
-                            response_to_from_header(&header).as_deref(),
-                            content_namespace == CLIENT_NAMESPACE,
-                            outcome,
-                        )
-                        .await),
+                    Err(outcome) => {
+                        let (version, outcome) = match response_version_from_header(&header) {
+                            Ok(version) => (version, outcome),
+                            Err(outcome) => (ResponseVersion::Current, outcome),
+                        };
+                        Err(self
+                            .writer
+                            .reject_header(
+                                response_to_from_header(&header).as_deref(),
+                                content_namespace == CLIENT_NAMESPACE,
+                                version,
+                                outcome,
+                            )
+                            .await)
+                    }
                 }
             }
             Err(ParseError::UnexpectedEof) => Err(CloseOutcome::Eof),
             Err(error) => Err(self
                 .writer
-                .reject_header(None, false, CloseOutcome::from_parse_error(&error))
+                .reject_header(
+                    None,
+                    false,
+                    ResponseVersion::Current,
+                    CloseOutcome::from_parse_error(&error),
+                )
                 .await),
             Ok(_) => Err(self
                 .writer
-                .reject_header(None, false, CloseOutcome::ParserError)
+                .reject_header(
+                    None,
+                    false,
+                    ResponseVersion::Current,
+                    CloseOutcome::ParserError,
+                )
                 .await),
         }
     }
@@ -394,7 +419,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             &self.host,
             header.response_to.as_deref(),
             header.client_content_namespace,
-            true,
+            ResponseVersion::Current,
         )?;
         self.send(&xml).await?;
         self.open = true;
@@ -405,14 +430,10 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         &mut self,
         to: Option<&str>,
         client_content_namespace: bool,
+        version: ResponseVersion<'_>,
         outcome: CloseOutcome,
     ) -> CloseOutcome {
-        let header = match response_header_xml(
-            &self.host,
-            to,
-            client_content_namespace,
-            outcome != CloseOutcome::UnsupportedVersion,
-        ) {
+        let header = match response_header_xml(&self.host, to, client_content_namespace, version) {
             Ok(header) => header,
             Err(outcome) => return outcome,
         };

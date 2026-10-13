@@ -18,7 +18,9 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use super::StreamSettings;
 use super::certificate::CertificateMonitor;
 use super::close::{self, CloseContext};
-use super::header::{response_to_from_header, validate_header};
+use super::header::{
+    ResponseVersion, response_to_from_header, response_version_from_header, validate_header,
+};
 use super::outcome::CloseOutcome;
 use super::session::{
     ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, Writer, namespace_error,
@@ -94,17 +96,26 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                 ) {
                     Ok(header) => header,
                     Err(outcome) => {
+                        let (version, outcome) = match response_version_from_header(&header) {
+                            Ok(version) => (version, outcome),
+                            Err(outcome) => (ResponseVersion::Current, outcome),
+                        };
                         return Err(writer
                             .reject_header(
                                 response_to_from_header(&header).as_deref(),
                                 content_namespace == CLIENT_NAMESPACE,
+                                version,
                                 outcome,
                             )
                             .await);
                     }
                 },
                 Err(CloseOutcome::Eof) => return Err(CloseOutcome::Eof),
-                Err(outcome) => return Err(writer.reject_header(None, false, outcome).await),
+                Err(outcome) => {
+                    return Err(writer
+                        .reject_header(None, false, ResponseVersion::Current, outcome)
+                        .await);
+                }
                 _ => return Err(CloseOutcome::ParserError),
             };
             writer.set_host(header.host.clone());
@@ -209,6 +220,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                     .reject_header(
                         header.response_to.as_deref(),
                         header.client_content_namespace,
+                        ResponseVersion::Current,
                         CloseOutcome::HostUnknown,
                     )
                     .await);

@@ -93,7 +93,6 @@ pub enum ParseError {
     BadNamespacePrefix,
     UnboundNamespacePrefix,
     UnsupportedEncoding,
-    UnsupportedVersion,
     RestrictedXml,
     UnexpectedEvent,
     UnexpectedEof,
@@ -536,7 +535,6 @@ async fn validate_stream_start<R: AsyncBufRead + Unpin>(
 fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {
     let start = BytesStart::from_content(declaration.as_ref(), 3);
     let mut previous = 0;
-    let mut unsupported_version = false;
     let mut unsupported_encoding = false;
     for attribute in start.attributes() {
         let attribute = attribute.map_err(quick_xml::Error::from)?;
@@ -556,7 +554,6 @@ fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {
                 }) {
                     return Err(ParseError::NotWellFormed);
                 }
-                unsupported_version = attribute.value.as_ref() != "1.0";
             }
             2 => {
                 let mut bytes = attribute.value.bytes();
@@ -578,9 +575,6 @@ fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {
     }
     if previous == 0 {
         return Err(ParseError::NotWellFormed);
-    }
-    if unsupported_version {
-        return Err(ParseError::UnsupportedVersion);
     }
     if unsupported_encoding {
         return Err(ParseError::UnsupportedEncoding);
@@ -650,7 +644,6 @@ impl fmt::Display for ParseError {
             Self::BadNamespacePrefix => "content namespace element uses a prefix",
             Self::UnboundNamespacePrefix => "unbound XML namespace prefix",
             Self::UnsupportedEncoding => "XMPP requires UTF-8 input",
-            Self::UnsupportedVersion => "XMPP requires XML 1.0",
             Self::RestrictedXml => "restricted XML construct",
             Self::UnexpectedEvent => "unexpected XML stream event",
             Self::UnexpectedEof => "XML stream ended without a closing tag",

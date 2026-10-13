@@ -839,6 +839,68 @@ fn distinguishes_transport_errors_from_invalid_xml() {
 }
 
 #[test]
+fn xml_one_x_declarations_keep_xml_one_zero_character_rules_and_events() -> TestResult {
+    block_on(async {
+        for chunk in [1, usize::MAX] {
+            let mut expected = String::new();
+            for version in [
+                "1.0",
+                "1.1",
+                "1.000",
+                "1.999999999999999999999999999999999999999",
+            ] {
+                let input = format!(
+                    "<?xml version='{version}'?>{OPEN}<message><body>\u{85}\u{2028}&amp;&#65;</body></message>{CLOSE}"
+                );
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                open(&mut parser).await?;
+                let parsed = stanza(&mut parser).await?;
+                let view = parsed.value().resolve(parsed.arena())?;
+                assert_eq!(
+                    view.child("body", CLIENT_NAMESPACE)?
+                        .ok_or("body")?
+                        .text()?,
+                    Some("\u{85}\u{2028}&A")
+                );
+                let mut output = String::new();
+                view.write_xml(&mut output)?;
+                if expected.is_empty() {
+                    expected = output;
+                } else {
+                    assert_eq!(output, expected);
+                }
+                assert!(matches!(
+                    parser.next_event().await?,
+                    Some(StreamEvent::StreamEnd)
+                ));
+
+                for element in [
+                    "<message id='&#x1;'/>",
+                    "<message><body>&#x1;</body></message>",
+                ] {
+                    let input = format!("<?xml version='{version}'?>{OPEN}{element}{CLOSE}");
+                    let mut parser = XmppParser::new(
+                        Fragmented::new(input.as_bytes(), chunk),
+                        config(4096)?,
+                        GlobalChunkAllocator,
+                    );
+                    open(&mut parser).await?;
+                    assert!(matches!(
+                        parser.next_event().await,
+                        Err(ParseError::NotWellFormed)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn declaration_encoding_and_unclosed_stream_are_checked() -> TestResult {
     block_on(async {
         let input = format!(
@@ -852,7 +914,7 @@ fn declaration_encoding_and_unclosed_stream_are_checked() -> TestResult {
         open(&mut parser).await?;
         stanza(&mut parser).await?;
         for declaration in [
-            "<?xml version='1.1'?>",
+            "<?xml version='2.0'?>",
             "<?xml version='1.0' encoding='ISO-8859-1'?>",
             "<?xml encoding='UTF-8' version='1.0'?>",
             "<?xml version='1.0' extra='1'?>",
@@ -2329,6 +2391,7 @@ fn xml_declaration_grammar_and_position_errors_are_not_well_formed() -> TestResu
                 "<?xml version='1.0' standalone='yes' encoding='UTF-8'?>",
                 "<?xml version='1.0' version='1.0'?>",
                 "<?xml version='invalid'?>",
+                "<?xml version='2.0'?>",
                 "<?xml version='1.'?>",
                 "<?xml version='1.0' encoding='9invalid'?>",
                 " <?xml version='1.0'?>",

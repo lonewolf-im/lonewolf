@@ -504,7 +504,6 @@ fn evaluate_fails_closed_and_stops_handlers_and_checks_after_drop() -> TestResul
 #[derive(Clone)]
 struct UnavailableAllocator;
 
-// This allocator never returns a chunk.
 unsafe impl lonewolf_util::arena::ChunkAllocator for UnavailableAllocator {
     fn allocate(
         &self,
@@ -564,6 +563,153 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
         assert_eq!(audience.contacts, [contact]);
         assert_eq!(audience.pending, [pending]);
         router.shutdown().await?;
+        Ok(())
+    })
+}
+
+struct RecordingArchive {
+    selected: bool,
+    outcome: lonewolf_extension::archive::ArchiveOutcome,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl lonewolf_extension::Extension<GlobalChunkAllocator, RedbStorage> for RecordingArchive {
+    fn name(&self) -> &'static str {
+        "recording-archive"
+    }
+
+    fn register(
+        self: std::sync::Arc<Self>,
+        _: &str,
+        slots: &mut lonewolf_extension::Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), lonewolf_extension::RegistrationError> {
+        slots.archive(self)
+    }
+}
+
+impl lonewolf_extension::archive::ArchiveHandler<GlobalChunkAllocator, RedbStorage>
+    for RecordingArchive
+{
+    fn selects(
+        &self,
+        _: &lonewolf_extension::archive::ArchiveRequest<'_, GlobalChunkAllocator>,
+    ) -> bool {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.selected
+    }
+
+    fn archive<'a>(
+        &'a self,
+        _: lonewolf_extension::archive::ArchiveRequest<'a, GlobalChunkAllocator>,
+        _: &'a mut lonewolf_storage::RedbWrite,
+        _: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> lonewolf_extension::archive::ArchiveFuture<'a> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::pin(async { Ok(self.outcome) })
+    }
+}
+
+fn archive_fixture(
+    selected: bool,
+    outcome: lonewolf_extension::archive::ArchiveOutcome,
+) -> TestResult<(Fixture, std::sync::Arc<RecordingArchive>)> {
+    let mut fixture = Fixture::new()?;
+    let handler = std::sync::Arc::new(RecordingArchive {
+        selected,
+        outcome,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut extensions = lonewolf_extension::Extensions::default();
+    extensions.register(handler.clone())?;
+    fixture.router = fixture
+        .router
+        .with_extensions(std::collections::BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["recording-archive"])?,
+        )]));
+    fixture.handle = fixture.router.handle();
+    Ok((fixture, handler))
+}
+
+#[test]
+fn stamping_adds_the_received_id_and_removes_spoofed_ones() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_extension::archive::{ArchiveId, ArchiveOutcome};
+        use crate::stages::archive::{ArchiveStep, archive};
+
+        let (fixture, handler) = archive_fixture(true, ArchiveOutcome::Archived(ArchiveId::new(7)))?;
+        let recipient = account("bob@localhost")?;
+        let stanza = parsed("<message from='alice@localhost/res' to='bob@localhost' type='chat'><stanza-id xmlns='urn:xmpp:sid:0' by='bob@localhost' id='spoof'/><stanza-id xmlns='urn:xmpp:sid:0' by='other@example.org' id='foreign'/></message>").await?;
+        let ArchiveStep::Accepted(archived) = archive(&fixture.stage(), stanza, None, Some(&recipient)).await.map_err(|_| "archive failed")? else {
+            return Err("archive rejected message".into());
+        };
+        assert_eq!(archived.sent, None);
+        assert_eq!(archived.received, Some(ArchiveId::new(7)));
+        let view = archived.stanza.resolve()?;
+        let children = view.children()?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(children.len(), 2);
+        for (child, (id, by)) in children.iter().zip([("foreign", "other@example.org"), ("7", "bob@localhost")]) {
+            assert_eq!(child.name(), "stanza-id");
+            assert_eq!(child.namespace(), "urn:xmpp:sid:0");
+            assert_eq!(child.attribute("id", "")?, Some(id));
+            assert_eq!(child.attribute("by", "")?, Some(by));
+        }
+        assert_eq!(handler.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn error_messages_are_never_archived() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_extension::archive::{ArchiveId, ArchiveOutcome};
+        use crate::stages::archive::{ArchiveStep, archive};
+
+        let (fixture, handler) = archive_fixture(true, ArchiveOutcome::Archived(ArchiveId::new(7)))?;
+        let sender = account("alice@localhost")?;
+        let recipient = account("bob@localhost")?;
+        let stanza = parsed("<message from='alice@localhost/res' to='bob@localhost' type='error'><stanza-id xmlns='urn:xmpp:sid:0' by='bob@localhost' id='original'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>").await?;
+        let mut expected = String::new();
+        stanza.resolve()?.write_xml(&mut expected)?;
+        let ArchiveStep::Accepted(archived) = archive(&fixture.stage(), stanza, Some(&sender), Some(&recipient)).await.map_err(|_| "archive failed")? else {
+            return Err("archive rejected error message".into());
+        };
+        assert_eq!(archived.sent, None);
+        assert_eq!(archived.received, None);
+        let mut actual = String::new();
+        archived.stanza.resolve()?.write_xml(&mut actual)?;
+        assert_eq!(actual, expected);
+        assert_eq!(handler.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn unselected_and_skipped_archives_remove_spoofed_ids_without_stamping() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_extension::archive::ArchiveOutcome;
+        use crate::stages::archive::{ArchiveStep, archive};
+
+        for selected in [false, true] {
+            let (fixture, handler) = archive_fixture(selected, ArchiveOutcome::Skipped)?;
+            let recipient = account("bob@localhost")?;
+            let stanza = parsed("<message from='alice@localhost/res' to='bob@localhost' type='chat'><stanza-id xmlns='urn:xmpp:sid:0' by='bob@localhost' id='spoof'/><stanza-id xmlns='urn:xmpp:sid:0' by='other@example.org' id='foreign'/></message>").await?;
+            let ArchiveStep::Accepted(archived) = archive(&fixture.stage(), stanza, None, Some(&recipient)).await.map_err(|_| "archive failed")? else {
+                return Err("archive rejected message".into());
+            };
+            assert_eq!(archived.sent, None);
+            assert_eq!(archived.received, None);
+            let view = archived.stanza.resolve()?;
+            let children = view.children()?.collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].attribute("by", "")?, Some("other@example.org"));
+            assert_eq!(handler.calls.load(std::sync::atomic::Ordering::Relaxed), if selected { 2 } else { 1 });
+            fixture.router.shutdown().await?;
+        }
         Ok(())
     })
 }

@@ -9,6 +9,7 @@ use lonewolf_xmpp::stanza::BuildError;
 use crate::delivery::WorkHandle;
 use crate::router::RouterHandle;
 
+pub(crate) mod archive;
 pub(crate) mod message;
 pub(crate) mod policy;
 pub(crate) mod service;

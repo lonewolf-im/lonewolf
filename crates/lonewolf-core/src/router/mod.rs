@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::account::AccountHandler;
+use lonewolf_extension::archive::ArchiveHandler;
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::IqRegistry;
@@ -207,6 +208,15 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A, RedbStorage>> {
         self.extensions.get(domain).map(ExtensionRegistry::iq)
+    }
+
+    pub(crate) fn archive_handler(
+        &self,
+        domain: &str,
+    ) -> Option<&Arc<dyn ArchiveHandler<A, RedbStorage>>> {
+        self.extensions
+            .get(domain)
+            .and_then(ExtensionRegistry::archive)
     }
 
     pub(crate) fn policies(

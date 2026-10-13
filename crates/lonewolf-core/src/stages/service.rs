@@ -9,7 +9,7 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaErrorCondition, StanzaType};
 
 use super::message::{self, DeliveryOutcome};
-use super::{Stage, StageFailure, policy};
+use super::{Stage, StageFailure, archive, policy};
 use crate::delivery::WorkHandle;
 use crate::router::{Destination, RoutedStanza, RouterError, RouterHandle, ServiceRoute};
 
@@ -137,6 +137,19 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                             storage: self.storage,
                             allocator: self.allocator,
                             work: self.work,
+                        };
+                        let stanza = if self.router.archive_handler(to.domainpart()).is_some() {
+                            let recipient =
+                                AccountKey::try_from(to.bare()).map_err(|_| DeliveryError)?;
+                            match archive::archive(&stage, stanza, None, Some(&recipient))
+                                .await
+                                .map_err(|_| DeliveryError)?
+                            {
+                                archive::ArchiveStep::Accepted(archived) => archived.stanza,
+                                archive::ArchiveStep::Rejected { .. } => return Err(DeliveryError),
+                            }
+                        } else {
+                            stanza
                         };
                         match message::deliver(&stage, stanza, kind).await {
                             Ok(

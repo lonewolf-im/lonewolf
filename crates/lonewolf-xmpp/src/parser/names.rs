@@ -9,7 +9,7 @@ use super::{MAX_ATTRIBUTES_PER_ELEMENT, ParseError};
 use crate::stanza::incoming::Frame;
 use crate::stanza::namespace::NamespaceContext;
 use crate::stanza::{
-    CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaKind, StanzaNamespace, XML_NAMESPACE, xml,
+    BuildError, CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaKind, StanzaNamespace, XML_NAMESPACE, xml,
 };
 
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
@@ -31,7 +31,6 @@ pub(super) fn push(
         validate_qname(attribute.key)?;
         if let Some(prefix) = attribute.key.as_namespace_binding() {
             let value = normalized(&attribute)?;
-            xml::validate_text(&value)?;
             if value == XMLNS_NAMESPACE
                 || (value == XML_NAMESPACE && prefix != PrefixDeclaration::Named("xml"))
                 || (value.is_empty() && matches!(prefix, PrefixDeclaration::Named(_)))
@@ -118,7 +117,15 @@ pub(super) fn frame<A: ChunkAllocator>(
         let name = name.into_inner();
         let value = normalized(&attribute)?;
         has_lang |= name == "lang" && namespace == XML_NAMESPACE;
-        frame.attribute(name, namespace, &value, arena)?;
+        frame
+            .attribute(name, namespace, &value, arena)
+            .map_err(|error| {
+                if matches!(error, BuildError::DuplicateAttribute) {
+                    ParseError::NotWellFormed
+                } else {
+                    error.into()
+                }
+            })?;
     }
     if root && !has_lang && !stream_lang.is_empty() {
         frame.attribute("lang", XML_NAMESPACE, stream_lang, arena)?;
@@ -128,11 +135,11 @@ pub(super) fn frame<A: ChunkAllocator>(
 
 fn normalized<'a>(attribute: &Attribute<'a>) -> Result<std::borrow::Cow<'a, str>, ParseError> {
     if attribute.value.contains('<') {
-        return Err(ParseError::InvalidXml);
+        return Err(ParseError::NotWellFormed);
     }
-    attribute
-        .normalized_value(XmlVersion::Explicit1_0)
-        .map_err(ParseError::from)
+    let value = attribute.normalized_value(XmlVersion::Explicit1_0)?;
+    xml::validate_text(&value).map_err(|_| ParseError::NotWellFormed)?;
+    Ok(value)
 }
 
 fn resolved_namespace(namespace: ResolveResult<'_>) -> Result<&str, ParseError> {
@@ -146,10 +153,10 @@ fn resolved_namespace(namespace: ResolveResult<'_>) -> Result<&str, ParseError> 
 fn validate_qname(name: QName<'_>) -> Result<(), ParseError> {
     let name = name.into_inner();
     if let Some((prefix, local)) = name.split_once(':') {
-        xml::validate_name(prefix, "", false)?;
-        xml::validate_name(local, "", false)?;
+        xml::validate_name(prefix, "", false).map_err(|_| ParseError::NotWellFormed)?;
+        xml::validate_name(local, "", false).map_err(|_| ParseError::NotWellFormed)?;
     } else {
-        xml::validate_name(name, "", false)?;
+        xml::validate_name(name, "", false).map_err(|_| ParseError::NotWellFormed)?;
     }
     Ok(())
 }

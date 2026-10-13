@@ -43,23 +43,23 @@ fn unbound_prefix_returns_not_well_formed_before_tls() -> TestResult {
 }
 
 #[test]
-fn mismatched_tags_returns_bad_format_before_tls() -> TestResult {
+fn mismatched_tags_returns_not_well_formed_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.tcp_client()?;
     client.open()?;
 
     client.send(r#"<message><body></message>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
-fn duplicate_attributes_returns_bad_format_before_tls() -> TestResult {
+fn duplicate_attributes_returns_not_well_formed_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.tcp_client()?;
     client.open()?;
 
     client.send(r#"<message id='a' id='b'/>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -149,21 +149,21 @@ fn unbound_prefix_returns_not_well_formed_before_authentication() -> TestResult 
 }
 
 #[test]
-fn mismatched_tags_returns_bad_format_before_authentication() -> TestResult {
+fn mismatched_tags_returns_not_well_formed_before_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send(r#"<message><body></message>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
-fn duplicate_attributes_returns_bad_format_before_authentication() -> TestResult {
+fn duplicate_attributes_returns_not_well_formed_before_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send(r#"<message id='a' id='b'/>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -254,23 +254,23 @@ fn unbound_prefix_returns_not_well_formed_before_binding() -> TestResult {
 }
 
 #[test]
-fn mismatched_tags_returns_bad_format_before_binding() -> TestResult {
+fn mismatched_tags_returns_not_well_formed_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
     client.send(r#"<message><body></message>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
-fn duplicate_attributes_returns_bad_format_before_binding() -> TestResult {
+fn duplicate_attributes_returns_not_well_formed_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
     client.send(r#"<message id='a' id='b'/>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -354,23 +354,23 @@ fn unbound_prefix_returns_not_well_formed_after_binding() -> TestResult {
 }
 
 #[test]
-fn mismatched_tags_returns_bad_format_after_binding() -> TestResult {
+fn mismatched_tags_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.connect("alice", "pencil", "desktop")?;
 
     client.send(r#"<message><body></message>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
-fn duplicate_attributes_returns_bad_format_after_binding() -> TestResult {
+fn duplicate_attributes_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.connect("alice", "pencil", "desktop")?;
 
     client.send(r#"<message id='a' id='b'/>"#)?;
-    client.expect_stream_error("bad-format")
+    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -757,7 +757,10 @@ fn fatal_errors_in_rejected_envelopes_withdraw_the_bound_resource() -> TestResul
         "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
     )?;
     for (input, condition) in [
-        ("<iq type='future'><query></iq>".to_owned(), "bad-format"),
+        (
+            "<iq type='future'><query></iq>".to_owned(),
+            "not-well-formed",
+        ),
         (
             "<iq type='future'><!--forbidden--></iq>".to_owned(),
             "restricted-xml",
@@ -850,4 +853,73 @@ fn failed_parser_enters_tls_closure_without_interpreting_footer_text() -> TestRe
     client.expect_tcp_open()?;
     client.send_tls_close()?;
     client.expect_tcp_eof()
+}
+
+#[test]
+fn xml_grammar_errors_close_every_phase_with_complete_and_fragmented_input() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for phase in 0..4 {
+        for fragmented in [false, true] {
+            for (prefix, suffix) in [
+                ("<message><body></mes", "sage>"),
+                ("<message id='a' i", "d='b'/>"),
+                ("<message id='a", "<b'/>"),
+                ("<message><body>]", "]></body></message>"),
+            ] {
+                if phase == 0 {
+                    let mut client = suite.tcp_client()?;
+                    client.open()?;
+                    if fragmented {
+                        client.send(prefix)?;
+                        client.send(suffix)?;
+                    } else {
+                        client.send(&format!("{prefix}{suffix}"))?;
+                    }
+                    client.expect_stream_error("not-well-formed")?;
+                } else {
+                    let mut client = if phase == 1 {
+                        suite.unauthenticated_client()?
+                    } else {
+                        suite.authenticated_client("alice", "pencil")?
+                    };
+                    if phase == 3 {
+                        client.bind(Some("desk"))?;
+                    }
+                    if fragmented {
+                        client.send(prefix)?;
+                        client.send(suffix)?;
+                    } else {
+                        client.send(&format!("{prefix}{suffix}"))?;
+                    }
+                    client.expect_stream_error("not-well-formed")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_xml_prevents_following_stanza_delivery() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let mut recipient = suite.connect("bob", "pencil", "desk")?;
+    for malformed in [
+        "<message><body></message>",
+        "<message id='a' id='b'/>",
+        "<message id='a<b'/>",
+        "<message><body>]]></body></message>",
+    ] {
+        let mut sender = suite.connect("alice", "pencil", "desk")?;
+        sender.send(&format!(
+            "{malformed}<message to='bob@localhost/desk' id='forbidden'/>"
+        ))?;
+        sender.expect_stream_error("not-well-formed")?;
+        recipient.send("<message to='bob@localhost/desk' id='sentinel'/>")?;
+        recipient.expect_xml("<message xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost/desk' id='sentinel'/>")?;
+    }
+    recipient.expect_no_tls_input()?;
+    recipient.close()
 }

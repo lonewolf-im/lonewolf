@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::support::{C2sSuite, OPEN, TestResult};
+use super::support::{C2sSuite, OPEN, TLS_NAMESPACE, TestResult};
 
 fn rejected_version_headers() -> impl Iterator<Item = (String, Option<&'static str>, &'static str)>
 {
@@ -1018,4 +1018,47 @@ fn restart_sender_must_match_the_authenticated_account() -> TestResult {
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' from='bob@localhost' to='localhost' version='1.0'>"#)?;
     client.expect_stream_error("invalid-from")
+}
+
+#[test]
+fn authenticated_restart_to_another_host_is_unknown() -> TestResult {
+    let hosts = "[hosts.'other.localhost'.tls]\ncertificate_chain_path = 'certificate.pem'\nprivate_key_path = 'private-key.pem'";
+    let suite = C2sSuite::with_hosts(hosts)?;
+    suite.create_account("alice", "pencil")?;
+
+    for from in [None, Some("alice@localhost"), Some("bob@localhost")] {
+        let mut client = suite.unauthenticated_client()?;
+        client.authenticate("alice", "pencil")?;
+        let mut client = client.restart();
+        let from_attribute = from.map_or_else(String::new, |from| format!(" from='{from}'"));
+        let opening = format!(
+            "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'{from_attribute} to='other.localhost' version='1.0'>"
+        );
+
+        let header = client.open_with(&opening)?;
+        assert_eq!(header.attribute("from"), Some("localhost"));
+        assert_eq!(header.attribute("to"), from);
+        client.expect_stream_error("host-unknown")?;
+    }
+
+    let mut client = suite.unauthenticated_client()?;
+    client.authenticate("alice", "pencil")?;
+    let mut client = client.restart();
+    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' from='bob@localhost' to='localhost' version='1.0'>"#)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
+    assert_eq!(header.attribute("to"), Some("bob@localhost"));
+    client.expect_stream_error("invalid-from")
+}
+
+#[test]
+fn tls_restart_to_another_host_is_unknown() -> TestResult {
+    let hosts = "[hosts.'other.localhost'.tls]\ncertificate_chain_path = 'certificate.pem'\nprivate_key_path = 'private-key.pem'";
+    let suite = C2sSuite::with_hosts(hosts)?;
+    let mut plain = suite.tcp_client()?;
+    plain.open()?.child(TLS_NAMESPACE, "starttls")?;
+    let mut client = plain.start_tls(&suite)?;
+
+    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='other.localhost' version='1.0'>"#)?;
+    assert_eq!(header.attribute("from"), Some("localhost"));
+    client.expect_stream_error("host-unknown")
 }

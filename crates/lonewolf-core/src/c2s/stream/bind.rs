@@ -111,11 +111,21 @@ async fn bind_session<A: ChunkAllocator + Clone>(
     certificate: Option<(&RedbStorage, &CertificateMonitor)>,
 ) -> Result<(Registration<A>, bool), CloseOutcome> {
     let header = session.read_header(hosts).await?;
-    if header.host != session.host()
-        || header
-            .response_to
-            .as_deref()
-            .is_some_and(|from| from != account.as_str())
+    if header.host != session.host() {
+        return Err(session
+            .writer
+            .reject_header(
+                header.response_to.as_deref(),
+                header.client_content_namespace,
+                ResponseVersion::Current,
+                CloseOutcome::HostUnknown,
+            )
+            .await);
+    }
+    if header
+        .response_to
+        .as_deref()
+        .is_some_and(|from| from != account.as_str())
     {
         return Err(session
             .writer

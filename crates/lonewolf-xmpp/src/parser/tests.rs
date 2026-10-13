@@ -120,6 +120,7 @@ struct Fragmented<'a> {
     split: usize,
     pending: bool,
     stall_at_end: bool,
+    error_at_end: bool,
     consumed: Arc<AtomicUsize>,
 }
 
@@ -132,6 +133,7 @@ impl<'a> Fragmented<'a> {
             split: bytes.len(),
             pending: false,
             stall_at_end: false,
+            error_at_end: false,
             consumed: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -144,6 +146,9 @@ impl AsyncBufRead for Fragmented<'_> {
             this.pending = false;
             cx.waker().wake_by_ref();
             return Poll::Pending;
+        }
+        if this.error_at_end && this.position == this.bytes.len() {
+            return Poll::Ready(Err(io::Error::other("transport failure")));
         }
         if this.stall_at_end && this.position == this.bytes.len() {
             return Poll::Pending;
@@ -465,10 +470,10 @@ fn distinguishes_transport_errors_from_invalid_xml() {
 }
 
 #[test]
-fn declaration_bom_encoding_and_unclosed_stream_are_checked() -> TestResult {
+fn declaration_encoding_and_unclosed_stream_are_checked() -> TestResult {
     block_on(async {
         let input = format!(
-            "\u{feff}<?xml version='1.0' encoding='utf-8' standalone='yes'?>{OPEN}<presence/>{CLOSE}"
+            "<?xml version='1.0' encoding='utf-8' standalone='yes'?>{OPEN}<presence/>{CLOSE}"
         );
         let mut parser = XmppParser::new(
             Fragmented::new(input.as_bytes(), 1),
@@ -683,7 +688,7 @@ fn stream_footer_does_not_consume_the_stanza_budget() -> TestResult {
 }
 
 #[test]
-fn declaration_position_and_bom_are_independent_of_fragmentation() -> TestResult {
+fn declaration_position_is_independent_of_fragmentation() -> TestResult {
     for chunk in [1, usize::MAX] {
         block_on(async {
             for prefix in [
@@ -699,9 +704,12 @@ fn declaration_position_and_bom_are_independent_of_fragmentation() -> TestResult
                     config(4096)?,
                     GlobalChunkAllocator,
                 );
-                assert!(parser.next_event().await.is_err(), "accepted {prefix:?}");
+                assert!(
+                    matches!(parser.next_event().await, Err(ParseError::NotWellFormed)),
+                    "accepted {prefix:?}"
+                );
             }
-            for prefix in ["\u{feff} \r\n", " \r\n"] {
+            for prefix in [" \r\n", "\t"] {
                 let input = format!("{prefix}{OPEN}");
                 let mut parser = XmppParser::new(
                     Fragmented::new(input.as_bytes(), chunk),
@@ -714,6 +722,183 @@ fn declaration_position_and_bom_are_independent_of_fragmentation() -> TestResult
         })?;
     }
     Ok(())
+}
+
+#[test]
+fn stream_start_preserves_character_semantics_across_splits_and_restarts() -> TestResult {
+    block_on(async {
+        for prefix in [
+            "\u{feff}",
+            "\u{feff}<?xml version='1.0' encoding='UTF-8'?>",
+            "\u{feff}\u{feff}",
+            "\u{feff} \t\r\n",
+            " \t\r\n\u{feff}",
+            "\u{feff} \u{feff}",
+            "\u{fffd}",
+            "\u{f000}",
+            "é",
+            "🐺",
+            "!",
+        ] {
+            for suffix in ["", OPEN] {
+                for restart in [false, true] {
+                    let initial = if restart { OPEN } else { "" };
+                    let input = format!("{initial}{prefix}{suffix}");
+                    for chunk in [1, usize::MAX] {
+                        for split in [1, 2, input.len() - initial.len()] {
+                            let mut reader = Fragmented::new(input.as_bytes(), chunk);
+                            reader.split = initial.len() + split.min(input.len() - initial.len());
+                            let mut parser =
+                                XmppParser::new(reader, config(4096)?, GlobalChunkAllocator);
+                            if restart {
+                                open(&mut parser).await?;
+                                parser = parser.restart()?;
+                            }
+                            let error = parser
+                                .next_event()
+                                .await
+                                .err()
+                                .ok_or("accepted stream text")?;
+                            assert!(
+                                matches!(error, ParseError::NotWellFormed),
+                                "{prefix:?}, restart={restart}, chunk={chunk}, split={split}: {error:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn stream_start_distinguishes_malformed_utf8_from_clean_eof() -> TestResult {
+    block_on(async {
+        for invalid in [
+            b"\xef".as_slice(),
+            b"\xef\xbb",
+            b"\xef<",
+            b"\xef\xbb<",
+            b"\xef\xff\xbf",
+            b"\x80",
+            b"\xc0\x80",
+            b"\xed\xa0\x80",
+            b"\xf4\x90\x80\x80",
+            b"\xf0\x9f\x90",
+            b"\xff",
+        ] {
+            for restart in [false, true] {
+                let mut input = Vec::new();
+                if restart {
+                    input.extend_from_slice(OPEN.as_bytes());
+                }
+                input.extend_from_slice(invalid);
+                for chunk in [1, usize::MAX] {
+                    let mut parser = XmppParser::new(
+                        Fragmented::new(&input, chunk),
+                        config(4096)?,
+                        GlobalChunkAllocator,
+                    );
+                    if restart {
+                        open(&mut parser).await?;
+                        parser = parser.restart()?;
+                    }
+                    let error = parser
+                        .next_event()
+                        .await
+                        .err()
+                        .ok_or("accepted invalid UTF-8")?;
+                    assert!(
+                        matches!(error, ParseError::UnsupportedEncoding),
+                        "{invalid:?}, restart={restart}: {error:?}"
+                    );
+                }
+            }
+        }
+        for input in ["", " \t\r\n"] {
+            let mut parser = XmppParser::new(
+                Fragmented::new(input.as_bytes(), 1),
+                config(4096)?,
+                GlobalChunkAllocator,
+            );
+            assert!(matches!(
+                parser.next_event().await,
+                Err(ParseError::UnexpectedEof)
+            ));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn stream_start_retains_transport_errors_during_scalar_reads() -> TestResult {
+    block_on(async {
+        for bytes in [b"".as_slice(), b"\xef", b"\xef\xbb", b"\xf0\x9f\x90"] {
+            for restart in [false, true] {
+                let mut input = Vec::new();
+                if restart {
+                    input.extend_from_slice(OPEN.as_bytes());
+                }
+                input.extend_from_slice(bytes);
+                let mut reader = Fragmented::new(&input, 1);
+                reader.error_at_end = true;
+                let mut parser = XmppParser::new(reader, config(4096)?, GlobalChunkAllocator);
+                if restart {
+                    open(&mut parser).await?;
+                    parser = parser.restart()?;
+                }
+                let error = parser
+                    .next_event()
+                    .await
+                    .err()
+                    .ok_or("expected transport error")?;
+                assert!(error.is_transport_error(), "{bytes:?}: {error:?}");
+                assert!(matches!(
+                    parser.next_event().await,
+                    Err(ParseError::ParserFailed)
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn payload_preserves_feff_and_replacement_characters_with_wire_byte_limits() -> TestResult {
+    block_on(async {
+        let message = "<message><body>\u{feff}a\u{feff}\u{fffd}</body></message>";
+        let input = format!("{OPEN}{message}{CLOSE}");
+        for chunk in [1, usize::MAX] {
+            let mut parser = XmppParser::new(
+                Fragmented::new(input.as_bytes(), chunk),
+                config(message.len())?,
+                GlobalChunkAllocator,
+            );
+            open(&mut parser).await?;
+            let parsed = stanza(&mut parser).await?;
+            let body = parsed
+                .value()
+                .resolve(parsed.arena())?
+                .child("body", CLIENT_NAMESPACE)?
+                .ok_or("body")?;
+            assert_eq!(body.text()?, Some("\u{feff}a\u{feff}\u{fffd}"));
+            assert!(matches!(
+                parser.next_event().await?,
+                Some(StreamEvent::StreamEnd)
+            ));
+            let mut parser = XmppParser::new(
+                Fragmented::new(input.as_bytes(), chunk),
+                config(message.len() - 1)?,
+                GlobalChunkAllocator,
+            );
+            open(&mut parser).await?;
+            assert!(
+                matches!(parser.next_event().await, Err(ParseError::SizeLimitExceeded { limit }) if limit == message.len() - 1)
+            );
+        }
+        Ok(())
+    })
 }
 
 #[test]

@@ -16,7 +16,6 @@ use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
-use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use x509_cert::Certificate;
 use x509_cert::crl::CertificateList;
@@ -205,6 +204,7 @@ impl fmt::Debug for VerifiedClient {
 pub struct ClientCertificatePolicy {
     host: Box<str>,
     roots: Arc<RootCertStore>,
+    anchor_expirations: Box<[SystemTime]>,
     provider: Arc<CryptoProvider>,
     crls_path: PathBuf,
     verifier: Arc<dyn ClientCertVerifier>,
@@ -229,19 +229,36 @@ impl ClientCertificatePolicy {
         let file = File::open(&config.trust_anchors_path)
             .map_err(|_| ClientIdentityError::TrustAnchors)?;
         let mut roots = RootCertStore::empty();
+        let mut anchor_expirations = Vec::new();
         for certificate in CertificateDer::pem_reader_iter(file) {
-            roots
-                .add(certificate.map_err(|_| ClientIdentityError::TrustAnchors)?)
+            let certificate = certificate.map_err(|_| ClientIdentityError::TrustAnchors)?;
+            let expiration = certificate_expiration(&certificate)
                 .map_err(|_| ClientIdentityError::TrustAnchors)?;
+            roots
+                .add(certificate)
+                .map_err(|_| ClientIdentityError::TrustAnchors)?;
+            anchor_expirations.push(expiration);
         }
         if roots.is_empty() {
             return Err(ClientIdentityError::TrustAnchors);
+        }
+        for (index, root) in roots.roots.iter().enumerate() {
+            let expiration = roots
+                .roots
+                .iter()
+                .zip(&anchor_expirations)
+                .filter(|(candidate, _)| *candidate == root)
+                .map(|(_, expiration)| *expiration)
+                .max()
+                .ok_or(ClientIdentityError::TrustAnchors)?;
+            anchor_expirations[index] = expiration;
         }
         let roots = Arc::new(roots);
         let (verifier, _) = load_verifier(&roots, &provider, &config.crls_path, SystemTime::now())?;
         Ok(Arc::new(Self {
             host: host.into(),
             roots,
+            anchor_expirations: anchor_expirations.into_boxed_slice(),
             provider,
             crls_path: config.crls_path.clone(),
             verifier,
@@ -271,7 +288,7 @@ impl ClientCertificatePolicy {
 
     fn handshake_verifier_result(
         &self,
-        loaded: Result<(Arc<dyn ClientCertVerifier>, SystemTime), ClientIdentityError>,
+        loaded: Result<(Arc<KeyUsageVerifier>, SystemTime), ClientIdentityError>,
         now: SystemTime,
     ) -> Arc<dyn ClientCertVerifier> {
         match loaded {
@@ -338,25 +355,40 @@ impl ClientCertificatePolicy {
             now.duration_since(UNIX_EPOCH)
                 .map_err(|_| ClientIdentityError::InvalidTime)?,
         );
-        verifier
-            .verify_client_cert(leaf, intermediates, time)
+        let leaf = webpki::EndEntityCert::try_from(leaf)
+            .map_err(|error| ClientIdentityError::Verification(webpki_error(error)))?;
+        let path = verifier
+            .verify_path(&leaf, intermediates, time)
             .map_err(ClientIdentityError::Verification)?;
-        for certificate in chain {
-            let certificate = Certificate::from_der(certificate.as_ref())
-                .map_err(|_| ClientIdentityError::MalformedCertificate)?;
-            let expiration = UNIX_EPOCH
-                .checked_add(
-                    certificate
-                        .tbs_certificate()
-                        .validity()
-                        .not_after
-                        .to_unix_duration(),
-                )
-                .ok_or(ClientIdentityError::InvalidTime)?;
-            valid_until = valid_until.min(expiration);
+        valid_until = valid_until.min(certificate_expiration(&path.end_entity().der())?);
+        for certificate in path.intermediate_certificates() {
+            valid_until = valid_until.min(certificate_expiration(&certificate.der())?);
         }
+        let anchor_index = self
+            .roots
+            .roots
+            .iter()
+            .position(|anchor| std::ptr::eq(anchor, path.anchor()))
+            .ok_or(ClientIdentityError::TrustAnchors)?;
+        valid_until = valid_until.min(self.anchor_expirations[anchor_index]);
         ClientValidity::at(now, valid_until)
     }
+}
+
+fn certificate_expiration(
+    certificate: &CertificateDer<'_>,
+) -> Result<SystemTime, ClientIdentityError> {
+    let parsed = Certificate::from_der(certificate.as_ref())
+        .map_err(|_| ClientIdentityError::MalformedCertificate)?;
+    UNIX_EPOCH
+        .checked_add(
+            parsed
+                .tbs_certificate()
+                .validity()
+                .not_after
+                .to_unix_duration(),
+        )
+        .ok_or(ClientIdentityError::InvalidTime)
 }
 
 fn load_verifier(
@@ -364,7 +396,7 @@ fn load_verifier(
     provider: &Arc<CryptoProvider>,
     path: &std::path::Path,
     now: SystemTime,
-) -> Result<(Arc<dyn ClientCertVerifier>, SystemTime), ClientIdentityError> {
+) -> Result<(Arc<KeyUsageVerifier>, SystemTime), ClientIdentityError> {
     let file = File::open(path).map_err(|_| ClientIdentityError::RevocationMaterial)?;
     let mut crls = Vec::new();
     let mut valid_until = None;
@@ -387,33 +419,72 @@ fn load_verifier(
         }
         valid_until =
             Some(valid_until.map_or(expiration, |deadline: SystemTime| deadline.min(expiration)));
-        crls.push(crl);
+        crls.push(webpki::CertRevocationList::Owned(
+            webpki::OwnedCertRevocationList::from_der(crl.as_ref())
+                .map_err(|_| ClientIdentityError::RevocationMaterial)?,
+        ));
     }
     let valid_until = valid_until.ok_or(ClientIdentityError::RevocationMaterial)?;
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(Arc::clone(roots), Arc::clone(provider))
-            .allow_unauthenticated()
-            .with_crls(crls)
-            .enforce_revocation_expiration()
-            .build()
-            .map_err(|_| ClientIdentityError::RevocationMaterial)?;
-    Ok((Arc::new(KeyUsageVerifier { inner: verifier }), valid_until))
+    Ok((
+        Arc::new(KeyUsageVerifier {
+            roots: Arc::clone(roots),
+            root_hint_subjects: roots.subjects(),
+            crls,
+            supported_algorithms: provider.signature_verification_algorithms,
+        }),
+        valid_until,
+    ))
 }
 
 #[derive(Debug)]
 struct KeyUsageVerifier {
-    inner: Arc<dyn ClientCertVerifier>,
+    roots: Arc<RootCertStore>,
+    root_hint_subjects: Vec<rustls::DistinguishedName>,
+    crls: Vec<webpki::CertRevocationList<'static>>,
+    supported_algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl KeyUsageVerifier {
+    fn verify_path<'p>(
+        &'p self,
+        end_entity: &'p webpki::EndEntityCert<'p>,
+        intermediates: &'p [CertificateDer<'p>],
+        now: UnixTime,
+    ) -> Result<webpki::VerifiedPath<'p>, rustls::Error> {
+        let crl_refs = self.crls.iter().collect::<Vec<_>>();
+        let revocation = webpki::RevocationOptionsBuilder::new(&crl_refs)
+            .map_err(|_| {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownRevocationStatus)
+            })?
+            .with_depth(webpki::RevocationCheckDepth::Chain)
+            .with_status_policy(webpki::UnknownStatusPolicy::Deny)
+            .with_expiration_policy(webpki::ExpirationPolicy::Enforce)
+            .build();
+        let path = end_entity
+            .verify_for_usage(
+                self.supported_algorithms.all,
+                &self.roots.roots,
+                intermediates,
+                now,
+                webpki::KeyUsage::client_auth(),
+                Some(revocation),
+                None,
+            )
+            .map_err(webpki_error)?;
+        validate_key_usage(&end_entity.der(), intermediates)?;
+        Ok(path)
+    }
 }
 
 impl ClientCertVerifier for KeyUsageVerifier {
     fn offer_client_auth(&self) -> bool {
-        self.inner.offer_client_auth()
+        true
     }
     fn client_auth_mandatory(&self) -> bool {
-        self.inner.client_auth_mandatory()
+        false
     }
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        self.inner.root_hint_subjects()
+        &self.root_hint_subjects
     }
     fn verify_client_cert(
         &self,
@@ -421,11 +492,9 @@ impl ClientCertVerifier for KeyUsageVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let verified = self
-            .inner
-            .verify_client_cert(end_entity, intermediates, now)?;
-        validate_key_usage(end_entity, intermediates)?;
-        Ok(verified)
+        let end_entity = webpki::EndEntityCert::try_from(end_entity).map_err(webpki_error)?;
+        self.verify_path(&end_entity, intermediates, now)?;
+        Ok(ClientCertVerified::assertion())
     }
     fn verify_tls12_signature(
         &self,
@@ -433,7 +502,7 @@ impl ClientCertVerifier for KeyUsageVerifier {
         cert: &CertificateDer<'_>,
         signature: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, signature)
+        rustls::crypto::verify_tls12_signature(message, cert, signature, &self.supported_algorithms)
     }
     fn verify_tls13_signature(
         &self,
@@ -441,13 +510,108 @@ impl ClientCertVerifier for KeyUsageVerifier {
         cert: &CertificateDer<'_>,
         signature: &rustls::DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, signature)
+        rustls::crypto::verify_tls13_signature(message, cert, signature, &self.supported_algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        self.supported_algorithms.supported_schemes()
     }
     fn requires_raw_public_keys(&self) -> bool {
-        self.inner.requires_raw_public_keys()
+        false
+    }
+}
+
+fn webpki_error(error: webpki::Error) -> rustls::Error {
+    use rustls::{CertRevocationListError, CertificateError, OtherError};
+    use webpki::Error::*;
+    use webpki::InvalidNameContext;
+    match error {
+        BadDer | BadDerTime | TrailingData(_) => CertificateError::BadEncoding.into(),
+        CertNotValidYet { time, not_before } => {
+            CertificateError::NotValidYetContext { time, not_before }.into()
+        }
+        CertExpired { time, not_after } => {
+            CertificateError::ExpiredContext { time, not_after }.into()
+        }
+        InvalidCertValidity => CertificateError::Expired.into(),
+        UnknownIssuer => CertificateError::UnknownIssuer.into(),
+        CertNotValidForName(InvalidNameContext {
+            expected,
+            presented,
+        }) => CertificateError::NotValidForNameContext {
+            expected,
+            presented,
+        }
+        .into(),
+        CertRevoked => CertificateError::Revoked.into(),
+        UnknownRevocationStatus => CertificateError::UnknownRevocationStatus.into(),
+        CrlExpired { time, next_update } => {
+            CertificateError::ExpiredRevocationListContext { time, next_update }.into()
+        }
+        IssuerNotCrlSigner => CertRevocationListError::IssuerInvalidForCrl.into(),
+
+        InvalidSignatureForPublicKey => CertificateError::BadSignature.into(),
+        #[allow(deprecated)]
+        UnsupportedSignatureAlgorithm | UnsupportedSignatureAlgorithmForPublicKey => {
+            CertificateError::UnsupportedSignatureAlgorithm.into()
+        }
+        UnsupportedSignatureAlgorithmContext(cx) => {
+            CertificateError::UnsupportedSignatureAlgorithmContext {
+                signature_algorithm_id: cx.signature_algorithm_id,
+                supported_algorithms: cx.supported_algorithms,
+            }
+            .into()
+        }
+        UnsupportedSignatureAlgorithmForPublicKeyContext(cx) => {
+            CertificateError::UnsupportedSignatureAlgorithmForPublicKeyContext {
+                signature_algorithm_id: cx.signature_algorithm_id,
+                public_key_algorithm_id: cx.public_key_algorithm_id,
+            }
+            .into()
+        }
+
+        InvalidCrlSignatureForPublicKey => CertRevocationListError::BadSignature.into(),
+        #[allow(deprecated)]
+        UnsupportedCrlSignatureAlgorithm | UnsupportedCrlSignatureAlgorithmForPublicKey => {
+            CertRevocationListError::UnsupportedSignatureAlgorithm.into()
+        }
+        UnsupportedCrlSignatureAlgorithmContext(cx) => {
+            CertRevocationListError::UnsupportedSignatureAlgorithmContext {
+                signature_algorithm_id: cx.signature_algorithm_id,
+                supported_algorithms: cx.supported_algorithms,
+            }
+            .into()
+        }
+        UnsupportedCrlSignatureAlgorithmForPublicKeyContext(cx) => {
+            CertRevocationListError::UnsupportedSignatureAlgorithmForPublicKeyContext {
+                signature_algorithm_id: cx.signature_algorithm_id,
+                public_key_algorithm_id: cx.public_key_algorithm_id,
+            }
+            .into()
+        }
+
+        #[allow(deprecated)]
+        RequiredEkuNotFound => CertificateError::InvalidPurpose.into(),
+        RequiredEkuNotFoundContext(webpki::RequiredEkuNotFoundContext { required, present }) => {
+            CertificateError::InvalidPurposeContext {
+                required: extended_key_purpose(required.oid_values()),
+                presented: present
+                    .into_iter()
+                    .map(|eku| extended_key_purpose(eku.into_iter()))
+                    .collect(),
+            }
+            .into()
+        }
+
+        _ => CertificateError::Other(OtherError(Arc::new(error))).into(),
+    }
+}
+
+fn extended_key_purpose(values: impl Iterator<Item = usize>) -> rustls::ExtendedKeyPurpose {
+    let values = values.collect::<Vec<_>>();
+    match values.as_slice() {
+        webpki::KeyUsage::CLIENT_AUTH_REPR => rustls::ExtendedKeyPurpose::ClientAuth,
+        webpki::KeyUsage::SERVER_AUTH_REPR => rustls::ExtendedKeyPurpose::ServerAuth,
+        _ => rustls::ExtendedKeyPurpose::Other(values),
     }
 }
 

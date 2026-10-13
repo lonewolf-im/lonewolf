@@ -893,6 +893,13 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
         ),
         ("<iq type='future' id=''/>", "iq", "", "bad-request", ""),
         (
+            "<iq type='bogus' id='x'><q xmlns='urn:x'/></iq>",
+            "iq",
+            "x",
+            "bad-request",
+            "",
+        ),
+        (
             "<iq type='get' id='zero'/>",
             "iq",
             "zero",
@@ -911,7 +918,7 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
             "iq",
             "precedence",
             "bad-request",
-            "",
+            " from='localhost'",
         ),
         (
             "<presence type='future' id='presence'/>",
@@ -932,21 +939,21 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
             "message",
             "destination",
             "jid-malformed",
-            "",
+            " from='localhost'",
         ),
         (
             "<iq type='get' to='bad@' id='iq-to'><query/></iq>",
             "iq",
             "iq-to",
             "jid-malformed",
-            "",
+            " from='localhost'",
         ),
         (
             "<presence to='bad@' id='presence-to'/>",
             "presence",
             "presence-to",
             "jid-malformed",
-            "",
+            " from='localhost'",
         ),
         (
             "<message from='bad@' to='alice@localhost/desktop' id='source'/>",
@@ -960,7 +967,7 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
             "message",
             "spoofed",
             "jid-malformed",
-            "",
+            " from='localhost'",
         ),
     ] {
         client.send(request)?;
@@ -1006,7 +1013,7 @@ fn explicit_empty_ids_survive_valid_stanzas_and_error_replies() -> TestResult {
     client.send("<message to='alice@localhost/desktop' id=''/>")?;
     client.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost/desktop' id=''/>")?;
     client.send("<presence type='probe' to='bad@' id=''/>")?;
-    client.expect_xml("<presence xmlns='jabber:client' to='alice@localhost/desktop' id='' type='error'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    client.expect_xml("<presence xmlns='jabber:client' from='localhost' to='alice@localhost/desktop' id='' type='error'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
     client.close()
 }
 

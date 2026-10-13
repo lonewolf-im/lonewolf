@@ -96,15 +96,17 @@ impl RejectedStanza {
             .transpose()
     }
 
-    /// Both the rejection and authenticated JID must belong to `arena`.
+    /// The rejection and both JIDs must belong to `arena`.
     /// Returns [`BuildError::InvalidErrorSource`] for IQ responses and error stanzas.
     pub fn error_in<A: ChunkAllocator>(
         &self,
         authenticated: Jid,
+        server: Jid,
         arena: &mut Arena<A>,
     ) -> Result<Stanza, BuildError> {
         let envelope = *arena.get(self.envelope)?;
         authenticated.resolve(arena)?;
+        server.resolve(arena)?;
         if !self.can_reply {
             return Err(BuildError::InvalidErrorSource);
         }
@@ -133,7 +135,11 @@ impl RejectedStanza {
                 stanza_type,
                 original_message_type: None,
                 namespace: self.namespace,
-                from: envelope.to,
+                from: if self.invalid_to() {
+                    Some(server)
+                } else {
+                    envelope.to
+                },
                 to: Some(authenticated),
                 id,
                 lang: envelope.lang,

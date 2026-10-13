@@ -1514,8 +1514,9 @@ fn complete_stanza_rejections_preserve_ids_and_allow_the_next_stanza() -> TestRe
             assert_eq!(rejected.reason(), reason, "{input}");
             assert_eq!(rejected.can_reply(), can_reply, "{input}");
             let authenticated = crate::jid::Jid::parse_in("alice@example.org/desk", &mut arena)?;
+            let server = crate::jid::Jid::parse_in("example.org", &mut arena)?;
             if can_reply {
-                let reply = rejected.error_in(authenticated, &mut arena)?;
+                let reply = rejected.error_in(authenticated, server, &mut arena)?;
                 let reply = reply.resolve(&arena)?;
                 assert_eq!(reply.kind(), rejected.kind());
                 assert!(reply.stanza_type().is_error());
@@ -1525,7 +1526,10 @@ fn complete_stanza_rejections_preserve_ids_and_allow_the_next_stanza() -> TestRe
                     reply.to()?.ok_or("reply recipient")?.as_str(),
                     "alice@example.org/desk"
                 );
-                assert!(reply.from()?.is_none());
+                assert_eq!(
+                    reply.from()?.map(|jid| jid.as_str()),
+                    rejected.invalid_to().then_some("example.org")
+                );
                 let error = reply
                     .child("error", CLIENT_NAMESPACE)?
                     .ok_or("error child")?;
@@ -1541,7 +1545,7 @@ fn complete_stanza_rejections_preserve_ids_and_allow_the_next_stanza() -> TestRe
                 );
             } else {
                 assert!(matches!(
-                    rejected.error_in(authenticated, &mut arena),
+                    rejected.error_in(authenticated, server, &mut arena),
                     Err(BuildError::InvalidErrorSource)
                 ));
             }
@@ -1609,7 +1613,7 @@ fn rejected_iq_envelopes_preserve_address_validity_and_borrowed_metadata() -> Te
 }
 
 #[test]
-fn rejected_stanza_error_checks_both_arena_owners_without_optional_metadata() -> TestResult {
+fn rejected_stanza_error_checks_all_arena_owners_without_optional_metadata() -> TestResult {
     block_on(async {
         let input = format!("{OPEN}<iq/>");
         let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
@@ -1620,12 +1624,19 @@ fn rejected_stanza_error_checks_both_arena_owners_without_optional_metadata() ->
         let (rejected, mut source) = parsed.into_parts();
         let mut other = Arena::try_new(ArenaConfig::default())?;
         let foreign = crate::jid::Jid::parse_in("alice@example.org/desk", &mut other)?;
+        let foreign_server = crate::jid::Jid::parse_in("example.org", &mut other)?;
+        let authenticated = crate::jid::Jid::parse_in("alice@example.org/desk", &mut source)?;
+        let server = crate::jid::Jid::parse_in("example.org", &mut source)?;
         assert!(matches!(
-            rejected.error_in(foreign, &mut other),
+            rejected.error_in(foreign, foreign_server, &mut other),
             Err(BuildError::Access(HandleError::WrongArena))
         ));
         assert!(matches!(
-            rejected.error_in(foreign, &mut source),
+            rejected.error_in(foreign, server, &mut source),
+            Err(BuildError::Access(HandleError::WrongArena))
+        ));
+        assert!(matches!(
+            rejected.error_in(authenticated, foreign_server, &mut source),
             Err(BuildError::Access(HandleError::WrongArena))
         ));
         Ok(())

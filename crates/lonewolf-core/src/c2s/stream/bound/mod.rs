@@ -473,7 +473,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             Some(self.registration.resource()),
             &mut arena,
         )?;
-        let reply = rejected.error_in(authenticated, &mut arena)?;
+        let server = Jid::from_trusted_parts_in(None, account.domain(), None, &mut arena)?;
+        let reply = rejected.error_in(authenticated, server, &mut arena)?;
         self.outbox.push(Output::Owned {
             stanza: reply,
             arena,

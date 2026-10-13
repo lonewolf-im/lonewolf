@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use crate::jid::Jid;
+use crate::parser::{ParserConfig, StreamEvent, XmppParser};
 use crate::stanza::{
     ApplicationCondition, AsyncWriteError, BuildError, CLIENT_NAMESPACE, Element, IqType,
     MAX_ELEMENT_DEPTH, MessageType, NodeRef, PresenceType, SERVER_NAMESPACE,
@@ -99,6 +100,66 @@ fn message(arena: &mut Arena, child: Element) -> Result<Stanza, BuildError> {
     )
     .child(child)?
     .build()
+}
+
+fn assert_rejected_error_source(input: &str, expected_from: Option<&str>) -> TestResult {
+    futures_executor::block_on(async {
+        let input = format!(
+            "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>{input}"
+        );
+        let mut parser = XmppParser::new(
+            input.as_bytes(),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(4096).ok_or("zero limit")?,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        );
+        assert!(matches!(
+            parser.next_event().await?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        let Some(StreamEvent::RejectedStanza(parsed)) = parser.next_event().await? else {
+            return Err("expected rejection".into());
+        };
+        let (rejected, mut arena) = parsed.into_parts();
+        let authenticated = Jid::parse_in("alice@example.org/desk", &mut arena)?;
+        let server = Jid::parse_in("example.org", &mut arena)?;
+        let reply = rejected.error_in(authenticated, server, &mut arena)?;
+        let resolved = reply.resolve(&arena)?;
+        assert_eq!(resolved.from()?.map(|jid| jid.as_str()), expected_from);
+        assert_eq!(
+            resolved.to()?.map(|jid| jid.as_str()),
+            Some("alice@example.org/desk")
+        );
+        assert_eq!(resolved.id()?, Some("source-check"));
+        assert!(!stanza_xml(reply, &arena)?.contains("bad@"));
+        Ok(())
+    })
+}
+
+#[test]
+fn rejected_error_for_invalid_to_uses_server_domain() -> TestResult {
+    assert_rejected_error_source(
+        "<message to='bad@' id='source-check'/>",
+        Some("example.org"),
+    )
+}
+
+#[test]
+fn rejected_error_for_absent_to_omits_from() -> TestResult {
+    assert_rejected_error_source(
+        "<iq type='bogus' id='source-check'><q xmlns='urn:x'/></iq>",
+        None,
+    )
+}
+
+#[test]
+fn rejected_error_for_invalid_from_uses_valid_recipient() -> TestResult {
+    assert_rejected_error_source(
+        "<message from='bad@' to='bob@example.net' id='source-check'/>",
+        Some("bob@example.net"),
+    )
 }
 
 #[test]

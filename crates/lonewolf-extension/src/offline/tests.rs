@@ -367,16 +367,21 @@ fn per_host_quota_accepts_the_limit_then_rejects_the_next_message() -> TestResul
 }
 
 #[test]
-fn unknown_accounts_receive_service_unavailable_and_keep_no_backlog() -> TestResult {
+fn unknown_accounts_return_no_recipient_and_keep_no_backlog() -> TestResult {
     block_on(async {
         let test = TestOffline::new(BTreeMap::new(), &[]).await?;
         let owner = key("bob@example.com")?;
-        assert!(matches!(
-            test.store_at(&owner, MESSAGE, received_at()).await?,
-            Err(HandlerError::Stanza(
-                StanzaErrorCondition::ServiceUnavailable
-            ))
-        ));
+        for xml in [
+            MESSAGE,
+            "<message from='alice@example.org/desk' to='bob@example.com' type='chat'><body>hello</body></message>",
+        ] {
+            assert_eq!(
+                test.store_at(&owner, xml, received_at())
+                    .await?
+                    .map_err(|error| format!("{error:?}"))?,
+                StoreOutcome::NoRecipient
+            );
+        }
         assert!(test.backlog(&owner).await?.is_none());
         Ok(())
     })
@@ -597,7 +602,9 @@ fn offline_storage_failure_categories_and_policy_conditions_remain_separate() ->
                 )),
                 &recipient,
                 operation,
-            );
+            )
+            .err()
+            .ok_or("expected storage failure")?;
             assert_eq!(error.condition(), StanzaErrorCondition::InternalServerError);
             assert_eq!(
                 error.failure(),
@@ -609,6 +616,24 @@ fn offline_storage_failure_categories_and_policy_conditions_remain_separate() ->
             assert!(!format!("{error:?}").contains("seeded-sensitive-backend-source"));
         }
     }
+    assert_eq!(
+        super::store_error(
+            lonewolf_storage::offline::OfflineError::NoAccount,
+            &recipient,
+            "offline_push",
+        )
+        .map_err(|error| format!("{error:?}"))?,
+        StoreOutcome::NoRecipient
+    );
+    let error = super::store_error(
+        lonewolf_storage::offline::OfflineError::ValueTooLarge,
+        &recipient,
+        "offline_push",
+    )
+    .err()
+    .ok_or("expected value limit failure")?;
+    assert_eq!(error.condition(), StanzaErrorCondition::ResourceConstraint);
+    assert_eq!(error.failure(), None);
     for (cause, condition) in [
         (
             lonewolf_storage::offline::OfflineError::NoAccount,

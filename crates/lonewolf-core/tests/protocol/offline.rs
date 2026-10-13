@@ -526,12 +526,48 @@ fn headline_groupchat_and_error_keep_their_existing_offline_behaviour() -> TestR
 }
 
 #[test]
-fn unknown_local_account_still_receives_service_unavailable() -> TestResult {
+fn unknown_local_accounts_silently_discard_normal_and_chat_messages() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline'")?;
     accounts(&suite)?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
-    alice.send("<message to='unknown@localhost' type='chat' id='unknown'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='unknown@localhost' to='alice@localhost/desk' id='unknown' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    for kind in ["normal", "chat"] {
+        alice.send(&format!(
+            "<message to='unknown@localhost' type='{kind}' id='unknown'><body>Hello</body></message>"
+        ))?;
+        barrier(&mut alice, "alice@localhost/desk")?;
+    }
+    alice.close()
+}
+
+#[test]
+fn existing_offline_and_unknown_accounts_give_the_sender_the_same_silence() -> TestResult {
+    let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
+    accounts(&suite)?;
+    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    for kind in ["normal", "chat"] {
+        for recipient in ["bob", "unknown"] {
+            alice.send(&format!(
+                "<message to='{recipient}@localhost' type='{kind}' id='{kind}'><body>Hello</body></message>"
+            ))?;
+            barrier(&mut alice, "alice@localhost/desk")?;
+        }
+    }
+    let mut bob = suite.connect("bob", "secret", "phone")?;
+    inspect(&mut bob, "bob@localhost/phone", 2, 2, Some("bob@localhost"))?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    for kind in ["normal", "chat"] {
+        receive_stored(
+            &mut bob,
+            &format!(
+                "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='{kind}' id='{kind}'><body>Hello</body></message>"
+            ),
+        )?;
+    }
+    await_empty(&mut bob, "bob@localhost/phone")?;
+    bob.close()?;
     alice.close()
 }
 

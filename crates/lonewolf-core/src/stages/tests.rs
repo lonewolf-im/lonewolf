@@ -275,6 +275,31 @@ fn deliver_rejects_a_chat_message_without_an_offline_handler() -> TestResult {
 }
 
 #[test]
+fn deliver_discards_messages_when_offline_storage_reports_no_recipient() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new()?;
+        let mut extensions = lonewolf_extension::Extensions::default();
+        extensions.register(Arc::new(lonewolf_extension::offline::Offline::new(BTreeMap::new())))?;
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["offline"])?,
+        )]));
+        fixture.handle = fixture.router.handle();
+        for (kind, attribute) in [(MessageType::Normal, "normal"), (MessageType::Chat, "chat")] {
+            let stanza = parsed(&format!(
+                "<message from='alice@localhost/laptop' to='unknown@localhost' type='{attribute}'><body>Hello</body></message>"
+            )).await?;
+            assert!(matches!(
+                deliver(&fixture.stage(), stanza, kind).await,
+                Ok(DeliveryOutcome::Discarded)
+            ));
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+#[test]
 fn evaluate_allows_without_policies() -> TestResult {
     Runtime::new()?.block_on(async {
         use crate::stages::policy::{Check, evaluate};

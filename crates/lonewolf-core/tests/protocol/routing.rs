@@ -448,7 +448,7 @@ fn offline_account_returns_service_unavailable_with_the_original_payload() -> Te
 
 #[test]
 fn unknown_account_returns_service_unavailable_with_the_original_payload() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.connect("alice", "pencil", "desk")?;
 

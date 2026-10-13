@@ -165,10 +165,10 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                 .get(message.recipient.domain())
                 .copied()
                 .unwrap_or_default();
-            let message_count = transaction
-                .offline_count(message.recipient)
-                .await
-                .map_err(|error| store_error(error, message.recipient, "offline_count"))?;
+            let message_count = match transaction.offline_count(message.recipient).await {
+                Ok(count) => count,
+                Err(error) => return store_error(error, message.recipient, "offline_count"),
+            };
             if message_count >= limits.max_messages_per_account.get() as usize {
                 tracing::info!(
                     operation = "store",
@@ -182,10 +182,13 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                 return Err(StanzaErrorCondition::ResourceConstraint.into());
             }
             let (stored_at, stanza) = xml::stamped(&message, scratch)?;
-            let sequence = transaction
+            let sequence = match transaction
                 .push_offline_message(message.recipient, stored_at, stanza.as_bytes())
                 .await
-                .map_err(|error| store_error(error, message.recipient, "offline_push"))?;
+            {
+                Ok(sequence) => sequence,
+                Err(error) => return store_error(error, message.recipient, "offline_push"),
+            };
             Ok(StoreOutcome::Stored(sequence))
         })
     }
@@ -254,11 +257,20 @@ fn store_error(
     error: OfflineError,
     recipient: &AccountKey,
     operation: &'static str,
-) -> HandlerError {
+) -> Result<StoreOutcome, HandlerError> {
     let reason = match &error {
-        OfflineError::NoAccount => "no_account",
+        OfflineError::NoAccount => {
+            tracing::debug!(
+                operation = "store",
+                outcome = "discarded",
+                reason = "no_account",
+                recipient_jid = ?recipient.as_str(),
+                "offline message policy decided"
+            );
+            return Ok(StoreOutcome::NoRecipient);
+        }
         OfflineError::ValueTooLarge => "value_too_large",
-        OfflineError::Storage(_) => return offline_error(error, operation),
+        OfflineError::Storage(_) => return Err(offline_error(error, operation)),
     };
     tracing::info!(
         operation = "store",
@@ -267,7 +279,7 @@ fn store_error(
         recipient_jid = ?recipient.as_str(),
         "offline message policy decided"
     );
-    offline_error(error, operation)
+    Err(offline_error(error, operation))
 }
 
 fn offline_error(error: OfflineError, operation: &'static str) -> HandlerError {

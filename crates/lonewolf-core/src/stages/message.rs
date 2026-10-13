@@ -146,7 +146,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
                     error,
                 }
             }
-            Ok(StoreOutcome::Discarded) => {
+            Ok(StoreOutcome::Discarded | StoreOutcome::NoRecipient) => {
                 drop(transaction);
                 StorePreparation::Discarded
             }

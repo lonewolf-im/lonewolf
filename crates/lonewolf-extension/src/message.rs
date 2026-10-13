@@ -25,6 +25,8 @@ pub enum StoreOutcome {
     Stored(OfflineSequence),
     /// The sender receives no reply.
     Discarded,
+    /// The recipient has no account and the sender receives no reply.
+    NoRecipient,
 }
 
 pub struct Backlog {

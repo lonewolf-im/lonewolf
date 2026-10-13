@@ -34,7 +34,7 @@ use crate::hosts::client_identity::VerifiedClient;
 pub(super) const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 pub(super) const STARTTLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
 pub(super) const STARTTLS_PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
-const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
+pub(super) const STARTTLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 
 pub(super) struct Established<A: ChunkAllocator> {
     pub(super) session: Session<A>,
@@ -316,7 +316,7 @@ fn is_starttls<A: ChunkAllocator>(element: &Parsed<Element, A>) -> bool {
         && view.text().is_ok_and(|text| text.is_none())
 }
 
-fn is_starttls_element<A: ChunkAllocator>(element: &Parsed<Element, A>) -> bool {
+pub(super) fn is_starttls_element<A: ChunkAllocator>(element: &Parsed<Element, A>) -> bool {
     element
         .value()
         .resolve(element.arena())

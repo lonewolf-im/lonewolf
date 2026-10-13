@@ -270,15 +270,55 @@ fn non_plus_listener_accepts_the_scram_y_flag() -> TestResult {
 }
 
 #[test]
-fn missing_mechanism_returns_malformed_request() -> TestResult {
+fn missing_mechanism_returns_invalid_mechanism() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.unauthenticated_client()?;
 
-    client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>!</auth>")?;
     client.expect_xml(
-        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><malformed-request/></failure>",
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
     )?;
     client.close()
+}
+
+#[test]
+fn missing_mechanism_with_inherited_xml_lang_returns_invalid_mechanism() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.tls_client()?;
+
+    client.open_with(&format!("{} xml:lang='en'>", OPEN.trim_end_matches('>')))?;
+    client.features()?;
+    client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn empty_mechanism_returns_invalid_mechanism() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism=''/>")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+    )?;
+    client.close()
+}
+
+#[test]
+fn missing_mechanism_attempts_close_after_retry_limit() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..3 {
+        client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+        client.expect_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+        )?;
+    }
+    client.expect_stream_error("policy-violation")
 }
 
 #[test]

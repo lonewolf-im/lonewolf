@@ -565,6 +565,10 @@ fn parse_sasl_message<A: ChunkAllocator>(
         }
     }
     match view.name() {
+        "auth" if attribute_count == 0 => Ok(SaslMessage::Auth(AuthRequest {
+            mechanism: None,
+            initial: None,
+        })),
         "auth" if attribute_count == 1 => {
             let mechanism = mechanism.ok_or("malformed-request")?;
             Ok(SaslMessage::Auth(AuthRequest {

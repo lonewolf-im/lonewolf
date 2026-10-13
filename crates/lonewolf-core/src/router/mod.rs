@@ -14,9 +14,9 @@ use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
-use lonewolf_extension::observer::MessageObserver;
+use lonewolf_extension::observer::{MessageObserver, SessionObserver};
 use lonewolf_extension::policy::PolicyHandler;
-use lonewolf_extension::presence::PresenceRegistry;
+use lonewolf_extension::presence::{PresenceDecorator, PresenceRegistry};
 use lonewolf_extension::service::ServiceHandler;
 use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
@@ -228,6 +228,31 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::message_observers)
+    }
+
+    #[expect(clippy::type_complexity)]
+    pub(crate) fn session_observers(
+        &self,
+        domain: &str,
+    ) -> &[(&'static str, Arc<dyn SessionObserver<A, RedbStorage>>)] {
+        self.extensions
+            .get(domain)
+            .map_or(&[], ExtensionRegistry::session_observers)
+    }
+
+    #[expect(clippy::type_complexity)]
+    pub(crate) fn presence_decorations(
+        &self,
+        domain: &str,
+    ) -> &[(
+        &'static str,
+        &'static str,
+        &'static str,
+        Arc<dyn PresenceDecorator<A, RedbStorage>>,
+    )] {
+        self.extensions
+            .get(domain)
+            .map_or(&[], ExtensionRegistry::presence_decorations)
     }
 
     pub(crate) fn policies(

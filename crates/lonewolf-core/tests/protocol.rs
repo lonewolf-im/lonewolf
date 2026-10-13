@@ -49,3 +49,6 @@ mod stream_opening;
 
 #[path = "protocol/stream_errors.rs"]
 mod stream_errors;
+
+#[path = "protocol/sessions.rs"]
+mod sessions;

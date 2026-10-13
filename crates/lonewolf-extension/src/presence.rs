@@ -5,9 +5,9 @@ use std::sync::Arc;
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
-use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
-use lonewolf_xmpp::stanza::{PresenceType, RoutedStanza, StanzaErrorCondition};
+use lonewolf_xmpp::stanza::{Element, PresenceType, RoutedStanza, StanzaErrorCondition};
 
 use crate::delivery::{HandlerError, HostLookup};
 use crate::{Effects, ExtensionFuture, RegistrationError};
@@ -147,4 +147,14 @@ impl<A: ChunkAllocator, S: Storage> PresenceRegistry<A, S> {
     pub fn find(&self, kind: PresenceRequestType) -> Option<&dyn PresenceHandler<A, S>> {
         self.handlers[kind as usize].as_deref()
     }
+}
+
+pub trait PresenceDecorator<A: ChunkAllocator, S: Storage>: Send + Sync {
+    /// The child must match the registered name and namespace.
+    fn decorate<'a>(
+        &'a self,
+        owner: &'a AccountKey,
+        transaction: &'a S::Read,
+        arena: &'a mut Arena<A>,
+    ) -> PresenceFuture<'a, Option<Element>>;
 }

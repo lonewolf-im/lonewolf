@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Handler interfaces for extensions built into this workspace; they are not a stable API for independent crates.
+//! These interfaces are not stable for independent crates.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -37,9 +37,9 @@ use delivery::{Delivery, DeliveryFuture};
 use discovery::Discovery;
 use iq::{IqRegistry, IqRoute};
 use message::MessageHandler;
-use observer::MessageObserver;
+use observer::{MessageObserver, SessionObserver};
 use policy::PolicyHandler;
-use presence::{PresenceRegistry, PresenceRequestType};
+use presence::{PresenceDecorator, PresenceRegistry, PresenceRequestType};
 use service::ServiceHandler;
 
 /// Deliveries run after commit, in storage-view order for each account in `accounts`.
@@ -132,6 +132,10 @@ pub enum RegistrationError {
     UnknownExtension(String),
     DuplicateRoute(IqRoute),
     DuplicatePresenceRoute(PresenceRequestType),
+    DuplicatePresenceDecoration {
+        name: &'static str,
+        namespace: &'static str,
+    },
     DuplicateMessageHandler,
     DuplicateArchiveHandler,
     InvalidServiceDomain(String),
@@ -162,6 +166,10 @@ impl fmt::Display for RegistrationError {
             Self::DuplicatePresenceRoute(route) => {
                 write!(formatter, "conflicting presence route {route:?}")
             }
+            Self::DuplicatePresenceDecoration { name, namespace } => write!(
+                formatter,
+                "conflicting presence decorations for {name:?} in {namespace:?}"
+            ),
             Self::DuplicateMessageHandler => formatter.write_str("conflicting message handlers"),
             Self::DuplicateArchiveHandler => formatter.write_str("conflicting archive handlers"),
             Self::InvalidServiceDomain(domain) => {
@@ -204,6 +212,15 @@ pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     accounts: Vec<(&'static str, Arc<dyn AccountHandler<A, S>>)>,
     #[expect(clippy::type_complexity)]
     message_observers: Vec<(&'static str, Arc<dyn MessageObserver<A, S>>)>,
+    #[expect(clippy::type_complexity)]
+    session_observers: Vec<(&'static str, Arc<dyn SessionObserver<A, S>>)>,
+    #[expect(clippy::type_complexity)]
+    presence_decorations: Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        Arc<dyn PresenceDecorator<A, S>>,
+    )>,
     policies: Vec<(&'static str, Arc<dyn PolicyHandler<S>>)>,
     stream_features: String,
     enabled: Vec<&'static str>,
@@ -221,6 +238,8 @@ impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
             accounts: Vec::new(),
             policies: Vec::new(),
             message_observers: Vec::new(),
+            session_observers: Vec::new(),
+            presence_decorations: Vec::new(),
             stream_features: String::new(),
             enabled: Vec::new(),
         }
@@ -261,6 +280,23 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
     #[expect(clippy::type_complexity)]
     pub fn message_observers(&self) -> &[(&'static str, Arc<dyn MessageObserver<A, S>>)] {
         &self.message_observers
+    }
+
+    #[expect(clippy::type_complexity)]
+    pub fn session_observers(&self) -> &[(&'static str, Arc<dyn SessionObserver<A, S>>)] {
+        &self.session_observers
+    }
+
+    #[expect(clippy::type_complexity)]
+    pub fn presence_decorations(
+        &self,
+    ) -> &[(
+        &'static str,
+        &'static str,
+        &'static str,
+        Arc<dyn PresenceDecorator<A, S>>,
+    )] {
+        &self.presence_decorations
     }
 
     pub fn policies(&self) -> &[(&'static str, Arc<dyn PolicyHandler<S>>)] {

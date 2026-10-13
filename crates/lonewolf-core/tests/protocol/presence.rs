@@ -397,6 +397,116 @@ fn subscribed_bare_probes_preserve_current_presence_and_full_probes_are_minimal(
 }
 
 #[test]
+fn subscribed_full_probes_find_freshly_bound_resources_before_initial_presence() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    for user in ["alice", "bob", "carol"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut sibling = suite.connect("alice", "password", "phone")?;
+    let mut bob = suite.connect("bob", "password", "earlier")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+    bob.send("<presence/>")?;
+    bob.receive()?;
+    alice.send("<presence type='subscribe' to='bob@localhost'/>")?;
+    assert_eq!(bob.receive()?.attribute("type"), Some("subscribe"));
+    bob.send("<presence type='subscribed' to='alice@localhost'/>")?;
+    sentinel(&mut bob, &mut alice, "alice@localhost/desk")?;
+    bob.close()?;
+
+    let mut quiet = suite.connect("bob", "password", "quiet")?;
+    quiet.send("<iq type='get' id='persisted'><query xmlns='jabber:iq:roster'/></iq>")?;
+    let roster = quiet.receive()?;
+    let roster = roster.child("jabber:iq:roster", "query")?;
+    assert_eq!(roster.children.len(), 1);
+    assert_eq!(roster.children[0].attribute("jid"), Some("alice@localhost"));
+    assert_eq!(roster.children[0].attribute("subscription"), Some("from"));
+    alice.send("<iq type='get' id='before'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
+    let before = alice.receive()?;
+    let before = before.child("jabber:iq:roster", "query")?;
+    let version = before.attribute("ver").ok_or("missing version")?.to_owned();
+    assert_eq!(before.children[0].attribute("subscription"), Some("to"));
+
+    alice.send("<presence type='probe' to='bob@localhost/quiet'/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/quiet' to='alice@localhost/desk'/>",
+    )?;
+    alice.send("<presence type='probe' to='bob@localhost'/>")?;
+    let bare = alice.receive()?;
+    assert_eq!(bare.attribute("from"), Some("bob@localhost"));
+    assert_eq!(bare.attribute("type"), Some("unavailable"));
+    carol.send("<presence type='probe' to='bob@localhost/quiet'/>")?;
+    carol.expect_xml("<presence xmlns='jabber:client' from='bob@localhost' to='carol@localhost/desk' type='unsubscribed'/>")?;
+    alice.send("<presence type='probe' to='bob@localhost/missing'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' type='unavailable'/>")?;
+
+    let mut phone = suite.connect("bob", "password", "phone")?;
+    phone.send("<presence id='sibling'><status>private</status><priority>2</priority><x xmlns='urn:test'/></presence>")?;
+    assert_eq!(phone.receive()?.attribute("id"), Some("sibling"));
+    alice.send("<presence type='probe' to='bob@localhost/quiet'/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/quiet' to='alice@localhost/desk'/>",
+    )?;
+    alice.send("<presence type='probe' to='bob@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost/desk' id='sibling'><status>private</status><priority>2</priority><x xmlns='urn:test'/></presence>")?;
+    alice.send("<message to='bob@localhost' id='available-only'/>")?;
+    assert_eq!(phone.receive()?.attribute("id"), Some("available-only"));
+    sentinel(&mut alice, &mut quiet, "bob@localhost/quiet")?;
+    sentinel(&mut quiet, &mut sibling, "alice@localhost/phone")?;
+    alice.send("<iq type='get' id='after'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
+    let after = alice.receive()?;
+    let after = after.child("jabber:iq:roster", "query")?;
+    assert_eq!(after.attribute("ver"), Some(version.as_str()));
+    assert_eq!(after.children, before.children);
+
+    quiet.close()?;
+    alice.send("<presence type='probe' to='bob@localhost/quiet'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/quiet' to='alice@localhost/desk' type='unavailable'/>")?;
+    alice.close()?;
+    sibling.close()?;
+    phone.close()?;
+    carol.close()
+}
+
+#[test]
+fn policy_denials_suppress_authorized_full_probes_before_initial_presence() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "spammer", "blocked"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "quiet")?;
+    let mut spammer = suite.connect("spammer", "password", "quiet")?;
+    let mut blocked = suite.connect("blocked", "password", "quiet")?;
+    alice.send("<iq type='set' to='localhost' id='off'><toggle xmlns='urn:lonewolf:test:policy' enabled='false'/></iq>")?;
+    assert_eq!(alice.receive()?.attribute("type"), Some("result"));
+    for (owner, observer) in [(&mut alice, "spammer"), (&mut blocked, "alice")] {
+        owner.send(&format!("<presence type='subscribed' to='{observer}@localhost'/><iq type='get' id='ready'><query xmlns='urn:test:barrier'/></iq>"))?;
+        assert_eq!(owner.receive()?.attribute("id"), Some("ready"));
+    }
+    for (observer, owner) in [(&mut spammer, "alice"), (&mut alice, "blocked")] {
+        observer.send(&format!("<presence type='subscribe' to='{owner}@localhost'/><iq type='get' id='ready'><query xmlns='urn:test:barrier'/></iq>"))?;
+        assert_eq!(observer.receive()?.attribute("id"), Some("ready"));
+    }
+    alice.send("<iq type='set' to='localhost' id='on'><toggle xmlns='urn:lonewolf:test:policy' enabled='true'/></iq>")?;
+    assert_eq!(alice.receive()?.attribute("type"), Some("result"));
+    for (observer, owner) in [(&mut spammer, "alice"), (&mut alice, "blocked")] {
+        observer.send(&format!("<presence type='probe' to='{owner}@localhost/quiet'/><iq type='get' id='after-denied'><query xmlns='urn:test:barrier'/></iq>"))?;
+        let reply = observer.receive()?;
+        reply.assert_name("jabber:client", "iq");
+        assert_eq!(reply.attribute("id"), Some("after-denied"));
+    }
+    alice.send("<iq type='set' to='localhost' id='off'><toggle xmlns='urn:lonewolf:test:policy' enabled='false'/></iq>")?;
+    assert_eq!(alice.receive()?.attribute("type"), Some("result"));
+    spammer.send("<presence type='probe' to='alice@localhost/quiet'/>")?;
+    spammer.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/quiet' to='spammer@localhost/quiet'/>")?;
+    alice.send("<presence type='probe' to='blocked@localhost/quiet'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='blocked@localhost/quiet' to='alice@localhost/quiet'/>")?;
+    alice.close()?;
+    spammer.close()?;
+    blocked.close()
+}
+
+#[test]
 fn probe_denials_preserve_preapproval_and_roster_version() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;

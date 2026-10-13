@@ -5,6 +5,7 @@ use std::fmt;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lonewolf_extension::ExtensionRegistry;
@@ -30,7 +31,64 @@ use crate::order::Order;
 use crate::stages::service::{ServicePresenceGate, ServicePresenceGates};
 pub(crate) use local::ResourceMatch;
 
+pub(crate) mod iq_requests;
 pub(crate) mod local;
+
+use iq_requests::IqRequests;
+
+const MAX_DETACHED: usize = 4096;
+
+#[derive(Clone, Default)]
+pub(crate) struct DetachedWork {
+    active: Arc<AtomicUsize>,
+}
+
+pub(crate) struct DetachedGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl DetachedWork {
+    pub(crate) fn try_start(&self) -> Option<DetachedGuard> {
+        self.active
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                (active < MAX_DETACHED).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| DetachedGuard {
+                active: Arc::clone(&self.active),
+            })
+    }
+}
+
+impl Drop for DetachedGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+
+    #[test]
+    fn detached_work_limit_is_shared_and_dropped_guards_free_slots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let work = DetachedWork::default();
+        let other = work.clone();
+        let mut guards = Vec::with_capacity(MAX_DETACHED);
+        for _ in 0..MAX_DETACHED {
+            guards.push(work.try_start().ok_or("available detached slot")?);
+        }
+        assert!(other.try_start().is_none());
+        drop(guards.pop());
+        let replacement = other.try_start().ok_or("released detached slot")?;
+        assert!(work.try_start().is_none());
+        drop(guards);
+        drop(replacement);
+        assert_eq!(work.active.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+}
 
 pub(crate) use local::Registration;
 use local::SessionLiveness;
@@ -50,6 +108,8 @@ pub(crate) struct RouterHandle<A: ChunkAllocator> {
     services: Arc<BTreeMap<String, ServiceRoute<A>>>,
     service_presence: Option<Arc<ServicePresenceGates>>,
     order: Arc<Order>,
+    iq_requests: Arc<IqRequests<A>>,
+    detached_work: DetachedWork,
 }
 
 pub(crate) struct ServiceRoute<A: ChunkAllocator> {
@@ -120,6 +180,8 @@ impl<A: ChunkAllocator + Clone> Router<A> {
             services: Arc::default(),
             service_presence: None,
             order: Order::new(),
+            iq_requests: IqRequests::new(),
+            detached_work: DetachedWork::default(),
         };
         Self { local, handle }
     }
@@ -168,11 +230,21 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
             services: Arc::clone(&self.services),
             service_presence: self.service_presence.clone(),
             order: Arc::clone(&self.order),
+            iq_requests: Arc::clone(&self.iq_requests),
+            detached_work: self.detached_work.clone(),
         }
     }
 }
 
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
+    pub(crate) fn iq_requests(&self) -> &Arc<IqRequests<A>> {
+        &self.iq_requests
+    }
+
+    pub(crate) fn detached_work(&self) -> &DetachedWork {
+        &self.detached_work
+    }
+
     pub(crate) fn state(&self) -> RouterState {
         self.local.state()
     }

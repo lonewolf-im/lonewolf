@@ -159,6 +159,9 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(ConflictingIq))?;
     extensions.register(Arc::new(TestIq))?;
     extensions.register(Arc::new(TestIqResults))?;
+    extensions.register(Arc::new(TestIqRequester {
+        outcome: Arc::new(PlMutex::new(None)),
+    }))?;
     extensions.register(Arc::new(ServerIq))?;
     extensions.register(Arc::new(ErrorIq))?;
     extensions.register(Arc::new(FailureIq))?;
@@ -900,6 +903,125 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ConflictingIq {
         _: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async { Ok(IqReply::new(None, Effects::none())) })
+    }
+}
+
+struct TestIqRequester {
+    outcome: Arc<PlMutex<Option<&'static str>>>,
+}
+
+const REQUESTER_ASK: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Set,
+    namespace: "urn:lonewolf:test:requester",
+    name: "ask",
+};
+
+const REQUESTER_OUTCOME: IqRoute = IqRoute {
+    scope: IqScope::Server,
+    kind: IqRequestType::Get,
+    name: "outcome",
+    ..REQUESTER_ASK
+};
+
+impl<A: ChunkAllocator + 'static> Extension<A, RedbStorage> for TestIqRequester {
+    fn name(&self) -> &'static str {
+        "test-iq-requester"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(REQUESTER_ASK, self.clone())?;
+        slots.iq(REQUESTER_OUTCOME, self)
+    }
+}
+
+impl<A: ChunkAllocator + 'static> IqHandler<A, RedbStorage> for TestIqRequester {
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn HostLookup,
+        _: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let jid: Box<str> = request
+                .payload
+                .attribute("jid", "")
+                .map_err(|_| StanzaErrorCondition::BadRequest)?
+                .ok_or(StanzaErrorCondition::BadRequest)?
+                .into();
+            let timeout = request
+                .payload
+                .attribute("timeout", "")
+                .map_err(|_| StanzaErrorCondition::BadRequest)?
+                .and_then(|value| value.parse().ok())
+                .ok_or(StanzaErrorCondition::BadRequest)?;
+            *self.outcome.lock() = None;
+            let outcome = Arc::clone(&self.outcome);
+            let effects = Effects::new(Vec::new(), move |delivery| {
+                Box::pin(async move {
+                    delivery.detach(Box::new(move |delivery| {
+                        Box::pin(async move {
+                            let mut arena = delivery.arena()?;
+                            let from = Jid::parse_in("localhost", &mut arena)?;
+                            let to = Jid::parse_in(&jid, &mut arena)?;
+                            let ping = Element::builder_in("ping", "urn:xmpp:ping", &mut arena)?
+                                .build()?;
+                            let stanza = Stanza::builder_in(
+                                StanzaType::Iq(IqType::Get),
+                                StanzaNamespace::Client,
+                                &mut arena,
+                            )
+                            .id(Some("request"))?
+                            .from(Some(from))?
+                            .to(Some(to))?
+                            .child(ping)?
+                            .build()?;
+                            let result = delivery
+                                .request_iq(
+                                    RoutedStanza::from_parts(stanza, arena),
+                                    Duration::from_secs(timeout),
+                                )
+                                .await;
+                            *outcome.lock() = Some(match result {
+                                Ok(response) => match response.resolve()?.stanza_type() {
+                                    StanzaType::Iq(IqType::Result) => "answered:result",
+                                    StanzaType::Iq(IqType::Error) => "answered:error",
+                                    _ => return Err(DeliveryError),
+                                },
+                                Err(_) => "failed",
+                            });
+                            Ok(())
+                        })
+                    }))
+                })
+            });
+            Ok(IqReply::new(None, effects))
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        _: IqRequest<'a, A>,
+        _: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let outcome = *self.outcome.lock();
+            let payload = outcome
+                .map(|value| {
+                    Element::builder_in("outcome", REQUESTER_OUTCOME.namespace, response)
+                        .and_then(|builder| builder.attribute("value", "", value))
+                        .and_then(|builder| builder.build())
+                })
+                .transpose()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            Ok(IqReply::new(payload, Effects::none()))
+        })
     }
 }
 

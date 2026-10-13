@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::{Future, poll_fn};
+use std::io::Write;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
+use std::time::Duration;
 
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
-use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{
     Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError, HostLookup,
-    SessionTag, StanzaFactory,
+    IqResponseFuture, SessionTag, StanzaFactory,
 };
 use lonewolf_extension::message::MessageHandler;
+use lonewolf_extension::{Deliver, Effects};
 #[cfg(test)]
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
@@ -22,11 +24,13 @@ use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::{RedbStorage, RedbWrite, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
+use lonewolf_xmpp::stanza::{IqType, StanzaType};
 
 use crate::order::{Order, Ticket};
+use crate::router::iq_requests::{ID_PREFIX, MAX_TIMEOUT};
 use crate::router::{
-    Mailbox, MailboxEntry, Registration, RoutedStanza, RouterError, RouterHandle, SessionHandle,
-    StoredRelease,
+    Destination, Mailbox, MailboxEntry, Registration, RoutedStanza, RouterError, RouterHandle,
+    SessionHandle, StoredRelease,
 };
 
 pub(crate) struct WorkGroup {
@@ -383,9 +387,78 @@ impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<A> {
     }
 }
 
-impl<A: ChunkAllocator + Clone> Delivery<A> for RouterDelivery<A> {
+impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
     fn arena(&self) -> Result<Arena<A>, DeliveryError> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
+    }
+
+    fn request_iq<'a>(
+        &'a self,
+        request: RoutedStanza<A>,
+        timeout: Duration,
+    ) -> IqResponseFuture<'a, A> {
+        Box::pin(async move {
+            let view = request.resolve()?;
+            if !matches!(
+                view.stanza_type(),
+                StanzaType::Iq(IqType::Get | IqType::Set)
+            ) {
+                return Err(DeliveryError);
+            }
+            let from = view.from()?.ok_or(DeliveryError)?;
+            let to = view.to()?.ok_or(DeliveryError)?;
+            if self.router.destination(from) != Destination::Server
+                || self.router.destination(to) != Destination::Resource
+            {
+                return Err(DeliveryError);
+            }
+            let mut pending = self
+                .router
+                .iq_requests()
+                .register(to.as_str())
+                .map_err(|_| DeliveryError)?;
+            let mut buffer = [0; 26];
+            let mut remainder = buffer.as_mut_slice();
+            write!(remainder, "{ID_PREFIX}{}", pending.id()).map_err(|_| DeliveryError)?;
+            let written = 26 - remainder.len();
+            let id = std::str::from_utf8(&buffer[..written]).map_err(|_| DeliveryError)?;
+            let mut arena = self.arena()?;
+            let stanza = view.to_builder_in(&mut arena)?.id(Some(id))?.build()?;
+            drop(request);
+            self.router
+                .route_full(RoutedStanza::from_parts(stanza, arena))
+                .await
+                .map_err(|_| DeliveryError)?;
+            match compio::time::timeout(timeout.min(MAX_TIMEOUT), pending.response()).await {
+                Ok(Some(response)) => Ok(response),
+                Ok(None) | Err(_) => Err(DeliveryError),
+            }
+        })
+    }
+
+    fn detach(&self, work: Deliver<A>) -> Result<(), DeliveryError> {
+        let guard = self
+            .router
+            .detached_work()
+            .try_start()
+            .ok_or(DeliveryError)?;
+        let delivery = RouterDelivery {
+            router: self.router.clone(),
+            allocator: self.allocator.clone(),
+            session: None,
+        };
+        compio::runtime::spawn(async move {
+            if work(&delivery).await.is_err() {
+                tracing::error!(
+                    failure_kind = "delivery",
+                    operation = "detached_work",
+                    "internal operation failed"
+                );
+            }
+            drop(guard);
+        })
+        .detach();
+        Ok(())
     }
 
     fn tag_session<'a>(&'a self, tag: SessionTag) -> DeliveryFuture<'a> {

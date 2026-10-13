@@ -1,6 +1,151 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::support::{C2sSuite, TestResult};
+use std::time::{Duration, Instant};
+
+use crate::support::{C2sSuite, Client, TestResult};
+
+fn requester_outcome(client: &mut Client) -> TestResult<Option<String>> {
+    client.send("<iq type='get' to='localhost' id='outcome'><outcome xmlns='urn:lonewolf:test:requester'/></iq>")?;
+    let reply = client.receive()?;
+    assert_eq!(reply.attribute("type"), Some("result"));
+    assert_eq!(reply.attribute("id"), Some("outcome"));
+    match reply.children.first() {
+        Some(outcome) => {
+            outcome.assert_name("urn:lonewolf:test:requester", "outcome");
+            Ok(Some(
+                outcome
+                    .attribute("value")
+                    .ok_or("missing outcome value")?
+                    .into(),
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
+fn wait_for_requester_outcome(client: &mut Client, expected: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(outcome) = requester_outcome(client)? {
+            assert_eq!(outcome, expected);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("server IQ request remained pending".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn detached_requests_receive_the_addressed_resources_answer() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/desk' timeout='5'/></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
+    )?;
+    let request = bob.receive()?;
+    assert_eq!(request.attribute("type"), Some("get"));
+    assert_eq!(request.attribute("from"), Some("localhost"));
+    assert_eq!(request.attribute("to"), Some("bob@localhost/desk"));
+    request.child("urn:xmpp:ping", "ping")?;
+    let id = request.attribute("id").ok_or("missing request ID")?;
+    assert!(id.starts_with("lw-iq-"));
+    bob.send(&format!("<iq type='result' to='localhost' id='{id}'/>"))?;
+    wait_for_requester_outcome(&mut alice, "answered:result")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn responses_from_other_entities_are_ignored() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
+    for name in ["alice", "bob", "carol"] {
+        suite.create_account(name, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut carol = suite.connect("carol", "password", "desk")?;
+    alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/desk' timeout='5'/></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
+    )?;
+    let request = bob.receive()?;
+    let id = request.attribute("id").ok_or("missing request ID")?;
+    carol.send(&format!(
+        "<iq type='result' from='bob@localhost/desk' to='localhost' id='{id}'/>"
+    ))?;
+    carol.send("<message to='carol@localhost/desk' id='processed'/>")?;
+    carol.expect_xml("<message xmlns='jabber:client' from='carol@localhost/desk' to='carol@localhost/desk' id='processed'/>")?;
+    assert_eq!(requester_outcome(&mut alice)?, None);
+    bob.send(&format!("<iq type='result' to='localhost' id='{id}'/>"))?;
+    wait_for_requester_outcome(&mut alice, "answered:result")?;
+    alice.close()?;
+    bob.close()?;
+    carol.close()
+}
+
+#[test]
+fn unanswered_requests_time_out() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut bob = suite.connect("bob", "password", "desk")?;
+    alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/desk' timeout='1'/></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
+    )?;
+    assert_eq!(bob.receive()?.attribute("type"), Some("get"));
+    wait_for_requester_outcome(&mut alice, "failed")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn requests_to_absent_resources_fail() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/absent' timeout='5'/></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
+    )?;
+    wait_for_requester_outcome(&mut alice, "failed")?;
+    alice.close()
+}
+
+#[test]
+fn detached_requests_to_the_initiating_resource_do_not_deadlock() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='alice@localhost/desk' timeout='5'/></iq>")?;
+    let first = alice.receive()?;
+    let second = alice.receive()?;
+    let (reply, request) = if first.attribute("type") == Some("result") {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    reply.assert_xml(
+        "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
+    )?;
+    assert_eq!(request.attribute("type"), Some("get"));
+    assert_eq!(request.attribute("from"), Some("localhost"));
+    assert_eq!(request.attribute("to"), Some("alice@localhost/desk"));
+    request.child("urn:xmpp:ping", "ping")?;
+    let id = request.attribute("id").ok_or("missing request ID")?;
+    assert!(id.starts_with("lw-iq-"));
+    alice.send(&format!("<iq type='result' to='localhost' id='{id}'/>"))?;
+    wait_for_requester_outcome(&mut alice, "answered:result")?;
+    alice.close()
+}
 
 #[test]
 fn iq_results_arrive_in_order_before_the_reply() -> TestResult {

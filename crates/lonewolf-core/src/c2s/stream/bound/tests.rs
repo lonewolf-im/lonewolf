@@ -1377,6 +1377,10 @@ fn cancelled_terminal_owner_keeps_directed_withdrawal_and_replacement_grants() -
                 session: fixture.registration.handle(),
                 router: handle.clone(),
                 storage: fixture.storage.clone(),
+                allocator: GlobalChunkAllocator,
+                work: fixture.work.handle(),
+                service_presence: None,
+                service_pending: None,
                 account: fixture.registration.account().clone(),
                 fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             }
@@ -1462,6 +1466,11 @@ fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() ->
         let work = PresenceWork {
             session: fixture.registration.handle(),
             router: handle.clone(),
+            storage: fixture.storage.clone(),
+            allocator: GlobalChunkAllocator,
+            work: fixture.work.handle(),
+            service_presence: None,
+            completion: None,
             account: fixture.registration.account().clone(),
             priority: None,
             available: false,
@@ -1474,7 +1483,7 @@ fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() ->
             fixture.work.start(),
             ticket,
             None,
-            move |_: Vec<MailboxEntry<GlobalChunkAllocator>>| work.run(),
+            move |_: Vec<MailboxEntry<GlobalChunkAllocator>>, ticket| work.run(ticket),
         ));
         drop(blocker);
         fixture.work.drain().await;
@@ -1495,6 +1504,10 @@ fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() ->
                 session: fixture.registration.handle(),
                 router: handle,
                 storage: fixture.storage.clone(),
+                allocator: GlobalChunkAllocator,
+                work: fixture.work.handle(),
+                service_presence: None,
+                service_pending: None,
                 account: fixture.registration.account().clone(),
                 fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             }
@@ -1550,6 +1563,11 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
         let work = PresenceWork {
             session: fixture.registration.handle(),
             router: handle.clone(),
+            storage: fixture.storage.clone(),
+            allocator: GlobalChunkAllocator,
+            work: fixture.work.handle(),
+            service_presence: None,
+            completion: None,
             account: fixture.registration.account().clone(),
             priority: None,
             available: false,
@@ -1562,7 +1580,7 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
             fixture.work.start(),
             ticket,
             None,
-            move |_: Vec<MailboxEntry<GlobalChunkAllocator>>| work.run(),
+            move |_: Vec<MailboxEntry<GlobalChunkAllocator>>, ticket| work.run(ticket),
         ));
         Pending::spawn(
             fixture.work.start(),
@@ -1570,6 +1588,10 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
                 session: fixture.registration.handle(),
                 router: handle,
                 storage: fixture.storage.clone(),
+                allocator: GlobalChunkAllocator,
+                work: fixture.work.handle(),
+                service_presence: None,
+                service_pending: None,
                 account: fixture.registration.account().clone(),
                 fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             }
@@ -2415,9 +2437,16 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
                     Some(&fixture.registration),
                 ),
             };
-            let pending = after_turn(fixture.work.start(), ticket, None, move |queued| {
-                work.run(queued)
-            });
+            let pending = after_turn(
+                fixture.work.start(),
+                ticket,
+                None,
+                move |queued, ticket| async move {
+                    let result = work.run(queued).await;
+                    drop(ticket);
+                    result
+                },
+            );
             started.await?;
             drop(pending);
             release.send(()).map_err(|_| "IQ get work was cancelled")?;

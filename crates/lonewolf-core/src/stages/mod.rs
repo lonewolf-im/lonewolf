@@ -6,17 +6,17 @@ use lonewolf_util::arena::{ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::JidError;
 use lonewolf_xmpp::stanza::BuildError;
 
-use crate::delivery::WorkGroup;
+use crate::delivery::WorkHandle;
 use crate::router::RouterHandle;
 
 pub(crate) mod message;
+pub(crate) mod service;
 
-/// What a stage needs from the server, borrowed from the task that handles the stanza.
 pub(crate) struct Stage<'s, A: ChunkAllocator> {
     pub(crate) router: &'s RouterHandle<A>,
     pub(crate) storage: &'s RedbStorage,
     pub(crate) allocator: &'s A,
-    pub(crate) work: &'s WorkGroup,
+    pub(crate) work: &'s WorkHandle,
 }
 
 /// The stage could not finish, so the caller ends the stream it serves.

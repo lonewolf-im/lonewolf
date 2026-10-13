@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError, HostLookup, SessionTag};
+use lonewolf_extension::delivery::{
+    DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
+};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
@@ -14,7 +17,10 @@ use lonewolf_extension::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
     PresenceTransition, PresenceUpdate,
 };
-use lonewolf_extension::{Effects, Extension, Extensions, RegistrationError, Slots};
+use lonewolf_extension::service::{ServiceContext, ServiceHandler};
+use lonewolf_extension::{
+    Effects, Extension, ExtensionFuture, Extensions, RegistrationError, Slots,
+};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_storage::roster::{RosterJid, RosterWrites};
@@ -23,12 +29,14 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
-    Element, IqType, PresenceType, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaType,
+    Element, IqType, MessageType, PresenceType, RoutedStanza, Stanza, StanzaErrorCondition,
+    StanzaNamespace, StanzaType,
 };
 
 use super::TestResult;
 
 const NAMESPACE: &str = "urn:lonewolf:test:iq";
+const SERVICE_NAMESPACE: &str = "urn:lonewolf:test:service";
 const OFFLINE_ROUTE: IqRoute = IqRoute {
     scope: IqScope::Account,
     kind: IqRequestType::Get,
@@ -90,6 +98,24 @@ const SUBSCRIPTION_KINDS: [PresenceRequestType; 4] = [
 
 pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage>> {
     let mut extensions = Extensions::default();
+    extensions.register(Arc::new(TestService {
+        joined: parking_lot::Mutex::new(BTreeSet::new()),
+    }))?;
+    extensions.register(Arc::new(TestHostService))?;
+    for kind in [
+        ServiceLifecycleKind::OfflineWithdrawal,
+        ServiceLifecycleKind::DelayedAvailable,
+        ServiceLifecycleKind::DelayedUnavailable,
+    ] {
+        extensions.register(Arc::new(ServiceLifecycle {
+            inner: TestService {
+                joined: parking_lot::Mutex::new(BTreeSet::new()),
+            },
+            kind,
+            delay: AtomicBool::new(true),
+            release: async_lock::Semaphore::new(0),
+        }))?;
+    }
     extensions.register(Arc::new(ConflictingIq))?;
     extensions.register(Arc::new(TestIq))?;
     extensions.register(Arc::new(ServerIq))?;
@@ -119,6 +145,231 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
         fail_ack: AtomicBool::new(false),
     }))?;
     Ok(extensions)
+}
+
+struct TestService {
+    joined: parking_lot::Mutex<BTreeSet<String>>,
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestService {
+    fn name(&self) -> &'static str {
+        "test-service"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.service(&format!("echo.{host}"), self)
+    }
+}
+
+impl<A: ChunkAllocator> ServiceHandler<A, RedbStorage> for TestService {
+    fn route<'a>(
+        &'a self,
+        stanza: RoutedStanza<A>,
+        context: ServiceContext<'a, A, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async move {
+            let view = stanza
+                .resolve()
+                .map_err(|_| HandlerError::Stanza(StanzaErrorCondition::InternalServerError))?;
+            if view.stanza_type() == StanzaType::Iq(IqType::Set) {
+                return Err(StanzaErrorCondition::BadRequest.into());
+            }
+            let result = async {
+                match view.stanza_type() {
+                    StanzaType::Iq(IqType::Get) => {
+                        let query = view.children()?.next().transpose()?;
+                        if query.is_none_or(|query| {
+                            query.name() != "query" || query.namespace() != SERVICE_NAMESPACE
+                        }) {
+                            return Ok(());
+                        }
+                        let count = self.joined.lock().len().to_string();
+                        let mut arena = context.outbound.arena()?;
+                        let count = Element::builder_in("count", SERVICE_NAMESPACE, &mut arena)?
+                            .text(&count)?
+                            .build()?;
+                        let payload = Element::builder_in("query", SERVICE_NAMESPACE, &mut arena)?
+                            .child(count)?
+                            .build()?;
+                        let request = view.to_builder_in(&mut arena)?.build()?;
+                        let reply = request.reply_in(&mut arena)?.child(payload)?.build()?;
+                        context
+                            .outbound
+                            .route(RoutedStanza::from_parts(reply, arena))
+                            .await
+                    }
+                    StanzaType::Message(kind) if kind != MessageType::Error => {
+                        let mut arena = context.outbound.arena()?;
+                        let reply = view.to_builder_in(&mut arena)?.swap_addresses().build()?;
+                        context
+                            .outbound
+                            .route(RoutedStanza::from_parts(reply, arena))
+                            .await
+                    }
+                    StanzaType::Presence(PresenceType::Available | PresenceType::Unavailable) => {
+                        let from = view.from()?.ok_or(DeliveryError)?;
+                        if view.stanza_type() == StanzaType::Presence(PresenceType::Available) {
+                            self.joined.lock().insert(from.as_str().into());
+                        } else {
+                            self.joined.lock().remove(from.as_str());
+                        }
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            };
+            result.await.map_err(|_: DeliveryError| {
+                HandlerError::Stanza(StanzaErrorCondition::InternalServerError)
+            })
+        })
+    }
+}
+
+struct TestHostService;
+
+#[derive(Clone, Copy)]
+enum ServiceLifecycleKind {
+    OfflineWithdrawal,
+    DelayedAvailable,
+    DelayedUnavailable,
+}
+
+struct ServiceLifecycle {
+    inner: TestService,
+    kind: ServiceLifecycleKind,
+    delay: AtomicBool,
+    release: async_lock::Semaphore,
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for ServiceLifecycle {
+    fn name(&self) -> &'static str {
+        match self.kind {
+            ServiceLifecycleKind::OfflineWithdrawal => "test-service-offline-withdrawal",
+            ServiceLifecycleKind::DelayedAvailable => "test-service-delayed-available",
+            ServiceLifecycleKind::DelayedUnavailable => "test-service-delayed-unavailable",
+        }
+    }
+
+    fn register(
+        self: Arc<Self>,
+        host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.service(&format!("echo.{host}"), self)
+    }
+}
+
+impl<A: ChunkAllocator> ServiceHandler<A, RedbStorage> for ServiceLifecycle {
+    fn route<'a>(
+        &'a self,
+        stanza: RoutedStanza<A>,
+        context: ServiceContext<'a, A, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async move {
+            let result = async {
+                let view = stanza.resolve()?;
+                let kind = view.stanza_type();
+                if kind == StanzaType::Iq(IqType::Get)
+                    && view.children()?.next().transpose()?.is_some_and(|child| {
+                        child.name() == "release" && child.namespace() == SERVICE_NAMESPACE
+                    })
+                {
+                    self.release.add_permits(1);
+                    let mut arena = context.outbound.arena()?;
+                    let request = view.to_builder_in(&mut arena)?.build()?;
+                    let reply = request.reply_in(&mut arena)?.build()?;
+                    context
+                        .outbound
+                        .route(RoutedStanza::from_parts(reply, arena))
+                        .await?;
+                    return Ok(true);
+                }
+                let delayed = matches!(
+                    (self.kind, kind),
+                    (
+                        ServiceLifecycleKind::DelayedAvailable,
+                        StanzaType::Presence(PresenceType::Available)
+                    ) | (
+                        ServiceLifecycleKind::DelayedUnavailable,
+                        StanzaType::Presence(PresenceType::Unavailable)
+                    )
+                );
+                if delayed && self.delay.swap(false, Ordering::Relaxed) {
+                    tracing::info!("test service presence waiting");
+                    self.release.acquire().await.forget();
+                    tracing::info!("test service presence released");
+                }
+                if matches!(self.kind, ServiceLifecycleKind::OfflineWithdrawal)
+                    && kind == StanzaType::Presence(PresenceType::Unavailable)
+                {
+                    let mut arena = context.outbound.arena()?;
+                    let from = Jid::parse_in(context.domain, &mut arena)?;
+                    let to = Jid::parse_in(
+                        view.from()?.ok_or(DeliveryError)?.bare().as_str(),
+                        &mut arena,
+                    )?;
+                    let body = Element::builder_in("body", "jabber:client", &mut arena)?
+                        .text("withdrawn")?
+                        .build()?;
+                    let notice = Stanza::builder_in(
+                        StanzaType::Message(MessageType::Chat),
+                        StanzaNamespace::Client,
+                        &mut arena,
+                    )
+                    .from(Some(from))?
+                    .to(Some(to))?
+                    .child(body)?
+                    .build()?;
+                    context
+                        .outbound
+                        .route(RoutedStanza::from_parts(notice, arena))
+                        .await?;
+                    tracing::info!("test service withdrawal message stored");
+                }
+                Ok(false)
+            }
+            .await
+            .map_err(|_: DeliveryError| {
+                HandlerError::Stanza(StanzaErrorCondition::InternalServerError)
+            })?;
+            if result {
+                return Ok(());
+            }
+            let unavailable = stanza
+                .resolve()
+                .map_err(|_| HandlerError::Stanza(StanzaErrorCondition::InternalServerError))?
+                .stanza_type()
+                == StanzaType::Presence(PresenceType::Unavailable);
+            self.inner.route(stanza, context).await?;
+            if unavailable {
+                tracing::info!("test service withdrawal handled");
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestHostService {
+    fn name(&self) -> &'static str {
+        "test-host-service"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.service(
+            host,
+            Arc::new(TestService {
+                joined: parking_lot::Mutex::new(BTreeSet::new()),
+            }),
+        )
+    }
 }
 
 struct ConflictingIq;

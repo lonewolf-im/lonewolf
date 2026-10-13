@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
 use std::io;
@@ -11,11 +12,17 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
-use crate::router::{Destination, Registration, RoutedStanza, Router, RouterError, StoredRelease};
+use crate::router::{
+    Destination, Registration, RoutedStanza, Router, RouterError, ServiceRoute, StoredRelease,
+};
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use lonewolf_extension::ExtensionFuture;
+use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::offline::Offline;
+use lonewolf_extension::service::{ServiceContext, ServiceHandler};
+use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
@@ -34,10 +41,28 @@ fn run_test(test: impl Future<Output = TestResult>) -> TestResult {
     Runtime::new()?.block_on(timeout(TIMEOUT, test))?
 }
 
+struct TestService;
+
+impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for TestService {
+    fn route<'a>(
+        &'a self,
+        _stanza: RoutedStanza<GlobalChunkAllocator>,
+        _context: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 #[test]
 fn destination_classifies_each_address_shape() -> TestResult {
     run_test(async {
-        let router = setup()?;
+        let router = setup()?.with_services(BTreeMap::from([(
+            "echo.localhost".into(),
+            ServiceRoute {
+                domain: Arc::from("echo.localhost"),
+                handler: Arc::new(TestService),
+            },
+        )]));
         let handle = router.handle();
         let mut arena = Arena::try_new(ArenaConfig::default())?;
         for (address, expected) in [
@@ -45,6 +70,8 @@ fn destination_classifies_each_address_shape() -> TestResult {
             ("localhost/x", Destination::ServerResource),
             ("alice@localhost", Destination::Account),
             ("alice@localhost/desk", Destination::Resource),
+            ("echo.localhost", Destination::Service),
+            ("room@echo.localhost/nick", Destination::Service),
             ("example.org", Destination::Remote),
             ("bob@example.org/x", Destination::Remote),
         ] {

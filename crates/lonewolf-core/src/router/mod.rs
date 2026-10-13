@@ -13,6 +13,7 @@ use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_extension::presence::PresenceRegistry;
+use lonewolf_extension::service::ServiceHandler;
 use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
@@ -22,6 +23,7 @@ use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, Stan
 
 use crate::hosts::Hosts;
 use crate::order::Order;
+use crate::stages::service::{ServicePresenceGate, ServicePresenceGates};
 pub(crate) use local::ResourceMatch;
 
 pub(crate) mod local;
@@ -41,18 +43,33 @@ pub(crate) struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
     local: LocalRouterHandle<A>,
     extensions: Arc<BTreeMap<String, ExtensionRegistry<A, RedbStorage>>>,
+    services: Arc<BTreeMap<String, ServiceRoute<A>>>,
+    service_presence: Option<Arc<ServicePresenceGates>>,
     order: Arc<Order>,
+}
+
+pub(crate) struct ServiceRoute<A: ChunkAllocator> {
+    pub(crate) domain: Arc<str>,
+    pub(crate) handler: Arc<dyn ServiceHandler<A, RedbStorage>>,
+}
+
+impl<A: ChunkAllocator> Clone for ServiceRoute<A> {
+    fn clone(&self) -> Self {
+        Self {
+            domain: Arc::clone(&self.domain),
+            handler: Arc::clone(&self.handler),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Destination {
-    /// A served domain itself.
     Server,
     /// A resource of a served domain, which no session can bind.
     ServerResource,
     Account,
     Resource,
-    /// A domain this server does not serve.
+    Service,
     Remote,
 }
 
@@ -96,6 +113,8 @@ impl<A: ChunkAllocator + Clone> Router<A> {
             hosts,
             local: local.handle(),
             extensions: Arc::default(),
+            services: Arc::default(),
+            service_presence: None,
             order: Order::new(),
         };
         Self { local, handle }
@@ -117,6 +136,12 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         self.local.state()
     }
 
+    pub(crate) fn with_services(mut self, services: BTreeMap<String, ServiceRoute<A>>) -> Self {
+        self.handle.service_presence = (!services.is_empty()).then(Arc::default);
+        self.handle.services = Arc::new(services);
+        self
+    }
+
     pub(crate) fn stop(&self) {
         self.local.stop();
     }
@@ -136,6 +161,8 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
             hosts: self.hosts.clone(),
             local: self.local.clone(),
             extensions: Arc::clone(&self.extensions),
+            services: Arc::clone(&self.services),
+            service_presence: self.service_presence.clone(),
             order: Arc::clone(&self.order),
         }
     }
@@ -152,7 +179,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     pub(crate) fn destination(&self, to: JidRef<'_>) -> Destination {
         if !self.hosts.is_local_host(to.domainpart()) {
-            return Destination::Remote;
+            return if self.services.contains_key(to.domainpart()) {
+                Destination::Service
+            } else {
+                Destination::Remote
+            };
         }
         match (to.localpart(), to.resourcepart()) {
             (None, None) => Destination::Server,
@@ -160,6 +191,16 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             (Some(_), None) => Destination::Account,
             (Some(_), Some(_)) => Destination::Resource,
         }
+    }
+
+    pub(crate) fn service(&self, domain: &str) -> Option<&ServiceRoute<A>> {
+        self.services.get(domain)
+    }
+
+    pub(crate) fn service_presence_gate(&self, source: &str) -> Option<Arc<ServicePresenceGate>> {
+        self.service_presence
+            .as_ref()
+            .map(|gates| gates.gate(source))
     }
 
     pub(crate) fn iq_handlers(&self, domain: &str) -> Option<&IqRegistry<A, RedbStorage>> {
@@ -331,7 +372,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .ok_or(RouterError::InvalidTarget)?;
         let destination = self.destination(to);
         match destination {
-            Destination::Remote => Err(RouterError::RemoteUnsupported),
+            Destination::Service | Destination::Remote => Err(RouterError::RemoteUnsupported),
             Destination::Server | Destination::ServerResource => Err(RouterError::NotFound),
             Destination::Resource => self.local.deliver_message(stanza, release).await,
             Destination::Account => self.local.deliver_bare(stanza, release).await,
@@ -579,7 +620,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             match self.destination(to) {
                 Destination::Resource => true,
                 Destination::Account => false,
-                Destination::Server | Destination::ServerResource | Destination::Remote => {
+                Destination::Server
+                | Destination::ServerResource
+                | Destination::Service
+                | Destination::Remote => {
                     return Ok(());
                 }
             }

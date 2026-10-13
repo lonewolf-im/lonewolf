@@ -5,6 +5,9 @@ mod support;
 #[path = "protocol/extensions.rs"]
 mod extensions;
 
+#[path = "protocol/services.rs"]
+mod services;
+
 #[path = "protocol/stream.rs"]
 mod stream;
 

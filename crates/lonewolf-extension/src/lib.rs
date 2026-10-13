@@ -20,6 +20,7 @@ pub mod message;
 pub mod offline;
 pub mod presence;
 pub mod roster;
+pub mod service;
 mod slots;
 
 pub use slots::Slots;
@@ -31,6 +32,7 @@ use delivery::{Delivery, DeliveryFuture};
 use iq::{IqRegistry, IqRoute};
 use message::MessageHandler;
 use presence::{PresenceRegistry, PresenceRequestType};
+use service::ServiceHandler;
 
 /// Deliveries run after commit, in storage-view order for each account in `accounts`.
 pub struct Effects<A> {
@@ -57,7 +59,6 @@ impl<A: ChunkAllocator> Effects<A> {
 }
 
 /// One instance serves every host that enables it.
-/// Handlers use only the supplied transaction and return ordered deliveries as [`Effects`].
 pub trait Extension<A: ChunkAllocator, S: Storage>: Send + Sync {
     /// The name hosts use to enable the extension, nonempty and without surrounding whitespace.
     fn name(&self) -> &'static str;
@@ -124,6 +125,8 @@ pub enum RegistrationError {
     DuplicateRoute(IqRoute),
     DuplicatePresenceRoute(PresenceRequestType),
     DuplicateMessageHandler,
+    InvalidServiceDomain(String),
+    DuplicateService(String),
     MissingDependency {
         extension: &'static str,
         dependency: &'static str,
@@ -151,6 +154,12 @@ impl fmt::Display for RegistrationError {
                 write!(formatter, "conflicting presence route {route:?}")
             }
             Self::DuplicateMessageHandler => formatter.write_str("conflicting message handlers"),
+            Self::InvalidServiceDomain(domain) => {
+                write!(formatter, "invalid service domain {domain:?}")
+            }
+            Self::DuplicateService(domain) => {
+                write!(formatter, "service domain {domain:?} is registered twice")
+            }
             Self::MissingDependency {
                 extension,
                 dependency,
@@ -178,6 +187,7 @@ pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     iq: IqRegistry<A, S>,
     presence: PresenceRegistry<A, S>,
     messages: Option<Arc<dyn MessageHandler<A, S>>>,
+    services: Vec<(String, Arc<dyn ServiceHandler<A, S>>)>,
     #[expect(clippy::type_complexity)]
     accounts: Vec<(&'static str, Arc<dyn AccountHandler<A, S>>)>,
     stream_features: String,
@@ -190,6 +200,7 @@ impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
             iq: IqRegistry::default(),
             presence: PresenceRegistry::default(),
             messages: None,
+            services: Vec::new(),
             accounts: Vec::new(),
             stream_features: String::new(),
             enabled: Vec::new(),
@@ -208,6 +219,11 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
 
     pub fn messages(&self) -> Option<&Arc<dyn MessageHandler<A, S>>> {
         self.messages.as_ref()
+    }
+
+    #[expect(clippy::type_complexity)]
+    pub fn services(&self) -> &[(String, Arc<dyn ServiceHandler<A, S>>)] {
+        &self.services
     }
 
     #[expect(clippy::type_complexity)]

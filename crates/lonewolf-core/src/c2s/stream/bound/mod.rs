@@ -11,7 +11,9 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::SystemTime;
 
-use futures_util::future::{Either, join, select};
+use futures_channel::oneshot;
+use futures_util::FutureExt;
+use futures_util::future::{Either, Shared, join, select};
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
 use lonewolf_extension::message::{Backlog, MessageHandler};
@@ -37,18 +39,19 @@ use super::outcome::CloseOutcome;
 use super::session::{Session, Writer};
 use crate::c2s::iq;
 use crate::delivery::{
-    EffectsDiagnostics, Pending, RouterDelivery, WorkGroup, after_turn, commit_and_deliver,
-    report_failure, report_handler_failure, storage_failure,
+    EffectsDiagnostics, Pending, RouterDelivery, WorkGroup, WorkHandle, after_turn,
+    commit_and_deliver, report_failure, report_handler_failure, storage_failure,
 };
 use crate::order::Ticket;
 use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
 use crate::router::{
     Destination, MailboxEntry, Registration, ResourceMatch, RoutedStanza, RouterError,
-    RouterHandle, SessionHandle,
+    RouterHandle, ServiceRoute, SessionHandle,
 };
 
 use crate::stages::Stage;
 use crate::stages::message::{self, DeliveryOutcome};
+use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
 
 mod link;
 mod output;
@@ -66,6 +69,9 @@ struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
     router: RouterHandle<A>,
     storage: RedbStorage,
     allocator: A,
+    work: WorkHandle,
+    service_presence: Option<Arc<ServicePresenceLease>>,
+    service_pending: Option<Shared<oneshot::Receiver<()>>>,
     available: bool,
     priority: Option<i8>,
     incoming: async_channel::Receiver<Incoming<A>>,
@@ -231,6 +237,9 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
                 router,
                 storage,
                 allocator,
+                work: work.handle(),
+                service_presence: None,
+                service_pending: None,
                 available: false,
                 priority: None,
                 incoming,
@@ -348,6 +357,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             session: self.registration.handle(),
             router: self.router.clone(),
             storage: self.storage.clone(),
+            allocator: self.allocator.clone(),
+            work: self.work.clone(),
+            service_presence: self.service_presence.take(),
+            service_pending: self.service_pending.take(),
             account: self.registration.account().clone(),
             fallback: self.unavailable_notice()?,
         };
@@ -404,6 +417,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         if stanza.namespace() != StanzaNamespace::Client {
             return Err(CloseOutcome::InvalidNamespace);
         }
+        let service = stanza
+            .to()?
+            .and_then(|to| self.router.service(to.domainpart()).cloned());
+        if let Some(route) = service {
+            return self.handle_service(parsed, route).await;
+        }
         match stanza.stanza_type() {
             StanzaType::Iq(_) => self.handle_iq(parsed).await,
             StanzaType::Presence(kind) => {
@@ -411,6 +430,91 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 self.handle_presence(parsed, kind, directed).await
             }
             StanzaType::Message(kind) => self.handle_message(parsed, kind).await,
+        }
+    }
+
+    async fn handle_service(
+        &mut self,
+        parsed: Parsed<Stanza, A>,
+        route: ServiceRoute<A>,
+    ) -> Result<(), CloseOutcome> {
+        let routed = self.stamp(parsed)?;
+        let presence = {
+            let view = routed.resolve()?;
+            matches!(
+                view.stanza_type(),
+                StanzaType::Presence(PresenceType::Available | PresenceType::Unavailable)
+            )
+        };
+        let outcome = if presence {
+            if self.service_presence.is_none() {
+                let from = routed
+                    .resolve()?
+                    .from()?
+                    .ok_or(CloseOutcome::InternalError)?;
+                let gate = self
+                    .router
+                    .service_presence_gate(from.as_str())
+                    .ok_or(CloseOutcome::InternalError)?;
+                let lease = self
+                    .outbox
+                    .drain_until(&self.registration, gate.acquire())
+                    .await?;
+                self.service_presence = Some(Arc::new(lease));
+            }
+            let (completion, completed) = oneshot::channel();
+            self.service_pending = Some(completed.shared());
+            let work = DirectedServiceWork {
+                session: self.registration.handle(),
+                router: self.router.clone(),
+                storage: self.storage.clone(),
+                allocator: self.allocator.clone(),
+                work: self.work.clone(),
+                lease: self
+                    .service_presence
+                    .as_ref()
+                    .cloned()
+                    .ok_or(CloseOutcome::InternalError)?,
+                completion,
+                stanza: routed.clone(),
+                route,
+            };
+            let pending = Pending::spawn(self.work.start(), work.run());
+            match self
+                .outbox
+                .drain_until(&self.registration, pending.finished())
+                .await?
+                .ok_or(CloseOutcome::InternalError)?
+            {
+                Ok(outcome) => outcome,
+                Err(RouterError::DirectedPresenceLimit) => {
+                    tracing::warn!(
+                        account_jid = ?self.registration.account().as_str(),
+                        stanza_kind = "presence",
+                        outcome = "directed_presence_limit",
+                        "directed presence rejected"
+                    );
+                    return self.reply_error(&routed, StanzaErrorCondition::ResourceConstraint);
+                }
+                Err(_) => return Err(CloseOutcome::InternalError),
+            }
+        } else {
+            let stage = Stage {
+                router: &self.router,
+                storage: &self.storage,
+                allocator: &self.allocator,
+                work: &self.work,
+            };
+            self.outbox
+                .drain_until(
+                    &self.registration,
+                    service::dispatch(&stage, &route, routed),
+                )
+                .await??
+        };
+        match outcome {
+            ServiceOutcome::Rejected { stanza, condition } => self.reply_error(&stanza, condition),
+            ServiceOutcome::Handled => Ok(()),
         }
     }
 
@@ -446,7 +550,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             let scope = match route.destination {
                 Destination::Account => Some(IqScope::Account),
                 Destination::Server => Some(IqScope::Server),
-                Destination::Resource | Destination::ServerResource | Destination::Remote => None,
+                Destination::Resource
+                | Destination::ServerResource
+                | Destination::Service
+                | Destination::Remote => None,
             };
             let handler = scope.and_then(|scope| {
                 self.router.iq_handlers(target.domainpart())?.find(
@@ -570,7 +677,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 work_group.start(),
                 ticket,
                 Some(registration.mailbox()),
-                move |queued| work.run(queued),
+                move |queued, ticket| async move {
+                    let result = work.run(queued).await;
+                    drop(ticket);
+                    result
+                },
             ))
         };
         let mut pending = self.outbox.drain_until(registration, prepare).await??;
@@ -865,7 +976,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             router: &self.router,
             storage: &self.storage,
             allocator: &self.allocator,
-            work: self.outbox.work,
+            work: &self.work,
         };
         let outcome = self
             .outbox
@@ -884,6 +995,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         parsed: Parsed<Stanza, A>,
         available: bool,
     ) -> Result<(), CloseOutcome> {
+        let completion = self.service_presence.as_ref().map(|_| {
+            let (completion, completed) = oneshot::channel();
+            self.service_pending = Some(completed.shared());
+            completion
+        });
         let priority = if available {
             let stanza = parsed.value().resolve(parsed.arena())?;
             match presence_priority(&stanza) {
@@ -994,6 +1110,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             let work = PresenceWork {
                 session: registration.handle(),
                 router: router.clone(),
+                storage: storage.clone(),
+                allocator: self.allocator.clone(),
+                work: self.work.clone(),
+                service_presence: self.service_presence.clone(),
+                completion,
                 account: registration.account().clone(),
                 priority,
                 available,
@@ -1006,7 +1127,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 work_group.start(),
                 ticket,
                 None,
-                move |_: Vec<MailboxEntry<A>>| work.run(),
+                move |_: Vec<MailboxEntry<A>>, ticket| work.run(ticket),
             )))
         };
         let mut pending = match self.outbox.drain_until(registration, prepare).await?? {
@@ -1742,116 +1863,164 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
     }
 }
 
+struct DirectedServiceWork<A: ChunkAllocator> {
+    session: SessionHandle<A>,
+    router: RouterHandle<A>,
+    storage: RedbStorage,
+    allocator: A,
+    work: WorkHandle,
+    lease: Arc<ServicePresenceLease>,
+    completion: oneshot::Sender<()>,
+    stanza: RoutedStanza<A>,
+    route: ServiceRoute<A>,
+}
+
+impl<A: ChunkAllocator + Clone> DirectedServiceWork<A> {
+    async fn run(self) -> Result<ServiceOutcome<A>, RouterError> {
+        let view = self
+            .stanza
+            .resolve()
+            .map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let available = view.stanza_type() == StanzaType::Presence(PresenceType::Available);
+        self.session.record_service_presence(to, available).await?;
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: &self.work,
+        };
+        let result = service::dispatch(&stage, &self.route, self.stanza)
+            .await
+            .map_err(|_| RouterError::Unavailable);
+        drop(self.lease);
+        let _ = self.completion.send(());
+        result
+    }
+}
+
 struct TerminalPresenceWork<A: ChunkAllocator> {
     session: SessionHandle<A>,
     router: RouterHandle<A>,
     storage: RedbStorage,
+    allocator: A,
+    work: WorkHandle,
+    service_presence: Option<Arc<ServicePresenceLease>>,
+    service_pending: Option<Shared<oneshot::Receiver<()>>>,
     account: AccountKey,
     fallback: RoutedStanza<A>,
 }
 
 impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
     async fn run(self) -> Result<(), CloseOutcome> {
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: &self.work,
+        };
         let withdrawal = self
             .session
             .end_presence()
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
-        if withdrawal.unavailable.is_none() {
-            let directed =
-                send_withdrawal(&self.router, &self.fallback, &withdrawal.directed, &[]).await;
-            let finished = self
-                .session
-                .finish_presence(withdrawal.directed.source_token)
-                .await
-                .map_err(|_| CloseOutcome::InternalError);
-            return directed.and(finished);
-        }
         let notice = withdrawal.unavailable.as_ref().unwrap_or(&self.fallback);
         let mut covered = Vec::new();
         let mut ticket = None;
-        let broadcast = async {
-            let handler = self
-                .router
-                .presence_handlers(self.account.domain())
-                .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
-            let (transaction, admitted) = self
-                .router
-                .order()
-                .fix(vec![self.account.clone()], async {
-                    match handler {
-                        Some(_) => self.storage.begin_read().await.map(Some).map_err(|error| {
-                            close_storage_failure(
-                                error,
-                                "presence_terminal_begin_read",
-                                &self.account,
+        let broadcast = if withdrawal.unavailable.is_some() {
+            async {
+                let handler = self
+                    .router
+                    .presence_handlers(self.account.domain())
+                    .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
+                let (transaction, admitted) = self
+                    .router
+                    .order()
+                    .fix(vec![self.account.clone()], async {
+                        match handler {
+                            Some(_) => self.storage.begin_read().await.map(Some).map_err(|error| {
+                                close_storage_failure(
+                                    error,
+                                    "presence_terminal_begin_read",
+                                    &self.account,
+                                )
+                            }),
+                            None => Ok(None),
+                        }
+                    })
+                    .await?;
+                ticket = Some(admitted);
+                let audience = match (handler, transaction.as_ref()) {
+                    (Some(handler), Some(transaction)) => {
+                        let view = notice.resolve()?;
+                        let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
+                        handler
+                            .audience(
+                                PresenceUpdate {
+                                    sender,
+                                    transition: PresenceTransition::Unavailable,
+                                },
+                                transaction,
                             )
-                        }),
-                        None => Ok(None),
+                            .await
+                            .map_err(|error| {
+                                report_handler_failure(&error, &self.account);
+                                CloseOutcome::InternalError
+                            })?
                     }
-                })
-                .await?;
-            ticket = Some(admitted);
-            let audience = match (handler, transaction.as_ref()) {
-                (Some(handler), Some(transaction)) => {
-                    let view = notice.resolve()?;
-                    let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
-                    handler
-                        .audience(
-                            PresenceUpdate {
-                                sender,
-                                transition: PresenceTransition::Unavailable,
-                            },
-                            transaction,
-                        )
-                        .await
-                        .map_err(|error| {
-                            report_handler_failure(&error, &self.account);
-                            CloseOutcome::InternalError
-                        })?
+                    _ => None,
+                };
+                if let Some(ticket) = ticket.as_mut() {
+                    ticket.turn().await;
                 }
-                _ => None,
-            };
-            if let Some(ticket) = ticket.as_mut() {
-                ticket.turn().await;
-            }
-            if let Some(audience) = audience {
-                if !self
-                    .session
-                    .replacement_is_available()
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?
-                {
-                    self.router
-                        .broadcast_presence(notice, &audience.subscribers)
+                if let Some(audience) = audience {
+                    if !self
+                        .session
+                        .replacement_is_available()
                         .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
+                        .map_err(|_| CloseOutcome::InternalError)?
+                    {
+                        self.router
+                            .broadcast_presence(notice, &audience.subscribers)
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                    }
+                    covered = audience.subscribers;
                 }
-                covered = audience.subscribers;
+                Ok(())
             }
+            .await
+        } else {
             Ok(())
-        }
-        .await;
+        };
         if let Some(ticket) = ticket.as_mut() {
             ticket.turn().await;
         }
-        let directed = send_withdrawal(&self.router, notice, &withdrawal.directed, &covered).await;
+        let local = send_local_withdrawal(&stage, notice, &withdrawal.directed, &covered).await;
         let finished = self
             .session
             .finish_presence(withdrawal.directed.source_token)
             .await
             .map_err(|_| CloseOutcome::InternalError);
-        broadcast.and(directed).and(finished)
+        drop(ticket);
+        if let Some(pending) = self.service_pending {
+            let _ = pending.await;
+        }
+        let services =
+            send_service_withdrawal(&stage, notice, &withdrawal.directed, &covered).await;
+        drop(self.service_presence);
+        broadcast.and(local).and(finished).and(services)
     }
 }
 
-async fn send_withdrawal<A: ChunkAllocator + Clone>(
-    router: &RouterHandle<A>,
-    notice: &RoutedStanza<A>,
-    withdrawal: &DirectedWithdrawal,
-    covered: &[RosterJid],
-) -> Result<(), CloseOutcome> {
-    let recipients = withdrawal
+fn withdrawal_recipients<'a>(
+    withdrawal: &'a DirectedWithdrawal,
+    covered: &'a [RosterJid],
+) -> impl Iterator<Item = &'a str> + Clone {
+    withdrawal
         .recipients
         .iter()
         .map(|recipient| recipient.as_str())
@@ -1859,16 +2028,60 @@ async fn send_withdrawal<A: ChunkAllocator + Clone>(
             !covered
                 .iter()
                 .any(|subscriber| subscriber.as_str() == *recipient)
-        });
-    router
-        .send_directed(notice, recipients)
+        })
+}
+
+async fn send_local_withdrawal<A: ChunkAllocator + Clone>(
+    stage: &Stage<'_, A>,
+    notice: &RoutedStanza<A>,
+    withdrawal: &DirectedWithdrawal,
+    covered: &[RosterJid],
+) -> Result<(), CloseOutcome> {
+    stage
+        .router
+        .send_directed(
+            notice,
+            withdrawal_recipients(withdrawal, covered)
+                .filter(|recipient| stage.router.service(domain_of(recipient)).is_none()),
+        )
         .await
         .map_err(|_| CloseOutcome::InternalError)
+}
+
+async fn send_service_withdrawal<A: ChunkAllocator + Clone>(
+    stage: &Stage<'_, A>,
+    notice: &RoutedStanza<A>,
+    withdrawal: &DirectedWithdrawal,
+    covered: &[RosterJid],
+) -> Result<(), CloseOutcome> {
+    for recipient in withdrawal_recipients(withdrawal, covered) {
+        if let Some(route) = stage.router.service(domain_of(recipient)) {
+            let mut arena = Arena::try_new_in(Default::default(), stage.allocator.clone())?;
+            let target = Jid::parse_in(recipient, &mut arena)?;
+            let stanza = notice
+                .resolve()?
+                .to_builder_in(&mut arena)?
+                .to(Some(target))?
+                .build()?;
+            service::dispatch(stage, route, RoutedStanza::from_parts(stanza, arena)).await?;
+        }
+    }
+    Ok(())
+}
+
+fn domain_of(jid: &str) -> &str {
+    let bare = jid.split_once('/').map_or(jid, |(bare, _)| bare);
+    bare.split_once('@').map_or(bare, |(_, domain)| domain)
 }
 
 struct PresenceWork<A: ChunkAllocator> {
     session: SessionHandle<A>,
     router: RouterHandle<A>,
+    storage: RedbStorage,
+    allocator: A,
+    work: WorkHandle,
+    service_presence: Option<Arc<ServicePresenceLease>>,
+    completion: Option<oneshot::Sender<()>>,
     account: AccountKey,
     priority: Option<i8>,
     available: bool,
@@ -1887,10 +2100,15 @@ struct PresenceOutcome<A: ChunkAllocator> {
 }
 
 impl<A: ChunkAllocator + Clone> PresenceWork<A> {
-    async fn run(self) -> Result<PresenceOutcome<A>, CloseOutcome> {
+    async fn run(self, ticket: Ticket) -> Result<PresenceOutcome<A>, CloseOutcome> {
         let PresenceWork {
             session,
             router,
+            storage,
+            allocator,
+            work,
+            service_presence,
+            completion,
             account,
             priority,
             available,
@@ -1944,13 +2162,27 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
         } else {
             Ok(())
         };
-        let directed = if !available {
-            send_withdrawal(&router, &routed, &change.directed, &covered).await
+        let stage = Stage {
+            router: &router,
+            storage: &storage,
+            allocator: &allocator,
+            work: &work,
+        };
+        let local = if !available {
+            send_local_withdrawal(&stage, &routed, &change.directed, &covered).await
+        } else {
+            Ok(())
+        };
+        drop(ticket);
+        let services = if !available {
+            send_service_withdrawal(&stage, &routed, &change.directed, &covered).await
         } else {
             Ok(())
         };
         change.directed.recipients.clear();
-        broadcast.and(directed)?;
+        drop(service_presence);
+        drop(completion);
+        broadcast.and(local).and(services)?;
         Ok(PresenceOutcome {
             change,
             echo: routed,
@@ -2120,5 +2352,7 @@ impl<A: ChunkAllocator + Clone> ResourceIqWork<A> {
 
 #[cfg(test)]
 mod preparation_tests;
+#[cfg(test)]
+mod service_tests;
 #[cfg(test)]
 mod tests;

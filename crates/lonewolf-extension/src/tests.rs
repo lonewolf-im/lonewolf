@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::{RedbStorage, RedbWrite};
 use lonewolf_util::arena::GlobalChunkAllocator;
+use lonewolf_xmpp::stanza::RoutedStanza;
 use parking_lot::Mutex as PlMutex;
 
 use super::account::AccountHandler;
@@ -13,6 +14,7 @@ use super::delivery::{HandlerError, HostLookup};
 use super::iq::{IqHandler, IqRequestType, IqRoute, IqScope};
 use super::message::MessageHandler;
 use super::presence::{PresenceHandler, PresenceRequestType};
+use super::service::{ServiceContext, ServiceHandler};
 use super::{Effects, Extension, ExtensionFuture, Extensions, RegistrationError, Slots};
 
 type TestExtensions = Extensions<GlobalChunkAllocator, RedbStorage>;
@@ -41,6 +43,39 @@ impl IqHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
 impl PresenceHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
 
 impl MessageHandler<GlobalChunkAllocator, RedbStorage> for Fake {}
+
+impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for Fake {
+    fn route<'a>(
+        &'a self,
+        _stanza: RoutedStanza<GlobalChunkAllocator>,
+        _context: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[test]
+fn service_domains_must_be_normalized_and_unique() -> Result<(), RegistrationError> {
+    let mut registry = super::ExtensionRegistry::default();
+    let mut slots = Slots::new(&mut registry, "service");
+    let handler = Arc::new(Fake::default());
+    assert_eq!(
+        slots.service("Example.com", handler.clone()),
+        Err(RegistrationError::InvalidServiceDomain(
+            "Example.com".into()
+        ))
+    );
+    slots.service("svc.example.com", handler.clone())?;
+    assert_eq!(
+        slots.service("svc.example.com", handler),
+        Err(RegistrationError::DuplicateService(
+            "svc.example.com".into()
+        ))
+    );
+    assert_eq!(registry.services().len(), 1);
+    assert_eq!(registry.services()[0].0, "svc.example.com");
+    Ok(())
+}
 
 impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
     fn name(&self) -> &'static str {

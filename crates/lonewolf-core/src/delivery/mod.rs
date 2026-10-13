@@ -33,6 +33,11 @@ pub(crate) struct WorkGroup {
     state: Arc<WorkState>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WorkHandle {
+    state: Arc<WorkState>,
+}
+
 struct WorkState {
     active: AtomicUsize,
     drained: AtomicWaker,
@@ -43,6 +48,12 @@ pub(crate) struct WorkGuard {
 }
 
 impl WorkGroup {
+    pub(crate) fn handle(&self) -> WorkHandle {
+        WorkHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(WorkState {
@@ -70,6 +81,15 @@ impl WorkGroup {
             }
         })
         .await;
+    }
+}
+
+impl WorkHandle {
+    pub(crate) fn start(&self) -> WorkGuard {
+        self.state.active.fetch_add(1, Ordering::Relaxed);
+        WorkGuard {
+            state: Arc::clone(&self.state),
+        }
     }
 }
 
@@ -145,7 +165,7 @@ impl<T> Pending<T> {
     }
 }
 
-/// Detached work holds the ticket, so a stalled caller cannot block later deliveries.
+/// The callback owns the turned ticket and must hold it through ordered deliveries.
 pub(crate) fn after_turn<A, T, F, Fut>(
     guard: WorkGuard,
     mut ticket: Ticket,
@@ -155,7 +175,7 @@ pub(crate) fn after_turn<A, T, F, Fut>(
 where
     A: ChunkAllocator,
     T: 'static,
-    F: FnOnce(Vec<MailboxEntry<A>>) -> Fut + 'static,
+    F: FnOnce(Vec<MailboxEntry<A>>, Ticket) -> Fut + 'static,
     Fut: Future<Output = T> + 'static,
 {
     let (report_turned, turned) = oneshot::channel();
@@ -164,8 +184,7 @@ where
         ticket.turn().await;
         let _ = report_turned.send(());
         let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
-        let result = work(queued).await;
-        drop(ticket);
+        let result = work(queued, ticket).await;
         let _ = report_done.send(result);
     }))
     .detach();

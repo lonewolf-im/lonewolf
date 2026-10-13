@@ -66,6 +66,55 @@ fn tls_restart_changes_the_stream_id_and_offers_sasl() -> TestResult {
 }
 
 #[test]
+fn starttls_after_tls_returns_tls_failure_and_closes() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+    client.expect_footer()?;
+    client.send("</stream:stream>")?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()
+}
+
+#[test]
+fn starttls_during_authentication_returns_tls_failure_and_closes() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
+    client.receive_sasl_challenge()?;
+    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+    client.expect_footer()?;
+    client.send("</stream:stream>")?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()
+}
+
+#[test]
+fn starttls_after_authentication_returns_tls_failure_and_closes() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+    client.expect_footer()?;
+    client.send("</stream:stream>")?;
+    client.expect_tls_close()?;
+    client.expect_tcp_open()?;
+    client.send_tls_close()?;
+    client.expect_tcp_eof()
+}
+
+#[test]
 fn stanza_size_limit_closes_the_stream_before_tls() -> TestResult {
     let suite = C2sSuite::with_limits("max_stanza_bytes = 10000")?;
     let mut client = suite.tcp_client()?;

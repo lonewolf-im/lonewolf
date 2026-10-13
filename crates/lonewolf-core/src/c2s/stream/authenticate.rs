@@ -14,7 +14,7 @@ use lonewolf_xmpp::parser::{Parsed, StreamEvent};
 use lonewolf_xmpp::stanza::{Element, NodeRef, XML_NAMESPACE};
 
 use super::certificate::CertificateMonitor;
-use super::establish::Established;
+use super::establish::{Established, STARTTLS_FAILURE, is_starttls_element};
 use super::outcome::CloseOutcome;
 use super::session::{Session, namespace_error};
 use crate::c2s::AuthService;
@@ -189,6 +189,10 @@ struct Identity {
 impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
     async fn read_request(&mut self) -> Result<Option<AuthRequest>, CloseOutcome> {
         let failure = match self.next_element().await? {
+            StreamEvent::Element(element) if is_starttls_element(&element) => {
+                self.session.writer.send(STARTTLS_FAILURE).await?;
+                return Err(CloseOutcome::StartTlsRejected);
+            }
             StreamEvent::Element(element) => match parse_sasl_message(&element) {
                 Ok(SaslMessage::Auth(request)) => return Ok(Some(request)),
                 Ok(SaslMessage::Abort) => "aborted",
@@ -448,6 +452,10 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
 
     async fn read_response(&mut self) -> Result<Response, CloseOutcome> {
         let failure = match self.next_element().await? {
+            StreamEvent::Element(element) if is_starttls_element(&element) => {
+                self.session.writer.send(STARTTLS_FAILURE).await?;
+                return Err(CloseOutcome::StartTlsRejected);
+            }
             StreamEvent::Element(element) => match parse_sasl_message(&element) {
                 Ok(SaslMessage::Response(response)) => return Ok(Response::Data(response)),
                 Ok(SaslMessage::Auth(request)) => return Ok(Response::Request(request)),

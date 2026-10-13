@@ -14,7 +14,7 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::certificate::CertificateMonitor;
-use super::establish::Established;
+use super::establish::{Established, STARTTLS_FAILURE, is_starttls_element};
 use super::header::{ResponseVersion, escape_attribute};
 use super::outcome::CloseOutcome;
 use super::session::{Session, Writer, namespace_error};
@@ -141,6 +141,10 @@ async fn bind_session<A: ChunkAllocator + Clone>(
             monitor.check()?;
         }
         let parsed = match session.next_event().await? {
+            Some(StreamEvent::Element(element)) if is_starttls_element(&element) => {
+                session.writer.send(STARTTLS_FAILURE).await?;
+                return Err(CloseOutcome::StartTlsRejected);
+            }
             Some(StreamEvent::Stanza(parsed)) => parsed,
             Some(StreamEvent::RejectedStanza(parsed)) => {
                 let rejected = parsed.value();

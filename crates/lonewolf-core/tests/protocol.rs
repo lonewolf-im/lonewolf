@@ -2,6 +2,9 @@
 
 mod support;
 
+#[path = "protocol/observers.rs"]
+mod observers;
+
 #[path = "protocol/archive.rs"]
 mod archive;
 

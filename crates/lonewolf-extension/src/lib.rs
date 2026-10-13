@@ -19,6 +19,7 @@ pub mod delivery;
 pub mod discovery;
 pub mod iq;
 pub mod message;
+pub mod observer;
 pub mod offline;
 pub mod policy;
 pub mod presence;
@@ -36,6 +37,7 @@ use delivery::{Delivery, DeliveryFuture};
 use discovery::Discovery;
 use iq::{IqRegistry, IqRoute};
 use message::MessageHandler;
+use observer::MessageObserver;
 use policy::PolicyHandler;
 use presence::{PresenceRegistry, PresenceRequestType};
 use service::ServiceHandler;
@@ -200,6 +202,8 @@ pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     discovery: Arc<Discovery>,
     #[expect(clippy::type_complexity)]
     accounts: Vec<(&'static str, Arc<dyn AccountHandler<A, S>>)>,
+    #[expect(clippy::type_complexity)]
+    message_observers: Vec<(&'static str, Arc<dyn MessageObserver<A, S>>)>,
     policies: Vec<(&'static str, Arc<dyn PolicyHandler<S>>)>,
     stream_features: String,
     enabled: Vec<&'static str>,
@@ -216,6 +220,7 @@ impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
             discovery: Arc::new(Discovery::default()),
             accounts: Vec::new(),
             policies: Vec::new(),
+            message_observers: Vec::new(),
             stream_features: String::new(),
             enabled: Vec::new(),
         }
@@ -251,6 +256,11 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
     #[expect(clippy::type_complexity)]
     pub fn account_handlers(&self) -> &[(&'static str, Arc<dyn AccountHandler<A, S>>)] {
         &self.accounts
+    }
+
+    #[expect(clippy::type_complexity)]
+    pub fn message_observers(&self) -> &[(&'static str, Arc<dyn MessageObserver<A, S>>)] {
+        &self.message_observers
     }
 
     pub fn policies(&self) -> &[(&'static str, Arc<dyn PolicyHandler<S>>)] {

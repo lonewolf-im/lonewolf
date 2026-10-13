@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::delivery::{DeliveryError, DeliveryFuture, HostLookup};
+use lonewolf_extension::observer::{MessageEvent, MessageOutcome, MessageRole};
 use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_extension::service::{ServiceContext, ServiceOutbound};
 use lonewolf_storage::RedbStorage;
@@ -9,8 +10,8 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaErrorCondition, StanzaType};
 
 use super::message::{self, DeliveryOutcome};
-use super::{Stage, StageFailure, archive, policy};
-use crate::delivery::WorkHandle;
+use super::{Stage, StageFailure, archive, observe, policy};
+use crate::delivery::{RouterDelivery, WorkHandle};
 use crate::router::{Destination, RoutedStanza, RouterError, RouterHandle, ServiceRoute};
 
 mod presence;
@@ -138,26 +139,57 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                             allocator: self.allocator,
                             work: self.work,
                         };
-                        let stanza = if self.router.archive_handler(to.domainpart()).is_some() {
-                            let recipient =
-                                AccountKey::try_from(to.bare()).map_err(|_| DeliveryError)?;
-                            match archive::archive(&stage, stanza, None, Some(&recipient))
+                        let observers = !self.router.message_observers(to.domainpart()).is_empty();
+                        let archive_needed = self.router.archive_handler(to.domainpart()).is_some();
+                        let recipient = if observers || archive_needed {
+                            Some(AccountKey::try_from(to.bare()).map_err(|_| DeliveryError)?)
+                        } else {
+                            None
+                        };
+                        let mut received = None;
+                        let stanza = if archive_needed {
+                            match archive::archive(&stage, stanza, None, recipient.as_ref())
                                 .await
                                 .map_err(|_| DeliveryError)?
                             {
-                                archive::ArchiveStep::Accepted(archived) => archived.stanza,
+                                archive::ArchiveStep::Accepted(archived) => {
+                                    received = archived.received;
+                                    archived.stanza
+                                }
                                 archive::ArchiveStep::Rejected { .. } => return Err(DeliveryError),
                             }
                         } else {
                             stanza
                         };
-                        match message::deliver(&stage, stanza, kind).await {
-                            Ok(
-                                DeliveryOutcome::Routed
-                                | DeliveryOutcome::Stored
-                                | DeliveryOutcome::Discarded,
-                            ) => Ok(()),
-                            Ok(DeliveryOutcome::Rejected { .. }) | Err(_) => Err(DeliveryError),
+                        let observed = observers.then(|| stanza.clone());
+                        let outcome = message::deliver(&stage, stanza, kind)
+                            .await
+                            .map_err(|_| DeliveryError)?;
+                        if let (
+                            Some(observed),
+                            Some(recipient),
+                            DeliveryOutcome::Routed | DeliveryOutcome::Stored,
+                        ) = (observed.as_ref(), recipient.as_ref(), &outcome)
+                        {
+                            let delivery = RouterDelivery::new(self.router, self.allocator, None);
+                            observe::message(
+                                &stage,
+                                &delivery,
+                                MessageEvent {
+                                    account: recipient,
+                                    role: MessageRole::Received,
+                                    stanza: observed,
+                                    outcome: MessageOutcome::from(&outcome),
+                                    archived: received,
+                                },
+                            )
+                            .await;
+                        }
+                        match outcome {
+                            DeliveryOutcome::Routed
+                            | DeliveryOutcome::Stored
+                            | DeliveryOutcome::Discarded => Ok(()),
+                            DeliveryOutcome::Rejected { .. } => Err(DeliveryError),
                         }
                     }
                     StanzaType::Presence(kind) => {

@@ -2,6 +2,9 @@
 
 mod support;
 
+#[path = "protocol/archive.rs"]
+mod archive;
+
 #[path = "protocol/policy.rs"]
 mod policy;
 

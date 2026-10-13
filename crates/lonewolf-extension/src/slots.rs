@@ -7,6 +7,7 @@ use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 
 use crate::account::AccountHandler;
+use crate::archive::ArchiveHandler;
 use crate::discovery::{DiscoScope, Identity};
 use crate::iq::{IqHandler, IqRoute};
 use crate::message::MessageHandler;
@@ -83,6 +84,17 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
 
     pub fn stream_feature(&mut self, feature: &'static str) {
         self.registry.stream_features.push_str(feature);
+    }
+
+    pub fn archive(
+        &mut self,
+        handler: Arc<dyn ArchiveHandler<A, S>>,
+    ) -> Result<(), RegistrationError> {
+        if self.registry.archive.is_some() {
+            return Err(RegistrationError::DuplicateArchiveHandler);
+        }
+        self.registry.archive = Some(handler);
+        Ok(())
     }
 
     pub fn policy(&mut self, handler: Arc<dyn PolicyHandler<S>>) {

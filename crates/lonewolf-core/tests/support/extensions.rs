@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use lonewolf_extension::archive::{
+    ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
+};
 use lonewolf_extension::delivery::{
     DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
 };
@@ -111,6 +115,11 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
         joined: PlMutex::new(BTreeSet::new()),
     }))?;
     extensions.register(Arc::new(TestHostService))?;
+    extensions.register(Arc::new(TestArchive {
+        next: AtomicU64::new(1),
+        entries: PlMutex::new(Vec::new()),
+    }))?;
+    extensions.register(Arc::new(TestSecondArchive))?;
     extensions.register(Arc::new(TestDiscovery))?;
     extensions.register(Arc::new(TestPolicy {
         enabled: AtomicBool::new(true),
@@ -1340,5 +1349,156 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestPolicy {
             self.enabled.store(enabled, Ordering::Relaxed);
             Ok(IqReply::new(None, Effects::none()))
         })
+    }
+}
+
+const ARCHIVE_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Server,
+    kind: IqRequestType::Get,
+    namespace: "urn:lonewolf:test:archive",
+    name: "entries",
+};
+
+struct TestArchive {
+    next: AtomicU64,
+    entries: PlMutex<Vec<(String, ArchiveDirection, u64)>>,
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestArchive {
+    fn name(&self) -> &'static str {
+        "test-archive"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(ARCHIVE_ROUTE, self.clone())?;
+        slots.archive(self)
+    }
+}
+
+impl<A: ChunkAllocator> ArchiveHandler<A, RedbStorage> for TestArchive {
+    fn selects(&self, request: &ArchiveRequest<'_, A>) -> bool {
+        request.stanza.resolve().is_ok_and(|view| {
+            matches!(
+                view.stanza_type(),
+                StanzaType::Message(MessageType::Chat | MessageType::Normal)
+            )
+        })
+    }
+
+    fn archive<'a>(
+        &'a self,
+        request: ArchiveRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a mut Arena<A>,
+    ) -> ArchiveFuture<'a> {
+        Box::pin(async move {
+            let view = request
+                .stanza
+                .resolve()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            if let Some(body) = view
+                .child("body", "jabber:client")
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                && body
+                    .text()
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                    == Some("reject")
+            {
+                return Err(StanzaErrorCondition::ResourceConstraint.into());
+            }
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            self.entries
+                .lock()
+                .push((request.owner.as_str().into(), request.direction, id));
+            Ok(ArchiveOutcome::Archived(ArchiveId::new(id)))
+        })
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestArchive {
+    fn get<'a>(
+        &'a self,
+        _: IqRequest<'a, A>,
+        _: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let entries = self
+                .entries
+                .lock()
+                .iter()
+                .map(|(owner, direction, id)| {
+                    let mut buffer = [0; 20];
+                    let mut output = buffer.as_mut_slice();
+                    write!(&mut output, "{id}")
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let written = 20 - output.len();
+                    let id = std::str::from_utf8(&buffer[..written])
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    Element::builder_in("entry", ARCHIVE_ROUTE.namespace, response)
+                        .and_then(|builder| builder.attribute("owner", "", owner))
+                        .and_then(|builder| {
+                            builder.attribute(
+                                "direction",
+                                "",
+                                match direction {
+                                    ArchiveDirection::Sent => "sent",
+                                    ArchiveDirection::Received => "received",
+                                },
+                            )
+                        })
+                        .and_then(|builder| builder.attribute("id", "", id))
+                        .and_then(|builder| builder.build())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut builder =
+                Element::builder_in(ARCHIVE_ROUTE.name, ARCHIVE_ROUTE.namespace, response)
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            for entry in entries {
+                builder = builder
+                    .child(entry)
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            }
+            let payload = builder
+                .build()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            Ok(IqReply::new(Some(payload), Effects::none()))
+        })
+    }
+}
+
+struct TestSecondArchive;
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestSecondArchive {
+    fn name(&self) -> &'static str {
+        "test-second-archive"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.archive(self)
+    }
+}
+
+impl<A: ChunkAllocator> ArchiveHandler<A, RedbStorage> for TestSecondArchive {
+    fn selects(&self, _: &ArchiveRequest<'_, A>) -> bool {
+        false
+    }
+
+    fn archive<'a>(
+        &'a self,
+        _: ArchiveRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a mut Arena<A>,
+    ) -> ArchiveFuture<'a> {
+        Box::pin(async { Ok(ArchiveOutcome::Skipped) })
     }
 }

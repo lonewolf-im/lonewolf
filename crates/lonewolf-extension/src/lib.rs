@@ -14,6 +14,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 
 pub mod account;
+pub mod archive;
 pub mod delivery;
 pub mod discovery;
 pub mod iq;
@@ -30,6 +31,7 @@ pub use slots::Slots;
 pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use account::AccountHandler;
+use archive::ArchiveHandler;
 use delivery::{Delivery, DeliveryFuture};
 use discovery::Discovery;
 use iq::{IqRegistry, IqRoute};
@@ -129,6 +131,7 @@ pub enum RegistrationError {
     DuplicateRoute(IqRoute),
     DuplicatePresenceRoute(PresenceRequestType),
     DuplicateMessageHandler,
+    DuplicateArchiveHandler,
     InvalidServiceDomain(String),
     DuplicateService(String),
     MissingDependency {
@@ -158,6 +161,7 @@ impl fmt::Display for RegistrationError {
                 write!(formatter, "conflicting presence route {route:?}")
             }
             Self::DuplicateMessageHandler => formatter.write_str("conflicting message handlers"),
+            Self::DuplicateArchiveHandler => formatter.write_str("conflicting archive handlers"),
             Self::InvalidServiceDomain(domain) => {
                 write!(formatter, "invalid service domain {domain:?}")
             }
@@ -191,6 +195,7 @@ pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     iq: IqRegistry<A, S>,
     presence: PresenceRegistry<A, S>,
     messages: Option<Arc<dyn MessageHandler<A, S>>>,
+    archive: Option<Arc<dyn ArchiveHandler<A, S>>>,
     services: Vec<(String, Arc<dyn ServiceHandler<A, S>>)>,
     discovery: Arc<Discovery>,
     #[expect(clippy::type_complexity)]
@@ -206,6 +211,7 @@ impl<A: ChunkAllocator, S: Storage> Default for ExtensionRegistry<A, S> {
             iq: IqRegistry::default(),
             presence: PresenceRegistry::default(),
             messages: None,
+            archive: None,
             services: Vec::new(),
             discovery: Arc::new(Discovery::default()),
             accounts: Vec::new(),
@@ -223,6 +229,10 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
 
     pub fn presence(&self) -> &PresenceRegistry<A, S> {
         &self.presence
+    }
+
+    pub fn archive(&self) -> Option<&Arc<dyn ArchiveHandler<A, S>>> {
+        self.archive.as_ref()
     }
 
     pub fn messages(&self) -> Option<&Arc<dyn MessageHandler<A, S>>> {

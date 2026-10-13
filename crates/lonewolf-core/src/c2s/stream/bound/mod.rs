@@ -53,7 +53,7 @@ use crate::router::{
 
 use crate::stages::message::{self, DeliveryOutcome};
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
-use crate::stages::{Stage, policy};
+use crate::stages::{Stage, archive, policy};
 
 mod link;
 mod output;
@@ -470,6 +470,34 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             } => return self.reply_rejection(&routed, condition, application),
             Verdict::Drop => return Ok(()),
         }
+        let routed = if matches!(routed.resolve()?.stanza_type(), StanzaType::Message(_))
+            && self
+                .router
+                .archive_handler(self.registration.account().domain())
+                .is_some()
+        {
+            let stage = Stage {
+                router: &self.router,
+                storage: &self.storage,
+                allocator: &self.allocator,
+                work: &self.work,
+            };
+            match self
+                .outbox
+                .drain_until(
+                    &self.registration,
+                    archive::archive(&stage, routed, Some(self.registration.account()), None),
+                )
+                .await??
+            {
+                archive::ArchiveStep::Accepted(archived) => archived.stanza,
+                archive::ArchiveStep::Rejected { stanza, condition } => {
+                    return self.reply_error(&stanza, condition);
+                }
+            }
+        } else {
+            routed
+        };
         let presence = {
             let view = routed.resolve()?;
             matches!(
@@ -1208,6 +1236,53 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             } => return self.reply_rejection(&routed, condition, application),
             Verdict::Drop => return Ok(()),
         }
+        let archived = {
+            let view = routed.resolve()?;
+            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
+            let local_recipient = matches!(
+                self.router.destination(to),
+                Destination::Account | Destination::Resource
+            );
+            let archive_needed = self
+                .router
+                .archive_handler(self.registration.account().domain())
+                .is_some()
+                || (local_recipient && self.router.archive_handler(to.domainpart()).is_some());
+            if archive_needed {
+                let recipient = if local_recipient {
+                    Some(AccountKey::try_from(to.bare())?)
+                } else {
+                    None
+                };
+                self.outbox
+                    .drain_until(
+                        &self.registration,
+                        archive::archive(
+                            &stage,
+                            routed,
+                            Some(self.registration.account()),
+                            recipient.as_ref(),
+                        ),
+                    )
+                    .await??
+            } else {
+                archive::ArchiveStep::Accepted(archive::Archived {
+                    stanza: routed,
+                    sent: None,
+                    received: None,
+                })
+            }
+        };
+        let archive::Archived {
+            stanza: routed,
+            sent: _sent,
+            received: _received,
+        } = match archived {
+            archive::ArchiveStep::Accepted(archived) => archived,
+            archive::ArchiveStep::Rejected { stanza, condition } => {
+                return self.reply_error(&stanza, condition);
+            }
+        };
         let outcome = self
             .outbox
             .drain_until(&self.registration, message::deliver(&stage, routed, kind))

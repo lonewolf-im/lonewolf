@@ -242,6 +242,35 @@ fn corrupt_stored_records_are_logged_once_skipped_and_removed_without_ending_the
 }
 
 #[test]
+fn prefixed_stored_stanzas_are_logged_once_skipped_and_allow_valid_replay() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup(
+        "'offline', 'test-offline-inspect'",
+        |directory| {
+            seed_replay_roster(directory)?;
+            seed_offline_records(directory, &[
+                b"<c:message xmlns:c='jabber:client' xmlns='urn:x' to='bob@localhost' type='chat'><c:body>private stored body</c:body></c:message>",
+                b"<message xmlns='jabber:client' to='bob@localhost'><c:body xmlns:c='jabber:client'>private stored body</c:body></message>",
+                b"<message xmlns='jabber:client' to='bob@localhost' type='chat' id='valid'/>",
+            ])
+        },
+    )?;
+    let mut bob = suite.connect("bob", "secret", "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    bob.expect_xml("<message xmlns='jabber:client' to='bob@localhost' type='chat' id='valid'/>")?;
+    await_empty(&mut bob, "bob@localhost/phone")?;
+    let logs = suite.wait_for_log("offline replay flushed")?;
+    assert_eq!(logs.matches("stored offline message rejected").count(), 2);
+    assert!(logs.contains("sequence=1"));
+    assert!(logs.contains("sequence=2"));
+    assert!(logs.contains("messages_written=1 messages_skipped=2"));
+    assert!(!logs.contains("private stored body"));
+    bob.close()
+}
+
+#[test]
 fn replay_exceeds_mailbox_capacity_and_uses_stored_size_instead_of_the_receivers_input_limit()
 -> TestResult {
     let body = "x".repeat(12_000);

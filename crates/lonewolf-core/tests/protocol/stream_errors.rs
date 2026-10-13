@@ -2,6 +2,105 @@
 
 use super::support::{C2sSuite, TestResult};
 
+const PREFIXED_CONTENT_STANZAS: [&str; 6] = [
+    "<c:message xmlns:c='jabber:client' to='bob@localhost/desk'/>",
+    "<c:message xmlns:c='jabber:client' xmlns='urn:x' to='bob@localhost/desk'><c:body>forbidden</c:body></c:message>",
+    "<c:presence xmlns:c='jabber:client' to='bob@localhost/desk'/>",
+    "<c:iq xmlns:c='jabber:client' to='bob@localhost/desk' type='get' id='forbidden'><query xmlns='urn:x'/></c:iq>",
+    "<message to='bob@localhost/desk'><c:body xmlns:c='jabber:client'>forbidden</c:body></message>",
+    "<c:message xmlns:c='jabber:server' to='bob@localhost/desk'/>",
+];
+
+#[test]
+fn prefixed_content_returns_bad_namespace_prefix_before_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for input in PREFIXED_CONTENT_STANZAS {
+        let mut client = suite.tcp_client()?;
+        client.open()?;
+        client.send(input)?;
+        client.expect_stream_error("bad-namespace-prefix")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefixed_content_returns_bad_namespace_prefix_before_authentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for input in PREFIXED_CONTENT_STANZAS {
+        let mut client = suite.unauthenticated_client()?;
+        client.send(input)?;
+        client.expect_stream_error("bad-namespace-prefix")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefixed_content_returns_bad_namespace_prefix_before_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for input in PREFIXED_CONTENT_STANZAS {
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+        client.send(input)?;
+        client.expect_stream_error("bad-namespace-prefix")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn prefixed_content_returns_bad_namespace_prefix_without_delivery_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let mut recipient = suite.connect("bob", "pencil", "desk")?;
+    for input in PREFIXED_CONTENT_STANZAS {
+        let mut sender = suite.connect("alice", "pencil", "desk")?;
+        sender.send(&format!(
+            "{input}<message to='bob@localhost/desk' id='forbidden'/>"
+        ))?;
+        sender.expect_stream_error("bad-namespace-prefix")?;
+        recipient.send("<message to='bob@localhost/desk' id='sentinel'/>")?;
+        recipient.expect_xml("<message xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost/desk' id='sentinel'/>")?;
+    }
+    recipient.expect_no_tls_input()?;
+    let logs = suite.wait_for_log("outcome=\"bad_namespace_prefix\"")?;
+    assert!(!logs.contains("<c:message"));
+    recipient.close()
+}
+
+#[test]
+fn explicit_unprefixed_content_routes_on_streams_without_a_default_namespace() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let mut recipient = suite.connect("bob", "pencil", "desk")?;
+    let opening = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
+    let mut plain = suite.tcp_client()?;
+    assert_eq!(plain.open_with(opening)?.attribute("xmlns"), None);
+    plain.features()?;
+    let mut sender = plain.start_tls(&suite)?;
+    assert_eq!(sender.open_with(opening)?.attribute("xmlns"), None);
+    sender.features()?;
+    sender.authenticate("alice", "pencil")?;
+    let mut sender = sender.restart();
+    assert_eq!(sender.open_with(opening)?.attribute("xmlns"), None);
+    sender.features()?;
+    sender.send("<iq xmlns='jabber:client' type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
+    let binding = sender.receive()?;
+    binding.assert_name("jabber:client", "iq");
+    assert_eq!(binding.attribute("type"), Some("result"));
+    assert_eq!(
+        binding
+            .child("urn:ietf:params:xml:ns:xmpp-bind", "bind")?
+            .child("urn:ietf:params:xml:ns:xmpp-bind", "jid")?
+            .text,
+        "alice@localhost/desk"
+    );
+    sender.send("<message xmlns='jabber:client' to='bob@localhost/desk' id='valid'><body>allowed</body><forwarded xmlns='urn:xmpp:forward:0'><c:message xmlns:c='jabber:client'/></forwarded><p:x xmlns:p='urn:x'/></message>")?;
+    recipient.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' id='valid'><body>allowed</body><forwarded xmlns='urn:xmpp:forward:0'><c:message xmlns:c='jabber:client'/></forwarded><p:x xmlns:p='urn:x'/></message>")?;
+    sender.close()?;
+    recipient.close()
+}
+
 #[test]
 fn server_namespace_message_returns_invalid_namespace_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;

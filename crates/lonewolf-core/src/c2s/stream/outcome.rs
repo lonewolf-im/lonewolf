@@ -26,6 +26,7 @@ pub(crate) enum CloseOutcome {
     InvalidTo,
     UnsupportedVersion,
     InvalidNamespace,
+    BadNamespacePrefix,
     InvalidFrom,
     InvalidLanguage,
     InvalidXml,
@@ -59,6 +60,7 @@ impl CloseOutcome {
             }
             ParseError::Build(BuildError::Allocation(_)) => Self::InternalError,
             ParseError::InvalidNamespace => Self::InvalidNamespace,
+            ParseError::BadNamespacePrefix => Self::BadNamespacePrefix,
             ParseError::InvalidXml => Self::InvalidXml,
             ParseError::NotWellFormed | ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
             ParseError::RestrictedXml => Self::RestrictedXml,
@@ -80,6 +82,7 @@ impl CloseOutcome {
             Self::HostUnknown => Some(StreamErrorCondition::HostUnknown),
             Self::UnsupportedVersion => Some(StreamErrorCondition::UnsupportedVersion),
             Self::InvalidNamespace => Some(StreamErrorCondition::InvalidNamespace),
+            Self::BadNamespacePrefix => Some(StreamErrorCondition::BadNamespacePrefix),
             Self::InvalidFrom => Some(StreamErrorCondition::InvalidFrom),
             Self::InvalidXml => Some(StreamErrorCondition::InvalidXml),
             Self::NotWellFormed => Some(StreamErrorCondition::NotWellFormed),
@@ -111,6 +114,7 @@ impl CloseOutcome {
             Self::InvalidTo => "invalid_to",
             Self::UnsupportedVersion => "unsupported_version",
             Self::InvalidNamespace => "invalid_namespace",
+            Self::BadNamespacePrefix => "bad_namespace_prefix",
             Self::InvalidFrom => "invalid_from",
             Self::InvalidLanguage => "invalid_language",
             Self::InvalidXml => "invalid_xml",
@@ -195,6 +199,10 @@ mod tests {
                 CloseOutcome::SizeLimitExceeded,
             ),
             (ParseError::InvalidNamespace, CloseOutcome::InvalidNamespace),
+            (
+                ParseError::BadNamespacePrefix,
+                CloseOutcome::BadNamespacePrefix,
+            ),
             (ParseError::InvalidXml, CloseOutcome::InvalidXml),
             (ParseError::UnexpectedEvent, CloseOutcome::ParserError),
             (ParseError::UnexpectedEof, CloseOutcome::ParserError),
@@ -264,6 +272,18 @@ mod tests {
         ] {
             assert_eq!(CloseOutcome::from_parse_error(&error), outcome, "{error:?}");
         }
+    }
+
+    #[test]
+    fn bad_namespace_prefix_has_a_distinct_stream_condition_and_name() {
+        assert_eq!(
+            CloseOutcome::BadNamespacePrefix.stream_condition(),
+            Some(StreamErrorCondition::BadNamespacePrefix)
+        );
+        assert_eq!(
+            CloseOutcome::BadNamespacePrefix.as_str(),
+            "bad_namespace_prefix"
+        );
     }
 
     #[test]

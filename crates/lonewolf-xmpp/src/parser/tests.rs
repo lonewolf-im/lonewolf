@@ -2033,47 +2033,100 @@ fn derived_attributes_generate_prefixes_without_changing_opaque_values() -> Test
 }
 
 #[test]
-fn prefixed_stanza_keeps_a_different_default_namespace() -> TestResult {
+fn prefixed_stanza_roots_and_direct_content_children_are_rejected() -> TestResult {
     block_on(async {
-        let input = format!(
-            "{OPEN}<c:message xmlns:c='jabber:client' xmlns='urn:types' value='Example'><c:body>kept</c:body></c:message>"
-        );
-        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
-        open(&mut parser).await?;
-        let parsed = stanza(&mut parser).await?;
-        let mut synchronous = String::new();
-        parsed
-            .value()
-            .resolve(parsed.arena())?
-            .write_xml(&mut synchronous)?;
-        let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
-        parsed
-            .value()
-            .resolve(parsed.arena())?
-            .write_xml_async(&mut asynchronous)
-            .await?;
-        for output in [
-            synchronous.as_str(),
-            std::str::from_utf8(asynchronous.get_ref())?,
-        ] {
-            let mut reader = quick_xml::NsReader::from_str(output);
-            let quick_xml::events::Event::Start(start) = reader.read_event()? else {
-                return Err("expected stanza".into());
-            };
-            assert!(
-                matches!(reader.resolver().resolve_element(start.name()), (quick_xml::name::ResolveResult::Bound(namespace), local) if namespace.as_ref() == CLIENT_NAMESPACE && local.as_ref() == "message")
+        for chunk in [1, usize::MAX] {
+            for namespace in ["jabber:client", "jabber:server"] {
+                for name in ["message", "presence", "iq"] {
+                    for default in ["jabber:client", "urn:types"] {
+                        for empty in [true, false] {
+                            let suffix = if empty {
+                                "/>".to_owned()
+                            } else {
+                                format!("></c:{name}>")
+                            };
+                            let input = format!(
+                                "{OPEN}<c:{name} xmlns:c='{namespace}' xmlns='{default}'{suffix}{CLOSE}"
+                            );
+                            let mut parser = XmppParser::new(
+                                Fragmented::new(input.as_bytes(), chunk),
+                                config(4096)?,
+                                GlobalChunkAllocator,
+                            );
+                            open(&mut parser).await?;
+                            assert!(
+                                matches!(
+                                    parser.next_event().await,
+                                    Err(ParseError::BadNamespacePrefix)
+                                ),
+                                "input={input:?}, chunk={chunk}"
+                            );
+                        }
+                    }
+                }
+            }
+            for (root, attributes) in [
+                ("message", ""),
+                ("presence", ""),
+                ("iq", "type='get'"),
+                ("iq", "type='bogus'"),
+            ] {
+                for child in [
+                    "body", "subject", "thread", "status", "show", "priority", "error", "x",
+                ] {
+                    for suffix in ["/>".to_owned(), format!(">x</c:{child}>")] {
+                        let input = format!(
+                            "{OPEN}<{root} {attributes}><c:{child} xmlns:c='jabber:client'{suffix}</{root}>{CLOSE}"
+                        );
+                        let mut parser = XmppParser::new(
+                            Fragmented::new(input.as_bytes(), chunk),
+                            config(4096)?,
+                            GlobalChunkAllocator,
+                        );
+                        open(&mut parser).await?;
+                        assert!(
+                            matches!(
+                                parser.next_event().await,
+                                Err(ParseError::BadNamespacePrefix)
+                            ),
+                            "input={input:?}, chunk={chunk}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn extension_payload_prefixes_and_unprefixed_stanzas_keep_their_namespace_context() -> TestResult {
+    block_on(async {
+        for chunk in [1, usize::MAX] {
+            let input = format!(
+                "{OPEN}<message xmlns='jabber:client'><forwarded xmlns='urn:xmpp:forward:0'><c:message xmlns:c='jabber:client'><c:body>kept</c:body></c:message></forwarded><p:x xmlns:p='urn:x'/><body xmlns:c='jabber:client' c:flag='kept'>normal</body></message>{CLOSE}"
             );
-            assert!(
-                matches!(reader.resolver().resolve_prefix(None, true), quick_xml::name::ResolveResult::Bound(namespace) if namespace.as_ref() == "urn:types")
+            let mut parser = XmppParser::new(
+                Fragmented::new(input.as_bytes(), chunk),
+                config(4096)?,
+                GlobalChunkAllocator,
             );
-            assert_eq!(
-                start
-                    .try_get_attribute("value")?
-                    .ok_or("value")?
-                    .value
-                    .as_ref(),
-                "Example"
-            );
+            open(&mut parser).await?;
+            let parsed = stanza(&mut parser).await?;
+            let view = parsed.value().resolve(parsed.arena())?;
+            let mut output = String::new();
+            view.write_xml(&mut output)?;
+            assert!(output.contains("<c:message"), "{output}");
+            assert!(output.contains("<c:body"), "{output}");
+            assert!(output.contains("<p:x"), "{output}");
+            assert!(output.contains("c:flag=\"kept\""), "{output}");
+            let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
+            view.write_xml_async(&mut asynchronous).await?;
+            assert_eq!(asynchronous.into_inner(), output.as_bytes());
+            assert!(matches!(
+                parser.next_event().await?,
+                Some(StreamEvent::StreamEnd)
+            ));
         }
         Ok(())
     })

@@ -14,16 +14,13 @@ use crate::delivery::{
     Pending, StoredDelivery, commit_and_store, report_failure, report_handler_failure,
     storage_failure,
 };
-use crate::router::{RoutedStanza, RouterError};
+use crate::router::{Destination, RoutedStanza, RouterError};
 
 pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
-    /// A session mailbox admitted the message.
     Routed,
-    /// The offline fallback committed the message.
     Stored,
     /// RFC 6121 or the offline fallback discards the message without a reply.
     Discarded,
-    /// The sender must receive this error.
     Rejected {
         stanza: RoutedStanza<A>,
         condition: StanzaErrorCondition,
@@ -39,22 +36,21 @@ enum StorePreparation<A: ChunkAllocator> {
     Committed(Pending<Result<(), crate::delivery::EffectsError>>),
 }
 
-/// Delivers a message with an authenticated `from` to its local destination.
+/// Requires a stanza with an authenticated sender.
 pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: MessageType,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
-    let bare = routed
-        .resolve()?
-        .to()?
-        .ok_or(StageFailure)?
-        .resourcepart()
-        .is_none();
+    let (bare, destination) = {
+        let view = routed.resolve()?;
+        let to = view.to()?.ok_or(StageFailure)?;
+        (to.resourcepart().is_none(), stage.router.destination(to))
+    };
     if bare && kind == MessageType::Error {
         return Ok(DeliveryOutcome::Discarded);
     }
-    if bare && kind == MessageType::Groupchat {
+    if bare && kind == MessageType::Groupchat && destination != Destination::Remote {
         return Ok(DeliveryOutcome::Rejected {
             stanza: routed,
             condition: StanzaErrorCondition::ServiceUnavailable,
@@ -77,6 +73,9 @@ pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
             }
             RouterError::InvalidTarget | RouterError::InvalidResource => {
                 StanzaErrorCondition::BadRequest
+            }
+            RouterError::RemoteUnsupported if destination == Destination::Remote => {
+                StanzaErrorCondition::RemoteServerNotFound
             }
             RouterError::NotFound | RouterError::Offline | RouterError::RemoteUnsupported => {
                 StanzaErrorCondition::ServiceUnavailable

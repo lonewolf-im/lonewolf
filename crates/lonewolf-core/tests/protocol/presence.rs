@@ -197,7 +197,49 @@ fn closing_the_stream_sends_unavailable_to_directed_recipients() -> TestResult {
 }
 
 #[test]
-fn directed_presence_to_an_absent_recipient_is_dropped_silently() -> TestResult {
+fn remote_directed_presence_returns_remote_server_not_found() -> TestResult {
+    for extensions in ["", "'roster'"] {
+        let suite = C2sSuite::with_extensions(extensions)?;
+        suite.create_account("alice", "password")?;
+        let mut alice = suite.connect("alice", "password", "desk")?;
+        for target in [
+            "bob@remote.example",
+            "bob@remote.example/phone",
+            "remote.example",
+            "remote.example/phone",
+        ] {
+            for kind in ["", " type='unavailable'"] {
+                alice.send(&format!("<presence to='{target}' from='mallory@localhost/spy' id='remote'{kind}><status>Keep &amp; escape</status></presence>"))?;
+                alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='remote'><status>Keep &amp; escape</status><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+            }
+        }
+        alice.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn remote_probes_return_remote_server_not_found() -> TestResult {
+    for extensions in ["", "'roster'"] {
+        let suite = C2sSuite::with_extensions(extensions)?;
+        suite.create_account("alice", "password")?;
+        let mut alice = suite.connect("alice", "password", "desk")?;
+        for target in [
+            "bob@remote.example",
+            "bob@remote.example/phone",
+            "remote.example",
+            "remote.example/phone",
+        ] {
+            alice.send(&format!("<presence type='probe' to='{target}' from='mallory@localhost/spy' id='remote'><x xmlns='urn:test'/></presence>"))?;
+            alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='remote'><x xmlns='urn:test'/><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+        }
+        alice.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn directed_presence_to_an_absent_local_recipient_is_dropped_silently() -> TestResult {
     let suite = C2sSuite::start()?;
     for user in ["alice", "bob", "carol"] {
         suite.create_account(user, "password")?;
@@ -209,7 +251,7 @@ fn directed_presence_to_an_absent_recipient_is_dropped_silently() -> TestResult 
     for target in [
         "nobody@localhost",
         "bob@localhost/tablet",
-        "bob@remote.example",
+        "localhost/desk",
         "localhost",
     ] {
         alice.send(&format!("<presence to='{target}'/>"))?;
@@ -718,11 +760,24 @@ fn directed_presence_quota_rejects_without_delivery_or_visibility_and_recovers()
     let mut bob = suite.connect("bob", "password", "desk")?;
     let mut carol = suite.connect("carol", "password", "desk")?;
 
+    for kind in ["", " type='unavailable'", " type='probe'"] {
+        alice.send(&format!(
+            "<presence to='remote.example/phone' id='remote'{kind}/>"
+        ))?;
+        alice.expect_xml("<presence xmlns='jabber:client' from='remote.example/phone' to='alice@localhost/desk' type='error' id='remote'><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    }
     alice.send("<presence to='unknown@localhost/desk'/>")?;
     alice.send("<presence to='bob@localhost/desk' id='first'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("first"));
     alice.send("<presence to='bob@localhost/desk' id='updated'><show>chat</show></presence>")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' id='updated'><show>chat</show></presence>")?;
+    alice.send(
+        "<presence to='bob@remote.example/phone' id='remote-unavailable' type='unavailable'/>",
+    )?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='bob@remote.example/phone' to='alice@localhost/desk' type='error' id='remote-unavailable'><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    bob.send("<presence type='probe' to='alice@localhost/desk' id='still-granted'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' id='still-granted'/>")?;
+
     alice.send("<presence to='carol@localhost/desk' id='rejected' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/></presence>")?;
     alice.expect_xml("<presence xmlns='jabber:client' from='carol@localhost/desk' to='alice@localhost/desk' type='error' id='rejected' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
     sentinel(&mut alice, &mut carol, "carol@localhost/desk")?;

@@ -415,8 +415,16 @@ fn subscription_presence_handlers_receive_authenticated_directed_requests() -> T
     let mut alice = suite.connect("alice", "password", "desk")?;
 
     for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
-        alice.send(&format!("<presence type='{kind}' id='{kind}' from='mallory@localhost/spy' to='bob@localhost'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick></presence>"))?;
-        alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='{kind}' from='bob@localhost' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+        for target in [
+            "bob@localhost",
+            "bob@remote.example",
+            "bob@remote.example/phone",
+            "remote.example",
+            "remote.example/phone",
+        ] {
+            alice.send(&format!("<presence type='{kind}' id='{kind}' from='mallory@localhost/spy' to='{target}'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick></presence>"))?;
+            alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='{kind}' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+        }
     }
 
     alice.close()
@@ -578,10 +586,17 @@ fn remote_requests_are_not_consumed_by_local_handlers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq', 'test-server-iq'")?;
     suite.create_account("alice", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
-    alice.send("<iq type='get' id='remote' to='bob@remote.example'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='remote' from='bob@remote.example'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
-    alice.send("<iq type='get' id='remote-server' to='remote.example'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='remote-server' from='remote.example'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    for kind in ["get", "set"] {
+        for target in [
+            "bob@remote.example",
+            "bob@remote.example/phone",
+            "remote.example",
+            "remote.example/phone",
+        ] {
+            alice.send(&format!("<iq type='{kind}' from='mallory@localhost/spy' id='remote' to='{target}'><query xmlns='urn:lonewolf:test:iq'/></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='remote' from='{target}'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        }
+    }
     alice.close()
 }
 

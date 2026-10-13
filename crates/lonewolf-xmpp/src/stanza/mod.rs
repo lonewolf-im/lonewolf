@@ -116,6 +116,7 @@ pub enum StanzaErrorCondition {
     JidMalformed,
     NotAcceptable,
     NotAllowed,
+    RemoteServerNotFound,
     ResourceConstraint,
     ServiceUnavailable,
 }
@@ -131,6 +132,7 @@ impl StanzaErrorCondition {
             Self::JidMalformed => "jid-malformed",
             Self::NotAcceptable => "not-acceptable",
             Self::NotAllowed => "not-allowed",
+            Self::RemoteServerNotFound => "remote-server-not-found",
             Self::ResourceConstraint => "resource-constraint",
             Self::ServiceUnavailable => "service-unavailable",
         }
@@ -139,9 +141,11 @@ impl StanzaErrorCondition {
     pub const fn error_type(self) -> &'static str {
         match self {
             Self::BadRequest | Self::JidMalformed | Self::NotAcceptable => "modify",
-            Self::Conflict | Self::ItemNotFound | Self::NotAllowed | Self::ServiceUnavailable => {
-                "cancel"
-            }
+            Self::Conflict
+            | Self::ItemNotFound
+            | Self::NotAllowed
+            | Self::RemoteServerNotFound
+            | Self::ServiceUnavailable => "cancel",
             Self::Forbidden => "auth",
             Self::InternalServerError => "cancel",
             Self::ResourceConstraint => "wait",

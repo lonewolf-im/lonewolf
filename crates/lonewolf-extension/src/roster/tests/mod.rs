@@ -27,6 +27,7 @@ use crate::account::AccountHandler;
 use crate::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
 };
+use crate::discovery::Discovery;
 use crate::iq::{IqHandler, IqReply, IqRequest, IqRequestType};
 use crate::presence::{
     PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceTransition,
@@ -243,9 +244,11 @@ impl IqCall {
             .query
             .resolve(&self.request)
             .unwrap_or_else(|error| panic!("{error}"));
+        let discovery = Discovery::default();
         let request = IqRequest {
             sender,
             target: sender.bare(),
+            discovery: &discovery,
             payload,
         };
         match kind {

@@ -8,6 +8,7 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
 
 use crate::delivery::{HandlerError, HostLookup};
+use crate::discovery::Discovery;
 use crate::{Effects, ExtensionFuture, RegistrationError};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -35,6 +36,8 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub sender: JidRef<'a>,
     /// An omitted destination resolves to the authenticated account's bare JID.
     pub target: JidRef<'a>,
+    /// What the target's host advertises.
+    pub discovery: &'a Discovery,
     pub payload: ElementRef<'a, Arena<A>>,
 }
 

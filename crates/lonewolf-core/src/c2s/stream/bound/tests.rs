@@ -2427,6 +2427,7 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
                 account,
                 transaction,
                 handler,
+                discovery: Arc::new(Discovery::default()),
                 arena,
                 request,
                 sender,

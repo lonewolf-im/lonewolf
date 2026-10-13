@@ -451,6 +451,7 @@ fn cancellation_during_blocked_output_obeys_the_precommit_handoff_boundary() -> 
         for handoff in [false, true] {
             let fixture = Fixture::new(&[]).await?;
             let (gate, entered, release) = Gate::new(Outcome::Commit);
+            let fixture = enable(fixture, &gate)?;
             let (mut session, output_entered, output_release) = session(&fixture, false).await?;
             let (request, mut arena) =
                 parsed("<iq type='set' id='cancelled'><query xmlns='urn:test:iq'/></iq>")
@@ -492,6 +493,7 @@ fn iq_snapshot_handoff_and_global_fixing_progress_while_output_is_blocked() -> T
     Runtime::new()?.block_on(async {
         let fixture = Fixture::new(&[]).await?;
         let (gate, _, _) = Gate::new(Outcome::Commit);
+        let fixture = enable(fixture, &gate)?;
         let router = fixture.router.handle();
         let (release_fix, blocked_fix) = oneshot::channel();
         let mut fixing = Box::pin(router.order().fix(Vec::new(), async {

@@ -7,6 +7,7 @@ use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 
 use crate::account::AccountHandler;
+use crate::discovery::{DiscoScope, Identity};
 use crate::iq::{IqHandler, IqRoute};
 use crate::message::MessageHandler;
 use crate::presence::{PresenceHandler, PresenceRequestType};
@@ -63,6 +64,7 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
             return Err(RegistrationError::DuplicateService(domain.into()));
         }
         self.registry.services.push((domain.into(), handler));
+        Arc::make_mut(&mut self.registry.discovery).add_service(domain);
         Ok(())
     }
 
@@ -81,6 +83,14 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
     /// Appends an XML element advertised to authenticated clients.
     pub fn stream_feature(&mut self, feature: &'static str) {
         self.registry.stream_features.push_str(feature);
+    }
+
+    pub fn disco_feature(&mut self, scope: DiscoScope, feature: &'static str) {
+        Arc::make_mut(&mut self.registry.discovery).add_feature(scope, feature);
+    }
+
+    pub fn disco_identity(&mut self, scope: DiscoScope, identity: Identity) {
+        Arc::make_mut(&mut self.registry.discovery).add_identity(scope, identity);
     }
 
     /// Adds a handler that runs inside every account deletion transaction on this host.

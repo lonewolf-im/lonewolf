@@ -1,6 +1,101 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::support::{C2sSuite, TestResult};
+use std::io::Read as _;
+use std::net::Shutdown;
+use std::time::{Duration, Instant};
+
+#[test]
+fn plaintext_parser_failure_half_closes_and_holds_capacity_until_peer_eof() -> TestResult {
+    let suite = C2sSuite::with_limits("max_connections_per_ip = 1")?;
+    let mut client = suite.tcp_client()?;
+    client.open()?;
+    let mut input = Vec::from(b"<message><body></message>".as_slice());
+    input.extend_from_slice(&[b'x'; 4096]);
+    client.send_bytes(&input)?;
+    let error = client.receive()?;
+    error.assert_name(super::support::xml::STREAM_NAMESPACE, "error");
+    assert_eq!(error.children.len(), 1);
+    error.child(super::support::STREAM_ERRORS, "not-well-formed")?;
+    client.expect_footer()?;
+    assert!(!client.has_buffered_input());
+    assert_eq!(client.transport().read(&mut [0; 1])?, 0);
+
+    let mut rejected = suite.tcp_client()?;
+    rejected
+        .transport()
+        .set_read_timeout(Some(Duration::from_millis(200)))?;
+    rejected.expect_eof()?;
+    client.transport().shutdown(Shutdown::Write)?;
+    suite.wait_for_log("outcome=\"not_well_formed\"")?;
+    let mut replacement = suite.tcp_client()?;
+    replacement.open()?;
+    replacement.close()
+}
+
+#[test]
+fn silent_plaintext_drain_peer_releases_capacity_at_the_original_deadline() -> TestResult {
+    let suite = C2sSuite::with_limits("max_connections_per_ip = 1")?;
+    let mut client = suite.tcp_client()?;
+    client.open()?;
+    let started = Instant::now();
+    client.send("<message><body></message>")?;
+    client
+        .receive()?
+        .child(super::support::STREAM_ERRORS, "not-well-formed")?;
+    client.expect_footer()?;
+    assert!(!client.has_buffered_input());
+    assert_eq!(client.transport().read(&mut [0; 1])?, 0);
+    let mut rejected = suite.tcp_client()?;
+    rejected
+        .transport()
+        .set_read_timeout(Some(Duration::from_millis(200)))?;
+    rejected.expect_eof()?;
+    suite.wait_for_log("outcome=\"not_well_formed\"")?;
+    assert!((Duration::from_secs(5)..Duration::from_secs(7)).contains(&started.elapsed()));
+    let mut replacement = suite.tcp_client()?;
+    replacement.open()?;
+    replacement.close()
+}
+
+#[test]
+fn healthy_plaintext_close_waits_for_footer_then_holds_capacity_until_peer_eof() -> TestResult {
+    let suite = C2sSuite::with_limits("max_connections_per_ip = 1")?;
+    let mut client = suite.tcp_client()?;
+    client.open()?;
+    client.send("<message/>")?;
+    client
+        .receive()?
+        .child(super::support::STREAM_ERRORS, "not-authorized")?;
+    client.expect_footer()?;
+    assert!(!client.has_buffered_input());
+    client
+        .transport()
+        .set_read_timeout(Some(Duration::from_millis(100)))?;
+    let error = client
+        .transport()
+        .read(&mut [0; 1])
+        .expect_err("FIN preceded the reciprocal footer");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    client
+        .transport()
+        .set_read_timeout(Some(Duration::from_secs(2)))?;
+    client.send("</stream:stream>")?;
+    assert_eq!(client.transport().read(&mut [0; 1])?, 0);
+    let mut rejected = suite.tcp_client()?;
+    rejected
+        .transport()
+        .set_read_timeout(Some(Duration::from_millis(200)))?;
+    rejected.expect_eof()?;
+    client.transport().shutdown(Shutdown::Write)?;
+    suite.wait_for_log("outcome=\"unsupported_input\"")?;
+    let mut replacement = suite.tcp_client()?;
+    replacement.open()?;
+    replacement.close()
+}
 
 const PREFIXED_CONTENT_STANZAS: [&str; 6] = [
     "<c:message xmlns:c='jabber:client' to='bob@localhost/desk'/>",

@@ -214,13 +214,36 @@ where
 {
     let outcome = reason.outcome();
     let deadline = context.deadline_for(outcome);
+    let can_drain = writer.is_open() && writer.is_intact();
+    let stage = Cell::new("xml");
     let result = context
         .until(deadline, async {
-            xml(reader, writer, reason).await.map(|_| outcome)
+            if !xml(reader, writer, reason).await? || !can_drain {
+                return Ok(outcome);
+            }
+            stage.set("transport");
+            let mut input = reader.take_input().await?;
+            SockRef::from(&context.socket)
+                .shutdown(Shutdown::Write)
+                .map_err(|_| CloseOutcome::TransportError)?;
+            stage.set("drain");
+            drain_plain(&mut input).await?;
+            Ok(outcome)
         })
         .await;
     context.abort();
-    completed(result, outcome, "xml")
+    completed(result, outcome, stage.get())
+}
+
+async fn drain_plain<R: tokio::io::AsyncRead + Unpin>(input: &mut R) -> Result<(), CloseOutcome> {
+    let mut buffer = [0; 4096];
+    loop {
+        match tokio::io::AsyncReadExt::read(input, &mut buffer).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => yield_once().await,
+            Err(_) => return Err(CloseOutcome::TransportError),
+        }
+    }
 }
 
 pub(super) async fn before_deadline<T>(

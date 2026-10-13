@@ -828,6 +828,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             outcome.arena,
             outcome.response,
             outcome.reply,
+            outcome.results,
         )
     }
 
@@ -882,8 +883,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     .await
             };
             Ok::<_, CloseOutcome>(match reply {
-                Ok(IqReply { payload, effects }) => Ok((
+                Ok(IqReply {
                     payload,
+                    effects,
+                    results,
+                }) => Ok((
+                    payload,
+                    results,
                     commit_and_deliver(
                         work.start(),
                         Arc::clone(router.order()),
@@ -906,8 +912,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             })
         };
         let prepared = self.outbox.drain_until(registration, prepare).await??;
-        let reply = match prepared {
-            Ok((payload, mut committed)) => {
+        let (reply, results) = match prepared {
+            Ok((payload, results, mut committed)) => {
                 self.outbox
                     .drain_until(registration, committed.turned())
                     .await?;
@@ -917,11 +923,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     .ok_or(CloseOutcome::InternalError)?
                     .map_err(|_| CloseOutcome::InternalError)?;
                 self.outbox.delivered(queued);
-                Ok(payload)
+                (Ok(payload), results)
             }
-            Err(error) => Err(error),
+            Err(error) => (Err(error), Vec::new()),
         };
-        self.queue_iq_reply(request, sender, arena, response, reply)
+        self.queue_iq_reply(request, sender, arena, response, reply, results)
     }
 
     fn queue_iq_reply(
@@ -931,6 +937,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         mut arena: Arena<A>,
         mut response: Arena<A>,
         reply: Result<Option<Element>, HandlerError>,
+        mut results: Vec<Stanza>,
     ) -> Result<(), CloseOutcome> {
         match reply {
             Err(error) => {
@@ -941,15 +948,45 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 });
             }
             Ok(payload) => {
+                let sender_ref = sender.resolve(&arena)?;
+                for result in &results {
+                    if result.resolve(&response)?.to()?.map(|to| to.as_str())
+                        != Some(sender_ref.as_str())
+                    {
+                        tracing::error!(
+                            account_jid = ?self.registration.account().as_str(),
+                            operation = "iq_results",
+                            outcome = "misaddressed",
+                            "internal operation failed"
+                        );
+                        let reply = iq::error_reply(
+                            &request,
+                            &mut arena,
+                            StanzaErrorCondition::InternalServerError,
+                            Some(sender),
+                        )?;
+                        self.outbox.push(Output::Owned {
+                            stanza: reply,
+                            arena,
+                        });
+                        return Ok(());
+                    }
+                }
                 let reply = {
                     let sender = sender.resolve(&arena)?;
                     let stanza = request.resolve(&arena)?;
                     iq::result_reply(&stanza, sender, payload, &mut response)?
                 };
-                self.outbox.push(Output::Owned {
-                    stanza: reply,
-                    arena: response,
-                });
+                if results.is_empty() {
+                    self.outbox.push(Output::Owned {
+                        stanza: reply,
+                        arena: response,
+                    });
+                } else {
+                    results.push(reply);
+                    self.outbox
+                        .routed(RoutedStanza::from_parts_shared(results, response));
+                }
             }
         }
         Ok(())
@@ -2182,6 +2219,7 @@ struct GetOutcome<A: ChunkAllocator> {
     arena: Arena<A>,
     response: Arena<A>,
     reply: Result<Option<Element>, HandlerError>,
+    results: Vec<Stanza>,
     /// Deliveries still queued when the ticket turned, written ahead of the reply.
     queued: Vec<MailboxEntry<A>>,
 }
@@ -2217,8 +2255,12 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
             handler.get(iq_request, &transaction, &mut response).await
         };
         drop(transaction);
-        let reply = match reply {
-            Ok(IqReply { payload, effects }) => {
+        let (reply, results) = match reply {
+            Ok(IqReply {
+                payload,
+                effects,
+                results,
+            }) => {
                 (effects.deliver)(&delivery).await.map_err(|_| {
                     report_failure(
                         Failure {
@@ -2229,17 +2271,18 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                     );
                     CloseOutcome::InternalError
                 })?;
-                Ok(payload)
+                (Ok(payload), results)
             }
             Err(error) => {
                 report_handler_failure(&error, &account);
-                Err(error)
+                (Err(error), Vec::new())
             }
         };
         Ok(GetOutcome {
             arena,
             response,
             reply,
+            results,
             queued,
         })
     }

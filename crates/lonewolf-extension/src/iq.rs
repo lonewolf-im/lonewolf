@@ -5,7 +5,7 @@ use std::sync::Arc;
 use lonewolf_storage::Storage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
-use lonewolf_xmpp::stanza::{Element, ElementRef, StanzaErrorCondition};
+use lonewolf_xmpp::stanza::{Element, ElementRef, Stanza, StanzaErrorCondition};
 
 use crate::delivery::{HandlerError, HostLookup};
 use crate::discovery::Discovery;
@@ -36,7 +36,6 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub sender: JidRef<'a>,
     /// An omitted destination resolves to the authenticated account's bare JID.
     pub target: JidRef<'a>,
-    /// What the target's host advertises.
     pub discovery: &'a Discovery,
     pub payload: ElementRef<'a, Arena<A>>,
 }
@@ -44,11 +43,23 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
 pub struct IqReply<A> {
     pub payload: Option<Element>,
     pub effects: Effects<A>,
+    /// Stanzas in the response arena that precede the reply on the requester's stream.
+    pub results: Vec<Stanza>,
 }
 
 impl<A: ChunkAllocator> IqReply<A> {
     pub fn new(payload: Option<Element>, effects: Effects<A>) -> Self {
-        Self { payload, effects }
+        Self {
+            payload,
+            effects,
+            results: Vec::new(),
+        }
+    }
+
+    /// Each result must be addressed to the request's sender.
+    pub fn with_results(mut self, results: Vec<Stanza>) -> Self {
+        self.results = results;
+        self
     }
 }
 

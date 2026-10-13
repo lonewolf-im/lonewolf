@@ -11,9 +11,10 @@ use std::task::{Context, Poll};
 
 use crate::jid::Jid;
 use crate::stanza::{
-    AsyncWriteError, BuildError, CLIENT_NAMESPACE, Element, IqType, MAX_ELEMENT_DEPTH, MessageType,
-    NodeRef, PresenceType, SERVER_NAMESPACE, STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza,
-    StanzaErrorCondition, StanzaKind, StanzaNamespace, StanzaType, WriteError, XML_NAMESPACE,
+    ApplicationCondition, AsyncWriteError, BuildError, CLIENT_NAMESPACE, Element, IqType,
+    MAX_ELEMENT_DEPTH, MessageType, NodeRef, PresenceType, SERVER_NAMESPACE,
+    STANZA_ERROR_NAMESPACE, STREAM_NAMESPACE, Stanza, StanzaErrorCondition, StanzaKind,
+    StanzaNamespace, StanzaType, WriteError, XML_NAMESPACE,
 };
 use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::{
@@ -1431,5 +1432,37 @@ fn writer_propagates_output_failure_and_debug_omits_payloads() -> TestResult {
         stanza.resolve(&arena)?
     );
     assert!(!debug.contains("secret"));
+    Ok(())
+}
+
+#[test]
+fn error_reply_writes_the_application_condition_after_the_defined_condition() -> TestResult {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let source = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .build()?;
+    let condition = StanzaErrorCondition::NotAcceptable;
+    let reply = source
+        .error_reply_with_in(
+            &mut arena,
+            condition,
+            Some(ApplicationCondition {
+                name: "blocked",
+                namespace: "urn:xmpp:blocking:errors",
+            }),
+        )?
+        .build()?;
+    let mut xml = String::new();
+    reply.resolve(&arena)?.write_xml(&mut xml)?;
+    assert_eq!(
+        xml,
+        format!(
+            r#"<message xmlns="jabber:client" type="error"><error type="{}"><not-acceptable xmlns="urn:ietf:params:xml:ns:xmpp-stanzas"/><blocked xmlns="urn:xmpp:blocking:errors"/></error></message>"#,
+            condition.error_type()
+        )
+    );
     Ok(())
 }

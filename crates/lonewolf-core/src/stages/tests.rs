@@ -11,6 +11,7 @@ use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition};
+use parking_lot::Mutex as PlMutex;
 
 use super::{DeliveryOutcome, deliver};
 use crate::config::Config;
@@ -182,4 +183,320 @@ fn deliver_rejects_a_chat_message_without_an_offline_handler() -> TestResult {
         fixture.router.shutdown().await?;
         Ok(())
     }))?
+}
+
+#[test]
+fn evaluate_allows_without_policies() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use crate::stages::policy::{Check, evaluate};
+        use lonewolf_extension::policy::{Direction, Verdict};
+        use lonewolf_xmpp::stanza::StanzaType;
+
+        let fixture = Fixture::new()?;
+        let sender = account("alice@localhost")?;
+        let recipient = account("bob@other.localhost")?;
+        let stanza = parsed(
+            "<message from='alice@localhost/desktop' to='bob@other.localhost/phone' type='chat'/>",
+        )
+        .await?;
+        let view = stanza.resolve()?;
+        let checks = [
+            Check {
+                account: &sender,
+                direction: Direction::Outbound,
+                peer: view.to()?.ok_or("missing to")?,
+            },
+            Check {
+                account: &recipient,
+                direction: Direction::Inbound,
+                peer: view.from()?.ok_or("missing from")?,
+            },
+        ];
+        assert_eq!(
+            evaluate(
+                &fixture.stage(),
+                StanzaType::Message(MessageType::Chat),
+                &checks
+            )
+            .await
+            .map_err(|_| "policy evaluation failed")?,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(
+                &fixture.stage(),
+                StanzaType::Message(MessageType::Chat),
+                &[]
+            )
+            .await
+            .map_err(|_| "policy evaluation failed")?,
+            Verdict::Allow
+        );
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PolicyCall {
+    extension: &'static str,
+    account: String,
+    direction: lonewolf_extension::policy::Direction,
+    snapshot: usize,
+}
+
+struct RecordingPolicy {
+    name: &'static str,
+    verdict: lonewolf_extension::policy::Verdict,
+    fail: bool,
+    calls: std::sync::Arc<PlMutex<Vec<PolicyCall>>>,
+}
+
+impl lonewolf_extension::Extension<GlobalChunkAllocator, RedbStorage> for RecordingPolicy {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn register(
+        self: std::sync::Arc<Self>,
+        _: &str,
+        slots: &mut lonewolf_extension::Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), lonewolf_extension::RegistrationError> {
+        slots.policy(self);
+        Ok(())
+    }
+}
+
+impl lonewolf_extension::policy::PolicyHandler<RedbStorage> for RecordingPolicy {
+    fn check<'a>(
+        &'a self,
+        request: lonewolf_extension::policy::PolicyRequest<'a>,
+        transaction: &'a lonewolf_storage::RedbRead,
+    ) -> lonewolf_extension::policy::PolicyFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().push(PolicyCall {
+                extension: self.name,
+                account: request.account.as_str().into(),
+                direction: request.direction,
+                snapshot: std::ptr::from_ref(transaction) as usize,
+            });
+            if self.fail {
+                Err(lonewolf_extension::delivery::HandlerError::Internal {
+                    condition: StanzaErrorCondition::InternalServerError,
+                    failure: lonewolf_extension::delivery::Failure {
+                        kind: lonewolf_extension::delivery::FailureKind::Delivery,
+                        operation: "test_policy",
+                    },
+                })
+            } else {
+                Ok(self.verdict)
+            }
+        })
+    }
+}
+
+#[test]
+fn evaluate_keeps_registration_and_check_order_on_one_snapshot() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use crate::stages::policy::{Check, evaluate};
+        use lonewolf_extension::Extensions;
+        use lonewolf_extension::policy::{Direction, Verdict};
+        use lonewolf_xmpp::stanza::ApplicationCondition;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut fixture = Fixture::new()?;
+        let calls = Arc::new(PlMutex::new(Vec::new()));
+        let first = Verdict::Reject {
+            condition: StanzaErrorCondition::NotAcceptable,
+            application: Some(ApplicationCondition {
+                name: "blocked",
+                namespace: "urn:test:policy",
+            }),
+        };
+        let mut extensions = Extensions::default();
+        for (name, verdict) in [
+            ("z-first", first),
+            (
+                "a-second",
+                Verdict::Reject {
+                    condition: StanzaErrorCondition::ServiceUnavailable,
+                    application: None,
+                },
+            ),
+        ] {
+            extensions.register(Arc::new(RecordingPolicy {
+                name,
+                verdict,
+                fail: false,
+                calls: Arc::clone(&calls),
+            }))?;
+        }
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([
+            (
+                "localhost".into(),
+                extensions.enable_host("localhost", ["z-first", "a-second"])?,
+            ),
+            (
+                "other.localhost".into(),
+                extensions.enable_host("other.localhost", ["a-second", "z-first"])?,
+            ),
+        ]));
+        fixture.handle = fixture.router.handle();
+        let sender = account("alice@localhost")?;
+        let recipient = account("bob@other.localhost")?;
+        let stanza = parsed(
+            "<message from='alice@localhost/desktop' to='bob@other.localhost/phone' type='chat'/>",
+        )
+        .await?;
+        let view = stanza.resolve()?;
+        let checks = [
+            Check {
+                account: &sender,
+                direction: Direction::Outbound,
+                peer: view.to()?.ok_or("missing to")?,
+            },
+            Check {
+                account: &recipient,
+                direction: Direction::Inbound,
+                peer: view.from()?.ok_or("missing from")?,
+            },
+        ];
+
+        assert_eq!(
+            evaluate(&fixture.stage(), view.stanza_type(), &checks)
+                .await
+                .map_err(|_| "policy failed")?,
+            first
+        );
+        {
+            let actual = calls.lock();
+            assert_eq!(actual.len(), 4);
+            let snapshot = actual[0].snapshot;
+            assert_eq!(
+                &*actual,
+                &[
+                    PolicyCall {
+                        extension: "z-first",
+                        account: "alice@localhost".into(),
+                        direction: Direction::Outbound,
+                        snapshot
+                    },
+                    PolicyCall {
+                        extension: "a-second",
+                        account: "alice@localhost".into(),
+                        direction: Direction::Outbound,
+                        snapshot
+                    },
+                    PolicyCall {
+                        extension: "a-second",
+                        account: "bob@other.localhost".into(),
+                        direction: Direction::Inbound,
+                        snapshot
+                    },
+                    PolicyCall {
+                        extension: "z-first",
+                        account: "bob@other.localhost".into(),
+                        direction: Direction::Inbound,
+                        snapshot
+                    },
+                ]
+            );
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn evaluate_fails_closed_and_stops_handlers_and_checks_after_drop() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use crate::stages::policy::{Check, evaluate};
+        use lonewolf_extension::Extensions;
+        use lonewolf_extension::policy::{Direction, Verdict};
+        use lonewolf_xmpp::stanza::{IqType, StanzaType};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let mut fixture = Fixture::new()?;
+        let calls = Arc::new(PlMutex::new(Vec::new()));
+        let mut extensions = Extensions::default();
+        for (name, verdict, fail) in [
+            ("broken", Verdict::Allow, true),
+            ("drop", Verdict::Drop, false),
+            ("skipped", Verdict::Allow, false),
+        ] {
+            extensions.register(Arc::new(RecordingPolicy {
+                name,
+                verdict,
+                fail,
+                calls: Arc::clone(&calls),
+            }))?;
+        }
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["broken", "drop", "skipped"])?,
+        )]));
+        fixture.handle = fixture.router.handle();
+        let sender = account("alice@localhost")?;
+        let recipient = account("bob@localhost")?;
+        let stanza = parsed(
+            "<message from='alice@localhost/desktop' to='bob@localhost/phone' type='chat'/>",
+        )
+        .await?;
+        let view = stanza.resolve()?;
+        let checks = [
+            Check {
+                account: &sender,
+                direction: Direction::Outbound,
+                peer: view.to()?.ok_or("missing to")?,
+            },
+            Check {
+                account: &recipient,
+                direction: Direction::Inbound,
+                peer: view.from()?.ok_or("missing from")?,
+            },
+        ];
+        assert_eq!(
+            evaluate(&fixture.stage(), view.stanza_type(), &checks)
+                .await
+                .map_err(|_| "policy failed")?,
+            Verdict::Drop
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .iter()
+                .map(|call| call.extension)
+                .collect::<Vec<_>>(),
+            ["broken", "drop"]
+        );
+
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["broken"])?,
+        )]));
+        fixture.handle = fixture.router.handle();
+        assert_eq!(
+            evaluate(&fixture.stage(), view.stanza_type(), &checks[..1])
+                .await
+                .map_err(|_| "policy failed")?,
+            Verdict::Reject {
+                condition: StanzaErrorCondition::InternalServerError,
+                application: None
+            }
+        );
+        assert_eq!(
+            evaluate(
+                &fixture.stage(),
+                StanzaType::Iq(IqType::Result),
+                &checks[..1]
+            )
+            .await
+            .map_err(|_| "policy failed")?,
+            Verdict::Drop
+        );
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
 }

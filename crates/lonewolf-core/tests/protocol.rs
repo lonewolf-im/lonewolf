@@ -2,6 +2,9 @@
 
 mod support;
 
+#[path = "protocol/policy.rs"]
+mod policy;
+
 #[path = "protocol/extensions.rs"]
 mod extensions;
 

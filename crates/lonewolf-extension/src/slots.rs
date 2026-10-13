@@ -10,6 +10,7 @@ use crate::account::AccountHandler;
 use crate::discovery::{DiscoScope, Identity};
 use crate::iq::{IqHandler, IqRoute};
 use crate::message::MessageHandler;
+use crate::policy::PolicyHandler;
 use crate::presence::{PresenceHandler, PresenceRequestType};
 use crate::service::ServiceHandler;
 use crate::{ExtensionRegistry, RegistrationError};
@@ -80,9 +81,12 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
         Ok(())
     }
 
-    /// Appends an XML element advertised to authenticated clients.
     pub fn stream_feature(&mut self, feature: &'static str) {
         self.registry.stream_features.push_str(feature);
+    }
+
+    pub fn policy(&mut self, handler: Arc<dyn PolicyHandler<S>>) {
+        self.registry.policies.push((self.extension, handler));
     }
 
     pub fn disco_feature(&mut self, scope: DiscoScope, feature: &'static str) {

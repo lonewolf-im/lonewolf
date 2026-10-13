@@ -97,6 +97,13 @@ pub enum IqType {
     Error,
 }
 
+/// An empty application-specific child of a stanza error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationCondition {
+    pub name: &'static str,
+    pub namespace: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StanzaErrorCondition {
     BadRequest,
@@ -368,6 +375,16 @@ impl Stanza {
         arena: &'a mut Arena<A>,
         condition: StanzaErrorCondition,
     ) -> Result<StanzaBuilder<'a, A>, BuildError> {
+        self.error_reply_with_in(arena, condition, None)
+    }
+
+    /// Keeps the error reply contract of [`Self::error_reply_in`] and adds an application condition.
+    pub fn error_reply_with_in<'a, A: ChunkAllocator>(
+        &self,
+        arena: &'a mut Arena<A>,
+        condition: StanzaErrorCondition,
+        application: Option<ApplicationCondition>,
+    ) -> Result<StanzaBuilder<'a, A>, BuildError> {
         let mut header = arena.get(self.data)?.header;
         header.stanza_type = match header.stanza_type {
             StanzaType::Iq(IqType::Get | IqType::Set) => StanzaType::Iq(IqType::Error),
@@ -383,10 +400,18 @@ impl Stanza {
         let children = arena.get(self.data)?.children;
         let defined_condition =
             Element::builder_in(condition.as_str(), STANZA_ERROR_NAMESPACE, arena)?.build()?;
-        let error = Element::builder_in("error", header.namespace.as_str(), arena)?
+        let application = application
+            .map(|application| {
+                Element::builder_in(application.name, application.namespace, arena)?.build()
+            })
+            .transpose()?;
+        let mut error = Element::builder_in("error", header.namespace.as_str(), arena)?
             .attribute("type", "", condition.error_type())?
-            .child(defined_condition)?
-            .build()?;
+            .child(defined_condition)?;
+        if let Some(application) = application {
+            error = error.child(application)?;
+        }
+        let error = error.build()?;
         std::mem::swap(&mut header.from, &mut header.to);
         StanzaBuilder {
             arena,

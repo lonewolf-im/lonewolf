@@ -1180,6 +1180,7 @@ dependencies = [
  "futures-util",
  "graviola",
  "hmac",
+ "idna",
  "lonewolf-admin",
  "lonewolf-auth",
  "lonewolf-extension",

@@ -46,12 +46,20 @@ impl PlainClient {
         self.start_tls_with_config(Arc::clone(&server.tls))
     }
 
-    pub fn start_tls_with_config(mut self, config: Arc<ClientConfig>) -> TestResult<Client> {
+    pub fn start_tls_with_config(self, config: Arc<ClientConfig>) -> TestResult<Client> {
+        self.start_tls_with_identity(config, ServerName::try_from("localhost")?)
+    }
+
+    pub fn start_tls_with_identity(
+        mut self,
+        config: Arc<ClientConfig>,
+        identity: ServerName<'static>,
+    ) -> TestResult<Client> {
         self.send(&format!("<starttls xmlns='{TLS_NAMESPACE}'/>"))?;
         self.receive()?.assert_name(TLS_NAMESPACE, "proceed");
         let socket = self.into_inner();
         assert!(socket.buffer().is_empty());
-        let connection = ClientConnection::new(config, ServerName::try_from("localhost")?)?;
+        let connection = ClientConnection::new(config, identity)?;
         Ok(XmlStream::new(StreamOwned::new(
             connection,
             socket.into_inner(),
@@ -99,7 +107,6 @@ impl Client {
         Ok(Self::authenticated_with_features(server, username, password)?.0)
     }
 
-    /// Rejects stream features outside binding and the supported roster features.
     pub fn authenticated_with_features(
         server: &C2sSuite,
         username: &str,

@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,8 +15,8 @@ use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, PublicKeyData};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
+use rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
@@ -48,15 +49,20 @@ struct Host {
 
 #[derive(Debug)]
 struct HostCertResolver {
-    domain: String,
+    identity: ServerName<'static>,
     certified_key: Arc<CertifiedKey>,
 }
 
 impl ResolvesServerCert for HostCertResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        match hello.server_name() {
-            Some(name) if !name.eq_ignore_ascii_case(&self.domain) => None,
-            _ => Some(Arc::clone(&self.certified_key)),
+        match (hello.server_name(), &self.identity) {
+            (None, _) => Some(Arc::clone(&self.certified_key)),
+            (Some(name), ServerName::DnsName(identity))
+                if name.eq_ignore_ascii_case(identity.as_ref()) =>
+            {
+                Some(Arc::clone(&self.certified_key))
+            }
+            _ => None,
         }
     }
 }
@@ -79,17 +85,19 @@ impl Hosts {
             None => return Err(HostsError::DefaultRequired),
         };
         let provider = Arc::new(rustls_graviola::default_provider());
-        let mut resolver = ResolvesServerCertUsingSni::new();
         let mut sorted_hosts = Vec::with_capacity(hosts.len());
         let blocking = BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() });
         for (domain, config) in hosts {
+            let identity = tls_identity(domain)?;
             let certified_key = match config.tls.as_ref() {
                 Some(tls) => load_certified_key(domain, tls, &provider)?,
                 None if domain == "localhost" => generate_localhost_key(&provider)?,
                 None => return Err(HostsError::MissingTls(domain.clone())),
             };
-            resolver
-                .add(domain, certified_key.clone())
+            certified_key
+                .end_entity_cert()
+                .and_then(ParsedCertificate::try_from)
+                .and_then(|certificate| rustls::client::verify_server_name(&certificate, &identity))
                 .map_err(|source| HostsError::InvalidCertificate {
                     domain: domain.clone(),
                     source,
@@ -125,7 +133,7 @@ impl Hosts {
                 .with_safe_default_protocol_versions()
                 .map_err(HostsError::TlsConfiguration)?;
             let certificate_resolver = Arc::new(HostCertResolver {
-                domain: domain.clone(),
+                identity,
                 certified_key: Arc::clone(&certified_key),
             });
             let mut tls_server_config = tls_builder
@@ -206,6 +214,27 @@ impl Hosts {
             .ok()?;
         self.hosts.get(index)
     }
+}
+
+fn tls_identity(domain: &str) -> Result<ServerName<'static>, HostsError> {
+    let invalid = || HostsError::InvalidCertificate {
+        domain: domain.into(),
+        source: rustls::Error::General("invalid TLS identity".into()),
+    };
+    if domain.starts_with('[') {
+        let address = domain
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .ok_or_else(invalid)?;
+        return Ok(ServerName::IpAddress(address.into()));
+    }
+    if let Ok(address) = domain.parse::<Ipv4Addr>() {
+        return Ok(ServerName::IpAddress(address.into()));
+    }
+    let ascii = idna::domain_to_ascii_strict(domain).map_err(|_| invalid())?;
+    let name = DnsName::try_from(ascii).map_err(|_| invalid())?;
+    Ok(ServerName::DnsName(name))
 }
 
 fn tls_server_end_point(certificate: &[u8]) -> Option<Vec<u8>> {

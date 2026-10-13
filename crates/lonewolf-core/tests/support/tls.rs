@@ -15,6 +15,14 @@ use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 use super::TestResult;
 
 pub fn configure(directory: &Path) -> TestResult<RootCertStore> {
+    configure_host(directory, "", &["localhost", "other.localhost"])
+}
+
+pub fn configure_host(
+    directory: &Path,
+    suffix: &str,
+    identities: &[&str],
+) -> TestResult<RootCertStore> {
     let key = SigningKey::<P256> {
         private_key: StaticPrivateKey::new_random()?,
     };
@@ -22,18 +30,22 @@ pub fn configure(directory: &Path) -> TestResult<RootCertStore> {
         public_key: key.private_key.public_key_uncompressed(),
         key,
     };
-    let mut parameters =
-        CertificateParams::new(vec!["localhost".into(), "other.localhost".into()])?;
+    let mut parameters = CertificateParams::new(
+        identities
+            .iter()
+            .map(|identity| (*identity).into())
+            .collect::<Vec<String>>(),
+    )?;
     parameters.serial_number = Some(1u64.into());
     let certificate = parameters.self_signed(&signer)?;
     let mut key_bytes = [0; 512];
     let key_der = signer.key.to_pkcs8_der(&mut key_bytes)?;
     fs::write(
-        directory.join("certificate.pem"),
+        directory.join(format!("certificate{suffix}.pem")),
         pem("CERTIFICATE", certificate.der())?,
     )?;
     fs::write(
-        directory.join("private-key.pem"),
+        directory.join(format!("private-key{suffix}.pem")),
         pem("PRIVATE KEY", key_der)?,
     )?;
     let mut roots = RootCertStore::empty();

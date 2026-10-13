@@ -43,6 +43,26 @@ fn unbound_prefix_returns_not_well_formed_before_tls() -> TestResult {
 }
 
 #[test]
+fn invalid_namespace_declarations_return_not_well_formed_before_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.tcp_client()?;
+    client.open()?;
+
+    client.send("<message><x xmlns:p=''/></message>")?;
+    client.expect_stream_error("not-well-formed")
+}
+
+#[test]
+fn invalid_xml_prefix_binding_returns_not_well_formed_before_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    let mut client = suite.tcp_client()?;
+    client.open()?;
+
+    client.send("<message xmlns:xml='urn:bad'/>")?;
+    client.expect_stream_error("not-well-formed")
+}
+
+#[test]
 fn mismatched_tags_returns_not_well_formed_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.tcp_client()?;
@@ -350,6 +370,26 @@ fn unbound_prefix_returns_not_well_formed_after_binding() -> TestResult {
     let mut client = suite.connect("alice", "pencil", "desktop")?;
 
     client.send(r#"<x:message/>"#)?;
+    client.expect_stream_error("not-well-formed")
+}
+
+#[test]
+fn invalid_namespace_declarations_return_not_well_formed_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desktop")?;
+
+    client.send("<message><x xmlns:p=''/></message>")?;
+    client.expect_stream_error("not-well-formed")
+}
+
+#[test]
+fn invalid_xml_prefix_binding_returns_not_well_formed_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desktop")?;
+
+    client.send("<message xmlns:xml='urn:bad'/>")?;
     client.expect_stream_error("not-well-formed")
 }
 

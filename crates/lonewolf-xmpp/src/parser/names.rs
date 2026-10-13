@@ -35,7 +35,7 @@ pub(super) fn push(
                 || (value == XML_NAMESPACE && prefix != PrefixDeclaration::Named("xml"))
                 || (value.is_empty() && matches!(prefix, PrefixDeclaration::Named(_)))
             {
-                return Err(ParseError::InvalidNamespace);
+                return Err(ParseError::NotWellFormed);
             }
             resolver
                 .add(prefix, Namespace(&value))

@@ -466,6 +466,24 @@ fn wrong_password_closes_after_three_failed_attempts() -> TestResult {
 }
 
 #[test]
+fn configured_authentication_retries_close_after_five_failed_attempts() -> TestResult {
+    let suite = C2sSuite::with_profile_settings(
+        "custom",
+        "[limits.c2s.profiles.custom]\nauthentication_retries = 4",
+    )?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+
+    for _ in 0..5 {
+        let reply = client.scram("alice", "wrong", "SCRAM-SHA-256", None)?;
+        reply.assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+        )?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
 fn malformed_final_for_known_account_returns_malformed_request() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;

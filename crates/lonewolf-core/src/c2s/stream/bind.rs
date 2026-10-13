@@ -25,7 +25,6 @@ const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
 const BIND_FEATURE: &str = "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>";
 const BIND_FEATURES: &str =
     "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
-const MAX_BIND_FAILURES: usize = 6;
 
 pub(super) struct Bound<A: ChunkAllocator> {
     pub(super) session: Session<A>,
@@ -48,7 +47,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     account: &AccountKey,
     router: &RouterHandle<A>,
     storage: RedbStorage,
-    max_resources_per_account: NonZeroUsize,
+    settings: &super::StreamSettings<A>,
     allocator: A,
 ) -> Result<Bound<A>, CloseOutcome> {
     drop(established.client);
@@ -76,7 +75,8 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 hosts,
                 account,
                 router,
-                max_resources_per_account,
+                settings.max_resources_per_account,
+                1 + settings.resource_binding_retries.get(),
                 monitor.as_ref().map(|monitor| (&storage, monitor)),
             );
             match &monitor {
@@ -107,6 +107,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
     account: &AccountKey,
     router: &RouterHandle<A>,
     max_resources_per_account: NonZeroUsize,
+    max_failures: usize,
     certificate: Option<(&RedbStorage, &CertificateMonitor)>,
 ) -> Result<(Registration<A>, bool), CloseOutcome> {
     let header = session.read_header(hosts).await?;
@@ -178,6 +179,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                     "modify",
                     "bad-request",
                     &mut invalid_attempts,
+                    max_failures,
                 )
                 .await?;
                 continue;
@@ -223,6 +225,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                     "modify",
                     "bad-request",
                     &mut invalid_attempts,
+                    max_failures,
                 )
                 .await?;
                 continue;
@@ -243,6 +246,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                     "modify",
                     "bad-request",
                     &mut invalid_attempts,
+                    max_failures,
                 )
                 .await?;
                 continue;
@@ -254,6 +258,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                     "wait",
                     "resource-constraint",
                     &mut invalid_attempts,
+                    max_failures,
                 )
                 .await?;
                 continue;
@@ -398,10 +403,11 @@ async fn reject_bind(
     error_type: &str,
     condition: &str,
     attempts: &mut usize,
+    max_failures: usize,
 ) -> Result<(), CloseOutcome> {
     send_bind_error(writer, id, error_type, condition).await?;
     *attempts += 1;
-    if *attempts == MAX_BIND_FAILURES {
+    if *attempts == max_failures {
         return Err(CloseOutcome::BindingAttemptsExceeded);
     }
     Ok(())

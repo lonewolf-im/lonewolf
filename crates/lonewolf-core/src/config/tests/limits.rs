@@ -45,6 +45,46 @@ fn setting(path: &str, value: impl std::fmt::Display) -> std::io::Result<tempfil
 }
 
 #[test]
+fn negotiation_retry_limits_accept_the_rfc_bounds_per_profile() -> TestResult {
+    let file = config_file(
+        "[limits.c2s]\ndefault = 'minimum'\n\
+         [limits.c2s.profiles.minimum]\nauthentication_retries = 2\nresource_binding_retries = 5\n\
+         [limits.c2s.profiles.maximum]\nauthentication_retries = 5\nresource_binding_retries = 10\n",
+    )?;
+    let limits = Value::try_from(Config::load(Some(file.path()))?.limits)?;
+    for (profile, authentication, binding) in [("minimum", 2, 5), ("maximum", 5, 10)] {
+        assert_eq!(
+            limits["c2s"]["profiles"][profile]["authentication_retries"].as_integer(),
+            Some(authentication)
+        );
+        assert_eq!(
+            limits["c2s"]["profiles"][profile]["resource_binding_retries"].as_integer(),
+            Some(binding)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn negotiation_retry_limits_reject_values_outside_the_rfc_bounds() -> TestResult {
+    for (field, values, minimum, maximum) in [
+        ("authentication_retries", [1, 6], 2, 5),
+        ("resource_binding_retries", [4, 11], 5, 10),
+    ] {
+        for value in values {
+            let path = format!("c2s.profiles.default.{field}");
+            let result = Config::load(Some(setting(&path, value)?.path()));
+            assert!(
+                matches!(result, Err(ConfigError::Invalid { ref reason, .. })
+                if reason == &format!("limits.{path} must be between {minimum} and {maximum}")),
+                "{path} = {value}: {result:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn limits_defaults_match_the_policy() -> TestResult {
     let expected = [
         ("max_connections_per_ip", 256),
@@ -52,6 +92,8 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("connection_establishment_timeout_secs", 10),
         ("authentication_timeout_secs", 15),
         ("resource_binding_timeout_secs", 5),
+        ("authentication_retries", 2),
+        ("resource_binding_retries", 5),
         ("connection_attempts_per_ip.per_second", 10),
         ("connection_attempts_per_ip.burst", 50),
         ("incoming_stanzas_per_connection.per_second", 20),

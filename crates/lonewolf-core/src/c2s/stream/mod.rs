@@ -36,7 +36,7 @@ use super::AuthService;
 use super::connection_limit::ConnectionPermit;
 use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::AuthMechanisms;
-use crate::config::limits::{ByteRate, EventRate};
+use crate::config::limits::C2sLimitProfile;
 use crate::hosts::Hosts;
 use crate::router::{RouterHandle, release_deferred};
 
@@ -79,6 +79,8 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
     establishment_timeout: Duration,
     authentication_timeout: Duration,
     binding_timeout: Duration,
+    authentication_retries: NonZeroUsize,
+    resource_binding_retries: NonZeroUsize,
     max_resources_per_account: NonZeroUsize,
     allocator: A,
 }
@@ -93,9 +95,7 @@ pub(super) struct StreamTimeouts {
 impl<A: ChunkAllocator> StreamSettings<A> {
     pub(super) fn new(
         auth_mechanisms: AuthMechanisms,
-        max_stanza_bytes: NonZeroUsize,
-        stanza_rate: &EventRate,
-        xml_rate: &ByteRate,
+        profile: &C2sLimitProfile,
         timeouts: StreamTimeouts,
         max_resources_per_account: NonZeroUsize,
         allocator: A,
@@ -104,14 +104,16 @@ impl<A: ChunkAllocator> StreamSettings<A> {
             auth_mechanisms,
             sasl_features: sasl_features(auth_mechanisms, false).map(Arc::from),
             external_sasl_features: sasl_features(auth_mechanisms, true).map(Arc::from),
-            max_stanza_bytes,
-            stanzas_per_second: stanza_rate.per_second,
-            stanza_burst: stanza_rate.burst,
-            xml_bytes_per_second: xml_rate.bytes_per_second,
-            xml_burst_bytes: xml_rate.burst_bytes,
+            max_stanza_bytes: profile.max_stanza_bytes,
+            stanzas_per_second: profile.incoming_stanzas_per_connection.per_second,
+            stanza_burst: profile.incoming_stanzas_per_connection.burst,
+            xml_bytes_per_second: profile.incoming_xml_per_connection.bytes_per_second,
+            xml_burst_bytes: profile.incoming_xml_per_connection.burst_bytes,
             establishment_timeout: timeouts.establishment,
             authentication_timeout: timeouts.authentication,
             binding_timeout: timeouts.binding,
+            authentication_retries: profile.authentication_retries,
+            resource_binding_retries: profile.resource_binding_retries,
             max_resources_per_account,
             allocator,
         }
@@ -261,6 +263,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                     &hosts,
                     &auth,
                     settings.auth_mechanisms,
+                    settings.authentication_retries.get(),
                 )),
             )
             .await;
@@ -284,7 +287,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 &account,
                 &router,
                 auth.storage.clone(),
-                settings.max_resources_per_account,
+                &settings,
                 settings.allocator.clone(),
             )
             .await?;

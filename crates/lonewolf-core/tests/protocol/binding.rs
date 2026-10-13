@@ -331,6 +331,22 @@ fn sixth_binding_failure_closes_the_stream() -> TestResult {
 }
 
 #[test]
+fn configured_resource_binding_retries_close_after_eight_failed_attempts() -> TestResult {
+    let suite = C2sSuite::with_profile_settings(
+        "custom",
+        "[limits.c2s.profiles.custom]\nresource_binding_retries = 7",
+    )?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    for _ in 0..8 {
+        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    }
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
 fn different_sender_closes_binding_without_registering_the_resource() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;

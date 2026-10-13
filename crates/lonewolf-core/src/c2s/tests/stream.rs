@@ -34,6 +34,7 @@ use crate::c2s::unauthenticated_limit::{
     Admission as UnauthenticatedAdmission, UnauthenticatedLimiter,
 };
 use crate::config::Config;
+use crate::config::limits::ByteRate;
 use crate::hosts::HostsError;
 use crate::router::Router;
 use crate::router::local::LocalRouter;
@@ -176,9 +177,14 @@ fn run_case_with_timeouts(
             router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
-                max_stanza_bytes,
-                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
-                xml_rate,
+                &crate::config::limits::C2sLimitProfile {
+                    max_stanza_bytes,
+                    incoming_xml_per_connection: ByteRate {
+                        bytes_per_second: xml_rate.bytes_per_second,
+                        burst_bytes: xml_rate.burst_bytes,
+                    },
+                    ..crate::config::limits::C2sLimitProfile::default()
+                },
                 StreamTimeouts {
                     establishment: establishment_timeout,
                     authentication: authentication_timeout,
@@ -425,9 +431,10 @@ fn run_starttls_restart_case_with_timeout(
             router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
-                MAX_STANZA_BYTES,
-                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
-                &ByteRate::default(),
+                &crate::config::limits::C2sLimitProfile {
+                    max_stanza_bytes: MAX_STANZA_BYTES,
+                    ..crate::config::limits::C2sLimitProfile::default()
+                },
                 StreamTimeouts {
                     establishment: Duration::from_secs(10),
                     authentication: authentication_timeout,
@@ -658,9 +665,10 @@ where
             router.handle(),
             StreamSettings::new(
                 mechanisms,
-                MAX_STANZA_BYTES,
-                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
-                &ByteRate::default(),
+                &crate::config::limits::C2sLimitProfile {
+                    max_stanza_bytes: MAX_STANZA_BYTES,
+                    ..crate::config::limits::C2sLimitProfile::default()
+                },
                 StreamTimeouts {
                     establishment: Duration::from_secs(10),
                     authentication: Duration::from_secs(10),
@@ -817,9 +825,11 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
             router.handle(),
             StreamSettings::new(
                 AuthMechanisms::ALL,
-                MAX_STANZA_BYTES,
-                &crate::config::limits::C2sLimitProfile::default().incoming_stanzas_per_connection,
-                &rate,
+                &crate::config::limits::C2sLimitProfile {
+                    max_stanza_bytes: MAX_STANZA_BYTES,
+                    incoming_xml_per_connection: rate,
+                    ..crate::config::limits::C2sLimitProfile::default()
+                },
                 StreamTimeouts {
                     establishment: Duration::from_secs(10),
                     authentication: Duration::from_secs(10),

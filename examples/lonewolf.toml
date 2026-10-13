@@ -107,6 +107,14 @@
 # Limit the time from authentication success through resource binding.
 # resource_binding_timeout_secs = 5
 
+# Allow users more retries when they enter passwords by hand.
+# Choose between 2 and 5 retries after the first failed authentication attempt.
+# authentication_retries = 2
+
+# Allow clients more retries after resource binding failures.
+# Choose between 5 and 10 retries after the first failed binding attempt.
+# resource_binding_retries = 5
+
 # Limit reconnect traffic from one IP while allowing clients behind shared NAT.
 # The allowance covers all workers of one listener.
 # Use per_second for the sustained event rate and burst for the bucket capacity.

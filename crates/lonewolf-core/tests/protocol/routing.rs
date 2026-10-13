@@ -1355,6 +1355,63 @@ fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
 }
 
 #[test]
+fn stored_stanzas_keep_local_namespace_bindings_without_stream_header_aliases() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    alice.send("<message to='bob@localhost' id='stored-qname' xmlns:w='urn:types'><payload xmlns='urn:x' type='w:Example'><nested xmlns:w='urn:nested' type='w:Example'/></payload></message>")?;
+    alice.send("<message to='alice@localhost/desk' id='barrier'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='barrier'/>")?;
+    let mut bob = suite.connect("bob", "pencil", "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    let delivered = bob.receive()?;
+    delivered.assert_name("jabber:client", "message");
+    assert_eq!(delivered.attribute("id"), Some("stored-qname"));
+    assert_eq!(delivered.attribute("xmlns:stream"), None);
+    delivered.child("urn:xmpp:delay", "delay")?;
+    let payload = delivered.child("urn:x", "payload")?;
+    assert_eq!(
+        payload.resolve_qname(payload.attribute("type").ok_or("type")?)?,
+        ("urn:types", "Example")
+    );
+    let nested = payload.child("urn:x", "nested")?;
+    assert_eq!(
+        nested.resolve_qname(nested.attribute("type").ok_or("type")?)?,
+        ("urn:nested", "Example")
+    );
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn routed_stanzas_do_not_copy_custom_stream_header_aliases() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut alice = suite.unauthenticated_client()?;
+    alice.authenticate("alice", "pencil")?;
+    let mut alice = alice.restart();
+    alice.open_with("<s:stream xmlns:s='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:xml='http://www.w3.org/XML/1998/namespace' to='localhost' version='1.0'>")?;
+    alice.features()?;
+    assert_eq!(alice.bind(Some("desk"))?, "alice@localhost/desk");
+    alice.send("<message to='alice@localhost/desk' id='namespace-clean' xmlns:a='urn:types'><payload xmlns='urn:x' type='a:Example'/></message>")?;
+    let delivered = alice.receive()?;
+    delivered.assert_name("jabber:client", "message");
+    assert_eq!(delivered.attribute("xmlns:stream"), None);
+    assert_eq!(delivered.attribute("xmlns:s"), None);
+    assert_eq!(delivered.attribute("xmlns:xml"), None);
+    let payload = delivered.child("urn:x", "payload")?;
+    assert_eq!(
+        payload.resolve_qname(payload.attribute("type").ok_or("type")?)?,
+        ("urn:types", "Example")
+    );
+    alice.close_with_footer("</s:stream>")
+}
+
+#[test]
 fn opaque_extension_qnames_retain_namespace_context_after_authenticated_routing() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
@@ -1362,6 +1419,7 @@ fn opaque_extension_qnames_retain_namespace_context_after_authenticated_routing(
     alice.send("<message to='alice@localhost/desk' id='namespace-qname' xmlns:a='urn:ancestor'><payload xmlns='urn:example:payload' xmlns:t='urn:example:types' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='t:Example'><inherited xsi:type='a:Example'/><nested xmlns:a='urn:nested' xsi:type='a:Example'/><collision xmlns:ns0='urn:reserved' xsi:type='ns0:Example'/><textual>t:Example</textual><p:prefixed xmlns:p='urn:element' xmlns='urn:default' xsi:type='Example'/></payload></message>")?;
     let delivered = alice.receive()?;
     delivered.assert_name("jabber:client", "message");
+    assert_eq!(delivered.attribute("xmlns:stream"), None);
     assert_eq!(delivered.attribute("from"), Some("alice@localhost/desk"));
     assert_eq!(delivered.attribute("to"), Some("alice@localhost/desk"));
     assert_eq!(delivered.attribute("id"), Some("namespace-qname"));

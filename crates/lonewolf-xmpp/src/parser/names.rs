@@ -9,7 +9,8 @@ use super::{MAX_ATTRIBUTES_PER_ELEMENT, ParseError};
 use crate::stanza::incoming::Frame;
 use crate::stanza::namespace::NamespaceContext;
 use crate::stanza::{
-    BuildError, CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaKind, StanzaNamespace, XML_NAMESPACE, xml,
+    BuildError, CLIENT_NAMESPACE, SERVER_NAMESPACE, STREAM_NAMESPACE, StanzaKind, StanzaNamespace,
+    XML_NAMESPACE, xml,
 };
 
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
@@ -58,6 +59,24 @@ pub(super) fn content_namespace(resolver: &NamespaceResolver) -> Result<&str, Pa
     resolved_namespace(namespace)
 }
 
+pub(super) fn has_extra_header_namespaces(resolver: &NamespaceResolver) -> bool {
+    let mut stream_alias_seen = false;
+    for (prefix, namespace) in resolver.bindings() {
+        let PrefixDeclaration::Named(prefix) = prefix else {
+            continue;
+        };
+        let namespace = namespace.into_inner();
+        if prefix == "xml" && namespace == XML_NAMESPACE {
+            continue;
+        }
+        if namespace != STREAM_NAMESPACE || stream_alias_seen {
+            return true;
+        }
+        stream_alias_seen = true;
+    }
+    false
+}
+
 pub(super) fn frame<A: ChunkAllocator>(
     resolver: &NamespaceResolver,
     start: &BytesStart<'_>,
@@ -91,21 +110,16 @@ pub(super) fn frame<A: ChunkAllocator>(
     let mut namespaces = parent_namespaces.unwrap_or_default();
     if parent_namespaces.is_none() {
         namespaces.bind("", content_namespace(resolver)?, arena)?;
-        for (prefix, namespace) in resolver.bindings() {
-            if let PrefixDeclaration::Named(prefix) = prefix {
-                namespaces.bind(prefix, namespace.into_inner(), arena)?;
-            }
-        }
-    } else {
-        for attribute in start.attributes() {
-            let attribute = attribute.map_err(quick_xml::Error::from)?;
-            if let Some(prefix) = attribute.key.as_namespace_binding() {
-                let prefix = match prefix {
-                    PrefixDeclaration::Default => "",
-                    PrefixDeclaration::Named(prefix) => prefix,
-                };
-                namespaces.bind(prefix, &normalized(&attribute)?, arena)?;
-            }
+    }
+    for attribute in start.attributes() {
+        let attribute = attribute.map_err(quick_xml::Error::from)?;
+        if let Some(prefix) = attribute.key.as_namespace_binding() {
+            let prefix = match prefix {
+                PrefixDeclaration::Default if parent_namespaces.is_none() => continue,
+                PrefixDeclaration::Default => "",
+                PrefixDeclaration::Named(prefix) => prefix,
+            };
+            namespaces.bind(prefix, &normalized(&attribute)?, arena)?;
         }
     }
     frame.set_namespaces(namespaces);

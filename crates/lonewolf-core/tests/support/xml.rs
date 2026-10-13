@@ -312,7 +312,15 @@ impl<R: Read> XmlStream<R> {
     where
         R: CloseTransport,
     {
-        self.send("</stream:stream>")?;
+        self.close_with_footer("</stream:stream>")
+    }
+
+    pub fn close_with_footer(&mut self, footer: &str) -> TestResult
+    where
+        R: CloseTransport,
+    {
+        self.send(footer)?;
+        self.footer_sent = true;
         self.expect_end()
     }
 

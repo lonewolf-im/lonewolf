@@ -103,6 +103,26 @@ impl C2sLimits {
                     isize::MAX
                 ));
             }
+            for (field, value, minimum, maximum) in [
+                (
+                    "authentication_retries",
+                    profile.authentication_retries,
+                    2,
+                    5,
+                ),
+                (
+                    "resource_binding_retries",
+                    profile.resource_binding_retries,
+                    5,
+                    10,
+                ),
+            ] {
+                if !(minimum..=maximum).contains(&value.get()) {
+                    return Err(format!(
+                        "limits.c2s.profiles.{name}.{field} must be between {minimum} and {maximum}"
+                    ));
+                }
+            }
             for (field, value) in [
                 (
                     "connection_establishment_timeout_secs",
@@ -158,6 +178,8 @@ pub struct C2sLimitProfile {
     pub connection_establishment_timeout_secs: NonZeroU64,
     pub authentication_timeout_secs: NonZeroU64,
     pub resource_binding_timeout_secs: NonZeroU64,
+    pub authentication_retries: NonZeroUsize,
+    pub resource_binding_retries: NonZeroUsize,
     /// Shares one bucket per IP across all workers of one listener.
     pub connection_attempts_per_ip: EventRate,
     pub incoming_stanzas_per_connection: EventRate,
@@ -173,6 +195,8 @@ impl Default for C2sLimitProfile {
             connection_establishment_timeout_secs: nonzero_secs(10),
             authentication_timeout_secs: nonzero_secs(15),
             resource_binding_timeout_secs: nonzero_secs(5),
+            authentication_retries: nonzero(2),
+            resource_binding_retries: nonzero(5),
             connection_attempts_per_ip: EventRate {
                 per_second: const { nonzero(10) },
                 burst: const { nonzero(50) },
@@ -194,6 +218,8 @@ struct C2sLimitProfileInput {
     connection_establishment_timeout_secs: Option<NonZeroU64>,
     authentication_timeout_secs: Option<NonZeroU64>,
     resource_binding_timeout_secs: Option<NonZeroU64>,
+    authentication_retries: Option<NonZeroUsize>,
+    resource_binding_retries: Option<NonZeroUsize>,
     connection_attempts_per_ip: EventRateInput,
     incoming_stanzas_per_connection: EventRateInput,
     incoming_xml_per_connection: ByteRate,
@@ -216,6 +242,12 @@ impl From<C2sLimitProfileInput> for C2sLimitProfile {
             resource_binding_timeout_secs: input
                 .resource_binding_timeout_secs
                 .unwrap_or(defaults.resource_binding_timeout_secs),
+            authentication_retries: input
+                .authentication_retries
+                .unwrap_or(defaults.authentication_retries),
+            resource_binding_retries: input
+                .resource_binding_retries
+                .unwrap_or(defaults.resource_binding_retries),
             connection_attempts_per_ip: input
                 .connection_attempts_per_ip
                 .with_defaults(defaults.connection_attempts_per_ip),

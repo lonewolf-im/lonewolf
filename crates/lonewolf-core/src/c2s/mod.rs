@@ -211,8 +211,6 @@ impl Listeners {
                 connections: Arc::new(ConnectionLimiter::new(profile.max_connections_per_ip.get())),
                 unauthenticated: Arc::clone(&unauthenticated),
             };
-            let max_stanza_bytes = profile.max_stanza_bytes;
-            let xml_rate = &profile.incoming_xml_per_connection;
             let establishment_timeout =
                 Duration::from_secs(profile.connection_establishment_timeout_secs.get());
             let authentication_timeout =
@@ -231,9 +229,7 @@ impl Listeners {
                 };
                 let settings = StreamSettings::new(
                     config.auth_mechanisms,
-                    max_stanza_bytes,
-                    &profile.incoming_stanzas_per_connection,
-                    xml_rate,
+                    profile,
                     StreamTimeouts {
                         establishment: establishment_timeout,
                         authentication: authentication_timeout,

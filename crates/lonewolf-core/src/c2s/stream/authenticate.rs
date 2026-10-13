@@ -24,8 +24,6 @@ use crate::hosts::client_identity::{ClientValidity, VerifiedClient};
 
 pub(super) const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const EMPTY_CHALLENGE: &str = "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>";
-const MAX_AUTH_ATTEMPTS: usize = 3;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SaslMechanism {
     External,
@@ -88,6 +86,7 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
     hosts: &Hosts,
     auth: &AuthService,
     mechanisms: AuthMechanisms,
+    retries: usize,
 ) -> Result<(AccountKey, SaslMechanism), CloseOutcome> {
     let Established {
         session,
@@ -114,7 +113,7 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         client_validity: None,
     };
     let mut replacement = None;
-    for _ in 0..MAX_AUTH_ATTEMPTS {
+    for _ in 0..1 + retries {
         let request = match replacement.take() {
             Some(request) => request,
             None => match authentication.read_request().await? {

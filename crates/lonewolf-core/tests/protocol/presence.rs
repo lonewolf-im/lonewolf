@@ -286,6 +286,8 @@ fn bare_directed_probes_reply_only_from_granting_resources_without_payload() -> 
     let mut ungranting = suite.connect("alice", "password", "tablet")?;
     let mut bob = suite.connect("bob", "password", "desk")?;
     let mut sibling = suite.connect("bob", "password", "phone")?;
+    desk.send("<presence id='private-broadcast'><status>private</status></presence>")?;
+    assert_eq!(desk.receive()?.attribute("id"), Some("private-broadcast"));
     for (source, id) in [(&mut desk, "desk"), (&mut phone, "phone")] {
         source.send(&format!("<presence to='bob@localhost/desk' id='{id}'><status>private</status><x xmlns='urn:test'/></presence>"))?;
         assert_eq!(bob.receive()?.attribute("id"), Some(id));
@@ -303,25 +305,34 @@ fn bare_directed_probes_reply_only_from_granting_resources_without_payload() -> 
     }
     sources.sort();
     assert_eq!(sources, ["alice@localhost/desk", "alice@localhost/phone"]);
-    for (target, from, kind) in [
-        ("alice@localhost/desk", "alice@localhost/desk", None),
-        (
-            "alice@localhost/tablet",
-            "alice@localhost",
-            Some("unsubscribed"),
-        ),
-        (
-            "alice@localhost/missing",
-            "alice@localhost",
-            Some("unsubscribed"),
-        ),
-    ] {
-        bob.send(&format!("<presence type='probe' to='{target}' id='full'/>"))?;
-        let reply = bob.receive()?;
-        assert_eq!(reply.attribute("from"), Some(from));
-        assert_eq!(reply.attribute("id"), Some("full"));
-        assert_eq!(reply.attribute("type"), kind);
-        assert!(reply.children.is_empty());
+    for probe_id in [" id='full'", ""] {
+        for (target, from, kind) in [
+            ("alice@localhost/desk", "alice@localhost/desk", None),
+            (
+                "alice@localhost/tablet",
+                "alice@localhost",
+                Some("unsubscribed"),
+            ),
+            (
+                "alice@localhost/missing",
+                "alice@localhost",
+                Some("unsubscribed"),
+            ),
+        ] {
+            bob.send(&format!("<presence type='probe' to='{target}'{probe_id}/>"))?;
+            let reply = bob.receive()?;
+            assert_eq!(reply.attribute("from"), Some(from));
+            assert_eq!(
+                reply.attribute("id"),
+                if probe_id.is_empty() {
+                    None
+                } else {
+                    Some("full")
+                }
+            );
+            assert_eq!(reply.attribute("type"), kind);
+            assert!(reply.children.is_empty());
+        }
     }
     desk.send("<presence type='unavailable' to='bob@localhost/desk'/>")?;
     assert_eq!(bob.receive()?.attribute("type"), Some("unavailable"));
@@ -361,16 +372,44 @@ fn subscribed_bare_probes_preserve_current_presence_and_full_probes_are_minimal(
     replies.sort_by_key(|reply| reply.attribute("id").map(str::to_owned));
     replies[0].assert_xml("<presence xmlns='jabber:client' id='original' xml:lang='fr' from='bob@localhost/desk' to='alice@localhost/desk'><show>away</show><status>bonjour</status><x xmlns='urn:test'/></presence>")?;
     replies[1].assert_xml("<presence xmlns='jabber:client' id='second' from='bob@localhost/phone' to='alice@localhost/desk'><priority>-1</priority></presence>")?;
-    for (target, kind) in [
-        ("bob@localhost/desk", None),
-        ("bob@localhost/missing", Some("unavailable")),
-    ] {
-        alice.send(&format!("<presence type='probe' to='{target}' id='full'/>"))?;
-        let reply = alice.receive()?;
-        assert_eq!(reply.attribute("from"), Some(target));
-        assert_eq!(reply.attribute("id"), Some("full"));
-        assert_eq!(reply.attribute("type"), kind);
-        assert!(reply.children.is_empty());
+    for probe_id in [" id='full'", ""] {
+        for (target, kind, source_id) in [
+            ("bob@localhost/desk", None, Some("original")),
+            ("bob@localhost/phone", None, Some("second")),
+            ("bob@localhost/missing", Some("unavailable"), None),
+        ] {
+            alice.send(&format!("<presence type='probe' to='{target}'{probe_id}/>"))?;
+            let reply = alice.receive()?;
+            assert_eq!(reply.attribute("from"), Some(target));
+            let expected_id = if kind.is_some() {
+                if probe_id.is_empty() {
+                    None
+                } else {
+                    Some("full")
+                }
+            } else {
+                source_id
+            };
+            assert_eq!(reply.attribute("id"), expected_id);
+            assert_eq!(reply.attribute("type"), kind);
+            assert!(reply.children.is_empty());
+        }
+    }
+    for (source_id, expected_id) in [(" id='latest'", Some("latest")), ("", None)] {
+        bob.send(&format!("<presence{source_id}><show>away</show><status>updated</status><priority>1</priority><x xmlns='urn:test'/></presence>"))?;
+        assert_eq!(bob.receive()?.attribute("id"), expected_id);
+        assert_eq!(phone.receive()?.attribute("id"), expected_id);
+        for probe_id in [" id='update-probe'", ""] {
+            alice.send(&format!(
+                "<presence type='probe' to='bob@localhost/desk'{probe_id}/>"
+            ))?;
+            let reply = alice.receive()?;
+            assert_eq!(reply.attribute("from"), Some("bob@localhost/desk"));
+            assert_eq!(reply.attribute("to"), Some("alice@localhost/desk"));
+            assert_eq!(reply.attribute("id"), expected_id);
+            assert!(reply.attribute("type").is_none());
+            assert!(reply.children.is_empty());
+        }
     }
     sentinel(&mut alice, &mut sibling, "alice@localhost/phone")?;
     bob.send("<presence type='unavailable' id='desk-gone'/>")?;
@@ -390,6 +429,10 @@ fn subscribed_bare_probes_preserve_current_presence_and_full_probes_are_minimal(
             .attribute("stamp")
             .is_some()
     );
+    alice.send("<presence type='probe' to='bob@localhost'/>")?;
+    let offline = alice.receive()?;
+    assert_eq!(offline.attribute("type"), Some("unavailable"));
+    assert!(offline.attribute("id").is_none());
     alice.close()?;
     sibling.close()?;
     bob.close()?;
@@ -427,6 +470,8 @@ fn subscribed_full_probes_find_freshly_bound_resources_before_initial_presence()
     let version = before.attribute("ver").ok_or("missing version")?.to_owned();
     assert_eq!(before.children[0].attribute("subscription"), Some("to"));
 
+    alice.send("<presence type='probe' to='bob@localhost/quiet' id='quiet-probe'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/quiet' to='alice@localhost/desk' id='quiet-probe'/>")?;
     alice.send("<presence type='probe' to='bob@localhost/quiet'/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/quiet' to='alice@localhost/desk'/>",
@@ -519,22 +564,29 @@ fn probe_denials_preserve_preapproval_and_roster_version() -> TestResult {
     let before = before.child("jabber:iq:roster", "query")?;
     assert_eq!(before.children[0].attribute("approved"), Some("true"));
     let version = before.attribute("ver").ok_or("missing version")?.to_owned();
-    for target in [
-        "alice@localhost",
-        "alice@localhost/desk",
-        "missing@localhost/secret",
-    ] {
-        bob.send(&format!(
-            "<presence type='probe' to='{target}' id='denied'/>"
-        ))?;
-        let reply = bob.receive()?;
-        assert_eq!(reply.attribute("type"), Some("unsubscribed"));
-        assert_eq!(
-            reply.attribute("from"),
-            Some(target.split('/').next().ok_or("missing bare")?)
-        );
-        assert_eq!(reply.attribute("id"), Some("denied"));
-        assert!(reply.children.is_empty());
+    for probe_id in [" id='denied'", ""] {
+        for target in [
+            "alice@localhost",
+            "alice@localhost/desk",
+            "missing@localhost/secret",
+        ] {
+            bob.send(&format!("<presence type='probe' to='{target}'{probe_id}/>"))?;
+            let reply = bob.receive()?;
+            assert_eq!(reply.attribute("type"), Some("unsubscribed"));
+            assert_eq!(
+                reply.attribute("from"),
+                Some(target.split('/').next().ok_or("missing bare")?)
+            );
+            assert_eq!(
+                reply.attribute("id"),
+                if probe_id.is_empty() {
+                    None
+                } else {
+                    Some("denied")
+                }
+            );
+            assert!(reply.children.is_empty());
+        }
     }
     bob.send("<message to='alice@localhost/desk' id='done'/>")?;
     assert_eq!(alice.receive()?.attribute("id"), Some("done"));
@@ -582,7 +634,7 @@ fn a_probe_waiting_for_account_order_keeps_draining_a_healthy_reader() -> TestRe
             );
         }
     }
-    requester.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/phone' id='probe'/>")?;
+    requester.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/phone' id='source'/>")?;
     assert_eq!(slow.receive()?.attribute("id"), Some("slow"));
     requester.send("<message to='bob@localhost/desk' id='after'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("after"));
@@ -608,7 +660,9 @@ fn cancelling_a_waiting_probe_releases_its_work_and_account_order() -> TestResul
     requester.send("<presence type='probe' to='alice@localhost/desk' id='cancelled'/>")?;
     requester.reset()?;
     source.send("<presence type='probe' to='alice@localhost/desk' id='next'/>")?;
-    source.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='next'/>")?;
+    source.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk'/>",
+    )?;
     assert_eq!(slow.receive()?.attribute("id"), Some("slow"));
     source.close()?;
     slow.close()

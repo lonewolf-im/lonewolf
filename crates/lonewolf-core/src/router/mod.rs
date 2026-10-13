@@ -842,6 +842,7 @@ fn probe_reply<A: ChunkAllocator>(
     request: &RoutedStanza<A>,
     from: &str,
     kind: PresenceType,
+    id: Option<&str>,
     at: Option<SystemTime>,
     allocator: A,
 ) -> Result<RoutedStanza<A>, RouterError> {
@@ -885,7 +886,7 @@ fn probe_reply<A: ChunkAllocator>(
     )
     .from(Some(from))
     .and_then(|builder| builder.to(Some(to)))
-    .and_then(|builder| builder.id(view.id()?))
+    .and_then(|builder| builder.id(id))
     .map_err(|_| RouterError::Unavailable)?;
     if let Some(delay) = delay {
         builder = builder.child(delay).map_err(|_| RouterError::Unavailable)?;

@@ -885,7 +885,7 @@ fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
         assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
         assert_eq!(view.from()?.ok_or("missing source")?.as_str(), "alice@localhost/desk");
         assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
-        assert_eq!(view.id()?, Some("full"));
+        assert_eq!(view.id()?, Some("p"));
         assert!(view.children()?.next().is_none());
 
         let request = routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='denied'/>").await?;
@@ -902,6 +902,60 @@ fn probe_replies_enter_the_requester_mailbox() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn full_probes_use_the_selected_resources_latest_optional_presence_id() -> Result<(), Box<dyn Error>>
+{
+    Runtime::new()?.block_on(async {
+        let alice = account()?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+        let router = test_router();
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+        let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
+        let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+        shard.presence(&alice, "phone", phone.token, Some(-1), routed("<presence from='alice@localhost/phone' id='phone'><priority>-1</priority></presence>").await?, None)?;
+        for (source_id, expected_id) in [(" id='first'", Some("first")), (" id='latest'", Some("latest")), ("", None)] {
+            let presence = routed(&format!("<presence from='alice@localhost/desk'{source_id}><show>away</show><status>private</status><priority>1</priority><x xmlns='urn:test'/></presence>")).await?;
+            shard.presence(&alice, "desk", desk.token, Some(1), presence, None)?;
+            let updates = phone.take_queued();
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].stanza.resolve()?.id()?, expected_id);
+            for probe_id in [" id='probe'", ""] {
+                for (requester, from, subscribed) in [
+                    (&observer, "bob@localhost/desk", true),
+                    (&phone, "alice@localhost/phone", false),
+                ] {
+                    for (resource, id) in [("desk", expected_id), ("phone", Some("phone"))] {
+                        let request = routed(&format!("<presence from='{from}' to='alice@localhost/{resource}' type='probe'{probe_id}/>")).await?;
+                        assert!(shard.probe(&requester.handle(), &request, subscribed)?.is_none());
+                        let replies = requester.take_queued();
+                        assert_eq!(replies.len(), 1);
+                        let view = replies[0].stanza.resolve()?;
+                        assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
+                        assert_eq!(view.from()?.ok_or("missing source")?.resourcepart(), Some(resource));
+                        assert_eq!(view.to()?.ok_or("missing target")?.as_str(), from);
+                        assert_eq!(view.id()?, id);
+                        assert!(view.children()?.next().is_none());
+                    }
+                }
+                let request = routed(&format!("<presence from='bob@localhost/desk' to='alice@localhost' type='probe'{probe_id}/>")).await?;
+                assert!(shard.probe(&observer.handle(), &request, true)?.is_none());
+                let replies = observer.take_queued();
+                assert_eq!(replies.len(), 2);
+                for reply in replies {
+                    let view = reply.stanza.resolve()?;
+                    let resource = view.from()?.ok_or("missing source")?.resourcepart().ok_or("missing resource")?;
+                    assert_eq!(view.id()?, if resource == "desk" { expected_id } else { Some("phone") });
+                    assert!(view.children()?.next().is_some());
+                }
+            }
+            assert!(desk.take_queued().is_empty());
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn full_probes_find_connected_resources_without_making_them_available() -> Result<(), Box<dyn Error>>
 {
     Runtime::new()?.block_on(async {
@@ -912,12 +966,13 @@ fn full_probes_find_connected_resources_without_making_them_available() -> Resul
         let mut shard = Shard::<GlobalChunkAllocator>::new();
         let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
         let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+        for probe_id in [" id='probe'", ""] {
         for (target, subscribed, kind, from) in [
             ("alice@localhost/desk", true, PresenceType::Available, "alice@localhost/desk"),
             ("alice@localhost", true, PresenceType::Unavailable, "alice@localhost"),
             ("alice@localhost/desk", false, PresenceType::Unsubscribed, "alice@localhost"),
         ] {
-            let request = routed(&format!("<presence from='bob@localhost/desk' to='{target}' type='probe'/>")).await?;
+            let request = routed(&format!("<presence from='bob@localhost/desk' to='{target}' type='probe'{probe_id}/>")).await?;
             assert_eq!(shard.probe(&observer.handle(), &request, subscribed)?.is_some(), kind == PresenceType::Unavailable);
             let replies = observer.take_queued();
             assert_eq!(replies.len(), 1);
@@ -925,8 +980,9 @@ fn full_probes_find_connected_resources_without_making_them_available() -> Resul
             assert_eq!(view.stanza_type(), StanzaType::Presence(kind));
             assert_eq!(view.from()?.ok_or("missing source")?.as_str(), from);
             assert_eq!(view.to()?.ok_or("missing target")?.as_str(), "bob@localhost/desk");
-            assert!(view.id()?.is_none());
+            assert_eq!(view.id()?, if probe_id.is_empty() { None } else { Some("probe") });
             assert!(view.children()?.next().is_none());
+        }
         }
         let request = routed("<presence from='alice@localhost/desk' to='alice@localhost/desk' type='probe'/>").await?;
         assert!(shard.probe(&desk.handle(), &request, false)?.is_none());
@@ -1113,10 +1169,10 @@ fn probe_reads_grants_when_it_runs() -> Result<(), Box<dyn Error>> {
         let mut shard = Shard::<GlobalChunkAllocator>::new();
         let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
         let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
-        let request = routed(
-            "<presence from='bob@localhost/desk' to='alice@localhost' type='probe' id='directed'/>",
-        )
-        .await?;
+        shard.presence(&alice, "desk", desk.token, Some(0), routed("<presence from='alice@localhost/desk' id='private-broadcast'><status>private</status></presence>").await?, None)?;
+        for target in ["alice@localhost", "alice@localhost/desk"] {
+        for probe_id in [" id='directed'", ""] {
+        let request = routed(&format!("<presence from='bob@localhost/desk' to='{target}' type='probe'{probe_id}/>")).await?;
         for available in [true, false] {
             shard.record_directed_presence(
                 &alice,
@@ -1140,8 +1196,10 @@ fn probe_reads_grants_when_it_runs() -> Result<(), Box<dyn Error>> {
                 view.to()?.ok_or("missing target")?.as_str(),
                 "bob@localhost/desk"
             );
-            assert_eq!(view.id()?, Some("directed"));
+            assert_eq!(view.id()?, if probe_id.is_empty() { None } else { Some("directed") });
             assert!(view.children()?.next().is_none());
+        }
+        }
         }
         Ok(())
     })

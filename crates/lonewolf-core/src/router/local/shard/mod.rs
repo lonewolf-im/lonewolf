@@ -729,11 +729,23 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             if source.presence.is_none() && !source.access.directed && !(full && ordinary) {
                 return Ok(None);
             }
+            let id = if full && ordinary {
+                match source.presence {
+                    Some(presence) => presence
+                        .resolve()
+                        .and_then(|presence| presence.id())
+                        .map_err(|_| RouterError::Unavailable)?,
+                    None => view.id().map_err(|_| RouterError::InvalidTarget)?,
+                }
+            } else {
+                view.id().map_err(|_| RouterError::InvalidTarget)?
+            };
             let from = format!("{}/{}", owner.as_str(), source.resource);
             crate::router::probe_reply(
                 request,
                 &from,
                 PresenceType::Available,
+                id,
                 None,
                 requester.router.allocator(),
             )
@@ -764,8 +776,14 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             } else {
                 (target.bare().as_str(), PresenceType::Unsubscribed, None)
             };
-            let stanza =
-                crate::router::probe_reply(request, from, kind, at, requester.router.allocator())?;
+            let stanza = crate::router::probe_reply(
+                request,
+                from,
+                kind,
+                view.id().map_err(|_| RouterError::InvalidTarget)?,
+                at,
+                requester.router.allocator(),
+            )?;
             if kind == PresenceType::Unavailable {
                 unavailable = Some(stanza.clone());
             }

@@ -520,6 +520,172 @@ fn quick_xml_namespace_errors_preserve_well_formedness_classification() {
 }
 
 #[test]
+fn malformed_entity_names_return_not_well_formed_in_every_context() -> TestResult {
+    block_on(async {
+        for reference in ["&;", "&123;", "&foo bar;", "&foo:bar;", "&\u{301}foo;"] {
+            for chunk in [1, usize::MAX] {
+                for (input, in_header) in entity_reference_inputs(reference) {
+                    let mut parser = XmppParser::new(
+                        Fragmented::new(input.as_bytes(), chunk),
+                        config(4096)?,
+                        GlobalChunkAllocator,
+                    );
+                    if !in_header {
+                        open(&mut parser).await?;
+                    }
+                    assert!(
+                        matches!(parser.next_event().await, Err(ParseError::NotWellFormed)),
+                        "reference={reference:?}, input={input:?}, chunk={chunk}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn entity_reference_inputs(reference: &str) -> [(String, bool); 4] {
+    [
+        (OPEN.replace('>', &format!(" flag='{reference}'>")), true),
+        (format!("{OPEN}<message id='{reference}'/>{CLOSE}"), false),
+        (format!("{OPEN}{reference}{CLOSE}"), false),
+        (
+            format!("{OPEN}<message><body>{reference}</body></message>{CLOSE}"),
+            false,
+        ),
+    ]
+}
+
+#[test]
+fn undeclared_entities_return_restricted_xml_in_every_context() -> TestResult {
+    block_on(async {
+        for name in ["foo", "é", "_name-1", "xmlns"] {
+            let reference = format!("&{name};");
+            for chunk in [1, usize::MAX] {
+                for (input, in_header) in entity_reference_inputs(&reference) {
+                    let mut parser = XmppParser::new(
+                        Fragmented::new(input.as_bytes(), chunk),
+                        config(4096)?,
+                        GlobalChunkAllocator,
+                    );
+                    if !in_header {
+                        open(&mut parser).await?;
+                    }
+                    assert!(
+                        matches!(parser.next_event().await, Err(ParseError::RestrictedXml)),
+                        "reference={reference:?}, input={input:?}, chunk={chunk}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn invalid_character_references_return_not_well_formed_in_every_context() -> TestResult {
+    block_on(async {
+        for reference in [
+            "&#x0;",
+            "&#0;",
+            "&#xD800;",
+            "&#x110000;",
+            "&#xG;",
+            "&#;",
+            "&#x;",
+            "&#12",
+        ] {
+            for chunk in [1, usize::MAX] {
+                for (input, in_header) in entity_reference_inputs(reference) {
+                    let mut parser = XmppParser::new(
+                        Fragmented::new(input.as_bytes(), chunk),
+                        config(4096)?,
+                        GlobalChunkAllocator,
+                    );
+                    if !in_header {
+                        open(&mut parser).await?;
+                    }
+                    assert!(
+                        matches!(parser.next_event().await, Err(ParseError::NotWellFormed)),
+                        "reference={reference:?}, input={input:?}, chunk={chunk}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn predefined_entities_and_character_references_preserve_values_and_depth_one_errors() -> TestResult
+{
+    block_on(async {
+        for (reference, expected) in [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&amp;", "&"),
+            ("&apos;", "'"),
+            ("&quot;", "\""),
+            ("&#65;", "A"),
+            ("&#xE9;", "é"),
+            ("&#x9;", "\t"),
+            ("&#10;", "\n"),
+            ("&#xD;", "\r"),
+            ("&#32;", " "),
+        ] {
+            for chunk in [1, usize::MAX] {
+                let input = format!(
+                    "{}<message id='{reference}'><body>{reference}</body></message>{CLOSE}",
+                    OPEN.replace('>', &format!(" flag='{reference}'>"))
+                );
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                let Some(StreamEvent::StreamStart { header, .. }) = parser.next_event().await?
+                else {
+                    return Err("expected stream start".into());
+                };
+                assert_eq!(
+                    header
+                        .value()
+                        .resolve(header.arena())?
+                        .attribute("flag", "")?,
+                    Some(expected)
+                );
+                let parsed = stanza(&mut parser).await?;
+                let view = parsed.value().resolve(parsed.arena())?;
+                assert_eq!(view.id()?, Some(expected));
+                assert_eq!(
+                    view.child("body", CLIENT_NAMESPACE)?
+                        .ok_or("body")?
+                        .text()?,
+                    Some(expected)
+                );
+                assert!(matches!(
+                    parser.next_event().await?,
+                    Some(StreamEvent::StreamEnd)
+                ));
+
+                let input = format!("{OPEN}{reference}{CLOSE}");
+                let mut parser = XmppParser::new(
+                    Fragmented::new(input.as_bytes(), chunk),
+                    config(4096)?,
+                    GlobalChunkAllocator,
+                );
+                open(&mut parser).await?;
+                assert!(
+                    matches!(parser.next_event().await, Err(ParseError::UnexpectedEvent)),
+                    "reference={reference:?}, chunk={chunk}"
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn unbound_prefix_remains_fatal() -> TestResult {
     block_on(async {
         let input = format!("{OPEN}<x:message/>");
@@ -2012,21 +2178,21 @@ fn xml_declaration_grammar_and_position_errors_are_not_well_formed() -> TestResu
 fn stream_character_data_checks_grammar_before_xmpp_structure() -> TestResult {
     for chunk in [1, usize::MAX] {
         block_on(async {
-            for (text, malformed) in [
-                ("]]>", true),
-                ("\0", true),
-                ("\u{1}", true),
-                ("<![CDATA[\u{1}]]>", true),
-                ("<![CDATA[\u{fffe}]]>", true),
-                ("&#0;", true),
-                ("&#1;", true),
-                ("&#xFFFE;", true),
-                ("&#x110000;", true),
-                ("&#invalid;", true),
-                ("ordinary text", false),
-                ("<![CDATA[ordinary text]]>", false),
-                ("&#65;", false),
-                ("&unknown;", false),
+            for (text, expected) in [
+                ("]]>", "not-well-formed"),
+                ("\0", "not-well-formed"),
+                ("\u{1}", "not-well-formed"),
+                ("<![CDATA[\u{1}]]>", "not-well-formed"),
+                ("<![CDATA[\u{fffe}]]>", "not-well-formed"),
+                ("&#0;", "not-well-formed"),
+                ("&#1;", "not-well-formed"),
+                ("&#xFFFE;", "not-well-formed"),
+                ("&#x110000;", "not-well-formed"),
+                ("&#invalid;", "not-well-formed"),
+                ("ordinary text", "unexpected-event"),
+                ("<![CDATA[ordinary text]]>", "unexpected-event"),
+                ("&#65;", "unexpected-event"),
+                ("&unknown;", "restricted-xml"),
             ] {
                 let input = format!("{OPEN}{text}{CLOSE}");
                 let mut parser = XmppParser::new(
@@ -2042,8 +2208,10 @@ fn stream_character_data_checks_grammar_before_xmpp_structure() -> TestResult {
                     .ok_or("expected stream text error")?;
                 assert!(
                     matches!(
-                        (&error, malformed),
-                        (ParseError::NotWellFormed, true) | (ParseError::UnexpectedEvent, false)
+                        (&error, expected),
+                        (ParseError::NotWellFormed, "not-well-formed")
+                            | (ParseError::UnexpectedEvent, "unexpected-event")
+                            | (ParseError::RestrictedXml, "restricted-xml")
                     ),
                     "{text:?}: {error:?}"
                 );

@@ -394,6 +394,60 @@ fn invalid_xml_prefix_binding_returns_not_well_formed_after_binding() -> TestRes
 }
 
 #[test]
+fn undeclared_entity_in_attribute_returns_restricted_xml_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desktop")?;
+
+    client.send("<message to='&foo;'/>")?;
+    client.expect_stream_error("restricted-xml")
+}
+
+#[test]
+fn undeclared_entity_between_stanzas_returns_restricted_xml_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desktop")?;
+
+    client.send("&foo;")?;
+    client.expect_stream_error("restricted-xml")
+}
+
+#[test]
+fn malformed_entity_name_in_attribute_returns_not_well_formed_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desktop")?;
+
+    client.send("<message id='&123;'/>")?;
+    client.expect_stream_error("not-well-formed")
+}
+
+#[test]
+fn malformed_entity_name_between_stanzas_returns_not_well_formed_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desktop")?;
+
+    client.send("&foo:bar;")?;
+    client.expect_stream_error("not-well-formed")
+}
+
+#[test]
+fn attribute_count_limit_returns_policy_violation_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    let attributes = (0..257)
+        .map(|index| format!(" a{index}='v'"))
+        .collect::<String>();
+    let input = format!("<message{attributes}/>");
+
+    client.send(&input)?;
+    client.expect_stream_error("policy-violation")
+}
+
+#[test]
 fn mismatched_tags_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
@@ -811,7 +865,7 @@ fn fatal_errors_in_rejected_envelopes_withdraw_the_bound_resource() -> TestResul
                 "<x>".repeat(128),
                 "</x>".repeat(128)
             ),
-            "bad-format",
+            "policy-violation",
         ),
         (
             format!(

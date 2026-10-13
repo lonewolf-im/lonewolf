@@ -10,13 +10,15 @@ use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
 use lonewolf_extension::delivery::{
-    DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
+    Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError, HostLookup,
+    SessionTag,
 };
 use lonewolf_extension::discovery::{DiscoScope, Identity};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
 };
 use lonewolf_extension::message::{MessageHandler, StoreFuture, UndeliverableMessage};
+use lonewolf_extension::observer::{MessageEvent, MessageObserver, MessageOutcome, MessageRole};
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::policy::{Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
 use lonewolf_extension::presence::{
@@ -118,6 +120,9 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(TestArchive {
         next: AtomicU64::new(1),
         entries: PlMutex::new(Vec::new()),
+    }))?;
+    extensions.register(Arc::new(TestMessageObserver {
+        events: PlMutex::new(Vec::new()),
     }))?;
     extensions.register(Arc::new(TestSecondArchive))?;
     extensions.register(Arc::new(TestDiscovery))?;
@@ -1583,5 +1588,160 @@ impl<A: ChunkAllocator> ArchiveHandler<A, RedbStorage> for TestSecondArchive {
         _: &'a mut Arena<A>,
     ) -> ArchiveFuture<'a> {
         Box::pin(async { Ok(ArchiveOutcome::Skipped) })
+    }
+}
+
+const OBSERVER_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Server,
+    kind: IqRequestType::Get,
+    namespace: "urn:lonewolf:test:observer",
+    name: "messages",
+};
+
+type ObservedMessage = (String, MessageRole, MessageOutcome, Option<ArchiveId>);
+
+struct TestMessageObserver {
+    events: PlMutex<Vec<ObservedMessage>>,
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestMessageObserver {
+    fn name(&self) -> &'static str {
+        "test-message-observer"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(OBSERVER_ROUTE, self.clone())?;
+        slots.message_observer(self);
+        Ok(())
+    }
+}
+
+impl<A: ChunkAllocator> MessageObserver<A, RedbStorage> for TestMessageObserver {
+    fn observe<'a>(
+        &'a self,
+        event: MessageEvent<'a, A>,
+        _: &'a RedbStorage,
+        delivery: &'a dyn Delivery<A>,
+    ) -> DeliveryFuture<'a> {
+        Box::pin(async move {
+            self.events.lock().push((
+                event.account.as_str().into(),
+                event.role,
+                event.outcome,
+                event.archived,
+            ));
+            if event.role == MessageRole::Sent
+                && event.outcome == MessageOutcome::Routed
+                && event
+                    .stanza
+                    .resolve()?
+                    .child("body", "jabber:client")?
+                    .is_some_and(|body| body.text().is_ok_and(|text| text == Some("copy")))
+            {
+                let domain = event.account.domain().to_owned();
+                delivery
+                    .push_to_tagged(
+                        event.account,
+                        SessionTag::Interested,
+                        Box::new(move |full, arena| {
+                            let from = Jid::from_parts_in(None, &domain, None, arena)?;
+                            let copied =
+                                Element::builder_in("copied", OBSERVER_ROUTE.namespace, arena)?
+                                    .build()?;
+                            Ok(Stanza::builder_in(
+                                StanzaType::Message(MessageType::Headline),
+                                StanzaNamespace::Client,
+                                arena,
+                            )
+                            .from(Some(from))?
+                            .to(Some(full))?
+                            .child(copied)?
+                            .build()?)
+                        }),
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestMessageObserver {
+    fn get<'a>(
+        &'a self,
+        _: IqRequest<'a, A>,
+        _: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let events = self
+                .events
+                .lock()
+                .iter()
+                .map(|(account, role, outcome, archived)| {
+                    let mut builder =
+                        Element::builder_in("event", OBSERVER_ROUTE.namespace, response)
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                            .attribute("account", "", account)
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                            .attribute(
+                                "role",
+                                "",
+                                match role {
+                                    MessageRole::Sent => "sent",
+                                    MessageRole::Received => "received",
+                                },
+                            )
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                            .attribute(
+                                "outcome",
+                                "",
+                                match outcome {
+                                    MessageOutcome::Routed => "routed",
+                                    MessageOutcome::Stored => "stored",
+                                    MessageOutcome::Forwarded => "forwarded",
+                                    MessageOutcome::Rejected => "rejected",
+                                    MessageOutcome::Discarded => "discarded",
+                                },
+                            )
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    if let Some(id) = archived {
+                        let mut buffer = [0; 20];
+                        let mut output = buffer.as_mut_slice();
+                        write!(&mut output, "{id}")
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                        let written = 20 - output.len();
+                        let id = std::str::from_utf8(&buffer[..written])
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                        builder = builder
+                            .attribute("archived", "", id)
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    }
+                    builder
+                        .build()
+                        .map_err(|_| HandlerError::from(StanzaErrorCondition::InternalServerError))
+                })
+                .collect::<Result<Vec<_>, HandlerError>>()?;
+            let mut builder =
+                Element::builder_in(OBSERVER_ROUTE.name, OBSERVER_ROUTE.namespace, response)
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            for event in events {
+                builder = builder
+                    .child(event)
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            }
+            Ok(IqReply::new(
+                Some(
+                    builder
+                        .build()
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?,
+                ),
+                Effects::none(),
+            ))
+        })
     }
 }

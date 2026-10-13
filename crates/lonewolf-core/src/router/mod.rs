@@ -14,6 +14,7 @@ use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
+use lonewolf_extension::observer::MessageObserver;
 use lonewolf_extension::policy::PolicyHandler;
 use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_extension::service::ServiceHandler;
@@ -217,6 +218,16 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.extensions
             .get(domain)
             .and_then(ExtensionRegistry::archive)
+    }
+
+    #[expect(clippy::type_complexity)]
+    pub(crate) fn message_observers(
+        &self,
+        domain: &str,
+    ) -> &[(&'static str, Arc<dyn MessageObserver<A, RedbStorage>>)] {
+        self.extensions
+            .get(domain)
+            .map_or(&[], ExtensionRegistry::message_observers)
     }
 
     pub(crate) fn policies(

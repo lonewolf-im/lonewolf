@@ -20,6 +20,7 @@ use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqSco
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
+use lonewolf_extension::observer::{MessageEvent, MessageOutcome, MessageRole};
 use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
@@ -53,7 +54,7 @@ use crate::router::{
 
 use crate::stages::message::{self, DeliveryOutcome};
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
-use crate::stages::{Stage, archive, policy};
+use crate::stages::{Stage, archive, observe, policy};
 
 mod link;
 mod output;
@@ -470,7 +471,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             } => return self.reply_rejection(&routed, condition, application),
             Verdict::Drop => return Ok(()),
         }
-        let routed = if matches!(routed.resolve()?.stanza_type(), StanzaType::Message(_))
+        let mut sent = None;
+        let is_message = matches!(routed.resolve()?.stanza_type(), StanzaType::Message(_));
+        let routed = if is_message
             && self
                 .router
                 .archive_handler(self.registration.account().domain())
@@ -490,13 +493,26 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 )
                 .await??
             {
-                archive::ArchiveStep::Accepted(archived) => archived.stanza,
+                archive::ArchiveStep::Accepted(archived) => {
+                    sent = archived.sent;
+                    archived.stanza
+                }
                 archive::ArchiveStep::Rejected { stanza, condition } => {
                     return self.reply_error(&stanza, condition);
                 }
             }
         } else {
             routed
+        };
+        let observed = if is_message
+            && !self
+                .router
+                .message_observers(self.registration.account().domain())
+                .is_empty()
+        {
+            Some(routed.clone())
+        } else {
+            None
         };
         let presence = {
             let view = routed.resolve()?;
@@ -571,6 +587,31 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 )
                 .await??
         };
+        if let Some(observed) = observed {
+            let stage = Stage {
+                router: &self.router,
+                storage: &self.storage,
+                allocator: &self.allocator,
+                work: &self.work,
+            };
+            let delivery = self.delivery();
+            self.outbox
+                .drain_until(
+                    &self.registration,
+                    observe::message(
+                        &stage,
+                        &delivery,
+                        MessageEvent {
+                            account: self.registration.account(),
+                            role: MessageRole::Sent,
+                            stanza: &observed,
+                            outcome: MessageOutcome::from(&outcome),
+                            archived: sent,
+                        },
+                    ),
+                )
+                .await?;
+        }
         match outcome {
             ServiceOutcome::Rejected { stanza, condition } => self.reply_error(&stanza, condition),
             ServiceOutcome::Handled => Ok(()),
@@ -1312,18 +1353,77 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         };
         let archive::Archived {
             stanza: routed,
-            sent: _sent,
-            received: _received,
+            sent,
+            received,
         } = match archived {
             archive::ArchiveStep::Accepted(archived) => archived,
             archive::ArchiveStep::Rejected { stanza, condition } => {
                 return self.reply_error(&stanza, condition);
             }
         };
+        let observed = {
+            let view = routed.resolve()?;
+            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
+            let local_recipient = matches!(
+                self.router.destination(to),
+                Destination::Account | Destination::Resource
+            );
+            if !self
+                .router
+                .message_observers(self.registration.account().domain())
+                .is_empty()
+                || (local_recipient && !self.router.message_observers(to.domainpart()).is_empty())
+            {
+                let recipient = if local_recipient {
+                    Some(AccountKey::try_from(to.bare())?)
+                } else {
+                    None
+                };
+                Some((routed.clone(), recipient))
+            } else {
+                None
+            }
+        };
         let outcome = self
             .outbox
             .drain_until(&self.registration, message::deliver(&stage, routed, kind))
             .await??;
+        if let Some((observed, recipient)) = observed {
+            let delivery = self.delivery();
+            self.outbox
+                .drain_until(&self.registration, async {
+                    let outcome = MessageOutcome::from(&outcome);
+                    observe::message(
+                        &stage,
+                        &delivery,
+                        MessageEvent {
+                            account: self.registration.account(),
+                            role: MessageRole::Sent,
+                            stanza: &observed,
+                            outcome,
+                            archived: sent,
+                        },
+                    )
+                    .await;
+                    if matches!(outcome, MessageOutcome::Routed | MessageOutcome::Stored)
+                        && let Some(recipient) = recipient.as_ref()
+                    {
+                        observe::message(
+                            &stage,
+                            &delivery,
+                            MessageEvent {
+                                account: recipient,
+                                role: MessageRole::Received,
+                                stanza: &observed,
+                                outcome,
+                                archived: received,
+                            },
+                        )
+                        .await;
+                    }
+                })
+                .await?;
+        }
         match outcome {
             DeliveryOutcome::Rejected { stanza, condition } => self.reply_error(&stanza, condition),
             DeliveryOutcome::Routed | DeliveryOutcome::Stored | DeliveryOutcome::Discarded => {

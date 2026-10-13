@@ -11,6 +11,7 @@ use crate::archive::ArchiveHandler;
 use crate::discovery::{DiscoScope, Identity};
 use crate::iq::{IqHandler, IqRoute};
 use crate::message::MessageHandler;
+use crate::observer::MessageObserver;
 use crate::policy::PolicyHandler;
 use crate::presence::{PresenceHandler, PresenceRequestType};
 use crate::service::ServiceHandler;
@@ -95,6 +96,12 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
         }
         self.registry.archive = Some(handler);
         Ok(())
+    }
+
+    pub fn message_observer(&mut self, handler: Arc<dyn MessageObserver<A, S>>) {
+        self.registry
+            .message_observers
+            .push((self.extension, handler));
     }
 
     pub fn policy(&mut self, handler: Arc<dyn PolicyHandler<S>>) {

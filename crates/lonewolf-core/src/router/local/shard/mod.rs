@@ -29,6 +29,15 @@ use crate::router::{RoutedStanza, RouterError, RouterState};
 
 const LAST_UNAVAILABLE_PER_SHARD: usize = 64;
 
+type RetirementTarget = (Box<str>, u64, RetireCause);
+
+fn mailbox_retire_cause<T>(error: TrySendError<T>) -> RetireCause {
+    match error {
+        TrySendError::Full(_) => RetireCause::MailboxOverflow,
+        TrySendError::Closed(_) => RetireCause::Evicted,
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DirectedRecipient(Box<str>);
 
@@ -115,6 +124,23 @@ impl<A: ChunkAllocator> Shard<A> {
     }
 
     fn remove(&mut self, account: &str, resource: &str, token: u64, cause: RetireCause) {
+        self.remove_with_targets(account, resource, token, cause, &[]);
+    }
+
+    fn remove_batch(&mut self, account: &str, targets: &[RetirementTarget]) {
+        for (resource, token, cause) in targets {
+            self.remove_with_targets(account, resource, *token, *cause, targets);
+        }
+    }
+
+    fn remove_with_targets(
+        &mut self,
+        account: &str,
+        resource: &str,
+        token: u64,
+        cause: RetireCause,
+        targets: &[RetirementTarget],
+    ) {
         let had_available = self.has_available(account);
         let mut retiring = Vec::new();
         if let Some(sessions) = self.accounts.get_mut(account) {
@@ -124,15 +150,17 @@ impl<A: ChunkAllocator> Shard<A> {
                 resource,
                 token,
                 cause,
+                targets,
                 &mut pending,
                 &mut retiring,
             );
-            while let Some((resource, token)) = pending.pop() {
+            while let Some((resource, token, cause)) = pending.pop() {
                 Self::remove_session(
                     sessions,
                     &resource,
                     token,
                     cause,
+                    targets,
                     &mut pending,
                     &mut retiring,
                 );
@@ -141,7 +169,10 @@ impl<A: ChunkAllocator> Shard<A> {
                 self.accounts.remove(account);
             }
         }
-        if cause == RetireCause::Evicted && had_available && !self.has_available(account) {
+        if matches!(cause, RetireCause::Evicted | RetireCause::MailboxOverflow)
+            && had_available
+            && !self.has_available(account)
+        {
             self.record_last_unavailable(account);
         }
         for (token, presence) in retiring {
@@ -157,7 +188,8 @@ impl<A: ChunkAllocator> Shard<A> {
         resource: &str,
         token: u64,
         cause: RetireCause,
-        pending: &mut Vec<(Box<str>, u64)>,
+        targets: &[RetirementTarget],
+        pending: &mut Vec<RetirementTarget>,
         retiring: &mut Vec<(u64, RetiredPresence<A>)>,
     ) {
         if sessions
@@ -172,12 +204,17 @@ impl<A: ChunkAllocator> Shard<A> {
                 for (recipient_resource, recipient) in sessions.iter() {
                     if recipient.alive.load(Ordering::Acquire)
                         && recipient.priority.is_some()
-                        && recipient
+                        && let Err(error) = recipient
                             .outbound
                             .try_send(MailboxEntry::new(unavailable.clone()))
-                            .is_err()
                     {
-                        pending.push((recipient_resource.clone(), recipient.token));
+                        let cause = targets
+                            .iter()
+                            .find(|(resource, token, _)| {
+                                resource == recipient_resource && *token == recipient.token
+                            })
+                            .map_or_else(|| mailbox_retire_cause(error), |(_, _, cause)| *cause);
+                        pending.push((recipient_resource.clone(), recipient.token, cause));
                     }
                 }
             }
@@ -323,26 +360,20 @@ impl<A: ChunkAllocator> Shard<A> {
                 if session.token != token
                     && session.alive.load(Ordering::Acquire)
                     && session.priority.is_some()
-                    && session
-                        .outbound
-                        .try_send(MailboxEntry::new(stanza.clone()))
-                        .is_err()
+                    && let Err(error) = session.outbound.try_send(MailboxEntry::new(stanza.clone()))
                 {
-                    failed.push((recipient_resource.clone(), session.token));
+                    failed.push((
+                        recipient_resource.clone(),
+                        session.token,
+                        mailbox_retire_cause(error),
+                    ));
                 }
             }
             if let Some(source) = sessions.get_mut(resource) {
                 source.presence = priority.map(|_| stanza);
             }
         }
-        for (recipient_resource, recipient_token) in failed {
-            self.remove(
-                account.as_str(),
-                &recipient_resource,
-                recipient_token,
-                RetireCause::Evicted,
-            );
-        }
+        self.remove_batch(account.as_str(), &failed);
         if priority.is_some() {
             self.last_unavailable
                 .retain(|(known, _)| known.as_ref() != account.as_str());
@@ -387,22 +418,18 @@ impl<A: ChunkAllocator> Shard<A> {
                 if recipient.token != token
                     && recipient.alive.load(Ordering::Acquire)
                     && recipient.priority.is_some()
-                    && recipient
+                    && let Err(error) = recipient
                         .outbound
                         .try_send(MailboxEntry::new(stanza.clone()))
-                        .is_err()
                 {
-                    failed.push((recipient_resource.clone(), recipient.token));
+                    failed.push((
+                        recipient_resource.clone(),
+                        recipient.token,
+                        mailbox_retire_cause(error),
+                    ));
                 }
             }
-            for (recipient_resource, recipient_token) in failed {
-                self.remove(
-                    account.as_str(),
-                    &recipient_resource,
-                    recipient_token,
-                    RetireCause::Evicted,
-                );
-            }
+            self.remove_batch(account.as_str(), &failed);
         }
         if let (Some(stanza), Some(_)) = (presence, unavailable.as_ref()) {
             self.retiring
@@ -1099,7 +1126,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 continue;
             }
             if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
-                failed.push((resource.clone(), session.token));
+                failed.push((resource.clone(), session.token, RetireCause::Evicted));
                 continue;
             }
             if !valid() {
@@ -1109,16 +1136,18 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 Ok(()) => delivered = true,
                 Err(TrySendError::Full(_)) => {
                     busy = true;
-                    failed.push((resource.clone(), session.token));
+                    failed.push((
+                        resource.clone(),
+                        session.token,
+                        RetireCause::MailboxOverflow,
+                    ));
                 }
                 Err(TrySendError::Closed(_)) => {
-                    failed.push((resource.clone(), session.token));
+                    failed.push((resource.clone(), session.token, RetireCause::Evicted));
                 }
             }
         }
-        for (resource, token) in failed {
-            self.remove(account, &resource, token, RetireCause::Evicted);
-        }
+        self.remove_batch(account, &failed);
         if delivered {
             Ok(())
         } else if busy {
@@ -1185,7 +1214,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 continue;
             }
             if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
-                failed.push((resource.clone(), session.token));
+                failed.push((resource.clone(), session.token, RetireCause::Evicted));
                 continue;
             }
             full_jid.clear();
@@ -1208,11 +1237,9 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             let failed = sessions
                 .iter()
                 .filter(|(_, session)| session.tags.contains(tag))
-                .map(|(resource, session)| (resource.clone(), session.token))
+                .map(|(resource, session)| (resource.clone(), session.token, RetireCause::Evicted))
                 .collect::<Vec<_>>();
-            for (resource, token) in failed {
-                self.remove(account.as_str(), &resource, token, RetireCause::Evicted);
-            }
+            self.remove_batch(account.as_str(), &failed);
             return Err(error);
         }
         if let Some(sessions) = self.accounts.get(account.as_str()) {
@@ -1220,20 +1247,17 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 let Some(session) = sessions.get(resource.as_ref()) else {
                     continue;
                 };
-                if session.token == token
-                    && (!session.alive.load(Ordering::Acquire)
-                        || session
-                            .outbound
-                            .try_send(MailboxEntry::new(stanza))
-                            .is_err())
-                {
-                    failed.push((resource, token));
+                if session.token != token {
+                    continue;
+                }
+                if !session.alive.load(Ordering::Acquire) {
+                    failed.push((resource, token, RetireCause::Evicted));
+                } else if let Err(error) = session.outbound.try_send(MailboxEntry::new(stanza)) {
+                    failed.push((resource, token, mailbox_retire_cause(error)));
                 }
             }
         }
-        for (resource, token) in failed {
-            self.remove(account.as_str(), &resource, token, RetireCause::Evicted);
-        }
+        self.remove_batch(account.as_str(), &failed);
         Ok(())
     }
 
@@ -1245,16 +1269,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         };
         let bound: Vec<_> = sessions
             .iter()
-            .map(|(resource, session)| (resource.clone(), session.token))
+            .map(|(resource, session)| {
+                (resource.clone(), session.token, RetireCause::AccountDeleted)
+            })
             .collect();
-        for (resource, token) in bound {
-            self.remove(
-                account.as_str(),
-                &resource,
-                token,
-                RetireCause::AccountDeleted,
-            );
-        }
+        self.remove_batch(account.as_str(), &bound);
     }
 }
 

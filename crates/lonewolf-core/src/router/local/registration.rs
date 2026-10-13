@@ -81,6 +81,7 @@ pub(crate) struct PresenceChange<A: ChunkAllocator> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetireCause {
     Evicted,
+    MailboxOverflow,
     AccountDeleted,
     RouterStopped,
 }

@@ -188,7 +188,7 @@ fn rejected_iq_envelopes_share_the_binding_failure_limit() -> TestResult {
         let input = if attempt % 2 == 0 {
             "<iq type='bogus' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>"
         } else {
-            "<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>"
+            "<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>"
         };
         client.send(input)?;
         client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -200,20 +200,77 @@ fn rejected_iq_envelopes_share_the_binding_failure_limit() -> TestResult {
     replacement.close()
 }
 
+fn assert_generated_identifier(jid: &str) -> TestResult {
+    let random = jid
+        .strip_prefix("alice@localhost/lw-")
+        .ok_or("missing generated resource")?;
+    assert_eq!(random.len(), 32);
+    assert!(
+        random
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    Ok(())
+}
+
+fn assert_generated_resource_lifecycle(suite: &C2sSuite, resource: &str) -> TestResult {
+    let logs = suite.wait_for_log("stream disconnected")?;
+    let bound = logs
+        .lines()
+        .find(|line| line.contains("resource bound"))
+        .ok_or("missing bound lifecycle event")?;
+    assert!(bound.contains("resource_requested=false"), "{logs}");
+    if !resource.is_empty() {
+        assert!(!logs.contains(resource), "{logs}");
+    }
+    Ok(())
+}
+
 #[test]
-fn empty_resource_returns_bad_request_and_allows_retry() -> TestResult {
+fn empty_resource_gets_a_generated_identifier() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
-    client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
-    client.expect_xml(
-        "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
-    </iq>",
-    )?;
+    assert_generated_identifier(&client.bind(Some(""))?)?;
+    client.close()?;
+    assert_generated_resource_lifecycle(&suite, "")
+}
 
-    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+#[test]
+fn oversized_resource_gets_a_generated_identifier() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+    let resource = "x".repeat(1100);
+
+    assert_generated_identifier(&client.bind(Some(&resource))?)?;
+    client.close()?;
+    assert_generated_resource_lifecycle(&suite, &resource)
+}
+
+#[test]
+fn unpreparable_resource_gets_a_generated_identifier() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+    let resource = "private\u{200b}resource";
+
+    assert_generated_identifier(&client.bind(Some(resource))?)?;
+    client.close()?;
+    assert_generated_resource_lifecycle(&suite, resource)
+}
+
+#[test]
+fn requested_resource_is_normalized_in_the_bound_jid() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+
+    assert_eq!(
+        client.bind(Some("Desk\u{a0}Phone"))?,
+        "alice@localhost/Desk Phone"
+    );
     client.close()
 }
 
@@ -294,7 +351,7 @@ fn fifth_binding_failure_still_allows_success() -> TestResult {
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
     for _ in 0..5 {
-        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
         client.expect_xml(
             "<iq xmlns='jabber:client' type='error' id='bad'>
             <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -313,7 +370,7 @@ fn sixth_binding_failure_closes_the_stream() -> TestResult {
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
     for _ in 0..5 {
-        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
         client.expect_xml(
             "<iq xmlns='jabber:client' type='error' id='bad'>
             <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -321,7 +378,7 @@ fn sixth_binding_failure_closes_the_stream() -> TestResult {
         )?;
     }
 
-    client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+    client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
         <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -340,7 +397,7 @@ fn configured_resource_binding_retries_close_after_eight_failed_attempts() -> Te
     let mut client = suite.authenticated_client("alice", "pencil")?;
 
     for _ in 0..8 {
-        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
         client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     }
     client.expect_stream_error("policy-violation")
@@ -439,7 +496,7 @@ fn malformed_and_resource_limit_bind_failures_share_the_retry_limit() -> TestRes
 
     for attempt in 0..6 {
         if attempt % 2 == 0 {
-            phone.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+            phone.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
             phone.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
         } else {
             phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
@@ -450,7 +507,7 @@ fn malformed_and_resource_limit_bind_failures_share_the_retry_limit() -> TestRes
 }
 
 #[test]
-fn invalid_resource_and_resource_limit_bind_failures_share_the_retry_limit() -> TestResult {
+fn unusable_resource_fallback_and_resource_limit_share_the_retry_limit() -> TestResult {
     let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 20")?;
     suite.create_account("alice", "pencil")?;
     let mut desktops = Vec::with_capacity(10);
@@ -463,7 +520,7 @@ fn invalid_resource_and_resource_limit_bind_failures_share_the_retry_limit() -> 
     for attempt in 0..6 {
         if attempt % 2 == 0 {
             phone.send(&format!("<iq type='set' id='invalid'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{overlong_resource}</resource></bind></iq>"))?;
-            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
         } else {
             phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
             phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -482,7 +539,7 @@ fn prefix_free_stream_returns_client_namespace_binding_and_iq_replies() -> TestR
     client.open_with(&OPEN.replace(" xmlns='jabber:client'", ""))?;
     client.features()?.child(BIND_NAMESPACE, "bind")?;
 
-    client.send("<iq xmlns='jabber:client' type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+    client.send("<iq xmlns='jabber:client' type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
         <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -502,4 +559,73 @@ fn prefix_free_stream_returns_client_namespace_binding_and_iq_replies() -> TestR
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
     </iq>")?;
     client.close()
+}
+
+#[test]
+fn fifth_structural_failure_still_allows_unusable_resource_fallback() -> TestResult {
+    let oversized = "x".repeat(1100);
+    for resource in ["", oversized.as_str(), "private\u{200b}resource"] {
+        let suite = C2sSuite::resource_limit(1)?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+
+        for payload in [
+            "<resource/><resource>phone</resource>",
+            "<resource>desk</resource><resource/>",
+            "<other/>",
+            "<resource attr='1'/>",
+            "text",
+        ] {
+            client.send(&format!(
+                "<iq type='set' id='bad'><bind xmlns='{BIND_NAMESPACE}'>{payload}</bind></iq>"
+            ))?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        }
+
+        assert_generated_identifier(&client.bind(Some(resource))?)?;
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn saturated_unusable_resource_fallback_counts_one_failure_per_request() -> TestResult {
+    let oversized = "x".repeat(1100);
+    for resource in ["", oversized.as_str(), "private\u{200b}resource"] {
+        let suite = C2sSuite::resource_limit(1)?;
+        suite.create_account("alice", "pencil")?;
+        let mut desktop = suite.connect("alice", "pencil", "desk")?;
+        let mut phone = suite.authenticated_client("alice", "pencil")?;
+
+        for _ in 0..6 {
+            phone.send(&format!("<iq type='set' id='full'><bind xmlns='{BIND_NAMESPACE}'><resource>{resource}</resource></bind></iq>"))?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        }
+        phone.expect_stream_error("policy-violation")?;
+        desktop.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
+    for bind in [
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/><resource/></bind>",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/><resource>phone</resource></bind>",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><other/></bind>",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind>",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind' attr='1'/>",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>text</bind>",
+    ] {
+        let suite = C2sSuite::resource_limit(1)?;
+        suite.create_account("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+
+        for _ in 0..6 {
+            client.send(&format!("<iq type='set' id='bad'>{bind}</iq>"))?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        }
+        client.expect_stream_error("policy-violation")?;
+    }
+    Ok(())
 }

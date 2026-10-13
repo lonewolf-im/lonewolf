@@ -46,7 +46,7 @@ fn rejected_binding_and_bound_stanzas_preserve_the_connection_allowance() -> Tes
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.authenticated_client("alice", "pencil")?;
 
-    alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+    alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     alice.expect_no_tls_input()?;
@@ -173,7 +173,7 @@ fn stanza_shaping_does_not_extend_the_resource_binding_deadline() -> TestResult 
     suite.create_account("alice", "pencil")?;
     let mut alice = suite.authenticated_client("alice", "pencil")?;
     let started = Instant::now();
-    alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/></bind></iq>")?;
+    alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     alice

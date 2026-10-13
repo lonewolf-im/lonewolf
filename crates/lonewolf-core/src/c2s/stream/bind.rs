@@ -216,7 +216,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
         if to.is_some_and(|to| to.as_str() != session.host()) {
             return Err(CloseOutcome::UnsupportedInput);
         }
-        let requested = match requested_resource(&stanza) {
+        let mut requested = match requested_resource(&stanza) {
             Ok(requested) => requested,
             Err(BindRequestError::Malformed) => {
                 reject_bind(
@@ -234,23 +234,20 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                 return Err(CloseOutcome::InternalError);
             }
         };
-        let registration = match router
+        let result = match router
             .register(account, requested, max_resources_per_account)
             .await
         {
-            Ok(registration) => registration,
-            Err(RouterError::InvalidResource) => {
-                reject_bind(
-                    &mut session.writer,
-                    id,
-                    "modify",
-                    "bad-request",
-                    &mut invalid_attempts,
-                    max_failures,
-                )
-                .await?;
-                continue;
+            Err(RouterError::InvalidResource) if requested.is_some() => {
+                requested = None;
+                router
+                    .register(account, None, max_resources_per_account)
+                    .await
             }
+            result => result,
+        };
+        let registration = match result {
+            Ok(registration) => registration,
             Err(RouterError::ResourceLimit) => {
                 reject_bind(
                     &mut session.writer,
@@ -344,17 +341,24 @@ fn requested_resource<'a, R: ArenaRead>(
                 {
                     return Err(BindRequestError::Malformed);
                 }
-                let text = element
-                    .text()
-                    .map_err(|_| BindRequestError::Internal)?
-                    .filter(|text| !text.is_empty())
-                    .ok_or(BindRequestError::Malformed)?;
-                resource = Some(text);
+                let text = element.text().map_err(|_| BindRequestError::Internal)?;
+                if text.is_none()
+                    && element
+                        .children()
+                        .map_err(|_| BindRequestError::Internal)?
+                        .next()
+                        .transpose()
+                        .map_err(|_| BindRequestError::Internal)?
+                        .is_some()
+                {
+                    return Err(BindRequestError::Malformed);
+                }
+                resource = Some(text.unwrap_or(""));
             }
             _ => return Err(BindRequestError::Malformed),
         }
     }
-    Ok(resource)
+    Ok(resource.filter(|text| !text.is_empty()))
 }
 
 async fn send_bind_result<A: ChunkAllocator>(

@@ -12,6 +12,7 @@ const TABLES: &[&str] = &[
     "limits.c2s.profiles.default",
     "limits.c2s.profiles.default.connection_attempts_per_ip",
     "limits.c2s.profiles.default.incoming_stanzas_per_connection",
+    "limits.c2s.profiles.default.new_recipients_per_connection",
     "limits.c2s.profiles.default.incoming_xml_per_connection",
 ];
 
@@ -98,6 +99,8 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("connection_attempts_per_ip.burst", 50),
         ("incoming_stanzas_per_connection.per_second", 20),
         ("incoming_stanzas_per_connection.burst", 100),
+        ("new_recipients_per_connection.per_second", 1),
+        ("new_recipients_per_connection.burst", 100),
         ("incoming_xml_per_connection.bytes_per_second", 262_144),
         ("incoming_xml_per_connection.burst_bytes", 1_048_576),
     ];
@@ -301,6 +304,7 @@ default = "public"
 [limits.c2s.profiles.public]
 max_connections_per_ip = 1
 incoming_stanzas_per_connection = { per_second = 1, burst = 1 }
+new_recipients_per_connection = { per_second = 4, burst = 7 }
 [limits.c2s.profiles.internal]
 "#,
     )?;
@@ -444,6 +448,7 @@ fn bucket_capacities_can_be_smaller_than_refill_rates() -> TestResult {
 [limits.c2s.profiles.default]
 connection_attempts_per_ip = { burst = 1 }
 incoming_stanzas_per_connection = { burst = 1 }
+new_recipients_per_connection = { per_second = 10, burst = 1 }
 incoming_xml_per_connection = { burst_bytes = 1 }
 "#,
     )?;
@@ -455,5 +460,27 @@ incoming_xml_per_connection = { burst_bytes = 1 }
 fn serialized_limits_round_trip_with_profile_specific_defaults() -> TestResult {
     let decoded: LimitsConfig = defaults()?.try_into()?;
     assert_eq!(decoded, Config::default().limits);
+    Ok(())
+}
+
+#[test]
+fn named_profiles_use_independent_recipient_rate_defaults() -> TestResult {
+    let file = config_file(
+        "[limits.c2s]\ndefault = 'strict'\n\
+         [limits.c2s.profiles.strict]\nnew_recipients_per_connection = { burst = 3 }\n\
+         [limits.c2s.profiles.fast]\nnew_recipients_per_connection = { per_second = 9 }\n",
+    )?;
+    let limits = Value::try_from(Config::load(Some(file.path()))?.limits)?;
+    for (name, per_second, burst) in [("strict", 1, 3), ("fast", 9, 100)] {
+        assert_eq!(
+            limits["c2s"]["profiles"][name]["new_recipients_per_connection"]["per_second"]
+                .as_integer(),
+            Some(per_second)
+        );
+        assert_eq!(
+            limits["c2s"]["profiles"][name]["new_recipients_per_connection"]["burst"].as_integer(),
+            Some(burst)
+        );
+    }
     Ok(())
 }

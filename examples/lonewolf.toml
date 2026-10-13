@@ -80,7 +80,6 @@
 # Limit distinct directed-presence recipients per bound resource on every listener.
 # Increase this allowance for clients that send presence to many recipients.
 # Bare and full JIDs each use a slot, including recipients that cannot receive delivery.
-# Each slot retains up to 3071 address bytes plus grant and allocation overhead.
 # max_directed_presence_recipients_per_resource = 256
 
 # Add one section per profile and use a nonblank name.
@@ -124,6 +123,11 @@
 # Message, presence, and IQ processing waits when the allowance is empty.
 # Use per_second for the sustained event rate and burst for the bucket capacity.
 # incoming_stanzas_per_connection = { per_second = 20, burst = 100 }
+
+# Limit how quickly one connection can address new recipients.
+# Clients that message many contacts at once may need a larger burst.
+# Use per_second for the sustained rate and burst for the bucket capacity.
+# new_recipients_per_connection = { per_second = 1, burst = 100 }
 
 # Bound incoming XML traffic per connection, including control elements and whitespace.
 # TCP and TLS overhead do not count toward this allowance.

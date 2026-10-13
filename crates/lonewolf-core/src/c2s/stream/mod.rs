@@ -8,6 +8,7 @@ mod close;
 mod establish;
 mod header;
 mod outcome;
+mod recipient_rate;
 mod renegotiation;
 mod session;
 mod stanza_rate;
@@ -74,6 +75,8 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
     max_stanza_bytes: NonZeroUsize,
     stanzas_per_second: NonZeroUsize,
     stanza_burst: NonZeroUsize,
+    recipients_per_second: NonZeroUsize,
+    recipient_burst: NonZeroUsize,
     xml_bytes_per_second: NonZeroUsize,
     xml_burst_bytes: NonZeroUsize,
     establishment_timeout: Duration,
@@ -107,6 +110,8 @@ impl<A: ChunkAllocator> StreamSettings<A> {
             max_stanza_bytes: profile.max_stanza_bytes,
             stanzas_per_second: profile.incoming_stanzas_per_connection.per_second,
             stanza_burst: profile.incoming_stanzas_per_connection.burst,
+            recipients_per_second: profile.new_recipients_per_connection.per_second,
+            recipient_burst: profile.new_recipients_per_connection.burst,
             xml_bytes_per_second: profile.incoming_xml_per_connection.bytes_per_second,
             xml_burst_bytes: profile.incoming_xml_per_connection.burst_bytes,
             establishment_timeout: timeouts.establishment,
@@ -293,7 +298,12 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             .await?;
             lifecycle.bound(bound.resource_requested, binding_started_at);
             bound.session.close.phase_deadline = None;
-            Ok(bound_stream(bound, &mut work).await)
+            let recipients = recipient_rate::RecipientLimiter::new(
+                settings.recipients_per_second,
+                settings.recipient_burst,
+                Instant::now(),
+            );
+            Ok(bound_stream(bound, &mut work, recipients).await)
         };
         let outcome = finish_phases(phases, &close_control).await;
         work.drain().await;

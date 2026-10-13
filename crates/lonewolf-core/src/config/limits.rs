@@ -183,6 +183,7 @@ pub struct C2sLimitProfile {
     /// Shares one bucket per IP across all workers of one listener.
     pub connection_attempts_per_ip: EventRate,
     pub incoming_stanzas_per_connection: EventRate,
+    pub new_recipients_per_connection: EventRate,
     /// Measures XML bytes, including control elements and whitespace, without TCP or TLS overhead.
     pub incoming_xml_per_connection: ByteRate,
 }
@@ -205,6 +206,10 @@ impl Default for C2sLimitProfile {
                 per_second: const { nonzero(20) },
                 burst: const { nonzero(100) },
             },
+            new_recipients_per_connection: EventRate {
+                per_second: NonZeroUsize::MIN,
+                burst: const { nonzero(100) },
+            },
             incoming_xml_per_connection: ByteRate::default(),
         }
     }
@@ -222,6 +227,7 @@ struct C2sLimitProfileInput {
     resource_binding_retries: Option<NonZeroUsize>,
     connection_attempts_per_ip: EventRateInput,
     incoming_stanzas_per_connection: EventRateInput,
+    new_recipients_per_connection: EventRateInput,
     incoming_xml_per_connection: ByteRate,
 }
 
@@ -254,6 +260,9 @@ impl From<C2sLimitProfileInput> for C2sLimitProfile {
             incoming_stanzas_per_connection: input
                 .incoming_stanzas_per_connection
                 .with_defaults(defaults.incoming_stanzas_per_connection),
+            new_recipients_per_connection: input
+                .new_recipients_per_connection
+                .with_defaults(defaults.new_recipients_per_connection),
             incoming_xml_per_connection: input.incoming_xml_per_connection,
         }
     }

@@ -116,6 +116,8 @@ pub enum StanzaErrorCondition {
     JidMalformed,
     NotAcceptable,
     NotAllowed,
+    /// Uses `wait` because the client can retry after the policy allows it.
+    PolicyViolation,
     RemoteServerNotFound,
     ResourceConstraint,
     ServiceUnavailable,
@@ -132,6 +134,7 @@ impl StanzaErrorCondition {
             Self::JidMalformed => "jid-malformed",
             Self::NotAcceptable => "not-acceptable",
             Self::NotAllowed => "not-allowed",
+            Self::PolicyViolation => "policy-violation",
             Self::RemoteServerNotFound => "remote-server-not-found",
             Self::ResourceConstraint => "resource-constraint",
             Self::ServiceUnavailable => "service-unavailable",
@@ -148,7 +151,7 @@ impl StanzaErrorCondition {
             | Self::ServiceUnavailable => "cancel",
             Self::Forbidden => "auth",
             Self::InternalServerError => "cancel",
-            Self::ResourceConstraint => "wait",
+            Self::PolicyViolation | Self::ResourceConstraint => "wait",
         }
     }
 }

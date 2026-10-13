@@ -172,11 +172,14 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                     .id(parsed.arena())
                     .map_err(|_| CloseOutcome::InternalError)?
                     .unwrap_or("");
-                send_bind_error(&mut session.writer, id, "modify", "bad-request").await?;
-                invalid_attempts += 1;
-                if invalid_attempts == MAX_BIND_FAILURES {
-                    return Err(CloseOutcome::BindingAttemptsExceeded);
-                }
+                reject_bind(
+                    &mut session.writer,
+                    id,
+                    "modify",
+                    "bad-request",
+                    &mut invalid_attempts,
+                )
+                .await?;
                 continue;
             }
             Some(StreamEvent::StreamEnd) | None => return Err(CloseOutcome::StreamEnd),
@@ -214,11 +217,14 @@ async fn bind_session<A: ChunkAllocator + Clone>(
         let requested = match requested_resource(&stanza) {
             Ok(requested) => requested,
             Err(BindRequestError::Malformed) => {
-                send_bind_error(&mut session.writer, id, "modify", "bad-request").await?;
-                invalid_attempts += 1;
-                if invalid_attempts == MAX_BIND_FAILURES {
-                    return Err(CloseOutcome::BindingAttemptsExceeded);
-                }
+                reject_bind(
+                    &mut session.writer,
+                    id,
+                    "modify",
+                    "bad-request",
+                    &mut invalid_attempts,
+                )
+                .await?;
                 continue;
             }
             Err(BindRequestError::Internal) => {
@@ -231,15 +237,25 @@ async fn bind_session<A: ChunkAllocator + Clone>(
         {
             Ok(registration) => registration,
             Err(RouterError::InvalidResource) => {
-                send_bind_error(&mut session.writer, id, "modify", "bad-request").await?;
-                invalid_attempts += 1;
-                if invalid_attempts == MAX_BIND_FAILURES {
-                    return Err(CloseOutcome::BindingAttemptsExceeded);
-                }
+                reject_bind(
+                    &mut session.writer,
+                    id,
+                    "modify",
+                    "bad-request",
+                    &mut invalid_attempts,
+                )
+                .await?;
                 continue;
             }
             Err(RouterError::ResourceLimit) => {
-                send_bind_error(&mut session.writer, id, "wait", "resource-constraint").await?;
+                reject_bind(
+                    &mut session.writer,
+                    id,
+                    "wait",
+                    "resource-constraint",
+                    &mut invalid_attempts,
+                )
+                .await?;
                 continue;
             }
             Err(_) => return Err(CloseOutcome::InternalError),
@@ -374,6 +390,21 @@ async fn send_bind_error(
     xml.push_str(STANZA_ERROR_NAMESPACE);
     xml.push_str("'/></error></iq>");
     writer.send(&xml).await
+}
+
+async fn reject_bind(
+    writer: &mut Writer,
+    id: &str,
+    error_type: &str,
+    condition: &str,
+    attempts: &mut usize,
+) -> Result<(), CloseOutcome> {
+    send_bind_error(writer, id, error_type, condition).await?;
+    *attempts += 1;
+    if *attempts == MAX_BIND_FAILURES {
+        return Err(CloseOutcome::BindingAttemptsExceeded);
+    }
+    Ok(())
 }
 
 fn escape_text(output: &mut String, text: &str) {

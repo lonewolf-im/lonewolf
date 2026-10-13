@@ -30,11 +30,12 @@ pub struct PolicyRequest<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Verdict {
     Allow,
-    /// Replies are suppressed for presence, error stanzas, and IQ responses.
+    /// Rejections are suppressed for presence, error messages, and IQ responses.
     Reject {
         condition: StanzaErrorCondition,
         application: Option<ApplicationCondition>,
     },
+    /// Dropped IQ requests receive a service-unavailable error after stanza filtering.
     Drop,
 }
 
@@ -48,19 +49,26 @@ impl Verdict {
         }
     }
 
-    /// Rejection drops presence, error messages, and IQ responses to prevent reply loops.
+    /// Suppresses rejection replies that could cause loops and answers dropped IQ requests.
     pub fn for_stanza(self, kind: StanzaType) -> Self {
-        if matches!(self, Self::Reject { .. })
-            && matches!(
-                kind,
-                StanzaType::Presence(_)
-                    | StanzaType::Message(MessageType::Error)
-                    | StanzaType::Iq(IqType::Result | IqType::Error)
-            )
-        {
-            Self::Drop
-        } else {
-            self
+        match self {
+            Self::Drop if matches!(kind, StanzaType::Iq(IqType::Get | IqType::Set)) => {
+                Self::Reject {
+                    condition: StanzaErrorCondition::ServiceUnavailable,
+                    application: None,
+                }
+            }
+            Self::Reject { .. }
+                if matches!(
+                    kind,
+                    StanzaType::Presence(_)
+                        | StanzaType::Message(MessageType::Error)
+                        | StanzaType::Iq(IqType::Result | IqType::Error)
+                ) =>
+            {
+                Self::Drop
+            }
+            verdict => verdict,
         }
     }
 }
@@ -136,6 +144,49 @@ mod tests {
             StanzaType::Iq(IqType::Get),
         ] {
             assert_eq!(rejection.for_stanza(kind), rejection);
+        }
+        assert_eq!(
+            Verdict::Drop.for_stanza(StanzaType::Message(MessageType::Chat)),
+            Verdict::Drop
+        );
+    }
+
+    #[test]
+    fn dropped_iq_requests_are_rejected_and_other_stanzas_stay_dropped() {
+        let service_unavailable = Verdict::Reject {
+            condition: StanzaErrorCondition::ServiceUnavailable,
+            application: None,
+        };
+        let competing_rejection = Verdict::Reject {
+            condition: StanzaErrorCondition::Forbidden,
+            application: None,
+        };
+        for kind in [StanzaType::Iq(IqType::Get), StanzaType::Iq(IqType::Set)] {
+            assert_eq!(Verdict::Drop.for_stanza(kind), service_unavailable);
+            assert_eq!(
+                Verdict::Drop
+                    .strictest(competing_rejection)
+                    .for_stanza(kind),
+                service_unavailable
+            );
+        }
+        for kind in [
+            StanzaType::Iq(IqType::Result),
+            StanzaType::Iq(IqType::Error),
+            StanzaType::Presence(PresenceType::Available),
+            StanzaType::Presence(PresenceType::Unavailable),
+            StanzaType::Presence(PresenceType::Subscribe),
+            StanzaType::Presence(PresenceType::Subscribed),
+            StanzaType::Presence(PresenceType::Unsubscribe),
+            StanzaType::Presence(PresenceType::Unsubscribed),
+            StanzaType::Presence(PresenceType::Probe),
+            StanzaType::Presence(PresenceType::Error),
+            StanzaType::Message(MessageType::Normal),
+            StanzaType::Message(MessageType::Chat),
+            StanzaType::Message(MessageType::Groupchat),
+            StanzaType::Message(MessageType::Headline),
+            StanzaType::Message(MessageType::Error),
+        ] {
             assert_eq!(Verdict::Drop.for_stanza(kind), Verdict::Drop);
         }
     }

@@ -1436,3 +1436,253 @@ fn probe_unavailable_cache_is_bounded_and_does_not_invent_history() -> Result<()
         Ok(())
     })
 }
+
+fn retirement_session(
+    shard: &mut Shard<GlobalChunkAllocator>,
+    account: &AccountKey,
+    resource: &str,
+    token: u64,
+    unavailable: Option<RoutedStanza<GlobalChunkAllocator>>,
+) -> (
+    Receiver<MailboxEntry<GlobalChunkAllocator>>,
+    oneshot::Receiver<Retired<GlobalChunkAllocator>>,
+) {
+    let (outbound, inbound) = async_channel::bounded(1);
+    let (retired, retirement) = oneshot::channel();
+    shard
+        .accounts
+        .entry(account.as_str().into())
+        .or_default()
+        .insert(
+            resource.into(),
+            Session {
+                token,
+                alive: Arc::new(AtomicBool::new(true)),
+                outbound,
+                inbound: inbound.clone(),
+                priority: Some(0),
+                tags: SessionTags::default(),
+                presence: unavailable.clone(),
+                unavailable,
+                directed: Vec::new(),
+                retired,
+            },
+        );
+    (inbound, retirement)
+}
+
+#[test]
+fn retiring_push_families_distinguish_full_and_closed_mailboxes() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        for family in ["presence", "end", "cascade", "selected", "tagged"] {
+            for full in [true, false] {
+                let account = account()?;
+                let mut shard = Shard::new();
+                let unavailable =
+                    routed("<presence from='alice@localhost/root' type='unavailable'/>").await?;
+                let (_root_inbound, _root_retired) =
+                    retirement_session(&mut shard, &account, "root", 1, Some(unavailable.clone()));
+                let (inbound, retirement) =
+                    retirement_session(&mut shard, &account, "recipient", 2, None);
+                let stanza = routed("<presence to='alice@localhost'/>").await?;
+                if full {
+                    shard.accounts[account.as_str()]["recipient"]
+                        .outbound
+                        .try_send(MailboxEntry::new(stanza.clone()))?;
+                } else {
+                    inbound.close();
+                }
+                match family {
+                    "presence" => {
+                        shard.presence(&account, "root", 1, Some(0), stanza, Some(unavailable))?;
+                    }
+                    "end" => {
+                        shard.end_presence(&account, "root", 1)?;
+                    }
+                    "cascade" => shard.cleanup(&account, "root", 1),
+                    "selected" => assert_eq!(
+                        shard.deliver_presence_where(stanza, |session| session.token == 2),
+                        Err(if full {
+                            RouterError::Busy
+                        } else {
+                            RouterError::NotFound
+                        })
+                    ),
+                    "tagged" => {
+                        shard.tag(&account, "recipient", 2, SessionTag::Interested)?;
+                        let push =
+                            routed("<iq to='alice@localhost/recipient' type='set' id='push'><query xmlns='jabber:iq:roster'/></iq>")
+                                .await?;
+                        shard.deliver_to_tagged(&account, SessionTag::Interested, &mut |_| {
+                            Ok(push.clone())
+                        })?;
+                    }
+                    _ => unreachable!(),
+                }
+                let retired = retirement.await?;
+                if full {
+                    assert_eq!(retired.cause, RetireCause::MailboxOverflow, "{family}");
+                    assert_eq!(inbound.len(), 1);
+                } else {
+                    assert_eq!(retired.cause, RetireCause::Evicted, "{family}");
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn cascade_mailbox_failures_keep_independent_causes() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        for overflow_root in [true, false] {
+            let account = account()?;
+            let mut shard = Shard::new();
+            let unavailable =
+                routed("<presence from='alice@localhost/root' type='unavailable'/>").await?;
+            let (root_inbound, root_retirement) =
+                retirement_session(&mut shard, &account, "root", 1, Some(unavailable));
+            let (sibling_inbound, sibling_retirement) =
+                retirement_session(&mut shard, &account, "sibling", 2, None);
+            let stanza = routed("<presence to='alice@localhost'/>").await?;
+            if overflow_root {
+                shard.accounts[account.as_str()]["root"]
+                    .outbound
+                    .try_send(MailboxEntry::new(stanza.clone()))?;
+                sibling_inbound.close();
+                assert_eq!(
+                    shard.deliver_presence_where(stanza, |session| session.token == 1),
+                    Err(RouterError::Busy)
+                );
+            } else {
+                root_inbound.close();
+                shard.accounts[account.as_str()]["sibling"]
+                    .outbound
+                    .try_send(MailboxEntry::new(stanza))?;
+                shard.cleanup(&account, "root", 1);
+            }
+            assert_eq!(
+                root_retirement.await?.cause,
+                if overflow_root {
+                    RetireCause::MailboxOverflow
+                } else {
+                    RetireCause::Evicted
+                }
+            );
+            assert_eq!(
+                sibling_retirement.await?.cause,
+                if overflow_root {
+                    RetireCause::Evicted
+                } else {
+                    RetireCause::MailboxOverflow
+                }
+            );
+            assert!(shard.accounts.is_empty());
+            assert_eq!(shard.last_unavailable.len(), 1);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn selected_fault_and_deletion_causes_survive_full_mailbox_cascades() -> Result<(), Box<dyn Error>>
+{
+    Runtime::new()?.block_on(async {
+        for failure in [
+            None,
+            Some(RouterError::Unavailable),
+            Some(RouterError::InvalidTarget),
+        ] {
+            let deletion = failure.is_none();
+            for first in ["desk", "phone"] {
+                let account = account()?;
+                let mut shard = Shard::new();
+                let stanza = routed("<presence to='alice@localhost'/>").await?;
+                let mut retirements = Vec::new();
+                for (token, resource) in [
+                    (1, first),
+                    (2, if first == "desk" { "phone" } else { "desk" }),
+                    (3, "unrelated"),
+                ] {
+                    let unavailable = routed(&format!(
+                        "<presence from='alice@localhost/{resource}' type='unavailable'/>"
+                    ))
+                    .await?;
+                    let (_inbound, retirement) = retirement_session(
+                        &mut shard,
+                        &account,
+                        resource,
+                        token,
+                        Some(unavailable),
+                    );
+                    shard.accounts[account.as_str()][resource]
+                        .outbound
+                        .try_send(MailboxEntry::new(stanza.clone()))?;
+                    if resource != "unrelated" {
+                        shard.tag(&account, resource, token, SessionTag::Interested)?;
+                    }
+                    retirements.push((resource, retirement));
+                }
+                shard.record_last_unavailable(account.as_str());
+                if deletion {
+                    shard.retire_account(&account);
+                } else {
+                    let invalid =
+                        routed("<iq to='bob@localhost/desk' type='set' id='push'><query xmlns='jabber:iq:roster'/></iq>").await?;
+                    assert_eq!(
+                        shard.deliver_to_tagged(&account, SessionTag::Interested, &mut |_| {
+                            if failure == Some(RouterError::InvalidTarget) {
+                                Ok(invalid.clone())
+                            } else {
+                                Err(RouterError::Unavailable)
+                            }
+                        }),
+                        Err(failure.ok_or("missing build failure")?)
+                    );
+                }
+                for (resource, retirement) in retirements {
+                    assert_eq!(
+                        retirement.await?.cause,
+                        if deletion {
+                            RetireCause::AccountDeleted
+                        } else if resource == "unrelated" {
+                            RetireCause::MailboxOverflow
+                        } else {
+                            RetireCause::Evicted
+                        },
+                        "{resource}"
+                    );
+                }
+                assert!(shard.accounts.is_empty());
+                assert_eq!(shard.last_unavailable.is_empty(), deletion);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn last_mailbox_overflow_records_unavailable_until_account_deletion() -> Result<(), Box<dyn Error>>
+{
+    Runtime::new()?.block_on(async {
+        let account = account()?;
+        let mut shard = Shard::new();
+        let unavailable =
+            routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?;
+        let (_inbound, retirement) =
+            retirement_session(&mut shard, &account, "desk", 1, Some(unavailable));
+        let stanza = routed("<presence to='alice@localhost'/>").await?;
+        shard.accounts[account.as_str()]["desk"]
+            .outbound
+            .try_send(MailboxEntry::new(stanza.clone()))?;
+        assert_eq!(
+            shard.deliver_presence_where(stanza, |_| true),
+            Err(RouterError::Busy)
+        );
+        assert_eq!(retirement.await?.cause, RetireCause::MailboxOverflow);
+        assert_eq!(shard.last_unavailable.len(), 1);
+        shard.retire_account(&account);
+        assert!(shard.last_unavailable.is_empty());
+        Ok(())
+    })
+}

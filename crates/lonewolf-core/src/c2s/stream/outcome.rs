@@ -7,6 +7,7 @@ use lonewolf_xmpp::parser::ParseError;
 use lonewolf_xmpp::stanza::BuildError;
 use lonewolf_xmpp::stream::StreamErrorCondition;
 
+use crate::router::local::RetireCause;
 use crate::stages::StageFailure;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +43,7 @@ pub(crate) enum CloseOutcome {
     EstablishmentTimeout,
     AuthenticationAttemptsExceeded,
     AccountDeleted,
+    MailboxOverflow,
     InternalError,
     TransportError,
 }
@@ -102,6 +104,7 @@ impl CloseOutcome {
             Self::UnsupportedStanzaType => Some(StreamErrorCondition::UnsupportedStanzaType),
             Self::CertificateInvalid => Some(StreamErrorCondition::Reset),
             Self::AccountDeleted => Some(StreamErrorCondition::NotAuthorized),
+            Self::MailboxOverflow => Some(StreamErrorCondition::ResourceConstraint),
             Self::InternalError => Some(StreamErrorCondition::InternalServerError),
             _ => None,
         }
@@ -139,8 +142,19 @@ impl CloseOutcome {
             Self::EstablishmentTimeout => "establishment_timeout",
             Self::AuthenticationAttemptsExceeded => "authentication_attempts_exceeded",
             Self::AccountDeleted => "account_deleted",
+            Self::MailboxOverflow => "mailbox_overflow",
             Self::InternalError => "internal_error",
             Self::TransportError => "transport_error",
+        }
+    }
+}
+
+impl From<RetireCause> for CloseOutcome {
+    fn from(cause: RetireCause) -> Self {
+        match cause {
+            RetireCause::MailboxOverflow => Self::MailboxOverflow,
+            RetireCause::Evicted | RetireCause::RouterStopped => Self::InternalError,
+            RetireCause::AccountDeleted => Self::AccountDeleted,
         }
     }
 }
@@ -185,6 +199,47 @@ impl From<StageFailure> for CloseOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_causes_preserve_policy_deletion_and_fault_outcomes() {
+        for (cause, outcome, condition, name) in [
+            (
+                RetireCause::MailboxOverflow,
+                CloseOutcome::MailboxOverflow,
+                StreamErrorCondition::ResourceConstraint,
+                "mailbox_overflow",
+            ),
+            (
+                RetireCause::Evicted,
+                CloseOutcome::InternalError,
+                StreamErrorCondition::InternalServerError,
+                "internal_error",
+            ),
+            (
+                RetireCause::RouterStopped,
+                CloseOutcome::InternalError,
+                StreamErrorCondition::InternalServerError,
+                "internal_error",
+            ),
+            (
+                RetireCause::AccountDeleted,
+                CloseOutcome::AccountDeleted,
+                StreamErrorCondition::NotAuthorized,
+                "account_deleted",
+            ),
+        ] {
+            assert_eq!(CloseOutcome::from(cause), outcome);
+            assert_eq!(outcome.stream_condition(), Some(condition));
+            assert_eq!(outcome.as_str(), name);
+            assert!(!outcome.is_phase_timeout());
+        }
+        assert_eq!(
+            super::super::header::stream_error_xml(CloseOutcome::MailboxOverflow).as_deref(),
+            Some(
+                "<stream:error><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>"
+            )
+        );
+    }
 
     #[test]
     fn parse_errors_preserve_distinct_close_categories() {

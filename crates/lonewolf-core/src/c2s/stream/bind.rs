@@ -19,7 +19,6 @@ use super::header::{ResponseVersion, escape_attribute};
 use super::outcome::CloseOutcome;
 use super::session::{Session, Writer, namespace_error};
 use crate::hosts::Hosts;
-use crate::router::local::RetireCause;
 use crate::router::{Registration, RouterError, RouterHandle};
 
 const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
@@ -260,8 +259,8 @@ async fn bind_session<A: ChunkAllocator + Clone>(
             )
             .await
             {
-                Either::Left((Ok(retired), _)) if retired.cause == RetireCause::AccountDeleted => {
-                    return Err(CloseOutcome::AccountDeleted);
+                Either::Left((Ok(retired), _)) => {
+                    return Err(retired.cause.into());
                 }
                 Either::Left(_) => return Err(CloseOutcome::InternalError),
                 Either::Right((result, _)) => result?,

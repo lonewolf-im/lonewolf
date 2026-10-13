@@ -26,7 +26,7 @@ use super::super::close;
 use super::*;
 use crate::config::Config;
 use crate::hosts::Hosts;
-use crate::router::local::LocalRouter;
+use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Router, StoredRelease};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;

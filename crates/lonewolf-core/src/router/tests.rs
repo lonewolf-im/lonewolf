@@ -896,6 +896,10 @@ fn roster_push_retires_an_interested_resource_with_a_full_mailbox() -> TestResul
                 StanzaKind::Message
             );
         }
+        assert_eq!(
+            phone.wait_retired().await?.cause,
+            RetireCause::MailboxOverflow
+        );
         assert!(phone.recv().await.is_none());
 
         drop(desk);
@@ -938,6 +942,12 @@ fn roster_push_build_failure_retires_every_interested_resource() -> TestResult {
                 assert_eq!(
                     handle.route_full(stanza(&to).await?).await,
                     Err(RouterError::NotFound)
+                );
+            }
+            for registration in [&desk, &phone, &tablet] {
+                assert_eq!(
+                    registration.wait_retired().await?.cause,
+                    RetireCause::Evicted
                 );
             }
             assert!(desk.recv().await.is_none());

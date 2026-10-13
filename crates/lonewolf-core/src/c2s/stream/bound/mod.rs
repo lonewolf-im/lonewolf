@@ -48,7 +48,7 @@ use crate::delivery::{
     commit_and_deliver, report_failure, report_handler_failure, storage_failure,
 };
 use crate::order::Ticket;
-use crate::router::local::{DirectedWithdrawal, PresenceChange, RetireCause, SessionLiveness};
+use crate::router::local::{DirectedWithdrawal, PresenceChange, SessionLiveness};
 use crate::router::{
     Destination, MailboxEntry, Registration, ResourceMatch, RoutedStanza, RouterError,
     RouterHandle, ServiceRoute, SessionHandle,
@@ -277,8 +277,8 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
             session.outbox.writer.stop();
             let outcome = match stopped {
                 Either::Right(outcome) => outcome,
-                Either::Left(Ok(RetireCause::AccountDeleted)) => CloseOutcome::AccountDeleted,
-                Either::Left(_) => CloseOutcome::InternalError,
+                Either::Left(Ok(cause)) => cause.into(),
+                Either::Left(Err(_)) => CloseOutcome::InternalError,
             };
             let ended = session.end().await;
             let outcome = ended.map_or(CloseOutcome::InternalError, |()| outcome);

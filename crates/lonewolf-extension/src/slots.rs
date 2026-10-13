@@ -3,15 +3,16 @@
 use std::sync::Arc;
 
 use lonewolf_storage::Storage;
-use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
+use lonewolf_xmpp::jid::Jid;
 
 use crate::account::AccountHandler;
 use crate::iq::{IqHandler, IqRoute};
 use crate::message::MessageHandler;
 use crate::presence::{PresenceHandler, PresenceRequestType};
+use crate::service::ServiceHandler;
 use crate::{ExtensionRegistry, RegistrationError};
 
-/// Collects one extension's handlers for one host.
 pub struct Slots<'r, A: ChunkAllocator, S: Storage> {
     registry: &'r mut ExtensionRegistry<A, S>,
     extension: &'static str,
@@ -39,6 +40,30 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
         handler: Arc<dyn PresenceHandler<A, S>>,
     ) -> Result<(), RegistrationError> {
         self.registry.presence.register(kind, handler)
+    }
+
+    /// Registers every stanza addressed to the normalized domain or a JID under it.
+    pub fn service(
+        &mut self,
+        domain: &str,
+        handler: Arc<dyn ServiceHandler<A, S>>,
+    ) -> Result<(), RegistrationError> {
+        let invalid = || RegistrationError::InvalidServiceDomain(domain.into());
+        let mut arena = Arena::try_new(ArenaConfig::default()).map_err(|_| invalid())?;
+        let jid = Jid::from_parts_in(None, domain, None, &mut arena).map_err(|_| invalid())?;
+        if jid.resolve(&arena).map_err(|_| invalid())?.domainpart() != domain {
+            return Err(invalid());
+        }
+        if self
+            .registry
+            .services
+            .iter()
+            .any(|(registered, _)| registered == domain)
+        {
+            return Err(RegistrationError::DuplicateService(domain.into()));
+        }
+        self.registry.services.push((domain.into(), handler));
+        Ok(())
     }
 
     /// Registers the host's only offline fallback.

@@ -312,6 +312,15 @@ impl<A: ChunkAllocator> SessionHandle<A> {
             .await?
     }
 
+    pub(crate) async fn record_service_presence(
+        &self,
+        to: JidRef<'_>,
+        available: bool,
+    ) -> Result<(), RouterError> {
+        self.record_directed_presence(DirectedRecipient::new(to), available)
+            .await
+    }
+
     pub(crate) async fn tag(&self, tag: SessionTag) -> Result<(), RouterError> {
         self.router
             .with_shard(self.shard, |shard| {

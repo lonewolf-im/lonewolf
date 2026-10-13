@@ -3,6 +3,7 @@
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 
+use std::collections::BTreeMap;
 use std::env;
 use std::future::{Future, pending};
 use std::io;
@@ -39,9 +40,9 @@ mod storage;
 use config::Config;
 pub use error::RunError;
 use hosts::Hosts;
-use router::Router;
 pub use router::RouterFailure;
 use router::local::LocalRouter;
+use router::{Router, ServiceRoute};
 use storage::StoreRegistry;
 
 const DISPATCH_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
@@ -146,6 +147,24 @@ pub fn run_with_extensions(
                             host: error.host,
                             source: error.source,
                         })?;
+                let mut services = BTreeMap::new();
+                for registry in enabled_extensions.values() {
+                    for (domain, handler) in registry.services() {
+                        if hosts.is_local_host(domain) || services.contains_key(domain) {
+                            return Err(RunError::ServiceDomain {
+                                domain: domain.clone(),
+                            });
+                        }
+                        services.insert(
+                            domain.clone(),
+                            ServiceRoute {
+                                domain: Arc::from(domain.as_str()),
+                                handler: Arc::clone(handler),
+                            },
+                        );
+                        tracing::info!(service_domain = %domain, "service registered");
+                    }
+                }
                 let (deleter, deletions) = account_deletion::channel();
                 let admin = if config.admin.enabled {
                     Some(
@@ -166,8 +185,11 @@ pub fn run_with_extensions(
                         .c2s
                         .max_directed_presence_recipients_per_resource,
                 );
-                let serving_router = router
-                    .insert(Router::new(hosts.clone(), local).with_extensions(enabled_extensions));
+                let serving_router = router.insert(
+                    Router::new(hosts.clone(), local)
+                        .with_extensions(enabled_extensions)
+                        .with_services(services),
+                );
                 let router_handle = serving_router.handle();
                 let deletion_router = router_handle.clone();
                 let deletion_storage = storage.clone();

@@ -14,7 +14,7 @@ use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition};
 
 use super::{DeliveryOutcome, deliver};
 use crate::config::Config;
-use crate::delivery::WorkGroup;
+use crate::delivery::{WorkGroup, WorkHandle};
 use crate::hosts::Hosts;
 use crate::router::local::LocalRouter;
 use crate::router::{RoutedStanza, Router, RouterHandle};
@@ -28,7 +28,7 @@ struct Fixture {
     router: Router<GlobalChunkAllocator>,
     handle: RouterHandle<GlobalChunkAllocator>,
     allocator: GlobalChunkAllocator,
-    work: WorkGroup,
+    work: WorkHandle,
 }
 
 impl Fixture {
@@ -45,7 +45,7 @@ impl Fixture {
             router,
             handle,
             allocator: GlobalChunkAllocator,
-            work: WorkGroup::new(),
+            work: WorkGroup::new().handle(),
         })
     }
 

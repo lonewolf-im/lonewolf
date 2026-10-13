@@ -21,6 +21,9 @@ pub enum RunError {
         source: RegistrationError,
     },
     ExtensionCatalog(RegistrationError),
+    ServiceDomain {
+        domain: String,
+    },
     StanzaPool(PoolError),
     Runtime(io::Error),
     WorkerCount(io::Error),
@@ -55,6 +58,10 @@ impl fmt::Display for RunError {
             Self::ExtensionCatalog(source) => {
                 write!(formatter, "cannot initialize extension catalog: {source}")
             }
+            Self::ServiceDomain { domain } => write!(
+                formatter,
+                "service domain {domain:?} conflicts with a served host or another service"
+            ),
             Self::StanzaPool(source) => {
                 write!(formatter, "cannot initialize stanza arena pool: {source}")
             }
@@ -103,7 +110,7 @@ impl Error for RunError {
             | Self::C2s(source) => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),
             Self::Storage { source, .. } => Some(source),
-            Self::UnknownStore(_) => None,
+            Self::UnknownStore(_) | Self::ServiceDomain { .. } => None,
         }
     }
 }

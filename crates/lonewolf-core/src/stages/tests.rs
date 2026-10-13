@@ -500,3 +500,70 @@ fn evaluate_fails_closed_and_stops_handlers_and_checks_after_drop() -> TestResul
         Ok(())
     })
 }
+
+#[derive(Clone)]
+struct UnavailableAllocator;
+
+// This allocator never returns a chunk.
+unsafe impl lonewolf_util::arena::ChunkAllocator for UnavailableAllocator {
+    fn allocate(
+        &self,
+        _: std::alloc::Layout,
+    ) -> Result<lonewolf_util::arena::Chunk, lonewolf_util::arena::AllocationError> {
+        Err(lonewolf_util::arena::AllocationError::Exhausted)
+    }
+
+    unsafe fn deallocate(&self, _: lonewolf_util::arena::Chunk) {
+        panic!("unavailable allocator has no live chunks");
+    }
+}
+
+#[test]
+fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_extension::presence::PresenceAudience;
+        use lonewolf_storage::Storage;
+        use lonewolf_storage::roster::{PendingSubscription, RosterJid};
+        use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
+
+        let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+        let config = Config::default();
+        let router = Router::new(
+            Hosts::new(&config.hosts, None)?,
+            LocalRouter::new(UnavailableAllocator),
+        );
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let subscriber = account("bob@localhost")?;
+        let contact = account("carol@other.localhost")?;
+        let pending = PendingSubscription {
+            sender: RosterJid::from(&subscriber),
+            stanza: Box::from([]),
+        };
+        let mut audience = PresenceAudience {
+            subscribers: vec![RosterJid::from(&subscriber)],
+            contacts: vec![contact.clone()],
+            pending: vec![pending.clone()],
+        };
+        let mut arena = Arena::try_new(Default::default())?;
+        let sender = Jid::parse_in("alice@localhost/res", &mut arena)?;
+        let transaction = storage.begin_read().await?;
+        crate::stages::policy::filter_audience(
+            &handle,
+            &transaction,
+            &UnavailableAllocator,
+            &owner,
+            sender.resolve(&arena)?,
+            StanzaType::Presence(PresenceType::Available),
+            &mut audience,
+        )
+        .await
+        .map_err(|_| "audience filtering attempted allocation")?;
+        assert_eq!(audience.subscribers, [RosterJid::from(&subscriber)]);
+        assert_eq!(audience.contacts, [contact]);
+        assert_eq!(audience.pending, [pending]);
+        router.shutdown().await?;
+        Ok(())
+    })
+}

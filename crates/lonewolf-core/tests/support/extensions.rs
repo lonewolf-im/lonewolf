@@ -112,7 +112,9 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     }))?;
     extensions.register(Arc::new(TestHostService))?;
     extensions.register(Arc::new(TestDiscovery))?;
-    extensions.register(Arc::new(TestPolicy))?;
+    extensions.register(Arc::new(TestPolicy {
+        enabled: AtomicBool::new(true),
+    }))?;
     for kind in [
         ServiceLifecycleKind::OfflineWithdrawal,
         ServiceLifecycleKind::DelayedAvailable,
@@ -1255,7 +1257,9 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
     }
 }
 
-struct TestPolicy;
+struct TestPolicy {
+    enabled: AtomicBool,
+}
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPolicy {
     fn name(&self) -> &'static str {
@@ -1267,7 +1271,16 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPolicy {
         _: &str,
         slots: &mut Slots<'_, A, RedbStorage>,
     ) -> Result<(), RegistrationError> {
-        slots.policy(self);
+        slots.policy(self.clone());
+        slots.iq(
+            IqRoute {
+                scope: IqScope::Server,
+                kind: IqRequestType::Set,
+                namespace: "urn:lonewolf:test:policy",
+                name: "toggle",
+            },
+            self,
+        )?;
         Ok(())
     }
 }
@@ -1275,6 +1288,9 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPolicy {
 impl PolicyHandler<RedbStorage> for TestPolicy {
     fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
         Box::pin(async move {
+            if !self.enabled.load(Ordering::Relaxed) {
+                return Ok(Verdict::Allow);
+            }
             Ok(match (request.peer.localpart(), request.direction) {
                 (Some("blocked"), Direction::Outbound) => Verdict::Reject {
                     condition: StanzaErrorCondition::NotAcceptable,
@@ -1299,6 +1315,30 @@ impl PolicyHandler<RedbStorage> for TestPolicy {
                 }
                 _ => Verdict::Allow,
             })
+        })
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestPolicy {
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn HostLookup,
+        _: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let enabled = match request
+                .payload
+                .attribute("enabled", "")
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+            {
+                Some("true") => true,
+                Some("false") => false,
+                _ => return Err(StanzaErrorCondition::BadRequest.into()),
+            };
+            self.enabled.store(enabled, Ordering::Relaxed);
+            Ok(IqReply::new(None, Effects::none()))
         })
     }
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::support::{C2sSuite, TestResult};
+use super::support::{C2sSuite, Client, TestResult};
 
 #[test]
 fn outbound_rejection_carries_the_application_condition() -> TestResult {
@@ -100,10 +100,12 @@ fn iq_requests_follow_policy_and_rejected_responses_are_dropped() -> TestResult 
         "<iq type='get' to='blocked@localhost/res' id='reject'><query xmlns='urn:test:iq'/></iq>",
     )?;
     alice.expect_xml("<iq xmlns='jabber:client' from='blocked@localhost/res' type='error' id='reject'><query xmlns='urn:test:iq'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
+    toggle(&mut alice, false)?;
     alice.send("<presence to='blocked@localhost/res'/>")?;
     blocked.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/res' to='blocked@localhost/res'/>",
     )?;
+    toggle(&mut alice, true)?;
     blocked.send(
         "<iq type='get' to='alice@localhost/res' id='answer'><query xmlns='urn:test:iq'/></iq>",
     )?;
@@ -112,6 +114,7 @@ fn iq_requests_follow_policy_and_rejected_responses_are_dropped() -> TestResult 
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost/res' type='chat' id='ready'/>")?;
     second.send("<message type='chat' to='blocked@localhost/res' id='first'/>")?;
     blocked.expect_xml("<message xmlns='jabber:client' from='blocked@localhost/second' to='blocked@localhost/res' type='chat' id='first'/>")?;
+    toggle(&mut alice, false)?;
     alice.send("<presence to='blocked@localhost/res' type='unavailable'/>")?;
     blocked.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/res' to='blocked@localhost/res' type='unavailable'/>")?;
     alice.close()?;
@@ -133,5 +136,259 @@ fn stanzas_from_services_follow_inbound_policy() -> TestResult {
     bob.send("<message type='chat' to='alice@localhost/res' id='first'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
     alice.close()?;
+    bob.close()
+}
+
+fn toggle(client: &mut Client, enabled: bool) -> TestResult {
+    client.send(&format!("<iq type='set' to='localhost' id='toggle'><toggle xmlns='urn:lonewolf:test:policy' enabled='{enabled}'/></iq>"))?;
+    let reply = client.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("type"), Some("result"), "{reply:?}");
+    assert_eq!(reply.attribute("id"), Some("toggle"), "{reply:?}");
+    assert_eq!(reply.attribute("from"), Some("localhost"), "{reply:?}");
+    assert!(reply.children.is_empty(), "{reply:?}");
+    Ok(())
+}
+
+fn barrier(client: &mut Client) -> TestResult {
+    client.send("<iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")
+}
+
+fn mutually_subscribe(
+    left: &mut Client,
+    left_name: &str,
+    right: &mut Client,
+    right_name: &str,
+) -> TestResult {
+    left.send(&format!(
+        "<presence type='subscribed' to='{right_name}@localhost'/>"
+    ))?;
+    barrier(left)?;
+    right.send(&format!("<presence type='subscribe' to='{left_name}@localhost'/><presence type='subscribed' to='{left_name}@localhost'/>"))?;
+    barrier(right)?;
+    left.send(&format!(
+        "<presence type='subscribe' to='{right_name}@localhost'/>"
+    ))?;
+    barrier(left)
+}
+
+#[test]
+fn directed_presence_follows_policy() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "blocked", "bob"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut blocked = suite.connect("blocked", "password", "x")?;
+    let mut bob = suite.connect("bob", "password", "res")?;
+
+    alice.send("<presence to='blocked@localhost/x'/>")?;
+    barrier(&mut alice)?;
+    alice.close()?;
+    suite.wait_for_log("stream disconnected")?;
+    toggle(&mut bob, false)?;
+    bob.send("<message type='chat' to='blocked@localhost/x' id='first'/>")?;
+    blocked.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='blocked@localhost/x' type='chat' id='first'/>")?;
+    blocked.close()?;
+    bob.close()
+}
+
+#[test]
+fn probes_from_dropped_peers_are_unanswered() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "spammer", "bob"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut spammer = suite.connect("spammer", "password", "res")?;
+    let mut bob = suite.connect("bob", "password", "res")?;
+    toggle(&mut alice, false)?;
+    mutually_subscribe(&mut alice, "alice", &mut spammer, "spammer")?;
+    spammer.send("<presence/>")?;
+    spammer.expect_xml(
+        "<presence xmlns='jabber:client' from='spammer@localhost/res' to='spammer@localhost'/>",
+    )?;
+    toggle(&mut alice, true)?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='alice@localhost'/>",
+    )?;
+    spammer.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='spammer@localhost'/>",
+    )?;
+
+    spammer.send("<presence type='probe' to='alice@localhost'/>")?;
+    barrier(&mut spammer)?;
+    bob.send("<message type='chat' to='spammer@localhost/res' id='first'/>")?;
+    spammer.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='spammer@localhost/res' type='chat' id='first'/>")?;
+    alice.close()?;
+    spammer.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/res' to='spammer@localhost' type='unavailable'/>")?;
+    spammer.close()?;
+    bob.close()
+}
+
+#[test]
+fn subscription_requests_from_dropped_peers_are_discarded() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "spammer", "bob"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut spammer = suite.connect("spammer", "password", "res")?;
+    let mut bob = suite.connect("bob", "password", "res")?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='alice@localhost'/>",
+    )?;
+
+    spammer.send("<presence type='subscribe' to='alice@localhost'/>")?;
+    barrier(&mut spammer)?;
+    bob.send("<message type='chat' to='alice@localhost/res' id='first'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
+    alice.close()?;
+    spammer.close()?;
+    bob.close()
+}
+
+#[test]
+fn broadcasts_skip_members_rejected_by_policy() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "bob", "blocked", "spammer"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut blocked = suite.connect("blocked", "password", "res")?;
+    let mut spammer = suite.connect("spammer", "password", "res")?;
+    toggle(&mut alice, false)?;
+    mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
+    mutually_subscribe(&mut alice, "alice", &mut blocked, "blocked")?;
+    mutually_subscribe(&mut alice, "alice", &mut spammer, "spammer")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/res' to='bob@localhost'/>",
+    )?;
+    blocked.send("<presence/>")?;
+    blocked.expect_xml(
+        "<presence xmlns='jabber:client' from='blocked@localhost/res' to='blocked@localhost'/>",
+    )?;
+    spammer.send("<presence/>")?;
+    spammer.expect_xml(
+        "<presence xmlns='jabber:client' from='spammer@localhost/res' to='spammer@localhost'/>",
+    )?;
+    barrier(&mut spammer)?;
+    toggle(&mut alice, true)?;
+
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='alice@localhost'/>",
+    )?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='blocked@localhost/res' to='alice@localhost'/>",
+    )?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost'/>",
+    )?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost'/>",
+    )?;
+    spammer.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='spammer@localhost'/>",
+    )?;
+    barrier(&mut alice)?;
+    toggle(&mut bob, false)?;
+    bob.send("<message type='chat' to='alice@localhost/res' id='first'/><message type='chat' to='blocked@localhost/res' id='first'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
+    blocked.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='blocked@localhost/res' type='chat' id='first'/>")?;
+    toggle(&mut alice, true)?;
+    alice.close()?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost' type='unavailable'/>")?;
+    spammer.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/res' to='spammer@localhost' type='unavailable'/>")?;
+    bob.close()?;
+    blocked.close()?;
+    spammer.close()
+}
+
+#[test]
+fn session_end_broadcast_skips_members_rejected_by_policy() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "bob", "blocked", "spammer"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut blocked = suite.connect("blocked", "password", "res")?;
+    let mut spammer = suite.connect("spammer", "password", "res")?;
+    toggle(&mut alice, false)?;
+    mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
+    mutually_subscribe(&mut alice, "alice", &mut blocked, "blocked")?;
+    mutually_subscribe(&mut alice, "alice", &mut spammer, "spammer")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/res' to='bob@localhost'/>",
+    )?;
+    blocked.send("<presence/>")?;
+    blocked.expect_xml(
+        "<presence xmlns='jabber:client' from='blocked@localhost/res' to='blocked@localhost'/>",
+    )?;
+    spammer.send("<presence/>")?;
+    spammer.expect_xml(
+        "<presence xmlns='jabber:client' from='spammer@localhost/res' to='spammer@localhost'/>",
+    )?;
+    barrier(&mut spammer)?;
+    toggle(&mut alice, true)?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='alice@localhost'/>",
+    )?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='blocked@localhost/res' to='alice@localhost'/>",
+    )?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost'/>",
+    )?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost'/>",
+    )?;
+    spammer.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='spammer@localhost'/>",
+    )?;
+    barrier(&mut alice)?;
+
+    alice.close()?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost' type='unavailable'/>")?;
+    spammer.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/res' to='spammer@localhost' type='unavailable'/>")?;
+    toggle(&mut bob, false)?;
+    bob.send("<message type='chat' to='blocked@localhost/res' id='first'/>")?;
+    blocked.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='blocked@localhost/res' type='chat' id='first'/>")?;
+    bob.close()?;
+    blocked.close()?;
+    spammer.close()
+}
+
+#[test]
+fn pending_requests_from_dropped_peers_are_not_replayed() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "spammer", "bob"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut spammer = suite.connect("spammer", "password", "res")?;
+    let mut bob = suite.connect("bob", "password", "res")?;
+    toggle(&mut bob, false)?;
+    spammer.send("<presence type='subscribe' to='alice@localhost'/>")?;
+    barrier(&mut spammer)?;
+    toggle(&mut bob, true)?;
+    let mut alice = suite.connect("alice", "password", "res")?;
+
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/res' to='alice@localhost'/>",
+    )?;
+    barrier(&mut alice)?;
+    bob.send("<message type='chat' to='alice@localhost/res' id='first'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
+    alice.close()?;
+    spammer.close()?;
     bob.close()
 }

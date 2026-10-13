@@ -1051,10 +1051,40 @@ fn derives_message_and_presence_errors() -> TestResult {
         let view = reply.resolve(&arena)?;
         assert_eq!(view.stanza_type(), error_type);
         let error = view.children()?.next().ok_or("missing error")??;
-        assert_eq!(error.attribute("type", "")?, Some("wait"));
+        assert_eq!(error.attribute("type", "")?, Some("cancel"));
         assert_eq!(source.resolve(&arena)?.stanza_type(), source_type);
     }
     Ok(())
+}
+
+#[test]
+fn stanza_error_conditions_have_expected_names_and_types() {
+    for condition in [
+        StanzaErrorCondition::BadRequest,
+        StanzaErrorCondition::Conflict,
+        StanzaErrorCondition::Forbidden,
+        StanzaErrorCondition::InternalServerError,
+        StanzaErrorCondition::ItemNotFound,
+        StanzaErrorCondition::JidMalformed,
+        StanzaErrorCondition::NotAcceptable,
+        StanzaErrorCondition::NotAllowed,
+        StanzaErrorCondition::ResourceConstraint,
+        StanzaErrorCondition::ServiceUnavailable,
+    ] {
+        let expected = match condition {
+            StanzaErrorCondition::BadRequest => ("bad-request", "modify"),
+            StanzaErrorCondition::Conflict => ("conflict", "cancel"),
+            StanzaErrorCondition::Forbidden => ("forbidden", "auth"),
+            StanzaErrorCondition::InternalServerError => ("internal-server-error", "cancel"),
+            StanzaErrorCondition::ItemNotFound => ("item-not-found", "cancel"),
+            StanzaErrorCondition::JidMalformed => ("jid-malformed", "modify"),
+            StanzaErrorCondition::NotAcceptable => ("not-acceptable", "modify"),
+            StanzaErrorCondition::NotAllowed => ("not-allowed", "cancel"),
+            StanzaErrorCondition::ResourceConstraint => ("resource-constraint", "wait"),
+            StanzaErrorCondition::ServiceUnavailable => ("service-unavailable", "cancel"),
+        };
+        assert_eq!((condition.as_str(), condition.error_type()), expected);
+    }
 }
 
 #[test]

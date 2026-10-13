@@ -174,7 +174,7 @@ fn misaddressed_iq_results_become_an_internal_error() -> TestResult {
     let mut alice = suite.connect("alice", "password", "desk")?;
 
     alice.send("<iq type='get' id='misaddressed'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='misaddressed' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/><error type='wait'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='misaddressed' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
     alice.close()
@@ -627,7 +627,7 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
         suite.create_account("alice", "password")?;
         let mut alice = suite.connect("alice", "password", "desk")?;
         alice.send(&format!("<iq type='{kind}' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail></iq>"))?;
-        alice.expect_xml("<iq xmlns='jabber:client' type='error' to='alice@localhost/desk' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail><error type='wait'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        alice.expect_xml("<iq xmlns='jabber:client' type='error' to='alice@localhost/desk' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
         alice.send("<message to='alice@localhost/desk' id='still-open'/>")?;
         alice.expect_xml("<message xmlns='jabber:client' to='alice@localhost/desk' from='alice@localhost/desk' id='still-open'/>")?;
         let logs = suite.wait_for_log("internal operation failed")?;

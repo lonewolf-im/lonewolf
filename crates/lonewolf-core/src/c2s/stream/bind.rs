@@ -15,7 +15,7 @@ use lonewolf_xmpp::stanza::{
 
 use super::certificate::CertificateMonitor;
 use super::establish::Established;
-use super::header::escape_attribute;
+use super::header::{ResponseVersion, escape_attribute};
 use super::outcome::CloseOutcome;
 use super::session::{Session, Writer, namespace_error};
 use crate::hosts::Hosts;
@@ -107,6 +107,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
             .reject_header(
                 header.response_to.as_deref(),
                 header.client_content_namespace,
+                ResponseVersion::Current,
                 CloseOutcome::InvalidFrom,
             )
             .await);

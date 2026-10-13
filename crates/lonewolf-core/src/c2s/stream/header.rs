@@ -20,6 +20,47 @@ pub(super) struct ClientHeader {
     pub(super) client_content_namespace: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ResponseVersion<'a> {
+    Omitted,
+    Current,
+    ZeroMajor { minor: &'a str },
+}
+
+fn version_components(version: &str) -> Option<(&str, &str)> {
+    let (major, minor) = version.split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|digit| digit.is_ascii_digit())
+        || !minor.bytes().all(|digit| digit.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((normalized_component(major), normalized_component(minor)))
+}
+
+fn normalized_component(component: &str) -> &str {
+    let normalized = component.trim_start_matches('0');
+    if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    }
+}
+
+pub(super) fn response_version_from_header<A: ChunkAllocator>(
+    header: &Parsed<Element, A>,
+) -> Result<ResponseVersion<'_>, CloseOutcome> {
+    let header = header.value().resolve(header.arena())?;
+    let Some(version) = header.attribute("version", "")? else {
+        return Ok(ResponseVersion::Omitted);
+    };
+    Ok(match version_components(version) {
+        Some(("0", minor)) => ResponseVersion::ZeroMajor { minor },
+        _ => ResponseVersion::Current,
+    })
+}
+
 pub(super) fn validate_header<A: ChunkAllocator>(
     header: &Parsed<Element, A>,
     content_namespace: &str,
@@ -35,15 +76,8 @@ pub(super) fn validate_header<A: ChunkAllocator>(
     let version = header
         .attribute("version", "")?
         .ok_or(CloseOutcome::UnsupportedVersion)?;
-    let (major, minor) = version
-        .split_once('.')
-        .ok_or(CloseOutcome::UnsupportedVersion)?;
-    if major.is_empty()
-        || minor.is_empty()
-        || major.bytes().all(|digit| digit == b'0')
-        || !major.bytes().all(|digit| digit.is_ascii_digit())
-        || !minor.bytes().all(|digit| digit.is_ascii_digit())
-    {
+    let (major, _) = version_components(version).ok_or(CloseOutcome::UnsupportedVersion)?;
+    if major == "0" {
         return Err(CloseOutcome::UnsupportedVersion);
     }
     let to = header.attribute("to", "")?;
@@ -96,11 +130,15 @@ pub(super) fn response_header_xml(
     host: &str,
     to: Option<&str>,
     client_content_namespace: bool,
-    include_version: bool,
+    version: ResponseVersion<'_>,
 ) -> Result<String, CloseOutcome> {
     let mut id = [0_u8; 16];
     graviola::random::fill(&mut id).map_err(|_| CloseOutcome::InternalError)?;
-    let mut xml = String::with_capacity(192 + host.len() + to.map_or(0, str::len));
+    let version_bytes = match version {
+        ResponseVersion::ZeroMajor { minor } => minor.len(),
+        _ => 0,
+    };
+    let mut xml = String::with_capacity(192 + host.len() + to.map_or(0, str::len) + version_bytes);
     xml.push_str(
         "<?xml version='1.0'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams'",
     );
@@ -112,8 +150,14 @@ pub(super) fn response_header_xml(
     xml.push_str("' id='");
     write!(xml, "{:032x}", u128::from_be_bytes(id)).map_err(|_| CloseOutcome::InternalError)?;
     xml.push('\'');
-    if include_version {
-        xml.push_str(" version='1.0'");
+    match version {
+        ResponseVersion::Omitted => {}
+        ResponseVersion::Current => xml.push_str(" version='1.0'"),
+        ResponseVersion::ZeroMajor { minor } => {
+            xml.push_str(" version='0.");
+            xml.push_str(minor);
+            xml.push('\'');
+        }
     }
     xml.push_str(" xml:lang='en'");
     if let Some(to) = to {

@@ -65,7 +65,6 @@ impl CloseOutcome {
             ParseError::NotWellFormed | ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
             ParseError::RestrictedXml => Self::RestrictedXml,
             ParseError::UnsupportedEncoding => Self::UnsupportedEncoding,
-            ParseError::UnsupportedVersion => Self::UnsupportedVersion,
             _ => Self::ParserError,
         }
     }
@@ -189,10 +188,6 @@ mod tests {
             (
                 ParseError::UnsupportedEncoding,
                 CloseOutcome::UnsupportedEncoding,
-            ),
-            (
-                ParseError::UnsupportedVersion,
-                CloseOutcome::UnsupportedVersion,
             ),
             (
                 ParseError::SizeLimitExceeded { limit: 1 },

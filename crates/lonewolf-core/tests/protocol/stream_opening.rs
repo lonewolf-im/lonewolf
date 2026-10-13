@@ -2,6 +2,99 @@
 
 use super::support::{C2sSuite, OPEN, TestResult};
 
+fn rejected_version_headers() -> impl Iterator<Item = (String, Option<&'static str>, &'static str)>
+{
+    [
+        ("", "http://etherx.jabber.org/streams", "to='localhost'", None, "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='0.9'", Some("0.9"), "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='00.009'", Some("0.9"), "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='000.000'", Some("0.0"), "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='0.000999999999999999999999999999999999999999'", Some("0.999999999999999999999999999999999999999"), "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='1.x'", Some("1.0"), "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='+1.0'", Some("1.0"), "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' xmlns:w='urn:x'", None, "invalid-namespace"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='00.009' xmlns:w='urn:x'", Some("0.9"), "invalid-namespace"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='1.x' xmlns:w='urn:x'", Some("1.0"), "invalid-namespace"),
+        ("", "http://etherx.jabber.org/streams", "to='unknown.example'", None, "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='unknown.example' version='00.009'", Some("0.9"), "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='unknown.example' version='99999999999999999999999999999999999.99999999999999999999999999999'", Some("1.0"), "host-unknown"),
+        ("", "urn:invalid:stream", "to='localhost' version='0.9'", Some("1.0"), "invalid-namespace"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='0.9' version='0.9'", Some("1.0"), "not-well-formed"),
+        ("<?xml version='1.1'?>", "http://etherx.jabber.org/streams", "to='localhost'", None, "unsupported-version"),
+        ("<?xml version='1.1'?>", "http://etherx.jabber.org/streams", "to='localhost' version='00.009'", Some("0.9"), "unsupported-version"),
+        ("<?xml version='2.0'?>", "http://etherx.jabber.org/streams", "to='localhost' version='0.9'", Some("1.0"), "not-well-formed"),
+        ("<?xml version='1.1'?>", "http://etherx.jabber.org/streams", "to='localhost' version='0.9' flag='&#x1;'", Some("1.0"), "not-well-formed"),
+    ].into_iter().map(|(declaration, namespace, attributes, version, condition)| {
+        (format!("{declaration}<stream:stream xmlns:stream='{namespace}' xmlns='jabber:client' {attributes}>"), version, condition)
+    })
+}
+
+#[test]
+fn rejected_headers_negotiate_response_version_before_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for (opening, version, condition) in rejected_version_headers() {
+        let mut client = suite.tcp_client()?;
+        let header = client.open_with(&opening)?;
+        assert_eq!(header.attribute("version"), version, "{opening}");
+        client.expect_stream_error(condition)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_headers_negotiate_response_version_after_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for (opening, version, condition) in rejected_version_headers() {
+        let mut client = suite.tls_client()?;
+        let header = client.open_with(&opening)?;
+        assert_eq!(header.attribute("version"), version, "{opening}");
+        client.expect_stream_error(condition)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_headers_negotiate_response_version_after_authentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for (opening, version, condition) in rejected_version_headers() {
+        let mut client = suite.unauthenticated_client()?;
+        client.authenticate("alice", "pencil")?;
+        let mut client = client.restart();
+        let header = client.open_with(&opening)?;
+        assert_eq!(header.attribute("version"), version, "{opening}");
+        client.expect_stream_error(condition)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn higher_versions_wider_than_machine_integers_negotiate_one_zero_in_every_phase() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    let opening = "<?xml version='1.99999999999999999999999999999'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='99999999999999999999999999999999999.99999999999999999999999999999'>";
+    let mut plain = suite.tcp_client()?;
+    assert_eq!(plain.open_with(opening)?.attribute("version"), Some("1.0"));
+    plain.features()?;
+    plain.close()?;
+    let mut encrypted = suite.tls_client()?;
+    assert_eq!(
+        encrypted.open_with(opening)?.attribute("version"),
+        Some("1.0")
+    );
+    encrypted.features()?;
+    encrypted.close()?;
+    let mut authenticated = suite.unauthenticated_client()?;
+    authenticated.authenticate("alice", "pencil")?;
+    let mut authenticated = authenticated.restart();
+    assert_eq!(
+        authenticated.open_with(opening)?.attribute("version"),
+        Some("1.0")
+    );
+    authenticated.features()?;
+    authenticated.close()
+}
+
 const HEADER_NAMESPACE_REJECTIONS: [(&str, &str); 6] = [
     ("xmlns:w='urn:x'", "invalid-namespace"),
     ("xmlns:c='jabber:cl&#105;ent'", "invalid-namespace"),
@@ -400,7 +493,7 @@ fn old_version_is_rejected_before_tls() -> TestResult {
     let mut client = suite.tcp_client()?;
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='0.9'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("0.9"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -420,7 +513,7 @@ fn signed_version_is_rejected_before_tls() -> TestResult {
     let mut client = suite.tcp_client()?;
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='+1.0'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("1.0"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -430,7 +523,7 @@ fn nonnumeric_version_is_rejected_before_tls() -> TestResult {
     let mut client = suite.tcp_client()?;
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.x'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("1.0"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -515,13 +608,15 @@ fn wrong_stream_namespace_is_rejected_before_tls() -> TestResult {
 }
 
 #[test]
-fn xml_version_1_1_is_rejected_before_tls() -> TestResult {
+fn xml_version_1_1_is_accepted_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.tcp_client()?;
 
-    let header = client.open_with(r#"<?xml version='1.1'?>"#)?;
-    assert_eq!(header.attribute("version"), None);
-    client.expect_stream_error("unsupported-version")
+    let opening = format!("<?xml version='1.1'?>{OPEN}");
+    let header = client.open_with(&opening)?;
+    assert_eq!(header.attribute("version"), Some("1.0"));
+    client.features()?;
+    client.close()
 }
 
 #[test]
@@ -584,7 +679,7 @@ fn old_version_is_rejected_after_tls() -> TestResult {
     let mut client = suite.tls_client()?;
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='0.9'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("0.9"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -604,7 +699,7 @@ fn signed_version_is_rejected_after_tls() -> TestResult {
     let mut client = suite.tls_client()?;
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='+1.0'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("1.0"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -614,7 +709,7 @@ fn nonnumeric_version_is_rejected_after_tls() -> TestResult {
     let mut client = suite.tls_client()?;
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.x'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("1.0"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -673,13 +768,15 @@ fn wrong_stream_namespace_is_rejected_after_tls() -> TestResult {
 }
 
 #[test]
-fn xml_version_1_1_is_rejected_after_tls() -> TestResult {
+fn xml_version_1_1_is_accepted_after_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.tls_client()?;
 
-    let header = client.open_with(r#"<?xml version='1.1'?>"#)?;
-    assert_eq!(header.attribute("version"), None);
-    client.expect_stream_error("unsupported-version")
+    let opening = format!("<?xml version='1.1'?>{OPEN}");
+    let header = client.open_with(&opening)?;
+    assert_eq!(header.attribute("version"), Some("1.0"));
+    client.features()?;
+    client.close()
 }
 
 #[test]
@@ -757,7 +854,7 @@ fn old_version_is_rejected_after_authentication() -> TestResult {
     let mut client = client.restart();
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='0.9'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("0.9"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -783,7 +880,7 @@ fn signed_version_is_rejected_after_authentication() -> TestResult {
     let mut client = client.restart();
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='+1.0'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("1.0"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -796,7 +893,7 @@ fn nonnumeric_version_is_rejected_after_authentication() -> TestResult {
     let mut client = client.restart();
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.x'>"#)?;
-    assert_eq!(header.attribute("version"), None);
+    assert_eq!(header.attribute("version"), Some("1.0"));
     client.expect_stream_error("unsupported-version")
 }
 
@@ -873,16 +970,18 @@ fn wrong_stream_namespace_is_rejected_after_authentication() -> TestResult {
 }
 
 #[test]
-fn xml_version_1_1_is_rejected_after_authentication() -> TestResult {
+fn xml_version_1_1_is_accepted_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     let mut client = suite.unauthenticated_client()?;
     client.authenticate("alice", "pencil")?;
     let mut client = client.restart();
 
-    let header = client.open_with(r#"<?xml version='1.1'?>"#)?;
-    assert_eq!(header.attribute("version"), None);
-    client.expect_stream_error("unsupported-version")
+    let opening = format!("<?xml version='1.1'?>{OPEN}");
+    let header = client.open_with(&opening)?;
+    assert_eq!(header.attribute("version"), Some("1.0"));
+    client.features()?;
+    client.close()
 }
 
 #[test]

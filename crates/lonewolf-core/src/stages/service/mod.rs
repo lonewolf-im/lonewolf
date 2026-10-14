@@ -226,5 +226,4 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
 }
 
 #[cfg(test)]
-#[path = "service_tests.rs"]
 mod tests;

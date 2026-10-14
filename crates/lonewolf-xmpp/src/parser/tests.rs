@@ -316,6 +316,119 @@ impl AsyncRead for Fragmented<'_> {
 }
 
 #[test]
+fn adjacent_attributes_fail_terminally_at_every_transport_split() -> TestResult {
+    block_on(async {
+        for (opening, content) in [
+            (
+                OPEN,
+                "<message to='bob@localhost/phone'id='missing-space'><body>probe</body></message>",
+            ),
+            (OPEN, "<message id='a'type='chat'/>"),
+            (OPEN, "<message xmlns:x='urn:x'xmlns:y='urn:y'/>"),
+            (OPEN, "<message><x xmlns='urn:x' a='1'b='2'/></message>"),
+            (OPEN, "<iq type='bogus'id='invalid'/>"),
+            (
+                "",
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'xmlns='jabber:client'>",
+            ),
+            ("", "<?xml version='1.0'encoding='UTF-8'?>"),
+            ("", "<?xml version='1.0'encoding='ISO-8859-1'?>"),
+            ("", "<?xml version='1.0' encoding='UTF-8'standalone='yes'?>"),
+            (OPEN, "<message id='a'\u{a0}type='chat'/>"),
+            (OPEN, "<message id='a'\u{b}type='chat'/>"),
+        ] {
+            let input = format!("{opening}{content}<message id='trailing'/>{CLOSE}");
+            for (chunk, split) in [(1, input.len()), (usize::MAX, input.len())]
+                .into_iter()
+                .chain((1..input.len()).map(|split| (usize::MAX, split)))
+            {
+                let mut source = Fragmented::new(input.as_bytes(), chunk);
+                source.split = split;
+                let mut parser = XmppParser::new(source, config(4096)?, GlobalChunkAllocator);
+                if !opening.is_empty() {
+                    open(&mut parser).await?;
+                }
+                assert!(
+                    matches!(parser.next_event().await, Err(ParseError::NotWellFormed)),
+                    "{content}, chunk={chunk}, split={split}"
+                );
+                assert!(matches!(
+                    parser.next_event().await,
+                    Err(ParseError::ParserFailed)
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn attribute_spacing_rejects_incomplete_raw_suffixes() {
+    for suffix in [
+        "a='1'",
+        " =''",
+        " name",
+        " name ",
+        " name=",
+        " name= ",
+        " name=value",
+        " name='value",
+        " name=\"value",
+        " name='value'other='value'",
+        " name='value'\u{a0}other='value'",
+        " name='value'\u{c}other='value'",
+    ] {
+        let content = format!("x{suffix}");
+        let start = quick_xml::events::BytesStart::from_content(&content, 1);
+        assert!(
+            matches!(
+                super::names::validate_attribute_spacing(&start),
+                Err(ParseError::NotWellFormed)
+            ),
+            "{suffix:?}"
+        );
+    }
+}
+
+#[test]
+fn valid_attribute_spacing_and_quoted_values_survive_every_transport_split() -> TestResult {
+    block_on(async {
+        for content in [
+            "<message/>",
+            "<message > <body/></message>",
+            "<message id = '' type=\"chat\"/>",
+            "<message\tid\t=\t'a'\r type\r=\r'chat'\n xml:lang\n=\n'en' \t\r\n/>",
+            "<message a=\"' b='x' &quot; &apos;\" b='\" c=\"x\" &apos; &quot;'><x xmlns='urn:x' flag=''/></message>",
+        ] {
+            let input = format!(
+                "<?xml\tversion \r=\n'1.0'\r encoding=\"UTF-8\"\n standalone = 'yes' \t?>{OPEN}{content}{CLOSE}"
+            );
+            for (chunk, split) in [(1, input.len()), (usize::MAX, input.len())]
+                .into_iter()
+                .chain((1..input.len()).map(|split| (usize::MAX, split)))
+            {
+                let mut source = Fragmented::new(input.as_bytes(), chunk);
+                source.split = split;
+                let mut parser = XmppParser::new(source, config(4096)?, GlobalChunkAllocator);
+                open(&mut parser).await?;
+                let parsed = stanza(&mut parser).await?;
+                let view = parsed.value().resolve(parsed.arena())?;
+                if content.contains(" a=") {
+                    assert_eq!(view.attribute("a", "")?, Some("' b='x' \" '"));
+                    assert_eq!(view.attribute("b", "")?, Some("\" c=\"x\" ' \""));
+                }
+                assert!(matches!(
+                    parser.next_event().await?,
+                    Some(StreamEvent::StreamEnd)
+                ));
+                assert!(parser.next_event().await?.is_none());
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn parses_every_transport_split_with_namespaces_entities_and_utf8() -> TestResult {
     let input = format!(
         "{OPEN}<message type='chat' from='Alice@EXAMPLE.COM/Desk' id='a&amp;b'><body>hé&amp;<![CDATA[<llo>]]>&#x1F43A;</body><x xmlns='urn:example' flag='a&#x9;b\r\nc'/></message>{CLOSE}"

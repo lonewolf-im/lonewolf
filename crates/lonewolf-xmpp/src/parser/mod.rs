@@ -543,6 +543,7 @@ async fn validate_stream_start<R: AsyncBufRead + Unpin>(
 
 fn validate_declaration(declaration: &BytesDecl<'_>) -> Result<(), ParseError> {
     let start = BytesStart::from_content(declaration.as_ref(), 3);
+    names::validate_attribute_spacing(&start)?;
     let mut previous = 0;
     let mut unsupported_encoding = false;
     for attribute in start.attributes() {

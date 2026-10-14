@@ -6,6 +6,45 @@ use std::net::Shutdown;
 use std::time::{Duration, Instant};
 
 #[test]
+fn adjacent_attributes_return_not_well_formed_before_authentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for input in ["<message id='a'type='chat'/>", "<iq type='bogus'id='a'/>"] {
+        let mut client = suite.unauthenticated_client()?;
+        client.send(input)?;
+        client.expect_stream_error("not-well-formed")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn adjacent_attributes_return_not_well_formed_before_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for input in ["<message id='a'type='chat'/>", "<iq type='bogus'id='a'/>"] {
+        let mut client = suite.authenticated_client("alice", "pencil")?;
+        client.send(input)?;
+        client.expect_stream_error("not-well-formed")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn adjacent_attributes_prevent_delivery_and_trailing_iq_after_binding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "pencil")?;
+    let mut recipient = suite.connect("bob", "pencil", "phone")?;
+    let mut sender = suite.connect("alice", "pencil", "desk")?;
+
+    sender.send("<message to='bob@localhost/phone'id='missing-space'><body>probe</body></message><iq type='get' id='trailing'><query xmlns='jabber:iq:roster'/></iq>")?;
+    sender.expect_stream_error("not-well-formed")?;
+    recipient.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+    recipient.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' id='sentinel'/>")?;
+    recipient.expect_no_tls_input()?;
+    recipient.close()
+}
+
+#[test]
 fn plaintext_parser_failure_half_closes_and_holds_capacity_until_peer_eof() -> TestResult {
     let suite = C2sSuite::with_limits("max_connections_per_ip = 1")?;
     let mut client = suite.tcp_client()?;

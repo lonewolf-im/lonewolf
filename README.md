@@ -1,4 +1,4 @@
-<div align="center"><strong>Lonewolf: A modern and highly efficient XMPP server</strong></div>
+<div align="center"><strong>Lonewolf: XMPP with teeth.</strong></div>
 <div align="center">
   <img src="./.github/images/lonewolf.png"
        alt="lonewolf"

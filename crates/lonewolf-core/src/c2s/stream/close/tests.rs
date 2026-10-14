@@ -691,14 +691,8 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
             (CloseOutcome::AuthenticationTimeout, Tail::Error),
             (CloseOutcome::AuthenticationTimeout, Tail::Eof),
         ] {
-            let deadline = Instant::now() + Duration::from_millis(30);
-            let phase = if outcome.is_phase_timeout() {
-                deadline - CLOSE_TIMEOUT
-            } else {
-                deadline
-            };
-            let (context, listener, _peer) = test_context(
-                Some(phase),
+            let (mut context, listener, _peer) = test_context(
+                None,
                 std::future::pending::<Instant>().boxed_local().shared(),
             )
             .await?;
@@ -721,6 +715,12 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
                 .send_header(&header())
                 .await
                 .map_err(|error| format!("{error:?}"))?;
+            let deadline = Instant::now() + Duration::from_millis(30);
+            context.phase_deadline = Some(if outcome.is_phase_timeout() {
+                deadline - CLOSE_TIMEOUT
+            } else {
+                deadline
+            });
             assert_eq!(context.deadline_for(outcome), deadline);
             let result = finish_plain(&mut input, &mut writer, outcome.into(), &context).await;
             let expected = match tail {
@@ -768,12 +768,13 @@ fn peer_footer_plaintext_drain_preserves_outcome_and_deadline() -> TestResult {
                 .send_header(&header())
                 .await
                 .map_err(|error| format!("{error:?}"))?;
-            let deadline = Instant::now() + Duration::from_millis(30);
-            let (context, listener, _peer) = test_context(
-                Some(deadline),
+            let (mut context, listener, _peer) = test_context(
+                None,
                 std::future::pending::<Instant>().boxed_local().shared(),
             )
             .await?;
+            let deadline = Instant::now() + Duration::from_millis(30);
+            context.phase_deadline = Some(deadline);
             assert_eq!(context.deadline_for(CloseOutcome::StreamEnd), deadline);
             let result = finish_plain(
                 &mut input,

@@ -9,3 +9,8 @@
 [![LICENSE](https://img.shields.io/github/license/lonewolf-im/lonewolf)](https://github.com/lonewolf-im/lonewolf/blob/main/LICENSE)
 
 </div>
+
+## Roadmap
+
+See the [roadmap to 1.0](docs/ROADMAP.md) for planned releases, required XEPs, and
+cluster milestones.

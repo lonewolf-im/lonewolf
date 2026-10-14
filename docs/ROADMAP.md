@@ -39,7 +39,7 @@ record any adopted specification changes explicitly.
 | 0.3.0 | Federation, components, rooms, and uploads | Basic Core + IM |
 | 0.4.0 | Resumption, archives, and blocking | Partial Advanced IM |
 | 0.5.0 | Capabilities, PEP, avatars, and bookmarks | Advanced Core + IM |
-| 0.6.0 | Two-node cluster | Preserve desktop compliance across nodes |
+| 0.6.0 | PostgreSQL storage and two-node cluster | Preserve desktop compliance across nodes |
 | 0.7.0 | Mobile efficiency and push | Advanced Mobile |
 | 0.8.0 | Web transports and calling infrastructure | Advanced Web + A/V Calling |
 | 0.9.0 | Cluster recovery and release qualification | All categories under failure and load |
@@ -176,14 +176,40 @@ Release gate:
 Private XML Storage is a Lonewolf compatibility choice; the suite recommends it
 for legacy bookmarks. Direct TLS deployment records complement listener support.
 
-## 0.6.0: Two-node cluster
+## 0.6.0: PostgreSQL storage and two-node cluster
 
 No new XEP is introduced. All earlier features must work across node boundaries.
 
-Select the durable-storage and ownership model before implementation. Compare a
-shared transactional store with owner-local replicated storage. Either choice
-must preserve stable transactional reads, commit/effect ordering, cross-account
-subscription changes, and account deletion/recreation fences.
+Implement PostgreSQL (PgSQL) as a supported storage backend and verify it on one
+node before starting cross-node routing. Keep redb available for embedded,
+single-node deployments. Complete the PostgreSQL backend tracker before the
+cluster tracker.
+
+Storage requirements:
+
+- Remove concrete redb dependencies from core storage selection and extension
+  wiring so operators can select either backend through configuration.
+- Cover every persistent feature from earlier milestones, including accounts,
+  rosters, offline messages, vCards, blocklists, archives, rooms, PEP, and bookmarks.
+- Preserve consistent snapshots, stable transactional reads, atomic writes,
+  commit/effect ordering, and account deletion/recreation fences. Specify locking
+  or isolation and bounded transaction retries; PostgreSQL's default
+  [Read Committed isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+  alone does not meet the existing storage contract.
+- Use an external PostgreSQL service with a Rust client and TLS dependencies that
+  satisfy the project's no-C/C++ application-library rule.
+- Bound connection pools and database waits. Verify cancellation, connection
+  loss, unknown commit outcomes, and error mapping without duplicate effects.
+- Document database connection, TLS, credentials, and pool settings in
+  `examples/lonewolf.toml` when the backend is implemented.
+
+Storage release gate: the same client workflows pass against redb and PostgreSQL
+on one node, with separate transaction and database-failure checks against a real
+PostgreSQL instance. Later features must support both backends.
+
+Select the cluster storage topology and ownership model separately. PostgreSQL
+provides a shared-storage option; cross-node ordering, ownership, and recovery
+still require explicit coordination.
 
 Cluster requirements:
 
@@ -288,8 +314,9 @@ span several trackers. Discovery is the next implementation milestone.
 
 Retain the single-node deployment throughout this roadmap. Preserve the project's
 allocation, logging, dependency, configuration-reference, and test-organization
-rules. Resolve storage and ownership decisions in their trackers; this roadmap
-does not select a database, coordination service, or replication protocol.
+rules. PostgreSQL backend support is planned; select its client, cluster storage
+topology, coordination service, and replication protocol in implementation
+trackers.
 
 The target covers the server compliance categories and their supporting profiles.
 Additional XEPs can follow 1.0 without delaying these milestones. Client-only

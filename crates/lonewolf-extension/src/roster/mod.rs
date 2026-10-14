@@ -27,7 +27,7 @@ use crate::delivery::{
 use crate::iq::{IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope};
 use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
-    PresenceTransition, PresenceUpdate, ReceiveFuture,
+    PresenceTransition, PresenceUpdate, ReceiveFuture, SendFuture,
 };
 use crate::{
     Effects, Extension, ExtensionFactory, ExtensionFuture, HostOptions, OptionsError,
@@ -379,6 +379,15 @@ where
                 contacts,
             }))
         })
+    }
+
+    fn send<'a>(
+        &'a self,
+        request: PresenceRequest<'a, A>,
+        transaction: &'a mut S::Write,
+        _hosts: &'a dyn HostLookup,
+    ) -> SendFuture<'a, A> {
+        Box::pin(subscription::send_subscription(transaction, request))
     }
 
     fn receive<'a>(

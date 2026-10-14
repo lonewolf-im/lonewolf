@@ -26,7 +26,8 @@ use lonewolf_extension::observer::{
 };
 use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_extension::presence::{
-    PresenceAudience, PresenceRequest, PresenceRequestType, PresenceTransition, PresenceUpdate,
+    PresenceAudience, PresenceRequest, PresenceRequestType, PresenceSend, PresenceTransition,
+    PresenceUpdate,
 };
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
@@ -1836,49 +1837,44 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             return Ok(());
         }
 
-        {
-            let (sender, target) = presence_addresses(&routed)?;
-            let account = self.registration.account();
-            let local_recipient = self.router.destination(target) == Destination::Account;
-            if target.as_str() != account.as_str()
-                && (!self.router.policies(account.domain()).is_empty()
-                    || (local_recipient && !self.router.policies(target.domainpart()).is_empty()))
+        let (policy_sender, policy_target) = presence_addresses(&routed)?;
+        let account = self.registration.account();
+        let policy_applies = policy_target.as_str() != account.as_str();
+        let outbound_policy = policy_applies && !self.router.policies(account.domain()).is_empty();
+        let inbound_policy = policy_applies
+            && self.router.destination(policy_target) == Destination::Account
+            && !self.router.policies(policy_target.domainpart()).is_empty();
+        let policy_snapshot = if outbound_policy || inbound_policy {
+            let read = async {
+                self.storage.begin_read().await.map_err(|error| {
+                    close_storage_failure(error, "presence_subscription_begin_read", account)
+                })
+            };
+            Some(self.outbox.drain_until(&self.registration, read).await??)
+        } else {
+            None
+        };
+        if outbound_policy && let Some(snapshot) = policy_snapshot.as_ref() {
+            let checks = [policy::Check {
+                account,
+                direction: Direction::Outbound,
+                peer: policy_target,
+            }];
+            if self
+                .outbox
+                .drain_until(
+                    &self.registration,
+                    policy::evaluate_in(
+                        &self.router,
+                        snapshot,
+                        routed.resolve()?.stanza_type(),
+                        &checks,
+                    ),
+                )
+                .await??
+                != Verdict::Allow
             {
-                let recipient = if local_recipient {
-                    Some(AccountKey::try_from(target)?)
-                } else {
-                    None
-                };
-                let checks = [
-                    policy::Check {
-                        account,
-                        direction: Direction::Outbound,
-                        peer: target,
-                    },
-                    policy::Check {
-                        account: recipient.as_ref().unwrap_or(account),
-                        direction: Direction::Inbound,
-                        peer: sender,
-                    },
-                ];
-                let checks = &checks[..if recipient.is_some() { 2 } else { 1 }];
-                let stage = Stage {
-                    router: &self.router,
-                    storage: &self.storage,
-                    allocator: &self.allocator,
-                    work: &self.work,
-                };
-                if self
-                    .outbox
-                    .drain_until(
-                        &self.registration,
-                        policy::evaluate(&stage, routed.resolve()?.stanza_type(), checks),
-                    )
-                    .await??
-                    != Verdict::Allow
-                {
-                    return Ok(());
-                }
+                return Ok(());
             }
         }
         if let Some(sender_host) = sender_host {
@@ -1907,7 +1903,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 return self.reply_error(&source, error.condition());
             }
         }
-        if remote {
+        if sender_host.is_none() {
+            drop(policy_snapshot);
             return self.reply_error(&source, StanzaErrorCondition::RemoteServerNotFound);
         }
         let registration = &self.registration;
@@ -1924,38 +1921,92 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     registration.account(),
                 )
             })?;
-            let (_, original_target) = presence_addresses(&source)?;
-            if kind != PresenceRequestType::Subscribe
-                && router.is_local_host(original_target.domainpart())
-                && original_target.resourcepart().is_some()
-                && subscription_target(router, &transaction, original_target)
-                    .await?
-                    .is_none()
-            {
-                drop(transaction);
-                return Ok::<_, CloseOutcome>(None);
-            }
-            let effects = match router
-                .presence_handlers(target.domainpart())
-                .and_then(|handlers| handlers.find(kind))
-            {
-                Some(target_host) => {
-                    target_host
-                        .receive(
+            let sent = match sender_host {
+                Some(sender_host) => {
+                    let (sender, target) = presence_addresses(&source)?;
+                    sender_host
+                        .send(
                             PresenceRequest {
                                 kind,
                                 sender,
                                 target,
-                                stanza: &routed,
+                                stanza: &source,
                             },
                             &mut transaction,
                             &delivery,
                         )
                         .await
                 }
-                None => Err(HandlerError::Stanza(
-                    StanzaErrorCondition::ServiceUnavailable,
-                )),
+                None => Ok(PresenceSend::Continue),
+            };
+            let effects = match sent {
+                Ok(PresenceSend::Handled(effects)) => {
+                    drop(policy_snapshot);
+                    Ok(effects)
+                }
+                Ok(PresenceSend::Continue) => {
+                    if inbound_policy && let Some(snapshot) = policy_snapshot.as_ref() {
+                        let recipient = AccountKey::try_from(policy_target)?;
+                        let checks = [policy::Check {
+                            account: &recipient,
+                            direction: Direction::Inbound,
+                            peer: policy_sender,
+                        }];
+                        if policy::evaluate_in(
+                            router,
+                            snapshot,
+                            routed.resolve()?.stanza_type(),
+                            &checks,
+                        )
+                        .await?
+                            != Verdict::Allow
+                        {
+                            return Ok::<_, CloseOutcome>(None);
+                        }
+                    }
+                    drop(policy_snapshot);
+                    if remote {
+                        return Ok(Some(Err(HandlerError::Stanza(
+                            StanzaErrorCondition::RemoteServerNotFound,
+                        ))));
+                    }
+                    let (_, original_target) = presence_addresses(&source)?;
+                    if kind != PresenceRequestType::Subscribe
+                        && router.is_local_host(original_target.domainpart())
+                        && original_target.resourcepart().is_some()
+                        && subscription_target(router, &transaction, original_target)
+                            .await?
+                            .is_none()
+                    {
+                        return Ok(None);
+                    }
+                    match router
+                        .presence_handlers(target.domainpart())
+                        .and_then(|handlers| handlers.find(kind))
+                    {
+                        Some(target_host) => {
+                            target_host
+                                .receive(
+                                    PresenceRequest {
+                                        kind,
+                                        sender,
+                                        target,
+                                        stanza: &routed,
+                                    },
+                                    &mut transaction,
+                                    &delivery,
+                                )
+                                .await
+                        }
+                        None => Err(HandlerError::Stanza(
+                            StanzaErrorCondition::ServiceUnavailable,
+                        )),
+                    }
+                }
+                Err(error) => {
+                    drop(policy_snapshot);
+                    Err(error)
+                }
             };
             Ok(Some(match effects {
                 Ok(effects) => Ok(commit_and_deliver(

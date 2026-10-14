@@ -2,6 +2,49 @@
 
 use super::support::{C2sSuite, OPEN, TLS_NAMESPACE, TestResult};
 
+const OPENINGS_WITH_ADJACENT_ATTRIBUTES: [&str; 4] = [
+    "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'xmlns='jabber:client' to='localhost' version='1.0'>",
+    "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost'version='1.0'>",
+    "<?xml version='1.0'encoding='UTF-8'?>",
+    "<?xml version='1.0'encoding='ISO-8859-1'?>",
+];
+
+#[test]
+fn adjacent_opening_attributes_return_not_well_formed_before_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for opening in OPENINGS_WITH_ADJACENT_ATTRIBUTES {
+        let mut client = suite.tcp_client()?;
+        client.open_with(opening)?;
+        client.expect_stream_error("not-well-formed")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn adjacent_opening_attributes_return_not_well_formed_after_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for opening in OPENINGS_WITH_ADJACENT_ATTRIBUTES {
+        let mut client = suite.tls_client()?;
+        client.open_with(opening)?;
+        client.expect_stream_error("not-well-formed")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn adjacent_opening_attributes_return_not_well_formed_after_authentication() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", "pencil")?;
+    for opening in OPENINGS_WITH_ADJACENT_ATTRIBUTES {
+        let mut client = suite.unauthenticated_client()?;
+        client.authenticate("alice", "pencil")?;
+        let mut client = client.restart();
+        client.open_with(opening)?;
+        client.expect_stream_error("not-well-formed")?;
+    }
+    Ok(())
+}
+
 fn rejected_version_headers() -> impl Iterator<Item = (String, Option<&'static str>, &'static str)>
 {
     [

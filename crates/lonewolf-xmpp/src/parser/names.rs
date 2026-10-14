@@ -15,10 +15,63 @@ use crate::stanza::{
 
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
+pub(super) fn validate_attribute_spacing(start: &BytesStart<'_>) -> Result<(), ParseError> {
+    let bytes = start.attributes_raw().as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        if !is_xml_whitespace(bytes[position]) {
+            return Err(ParseError::NotWellFormed);
+        }
+        while position < bytes.len() && is_xml_whitespace(bytes[position]) {
+            position += 1;
+        }
+        if position == bytes.len() {
+            return Ok(());
+        }
+        let name_start = position;
+        while position < bytes.len()
+            && !is_xml_whitespace(bytes[position])
+            && bytes[position] != b'='
+        {
+            position += 1;
+        }
+        if position == name_start {
+            return Err(ParseError::NotWellFormed);
+        }
+        while position < bytes.len() && is_xml_whitespace(bytes[position]) {
+            position += 1;
+        }
+        if bytes.get(position) != Some(&b'=') {
+            return Err(ParseError::NotWellFormed);
+        }
+        position += 1;
+        while position < bytes.len() && is_xml_whitespace(bytes[position]) {
+            position += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(position) else {
+            return Err(ParseError::NotWellFormed);
+        };
+        position += 1;
+        while position < bytes.len() && bytes[position] != quote {
+            position += 1;
+        }
+        if position == bytes.len() {
+            return Err(ParseError::NotWellFormed);
+        }
+        position += 1;
+    }
+    Ok(())
+}
+
+fn is_xml_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
 pub(super) fn push(
     resolver: &mut NamespaceResolver,
     start: &BytesStart<'_>,
 ) -> Result<(), ParseError> {
+    validate_attribute_spacing(start)?;
     validate_qname(start.name())?;
     // Namespace values must be normalized before the resolver stores or compares them.
     resolver

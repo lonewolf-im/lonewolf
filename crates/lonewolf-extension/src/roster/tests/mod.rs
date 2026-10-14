@@ -30,8 +30,8 @@ use crate::delivery::{
 use crate::discovery::Discovery;
 use crate::iq::{IqHandler, IqReply, IqRequest, IqRequestType};
 use crate::presence::{
-    PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceTransition,
-    PresenceUpdate,
+    PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
+    PresenceTransition, PresenceUpdate,
 };
 use crate::{Effects, Extensions};
 
@@ -49,6 +49,7 @@ struct RecordingDelivery {
     pushes: RefCell<Vec<String>>,
     controls: RefCell<Vec<String>>,
     unavailable: Cell<usize>,
+    current: Cell<usize>,
     failing_deliveries: Cell<usize>,
 }
 
@@ -106,6 +107,7 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
     }
 
     fn current_presence<'a>(&'a self, _: &'a AccountKey, _: &'a AccountKey) -> DeliveryFuture<'a> {
+        self.current.set(self.current.get() + 1);
         Box::pin(async { Ok(()) })
     }
 
@@ -1135,4 +1137,319 @@ fn roster_read_and_mutation_failures_keep_storage_categories_and_operation() {
         assert_eq!(error.condition(), condition);
         assert_eq!(error.failure(), None);
     }
+}
+
+async fn sender_hook(
+    call: &SubscribeCall,
+    kind: PresenceRequestType,
+    transaction: &mut lonewolf_storage::RedbWrite,
+    delivery: &RecordingDelivery,
+) -> Result<PresenceSend<GlobalChunkAllocator>, HandlerError> {
+    let view = call
+        .stanza
+        .resolve()
+        .unwrap_or_else(|error| panic!("{error}"));
+    TestPresenceHandler::send(
+        &Roster::default(),
+        PresenceRequest {
+            kind,
+            sender: view.from().expect("sender address").expect("sender"),
+            target: view.to().expect("target address").expect("target"),
+            stanza: &call.stanza,
+        },
+        transaction,
+        delivery,
+    )
+    .await
+}
+
+#[test]
+fn sender_preapproval_preserves_fields_and_rolls_back_before_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    for target in [
+        "future@example.com",
+        "future@remote.invalid",
+        "future@other.example",
+    ] {
+        let (_directory, roster) = roster();
+        let owner = account("alice@example.com");
+        let contact = RosterJid::from(&account(target));
+        create_account(&roster, &owner);
+        let mut stored = subscribed(contact.clone(), SubscriptionState::To);
+        stored.name = Some("Future".into());
+        stored.groups = vec!["Friends".into(), "Work".into()];
+        stored.subscription.pending_out = true;
+        block_on(async {
+            let mut transaction = roster.storage.begin_write().await?;
+            transaction.put_roster_item(&owner, &stored).await?;
+            transaction.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+        let before = snapshot(&roster, &owner);
+        let delivery = RecordingDelivery::default();
+        let call = SubscribeCall::new("alice@example.com/desk", target);
+        for rollback in [true, false] {
+            let effects = block_on(async {
+                let mut transaction = roster.storage.begin_write().await?;
+                let PresenceSend::Handled(effects) = sender_hook(
+                    &call,
+                    PresenceRequestType::Subscribed,
+                    &mut transaction,
+                    &delivery,
+                )
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                else {
+                    panic!("preapproval must be handled");
+                };
+                assert_eq!(effects.accounts, vec![owner.clone()]);
+                assert!(delivery.pushes.borrow().is_empty());
+                if rollback {
+                    drop(transaction);
+                    Ok::<_, Box<dyn std::error::Error>>(None)
+                } else {
+                    transaction.commit().await?;
+                    Ok(Some(effects))
+                }
+            })?;
+            if let Some(effects) = effects {
+                stored.subscription.approved = true;
+                assert_eq!(item(&roster, &owner, &contact), Some(stored.clone()));
+                assert_eq!(
+                    snapshot(&roster, &owner).version.get(),
+                    before.version.get() + 1
+                );
+                block_on((effects.deliver)(&delivery))?;
+                assert_eq!(delivery.pushes.borrow().len(), 1);
+            } else {
+                assert_eq!(item(&roster, &owner, &contact), Some(stored.clone()));
+                assert_eq!(snapshot(&roster, &owner).version, before.version);
+            }
+        }
+        for (kind, approved, pushes) in [
+            (PresenceRequestType::Subscribed, true, 1),
+            (PresenceRequestType::Unsubscribed, false, 2),
+            (PresenceRequestType::Unsubscribed, false, 2),
+        ] {
+            let before_version = snapshot(&roster, &owner).version;
+            let changed = stored.subscription.approved != approved;
+            block_on(async {
+                let mut transaction = roster.storage.begin_write().await?;
+                let PresenceSend::Handled(effects) =
+                    sender_hook(&call, kind, &mut transaction, &delivery)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?
+                else {
+                    panic!("sender operation must be handled");
+                };
+                assert_eq!(effects.accounts, vec![owner.clone()]);
+                transaction.commit().await?;
+                (effects.deliver)(&delivery).await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+            stored.subscription.approved = approved;
+            assert_eq!(item(&roster, &owner, &contact), Some(stored.clone()));
+            assert_eq!(
+                snapshot(&roster, &owner).version.get(),
+                before_version.get() + u64::from(changed)
+            );
+            assert_eq!(delivery.pushes.borrow().len(), pushes);
+        }
+        assert!(delivery.controls.borrow().is_empty());
+        assert_eq!(delivery.current.get(), 0);
+        assert_eq!(delivery.unavailable.get(), 0);
+        assert!(pending(&roster, &owner).is_empty());
+        block_on(async {
+            let read = roster.storage.begin_read().await?;
+            assert!(
+                lonewolf_storage::account::AccountReads::account(&read, &account(target))
+                    .await?
+                    .is_none()
+            );
+            assert!(read.roster(&account(target)).await?.items.is_empty());
+            assert!(read.pending_requests(&account(target)).await?.is_empty());
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn sender_hook_classifies_grants_pending_requests_and_target_forms_without_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    for state in [
+        None,
+        Some(SubscriptionState::None),
+        Some(SubscriptionState::To),
+        Some(SubscriptionState::From),
+        Some(SubscriptionState::Both),
+    ] {
+        for has_pending in [false, true] {
+            for kind in [
+                PresenceRequestType::Subscribed,
+                PresenceRequestType::Unsubscribed,
+            ] {
+                let (_directory, roster) = roster();
+                let owner = account("alice@example.com");
+                let contact = RosterJid::from(&account("future@remote.invalid"));
+                create_account(&roster, &owner);
+                block_on(async {
+                    let mut transaction = roster.storage.begin_write().await?;
+                    if let Some(state) = state {
+                        transaction
+                            .put_roster_item(&owner, &subscribed(contact.clone(), state))
+                            .await?;
+                    }
+                    if has_pending {
+                        transaction
+                            .put_pending_request(
+                                &owner,
+                                PendingSubscription {
+                                    sender: contact.clone(),
+                                    stanza: b"<presence type='subscribe'/>".as_slice().into(),
+                                },
+                                std::num::NonZeroUsize::MAX,
+                            )
+                            .await?;
+                    }
+                    transaction.commit().await?;
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })?;
+                let before = snapshot(&roster, &owner);
+                let before_pending = pending(&roster, &owner);
+                let delivery = RecordingDelivery::default();
+                let granted = state.is_some_and(super::state::grants);
+                let should_continue = match kind {
+                    PresenceRequestType::Subscribed => !granted && has_pending,
+                    PresenceRequestType::Unsubscribed => granted || has_pending,
+                    _ => unreachable!(),
+                };
+                block_on(async {
+                    let mut transaction = roster.storage.begin_write().await?;
+                    let call =
+                        SubscribeCall::new("alice@example.com/desk", "future@remote.invalid");
+                    let result = sender_hook(&call, kind, &mut transaction, &delivery)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?;
+                    match result {
+                        PresenceSend::Continue => assert!(should_continue),
+                        PresenceSend::Handled(effects) => {
+                            assert!(!should_continue);
+                            assert_eq!(effects.accounts, vec![owner.clone()]);
+                        }
+                    }
+                    if should_continue || granted || kind == PresenceRequestType::Unsubscribed {
+                        assert_eq!(transaction.roster(&owner).await?.version, before.version);
+                        assert_eq!(transaction.roster(&owner).await?.items, before.items);
+                    }
+                    transaction.commit().await?;
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })?;
+                assert_eq!(pending(&roster, &owner), before_pending);
+                assert!(delivery.pushes.borrow().is_empty());
+                for target in [
+                    "future@remote.invalid/phone",
+                    "remote.invalid",
+                    "remote.invalid/phone",
+                ] {
+                    let call = SubscribeCall::new("alice@example.com/desk", target);
+                    block_on(async {
+                        let mut transaction = roster.storage.begin_write().await?;
+                        let before = transaction.roster(&owner).await?;
+                        assert!(matches!(
+                            sender_hook(&call, kind, &mut transaction, &delivery)
+                                .await
+                                .map_err(|error| format!("{error:?}"))?,
+                            PresenceSend::Continue
+                        ));
+                        assert_eq!(transaction.roster(&owner).await?.version, before.version);
+                        assert_eq!(transaction.roster(&owner).await?.items, before.items);
+                        Ok::<_, Box<dyn std::error::Error>>(())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sender_hook_creates_only_preapprovals_and_requires_a_live_sender()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, roster) = roster();
+    let owner = account("alice@example.com");
+    create_account(&roster, &owner);
+    let delivery = RecordingDelivery::default();
+    let call = SubscribeCall::new("alice@example.com/desk", "future@remote.invalid");
+    for kind in PresenceRequestType::ALL {
+        if kind == PresenceRequestType::Subscribed || kind == PresenceRequestType::Unsubscribed {
+            continue;
+        }
+        block_on(async {
+            let mut transaction = roster.storage.begin_write().await?;
+            assert!(matches!(
+                sender_hook(&call, kind, &mut transaction, &delivery)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?,
+                PresenceSend::Continue
+            ));
+            transaction.commit().await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        let PresenceSend::Handled(effects) = sender_hook(
+            &call,
+            PresenceRequestType::Unsubscribed,
+            &mut transaction,
+            &delivery,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        else {
+            panic!("cancellation must be handled");
+        };
+        assert_eq!(effects.accounts, vec![owner.clone()]);
+        transaction.commit().await?;
+        (effects.deliver)(&delivery).await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    assert_eq!(snapshot(&roster, &owner).version.get(), 0);
+    assert!(snapshot(&roster, &owner).items.is_empty());
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        let PresenceSend::Handled(effects) = sender_hook(
+            &call,
+            PresenceRequestType::Subscribed,
+            &mut transaction,
+            &delivery,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?
+        else {
+            panic!("preapproval must be handled");
+        };
+        transaction.commit().await?;
+        (effects.deliver)(&delivery).await?;
+        let mut transaction = roster.storage.begin_write().await?;
+        transaction.delete_account(&owner).await?;
+        transaction
+            .remove_roster_item(&owner, &RosterJid::from(&account("future@remote.invalid")))
+            .await?;
+        for kind in [
+            PresenceRequestType::Subscribed,
+            PresenceRequestType::Unsubscribed,
+        ] {
+            assert!(matches!(
+                sender_hook(&call, kind, &mut transaction, &delivery).await,
+                Err(HandlerError::Stanza(StanzaErrorCondition::Forbidden))
+            ));
+        }
+        assert!(transaction.roster(&owner).await?.items.is_empty());
+        transaction.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    assert_eq!(delivery.pushes.borrow().len(), 1);
+    Ok(())
 }

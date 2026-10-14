@@ -394,3 +394,72 @@ fn pending_requests_from_dropped_peers_are_not_replayed() -> TestResult {
     spammer.close()?;
     bob.close()
 }
+
+#[test]
+fn sender_preapproval_uses_outbound_policy_and_skips_prospective_recipient_policy() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+    for user in ["alice", "spammer", "rejecter"] {
+        suite.create_account(user, "password")?;
+    }
+    let mut alice = suite.connect("alice", "password", "res")?;
+    for sender in ["spammer", "rejecter"] {
+        let mut client = suite.connect(sender, "password", "res")?;
+        for target in ["blocked@localhost", "blocked@remote.invalid"] {
+            for kind in ["subscribed", "unsubscribed"] {
+                client.send(&format!("<presence type='{kind}' to='{target}'/>"))?;
+            }
+        }
+        client.send("<iq type='get' id='denied'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
+        client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='denied' to='{sender}@localhost/res'><query xmlns='jabber:iq:roster' ver='0'/></iq>"))?;
+        client.send("<presence type='subscribed' to='alice@localhost'/>")?;
+        let push = client.receive()?;
+        push.assert_name("jabber:client", "iq");
+        assert_eq!(push.attribute("type"), Some("set"));
+        assert_eq!(push.attribute("id"), Some("roster-1"));
+        push.child("jabber:iq:roster", "query")?.children[0].assert_xml("<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none' approved='true'/>")?;
+        client.send("<iq type='result' id='roster-1'/><presence type='subscribed' to='alice@localhost'/><iq type='get' id='approved'><query xmlns='jabber:iq:roster' ver='1'/></iq>")?;
+        client.expect_xml(&format!(
+            "<iq xmlns='jabber:client' type='result' id='approved' to='{sender}@localhost/res'/>"
+        ))?;
+        client.send("<presence type='subscribe' to='alice@localhost'/>")?;
+        barrier(&mut client)?;
+        client.send("<presence type='unsubscribed' to='alice@localhost'/>")?;
+        let push = client.receive()?;
+        assert_eq!(push.attribute("id"), Some("roster-2"));
+        push.child("jabber:iq:roster", "query")?.children[0].assert_xml(
+            "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+        )?;
+        client.send("<iq type='result' id='roster-2'/><iq type='get' id='cancelled'><query xmlns='jabber:iq:roster' ver='2'/></iq>")?;
+        client.expect_xml(&format!(
+            "<iq xmlns='jabber:client' type='result' id='cancelled' to='{sender}@localhost/res'/>"
+        ))?;
+        client.close()?;
+    }
+    alice.send("<iq type='get' id='unchanged'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='unchanged' to='alice@localhost/res'><query xmlns='jabber:iq:roster' ver='0'/></iq>")?;
+    alice.close()
+}
+
+#[test]
+fn pending_approvals_and_denials_still_require_recipient_inbound_policy() -> TestResult {
+    for sender in ["spammer", "rejecter"] {
+        let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
+        suite.create_account("alice", "password")?;
+        suite.create_account(sender, "password")?;
+        let mut alice = suite.connect("alice", "password", "res")?;
+        let mut client = suite.connect(sender, "password", "res")?;
+        alice.send(&format!("<presence type='subscribe' to='{sender}@localhost'/><iq type='get' id='pending'><query xmlns='jabber:iq:roster' ver=''/></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='pending' to='alice@localhost/res'><query xmlns='jabber:iq:roster' ver='1'><item jid='{sender}@localhost' subscription='none' ask='subscribe'/></query></iq>"))?;
+        for kind in ["subscribed", "unsubscribed"] {
+            client.send(&format!("<presence type='{kind}' to='alice@localhost'/><iq type='get' id='unchanged'><query xmlns='jabber:iq:roster' ver=''/></iq>"))?;
+            client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='unchanged' to='{sender}@localhost/res'><query xmlns='jabber:iq:roster' ver='0'/></iq>"))?;
+            alice.send(
+                "<iq type='get' id='still-pending'><query xmlns='jabber:iq:roster' ver='1'/></iq>",
+            )?;
+            alice.expect_xml("<iq xmlns='jabber:client' type='result' id='still-pending' to='alice@localhost/res'/>")?;
+        }
+        alice.close()?;
+        client.close()?;
+    }
+    Ok(())
+}

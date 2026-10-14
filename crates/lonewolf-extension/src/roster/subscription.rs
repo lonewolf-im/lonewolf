@@ -12,7 +12,70 @@ use super::state::{self, Cancellation, Removal, RequestOutcome, grants};
 use super::{account_exists, push_removal, push_roster, require_account, roster_error, xml};
 use crate::Effects;
 use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
-use crate::presence::PresenceRequest;
+use crate::presence::{PresenceRequest, PresenceRequestType, PresenceSend};
+
+pub(super) async fn send_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    transaction: &mut W,
+    request: PresenceRequest<'_, A>,
+) -> Result<PresenceSend<A>, HandlerError> {
+    if !matches!(
+        request.kind,
+        PresenceRequestType::Subscribed | PresenceRequestType::Unsubscribed
+    ) || request.target.localpart().is_none()
+        || request.target.resourcepart().is_some()
+    {
+        return Ok(PresenceSend::Continue);
+    }
+    let owner = AccountKey::try_from(request.sender.bare())
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    let contact = RosterJid::from(request.target);
+    require_account(transaction, &owner).await?;
+    let item = transaction
+        .roster_item(&owner, &contact)
+        .await
+        .map_err(|error| roster_error(error, "roster_read"))?;
+    let pending = transaction
+        .pending_request(&owner, &contact)
+        .await
+        .map_err(|error| roster_error(error, "roster_read"))?;
+    let granted = item.is_some_and(|item| grants(item.subscription.state));
+    let mutation = match request.kind {
+        PresenceRequestType::Subscribed if granted => None,
+        PresenceRequestType::Subscribed if pending.is_none() => {
+            state::update_subscription(transaction, &owner, &contact, state::pre_approve)
+                .await
+                .map_err(|error| roster_error(error, "roster_write"))?
+        }
+        PresenceRequestType::Unsubscribed if !granted && pending.is_none() => {
+            state::update_existing_subscription(
+                transaction,
+                &owner,
+                &contact,
+                |mut subscription| {
+                    if !subscription.approved {
+                        return None;
+                    }
+                    subscription.approved = false;
+                    Some(subscription)
+                },
+            )
+            .await
+            .map_err(|error| roster_error(error, "roster_write"))?
+        }
+        _ => return Ok(PresenceSend::Continue),
+    };
+    Ok(PresenceSend::Handled(Effects::new(
+        vec![owner.clone()],
+        move |delivery| {
+            Box::pin(async move {
+                if let Some(mutation) = mutation {
+                    push_roster(&owner, mutation, delivery).await?;
+                }
+                Ok(())
+            })
+        },
+    )))
+}
 
 pub(super) struct Parties {
     sender: AccountKey,

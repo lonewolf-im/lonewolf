@@ -1787,9 +1787,11 @@ private_key_path = "private-key.pem"
 fn remote_subscriptions_preserve_the_roster_and_version() -> TestResult {
     let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
     let mut alice = suite.connect("alice", "password", "desk")?;
-    let stored = "<query xmlns='jabber:iq:roster' ver='1'><item jid='bob@localhost' name='Bob Smith' subscription='both' ask='subscribe' approved='true'><group>Friends</group><group>Work</group></item></query>";
+    let seeded = "<item jid='bob@localhost' name='Bob Smith' subscription='both' ask='subscribe' approved='true'><group>Friends</group><group>Work</group></item>";
+    let mut version = 1;
+    let mut remote_item = String::new();
     alice.send("<iq type='get' id='before'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
-    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='before' to='alice@localhost/desk'>{stored}</iq>"))?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='before' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='1'>{seeded}</query></iq>"))?;
     for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
         for target in [
             "bob@remote.example",
@@ -1798,11 +1800,29 @@ fn remote_subscriptions_preserve_the_roster_and_version() -> TestResult {
             "remote.example/phone",
         ] {
             alice.send(&format!("<presence type='{kind}' from='mallory@localhost/spy' to='{target}' id='remote'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick></presence>"))?;
-            alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='remote' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+            if target == "bob@remote.example" && matches!(kind, "subscribed" | "unsubscribed") {
+                version += 1;
+                let approval = if kind == "subscribed" {
+                    " approved='true'"
+                } else {
+                    ""
+                };
+                remote_item = format!("<item jid='{target}' subscription='none'{approval}/>");
+                let push = expect_roster_push(
+                    &mut alice,
+                    "alice@localhost/desk",
+                    &format!(
+                        "<item xmlns='jabber:iq:roster' jid='{target}' subscription='none'{approval}/>"
+                    ),
+                )?;
+                alice.send(&format!("<iq type='result' id='{push}'/>"))?;
+            } else {
+                alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='remote' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+            }
             alice.send(
                 "<iq type='get' id='unchanged'><query xmlns='jabber:iq:roster' ver=''/></iq>",
             )?;
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='unchanged' to='alice@localhost/desk'>{stored}</iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='unchanged' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='{version}'>{seeded}{remote_item}</query></iq>"))?;
         }
     }
     alice.close()
@@ -1810,7 +1830,7 @@ fn remote_subscriptions_preserve_the_roster_and_version() -> TestResult {
 
 #[test]
 fn remote_subscriptions_return_errors_with_the_sender_roster_disabled() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", "password")?;
     suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
@@ -3495,4 +3515,77 @@ private_key_path = "private-key.pem"
         "<iq xmlns='jabber:client' type='result' id='unchanged' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
     alice.close()
+}
+
+#[test]
+fn sender_preapproval_handles_missing_remote_and_roster_disabled_contacts() -> TestResult {
+    for target in [
+        "future@localhost",
+        "future@example.invalid",
+        "future@other.localhost",
+    ] {
+        for interested in [false, true] {
+            let suite = C2sSuite::with_hosts(
+                r#"
+[hosts.localhost]
+extensions = ["roster"]
+[hosts."other.localhost"]
+extensions = []
+[hosts."other.localhost".tls]
+certificate_chain_path = "certificate.pem"
+private_key_path = "private-key.pem"
+"#,
+            )?;
+            suite.create_account("alice", "password")?;
+            if target == "future@other.localhost" {
+                suite.create_account_jid(target, "password")?;
+            }
+            let (mut alice, features) =
+                Client::authenticated_with_features(&suite, "alice", "password")?;
+            features.child("urn:xmpp:features:pre-approval", "sub")?;
+            assert_eq!(alice.bind(Some("desk"))?, "alice@localhost/desk");
+            let mut uninterested = suite.connect("alice", "password", "tablet")?;
+            if interested {
+                request_roster(
+                    &mut alice,
+                    "initial",
+                    "<iq xmlns='jabber:client' type='result' id='initial' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+                )?;
+            }
+            alice.send(&format!(
+                "<presence type='subscribed' from='mallory@localhost/spy' to='{target}'/>"
+            ))?;
+            if interested {
+                let push = expect_roster_push(
+                    &mut alice,
+                    "alice@localhost/desk",
+                    &format!(
+                        "<item xmlns='jabber:iq:roster' jid='{target}' subscription='none' approved='true'/>"
+                    ),
+                )?;
+                assert_eq!(push, "roster-1");
+                alice.send(&format!("<iq type='result' id='{push}'/>"))?;
+            }
+            alice.send(
+                "<iq type='get' id='approved'><query xmlns='jabber:iq:roster' ver=''/></iq>",
+            )?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='approved' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='1'><item jid='{target}' subscription='none' approved='true'/></query></iq>"))?;
+            alice.send(&format!("<presence type='subscribed' to='{target}'/><iq type='get' id='duplicate'><query xmlns='jabber:iq:roster' ver='1'/></iq>"))?;
+            alice.expect_xml("<iq xmlns='jabber:client' type='result' id='duplicate' to='alice@localhost/desk'/>")?;
+            alice.send(&format!("<presence type='unsubscribed' to='{target}'/>"))?;
+            let push = expect_roster_push(
+                &mut alice,
+                "alice@localhost/desk",
+                &format!("<item xmlns='jabber:iq:roster' jid='{target}' subscription='none'/>"),
+            )?;
+            assert_eq!(push, "roster-2");
+            alice.send(&format!("<iq type='result' id='{push}'/><presence type='unsubscribed' to='{target}'/><iq type='get' id='cancelled'><query xmlns='jabber:iq:roster' ver=''/></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='cancelled' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='2'><item jid='{target}' subscription='none'/></query></iq>"))?;
+            uninterested.send("<message to='alice@localhost/tablet' id='barrier'/>")?;
+            uninterested.expect_xml("<message xmlns='jabber:client' from='alice@localhost/tablet' to='alice@localhost/tablet' id='barrier'/>")?;
+            alice.close()?;
+            uninterested.close()?;
+        }
+    }
+    Ok(())
 }

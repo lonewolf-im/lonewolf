@@ -63,8 +63,9 @@ pub struct PresenceUpdate<'a> {
 
 pub struct PresenceRequest<'a, A: ChunkAllocator> {
     pub kind: PresenceRequestType,
-    /// The authenticated full JID while authorizing, and the bare JID while receiving.
+    /// The authenticated full JID for `authorize` and `send`, and the bare JID for `receive`.
     pub sender: JidRef<'a>,
+    /// The original target for `authorize` and `send`, and the bare target for `receive`.
     pub target: JidRef<'a>,
     pub stanza: &'a RoutedStanza<A>,
 }
@@ -79,6 +80,12 @@ pub struct PresenceAudience {
 }
 
 pub type PresenceFuture<'a, T> = ExtensionFuture<'a, Result<T, HandlerError>>;
+pub enum PresenceSend<A: ChunkAllocator> {
+    Continue,
+    Handled(Effects<A>),
+}
+
+pub type SendFuture<'a, A> = PresenceFuture<'a, PresenceSend<A>>;
 pub type ReceiveFuture<'a, A> = ExtensionFuture<'a, Result<Effects<A>, HandlerError>>;
 
 pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
@@ -104,6 +111,16 @@ pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
     /// Authorizes a subscription presence on the sender's host before it is routed.
     fn authorize<'a>(&'a self, _request: PresenceRequest<'a, A>) -> PresenceFuture<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// `Continue` makes no writes or effects; `Handled` owns processing and requires commit before delivery.
+    fn send<'a>(
+        &'a self,
+        _request: PresenceRequest<'a, A>,
+        _transaction: &'a mut S::Write,
+        _hosts: &'a dyn HostLookup,
+    ) -> SendFuture<'a, A> {
+        Box::pin(async { Ok(PresenceSend::Continue) })
     }
 
     /// Applies a subscription presence on the target's host inside the transaction and

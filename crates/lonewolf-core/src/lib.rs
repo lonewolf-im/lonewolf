@@ -168,7 +168,10 @@ pub fn run_with_extensions(
                         tracing::info!(service_domain = %domain, "service registered");
                     }
                 }
-                let server_metrics = metrics::ServerMetrics::new(&build, dropped_logs);
+                let mut server_metrics = metrics::ServerMetrics::new(&build, dropped_logs);
+                server_metrics.registry().register_collector(Box::new(
+                    metrics::StanzaPoolCollector::new(Arc::clone(&stanza_pool)),
+                ));
                 let metrics_server = if config.metrics.enabled {
                     Some(
                         lonewolf_metrics::MetricsServer::bind(config.metrics.address)

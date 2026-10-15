@@ -16,7 +16,7 @@ use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, PublicKeyData};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
@@ -26,8 +26,10 @@ use crate::config::{HostConfig, HostTlsConfig};
 use lonewolf_util::blocking::BlockingExecutor;
 
 pub mod client_identity;
+pub(crate) mod service_identity;
 
 use client_identity::{ClientCertificatePolicy, ClientIdentityError};
+use service_identity::{XmppService, verify_service_identity};
 
 #[derive(Clone, Debug)]
 pub struct Hosts {
@@ -96,8 +98,9 @@ impl Hosts {
             };
             certified_key
                 .end_entity_cert()
-                .and_then(ParsedCertificate::try_from)
-                .and_then(|certificate| rustls::client::verify_server_name(&certificate, &identity))
+                .and_then(|certificate| {
+                    verify_service_identity(certificate, &identity, XmppService::Client)
+                })
                 .map_err(|source| HostsError::InvalidCertificate {
                     domain: domain.clone(),
                     source,

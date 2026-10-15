@@ -660,3 +660,66 @@ fn refreshed_host_configs_keep_session_caches_separate() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn srv_client_identity_initializes_a_host_without_a_dns_identity() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let parameters = super::test_support::san_parameters(vec![super::test_support::srv_name(
+        "_xmpp-client.example.com",
+    )?])?;
+    let tls = test_tls_parameters(&directory, parameters, "srv-client")?;
+    let configured = BTreeMap::from([(
+        "example.com".into(),
+        HostConfig {
+            tls: Some(tls),
+            ..HostConfig::default()
+        },
+    )]);
+    let hosts = Hosts::new(&configured, None)?;
+    assert_eq!(hosts.default_host_name(), "example.com");
+    assert_eq!(
+        hosts.tls_server_end_point("example.com").map(<[u8]>::len),
+        Some(32)
+    );
+    Ok(())
+}
+
+#[test]
+fn server_service_and_unusable_srv_ids_cannot_initialize_a_client_host() -> TestResult {
+    use x509_cert::der::asn1::Utf8StringRef;
+    use x509_cert::ext::pkix::name::{GeneralName, OtherName};
+    for name in [
+        super::test_support::srv_name("_xmpp-server.example.com")?,
+        super::test_support::srv_name("_xmpp-client.other.example.com")?,
+        super::test_support::srv_name("_xmpp-client._tcp.example.com")?,
+        GeneralName::OtherName(OtherName {
+            type_id: x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.8.7"),
+            value: Utf8StringRef::new("_xmpp-client.example.com")?.into(),
+        }),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let tls = test_tls_parameters(
+            &directory,
+            super::test_support::san_parameters(vec![name])?,
+            "unusable-srv",
+        )?;
+        let configured = BTreeMap::from([(
+            "example.com".into(),
+            HostConfig {
+                tls: Some(tls),
+                ..HostConfig::default()
+            },
+        )]);
+        assert!(matches!(
+            Hosts::new(&configured, None),
+            Err(HostsError::InvalidCertificate {
+                source: rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidForName
+                        | rustls::CertificateError::NotValidForNameContext { .. }
+                ),
+                ..
+            })
+        ));
+    }
+    Ok(())
+}

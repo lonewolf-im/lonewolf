@@ -1241,10 +1241,22 @@ dependencies = [
 name = "lonewolf-metrics"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
+ "axum",
+ "blocking",
+ "compio",
+ "compio-io",
  "crossbeam-utils",
+ "futures-channel",
+ "futures-util",
+ "hyper",
+ "hyper-util",
  "lonewolf-util",
  "nix",
  "prometheus-client",
+ "socket2",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -7,10 +7,24 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-lock.workspace = true
+axum.workspace = true
+compio = { workspace = true, features = ["net", "time"] }
+compio-io.workspace = true
 crossbeam-utils.workspace = true
+futures-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 lonewolf-util.workspace = true
 nix = { workspace = true, features = ["resource"] }
 prometheus-client.workspace = true
+socket2.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+blocking.workspace = true
+futures-channel.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["feature"] }

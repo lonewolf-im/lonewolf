@@ -1393,7 +1393,7 @@ fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
 }
 
 #[test]
-fn stored_stanzas_keep_local_namespace_bindings_without_stream_header_aliases() -> TestResult {
+fn stored_stanzas_preserve_local_and_stream_namespace_bindings() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
     suite.create_account("bob", "pencil")?;
@@ -1409,7 +1409,10 @@ fn stored_stanzas_keep_local_namespace_bindings_without_stream_header_aliases() 
     let delivered = bob.receive()?;
     delivered.assert_name("jabber:client", "message");
     assert_eq!(delivered.attribute("id"), Some("stored-qname"));
-    assert_eq!(delivered.attribute("xmlns:stream"), None);
+    assert_eq!(
+        delivered.resolve_qname("stream:stream")?,
+        (super::support::xml::STREAM_NAMESPACE, "stream")
+    );
     delivered.child("urn:xmpp:delay", "delay")?;
     let payload = delivered.child("urn:x", "payload")?;
     assert_eq!(
@@ -1426,27 +1429,61 @@ fn stored_stanzas_keep_local_namespace_bindings_without_stream_header_aliases() 
 }
 
 #[test]
-fn routed_stanzas_do_not_copy_custom_stream_header_aliases() -> TestResult {
+fn routed_stanzas_preserve_stream_qnames_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", "pencil")?;
-    let mut alice = suite.unauthenticated_client()?;
-    alice.authenticate("alice", "pencil")?;
-    let mut alice = alice.restart();
-    alice.open_with("<s:stream xmlns:s='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:xml='http://www.w3.org/XML/1998/namespace' to='localhost' version='1.0'>")?;
-    alice.features()?;
-    assert_eq!(alice.bind(Some("desk"))?, "alice@localhost/desk");
-    alice.send("<message to='alice@localhost/desk' id='namespace-clean' xmlns:a='urn:types'><payload xmlns='urn:x' type='a:Example'/></message>")?;
-    let delivered = alice.receive()?;
-    delivered.assert_name("jabber:client", "message");
-    assert_eq!(delivered.attribute("xmlns:stream"), None);
-    assert_eq!(delivered.attribute("xmlns:s"), None);
-    assert_eq!(delivered.attribute("xmlns:xml"), None);
-    let payload = delivered.child("urn:x", "payload")?;
-    assert_eq!(
-        payload.resolve_qname(payload.attribute("type").ok_or("type")?)?,
-        ("urn:types", "Example")
-    );
-    alice.close_with_footer("</s:stream>")
+    suite.create_account("bob", "pencil")?;
+    let mut bob = suite.connect("bob", "pencil", "phone")?;
+    for prefix in ["s", "stream", "ns0"] {
+        let mut alice = suite.unauthenticated_client()?;
+        alice.authenticate("alice", "pencil")?;
+        let mut alice = alice.restart();
+        alice.open_with(&format!("<{prefix}:stream xmlns:{prefix}='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:xml='http://www.w3.org/XML/1998/namespace' to='localhost' version='1.0'>"))?;
+        alice.features()?;
+        assert_eq!(alice.bind(Some("desk"))?, "alice@localhost/desk");
+        let value = format!("{prefix}:stream");
+        alice.send(&format!("<message to='bob@localhost/phone' id='stream-qname' xmlns:a='urn:types'><x xmlns='urn:example:qname' kind='{value}'>{value}</x><payload xmlns='urn:x' type='a:Example'/></message>"))?;
+        let delivered = bob.receive()?;
+        delivered.assert_name("jabber:client", "message");
+        assert_eq!(delivered.attribute("from"), Some("alice@localhost/desk"));
+        assert_eq!(delivered.attribute("to"), Some("bob@localhost/phone"));
+        assert_eq!(delivered.attribute("id"), Some("stream-qname"));
+        assert_eq!(delivered.attribute("xmlns:xml"), None);
+        let payload = delivered.child("urn:x", "payload")?;
+        assert_eq!(
+            payload.resolve_qname(payload.attribute("type").ok_or("type")?)?,
+            ("urn:types", "Example")
+        );
+        let opaque = delivered.child("urn:example:qname", "x")?;
+        assert_eq!(opaque.attribute("kind"), Some(value.as_str()));
+        assert_eq!(opaque.text, value);
+        for qname in [opaque.attribute("kind").ok_or("kind")?, &opaque.text] {
+            assert_eq!(
+                opaque.resolve_qname(qname)?,
+                (super::support::xml::STREAM_NAMESPACE, "stream")
+            );
+        }
+        alice.send(&format!("<iq type='get' to='localhost' id='stream-qname-error'><x xmlns='urn:example:qname' kind='{value}'>{value}</x></iq>"))?;
+        let error = alice.receive()?;
+        error.assert_name("jabber:client", "iq");
+        assert_eq!(error.attribute("type"), Some("error"));
+        assert_eq!(error.attribute("id"), Some("stream-qname-error"));
+        assert_eq!(error.attribute("from"), Some("localhost"));
+        error
+            .child("jabber:client", "error")?
+            .child("urn:ietf:params:xml:ns:xmpp-stanzas", "service-unavailable")?;
+        let opaque = error.child("urn:example:qname", "x")?;
+        assert_eq!(opaque.attribute("kind"), Some(value.as_str()));
+        assert_eq!(opaque.text, value);
+        for qname in [opaque.attribute("kind").ok_or("kind")?, &opaque.text] {
+            assert_eq!(
+                opaque.resolve_qname(qname)?,
+                (super::support::xml::STREAM_NAMESPACE, "stream")
+            );
+        }
+        alice.close_with_footer(&format!("</{prefix}:stream>"))?;
+    }
+    bob.close()
 }
 
 #[test]
@@ -1457,7 +1494,10 @@ fn opaque_extension_qnames_retain_namespace_context_after_authenticated_routing(
     alice.send("<message to='alice@localhost/desk' id='namespace-qname' xmlns:a='urn:ancestor'><payload xmlns='urn:example:payload' xmlns:t='urn:example:types' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='t:Example'><inherited xsi:type='a:Example'/><nested xmlns:a='urn:nested' xsi:type='a:Example'/><collision xmlns:ns0='urn:reserved' xsi:type='ns0:Example'/><textual>t:Example</textual><p:prefixed xmlns:p='urn:element' xmlns='urn:default' xsi:type='Example'/></payload></message>")?;
     let delivered = alice.receive()?;
     delivered.assert_name("jabber:client", "message");
-    assert_eq!(delivered.attribute("xmlns:stream"), None);
+    assert_eq!(
+        delivered.resolve_qname("stream:stream")?,
+        (super::support::xml::STREAM_NAMESPACE, "stream")
+    );
     assert_eq!(delivered.attribute("from"), Some("alice@localhost/desk"));
     assert_eq!(delivered.attribute("to"), Some("alice@localhost/desk"));
     assert_eq!(delivered.attribute("id"), Some("namespace-qname"));

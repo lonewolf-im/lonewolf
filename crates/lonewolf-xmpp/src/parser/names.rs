@@ -161,18 +161,25 @@ pub(super) fn frame<A: ChunkAllocator>(
         Frame::element(name, namespace, arena)?
     };
     let mut namespaces = parent_namespaces.unwrap_or_default();
-    if parent_namespaces.is_none() {
+    if parent_namespaces.is_some() {
+        for attribute in start.attributes() {
+            let attribute = attribute.map_err(quick_xml::Error::from)?;
+            if let Some(prefix) = attribute.key.as_namespace_binding() {
+                let prefix = match prefix {
+                    PrefixDeclaration::Default => "",
+                    PrefixDeclaration::Named(prefix) => prefix,
+                };
+                namespaces.bind(prefix, &normalized(&attribute)?, arena)?;
+            }
+        }
+    } else {
         namespaces.bind("", content_namespace(resolver)?, arena)?;
-    }
-    for attribute in start.attributes() {
-        let attribute = attribute.map_err(quick_xml::Error::from)?;
-        if let Some(prefix) = attribute.key.as_namespace_binding() {
-            let prefix = match prefix {
-                PrefixDeclaration::Default if parent_namespaces.is_none() => continue,
-                PrefixDeclaration::Default => "",
-                PrefixDeclaration::Named(prefix) => prefix,
-            };
-            namespaces.bind(prefix, &normalized(&attribute)?, arena)?;
+        for (prefix, namespace) in resolver.bindings() {
+            if let PrefixDeclaration::Named(prefix) = prefix
+                && !matches!(prefix, "xml" | "xmlns")
+            {
+                namespaces.bind(prefix, namespace.into_inner(), arena)?;
+            }
         }
     }
     frame.set_namespaces(namespaces);

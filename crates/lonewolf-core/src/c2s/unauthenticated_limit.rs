@@ -54,7 +54,10 @@ impl UnauthenticatedLimiter {
         Admission::Denied { report_count }
     }
 
-    #[cfg(test)]
+    pub(super) fn limit(&self) -> usize {
+        self.max
+    }
+
     pub(super) fn active_count(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }

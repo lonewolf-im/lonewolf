@@ -129,7 +129,9 @@ async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, B
                     },
                     NonZeroUsize::MIN,
                     GlobalChunkAllocator,
+                    C2sWorkerMetrics::detached(),
                 ),
+                C2sWorkerMetrics::detached(),
             )
             .with_subscriber(subscriber)
             .await
@@ -295,7 +297,9 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                             },
                             NonZeroUsize::new(10).unwrap(),
                             GlobalChunkAllocator,
+                            C2sWorkerMetrics::detached(),
                         ),
+                        C2sWorkerMetrics::detached(),
                     )
                     .await
                 })
@@ -391,7 +395,9 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                                 },
                                 NonZeroUsize::new(10).unwrap(),
                                 GlobalChunkAllocator,
+                                C2sWorkerMetrics::detached(),
                             ),
+                            C2sWorkerMetrics::detached(),
                         )
                         .await
                     },
@@ -462,6 +468,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
             router.handle(),
             &handle,
             GlobalChunkAllocator,
+            &mut Registry::default(),
         )
         .await?;
         assert_eq!(
@@ -514,6 +521,7 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
             router.handle(),
             &dispatcher.handle(),
             GlobalChunkAllocator,
+            &mut Registry::default(),
         )
         .await
         .err()
@@ -600,6 +608,52 @@ fn fatal_listener_notification_precedes_connection_drain() -> TestResult {
         listeners.stop(Instant::now() + TIMEOUT);
         listeners.join().await?;
         dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn admission_rejection_reasons_follow_the_configuration_limits() -> TestResult {
+    run_test(async {
+        for (rejection, reason) in [
+            (
+                AdmissionRejection::Attempt {
+                    outcome: "rate_limited",
+                    report_count: None,
+                },
+                RejectReason::ConnectionAttemptsPerIp,
+            ),
+            (
+                AdmissionRejection::Attempt {
+                    outcome: "source_tracking_full",
+                    report_count: None,
+                },
+                RejectReason::AttemptTrackingFull,
+            ),
+            (
+                AdmissionRejection::Unauthenticated { report_count: None },
+                RejectReason::MaxUnauthenticatedConnections,
+            ),
+        ] {
+            assert_eq!(rejection_reason(&rejection), reason);
+        }
+        let limiter = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        for (outcome, reason) in [
+            ("connection_limit", RejectReason::MaxConnectionsPerIp),
+            ("source_tracking_full", RejectReason::ConnectionTrackingFull),
+        ] {
+            let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+                limiter.reserve(Instant::now()).await
+            else {
+                return Err("unauthenticated permit denied".into());
+            };
+            let rejection = AdmissionRejection::PerIp {
+                outcome,
+                report_count: None,
+                unauthenticated_permit,
+            };
+            assert_eq!(rejection_reason(&rejection), reason);
+        }
         Ok(())
     })
 }

@@ -227,6 +227,7 @@ pub fn run_with_extensions(
                         router_handle,
                         &dispatcher.handle(),
                         Arc::clone(&stanza_pool),
+                        server_metrics.registry(),
                     )
                     .await
                     .map_err(|failure| {

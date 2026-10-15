@@ -171,7 +171,13 @@ fn run_case_with_timeouts(
         let started = Instant::now();
         let stream = XmppStream::new(
             transport,
-            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
+            StreamAdmission::new(
+                permit,
+                unauthenticated_permit,
+                0,
+                0,
+                C2sWorkerMetrics::detached(),
+            ),
             hosts.clone(),
             auth,
             router.handle(),
@@ -192,6 +198,7 @@ fn run_case_with_timeouts(
                 },
                 NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
+                C2sWorkerMetrics::detached(),
             ),
         );
         let outcome = stream.run().await;
@@ -425,7 +432,13 @@ fn run_starttls_restart_case_with_timeout(
         let router = test_router(&hosts);
         let stream = XmppStream::new(
             transport,
-            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
+            StreamAdmission::new(
+                permit,
+                unauthenticated_permit,
+                0,
+                0,
+                C2sWorkerMetrics::detached(),
+            ),
             hosts,
             auth,
             router.handle(),
@@ -442,6 +455,7 @@ fn run_starttls_restart_case_with_timeout(
                 },
                 NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
+                C2sWorkerMetrics::detached(),
             ),
         );
         let outcome = stream.run().await;
@@ -659,7 +673,13 @@ where
         let router = test_router(&hosts);
         let outcome = XmppStream::new(
             transport,
-            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
+            StreamAdmission::new(
+                permit,
+                unauthenticated_permit,
+                0,
+                0,
+                C2sWorkerMetrics::detached(),
+            ),
             hosts,
             auth,
             router.handle(),
@@ -676,6 +696,7 @@ where
                 },
                 NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
+                C2sWorkerMetrics::detached(),
             ),
         )
         .run()
@@ -819,7 +840,13 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
         let router = test_router(&hosts);
         let stream = XmppStream::new(
             transport,
-            StreamAdmission::new(permit, unauthenticated_permit, 0, 0),
+            StreamAdmission::new(
+                permit,
+                unauthenticated_permit,
+                0,
+                0,
+                C2sWorkerMetrics::detached(),
+            ),
             hosts.clone(),
             auth,
             router.handle(),
@@ -837,6 +864,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
                 },
                 NonZeroUsize::new(10).unwrap(),
                 GlobalChunkAllocator,
+                C2sWorkerMetrics::detached(),
             ),
         );
         assert!(
@@ -860,13 +888,16 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
+    let metrics = crate::c2s::metrics::C2sMetrics::detached();
     let ((), logs) = capture_logs(|| {
         drop(ConnectionLifecycle {
             connection_id: 7,
             listener_id: 2,
             worker_id: 3,
             accepted_at: Instant::now(),
-            stream_phase: "binding",
+            phase: StreamPhase::Binding,
+            bound_at: None,
+            metrics: metrics.worker(0, 0),
             outcome: None,
         });
     })?;
@@ -874,11 +905,20 @@ fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
     assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
     assert!(logs.contains("stream_phase=\"binding\""), "{logs}");
     assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
+    let output = metrics.render().map_err(io::Error::other)?;
+    assert!(output.lines().any(|line| line == "lonewolf_c2s_connections_closed_total{listener=\"0\",phase=\"binding\",outcome=\"cancelled\"} 1"), "{output}");
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "lonewolf_c2s_session_duration_seconds_count 0"),
+        "{output}"
+    );
     Ok(())
 }
 
 #[test]
 fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
+    let metrics = crate::c2s::metrics::C2sMetrics::detached();
     let (result, logs) = capture_logs(|| {
         Runtime::new()?.block_on(async {
             let limiter = ConnectionLimiter::new(1);
@@ -894,7 +934,13 @@ fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
             else {
                 return Err("unauthenticated connection denied".into());
             };
-            drop(StreamAdmission::new(permit, unauthenticated_permit, 2, 3));
+            drop(StreamAdmission::new(
+                permit,
+                unauthenticated_permit,
+                2,
+                3,
+                metrics.worker(0, 0),
+            ));
             assert_eq!(unauthenticated.active_count(), 0);
             Ok::<_, Box<dyn Error>>(())
         })
@@ -905,6 +951,8 @@ fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
     assert!(logs.contains("listener_id=2"), "{logs}");
     assert!(logs.contains("worker_id=3"), "{logs}");
     assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
+    let output = metrics.render()?;
+    assert!(output.lines().any(|line| line == "lonewolf_c2s_connections_closed_total{listener=\"0\",phase=\"establishing\",outcome=\"cancelled\"} 1"), "{output}");
     Ok(())
 }
 
@@ -925,10 +973,17 @@ fn panicking_phase_closes_its_socket_before_waiting_for_tracked_work() -> Result
         let mut client = StdTcpStream::connect(listener.local_addr()?)?;
         client.set_read_timeout(Some(Duration::from_secs(1)))?;
         let (transport, _) = listener.accept().await?;
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let worker_metrics = metrics.worker(0, 0);
         let mut work = crate::delivery::WorkGroup::new();
         let guard = work.start();
         let mut completion = Box::pin(async {
-            let outcome = finish_phases(async { panic!("phase failure") }, &transport).await;
+            let outcome = finish_phases(
+                async { panic!("phase failure") },
+                &transport,
+                &worker_metrics,
+            )
+            .await;
             work.drain().await;
             outcome
         });
@@ -936,6 +991,13 @@ fn panicking_phase_closes_its_socket_before_waiting_for_tracked_work() -> Result
         assert_eq!(client.read(&mut [0; 1])?, 0);
         drop(guard);
         assert_eq!(completion.await, CloseOutcome::InternalError);
+        let output = metrics.render()?;
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "lonewolf_c2s_connection_panics_total{listener=\"0\"} 1"),
+            "{output}"
+        );
         listener.close().await?;
         Ok(())
     })
@@ -969,5 +1031,29 @@ fn external_only_features_require_a_usable_certificate() -> Result<(), Box<dyn E
     let empty: crate::config::TcpListenerConfig = toml::from_str("auth_mechanisms = []")?;
     assert!(sasl_features(empty.auth_mechanisms, false).is_none());
     assert!(sasl_features(empty.auth_mechanisms, true).is_none());
+    Ok(())
+}
+
+#[test]
+fn cancelled_bound_lifecycle_records_one_close_and_session() -> Result<(), Box<dyn Error>> {
+    let metrics = crate::c2s::metrics::C2sMetrics::detached();
+    drop(ConnectionLifecycle {
+        connection_id: 7,
+        listener_id: 0,
+        worker_id: 0,
+        accepted_at: Instant::now(),
+        phase: StreamPhase::Bound,
+        bound_at: Some(Instant::now()),
+        metrics: metrics.worker(0, 0),
+        outcome: None,
+    });
+    let output = metrics.render()?;
+    assert!(output.lines().any(|line| line == "lonewolf_c2s_connections_closed_total{listener=\"0\",phase=\"bound\",outcome=\"cancelled\"} 1"), "{output}");
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "lonewolf_c2s_session_duration_seconds_count 1"),
+        "{output}"
+    );
     Ok(())
 }

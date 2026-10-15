@@ -193,6 +193,17 @@
 # must belong to the user running Lonewolf and must not grant access to others.
 # socket_path = "./run/lonewolf/admin.sock"
 
+# [metrics]
+
+# Serve Prometheus metrics at /metrics for a scraper or collection agent.
+# The endpoint has no authentication, so bind it to a loopback or private address.
+# enabled = false
+
+# Choose the local IP address and port for the metrics endpoint.
+# Use a numeric IPv4 address or a bracketed IPv6 address followed by the port.
+# This address must not overlap a client endpoint.
+# address = "127.0.0.1:9520"
+
 # [account]
 
 # Choose where Lonewolf stores account records and credentials.

@@ -38,6 +38,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub account: AccountConfig,
     pub admin: AdminConfig,
+    pub metrics: MetricsConfig,
 }
 
 impl Default for Config {
@@ -51,6 +52,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             account: AccountConfig::default(),
             admin: AdminConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -94,6 +96,7 @@ impl Config {
         self.xmpp.validate()?;
         self.validate_hosts()?;
         self.c2s.validate()?;
+        self.metrics.validate(&self.c2s)?;
         self.limits.validate()?;
         for (index, listener) in self.c2s.listeners.iter().enumerate() {
             if !listener.auth_mechanisms.has_scram() {
@@ -267,12 +270,7 @@ impl C2sConfig {
             }
             for (previous, other) in self.listeners[..index].iter().enumerate() {
                 let other = other.address;
-                if address.port() == other.port()
-                    && address.is_ipv4() == other.is_ipv4()
-                    && (address == other
-                        || address.ip().is_unspecified()
-                        || other.ip().is_unspecified())
-                {
+                if endpoints_overlap(address, other) {
                     return Err(format!(
                         "c2s.listeners[{index}] overlaps c2s.listeners[{previous}]"
                     ));
@@ -281,6 +279,13 @@ impl C2sConfig {
         }
         Ok(())
     }
+}
+
+fn endpoints_overlap(first: SocketAddr, second: SocketAddr) -> bool {
+    first.port() != 0
+        && first.port() == second.port()
+        && first.is_ipv4() == second.is_ipv4()
+        && (first == second || first.ip().is_unspecified() || second.ip().is_unspecified())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -439,6 +444,37 @@ impl Default for AdminConfig {
             enabled: true,
             socket_path: PathBuf::from("./run/lonewolf/admin.sock"),
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    /// IPv6 addresses accept IPv6 only; port zero selects an ephemeral port.
+    pub address: SocketAddr,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: SocketAddr::from((Ipv4Addr::LOCALHOST, 9520)),
+        }
+    }
+}
+
+impl MetricsConfig {
+    fn validate(&self, c2s: &C2sConfig) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        for (index, listener) in c2s.listeners.iter().enumerate() {
+            if endpoints_overlap(self.address, listener.address) {
+                return Err(format!("metrics.address overlaps c2s.listeners[{index}]"));
+            }
+        }
+        Ok(())
     }
 }
 

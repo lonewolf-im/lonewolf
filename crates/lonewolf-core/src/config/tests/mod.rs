@@ -11,7 +11,7 @@ use std::process::Command;
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
     AccountConfig, ClientCertificateConfig, Config, ConfigError, HostConfig, HostTlsConfig,
-    StoreConfig, TcpListenerConfig, XmppConfig,
+    MetricsConfig, StoreConfig, TcpListenerConfig, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
 use lonewolf_extension::{Extensions, HostSelection};
@@ -96,6 +96,75 @@ fn admin_defaults_are_enabled_on_a_unix_socket() {
         config.admin.socket_path,
         Path::new("./run/lonewolf/admin.sock")
     );
+}
+
+#[test]
+fn metrics_defaults_are_disabled_on_loopback() -> TestResult {
+    assert_eq!(
+        Config::default().metrics,
+        MetricsConfig {
+            enabled: false,
+            address: "127.0.0.1:9520".parse()?,
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn explicit_metrics_settings_override_defaults() -> TestResult {
+    let file = config_file("[metrics]\nenabled = true\naddress = '[::1]:9100'\n")?;
+    assert_eq!(
+        Config::load(Some(file.path()))?.metrics,
+        MetricsConfig {
+            enabled: true,
+            address: "[::1]:9100".parse()?,
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn partial_metrics_settings_preserve_other_defaults() -> TestResult {
+    let file = config_file("[metrics]\nenabled = true\n")?;
+    assert_eq!(
+        Config::load(Some(file.path()))?.metrics,
+        MetricsConfig {
+            enabled: true,
+            ..MetricsConfig::default()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_metrics_keys_are_rejected() -> TestResult {
+    let file = config_file("[metrics]\npath = '/metrics'\n")?;
+    assert!(matches!(
+        Config::load(Some(file.path())),
+        Err(ConfigError::Parse { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn enabled_metrics_address_must_not_overlap_client_endpoints() -> TestResult {
+    let file = config_file(
+        "[[c2s.listeners]]\naddress = '0.0.0.0:5222'\n[metrics]\nenabled = true\naddress = '127.0.0.1:5222'\n",
+    )?;
+    assert!(matches!(
+        Config::load(Some(file.path())),
+        Err(ConfigError::Invalid { reason, .. })
+            if reason.contains("metrics.address overlaps c2s.listeners[0]")
+    ));
+
+    for contents in [
+        "[[c2s.listeners]]\naddress = '0.0.0.0:5222'\n[metrics]\nenabled = false\naddress = '127.0.0.1:5222'\n",
+        "[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[metrics]\nenabled = true\naddress = '127.0.0.1:0'\n",
+    ] {
+        let file = config_file(contents)?;
+        Config::load(Some(file.path()))?;
+    }
+    Ok(())
 }
 
 #[test]

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::{ALTERNATE_PASSWORD, OTHER_PASSWORD};
+
 use std::time::{Duration, Instant};
 
 use crate::support::{C2sSuite, Client, TestResult};
@@ -13,8 +15,8 @@ fn expect_self_message(client: &mut Client, resource: &str, id: &str) -> TestRes
 fn message_presence_and_iq_share_one_burst_then_resume_in_order() -> TestResult {
     let suite =
         C2sSuite::with_limits("incoming_stanzas_per_connection = { per_second = 1, burst = 4 }")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send("<message to='alice@localhost/desk' type='chat' id='first'/><presence/><iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq><message to='alice@localhost/desk' type='chat' id='last'/>")?;
     expect_self_message(&mut alice, "desk", "first")?;
@@ -31,8 +33,8 @@ fn message_presence_and_iq_share_one_burst_then_resume_in_order() -> TestResult 
 fn iq_results_and_errors_consume_allowance_before_the_next_request() -> TestResult {
     let suite =
         C2sSuite::with_limits("incoming_stanzas_per_connection = { per_second = 1, burst = 3 }")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send("<iq type='result' id='ignored-result'/><iq type='error' id='ignored-error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq><message to='alice@localhost/desk' type='chat' id='after'/>")?;
     alice.expect_no_tls_input()?;
@@ -43,8 +45,8 @@ fn iq_results_and_errors_consume_allowance_before_the_next_request() -> TestResu
 #[test]
 fn rejected_binding_and_bound_stanzas_preserve_the_connection_allowance() -> TestResult {
     let suite = C2sSuite::with_limits(STRICT)?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -60,9 +62,9 @@ fn rejected_binding_and_bound_stanzas_preserve_the_connection_allowance() -> Tes
 #[test]
 fn connections_have_independent_stanza_allowances() -> TestResult {
     let suite = C2sSuite::with_limits(STRICT)?;
-    suite.create_account("alice", "pencil")?;
-    let mut desk = suite.authenticated_client("alice", "pencil")?;
-    let mut phone = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desk = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
+    let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     assert_eq!(desk.bind(Some("desk"))?, "alice@localhost/desk");
     desk.send("<message to='alice@localhost/desk' type='chat' id='desk'/>")?;
     desk.expect_no_tls_input()?;
@@ -83,8 +85,8 @@ fn listeners_apply_default_and_selected_stanza_profiles() -> TestResult {
             "{STRICT}\n[limits.c2s.profiles.selected]\nincoming_stanzas_per_connection = {{ per_second = 1, burst = 3 }}\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'selected'",
         ),
     )?;
-    suite.create_account("alice", "pencil")?;
-    let mut strict = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut strict = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     strict.send("<message to='alice@localhost/desk' type='chat' id='strict'/>")?;
     strict.expect_no_tls_input()?;
 
@@ -92,7 +94,7 @@ fn listeners_apply_default_and_selected_stanza_profiles() -> TestResult {
         &suite,
         suite.listener_address(1)?,
         "alice",
-        "pencil",
+        ALTERNATE_PASSWORD,
         "phone",
     )?;
     let started = Instant::now();
@@ -115,10 +117,16 @@ fn a_shaped_reader_keeps_delivering_more_than_a_mailbox_of_live_stanzas() -> Tes
             "{STRICT}\n[limits.c2s.profiles.fast]\nincoming_stanzas_per_connection = {{ per_second = 100_000, burst = 100_000 }}\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'fast'",
         ),
     )?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "secret")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = Client::connect_at(&suite, suite.listener_address(1)?, "bob", "secret", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", OTHER_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = Client::connect_at(
+        &suite,
+        suite.listener_address(1)?,
+        "bob",
+        OTHER_PASSWORD,
+        "phone",
+    )?;
 
     alice.send("<message to='alice@localhost/desk' type='chat' id='pending'/>")?;
     alice.expect_no_tls_input()?;
@@ -136,23 +144,23 @@ fn a_shaped_reader_keeps_delivering_more_than_a_mailbox_of_live_stanzas() -> Tes
 #[test]
 fn deleting_an_account_cancels_its_token_wait_and_releases_its_resource() -> TestResult {
     let suite = C2sSuite::with_limits(STRICT)?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='alice@localhost/desk' type='chat' id='pending'/>")?;
     alice.expect_no_tls_input()?;
 
     suite.delete_account("alice")?;
     alice.expect_stream_error("not-authorized")?;
-    suite.create_account("alice", "pencil")?;
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }
 
 #[test]
 fn shutdown_cancels_a_stanza_token_wait() -> TestResult {
     let mut suite = C2sSuite::with_limits(STRICT)?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='alice@localhost/desk' type='chat' id='pending'/>")?;
     alice.expect_no_tls_input()?;
 
@@ -170,8 +178,8 @@ fn shutdown_cancels_a_stanza_token_wait() -> TestResult {
 #[test]
 fn stanza_shaping_does_not_extend_the_resource_binding_deadline() -> TestResult {
     let suite = C2sSuite::with_limits(&format!("{STRICT}\nresource_binding_timeout_secs = 1",))?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let started = Instant::now();
     alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -185,7 +193,7 @@ fn stanza_shaping_does_not_extend_the_resource_binding_deadline() -> TestResult 
     alice.expect_tls_close()?;
     alice.send_tls_close()?;
     alice.expect_tcp_eof()?;
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }
 
@@ -202,12 +210,12 @@ fn new_recipient_budget_rejects_fourth_without_poisoning_recent_recipients() -> 
             Ok(())
         },
     )?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     let mut recipients = Vec::new();
     for name in ["bob", "carol", "dave", "erin"] {
-        suite.create_account(name, "secret")?;
-        recipients.push(suite.connect(name, "secret", "phone")?);
+        suite.create_account(name, OTHER_PASSWORD)?;
+        recipients.push(suite.connect(name, OTHER_PASSWORD, "phone")?);
     }
     for (index, name) in ["bob", "carol", "dave"].into_iter().enumerate() {
         alice.send(&format!(
@@ -269,11 +277,11 @@ fn expect_policy_error(client: &mut Client, name: &str, target: &str, id: &str) 
 fn recipient_budget_rejects_iq_and_every_subscription_without_roster_changes() -> TestResult {
     let suite = C2sSuite::with_limits(RECIPIENT_STRICT)?;
     for name in ["alice", "bob", "carol"] {
-        suite.create_account(name, "pencil")?;
+        suite.create_account(name, ALTERNATE_PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "pencil", "phone")?;
-    let mut carol = suite.connect("carol", "pencil", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
+    let mut carol = suite.connect("carol", ALTERNATE_PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost/phone' id='burn'/><iq type='get' id='before'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("burn"));
     let before = alice.receive()?;
@@ -305,12 +313,12 @@ fn recipient_budget_exempts_own_account_server_services_and_responses() -> TestR
         |_| Ok(()),
     )?;
     for name in ["alice", "bob", "carol"] {
-        suite.create_account(name, "pencil")?;
+        suite.create_account(name, ALTERNATE_PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
-    let mut bob = suite.connect("bob", "pencil", "phone")?;
-    let mut carol = suite.connect("carol", "pencil", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
+    let mut carol = suite.connect("carol", ALTERNATE_PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost/phone' id='burn'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("burn"));
     alice.send("<message to='alice@localhost/desk' type='chat' id='own-full'/><iq type='get' to='alice@localhost' id='own-bare'><query xmlns='jabber:iq:roster'/></iq><message type='chat' to='alice@localhost' id='own-bare-message'/><message type='chat' id='no-to-message'/><iq type='get' id='no-to'><query xmlns='jabber:iq:roster'/></iq><iq type='get' to='localhost' id='server'><ping xmlns='urn:xmpp:ping'/></iq><iq type='get' to='localhost/resource' id='server-resource'><ping xmlns='urn:xmpp:ping'/></iq><message type='chat' to='room@echo.localhost' id='service'><body>echo</body></message>")?;
@@ -360,11 +368,11 @@ fn recipient_budget_exempts_own_account_server_services_and_responses() -> TestR
 fn recipient_budget_counts_bare_identity_across_resources() -> TestResult {
     let suite = C2sSuite::with_limits(RECIPIENT_STRICT)?;
     for name in ["alice", "bob", "carol"] {
-        suite.create_account(name, "pencil")?;
+        suite.create_account(name, ALTERNATE_PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut desk = suite.connect("bob", "pencil", "desk")?;
-    let mut phone = suite.connect("bob", "pencil", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut desk = suite.connect("bob", ALTERNATE_PASSWORD, "desk")?;
+    let mut phone = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost/desk' id='first'/><message to='bob@localhost/phone' id='second'/><iq to='bob@localhost' type='get' id='bare'><query xmlns='urn:test'/></iq><message to='carol@localhost/phone' id='denied'/>")?;
     assert_eq!(desk.receive()?.attribute("id"), Some("first"));
     assert_eq!(phone.receive()?.attribute("id"), Some("second"));
@@ -383,11 +391,11 @@ fn recipient_budget_quietly_drops_directed_presence_without_grant_changes() -> T
     let suite =
         C2sSuite::with_limits("new_recipients_per_connection = { per_second = 1, burst = 65 }")?;
     for name in ["alice", "bob", "carol"] {
-        suite.create_account(name, "pencil")?;
+        suite.create_account(name, ALTERNATE_PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "pencil", "phone")?;
-    let mut carol = suite.connect("carol", "pencil", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
+    let mut carol = suite.connect("carol", ALTERNATE_PASSWORD, "phone")?;
     alice.send("<presence to='bob@localhost/phone' id='grant'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("grant"));
     let mut fill = String::new();
@@ -425,12 +433,12 @@ fn recipient_budget_precedes_policy_and_archive_processing() -> TestResult {
         |_| Ok(()),
     )?;
     for name in ["alice", "bob", "blocked", "carol"] {
-        suite.create_account(name, "pencil")?;
+        suite.create_account(name, ALTERNATE_PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "pencil", "phone")?;
-    let mut blocked = suite.connect("blocked", "pencil", "phone")?;
-    let mut carol = suite.connect("carol", "pencil", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
+    let mut blocked = suite.connect("blocked", ALTERNATE_PASSWORD, "phone")?;
+    let mut carol = suite.connect("carol", ALTERNATE_PASSWORD, "phone")?;
     alice.send("<message type='chat' to='bob@localhost/phone' id='burn'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("burn"));
     for target in ["blocked@localhost/phone", "carol@localhost/phone"] {

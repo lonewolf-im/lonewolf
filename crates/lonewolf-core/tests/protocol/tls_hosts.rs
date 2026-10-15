@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::ALTERNATE_PASSWORD;
+
 use std::io::Write;
 use std::sync::Arc;
 
@@ -38,7 +40,7 @@ fn opening(domain: &str) -> String {
 fn idn_alabel_sni_retains_unicode_stream_and_bound_jid() -> TestResult {
     let domain = "bücher.example";
     let (mut suite, config) = host_suite(domain, "xn--bcher-kva.example")?;
-    suite.create_account_jid("alice@bücher.example", "pencil")?;
+    suite.create_account_jid("alice@bücher.example", ALTERNATE_PASSWORD)?;
     for (identity, sni) in [
         ("xn--bcher-kva.example", true),
         ("XN--BCHER-KVA.EXAMPLE", true),
@@ -59,7 +61,7 @@ fn idn_alabel_sni_retains_unicode_stream_and_bound_jid() -> TestResult {
             Some(domain)
         );
         client.features()?.child(SASL_NAMESPACE, "mechanisms")?;
-        client.authenticate("alice", "pencil")?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
         assert_eq!(
             client.open_with(&opening(domain))?.attribute("from"),
@@ -76,7 +78,7 @@ fn idn_alabel_sni_retains_unicode_stream_and_bound_jid() -> TestResult {
 fn ipv4_reference_identity_without_sni_authenticates_and_binds() -> TestResult {
     let domain = "192.0.2.1";
     let (mut suite, config) = host_suite(domain, domain)?;
-    suite.create_account_jid("alice@192.0.2.1", "pencil")?;
+    suite.create_account_jid("alice@192.0.2.1", ALTERNATE_PASSWORD)?;
     let mut plain = suite.tcp_client()?;
     assert_eq!(
         plain.open_with(&opening(domain))?.attribute("from"),
@@ -87,7 +89,7 @@ fn ipv4_reference_identity_without_sni_authenticates_and_binds() -> TestResult {
         plain.start_tls_with_identity(Arc::new(config), ServerName::try_from(domain)?)?;
     client.open_with(&opening(domain))?;
     client.features()?.child(SASL_NAMESPACE, "mechanisms")?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
     client.open_with(&opening(domain))?;
     client.features()?.child(BIND_NAMESPACE, "bind")?;
@@ -100,7 +102,7 @@ fn ipv4_reference_identity_without_sni_authenticates_and_binds() -> TestResult {
 fn ipv6_reference_identity_without_sni_authenticates_and_binds() -> TestResult {
     let domain = "[2001:db8::1]";
     let (mut suite, config) = host_suite(domain, "2001:db8::1")?;
-    suite.create_account_jid("alice@[2001:db8::1]", "pencil")?;
+    suite.create_account_jid("alice@[2001:db8::1]", ALTERNATE_PASSWORD)?;
     let mut plain = suite.tcp_client()?;
     assert_eq!(
         plain.open_with(&opening(domain))?.attribute("from"),
@@ -111,7 +113,7 @@ fn ipv6_reference_identity_without_sni_authenticates_and_binds() -> TestResult {
         plain.start_tls_with_identity(Arc::new(config), ServerName::try_from("2001:db8::1")?)?;
     client.open_with(&opening(domain))?;
     client.features()?.child(SASL_NAMESPACE, "mechanisms")?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
     client.open_with(&opening(domain))?;
     client.features()?.child(BIND_NAMESPACE, "bind")?;
@@ -149,7 +151,7 @@ fn selected_dns_hosts_keep_case_insensitive_and_absent_sni_policy() -> TestResul
     let mut suite = C2sSuite::with_hosts(
         "[hosts.'other.localhost'.tls]\ncertificate_chain_path = 'certificate.pem'\nprivate_key_path = 'private-key.pem'",
     )?;
-    suite.create_account_jid("alice@other.localhost", "pencil")?;
+    suite.create_account_jid("alice@other.localhost", ALTERNATE_PASSWORD)?;
     for (domain, identity, sni) in [
         ("localhost", "LOCALHOST", true),
         ("other.localhost", "OTHER.LOCALHOST", true),
@@ -165,7 +167,7 @@ fn selected_dns_hosts_keep_case_insensitive_and_absent_sni_policy() -> TestResul
         client.open_with(&opening(domain))?;
         client.features()?.child(SASL_NAMESPACE, "mechanisms")?;
         if domain == "other.localhost" {
-            client.authenticate("alice", "pencil")?;
+            client.authenticate("alice", ALTERNATE_PASSWORD)?;
             let mut bound = client.restart();
             bound.open_with(&opening(domain))?;
             bound.features()?.child(BIND_NAMESPACE, "bind")?;

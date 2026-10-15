@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::{ALTERNATE_PASSWORD, NEW_PASSWORD, PASSWORD};
+
 use std::time::{Duration, Instant};
 
 use rustls::version;
@@ -9,8 +11,8 @@ use super::support::{C2sSuite, Client, SASL_NAMESPACE, TestResult};
 #[test]
 fn requested_resource_logs_ordered_transitions_without_exposing_jids() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     client.bind(Some("desk"))?;
     client.close()?;
     let logs = suite.wait_for_log("stream disconnected")?;
@@ -54,8 +56,8 @@ fn requested_resource_logs_ordered_transitions_without_exposing_jids() -> TestRe
 #[test]
 fn generated_resource_logs_ordered_transitions_without_exposing_jids() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     client.bind(None)?;
     client.close()?;
     let logs = suite.wait_for_log("stream disconnected")?;
@@ -101,13 +103,13 @@ fn authentication_deadline_ends_at_sasl_success() -> TestResult {
     let suite = C2sSuite::with_limits(
         "authentication_timeout_secs = 2\nresource_binding_timeout_secs = 5",
     )?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     let started = Instant::now();
     client
         .scram(
             "alice",
-            "pencil",
+            ALTERNATE_PASSWORD,
             "SCRAM-SHA-256-PLUS",
             Some("tls-exporter"),
         )?
@@ -122,7 +124,7 @@ fn authentication_deadline_ends_at_sasl_success() -> TestResult {
 #[test]
 fn failed_exporter_proof_allows_non_exporter_retries_on_the_same_connection() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for version in [&version::TLS12, &version::TLS13] {
         for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
             for (retry_mechanism, binding) in [
@@ -136,7 +138,7 @@ fn failed_exporter_proof_allows_non_exporter_retries_on_the_same_connection() ->
                     "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
                 )?;
                 client
-                    .scram("alice", "pencil", retry_mechanism, binding)?
+                    .scram("alice", ALTERNATE_PASSWORD, retry_mechanism, binding)?
                     .assert_name(SASL_NAMESPACE, "success");
                 let mut client = client.restart();
                 client.open()?;
@@ -151,7 +153,7 @@ fn failed_exporter_proof_allows_non_exporter_retries_on_the_same_connection() ->
 #[test]
 fn rejected_exporter_identity_allows_a_non_exporter_retry() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for (username, authzid, condition) in [
         ("missing", None, "not-authorized"),
         ("alice", Some("bob@localhost"), "invalid-authzid"),
@@ -159,7 +161,7 @@ fn rejected_exporter_identity_allows_a_non_exporter_retry() -> TestResult {
         let mut client = suite.unauthenticated_client()?;
         let exchange = client.begin_scram(
             username,
-            "pencil",
+            ALTERNATE_PASSWORD,
             "SCRAM-SHA-256-PLUS",
             Some("tls-exporter"),
             authzid,
@@ -168,7 +170,7 @@ fn rejected_exporter_identity_allows_a_non_exporter_retry() -> TestResult {
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><{condition}/></failure>"
         ))?;
         client
-            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
             .assert_name(SASL_NAMESPACE, "success");
         let mut client = client.restart();
         client.open()?;
@@ -181,7 +183,7 @@ fn rejected_exporter_identity_allows_a_non_exporter_retry() -> TestResult {
 #[test]
 fn exporter_abort_and_malformed_final_allow_a_non_exporter_retry() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for (response, condition) in [
         (
             "<abort xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>",
@@ -211,7 +213,7 @@ fn exporter_abort_and_malformed_final_allow_a_non_exporter_retry() -> TestResult
                 "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><{condition}/></failure>"
             ))?;
             client
-                .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+                .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
                 .assert_name(SASL_NAMESPACE, "success");
             let mut client = client.restart();
             client.open()?;
@@ -225,7 +227,7 @@ fn exporter_abort_and_malformed_final_allow_a_non_exporter_retry() -> TestResult
 #[test]
 fn replacing_an_exporter_attempt_authenticates_without_the_exporter() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for version in [&version::TLS12, &version::TLS13] {
         for (mechanism, binding) in [
             ("SCRAM-SHA-256-PLUS", Some("tls-server-end-point")),
@@ -235,7 +237,7 @@ fn replacing_an_exporter_attempt_authenticates_without_the_exporter() -> TestRes
             client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice,r=nonce")?;
             assert!(client.receive_sasl_challenge()?.starts_with("r=nonce"));
             client
-                .scram("alice", "pencil", mechanism, binding)?
+                .scram("alice", ALTERNATE_PASSWORD, mechanism, binding)?
                 .assert_name(SASL_NAMESPACE, "success");
             let mut client = client.restart();
             client.open()?;
@@ -249,7 +251,7 @@ fn replacing_an_exporter_attempt_authenticates_without_the_exporter() -> TestRes
 #[test]
 fn failed_exporter_proof_refuses_exporter_reuse_and_allows_a_fresh_connection() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for version in [&version::TLS12, &version::TLS13] {
         for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
             let mut client = Client::secure_with_versions(&suite, &[version])?;
@@ -263,7 +265,7 @@ fn failed_exporter_proof_refuses_exporter_reuse_and_allows_a_fresh_connection() 
 
             let mut fresh = Client::secure_with_versions(&suite, &[version])?;
             fresh
-                .scram("alice", "pencil", mechanism, Some("tls-exporter"))?
+                .scram("alice", ALTERNATE_PASSWORD, mechanism, Some("tls-exporter"))?
                 .assert_name(SASL_NAMESPACE, "success");
             let mut fresh = fresh.restart();
             fresh.open()?;
@@ -278,10 +280,10 @@ fn failed_exporter_proof_refuses_exporter_reuse_and_allows_a_fresh_connection() 
 #[test]
 fn reusing_exporter_after_failure_abort_or_replacement_is_a_policy_violation() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for version in [&version::TLS12, &version::TLS13] {
         for username in ["alice", "missing"] {
-            for ending in ["proof", "abort", "replacement"] {
+            for ending in ["proof", "abort", NEW_PASSWORD] {
                 let mut client = Client::secure_with_versions(&suite, &[version])?;
                 if ending == "proof" {
                     client
@@ -320,7 +322,7 @@ fn reusing_exporter_after_failure_abort_or_replacement_is_a_policy_violation() -
 #[test]
 fn replacing_an_exporter_attempt_with_exporter_is_a_policy_violation() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for initial_response in [true, false] {
         let mut client = suite.unauthenticated_client()?;
         client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice,r=nonce")?;
@@ -341,7 +343,7 @@ fn replacing_an_exporter_attempt_with_exporter_is_a_policy_violation() -> TestRe
 #[test]
 fn mixed_exporter_and_non_exporter_failures_share_the_retry_budget() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for username in ["alice", "missing"] {
         let mut client = suite.unauthenticated_client()?;
         for (mechanism, binding) in [
@@ -364,7 +366,7 @@ fn mixed_exporter_and_non_exporter_failures_share_the_retry_budget() -> TestResu
 #[test]
 fn replacing_exporter_and_non_exporter_attempts_shares_the_retry_budget() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice,r=first")?;
     assert!(client.receive_sasl_challenge()?.starts_with("r=first"));
@@ -388,7 +390,7 @@ fn replacing_exporter_and_non_exporter_attempts_shares_the_retry_budget() -> Tes
 #[test]
 fn exporter_is_not_reserved_before_a_valid_client_first() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     client.send_sasl_auth("SCRAM-SHA-256-PLUS", "p=tls-exporter,,n=alice")?;
     client.expect_xml(
@@ -401,7 +403,7 @@ fn exporter_is_not_reserved_before_a_valid_client_first() -> TestResult {
     client
         .scram(
             "alice",
-            "pencil",
+            ALTERNATE_PASSWORD,
             "SCRAM-SHA-256-PLUS",
             Some("tls-exporter"),
         )?
@@ -415,7 +417,7 @@ fn exporter_is_not_reserved_before_a_valid_client_first() -> TestResult {
 #[test]
 fn endpoint_and_non_plus_attempts_keep_their_retry_budget() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for (mechanism, binding, first) in [
         ("SCRAM-SHA-256", None, "n,,n=alice,r=nonce"),
         (
@@ -436,7 +438,7 @@ fn endpoint_and_non_plus_attempts_keep_their_retry_budget() -> TestResult {
         client
             .expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><aborted/></failure>")?;
         client
-            .scram("alice", "pencil", mechanism, binding)?
+            .scram("alice", ALTERNATE_PASSWORD, mechanism, binding)?
             .assert_name(SASL_NAMESPACE, "success");
         let mut client = client.restart();
         client.open()?;
@@ -449,8 +451,8 @@ fn endpoint_and_non_plus_attempts_keep_their_retry_budget() -> TestResult {
 #[test]
 fn local_error_waits_for_delayed_xml_and_tls_closure() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     client.send("<unsupported/>")?;
     client.receive()?.assert_xml("<stream:error xmlns:stream='http://etherx.jabber.org/streams'><unsupported-stanza-type xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>")?;
     client.expect_footer()?;
@@ -465,8 +467,8 @@ fn local_error_waits_for_delayed_xml_and_tls_closure() -> TestResult {
 #[test]
 fn peer_footer_waits_for_delayed_tls_close_notify() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     client.send("</stream:stream>")?;
     client.expect_footer()?;
     client.expect_tls_close()?;
@@ -478,8 +480,8 @@ fn peer_footer_waits_for_delayed_tls_close_notify() -> TestResult {
 #[test]
 fn silent_peer_close_uses_one_five_second_budget() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     let started = Instant::now();
     client.send("<unsupported/>")?;
     client.receive()?;
@@ -509,8 +511,8 @@ fn authentication_deadline_caps_a_local_close_wait() -> TestResult {
 #[test]
 fn account_retirement_preserves_a_partial_read_while_recreation_proceeds() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut retiring = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut retiring = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     retiring.send("<message to='alice@localhost/desk' id='discarded'")?;
     std::thread::sleep(Duration::from_millis(50));
     suite.delete_account("alice")?;
@@ -519,8 +521,8 @@ fn account_retirement_preserves_a_partial_read_while_recreation_proceeds() -> Te
         .child("urn:ietf:params:xml:ns:xmpp-streams", "not-authorized")?;
     retiring.expect_footer()?;
     retiring.expect_no_tls_input()?;
-    suite.create_account("alice", "pencil")?;
-    let mut recreated = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut recreated = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     retiring.send("/></stream:stream>")?;
     retiring.expect_tls_close()?;
     retiring.send_tls_close()?;
@@ -533,13 +535,13 @@ fn account_retirement_preserves_a_partial_read_while_recreation_proceeds() -> Te
 #[test]
 fn unavailable_presence_and_resource_retirement_precede_a_silent_peer_wait() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut observer = suite.connect("alice", "pencil", "observer")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut observer = suite.connect("alice", ALTERNATE_PASSWORD, "observer")?;
     observer.send("<presence/>")?;
     observer.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
     )?;
-    let mut retiring = suite.connect("alice", "pencil", "desk")?;
+    let mut retiring = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     retiring.send("<presence/>")?;
     retiring.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
@@ -554,7 +556,7 @@ fn unavailable_presence_and_resource_retirement_precede_a_silent_peer_wait() -> 
     retiring.receive()?;
     retiring.expect_footer()?;
     observer.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost' type='unavailable'/>")?;
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     retiring.expect_no_tls_input()?;
     retiring.send("</stream:stream>")?;
     retiring.expect_tls_close()?;
@@ -569,9 +571,9 @@ fn unavailable_presence_and_resource_retirement_precede_a_silent_peer_wait() -> 
 #[test]
 fn account_iq_dispatch_observes_completed_deletion_and_recreation() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send(
         "<iq type='get' id='before' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>",
     )?;
@@ -583,7 +585,7 @@ fn account_iq_dispatch_observes_completed_deletion_and_recreation() -> TestResul
         alice.send(&format!("<iq type='{kind}' id='deleted-{kind}' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>"))?;
         alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='deleted-{kind}' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
     }
-    suite.create_account("bob", "password")?;
+    suite.create_account("bob", PASSWORD)?;
     alice.send(
         "<iq type='get' id='after' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>",
     )?;

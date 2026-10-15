@@ -261,3 +261,32 @@ fn assert_same_verifier<const N: usize>(
 }
 
 mod internal;
+
+#[test]
+fn provisioning_uses_fresh_salts_and_keeps_errors_distinct() -> TestResult {
+    use crate::scram::ProvisioningError;
+    let iterations = ScramIterations::new(4096)?;
+    let first = ScramCredentials::provision("ocean copper lantern meadow", iterations)?;
+    let second = ScramCredentials::provision("ocean copper lantern meadow", iterations)?;
+    let first_sha1 = first.sha1().ok_or("missing SHA-1 verifier")?;
+    let first_sha256 = first.sha256().ok_or("missing SHA-256 verifier")?;
+    assert_ne!(first_sha1.salt(), first_sha256.salt());
+    assert_ne!(
+        first_sha1.salt(),
+        second.sha1().ok_or("missing SHA-1 verifier")?.salt()
+    );
+    assert_ne!(
+        first_sha256.salt(),
+        second.sha256().ok_or("missing SHA-256 verifier")?.salt()
+    );
+    let error = ProvisioningError::WeakPassword;
+    assert!(error.source().is_none());
+    assert_eq!(
+        error.to_string(),
+        "password must contain at least 15 characters and 3 distinct characters after SASLprep"
+    );
+    let error = ProvisioningError::from(ScramError::InvalidPassword);
+    assert!(error.source().is_some());
+    assert_eq!(error.to_string(), "password is not valid for SCRAM");
+    Ok(())
+}

@@ -19,8 +19,7 @@ use axum::routing::{get, put};
 use futures_channel::oneshot;
 use http_body_util::BodyExt;
 use lonewolf_auth::scram::{
-    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramError, ScramHash, ScramIterations,
-    ScramVerifier,
+    ProvisioningError, SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramError, ScramIterations,
 };
 use lonewolf_storage::account::{
     AccountError, AccountKey, AccountReads, AccountWrites, NewAccount,
@@ -292,18 +291,14 @@ impl<S: Storage> Api<S> {
         self.passwords
             .run(move || {
                 let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?;
-                let sha1 = ScramVerifier::generate(ScramHash::Sha1, &password.0, iterations)?;
-                let sha256 = ScramVerifier::generate(ScramHash::Sha256, &password.0, iterations)?;
-                match (sha1, sha256) {
-                    (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) => {
-                        Ok(ScramCredentials::both(sha1, sha256))
-                    }
-                    _ => Err(ScramError::DerivationFailed),
-                }
+                ScramCredentials::provision(&password.0, iterations)
             })
             .await
             .map_err(|error| match error {
-                ScramError::InvalidPassword => {
+                ProvisioningError::WeakPassword => {
+                    ApiError::new(StatusCode::BAD_REQUEST, "weak_password")
+                }
+                ProvisioningError::Scram(ScramError::InvalidPassword) => {
                     ApiError::new(StatusCode::BAD_REQUEST, "invalid_password")
                 }
                 _ => {
@@ -544,6 +539,7 @@ mod tests {
 
     use async_lock::{Mutex, MutexGuardArc};
     use compio::time::timeout;
+    use lonewolf_auth::scram::{ScramHash, ScramVerifier};
     use lonewolf_auth::server::ScramDecoy;
     use lonewolf_storage::ReadTransaction;
     use lonewolf_storage::account::Account;
@@ -560,7 +556,7 @@ mod tests {
     type TestError = Box<dyn std::error::Error + Send + Sync>;
     type TestResult = Result<(), TestError>;
 
-    /// Keeps accounts in memory with snapshot reads and staged, single-writer commits.
+    /// Read snapshots exclude staged writes until the single writer commits.
     #[derive(Clone)]
     struct MemoryStorage {
         inner: Arc<MemoryInner>,
@@ -570,6 +566,7 @@ mod tests {
         state: PlMutex<MemoryState>,
         writer: Arc<Mutex<()>>,
         decoy: ScramDecoy,
+        write_admissions: AtomicUsize,
     }
 
     #[derive(Default)]
@@ -595,6 +592,7 @@ mod tests {
                     }),
                     writer: Arc::new(Mutex::new(())),
                     decoy: ScramDecoy::from_secret([0; 32]),
+                    write_admissions: AtomicUsize::new(0),
                 }),
             }
         }
@@ -629,6 +627,7 @@ mod tests {
         }
 
         async fn begin_write(&self) -> Result<MemoryTransaction, StorageError> {
+            self.inner.write_admissions.fetch_add(1, Ordering::SeqCst);
             let writer = Arc::clone(&self.inner.writer).lock_arc().await;
             Ok(self.transaction(Some(writer)))
         }
@@ -1029,7 +1028,8 @@ mod tests {
             deletion_started.await?;
             assert!(stored(&storage, &key).await?);
 
-            let mut create = pin!(api.create(key.clone(), Password("secret".into())));
+            let mut create =
+                pin!(api.create(key.clone(), Password("ocean copper lantern meadow".into())));
             assert!(
                 timeout(Duration::from_millis(200), create.as_mut())
                     .await
@@ -1084,7 +1084,7 @@ mod tests {
             assert!(!stored(&storage, &key).await?);
 
             let response = api
-                .create(key.clone(), Password("secret".into()))
+                .create(key.clone(), Password("ocean copper lantern meadow".into()))
                 .await
                 .map_err(|error| error.code)?;
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1205,5 +1205,29 @@ mod tests {
         )));
         assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(unavailable.code, "storage_unavailable");
+    }
+
+    #[test]
+    fn weak_provisioning_is_rejected_before_account_write_admission() -> TestResult {
+        compio::runtime::Runtime::new()?.block_on(async {
+            let storage = MemoryStorage::new([]);
+            let api = Api::new(
+                storage.clone(),
+                Arc::new(RecordDeleter::new(storage.clone())),
+            );
+            let key = account_key("alice@example.org").map_err(|error| error.code)?;
+            let Err(error) = api.create(key.clone(), Password("a".into())).await else {
+                return Err("weak creation succeeded".into());
+            };
+            assert_eq!(error.code, "weak_password");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(!stored(&storage, &key).await?);
+            assert_eq!(storage.inner.write_admissions.load(Ordering::SeqCst), 0);
+            let Err(error) = api.credentials(Password("\u{ad}".into())).await else {
+                return Err("empty prepared input succeeded".into());
+            };
+            assert_eq!(error.code, "invalid_password");
+            Ok(())
+        })
     }
 }

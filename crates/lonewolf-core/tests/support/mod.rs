@@ -11,6 +11,11 @@ pub use server::C2sSuite;
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+pub const PASSWORD: &str = "ocean copper lantern meadow";
+pub const ALTERNATE_PASSWORD: &str = "forest silver river valley";
+pub const OTHER_PASSWORD: &str = "garden cobalt window harbor";
+pub const NEW_PASSWORD: &str = "violet cedar cloud orchard";
+
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";

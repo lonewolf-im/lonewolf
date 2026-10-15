@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::ALTERNATE_PASSWORD;
+
 use super::support::{BIND_NAMESPACE, C2sSuite, OPEN, TestResult};
 
 #[test]
 fn requested_resource_is_returned_in_the_bound_jid() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     let jid = client.bind(Some("desk"))?;
 
@@ -17,8 +19,8 @@ fn requested_resource_is_returned_in_the_bound_jid() -> TestResult {
 #[test]
 fn requested_resource_preserves_xml_special_characters() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     let jid = client.bind(Some("Desk & <Phone>"))?;
 
@@ -29,8 +31,8 @@ fn requested_resource_preserves_xml_special_characters() -> TestResult {
 #[test]
 fn omitted_resource_generates_a_random_identifier() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     let jid = client.bind(None)?;
 
@@ -45,10 +47,10 @@ fn omitted_resource_generates_a_random_identifier() -> TestResult {
 #[test]
 fn conflicting_resource_gets_a_new_identifier_without_replacing_the_first_client() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desk")?;
-    let mut second = suite.authenticated_client("alice", "pencil")?;
-    let mut third = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut second = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
+    let mut third = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     let generated = second.bind(None)?;
     let conflict = third.bind(Some("desk"))?;
@@ -78,8 +80,8 @@ fn rejected_iq_envelopes_return_bad_request_and_allow_binding_on_the_same_connec
         ),
     ] {
         let suite = C2sSuite::resource_limit(1)?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
         client.send(&format!("<iq {envelope}><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>"))?;
         client.expect_xml(&format!(
             "<iq xmlns='jabber:client' type='error' id='{id}'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"
@@ -98,8 +100,8 @@ fn rejected_iq_child_counts_return_bad_request_and_allow_binding_retry() -> Test
         "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/><other/>",
     ] {
         let suite = C2sSuite::resource_limit(1)?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         client.send(&format!("<iq type='set' id='bad'>{children}</iq>"))?;
         client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -128,13 +130,13 @@ fn rejected_iq_envelopes_preserve_binding_authorization_and_namespace_gates() ->
         ),
     ] {
         let suite = C2sSuite::start()?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         client.send(&format!("<iq type='bogus' id='bad' {attributes}><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>"))?;
         client.expect_stream_error(condition)?;
 
-        let mut replacement = suite.authenticated_client("alice", "pencil")?;
+        let mut replacement = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
         assert_eq!(replacement.bind(Some("desk"))?, "alice@localhost/desk");
         replacement.close()?;
     }
@@ -164,8 +166,8 @@ fn iq_responses_are_ignored_before_binding_for_permitted_addresses() -> TestResu
             " from='alice@localhost' to='alice@localhost'",
         ] {
             let suite = C2sSuite::resource_limit(1)?;
-            suite.create_account("alice", "pencil")?;
-            let mut client = suite.authenticated_client("alice", "pencil")?;
+            suite.create_account("alice", ALTERNATE_PASSWORD)?;
+            let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
             client.send(&response.replace("{address}", address))?;
             assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -178,8 +180,8 @@ fn iq_responses_are_ignored_before_binding_for_permitted_addresses() -> TestResu
 #[test]
 fn fifth_rejected_iq_envelope_still_allows_success() -> TestResult {
     let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..5 {
         client.send("<iq type='bogus' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
@@ -193,8 +195,8 @@ fn fifth_rejected_iq_envelope_still_allows_success() -> TestResult {
 #[test]
 fn rejected_iq_envelopes_share_the_binding_failure_limit() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for attempt in 0..6 {
         let input = if attempt % 2 == 0 {
@@ -207,7 +209,7 @@ fn rejected_iq_envelopes_share_the_binding_failure_limit() -> TestResult {
     }
     client.expect_stream_error("policy-violation")?;
 
-    let mut replacement = suite.authenticated_client("alice", "pencil")?;
+    let mut replacement = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     assert_eq!(replacement.bind(Some("desk"))?, "alice@localhost/desk");
     replacement.close()
 }
@@ -241,8 +243,8 @@ fn assert_generated_resource_lifecycle(suite: &C2sSuite, resource: &str) -> Test
 #[test]
 fn empty_resource_gets_a_generated_identifier() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     assert_generated_identifier(&client.bind(Some(""))?)?;
     client.close()?;
@@ -252,8 +254,8 @@ fn empty_resource_gets_a_generated_identifier() -> TestResult {
 #[test]
 fn oversized_resource_gets_a_generated_identifier() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let resource = "x".repeat(1100);
 
     assert_generated_identifier(&client.bind(Some(&resource))?)?;
@@ -264,8 +266,8 @@ fn oversized_resource_gets_a_generated_identifier() -> TestResult {
 #[test]
 fn unpreparable_resource_gets_a_generated_identifier() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let resource = "private\u{200b}resource";
 
     assert_generated_identifier(&client.bind(Some(resource))?)?;
@@ -276,8 +278,8 @@ fn unpreparable_resource_gets_a_generated_identifier() -> TestResult {
 #[test]
 fn requested_resource_is_normalized_in_the_bound_jid() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     assert_eq!(
         client.bind(Some("Desk\u{a0}Phone"))?,
@@ -289,8 +291,8 @@ fn requested_resource_is_normalized_in_the_bound_jid() -> TestResult {
 #[test]
 fn resource_attributes_returns_bad_request_and_allows_retry() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'>desk</resource></bind></iq>")?;
     client.expect_xml(
@@ -306,8 +308,8 @@ fn resource_attributes_returns_bad_request_and_allows_retry() -> TestResult {
 #[test]
 fn duplicate_resources_returns_bad_request_and_allows_retry() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource><resource>phone</resource></bind></iq>")?;
     client.expect_xml(
@@ -323,8 +325,8 @@ fn duplicate_resources_returns_bad_request_and_allows_retry() -> TestResult {
 #[test]
 fn unknown_child_returns_bad_request_and_allows_retry() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><other/></bind></iq>")?;
     client.expect_xml(
@@ -340,8 +342,8 @@ fn unknown_child_returns_bad_request_and_allows_retry() -> TestResult {
 #[test]
 fn text_content_returns_bad_request_and_allows_retry() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(
         "<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>text</bind></iq>",
@@ -359,8 +361,8 @@ fn text_content_returns_bad_request_and_allows_retry() -> TestResult {
 #[test]
 fn fifth_binding_failure_still_allows_success() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..5 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
@@ -378,8 +380,8 @@ fn fifth_binding_failure_still_allows_success() -> TestResult {
 #[test]
 fn sixth_binding_failure_closes_the_stream() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..5 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
@@ -405,8 +407,8 @@ fn configured_resource_binding_retries_close_after_eight_failed_attempts() -> Te
         "custom",
         "[limits.c2s.profiles.custom]\nresource_binding_retries = 7",
     )?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..8 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
@@ -418,61 +420,61 @@ fn configured_resource_binding_retries_close_after_eight_failed_attempts() -> Te
 #[test]
 fn different_sender_closes_binding_without_registering_the_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='set' id='bad' from='bob@localhost'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     client.expect_stream_error("invalid-from")?;
 
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }
 
 #[test]
 fn full_jid_sender_closes_binding_without_registering_the_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='set' id='bad' from='alice@localhost/desk'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     client.expect_stream_error("invalid-from")?;
 
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }
 
 #[test]
 fn account_destination_closes_binding_without_registering_the_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='set' id='bad' to='bob@localhost'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     client.expect_stream_error("not-authorized")?;
 
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }
 
 #[test]
 fn server_namespace_closes_binding_without_registering_the_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='set' id='bad' xmlns='jabber:server' from='alice@localhost' to='localhost'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     client.expect_stream_error("invalid-namespace")?;
 
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }
 
 #[test]
 fn resource_limit_allows_retry_after_another_client_disconnects() -> TestResult {
     let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desk")?;
-    let mut phone = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
     phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'>
@@ -488,9 +490,9 @@ fn resource_limit_allows_retry_after_another_client_disconnects() -> TestResult 
 #[test]
 fn resource_limit_bind_failures_close_the_stream_at_the_retry_limit() -> TestResult {
     let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", "pencil")?;
-    let _desktop = suite.connect("alice", "pencil", "desk")?;
-    let mut phone = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let _desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..6 {
         phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
@@ -502,9 +504,9 @@ fn resource_limit_bind_failures_close_the_stream_at_the_retry_limit() -> TestRes
 #[test]
 fn malformed_and_resource_limit_bind_failures_share_the_retry_limit() -> TestResult {
     let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", "pencil")?;
-    let _desktop = suite.connect("alice", "pencil", "desk")?;
-    let mut phone = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let _desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for attempt in 0..6 {
         if attempt % 2 == 0 {
@@ -521,12 +523,12 @@ fn malformed_and_resource_limit_bind_failures_share_the_retry_limit() -> TestRes
 #[test]
 fn unusable_resource_fallback_and_resource_limit_share_the_retry_limit() -> TestResult {
     let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 20")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut desktops = Vec::with_capacity(10);
     for index in 0..10 {
-        desktops.push(suite.connect("alice", "pencil", &format!("desktop-{index}"))?);
+        desktops.push(suite.connect("alice", ALTERNATE_PASSWORD, &format!("desktop-{index}"))?);
     }
-    let mut phone = suite.authenticated_client("alice", "pencil")?;
+    let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let overlong_resource = "a".repeat(1024);
 
     for attempt in 0..6 {
@@ -544,9 +546,9 @@ fn unusable_resource_fallback_and_resource_limit_share_the_retry_limit() -> Test
 #[test]
 fn prefix_free_stream_returns_client_namespace_binding_and_iq_replies() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
     client.open_with(&OPEN.replace(" xmlns='jabber:client'", ""))?;
     client.features()?.child(BIND_NAMESPACE, "bind")?;
@@ -578,8 +580,8 @@ fn fifth_structural_failure_still_allows_unusable_resource_fallback() -> TestRes
     let oversized = "x".repeat(1100);
     for resource in ["", oversized.as_str(), "private\u{200b}resource"] {
         let suite = C2sSuite::resource_limit(1)?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         for payload in [
             "<resource><other/></resource>",
@@ -605,9 +607,9 @@ fn saturated_unusable_resource_fallback_counts_one_failure_per_request() -> Test
     let oversized = "x".repeat(1100);
     for resource in ["", oversized.as_str(), "private\u{200b}resource"] {
         let suite = C2sSuite::resource_limit(1)?;
-        suite.create_account("alice", "pencil")?;
-        let mut desktop = suite.connect("alice", "pencil", "desk")?;
-        let mut phone = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+        let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         for _ in 0..6 {
             phone.send(&format!("<iq type='set' id='full'><bind xmlns='{BIND_NAMESPACE}'><resource>{resource}</resource></bind></iq>"))?;
@@ -630,8 +632,8 @@ fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
         "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>text</bind>",
     ] {
         let suite = C2sSuite::resource_limit(1)?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         for _ in 0..6 {
             client.send(&format!("<iq type='set' id='bad'>{bind}</iq>"))?;
@@ -645,8 +647,8 @@ fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
 #[test]
 fn nested_resource_children_close_at_the_retry_limit() -> TestResult {
     let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..6 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource><other/></resource></bind></iq>")?;
@@ -658,8 +660,8 @@ fn nested_resource_children_close_at_the_retry_limit() -> TestResult {
 #[test]
 fn mixed_resource_children_close_at_the_retry_limit() -> TestResult {
     let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..6 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk<other/></resource></bind></iq>")?;
@@ -671,8 +673,8 @@ fn mixed_resource_children_close_at_the_retry_limit() -> TestResult {
 #[test]
 fn pre_bind_disco_without_destination_returns_service_unavailable_then_binds() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(
         "<iq type='get' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>",
@@ -696,8 +698,8 @@ fn pre_bind_requests_to_permitted_destinations_return_service_unavailable() -> T
             ("set", "<bind xmlns='urn:test:unsupported'/>"),
         ] {
             let suite = C2sSuite::start()?;
-            suite.create_account("alice", "pencil")?;
-            let mut client = suite.authenticated_client("alice", "pencil")?;
+            suite.create_account("alice", ALTERNATE_PASSWORD)?;
+            let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
             client.send(&format!(
                 "<iq type='{kind}' id='a&amp;b'{attributes}>{payload}</iq>"
@@ -713,8 +715,8 @@ fn pre_bind_requests_to_permitted_destinations_return_service_unavailable() -> T
 #[test]
 fn own_bare_destination_accepts_binding_and_rejected_request_recovery() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='get' id='bad' to='alice@localhost'><first/><second/></iq>")?;
     client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -741,8 +743,8 @@ fn pre_bind_iqs_to_other_entities_close_before_request_or_response_handling() ->
             "type='error'/>",
         ] {
             let suite = C2sSuite::start()?;
-            suite.create_account("alice", "pencil")?;
-            let mut client = suite.authenticated_client("alice", "pencil")?;
+            suite.create_account("alice", ALTERNATE_PASSWORD)?;
+            let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
             client.send(&format!("<iq to='{destination}' {stanza}"))?;
             client.expect_stream_error("not-authorized")?;
@@ -768,8 +770,8 @@ fn pre_bind_responses_preserve_namespace_and_address_gate_precedence() -> TestRe
             ("to=''", "not-authorized"),
         ] {
             let suite = C2sSuite::start()?;
-            suite.create_account("alice", "pencil")?;
-            let mut client = suite.authenticated_client("alice", "pencil")?;
+            suite.create_account("alice", ALTERNATE_PASSWORD)?;
+            let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
             let payload = if envelope.starts_with("type='error' id=") {
                 "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
@@ -787,8 +789,8 @@ fn pre_bind_responses_preserve_namespace_and_address_gate_precedence() -> TestRe
 fn ignored_pre_bind_responses_do_not_increment_or_reset_the_failure_count() -> TestResult {
     for bind_after_responses in [true, false] {
         let suite = C2sSuite::start()?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         for _ in 0..5 {
             client.send("<iq type='set' id='bad'><query xmlns='urn:test:unsupported'/></iq>")?;
@@ -819,8 +821,8 @@ fn unsupported_pre_bind_requests_close_at_default_and_configured_retry_limits() 
             "custom",
             &format!("[limits.c2s.profiles.custom]\nresource_binding_retries = {retries}"),
         )?;
-        suite.create_account("alice", "pencil")?;
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         for attempt in 0..max_failures {
             let kind = if attempt % 2 == 0 { "get" } else { "set" };
@@ -837,9 +839,9 @@ fn unsupported_pre_bind_requests_close_at_default_and_configured_retry_limits() 
 #[test]
 fn unsupported_malformed_and_resource_limit_failures_share_the_pre_bind_budget() -> TestResult {
     let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desk")?;
-    let mut phone = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     for _ in 0..2 {
         phone.send("<iq type='set' id='unsupported'><query xmlns='urn:test:unsupported'/></iq>")?;
@@ -858,14 +860,14 @@ fn ignored_pre_bind_responses_do_not_extend_the_shaped_binding_deadline() -> Tes
     let suite = C2sSuite::with_limits(
         "incoming_stanzas_per_connection = { per_second = 1, burst = 1 }\nresource_binding_timeout_secs = 1",
     )?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let started = std::time::Instant::now();
 
     client.send("<iq type='result' id='reply'/><iq type='result'/><iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     client.expect_stream_error("policy-violation")?;
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     suite.wait_for_log("outcome=\"binding_timeout\"")?;
-    let mut replacement = suite.connect("alice", "pencil", "desk")?;
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }

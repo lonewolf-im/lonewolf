@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::PASSWORD;
+
 use std::sync::Barrier;
 use std::thread;
 
@@ -9,7 +11,7 @@ const CAP_ONE: &str = "[hosts.localhost]\nextensions = ['roster']\n[hosts.localh
 
 fn accounts(suite: &C2sSuite) -> TestResult {
     for name in ["alice", "bob", "carol", "dave"] {
-        suite.create_account(name, "password")?;
+        suite.create_account(name, PASSWORD)?;
     }
     Ok(())
 }
@@ -43,9 +45,9 @@ fn duplicate_resources_refresh_one_pending_request_and_disconnect_keeps_capacity
 {
     let suite = C2sSuite::with_hosts(CAP_ONE)?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut alice_phone = suite.connect("alice", "password", "phone")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut alice_phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     subscribe(&mut alice, "bob@localhost", "first")?;
     barrier(&mut alice, "alice@localhost/desk")?;
     subscribe(&mut alice_phone, "bob@localhost", "refreshed")?;
@@ -64,7 +66,7 @@ fn duplicate_resources_refresh_one_pending_request_and_disconnect_keeps_capacity
         "unchanged",
         "<iq xmlns='jabber:client' type='result' id='unchanged' to='carol@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     available(&mut bob, "bob@localhost/phone", "bob@localhost")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='subscribe' id='refreshed'/>")?;
     barrier(&mut bob, "bob@localhost/phone")?;
@@ -86,17 +88,17 @@ fn listeners_and_workers_share_one_recipient_pending_limit() -> TestResult {
         &suite,
         suite.listener_address(0)?,
         "alice",
-        "password",
+        PASSWORD,
         "desk",
     )?;
     let mut carol = Client::connect_at(
         &suite,
         suite.listener_address(1)?,
         "carol",
-        "password",
+        PASSWORD,
         "phone",
     )?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     available(&mut bob, "bob@localhost/phone", "bob@localhost")?;
     let start = Barrier::new(2);
     let outcomes = thread::scope(|scope| -> TestResult<Vec<bool>> {
@@ -152,9 +154,9 @@ fn pending_limit_uses_the_recipient_host_override() -> TestResult {
         "[hosts.localhost]\nextensions = ['roster']\n[hosts.localhost.roster]\nmax_pending_subscription_requests = 3\n[hosts.'other.localhost']\nextensions = ['roster']\n[hosts.'other.localhost'.roster]\nmax_pending_subscription_requests = 1\n[hosts.'other.localhost'.tls]\ncertificate_chain_path = 'certificate.pem'\nprivate_key_path = 'private-key.pem'",
     )?;
     accounts(&suite)?;
-    suite.create_account_jid("bob@other.localhost", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    suite.create_account_jid("bob@other.localhost", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     subscribe(&mut alice, "bob@other.localhost", "first")?;
     barrier(&mut alice, "alice@localhost/desk")?;
     subscribe(&mut carol, "bob@other.localhost", "rejected")?;
@@ -177,9 +179,9 @@ fn approval_denial_and_withdrawal_each_release_pending_capacity() -> TestResult 
     for resolution in ["subscribed", "unsubscribed", "unsubscribe"] {
         let suite = C2sSuite::with_hosts(CAP_ONE)?;
         accounts(&suite)?;
-        let mut alice = suite.connect("alice", "password", "desk")?;
-        let mut carol = suite.connect("carol", "password", "desk")?;
-        let mut bob = suite.connect("bob", "password", "phone")?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+        let mut bob = suite.connect("bob", PASSWORD, "phone")?;
         subscribe(&mut alice, "bob@localhost", "first")?;
         barrier(&mut alice, "alice@localhost/desk")?;
         subscribe(&mut carol, "bob@localhost", "full")?;
@@ -209,9 +211,9 @@ fn approval_denial_and_withdrawal_each_release_pending_capacity() -> TestResult 
 fn deleting_requesters_and_recreating_recipients_releases_pending_capacity() -> TestResult {
     let suite = C2sSuite::with_hosts(CAP_ONE)?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
-    let mut dave = suite.connect("dave", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    let mut dave = suite.connect("dave", PASSWORD, "desk")?;
     subscribe(&mut alice, "bob@localhost", "first")?;
     barrier(&mut alice, "alice@localhost/desk")?;
     subscribe(&mut carol, "bob@localhost", "full")?;
@@ -228,10 +230,10 @@ fn deleting_requesters_and_recreating_recipients_releases_pending_capacity() -> 
         "full-again",
     )?;
     suite.delete_account("bob")?;
-    suite.create_account("bob", "password")?;
+    suite.create_account("bob", PASSWORD)?;
     subscribe(&mut dave, "bob@localhost", "after-recreation")?;
     barrier(&mut dave, "dave@localhost/desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     available(&mut bob, "bob@localhost/phone", "bob@localhost")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='dave@localhost' to='bob@localhost' type='subscribe' id='after-recreation'/>")?;
     barrier(&mut bob, "bob@localhost/phone")?;

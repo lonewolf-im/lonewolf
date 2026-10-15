@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prepares passwords with SASLprep and derives SCRAM verifiers.
-//!
 //! Derivation blocks the caller for the full configured iteration count.
 
 use std::borrow::Cow;
@@ -71,6 +69,38 @@ impl Error for ScramError {
     }
 }
 
+#[derive(Debug)]
+pub enum ProvisioningError {
+    WeakPassword,
+    Scram(ScramError),
+}
+
+impl fmt::Display for ProvisioningError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WeakPassword => formatter.write_str(
+                "password must contain at least 15 characters and 3 distinct characters after SASLprep",
+            ),
+            Self::Scram(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ProvisioningError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::WeakPassword => None,
+            Self::Scram(error) => Some(error),
+        }
+    }
+}
+
+impl From<ScramError> for ProvisioningError {
+    fn from(error: ScramError) -> Self {
+        Self::Scram(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScramHash {
     Sha1,
@@ -94,7 +124,7 @@ pub type ScramSha256Verifier = ScramVerifierData<32>;
 impl<const N: usize> ScramVerifierData<N> {
     /// Accepts stored values without validating their keys or minimum cost.
     ///
-    /// Use [`ScramVerifier::generate`] to create credentials from a password.
+    /// Use [`ScramCredentials::provision`] for new account passwords.
     pub fn new(
         salt: [u8; 16],
         iterations: NonZeroU32,
@@ -159,8 +189,6 @@ impl ScramVerifier {
         Self::generate_with_salt_source(hash, password, iterations, getrandom::fill)
     }
 
-    /// Derives a verifier using a caller-supplied salt.
-    ///
     /// Password preparation and ownership follow [`Self::generate`]. New
     /// credentials need an independently generated cryptographic salt.
     ///
@@ -242,6 +270,58 @@ pub struct ScramCredentials {
 }
 
 impl ScramCredentials {
+    /// Requires at least 15 scalars and 3 distinct scalars after SASLprep.
+    /// Derivation blocks the caller; the caller must erase its raw password buffer.
+    pub fn provision(
+        password: &str,
+        iterations: ScramIterations,
+    ) -> Result<Self, ProvisioningError> {
+        Self::provision_with_salt_source(password, iterations, getrandom::fill)
+    }
+
+    fn provision_with_salt_source(
+        password: &str,
+        iterations: ScramIterations,
+        mut fill: impl FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+    ) -> Result<Self, ProvisioningError> {
+        let password = PreparedPassword::new(password)?;
+        let mut distinct = Zeroizing::new(['\0'; 3]);
+        let mut distinct_count = 0;
+        let mut scalar_count = 0;
+        for scalar in password.0.chars() {
+            scalar_count += 1;
+            if distinct_count < distinct.len() && !distinct[..distinct_count].contains(&scalar) {
+                distinct[distinct_count] = scalar;
+                distinct_count += 1;
+            }
+        }
+        if scalar_count < 15 || distinct_count < 3 {
+            return Err(ProvisioningError::WeakPassword);
+        }
+        let mut sha1_salt = [0; 16];
+        let mut sha256_salt = [0; 16];
+        fill(&mut sha1_salt).map_err(ScramError::RandomUnavailable)?;
+        fill(&mut sha256_salt).map_err(ScramError::RandomUnavailable)?;
+        let sha1 = ScramVerifier::derive_prepared(
+            ScramHash::Sha1,
+            password.0.as_bytes(),
+            sha1_salt,
+            iterations,
+        )?;
+        let sha256 = ScramVerifier::derive_prepared(
+            ScramHash::Sha256,
+            password.0.as_bytes(),
+            sha256_salt,
+            iterations,
+        )?;
+        match (sha1, sha256) {
+            (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) => {
+                Ok(Self::both(sha1, sha256))
+            }
+            _ => Err(ScramError::DerivationFailed.into()),
+        }
+    }
+
     pub fn new(verifier: ScramVerifier) -> Self {
         match verifier {
             ScramVerifier::Sha1(verifier) => Self {

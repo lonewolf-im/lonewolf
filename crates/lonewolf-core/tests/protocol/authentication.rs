@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::{ALTERNATE_PASSWORD, NEW_PASSWORD, PASSWORD};
+
 use super::support::xml::STREAM_NAMESPACE;
 use rustls::{ProtocolVersion, SupportedProtocolVersion, version};
 
@@ -8,11 +10,11 @@ use super::support::{C2sSuite, Client, OPEN, SASL_NAMESPACE, STREAM_ERRORS, Test
 #[test]
 fn scram_sha256_authenticates() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client
-        .scram("Alice", "pencil", "SCRAM-SHA-256", None)?
+        .scram("Alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
         .assert_name(SASL_NAMESPACE, "success");
     let mut client = client.restart();
     let header = client.open_with(OPEN)?;
@@ -30,8 +32,8 @@ fn scram_sha256_authenticates() -> TestResult {
 #[test]
 fn authenticated_message_preserves_feff_and_replacement_characters() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     client.send("<message to='alice@localhost/desk' type='chat'><body>\u{feff}a\u{feff}\u{fffd}</body></message>")?;
     let received = client.receive()?;
     received.assert_name("jabber:client", "message");
@@ -56,7 +58,7 @@ fn exporter_authenticates_both_plus_mechanisms(
     version: &'static SupportedProtocolVersion,
 ) -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
         let mut client = Client::secure_with_versions(&suite, &[version])?;
         assert_eq!(
@@ -64,7 +66,7 @@ fn exporter_authenticates_both_plus_mechanisms(
             Some(version.version)
         );
         client
-            .scram("Alice", "pencil", mechanism, Some("tls-exporter"))?
+            .scram("Alice", ALTERNATE_PASSWORD, mechanism, Some("tls-exporter"))?
             .assert_name(SASL_NAMESPACE, "success");
         let mut client = client.restart();
         client.open()?;
@@ -79,7 +81,7 @@ fn exporter_authenticates_both_plus_mechanisms(
 #[test]
 fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
         let mut client = Client::secure_with_versions(&suite, &[&version::TLS12])?;
         assert_eq!(
@@ -101,7 +103,7 @@ fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
         assert_ne!(absent, empty);
         let exchange = client.begin_scram_with_channel_binding(
             "alice",
-            "pencil",
+            ALTERNATE_PASSWORD,
             mechanism,
             "tls-exporter",
             &absent,
@@ -110,7 +112,7 @@ fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
         )?;
         client
-            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
             .assert_name(SASL_NAMESPACE, "success");
         let mut client = client.restart();
         client.open()?;
@@ -123,7 +125,7 @@ fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
 #[test]
 fn wrong_exporter_data_rejects_both_plus_mechanisms_on_each_tls_version() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for version in [&version::TLS12, &version::TLS13] {
         for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
             let mut client = Client::secure_with_versions(&suite, &[version])?;
@@ -140,7 +142,7 @@ fn wrong_exporter_data_rejects_both_plus_mechanisms_on_each_tls_version() -> Tes
             wrong[0] ^= 1;
             let exchange = client.begin_scram_with_channel_binding(
                 "alice",
-                "pencil",
+                ALTERNATE_PASSWORD,
                 mechanism,
                 "tls-exporter",
                 &wrong,
@@ -149,7 +151,7 @@ fn wrong_exporter_data_rejects_both_plus_mechanisms_on_each_tls_version() -> Tes
                 "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
             )?;
             client
-                .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+                .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
                 .assert_name(SASL_NAMESPACE, "success");
             let mut client = client.restart();
             client.open()?;
@@ -163,7 +165,7 @@ fn wrong_exporter_data_rejects_both_plus_mechanisms_on_each_tls_version() -> Tes
 #[test]
 fn unknown_and_known_accounts_share_challenge_parameters_across_binding_retries() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut expected_parameters = None;
     for username in ["alice", "missing"] {
         let mut client = suite.unauthenticated_client()?;
@@ -192,13 +194,13 @@ fn unknown_and_known_accounts_share_challenge_parameters_across_binding_retries(
 #[test]
 fn scram_sha256_plus_with_tls_server_end_point_authenticates() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client
         .scram(
             "Alice",
-            "pencil",
+            ALTERNATE_PASSWORD,
             "SCRAM-SHA-256-PLUS",
             Some("tls-server-end-point"),
         )?
@@ -219,11 +221,11 @@ fn scram_sha256_plus_with_tls_server_end_point_authenticates() -> TestResult {
 #[test]
 fn scram_sha1_authenticates() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client
-        .scram("Alice", "pencil", "SCRAM-SHA-1", None)?
+        .scram("Alice", ALTERNATE_PASSWORD, "SCRAM-SHA-1", None)?
         .assert_name(SASL_NAMESPACE, "success");
     let mut client = client.restart();
     let header = client.open_with(OPEN)?;
@@ -241,13 +243,13 @@ fn scram_sha1_authenticates() -> TestResult {
 #[test]
 fn scram_sha1_plus_with_tls_server_end_point_authenticates() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client
         .scram(
             "Alice",
-            "pencil",
+            ALTERNATE_PASSWORD,
             "SCRAM-SHA-1-PLUS",
             Some("tls-server-end-point"),
         )?
@@ -453,7 +455,7 @@ fn malformed_scram_initial_message_returns_malformed_request() -> TestResult {
 #[test]
 fn wrong_password_closes_after_three_failed_attempts() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     for _ in 0..3 {
@@ -471,7 +473,7 @@ fn configured_authentication_retries_close_after_five_failed_attempts() -> TestR
         "custom",
         "[limits.c2s.profiles.custom]\nauthentication_retries = 4",
     )?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     for _ in 0..5 {
@@ -486,7 +488,7 @@ fn configured_authentication_retries_close_after_five_failed_attempts() -> TestR
 #[test]
 fn malformed_final_for_known_account_returns_malformed_request() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
@@ -502,7 +504,7 @@ fn malformed_final_for_known_account_returns_malformed_request() -> TestResult {
 #[test]
 fn known_account_uses_normalized_scram_challenge_parameters() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send_sasl_auth("SCRAM-SHA-256", "n,,n=Alice,r=firstnonce")?;
@@ -530,7 +532,7 @@ fn known_account_uses_normalized_scram_challenge_parameters() -> TestResult {
 #[test]
 fn unknown_account_closes_after_three_failed_attempts() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     for _ in 0..3 {
@@ -545,7 +547,7 @@ fn unknown_account_closes_after_three_failed_attempts() -> TestResult {
 #[test]
 fn malformed_final_for_unknown_account_returns_malformed_request() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send_sasl_auth("SCRAM-SHA-256", "n,,n=missing,r=nonce")?;
@@ -561,7 +563,7 @@ fn malformed_final_for_unknown_account_returns_malformed_request() -> TestResult
 #[test]
 fn unknown_account_uses_normalized_scram_challenge_parameters() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send_sasl_auth("SCRAM-SHA-256", "n,,n=Missing,r=firstnonce")?;
@@ -699,8 +701,8 @@ fn replacement_auth_discards_the_empty_initial_challenge() -> TestResult {
 #[test]
 fn valid_proof_with_unauthorized_authzid_can_retry_after_invalid_authzid() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "other password")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", "other private password")?;
 
     for authzid in [
         "bob@localhost",
@@ -711,13 +713,18 @@ fn valid_proof_with_unauthorized_authzid_can_retry_after_invalid_authzid() -> Te
         "",
     ] {
         let mut client = suite.unauthenticated_client()?;
-        let exchange =
-            client.begin_scram("alice", "pencil", "SCRAM-SHA-256", None, Some(authzid))?;
+        let exchange = client.begin_scram(
+            "alice",
+            ALTERNATE_PASSWORD,
+            "SCRAM-SHA-256",
+            None,
+            Some(authzid),
+        )?;
         client.finish_scram(exchange)?.assert_xml(
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-authzid/></failure>",
         )?;
 
-        client.authenticate("alice", "pencil")?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
         client.open()?;
         assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -729,11 +736,11 @@ fn valid_proof_with_unauthorized_authzid_can_retry_after_invalid_authzid() -> Te
 #[test]
 fn normalized_same_account_authzid_authenticates_with_channel_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     let exchange = client.begin_scram(
         "Alice",
-        "pencil",
+        ALTERNATE_PASSWORD,
         "SCRAM-SHA-256-PLUS",
         Some("tls-server-end-point"),
         Some("ALICE@LOCALHOST."),
@@ -750,7 +757,7 @@ fn normalized_same_account_authzid_authenticates_with_channel_binding() -> TestR
 #[test]
 fn unknown_account_and_wrong_proof_hide_authzid_outcomes() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
 
     for username in ["alice", "missing"] {
         let mut client = suite.unauthenticated_client()?;
@@ -768,18 +775,19 @@ fn unknown_account_and_wrong_proof_hide_authzid_outcomes() -> TestResult {
 #[test]
 fn password_rotation_rejects_old_proof_before_authzid_validation() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
 
     for authzid in [None, Some("bob@localhost")] {
-        suite.change_password("alice", "pencil")?;
+        suite.change_password("alice", ALTERNATE_PASSWORD)?;
         let mut client = suite.unauthenticated_client()?;
-        let exchange = client.begin_scram("alice", "pencil", "SCRAM-SHA-256", None, authzid)?;
-        suite.change_password("alice", "replacement")?;
+        let exchange =
+            client.begin_scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None, authzid)?;
+        suite.change_password("alice", NEW_PASSWORD)?;
         client.finish_scram(exchange)?.assert_xml(
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
         )?;
 
-        client.authenticate("alice", "replacement")?;
+        client.authenticate("alice", NEW_PASSWORD)?;
         let mut client = client.restart();
         client.open()?;
         assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -791,11 +799,11 @@ fn password_rotation_rejects_old_proof_before_authzid_validation() -> TestResult
 #[test]
 fn account_deletion_rejects_old_proof_before_authzid_validation() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     let exchange = client.begin_scram(
         "alice",
-        "pencil",
+        ALTERNATE_PASSWORD,
         "SCRAM-SHA-256",
         None,
         Some("bob@localhost"),
@@ -810,11 +818,11 @@ fn account_deletion_rejects_old_proof_before_authzid_validation() -> TestResult 
 #[test]
 fn protected_from_must_match_the_authenticated_account() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.tls_client()?;
     client.open_with(&OPEN.replace("to='localhost'", "from='bob@localhost' to='localhost'"))?;
     client.features()?;
-    let reply = client.scram("alice", "pencil", "SCRAM-SHA-256", None)?;
+    let reply = client.scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?;
     reply.assert_name(STREAM_NAMESPACE, "error");
     reply.child(STREAM_ERRORS, "invalid-from")?;
     client.expect_end()
@@ -830,7 +838,7 @@ fn optional_client_certificates_keep_no_certificate_and_trusted_certificate_scra
         Ok(())
     })?;
     let certificates = certificates.ok_or("missing client certificate fixtures")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for key in [
         None,
         Some(certificates.trusted),
@@ -846,7 +854,7 @@ fn optional_client_certificates_keep_no_certificate_and_trusted_certificate_scra
         let mut client = plain.start_tls_with_config(config)?;
         client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
         client
-            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
             .assert_name(SASL_NAMESPACE, "success");
         let mut client = client.restart();
         client.open()?;
@@ -899,7 +907,7 @@ fn client_certificate_handshakes_use_replaced_crls_without_restarting() -> TestR
         Ok(())
     })?;
     let certificates = certificates.ok_or("missing client certificate fixtures")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let config = with_client_certificate(&suite.tls, std::sync::Arc::clone(&certificates.trusted));
     for replace in [false, true] {
         if replace {
@@ -913,7 +921,7 @@ fn client_certificate_handshakes_use_replaced_crls_without_restarting() -> TestR
         let mut client = plain.start_tls_with_config(std::sync::Arc::clone(&config))?;
         client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
         client
-            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
             .assert_name(SASL_NAMESPACE, "success");
         let mut client = client.restart();
         client.open()?;
@@ -943,7 +951,7 @@ fn runtime_crl_failures_reject_certificates_and_keep_no_certificate_scram_workin
     })?;
     let certificates = certificates.ok_or("missing client certificate fixtures")?;
     let crls_path = crls_path.ok_or("missing CRL path")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for material in [
         None,
         Some(b"".as_slice()),
@@ -962,7 +970,7 @@ fn runtime_crl_failures_reject_certificates_and_keep_no_certificate_scram_workin
         assert!(client.open_with(OPEN).is_err());
         let mut client = suite.unauthenticated_client()?;
         client
-            .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+            .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
             .assert_name(SASL_NAMESPACE, "success");
         let mut client = client.restart();
         client.open()?;
@@ -980,7 +988,7 @@ fn runtime_crl_failures_reject_certificates_and_keep_no_certificate_scram_workin
     assert!(client.open_with(OPEN).is_err());
     let mut client = suite.unauthenticated_client()?;
     client
-        .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+        .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
         .assert_name(SASL_NAMESPACE, "success");
     let mut client = client.restart();
     client.open()?;
@@ -1008,7 +1016,7 @@ fn blocked_handshake_crl_reload_obeys_establishment_timeout_and_late_results_are
     )?;
     let certificates = certificates.ok_or("missing client certificate fixtures")?;
     let crls_path = crls_path.ok_or("missing CRL path")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let material = block_crl_reads(&crls_path)?;
     let mut plain = super::support::PlainClient::tcp(&suite)?;
     plain.open()?;
@@ -1026,7 +1034,7 @@ fn blocked_handshake_crl_reload_obeys_establishment_timeout_and_late_results_are
         plain.start_tls_with_config(with_client_certificate(&suite.tls, certificates.trusted))?;
     client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
     client
-        .scram("alice", "pencil", "SCRAM-SHA-256", None)?
+        .scram("alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
         .assert_name(SASL_NAMESPACE, "success");
     let mut client = client.restart();
     client.open()?;
@@ -1135,7 +1143,7 @@ fn external_only_listener_closes_without_usable_certificate_and_authenticates_wi
         client.open_with(OPEN)?;
         client.expect_stream_error("policy-violation")?;
     }
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = certificate_client(&suite, certificates.trusted, None)?;
     client.send_external_auth(Some(""))?;
     client.expect_xml("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
@@ -1148,7 +1156,7 @@ fn external_only_listener_closes_without_usable_certificate_and_authenticates_wi
 #[test]
 fn external_explicit_empty_and_omitted_responses_bind_and_route() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for authzid in [Some("Alice@LOCALHOST"), Some(""), None] {
         let mut client =
             certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
@@ -1171,8 +1179,8 @@ fn external_explicit_empty_and_omitted_responses_bind_and_route() -> TestResult 
 #[test]
 fn external_multiple_candidates_require_explicit_or_protected_identity() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
     let key = certificates.identity_key(
         &["alice@localhost", "bob@localhost"],
         time::OffsetDateTime::now_utc() + time::Duration::days(1),
@@ -1227,7 +1235,7 @@ fn external_rejects_unprovisioned_unauthorized_and_malformed_identities() -> Tes
 #[test]
 fn external_protected_from_mismatch_uses_invalid_from() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = certificate_client(&suite, certificates.trusted, Some("bob@localhost"))?;
     client.send_external_auth(Some("alice@localhost"))?;
     client.receive()?.child(STREAM_ERRORS, "invalid-from")?;
@@ -1309,7 +1317,7 @@ fn external_absent_for_no_certificate_no_candidates_and_disabled_policy() -> Tes
 #[test]
 fn external_abort_replacement_and_attempt_budget_match_scram() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client =
         certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
     client.send_external_auth(None)?;
@@ -1339,7 +1347,7 @@ fn external_abort_replacement_and_attempt_budget_match_scram() -> TestResult {
 #[test]
 fn external_revalidates_revocation_before_success() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client =
         certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
     certificates.replace_crl(
@@ -1356,7 +1364,7 @@ fn external_account_deletion_during_revalidation_prevents_success() -> TestResul
     use super::support::tls::{block_crl_reads, wait_for_crl_reader};
     use std::io::Write as _;
     let (suite, certificates, path) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = certificate_client(&suite, certificates.trusted, None)?;
     let material = block_crl_reads(&path)?;
     client.send_external_auth(Some(""))?;
@@ -1375,7 +1383,7 @@ fn external_account_deletion_during_revalidation_prevents_success() -> TestResul
 #[test]
 fn external_expiry_during_binding_uses_reset() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let key = certificates.identity_key(
         &["alice@localhost"],
         time::OffsetDateTime::now_utc() + time::Duration::seconds(3),
@@ -1392,9 +1400,9 @@ fn external_expiry_during_binding_uses_reset() -> TestResult {
 #[test]
 fn external_expiry_after_binding_sends_directed_unavailable() -> TestResult {
     let (suite, certificates, _) = external_suite("'roster'")?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut bob = Client::authenticated(&suite, "bob", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut bob = Client::authenticated(&suite, "bob", ALTERNATE_PASSWORD)?;
     bob.bind(Some("desk"))?;
     let key = certificates.identity_key(
         &["alice@localhost"],
@@ -1429,9 +1437,9 @@ fn external_anchor_expiry_after_binding_sends_directed_unavailable() -> TestResu
         Ok(())
     })?;
     let certificates = certificates.ok_or("missing certificate fixtures")?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut bob = Client::authenticated(&suite, "bob", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut bob = Client::authenticated(&suite, "bob", ALTERNATE_PASSWORD)?;
     bob.bind(Some("desk"))?;
     let mut alice = certificate_client(&suite, certificates.trusted, None)?;
     alice.send_external_auth(Some(""))?;
@@ -1453,7 +1461,7 @@ fn external_anchor_expiry_after_binding_sends_directed_unavailable() -> TestResu
 fn external_account_deletion_before_and_after_binding_retires_only_its_session() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
     for bound in [false, true] {
-        suite.create_account("alice", "pencil")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
         let mut client =
             certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?;
         client.send_external_auth(Some(""))?;
@@ -1476,11 +1484,11 @@ fn external_account_deletion_before_and_after_binding_retires_only_its_session()
 #[test]
 fn scram_with_a_certificate_does_not_activate_certificate_expiry_monitoring() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
     let key = certificates.identity_key(&["alice@localhost"], expires)?;
     let mut client = certificate_client(&suite, key, None)?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
     client.open()?;
     client.bind(Some("desk"))?;
@@ -1498,7 +1506,7 @@ fn external_shutdown_cancels_blocked_revalidation() -> TestResult {
     use super::support::tls::{block_crl_reads, wait_for_crl_reader};
     use std::io::Write as _;
     let (mut suite, certificates, path) = external_suite("")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = certificate_client(&suite, certificates.trusted, None)?;
     let material = block_crl_reads(&path)?;
     client.send_external_auth(Some(""))?;
@@ -1532,7 +1540,7 @@ fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_origin
     )?;
     let certificates = certificates.ok_or("missing client certificate fixtures")?;
     let path = path.ok_or("missing CRL path")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let material = block_crl_reads(&path)?;
     let started = std::time::Instant::now();
     let mut plain = suite.tcp_client()?;
@@ -1579,7 +1587,7 @@ fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_origin
     verification_release.write_all(&material)?;
     drop(verification_release);
     let mut client = certificate_client(&suite, certificates.trusted, None)?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
     client.open()?;
     assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -1605,7 +1613,7 @@ fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
     )?;
     let certificates = material.ok_or("missing certificate fixtures")?;
     let path = path.ok_or("missing CRL path")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = certificate_client(&suite, certificates.trusted, None)?;
     let started = std::time::Instant::now();
     let material = block_crl_reads(&path)?;
@@ -1623,9 +1631,80 @@ fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
     std::fs::write(&path, &material)?;
     release.write_all(&material)?;
     drop(release);
-    let mut client = Client::authenticated(&suite, "alice", "pencil")?;
+    let mut client = Client::authenticated(&suite, "alice", ALTERNATE_PASSWORD)?;
     client.bind(Some("desk"))?;
     client.send("<message to='alice@localhost/desk' type='chat' id='retry'/>")?;
     client.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' type='chat' id='retry'/>")?;
     client.close()
+}
+
+#[test]
+fn provisioned_passwords_authenticate_both_hashes_after_rejected_and_valid_rotation() -> TestResult
+{
+    let suite = C2sSuite::with_extensions("")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.reject_weak_password_change("alice", "a")?;
+    for password in [PASSWORD, NEW_PASSWORD] {
+        if password == NEW_PASSWORD {
+            suite.change_password("alice", password)?;
+        }
+        for mechanism in ["SCRAM-SHA-1", "SCRAM-SHA-256"] {
+            let mut client = suite.unauthenticated_client()?;
+            client
+                .scram("alice", password, mechanism, None)?
+                .assert_name(SASL_NAMESPACE, "success");
+            let mut client = client.restart();
+            client.open()?;
+            client.bind(Some("desk"))?;
+            client.close()?;
+        }
+    }
+    Ok(())
+}
+
+fn seed_legacy_short_password_credentials(directory: &std::path::Path) -> TestResult {
+    use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramIterations, ScramVerifier};
+    use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
+    use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
+    use lonewolf_util::arena::Arena;
+    use lonewolf_xmpp::jid::Jid;
+    std::fs::create_dir(directory.join("data"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(Default::default())?;
+    let key =
+        AccountKey::try_from(Jid::parse_in("legacy@localhost", &mut arena)?.resolve(&arena)?)?;
+    let iterations = ScramIterations::new(lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS.get())?;
+    let (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) = (
+        ScramVerifier::derive(ScramHash::Sha1, "a", [1; 16], iterations)?,
+        ScramVerifier::derive(ScramHash::Sha256, "a", [2; 16], iterations)?,
+    ) else {
+        return Err("wrong verifier hashes".into());
+    };
+    compio::runtime::Runtime::new()?.block_on(async {
+        let mut transaction = storage.begin_write().await?;
+        transaction
+            .create_account(NewAccount {
+                key,
+                credentials: ScramCredentials::both(sha1, sha256),
+            })
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn legacy_short_password_credentials_still_authenticate_both_hashes() -> TestResult {
+    let suite = C2sSuite::with_extensions_and_setup("", seed_legacy_short_password_credentials)?;
+    for mechanism in ["SCRAM-SHA-1", "SCRAM-SHA-256"] {
+        let mut client = suite.unauthenticated_client()?;
+        client
+            .scram("legacy", "a", mechanism, None)?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut client = client.restart();
+        client.open()?;
+        client.bind(Some("desk"))?;
+        client.close()?;
+    }
+    Ok(())
 }

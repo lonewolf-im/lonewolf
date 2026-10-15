@@ -77,7 +77,7 @@ fn account_commands_use_the_default_socket_and_preserve_json_errors() -> TestRes
         let created = ctl(
             directory,
             &["account", "create", "Alice@EXAMPLE.ORG", "--password-stdin"],
-            Some("first password\n"),
+            Some("first copper lantern meadow\n"),
         )?;
         assert!(created.status.success());
         assert_eq!(created.stdout, b"alice@example.org\n");
@@ -115,13 +115,13 @@ fn account_commands_use_the_default_socket_and_preserve_json_errors() -> TestRes
             ],
             Some("private password\n"),
         )?;
+        assert!(!String::from_utf8_lossy(&duplicate.stderr).contains("private password"));
         assert_eq!(duplicate.status.code(), Some(1));
         assert!(duplicate.stdout.is_empty());
         assert_eq!(
             serde_json::from_slice::<Value>(&duplicate.stderr)?,
             json!({"error":{"code":"account_exists"}})
         );
-        assert!(!String::from_utf8_lossy(&duplicate.stderr).contains("private password"));
 
         let changed = ctl(
             directory,
@@ -132,7 +132,7 @@ fn account_commands_use_the_default_socket_and_preserve_json_errors() -> TestRes
                 "--password-stdin",
                 "--json",
             ],
-            Some("replacement\n"),
+            Some("violet cedar cloud orchard\n"),
         )?;
         assert!(changed.status.success());
         assert_eq!(
@@ -391,4 +391,50 @@ fn a_later_page_failure_returns_nonzero_after_partial_output() -> TestResult {
         json!({"error":{"code":"future_error"}})
     );
     Ok(())
+}
+
+#[test]
+fn weak_password_errors_are_private_in_plain_and_json_modes() -> TestResult {
+    with_admin_server(|directory| {
+        let created = ctl(
+            directory,
+            &["account", "create", "alice@example.org", "--password-stdin"],
+            Some("ocean copper lantern meadow\n"),
+        )?;
+        assert!(created.status.success());
+        for json_mode in [false, true] {
+            for action in ["create", "password"] {
+                let secret = "weak-unique";
+                let mut arguments = vec![
+                    "account",
+                    action,
+                    if action == "create" {
+                        "missing@example.org"
+                    } else {
+                        "alice@example.org"
+                    },
+                    "--password-stdin",
+                ];
+                if json_mode {
+                    arguments.push("--json");
+                }
+                let output = ctl(directory, &arguments, Some(&format!("{secret}\n")))?;
+                assert_eq!(output.status.code(), Some(1));
+                assert!(output.stdout.is_empty());
+                assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+                if json_mode {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&output.stderr)?,
+                        json!({"error":{"code":"weak_password"}})
+                    );
+                } else {
+                    assert_eq!(
+                        String::from_utf8(output.stderr)?,
+                        "password must contain at least 15 characters and 3 distinct characters after SASLprep\n"
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
 }

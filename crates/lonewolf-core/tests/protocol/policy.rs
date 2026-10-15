@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::PASSWORD;
+
 use super::support::{C2sSuite, Client, TestResult};
 
 #[test]
 fn outbound_rejection_carries_the_application_condition() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("blocked", "password")?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut blocked = suite.connect("blocked", "password", "res")?;
-    let mut second = suite.connect("blocked", "password", "second")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("blocked", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut blocked = suite.connect("blocked", PASSWORD, "res")?;
+    let mut second = suite.connect("blocked", PASSWORD, "second")?;
     blocked.send("<presence/>")?;
     blocked.expect_xml(
         "<presence xmlns='jabber:client' from='blocked@localhost/res' to='blocked@localhost'/>",
@@ -29,12 +31,12 @@ fn outbound_rejection_carries_the_application_condition() -> TestResult {
 #[test]
 fn inbound_drop_replies_to_iq_and_discards_messages() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("spammer", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut spammer = suite.connect("spammer", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("spammer", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut spammer = suite.connect("spammer", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
 
     spammer.send("<message type='chat' to='alice@localhost/res' id='drop'/><iq type='get' to='alice@localhost/res' id='drop-iq'><query xmlns='urn:test:iq'/></iq><iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
     spammer.expect_xml("<iq xmlns='jabber:client' from='alice@localhost/res' type='error' id='drop-iq'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -50,10 +52,10 @@ fn inbound_drop_replies_to_iq_and_discards_messages() -> TestResult {
 #[test]
 fn inbound_rejection_answers_the_sender() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("rejecter", "password")?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut rejecter = suite.connect("rejecter", "password", "res")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("rejecter", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut rejecter = suite.connect("rejecter", PASSWORD, "res")?;
 
     rejecter.send("<message type='chat' to='alice@localhost/res' id='reject'/>")?;
     rejecter.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='rejecter@localhost/res' type='error' id='reject'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
@@ -66,9 +68,9 @@ fn inbound_rejection_answers_the_sender() -> TestResult {
 #[test]
 fn policy_does_not_apply_within_one_account() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
-    suite.create_account("blocked", "password")?;
-    let mut sender = suite.connect("blocked", "password", "a")?;
-    let mut recipient = suite.connect("blocked", "password", "b")?;
+    suite.create_account("blocked", PASSWORD)?;
+    let mut sender = suite.connect("blocked", PASSWORD, "a")?;
+    let mut recipient = suite.connect("blocked", PASSWORD, "b")?;
 
     sender.send("<message type='chat' to='blocked@localhost/b' id='self'/>")?;
     recipient.expect_xml("<message xmlns='jabber:client' from='blocked@localhost/a' to='blocked@localhost/b' type='chat' id='self'/>")?;
@@ -79,8 +81,8 @@ fn policy_does_not_apply_within_one_account() -> TestResult {
 #[test]
 fn failing_policy_rejects_with_its_condition() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "res")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
 
     alice.send("<message type='chat' to='broken@localhost' id='failure'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='broken@localhost' to='alice@localhost/res' type='error' id='failure'><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
@@ -90,13 +92,13 @@ fn failing_policy_rejects_with_its_condition() -> TestResult {
 #[test]
 fn iq_requests_follow_policy_and_rejected_responses_are_dropped() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("blocked", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut blocked = suite.connect("blocked", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
-    let mut second = suite.connect("blocked", "password", "second")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("blocked", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut blocked = suite.connect("blocked", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
+    let mut second = suite.connect("blocked", PASSWORD, "second")?;
 
     alice.send(
         "<iq type='get' to='blocked@localhost/res' id='reject'><query xmlns='urn:test:iq'/></iq>",
@@ -128,10 +130,10 @@ fn iq_requests_follow_policy_and_rejected_responses_are_dropped() -> TestResult 
 #[test]
 fn stanzas_from_services_follow_inbound_policy() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy', 'test-service'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
 
     alice.send("<message type='chat' to='spammer@echo.localhost' id='drop'/><message type='chat' to='bob@localhost/res' id='ready'/>")?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost/res' type='chat' id='ready'/>")?;
@@ -179,11 +181,11 @@ fn mutually_subscribe(
 fn directed_presence_follows_policy() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "blocked", "bob"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut blocked = suite.connect("blocked", "password", "x")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut blocked = suite.connect("blocked", PASSWORD, "x")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
 
     alice.send("<presence to='blocked@localhost/x'/>")?;
     barrier(&mut alice)?;
@@ -200,11 +202,11 @@ fn directed_presence_follows_policy() -> TestResult {
 fn probes_from_dropped_peers_are_unanswered() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "spammer", "bob"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut spammer = suite.connect("spammer", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut spammer = suite.connect("spammer", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     toggle(&mut alice, false)?;
     mutually_subscribe(&mut alice, "alice", &mut spammer, "spammer")?;
     spammer.send("<presence/>")?;
@@ -234,11 +236,11 @@ fn probes_from_dropped_peers_are_unanswered() -> TestResult {
 fn subscription_requests_from_dropped_peers_are_discarded() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "spammer", "bob"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut spammer = suite.connect("spammer", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut spammer = suite.connect("spammer", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     alice.send("<presence/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/res' to='alice@localhost'/>",
@@ -257,12 +259,12 @@ fn subscription_requests_from_dropped_peers_are_discarded() -> TestResult {
 fn broadcasts_skip_members_rejected_by_policy() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "bob", "blocked", "spammer"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
-    let mut blocked = suite.connect("blocked", "password", "res")?;
-    let mut spammer = suite.connect("spammer", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
+    let mut blocked = suite.connect("blocked", PASSWORD, "res")?;
+    let mut spammer = suite.connect("spammer", PASSWORD, "res")?;
     toggle(&mut alice, false)?;
     mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
     mutually_subscribe(&mut alice, "alice", &mut blocked, "blocked")?;
@@ -316,12 +318,12 @@ fn broadcasts_skip_members_rejected_by_policy() -> TestResult {
 fn session_end_broadcast_skips_members_rejected_by_policy() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "bob", "blocked", "spammer"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
-    let mut blocked = suite.connect("blocked", "password", "res")?;
-    let mut spammer = suite.connect("spammer", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
+    let mut blocked = suite.connect("blocked", PASSWORD, "res")?;
+    let mut spammer = suite.connect("spammer", PASSWORD, "res")?;
     toggle(&mut alice, false)?;
     mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
     mutually_subscribe(&mut alice, "alice", &mut blocked, "blocked")?;
@@ -373,15 +375,15 @@ fn session_end_broadcast_skips_members_rejected_by_policy() -> TestResult {
 fn pending_requests_from_dropped_peers_are_not_replayed() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "spammer", "bob"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut spammer = suite.connect("spammer", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut spammer = suite.connect("spammer", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     toggle(&mut bob, false)?;
     spammer.send("<presence type='subscribe' to='alice@localhost'/>")?;
     barrier(&mut spammer)?;
     toggle(&mut bob, true)?;
-    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
 
     alice.send("<presence/>")?;
     alice.expect_xml(
@@ -399,11 +401,11 @@ fn pending_requests_from_dropped_peers_are_not_replayed() -> TestResult {
 fn sender_preapproval_uses_outbound_policy_and_skips_prospective_recipient_policy() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "spammer", "rejecter"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
     for sender in ["spammer", "rejecter"] {
-        let mut client = suite.connect(sender, "password", "res")?;
+        let mut client = suite.connect(sender, PASSWORD, "res")?;
         for target in ["blocked@localhost", "blocked@remote.invalid"] {
             for kind in ["subscribed", "unsubscribed"] {
                 client.send(&format!("<presence type='{kind}' to='{target}'/>"))?;
@@ -444,10 +446,10 @@ fn sender_preapproval_uses_outbound_policy_and_skips_prospective_recipient_polic
 fn pending_approvals_and_denials_still_require_recipient_inbound_policy() -> TestResult {
     for sender in ["spammer", "rejecter"] {
         let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
-        suite.create_account("alice", "password")?;
-        suite.create_account(sender, "password")?;
-        let mut alice = suite.connect("alice", "password", "res")?;
-        let mut client = suite.connect(sender, "password", "res")?;
+        suite.create_account("alice", PASSWORD)?;
+        suite.create_account(sender, PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "res")?;
+        let mut client = suite.connect(sender, PASSWORD, "res")?;
         alice.send(&format!("<presence type='subscribe' to='{sender}@localhost'/><iq type='get' id='pending'><query xmlns='jabber:iq:roster' ver=''/></iq>"))?;
         alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='pending' to='alice@localhost/res'><query xmlns='jabber:iq:roster' ver='1'><item jid='{sender}@localhost' subscription='none' ask='subscribe'/></query></iq>"))?;
         for kind in ["subscribed", "unsubscribed"] {

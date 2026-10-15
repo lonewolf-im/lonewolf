@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::{ALTERNATE_PASSWORD, OTHER_PASSWORD};
+
 use crate::support::{C2sSuite, TestResult};
 
 fn sample_value(body: &str, series: &str) -> Option<f64> {
@@ -38,7 +40,7 @@ fn storage_commits_are_reported_per_store() -> TestResult {
     let series = "lonewolf_storage_commit_duration_seconds_count{store=\"primary\"}";
     let before = suite.scrape_metrics()?;
     let before = sample_value(&before, series).ok_or("missing storage commit count")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let body = suite.scrape_metrics()?;
     let after = sample_value(&body, series).ok_or("missing storage commit count")?;
     assert!(after >= before + 1.0, "{body}");
@@ -49,10 +51,10 @@ fn storage_commits_are_reported_per_store() -> TestResult {
 #[test]
 fn router_sessions_and_message_outcomes_are_reported() -> TestResult {
     let mut suite = C2sSuite::with_metrics()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "secret")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", OTHER_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "desk")?;
     suite.wait_for_metric("lonewolf_router_sessions 2")?;
     alice.send(
         "<message to='bob@localhost/desk' type='chat' id='routed'><body>Hello</body></message>",
@@ -73,8 +75,8 @@ fn router_sessions_and_message_outcomes_are_reported() -> TestResult {
 #[test]
 fn client_connection_lifecycle_is_reported() -> TestResult {
     let mut suite = C2sSuite::with_metrics()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     client.bind(Some("desk"))?;
     let body = suite.wait_for_metric("lonewolf_c2s_connections{listener=\"0\"} 1")?;
     for sample in [
@@ -124,7 +126,7 @@ fn admission_rejections_are_reported_by_limit() -> TestResult {
 #[test]
 fn authentication_and_binding_outcomes_are_reported() -> TestResult {
     let mut suite = C2sSuite::with_metrics_settings("", 1)?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'/>")?;
     client.expect_xml(
@@ -132,7 +134,7 @@ fn authentication_and_binding_outcomes_are_reported() -> TestResult {
     )?;
     let failure = client.scram("alice", "wrong", "SCRAM-SHA-256", None)?;
     failure.assert_name("urn:ietf:params:xml:ns:xmpp-sasl", "failure");
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
     client
         .open()?
@@ -140,7 +142,7 @@ fn authentication_and_binding_outcomes_are_reported() -> TestResult {
     assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
     suite.wait_for_metric("lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"iq\"} 1")?;
     suite.wait_for_metric("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 1")?;
-    let mut second = suite.authenticated_client("alice", "pencil")?;
+    let mut second = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     second.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
     second.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     suite.wait_for_metric("lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"iq\"} 2")?;
@@ -168,8 +170,8 @@ fn stanza_byte_and_rate_limit_counters_are_reported() -> TestResult {
         "new_recipients_per_connection = { per_second = 1, burst = 1 }",
         10,
     )?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@localhost' type='chat'/><message to='carol@localhost' type='chat'/><message to='dave@localhost' type='chat'/>")?;
     let deadline = Instant::now() + Duration::from_secs(10);
     let (body, rejected) = loop {

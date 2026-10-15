@@ -14,7 +14,8 @@ use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::parser::{ParseError, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    AsyncWriteError, CLIENT_NAMESPACE, NodeRef, SERVER_NAMESPACE, StanzaNamespace, StanzaRef,
+    AsyncWriteError, CLIENT_NAMESPACE, NodeRef, SERVER_NAMESPACE, StanzaKind, StanzaNamespace,
+    StanzaRef,
 };
 use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamErrorCondition};
 use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
@@ -27,13 +28,15 @@ use super::header::{
 use super::outcome::CloseOutcome;
 use super::renegotiation::RecordGuard;
 use super::stanza_rate::StanzaLimiter;
+use super::traffic::CountingIo;
+use crate::c2s::metrics::{C2sWorkerMetrics, RateLimit};
 use crate::hosts::Hosts;
 use crate::router::RoutedStanza;
 
 pub(super) const IO_BUFFER_BYTES: usize = 4_096;
 
 pub(super) type TlsTransport =
-    futures_rustls::server::TlsStream<RecordGuard<Pin<Box<AsyncStream<TcpStream>>>>>;
+    futures_rustls::server::TlsStream<RecordGuard<CountingIo<Pin<Box<AsyncStream<TcpStream>>>>>>;
 pub(super) type TlsReader = ReadHalf<TlsTransport>;
 pub(super) type TlsWriter = WriteHalf<TlsTransport>;
 pub(super) type XmlInput = ClosingInput<BufReader<tokio_util::compat::Compat<TlsReader>>>;
@@ -55,6 +58,7 @@ pub(super) struct Reader<A: ChunkAllocator, R = XmlInput> {
 struct ReadState<A: ChunkAllocator, R> {
     parser: XmppParser<R, A>,
     stanzas: StanzaLimiter,
+    metrics: C2sWorkerMetrics,
 }
 
 type ReadResult<A, R> = (ReadState<A, R>, Result<Option<StreamEvent<A>>, ParseError>);
@@ -63,6 +67,7 @@ type PendingRead<A, R> = Pin<Box<dyn Future<Output = ReadResult<A, R>>>>;
 pub(super) struct Writer<W = TlsWriter> {
     output: Option<BufWriter<W>>,
     host: String,
+    metrics: C2sWorkerMetrics,
     intact: bool,
     open: bool,
 }
@@ -135,10 +140,11 @@ impl<A: ChunkAllocator + Clone> Session<A> {
         stanzas: StanzaLimiter,
         closing: Rc<Cell<ReadMode>>,
         close: CloseContext,
+        metrics: C2sWorkerMetrics,
     ) -> Self {
         Self {
-            reader: Reader::with_mode(parser, stanzas, closing),
-            writer: Writer::new(writer, host),
+            reader: Reader::with_mode(parser, stanzas, closing, metrics.clone()),
+            writer: Writer::new(writer, host, metrics),
             close,
         }
     }
@@ -230,16 +236,26 @@ impl<A: ChunkAllocator + Clone> Session<A> {
 impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> {
     #[cfg(test)]
     pub(super) fn new(parser: XmppParser<R, A>, stanzas: StanzaLimiter) -> Self {
-        Self::with_mode(parser, stanzas, Rc::new(Cell::new(ReadMode::Open)))
+        Self::with_mode(
+            parser,
+            stanzas,
+            Rc::new(Cell::new(ReadMode::Open)),
+            C2sWorkerMetrics::detached(),
+        )
     }
 
     pub(super) fn with_mode(
         parser: XmppParser<R, A>,
         stanzas: StanzaLimiter,
         closing: Rc<Cell<ReadMode>>,
+        metrics: C2sWorkerMetrics,
     ) -> Self {
         Self {
-            ready: Some(ReadState { parser, stanzas }),
+            ready: Some(ReadState {
+                parser,
+                stanzas,
+                metrics,
+            }),
             pending: None,
             closing,
             failed: false,
@@ -257,6 +273,7 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
         self.ready = Some(ReadState {
             parser,
             stanzas: state.stanzas,
+            metrics: state.metrics,
         });
         self.failed |= result.is_err();
         result
@@ -280,21 +297,33 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
                     })
                     .await
                 };
-                if matches!(
-                    event,
-                    Ok(Some(
-                        StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_)
-                    ))
-                ) {
-                    let mut acquire = std::pin::pin!(state.stanzas.acquire());
-                    poll_fn(|cx| {
-                        if closing.get() != ReadMode::Open {
-                            std::task::Poll::Ready(())
-                        } else {
-                            acquire.as_mut().poll(cx)
-                        }
-                    })
-                    .await;
+                let kind = match &event {
+                    Ok(Some(StreamEvent::Stanza(parsed))) => parsed
+                        .value()
+                        .resolve(parsed.arena())
+                        .ok()
+                        .map(|stanza| stanza.kind()),
+                    Ok(Some(StreamEvent::RejectedStanza(parsed))) => Some(parsed.value().kind()),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    state.metrics.stanza_received(kind);
+                    let waited = {
+                        let mut acquire = std::pin::pin!(state.stanzas.acquire());
+                        poll_fn(|cx| {
+                            if closing.get() != ReadMode::Open {
+                                Poll::Ready(false)
+                            } else {
+                                acquire.as_mut().poll(cx)
+                            }
+                        })
+                        .await
+                    };
+                    if waited {
+                        state
+                            .metrics
+                            .rate_limited(RateLimit::IncomingStanzasPerConnection);
+                    }
                 }
                 (state, event)
             }));
@@ -339,10 +368,11 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
 }
 
 impl<W: AsyncWrite + Unpin> Writer<W> {
-    pub(super) fn new(output: W, host: String) -> Self {
+    pub(super) fn new(output: W, host: String, metrics: C2sWorkerMetrics) -> Self {
         Self {
             output: Some(BufWriter::with_capacity(IO_BUFFER_BYTES, output)),
             host,
+            metrics,
             intact: true,
             open: false,
         }
@@ -380,6 +410,17 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         Ok(())
     }
 
+    /// `xml` must contain one complete stanza of `kind`.
+    pub(super) async fn send_stanza_xml(
+        &mut self,
+        xml: &str,
+        kind: StanzaKind,
+    ) -> Result<(), CloseOutcome> {
+        self.send(xml).await?;
+        self.metrics.stanza_sent(kind);
+        Ok(())
+    }
+
     /// The caller must flush buffered output.
     pub(super) async fn write_stanza<R: ArenaRead>(
         &mut self,
@@ -394,6 +435,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
                 AsyncWriteError::Output(error) => CloseOutcome::from_io_error(&error),
             })?;
         self.intact = true;
+        self.metrics.stanza_sent(stanza.kind());
         Ok(())
     }
 

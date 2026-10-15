@@ -37,15 +37,15 @@ fn acquisition_waits_for_refill_after_the_burst_and_survives_cancellation() -> T
             NonZeroUsize::new(20).ok_or("invalid rate")?,
             NonZeroUsize::new(2).ok_or("invalid burst")?,
         );
-        limiter.acquire().await;
-        limiter.acquire().await;
+        assert!(!limiter.acquire().await);
+        assert!(!limiter.acquire().await);
         assert!(
             timeout(Duration::from_millis(10), limiter.acquire())
                 .await
                 .is_err()
         );
-        timeout(Duration::from_millis(200), limiter.acquire()).await?;
-        timeout(Duration::from_millis(200), limiter.acquire()).await?;
+        assert!(timeout(Duration::from_millis(200), limiter.acquire()).await?);
+        assert!(timeout(Duration::from_millis(200), limiter.acquire()).await?);
         Ok(())
     })
 }

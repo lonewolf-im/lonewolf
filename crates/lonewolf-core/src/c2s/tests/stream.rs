@@ -511,7 +511,10 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
                 .ok_or("no TLS config")?,
         )
         .accept(super::renegotiation::RecordGuard::new(
-            Box::pin(AsyncStream::new(socket.clone())),
+            super::traffic::CountingIo::new(
+                Box::pin(AsyncStream::new(socket.clone())),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
+            ),
             socket.clone(),
         ))
         .await?;

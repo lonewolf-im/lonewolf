@@ -55,7 +55,11 @@ fn local_close_discards_complete_stanzas_without_spending_stanza_tokens() -> Tes
             .next_event()
             .await
             .map_err(|outcome| format!("{outcome:?}"))?;
-        let mut writer = Writer::new(Vec::new(), "localhost".into());
+        let mut writer = Writer::new(
+            Vec::new(),
+            "localhost".into(),
+            crate::c2s::metrics::C2sWorkerMetrics::detached(),
+        );
         writer
             .send_header(&header())
             .await
@@ -122,6 +126,7 @@ fn interrupted_stanza_serialization_never_appends_or_flushes_a_footer() -> TestR
                 allowance: Rc::clone(&allowance),
             },
             "localhost".into(),
+            crate::c2s::metrics::C2sWorkerMetrics::detached(),
         );
         writer
             .send_header(&header())
@@ -196,6 +201,7 @@ fn blocked_phase_writes_cancel_before_timeout_close_discards_application_bufferi
                     allowance: Rc::clone(&allowance),
                 },
                 "localhost".into(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
             );
             writer
                 .send_header(&header())
@@ -245,6 +251,7 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
                 allowance: Rc::clone(&allowance),
             },
             "localhost".into(),
+            crate::c2s::metrics::C2sWorkerMetrics::detached(),
         );
         writer
             .send_header(&header())
@@ -710,7 +717,11 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
             );
             assert!(input.is_failed());
             let polls = parser_polls.get();
-            let mut writer = Writer::new(Vec::new(), "localhost".into());
+            let mut writer = Writer::new(
+                Vec::new(),
+                "localhost".into(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
+            );
             writer
                 .send_header(&header())
                 .await
@@ -763,7 +774,11 @@ fn peer_footer_plaintext_drain_preserves_outcome_and_deadline() -> TestResult {
             ));
             assert!(!input.is_failed());
             let polls = parser_polls.get();
-            let mut writer = Writer::new(Vec::new(), "localhost".into());
+            let mut writer = Writer::new(
+                Vec::new(),
+                "localhost".into(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
+            );
             writer
                 .send_header(&header())
                 .await
@@ -822,7 +837,11 @@ fn unopened_and_disconnected_plaintext_closes_never_poll_input() -> TestResult {
             )
             .await?;
             let (mut input, _, _) = probe_reader(Vec::new(), Tail::Panic);
-            let mut writer = Writer::new(Vec::new(), "localhost".into());
+            let mut writer = Writer::new(
+                Vec::new(),
+                "localhost".into(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
+            );
             if outcome != CloseOutcome::AuthenticationTimeout {
                 writer
                     .send_header(&header())
@@ -901,7 +920,11 @@ fn failed_plaintext_footer_flush_never_polls_input() -> TestResult {
         )
         .await?;
         let failure = Rc::new(Cell::new(false));
-        let mut writer = Writer::new(FlushFailure(Rc::clone(&failure)), "localhost".into());
+        let mut writer = Writer::new(
+            FlushFailure(Rc::clone(&failure)),
+            "localhost".into(),
+            crate::c2s::metrics::C2sWorkerMetrics::detached(),
+        );
         writer
             .send_header(&header())
             .await

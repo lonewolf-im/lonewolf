@@ -20,10 +20,13 @@ impl StanzaLimiter {
         }
     }
 
-    pub(super) async fn acquire(&mut self) {
+    pub(super) async fn acquire(&mut self) -> bool {
+        let mut waited = false;
         while !self.try_acquire(Instant::now()) {
+            waited = true;
             compio::time::sleep(self.bucket.refill_delay(self.per_second)).await;
         }
+        waited
     }
 
     fn try_acquire(&mut self, now: Instant) -> bool {

@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use lonewolf_util::token_bucket::TokenBucket;
 
+use crate::c2s::metrics::{C2sWorkerMetrics, RateLimit};
+
 pub(super) struct RecipientLimiter {
     per_second: NonZeroUsize,
     burst: NonZeroUsize,
@@ -15,10 +17,16 @@ pub(super) struct RecipientLimiter {
     recent: [u64; 64],
     len: usize,
     next: usize,
+    metrics: C2sWorkerMetrics,
 }
 
 impl RecipientLimiter {
-    pub(super) fn new(per_second: NonZeroUsize, burst: NonZeroUsize, now: Instant) -> Self {
+    pub(super) fn new(
+        per_second: NonZeroUsize,
+        burst: NonZeroUsize,
+        now: Instant,
+        metrics: C2sWorkerMetrics,
+    ) -> Self {
         Self {
             per_second,
             burst,
@@ -27,6 +35,7 @@ impl RecipientLimiter {
             recent: [0; 64],
             len: 0,
             next: 0,
+            metrics,
         }
     }
 
@@ -37,6 +46,8 @@ impl RecipientLimiter {
         }
         self.bucket.replenish(self.per_second, self.burst, now);
         if self.bucket.available() == 0 {
+            self.metrics
+                .rate_limited(RateLimit::NewRecipientsPerConnection);
             return false;
         }
         self.bucket.consume(1);

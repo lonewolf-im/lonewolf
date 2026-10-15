@@ -264,3 +264,201 @@ fn closing_bypasses_a_depleted_byte_bucket() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn parsed_and_written_stanzas_are_counted_by_kind() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let input = format!("{HEADER}<message/><iq type='unknown'/>");
+        let mut reader = reader(input.as_bytes(), 3)?;
+        reader.ready.as_mut().ok_or("missing read state")?.metrics = metrics.worker(0, 0);
+        assert!(matches!(
+            reader.next_event().await,
+            Ok(Some(StreamEvent::StreamStart { .. }))
+        ));
+        let Some(StreamEvent::Stanza(parsed)) =
+            reader.next_event().await.map_err(|e| format!("{e:?}"))?
+        else {
+            return Err("missing message stanza".into());
+        };
+        let mut writer = Writer::new(Vec::new(), "localhost".into(), metrics.worker(0, 0));
+        let stanza = parsed.value().resolve(parsed.arena())?;
+        writer
+            .write_stanza(&stanza)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert!(matches!(
+            reader.next_event().await,
+            Ok(Some(StreamEvent::RejectedStanza(_)))
+        ));
+        let body = metrics.render()?;
+        for sample in [
+            "lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"} 1\n",
+            "lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"iq\"} 1\n",
+            "lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"message\"} 1\n",
+        ] {
+            assert!(body.contains(sample), "{body}");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn resumed_stanza_waits_are_counted_once() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let input = format!("{HEADER}<message/><message/>");
+        let mut reader = reader(input.as_bytes(), 1)?;
+        let state = reader.ready.as_mut().ok_or("missing read state")?;
+        state.metrics = metrics.worker(0, 0);
+        state.stanzas = StanzaLimiter::new(NonZeroUsize::new(20).ok_or("zero rate")?, NonZeroUsize::MIN);
+        assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::StreamStart { .. }))));
+        assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::Stanza(_)))));
+        let mut waiting = Box::pin(reader.next_event());
+        assert!(poll!(waiting.as_mut()).is_pending());
+        assert!(metrics.render()?.contains("lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"} 2\n"));
+        drop(waiting);
+        assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::Stanza(_)))));
+        let body = metrics.render()?;
+        assert!(body.contains("lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"} 2\n"), "{body}");
+        assert!(body.contains("lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"incoming_stanzas_per_connection\"} 1\n"), "{body}");
+        Ok(())
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Ready,
+    WriteFailure,
+    FlushFailure,
+    FlushPending,
+}
+
+struct OutputState {
+    mode: Cell<OutputMode>,
+    bytes: std::cell::RefCell<Vec<u8>>,
+    flush_polled: Cell<bool>,
+}
+
+impl OutputState {
+    fn new(mode: OutputMode) -> Rc<Self> {
+        Rc::new(Self {
+            mode: Cell::new(mode),
+            bytes: std::cell::RefCell::new(Vec::new()),
+            flush_polled: Cell::new(false),
+        })
+    }
+}
+
+struct ControlledOutput(Rc<OutputState>);
+
+impl AsyncWrite for ControlledOutput {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.0.mode.get() == OutputMode::WriteFailure {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        self.0.bytes.borrow_mut().extend_from_slice(input);
+        Poll::Ready(Ok(input.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.0.flush_polled.set(true);
+        match self.0.mode.get() {
+            OutputMode::FlushPending => Poll::Pending,
+            OutputMode::FlushFailure => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+            _ => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        panic!("sending a stanza must not close the transport")
+    }
+}
+
+#[test]
+fn raw_stanza_is_counted_once_after_its_flush_completes() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let output = OutputState::new(OutputMode::FlushPending);
+        let mut writer = Writer::new(
+            ControlledOutput(Rc::clone(&output)),
+            "localhost".into(),
+            metrics.worker(0, 0),
+        );
+        let xml = "<iq xmlns='jabber:client' type='result' id='bind'/>";
+        let mut send = Box::pin(writer.send_stanza_xml(xml, StanzaKind::Iq));
+        assert!(poll!(send.as_mut()).is_pending());
+        assert!(output.flush_polled.get());
+        assert!(
+            metrics
+                .render()?
+                .contains("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 0\n")
+        );
+        assert_eq!(output.bytes.borrow().as_slice(), xml.as_bytes());
+        output.mode.set(OutputMode::Ready);
+        assert_eq!(send.await, Ok(()));
+        assert!(
+            metrics
+                .render()?
+                .contains("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 1\n")
+        );
+        assert_eq!(output.bytes.borrow().as_slice(), xml.as_bytes());
+        Ok(())
+    })
+}
+
+#[test]
+fn raw_stanza_write_and_flush_failures_do_not_increment_sent_count() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for mode in [OutputMode::WriteFailure, OutputMode::FlushFailure] {
+            let metrics = crate::c2s::metrics::C2sMetrics::detached();
+            let output = OutputState::new(mode);
+            let mut writer = Writer::new(
+                ControlledOutput(Rc::clone(&output)),
+                "localhost".into(),
+                metrics.worker(0, 0),
+            );
+            assert_eq!(
+                writer
+                    .send_stanza_xml("<iq type='error' id='bind'/>", StanzaKind::Iq)
+                    .await,
+                Err(CloseOutcome::TransportError)
+            );
+            assert_eq!(output.flush_polled.get(), mode == OutputMode::FlushFailure);
+            assert!(
+                metrics
+                    .render()?
+                    .contains("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 0\n")
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn cancelled_raw_stanza_flush_does_not_increment_sent_count() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let output = OutputState::new(OutputMode::FlushPending);
+        let mut writer = Writer::new(
+            ControlledOutput(Rc::clone(&output)),
+            "localhost".into(),
+            metrics.worker(0, 0),
+        );
+        let mut send =
+            Box::pin(writer.send_stanza_xml("<iq type='error' id='bind'/>", StanzaKind::Iq));
+        assert!(poll!(send.as_mut()).is_pending());
+        assert!(output.flush_polled.get());
+        drop(send);
+        assert!(
+            metrics
+                .render()?
+                .contains("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 0\n")
+        );
+        Ok(())
+    })
+}

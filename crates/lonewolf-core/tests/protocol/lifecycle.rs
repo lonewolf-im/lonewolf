@@ -565,3 +565,34 @@ fn unavailable_presence_and_resource_retirement_precede_a_silent_peer_wait() -> 
     replacement.close()?;
     observer.close()
 }
+
+#[test]
+fn account_iq_dispatch_observes_completed_deletion_and_recreation() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send(
+        "<iq type='get' id='before' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='before' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='bob@localhost'/></iq>")?;
+    alice.send("<iq type='set' id='before-set' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='before-set' from='bob@localhost' to='alice@localhost/desk'/>")?;
+    suite.delete_account("bob")?;
+    for kind in ["get", "set"] {
+        alice.send(&format!("<iq type='{kind}' id='deleted-{kind}' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='deleted-{kind}' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+    }
+    suite.create_account("bob", "password")?;
+    alice.send(
+        "<iq type='get' id='after' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='after' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='bob@localhost'/></iq>")?;
+    alice.send("<iq type='set' id='after-set' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='after-set' from='bob@localhost' to='alice@localhost/desk'/>")?;
+    alice.send(
+        "<iq type='get' id='calls'><query xmlns='urn:lonewolf:test:iq' calls='true'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='calls' to='alice@localhost/desk'><calls xmlns='urn:lonewolf:test:iq' gets='2' sets='2'/></iq>")?;
+    alice.close()
+}

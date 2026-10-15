@@ -365,7 +365,7 @@ fn guarded_preparations_release_writer_before_blocked_output_resumes() -> TestRe
                     Workflow::Iq => {
                         let (request, mut arena) = request.into_parts();
                         let sender = Jid::parse_in("bob@localhost/preparing", &mut arena)?;
-                        session.handle_iq_set(request, sender, arena, Arena::try_new(Default::default())?, gate.clone()).await
+                        session.handle_iq_set(request, sender, arena, Arena::try_new(Default::default())?, gate.clone(), Some(fixture.registration.account().clone())).await
                     }
                     Workflow::Offline => session.handle_message(request, MessageType::Chat).await,
                     Workflow::Subscription => session.handle_subscription(request, PresenceRequestType::Subscribe).await,
@@ -470,6 +470,7 @@ fn cancellation_during_blocked_output_obeys_the_precommit_handoff_boundary() -> 
                 arena,
                 Arena::try_new(Default::default())?,
                 gate.clone(),
+                Some(fixture.registration.account().clone()),
             ));
             drive(operation.as_mut(), entered).await??;
             queue_delivery(&fixture).await?;
@@ -518,7 +519,7 @@ fn iq_snapshot_handoff_and_global_fixing_progress_while_output_is_blocked() -> T
             arena,
             Arena::try_new(Default::default())?,
             gate.clone(),
-            vec![fixture.registration.account().clone()],
+            Some(fixture.registration.account().clone()),
         ));
         queue_delivery(&fixture).await?;
         drive(operation.as_mut(), output_entered).await??;

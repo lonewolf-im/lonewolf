@@ -2163,6 +2163,30 @@ fn versioned_roster_get_behind_a_removal_returns_the_full_roster() -> TestResult
 }
 
 #[test]
+fn roster_get_for_a_missing_account_returns_service_unavailable() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<iq type='get' id='missing-roster' to='missing@localhost'><query xmlns='jabber:iq:roster'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-roster' from='missing@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.send("<message to='alice@localhost/desk' id='processed'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='processed'/>")?;
+    alice.close()
+}
+
+#[test]
+fn roster_set_for_a_missing_account_returns_service_unavailable() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    alice.send("<iq type='set' id='missing-roster' to='missing@localhost'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-roster' from='missing@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.send("<message to='alice@localhost/desk' id='processed'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='processed'/>")?;
+    alice.close()
+}
+
+#[test]
 fn roster_get_for_another_account_returns_forbidden() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", "password")?;

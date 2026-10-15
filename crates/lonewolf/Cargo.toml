@@ -29,3 +29,7 @@ path = "../lonewolf-core/tests/server/cli.rs"
 [[test]]
 name = "workers"
 path = "../lonewolf-core/tests/server/workers.rs"
+
+[[test]]
+name = "metrics"
+path = "../lonewolf-core/tests/server/metrics.rs"

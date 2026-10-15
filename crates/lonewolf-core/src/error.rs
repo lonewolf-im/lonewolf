@@ -33,6 +33,7 @@ pub enum RunError {
     RouterFailed(RouterFailure),
     Signal(io::Error),
     Admin(io::Error),
+    Metrics(io::Error),
     C2s(io::Error),
     UnknownStore(String),
     StorageDirectory {
@@ -75,6 +76,7 @@ impl fmt::Display for RunError {
             }
             Self::RouterFailed(failure) => failure.fmt(formatter),
             Self::RouterShutdown(source) => write!(formatter, "cannot stop router: {source}"),
+            Self::Metrics(source) => write!(formatter, "metrics service failed: {source}"),
             Self::Admin(source) => write!(formatter, "admin service failed: {source}"),
             Self::C2s(source) => write!(formatter, "c2s listener service failed: {source}"),
             Self::Signal(source) => write!(formatter, "cannot wait for shutdown signal: {source}"),
@@ -106,6 +108,7 @@ impl Error for RunError {
             | Self::DispatcherShutdown(source)
             | Self::RouterShutdown(source)
             | Self::Signal(source)
+            | Self::Metrics(source)
             | Self::Admin(source)
             | Self::C2s(source) => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),

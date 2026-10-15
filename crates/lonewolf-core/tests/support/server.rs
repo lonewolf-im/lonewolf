@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -14,6 +14,8 @@ use parking_lot::{Condvar as PlCondvar, Mutex as PlMutex};
 use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
 use super::{Client, PlainClient, TIMEOUT, TestResult, tls};
+
+const METRICS_SETTINGS: &str = "[metrics]\nenabled = true\naddress = \"127.0.0.1:0\"";
 
 static ACTIVE_SERVERS: PlMutex<usize> = PlMutex::new(0);
 static SERVER_SLOT: PlCondvar = PlCondvar::new();
@@ -49,6 +51,57 @@ pub struct C2sSuite {
 impl C2sSuite {
     pub fn start() -> TestResult<Self> {
         Self::configured("", "")
+    }
+
+    pub fn with_metrics() -> TestResult<Self> {
+        Self::with_metrics_settings("", 10)
+    }
+
+    pub fn with_metrics_settings(limits: &str, resources: usize) -> TestResult<Self> {
+        Self::settings("", limits, resources, METRICS_SETTINGS)
+    }
+
+    pub fn metrics_address(&self) -> TestResult<SocketAddr> {
+        let logs = self.wait_for_log("metrics service started")?;
+        let port = logs
+            .lines()
+            .find(|line| line.contains("metrics service started"))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("port="))
+            })
+            .ok_or("missing metrics listener port")?
+            .parse()?;
+        Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    }
+
+    pub fn scrape_metrics(&self) -> TestResult<String> {
+        let mut stream = TcpStream::connect_timeout(&self.metrics_address()?, TIMEOUT)?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        stream.set_write_timeout(Some(TIMEOUT))?;
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or("missing metrics response body")?;
+        Ok(body.to_owned())
+    }
+
+    pub fn wait_for_metric(&self, sample: &str) -> TestResult<String> {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let body = self.scrape_metrics()?;
+            if body.lines().any(|line| line == sample) {
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("missing metric sample {sample}: {body}").into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn with_extensions(extensions: &str) -> TestResult<Self> {

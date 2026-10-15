@@ -22,6 +22,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::PooledChunkAllocator;
+use prometheus_client::registry::Registry;
 
 mod account_deletion;
 mod c2s;
@@ -30,6 +31,7 @@ mod delivery;
 mod error;
 pub mod hosts;
 mod logging;
+mod metrics;
 mod order;
 mod panic;
 pub(crate) mod router;
@@ -88,7 +90,8 @@ pub fn run_with_extensions(
         Hosts::new(&config.hosts, config.xmpp.default_host.as_deref()).map_err(RunError::Hosts)?;
     let worker_count = worker_count().map_err(RunError::WorkerCount)?;
 
-    let _logging_guard = logging::init(config.logging.level).map_err(RunError::Logging)?;
+    let (_logging_guard, dropped_logs) =
+        logging::init(config.logging.level).map_err(RunError::Logging)?;
     tracing::info!(
         version = build.version,
         branch = build.branch,
@@ -165,6 +168,16 @@ pub fn run_with_extensions(
                         tracing::info!(service_domain = %domain, "service registered");
                     }
                 }
+                let server_metrics = metrics::ServerMetrics::new(&build, dropped_logs);
+                let metrics_server = if config.metrics.enabled {
+                    Some(
+                        lonewolf_metrics::MetricsServer::bind(config.metrics.address)
+                            .await
+                            .map_err(RunError::Metrics)?,
+                    )
+                } else {
+                    None
+                };
                 let (deleter, deletions) = account_deletion::channel();
                 let admin = if config.admin.enabled {
                     Some(
@@ -209,8 +222,10 @@ pub fn run_with_extensions(
                         RunError::C2s(failure.error)
                     })?,
                 );
+                let registry = server_metrics.into_registry();
                 run_services(
                     admin,
+                    metrics_server.map(|server| (server, registry)),
                     listeners,
                     serving_router,
                     &mut shutdown_deadline,
@@ -266,11 +281,18 @@ pub fn run_with_extensions(
 
 async fn run_services<A: ChunkAllocator + Clone>(
     admin: Option<lonewolf_admin::Server>,
+    metrics: Option<(lonewolf_metrics::MetricsServer, Arc<Registry>)>,
     listeners: &mut c2s::Listeners,
     router: &mut Router<A>,
     shutdown_deadline: &mut Option<Instant>,
     deletions: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
+    let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
+    let metrics_task = metrics.map(|(server, registry)| {
+        compio::runtime::spawn(server.run(registry, async move {
+            let _ = metrics_stopped.await;
+        }))
+    });
     let admin_enabled = admin.is_some();
     let (stop_admin, stopped) = oneshot::channel::<()>();
     // The admin service can wait for accepted deletions while it drains.
@@ -325,6 +347,7 @@ async fn run_services<A: ChunkAllocator + Clone>(
     *shutdown_deadline = Some(deadline);
     listeners.stop(deadline);
     drop(stop_admin);
+    drop(stop_metrics);
     let drain = async {
         let services = async {
             match result {
@@ -332,8 +355,17 @@ async fn run_services<A: ChunkAllocator + Clone>(
                 Either::Left(result) | Either::Right(result) => result,
             }
         };
-        let (services, listeners) = join(services, listeners.join()).await;
-        services.and(listeners.map_err(RunError::C2s))
+        let metrics = async {
+            match metrics_task {
+                Some(task) => task
+                    .await
+                    .map_err(|_| RunError::Metrics(io::Error::other("metrics service panicked"))),
+                None => Ok(()),
+            }
+        };
+        let ((services, listeners), metrics) =
+            join(join(services, listeners.join()), metrics).await;
+        services.and(listeners.map_err(RunError::C2s)).and(metrics)
     };
     drain_services_until(deadline, router_failure, drain).await
 }

@@ -45,3 +45,27 @@ fn storage_commits_are_reported_per_store() -> TestResult {
     assert!(!body.contains("alice"), "{body}");
     suite.stop()
 }
+
+#[test]
+fn router_sessions_and_message_outcomes_are_reported() -> TestResult {
+    let mut suite = C2sSuite::with_metrics()?;
+    suite.create_account("alice", "pencil")?;
+    suite.create_account("bob", "secret")?;
+    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut bob = suite.connect("bob", "secret", "desk")?;
+    suite.wait_for_metric("lonewolf_router_sessions 2")?;
+    alice.send(
+        "<message to='bob@localhost/desk' type='chat' id='routed'><body>Hello</body></message>",
+    )?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' type='chat' id='routed'><body>Hello</body></message>")?;
+    suite.wait_for_metric("lonewolf_router_messages_total{outcome=\"routed\"} 1")?;
+    bob.close()?;
+    suite.wait_for_metric("lonewolf_router_sessions 1")?;
+    alice
+        .send("<message to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>")?;
+    let body = suite.wait_for_metric("lonewolf_router_messages_total{outcome=\"stored\"} 1")?;
+    assert!(!body.contains("alice"), "{body}");
+    assert!(!body.contains("bob"), "{body}");
+    alice.close()?;
+    suite.stop()
+}

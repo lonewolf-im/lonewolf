@@ -25,6 +25,7 @@ use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
 use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, StanzaType};
+use prometheus_client::registry::Registry;
 
 use crate::hosts::Hosts;
 use crate::order::Order;
@@ -33,8 +34,10 @@ pub(crate) use local::ResourceMatch;
 
 pub(crate) mod iq_requests;
 pub(crate) mod local;
+pub(crate) mod metrics;
 
 use iq_requests::IqRequests;
+use metrics::{RouterCollector, RouterMetrics};
 
 const MAX_DETACHED: usize = 4096;
 
@@ -48,6 +51,10 @@ pub(crate) struct DetachedGuard {
 }
 
 impl DetachedWork {
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn try_start(&self) -> Option<DetachedGuard> {
         self.active
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
@@ -190,6 +197,13 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         self.handle.clone()
     }
 
+    pub(crate) fn register_metrics(&self, registry: &mut Registry) {
+        registry.register_collector(Box::new(RouterCollector::new(
+            Arc::clone(self.handle.local.metrics()),
+            self.handle.detached_work.clone(),
+        )));
+    }
+
     pub(crate) fn with_extensions(
         mut self,
         extensions: BTreeMap<String, ExtensionRegistry<A, RedbStorage>>,
@@ -239,6 +253,10 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     pub(crate) fn iq_requests(&self) -> &Arc<IqRequests<A>> {
         &self.iq_requests
+    }
+
+    pub(crate) fn metrics(&self) -> &RouterMetrics {
+        self.local.metrics()
     }
 
     pub(crate) fn detached_work(&self) -> &DetachedWork {

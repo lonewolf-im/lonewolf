@@ -27,9 +27,9 @@ use super::shard::DirectedRecipient;
 use super::shard::Shard;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
+use crate::router::metrics::RouterMetrics;
 use crate::router::{RoutedStanza, RouterError, RouterFailure, RouterState};
 
-// A fixed power of two keeps unrelated accounts apart regardless of worker count and allows masking.
 const SHARD_COUNT: usize = 256;
 
 const RESOURCE_QUEUE_CAPACITY: usize = 64;
@@ -45,6 +45,7 @@ pub(in crate::router) struct LocalRouterHandle<A: ChunkAllocator> {
 
 pub(super) struct Inner<A: ChunkAllocator> {
     pub(super) slots: Box<[CachePadded<Slot<A>>]>,
+    metrics: Arc<RouterMetrics>,
     hash_state: RandomState,
     lifecycle: PlMutex<Lifecycle>,
     allocator: A,
@@ -73,12 +74,14 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
         Self::with_options(
             allocator,
             default_max_directed_presence_recipients_per_resource(),
+            NonZeroUsize::MIN,
         )
     }
 
     pub(crate) fn with_options(
         allocator: A,
         max_directed_presence_recipients_per_resource: NonZeroUsize,
+        workers: NonZeroUsize,
     ) -> Self {
         let (notify, failure) = oneshot::channel();
         let slots = (0..SHARD_COUNT)
@@ -95,6 +98,7 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
             handle: LocalRouterHandle {
                 inner: Arc::new(Inner {
                     slots,
+                    metrics: Arc::new(RouterMetrics::new(SHARD_COUNT, workers)),
                     hash_state: RandomState::new(),
                     lifecycle: PlMutex::new(Lifecycle {
                         state: RouterState::Running,
@@ -132,16 +136,20 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
                 Err(_) => return std::future::pending().await,
             }
         };
-        for slot in &self.handle.inner.slots {
-            slot.shard.lock().await.terminate();
+        for (index, slot) in self.handle.inner.slots.iter().enumerate() {
+            let mut shard = slot.shard.lock().await;
+            shard.terminate();
+            self.handle.inner.metrics.publish_sessions(index, 0);
         }
         failure
     }
 
     pub(crate) async fn shutdown(self) -> io::Result<()> {
         self.stop();
-        for slot in &self.handle.inner.slots {
-            slot.shard.lock().await.terminate();
+        for (index, slot) in self.handle.inner.slots.iter().enumerate() {
+            let mut shard = slot.shard.lock().await;
+            shard.terminate();
+            self.handle.inner.metrics.publish_sessions(index, 0);
         }
         match self.handle.inner.lifecycle.lock().failure {
             Some(failure) => Err(io::Error::other(failure)),
@@ -152,8 +160,9 @@ impl<A: ChunkAllocator + Clone> LocalRouter<A> {
 
 impl<A: ChunkAllocator> Drop for Inner<A> {
     fn drop(&mut self) {
-        for slot in &mut self.slots {
+        for (index, slot) in self.slots.iter_mut().enumerate() {
             slot.shard.get_mut().terminate();
+            self.metrics.publish_sessions(index, 0);
         }
     }
 }
@@ -427,6 +436,10 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
 }
 
 impl<A: ChunkAllocator> LocalRouterHandle<A> {
+    pub(in crate::router) fn metrics(&self) -> &Arc<RouterMetrics> {
+        &self.inner.metrics
+    }
+
     pub(in crate::router) fn state(&self) -> RouterState {
         self.inner.lifecycle.lock().state
     }
@@ -467,9 +480,17 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
             operation(shard)
         }));
         match result {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                self.inner
+                    .metrics
+                    .publish_sessions(index, shard.session_count());
+                Ok(value)
+            }
             Err(payload) => {
                 shard.terminate();
+                self.inner
+                    .metrics
+                    .publish_sessions(index, shard.session_count());
                 self.fail(RouterFailure { shard_id: index });
                 drop(payload);
                 Err(RouterError::Stopped)
@@ -538,5 +559,7 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
     }
 }
 
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 mod supervision_tests;

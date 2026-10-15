@@ -76,7 +76,6 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
     run_with_extensions(config_path, build, Extensions::default())
 }
 
-/// Adds the built-in extensions to the supplied catalog.
 /// Enabled extensions must have disjoint stanza routes.
 pub fn run_with_extensions(
     config_path: Option<&Path>,
@@ -208,12 +207,14 @@ pub fn run_with_extensions(
                         .limits
                         .c2s
                         .max_directed_presence_recipients_per_resource,
+                    worker_count,
                 );
                 let serving_router = router.insert(
                     Router::new(hosts.clone(), local)
                         .with_extensions(enabled_extensions)
                         .with_services(services),
                 );
+                serving_router.register_metrics(server_metrics.registry());
                 let router_handle = serving_router.handle();
                 let deletion_router = router_handle.clone();
                 let deletion_storage = storage.clone();

@@ -123,6 +123,60 @@ fn deliver_routes_a_chat_message_to_a_bound_resource() -> TestResult {
 }
 
 #[test]
+fn deliver_records_each_completed_outcome_once() -> TestResult {
+    use crate::router::metrics::MessageOutcome;
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new()?;
+        let recipient = account("bob@localhost")?;
+        let registration = fixture
+            .handle
+            .register(&recipient, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        for (xml, kind, outcome) in [
+            (
+                "<message from='alice@localhost/laptop' to='bob@localhost/phone' type='chat'/>",
+                MessageType::Chat,
+                MessageOutcome::Routed,
+            ),
+            (
+                "<message from='alice@localhost/laptop' to='bob@localhost' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>",
+                MessageType::Error,
+                MessageOutcome::Discarded,
+            ),
+            (
+                "<message from='alice@localhost/laptop' to='bob@localhost' type='groupchat'/>",
+                MessageType::Groupchat,
+                MessageOutcome::Rejected,
+            ),
+            (
+                "<message from='alice@localhost/laptop' type='chat'/>",
+                MessageType::Chat,
+                MessageOutcome::Failed,
+            ),
+        ] {
+            let result = deliver(&fixture.stage(), parsed(xml).await?, kind).await;
+            match outcome {
+                MessageOutcome::Routed => assert!(matches!(result, Ok(DeliveryOutcome::Routed))),
+                MessageOutcome::Discarded => {
+                    assert!(matches!(result, Ok(DeliveryOutcome::Discarded)))
+                }
+                MessageOutcome::Rejected => {
+                    assert!(matches!(result, Ok(DeliveryOutcome::Rejected { .. })))
+                }
+                MessageOutcome::Failed => assert!(result.is_err()),
+                MessageOutcome::Stored => return Err("unexpected stored outcome".into()),
+            }
+            assert_eq!(fixture.handle.metrics().messages(outcome), 1);
+        }
+        assert_eq!(fixture.handle.metrics().messages(MessageOutcome::Stored), 0);
+        drop(registration);
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+#[test]
 fn deliver_rejects_a_bare_groupchat_message() -> TestResult {
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
         let fixture = Fixture::new()?;

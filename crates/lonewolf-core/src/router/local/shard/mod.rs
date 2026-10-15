@@ -113,11 +113,21 @@ pub(super) struct Shard<A: ChunkAllocator> {
     last_unavailable: VecDeque<(Box<str>, LastUnavailable)>,
     accounts: HashMap<Box<str>, HashMap<Box<str>, Session<A>>>,
     retiring: HashMap<Box<str>, HashMap<u64, RetiredPresence<A>>>,
+    session_count: usize,
     next_token: u64,
     pub(super) terminated: bool,
 }
 
 impl<A: ChunkAllocator> Shard<A> {
+    pub(super) fn session_count(&self) -> usize {
+        self.session_count
+    }
+
+    #[cfg(test)]
+    pub(super) fn counted_sessions(&self) -> usize {
+        self.accounts.values().map(HashMap::len).sum()
+    }
+
     pub(super) fn cleanup(&mut self, account: &AccountKey, resource: &str, token: u64) {
         self.remove(account.as_str(), resource, token, RetireCause::Evicted);
         self.finish_presence(account, token);
@@ -144,6 +154,7 @@ impl<A: ChunkAllocator> Shard<A> {
         let had_available = self.has_available(account);
         let mut retiring = Vec::new();
         if let Some(sessions) = self.accounts.get_mut(account) {
+            let before = sessions.len();
             let mut pending = Vec::new();
             Self::remove_session(
                 sessions,
@@ -165,6 +176,7 @@ impl<A: ChunkAllocator> Shard<A> {
                     &mut retiring,
                 );
             }
+            self.session_count = self.session_count.saturating_sub(before - sessions.len());
             if sessions.is_empty() {
                 self.accounts.remove(account);
             }
@@ -526,6 +538,7 @@ impl<A: ChunkAllocator> Shard<A> {
                 while session.inbound.try_recv().is_ok() {}
             }
         }
+        self.session_count = 0;
         self.retiring.clear();
         self.last_unavailable.clear();
     }
@@ -545,6 +558,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             last_unavailable: VecDeque::new(),
             accounts: HashMap::new(),
             retiring: HashMap::new(),
+            session_count: 0,
             next_token: 0,
             terminated: false,
         }
@@ -649,6 +663,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 retired,
             },
         );
+        self.session_count += 1;
         Ok(Registration {
             account,
             resource,

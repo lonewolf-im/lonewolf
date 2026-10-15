@@ -38,3 +38,5 @@ mod stream_opening;
 mod stream_errors;
 
 mod sessions;
+
+mod metrics;

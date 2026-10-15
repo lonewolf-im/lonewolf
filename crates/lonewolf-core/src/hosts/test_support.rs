@@ -53,3 +53,28 @@ impl rcgen::SigningKey for TestSigner {
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }
+
+pub(in crate::hosts) fn srv_name(
+    value: &str,
+) -> Result<x509_cert::ext::pkix::name::GeneralName, x509_cert::der::Error> {
+    use x509_cert::der::asn1::{Ia5String, ObjectIdentifier};
+    use x509_cert::ext::pkix::name::{GeneralName, OtherName};
+    Ok(GeneralName::OtherName(OtherName {
+        type_id: ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.8.7"),
+        value: (&Ia5String::new(value)?).into(),
+    }))
+}
+
+pub(in crate::hosts) fn san_parameters(
+    names: Vec<x509_cert::ext::pkix::name::GeneralName>,
+) -> Result<rcgen::CertificateParams, Box<dyn std::error::Error>> {
+    use x509_cert::der::Encode;
+    let mut parameters = rcgen::CertificateParams::new(Vec::<String>::new())?;
+    parameters
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[2, 5, 29, 17],
+            x509_cert::ext::pkix::SubjectAltName(names).to_der()?,
+        ));
+    Ok(parameters)
+}

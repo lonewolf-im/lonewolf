@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use futures_util::io::AsyncWrite;
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ScramServer, ServerError};
 use lonewolf_storage::account::AccountKey;
@@ -16,7 +17,7 @@ use lonewolf_xmpp::stanza::{Element, NodeRef, XML_NAMESPACE};
 use super::certificate::CertificateMonitor;
 use super::establish::{Established, STARTTLS_FAILURE, is_starttls_element};
 use super::outcome::CloseOutcome;
-use super::session::{Session, namespace_error};
+use super::session::{Session, Writer, namespace_error};
 use crate::c2s::AuthService;
 use crate::c2s::metrics::C2sWorkerMetrics;
 use crate::config::AuthMechanisms;
@@ -545,16 +546,13 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
     }
 
     async fn reject(&mut self, failure: SaslFailure) -> Result<(), CloseOutcome> {
-        self.metrics
-            .authentication_failed(self.attempt_mechanism, failure);
-        let condition = failure.condition();
-        let mut xml = String::with_capacity(SASL_NAMESPACE.len() + condition.len() + 48);
-        write!(
-            xml,
-            "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
+        send_sasl_failure(
+            &mut self.session.writer,
+            self.metrics,
+            self.attempt_mechanism,
+            failure,
         )
-        .map_err(|_| CloseOutcome::InternalError)?;
-        self.session.writer.send(&xml).await
+        .await
     }
 
     async fn send_sasl(&mut self, kind: &'static str, message: &str) -> Result<(), CloseOutcome> {
@@ -565,6 +563,24 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
         self.session.writer.send(&xml).await
     }
+}
+
+async fn send_sasl_failure<W: AsyncWrite + Unpin>(
+    writer: &mut Writer<W>,
+    metrics: &C2sWorkerMetrics,
+    mechanism: Option<SaslMechanism>,
+    failure: SaslFailure,
+) -> Result<(), CloseOutcome> {
+    let condition = failure.condition();
+    let mut xml = String::with_capacity(SASL_NAMESPACE.len() + condition.len() + 48);
+    write!(
+        xml,
+        "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
+    )
+    .map_err(|_| CloseOutcome::InternalError)?;
+    writer.send(&xml).await?;
+    metrics.authentication_failed(mechanism, failure);
+    Ok(())
 }
 
 pub(super) fn account_key(username: &str, host: &str) -> Option<AccountKey> {
@@ -675,4 +691,112 @@ fn decode_sasl_text(text: Option<&str>) -> Result<Vec<u8>, SaslFailure> {
     STANDARD
         .decode(text)
         .map_err(|_| SaslFailure::IncorrectEncoding)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::error::Error;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use compio::runtime::Runtime;
+    use futures_util::poll;
+
+    use super::*;
+    use crate::c2s::metrics::C2sMetrics;
+
+    struct RejectionWriter<'a> {
+        flush_polled: &'a Cell<bool>,
+        fail: bool,
+    }
+
+    impl AsyncWrite for RejectionWriter<'_> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flush_polled.set(true);
+            if self.fail {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            panic!("SASL rejection must not close the transport")
+        }
+    }
+
+    #[test]
+    fn failed_sasl_rejection_flush_does_not_record_authentication_outcome()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let metrics = C2sMetrics::detached();
+            let worker = metrics.worker(0, 0);
+            let flush_polled = Cell::new(false);
+            let mut writer = Writer::new(
+                RejectionWriter {
+                    flush_polled: &flush_polled,
+                    fail: true,
+                },
+                "localhost".into(),
+            );
+            assert_eq!(
+                send_sasl_failure(&mut writer, &worker, None, SaslFailure::InvalidMechanism).await,
+                Err(CloseOutcome::TransportError),
+            );
+            assert!(flush_polled.get());
+            assert!(
+                !metrics
+                    .render()?
+                    .contains("lonewolf_c2s_authentications_total")
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cancelled_sasl_rejection_flush_does_not_record_authentication_outcome()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let metrics = C2sMetrics::detached();
+            let worker = metrics.worker(0, 0);
+            let flush_polled = Cell::new(false);
+            let mut writer = Writer::new(
+                RejectionWriter {
+                    flush_polled: &flush_polled,
+                    fail: false,
+                },
+                "localhost".into(),
+            );
+            let mut rejection = Box::pin(send_sasl_failure(
+                &mut writer,
+                &worker,
+                None,
+                SaslFailure::InvalidMechanism,
+            ));
+            assert!(poll!(rejection.as_mut()).is_pending());
+            assert!(flush_polled.get());
+            assert!(
+                !metrics
+                    .render()?
+                    .contains("lonewolf_c2s_authentications_total")
+            );
+            drop(rejection);
+            assert!(
+                !metrics
+                    .render()?
+                    .contains("lonewolf_c2s_authentications_total")
+            );
+            Ok(())
+        })
+    }
 }

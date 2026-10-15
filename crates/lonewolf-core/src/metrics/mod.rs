@@ -13,6 +13,7 @@ use tracing_appender::non_blocking::ErrorCounter;
 use crate::BuildInfo;
 
 pub(crate) use pool::StanzaPoolCollector;
+pub(crate) use storage::StorageCollector;
 
 pub(crate) struct ServerMetrics {
     root: Registry,
@@ -72,6 +73,7 @@ impl Collector for LogCollector {
 }
 
 mod pool;
+mod storage;
 
 #[cfg(test)]
 mod tests;

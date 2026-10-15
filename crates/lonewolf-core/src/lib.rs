@@ -170,6 +170,14 @@ pub fn run_with_extensions(
                 }
                 let mut server_metrics = metrics::ServerMetrics::new(&build, dropped_logs);
                 server_metrics.registry().register_collector(Box::new(
+                    metrics::StorageCollector::new(
+                        stores
+                            .opened()
+                            .map(|(name, storage)| (name.to_owned(), storage.clone()))
+                            .collect(),
+                    ),
+                ));
+                server_metrics.registry().register_collector(Box::new(
                     metrics::StanzaPoolCollector::new(Arc::clone(&stanza_pool)),
                 ));
                 let metrics_server = if config.metrics.enabled {

@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ::redb::{
     Database, Durability, ReadTransaction as RedbReadTransaction, ReadableDatabase,
@@ -15,6 +16,7 @@ use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_auth::server::ScramDecoy;
 use lonewolf_util::blocking::BlockingExecutor;
 
+use crate::metrics::{StoreMetrics, StoreOperation};
 use crate::storage::{ReadTransaction, Storage, WriteTransaction};
 use crate::{StorageError, StorageErrorKind, account, offline, roster};
 
@@ -41,6 +43,7 @@ struct Inner {
     /// thread never blocks inside redb's own writer lock while a handle is open.
     writer: Arc<Mutex<()>>,
     decoy: ScramDecoy,
+    metrics: Arc<StoreMetrics>,
 }
 
 /// One consistent snapshot; every operation runs on the read executor.
@@ -55,6 +58,7 @@ pub struct RedbWrite {
     transaction: Arc<RedbWriteTransaction>,
     writes: BlockingExecutor,
     _writer: MutexGuardArc<()>,
+    metrics: Arc<StoreMetrics>,
 }
 
 impl RedbStorage {
@@ -73,8 +77,13 @@ impl RedbStorage {
                 writes: BlockingExecutor::new(NonZeroUsize::MIN),
                 writer: Arc::new(Mutex::new(())),
                 decoy,
+                metrics: Arc::new(StoreMetrics::new()),
             }),
         })
+    }
+
+    pub fn metrics(&self) -> &StoreMetrics {
+        &self.inner.metrics
     }
 
     /// Opens or creates the database file synchronously and initializes its tables.
@@ -126,7 +135,12 @@ impl Storage for RedbStorage {
             .inner
             .reads
             .run(move || inner.database.begin_read().map_err(storage_error))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                self.inner
+                    .metrics
+                    .record_failure(StoreOperation::BeginRead, error.kind());
+            })?;
         Ok(RedbRead {
             transaction: Arc::new(transaction),
             reads: self.inner.reads.clone(),
@@ -134,17 +148,28 @@ impl Storage for RedbStorage {
     }
 
     async fn begin_write(&self) -> Result<RedbWrite, StorageError> {
+        let started = Instant::now();
         let writer = Arc::clone(&self.inner.writer).lock_arc().await;
         let inner = Arc::clone(&self.inner);
         let transaction = self
             .inner
             .writes
             .run(move || begin_write(&inner.database))
-            .await?;
+            .await
+            .inspect_err(|error| {
+                self.inner
+                    .metrics
+                    .record_failure(StoreOperation::BeginWrite, error.kind());
+            })?;
+        self.inner
+            .metrics
+            .write_wait_duration()
+            .observe(started.elapsed().as_secs_f64());
         Ok(RedbWrite {
             transaction: Arc::new(transaction),
             writes: self.inner.writes.clone(),
             _writer: writer,
+            metrics: Arc::clone(&self.inner.metrics),
         })
     }
 
@@ -182,14 +207,24 @@ impl WriteTransaction for RedbWrite {
             transaction,
             writes,
             _writer,
+            metrics,
         } = self;
         // An operation future dropped before it finished may still hold the
         // transaction on the writer thread; committing around it is unsafe.
-        let transaction = Arc::into_inner(transaction)
-            .ok_or_else(|| StorageError::new(StorageErrorKind::Other))?;
-        writes
+        let transaction = Arc::into_inner(transaction).ok_or_else(|| {
+            metrics.record_failure(StoreOperation::Commit, StorageErrorKind::Other);
+            StorageError::new(StorageErrorKind::Other)
+        })?;
+        let started = Instant::now();
+        let result = writes
             .run(move || transaction.commit().map_err(commit_error))
-            .await
+            .await;
+        metrics
+            .commit_duration()
+            .observe(started.elapsed().as_secs_f64());
+        result.inspect_err(|error| {
+            metrics.record_failure(StoreOperation::Commit, error.kind());
+        })
     }
 }
 

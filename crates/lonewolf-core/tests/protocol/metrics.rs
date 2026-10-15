@@ -31,3 +31,17 @@ fn metrics_endpoint_reports_build_information() -> TestResult {
     assert!(body.ends_with("# EOF\n"), "{body}");
     suite.stop()
 }
+
+#[test]
+fn storage_commits_are_reported_per_store() -> TestResult {
+    let mut suite = C2sSuite::with_metrics()?;
+    let series = "lonewolf_storage_commit_duration_seconds_count{store=\"primary\"}";
+    let before = suite.scrape_metrics()?;
+    let before = sample_value(&before, series).ok_or("missing storage commit count")?;
+    suite.create_account("alice", "pencil")?;
+    let body = suite.scrape_metrics()?;
+    let after = sample_value(&body, series).ok_or("missing storage commit count")?;
+    assert!(after >= before + 1.0, "{body}");
+    assert!(!body.contains("alice"), "{body}");
+    suite.stop()
+}

@@ -13,6 +13,26 @@ pub enum StorageErrorKind {
     Other,
 }
 
+impl StorageErrorKind {
+    pub const ALL: [Self; 5] = [
+        Self::Unavailable,
+        Self::CorruptData,
+        Self::UnsupportedVersion,
+        Self::CommitUnknown,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::CorruptData => "corrupt_data",
+            Self::UnsupportedVersion => "unsupported_version",
+            Self::CommitUnknown => "commit_unknown",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Omits backend details from [`Debug`](fmt::Debug) and [`Display`](fmt::Display).
 ///
 /// The source chain can contain credentials or account identifiers and must

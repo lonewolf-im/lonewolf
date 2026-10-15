@@ -27,6 +27,10 @@ impl<'config> StoreRegistry<'config> {
         self.store(name).cloned()
     }
 
+    pub(crate) fn opened(&self) -> impl Iterator<Item = (&str, &RedbStorage)> + '_ {
+        self.stores.iter().map(|(name, storage)| (*name, storage))
+    }
+
     fn store(&mut self, name: &str) -> Result<&RedbStorage, RunError> {
         let (name, config) = self
             .config

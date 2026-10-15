@@ -12,6 +12,7 @@ getrandom.workspace = true
 lonewolf-auth.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
+prometheus-client.workspace = true
 redb.workspace = true
 zeroize.workspace = true
 

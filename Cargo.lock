@@ -1272,6 +1272,7 @@ dependencies = [
  "lonewolf-util",
  "lonewolf-xmpp",
  "parking_lot",
+ "prometheus-client",
  "redb",
  "tempfile",
  "zeroize",

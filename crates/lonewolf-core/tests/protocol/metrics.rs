@@ -23,6 +23,11 @@ fn metrics_endpoint_reports_build_information() -> TestResult {
         sample_value(&body, "lonewolf_log_dropped_lines_total"),
         Some(0.0)
     );
+    assert!(
+        body.lines()
+            .any(|line| line == "lonewolf_stanza_pool_chunks{chunk_bytes=\"524288\"} 2"),
+        "{body}"
+    );
     assert!(body.ends_with("# EOF\n"), "{body}");
     suite.stop()
 }

@@ -69,3 +69,54 @@ fn router_sessions_and_message_outcomes_are_reported() -> TestResult {
     alice.close()?;
     suite.stop()
 }
+
+#[test]
+fn client_connection_lifecycle_is_reported() -> TestResult {
+    let mut suite = C2sSuite::with_metrics()?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", "pencil")?;
+    client.bind(Some("desk"))?;
+    let body = suite.wait_for_metric("lonewolf_c2s_connections{listener=\"0\"} 1")?;
+    for sample in [
+        "lonewolf_c2s_connections_accepted_total{listener=\"0\"} 1",
+        "lonewolf_c2s_unauthenticated_connections 0",
+        "lonewolf_c2s_phase_duration_seconds_count{phase=\"establishing\"} 1",
+        "lonewolf_c2s_phase_duration_seconds_count{phase=\"authenticating\"} 1",
+        "lonewolf_c2s_phase_duration_seconds_count{phase=\"binding\"} 1",
+    ] {
+        assert!(body.lines().any(|line| line == sample), "{body}");
+    }
+    client.close()?;
+    suite.wait_for_metric("lonewolf_c2s_connections_closed_total{listener=\"0\",phase=\"bound\",outcome=\"stream_end\"} 1")?;
+    suite.wait_for_metric("lonewolf_c2s_connections{listener=\"0\"} 0")?;
+    let body = suite.wait_for_metric("lonewolf_c2s_session_duration_seconds_count 1")?;
+    assert!(!body.contains("alice"), "{body}");
+    suite.stop()
+}
+
+#[test]
+fn admission_rejections_are_reported_by_limit() -> TestResult {
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let mut suite = C2sSuite::with_metrics_settings(
+        "connection_attempts_per_ip = { per_second = 1, burst = 1 }",
+        10,
+    )?;
+    let connections: Vec<_> = (0..5)
+        .map(|_| TcpStream::connect(suite.address))
+        .collect::<Result<_, _>>()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let body = suite.scrape_metrics()?;
+        if sample_value(&body, "lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"connection_attempts_per_ip\"}").is_some_and(|value| value >= 1.0) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("missing admission rejection metric: {body}").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(connections);
+    suite.stop()
+}

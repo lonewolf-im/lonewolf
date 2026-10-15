@@ -54,6 +54,87 @@ pub(crate) enum CloseOutcome {
 }
 
 impl CloseOutcome {
+    /// Declaration order; `PeerError` stands for every peer condition.
+    pub(crate) const ALL: [Self; 35] = [
+        Self::StreamEnd,
+        Self::PeerError(StreamErrorCondition::UndefinedCondition),
+        Self::ClosingTimeout,
+        Self::SystemShutdown,
+        Self::Eof,
+        Self::UnsupportedInput,
+        Self::UnsupportedStanzaType,
+        Self::SizeLimitExceeded,
+        Self::ParserLimitExceeded,
+        Self::ParserError,
+        Self::HostUnknown,
+        Self::InvalidTo,
+        Self::UnsupportedVersion,
+        Self::InvalidNamespace,
+        Self::BadNamespacePrefix,
+        Self::InvalidFrom,
+        Self::InvalidLanguage,
+        Self::InvalidXml,
+        Self::NotWellFormed,
+        Self::RestrictedXml,
+        Self::UnsupportedEncoding,
+        Self::StartTlsRejected,
+        Self::TlsFailure,
+        Self::CertificateInvalid,
+        Self::NoAuthenticationMechanism,
+        Self::AuthenticationTimeout,
+        Self::BindingTimeout,
+        Self::BindingAttemptsExceeded,
+        Self::EstablishmentTimeout,
+        Self::AuthenticationAttemptsExceeded,
+        Self::ChannelBindingReused,
+        Self::AccountDeleted,
+        Self::MailboxOverflow,
+        Self::InternalError,
+        Self::TransportError,
+    ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::StreamEnd => 0,
+            Self::PeerError(_) => 1,
+            Self::ClosingTimeout => 2,
+            Self::SystemShutdown => 3,
+            Self::Eof => 4,
+            Self::UnsupportedInput => 5,
+            Self::UnsupportedStanzaType => 6,
+            Self::SizeLimitExceeded => 7,
+            Self::ParserLimitExceeded => 8,
+            Self::ParserError => 9,
+            Self::HostUnknown => 10,
+            Self::InvalidTo => 11,
+            Self::UnsupportedVersion => 12,
+            Self::InvalidNamespace => 13,
+            Self::BadNamespacePrefix => 14,
+            Self::InvalidFrom => 15,
+            Self::InvalidLanguage => 16,
+            Self::InvalidXml => 17,
+            Self::NotWellFormed => 18,
+            Self::RestrictedXml => 19,
+            Self::UnsupportedEncoding => 20,
+            Self::StartTlsRejected => 21,
+            Self::TlsFailure => 22,
+            Self::CertificateInvalid => 23,
+            Self::NoAuthenticationMechanism => 24,
+            Self::AuthenticationTimeout => 25,
+            Self::BindingTimeout => 26,
+            Self::BindingAttemptsExceeded => 27,
+            Self::EstablishmentTimeout => 28,
+            Self::AuthenticationAttemptsExceeded => 29,
+            Self::ChannelBindingReused => 30,
+            Self::AccountDeleted => 31,
+            Self::MailboxOverflow => 32,
+            Self::InternalError => 33,
+            Self::TransportError => 34,
+        }
+    }
+
     pub(super) fn is_phase_timeout(self) -> bool {
         matches!(
             self,
@@ -223,6 +304,20 @@ impl From<StageFailure> for CloseOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metric_indexes_follow_all_and_names_are_unique() {
+        let mut names = std::collections::HashSet::new();
+        for (index, outcome) in CloseOutcome::ALL.into_iter().enumerate() {
+            assert_eq!(outcome.index(), index);
+            assert!(names.insert(outcome.as_str()));
+            assert_ne!(outcome.as_str(), "cancelled");
+        }
+        assert_eq!(
+            CloseOutcome::PeerError(StreamErrorCondition::PolicyViolation).index(),
+            1
+        );
+    }
 
     #[test]
     fn absent_authentication_mechanism_is_policy_violation_and_has_a_distinct_name() {

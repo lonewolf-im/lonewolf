@@ -3,6 +3,7 @@
 use std::future::pending;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +20,7 @@ use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use nix::errno::Errno;
+use prometheus_client::registry::Registry;
 use socket2::SockRef;
 
 use crate::config::C2sConfig;
@@ -29,12 +31,14 @@ use crate::router::RouterHandle;
 mod attempt_limit;
 mod connection_limit;
 mod iq;
+mod metrics;
 mod rejection_report;
 mod stream;
 mod unauthenticated_limit;
 
 use attempt_limit::{Admission, AttemptLimiter};
 use connection_limit::{ConnectionAdmission, ConnectionLimiter, ConnectionPermit};
+use metrics::{C2sMetrics, C2sWorkerMetrics, RejectReason};
 use stream::{StreamAdmission, StreamSettings, StreamTimeouts, XmppStream};
 use unauthenticated_limit::{
     Admission as UnauthenticatedAdmission, UnauthenticatedLimiter, UnauthenticatedPermit,
@@ -168,6 +172,7 @@ pub(crate) struct Listeners {
 }
 
 impl Listeners {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &C2sConfig,
         limits: &C2sLimits,
@@ -176,6 +181,7 @@ impl Listeners {
         router: RouterHandle<A>,
         dispatcher: &DispatchHandle,
         allocator: A,
+        registry: &mut Registry,
     ) -> Result<Self, StartError> {
         let (stop, stopped) = oneshot::channel();
         let (report_failure, failures) = async_channel::bounded(1);
@@ -189,6 +195,12 @@ impl Listeners {
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(
             limits.max_unauthenticated_connections,
         ));
+        let metrics = C2sMetrics::new(
+            config.listeners.len(),
+            NonZeroUsize::new(dispatcher.worker_count()).unwrap_or(NonZeroUsize::MIN),
+            Arc::clone(&unauthenticated),
+        );
+        metrics.register(registry);
         let auth = Arc::new(AuthService { storage });
         let mut listeners = Self {
             stop: Some(stop),
@@ -227,6 +239,7 @@ impl Listeners {
                     auth: Arc::clone(&auth),
                     router: router.clone(),
                 };
+                let worker_metrics = metrics.worker(listener_id, worker_id);
                 let settings = StreamSettings::new(
                     config.auth_mechanisms,
                     profile,
@@ -237,6 +250,7 @@ impl Listeners {
                     },
                     limits.max_resources_per_account,
                     allocator.clone(),
+                    worker_metrics.clone(),
                 );
                 let task = dispatcher
                     .dispatch_at(worker_id, move |context| async move {
@@ -254,6 +268,7 @@ impl Listeners {
                                 admission,
                                 services,
                                 settings,
+                                worker_metrics,
                             )
                             .await
                         }
@@ -341,6 +356,7 @@ async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(BACKLOG).await
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn run_listener<A: ChunkAllocator + Clone>(
     listener: TcpListener,
     context: WorkerContext,
@@ -349,6 +365,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
     admission: AdmissionLimits,
     services: StreamServices<A>,
     settings: StreamSettings<A>,
+    metrics: C2sWorkerMetrics,
 ) -> io::Result<()> {
     let ListenerControl {
         stop,
@@ -389,8 +406,13 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         match event {
             ListenerEvent::Accepted(Ok((stream, peer))) => {
                 accept.as_mut().set(listener.accept());
-                match admission.reserve(peer.ip()).await {
+                let reserved = admission.reserve(peer.ip()).await;
+                if let Err(rejection) = &reserved {
+                    metrics.connection_rejected(rejection_reason(rejection));
+                }
+                match reserved {
                     Ok((ip_permit, unauthenticated_permit)) => {
+                        metrics.connection_accepted();
                         active.push(
                             XmppStream::new(
                                 stream,
@@ -399,6 +421,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                                     unauthenticated_permit,
                                     listener_id,
                                     worker_id,
+                                    metrics.clone(),
                                 ),
                                 services.hosts.clone(),
                                 Arc::clone(&services.auth),
@@ -407,6 +430,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                             )
                             .run_until(shutdown.clone()),
                         );
+                        metrics.set_connections(active.len());
                     }
                     Err(AdmissionRejection::PerIp {
                         outcome,
@@ -457,7 +481,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                     }
                 }
             }
-            ListenerEvent::Closed => {}
+            ListenerEvent::Closed => metrics.set_connections(active.len()),
             ListenerEvent::Accepted(Err(error)) => {
                 accept.as_mut().set(listener.accept());
                 if matches!(
@@ -494,8 +518,14 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         let _ = report_failure.try_send(io::Error::new(error.kind(), error.to_string()));
     }
     let deadline = shutdown.await;
-    let drained =
-        compio::time::timeout_at(deadline, async { while active.next().await.is_some() {} }).await;
+    let drained = compio::time::timeout_at(deadline, async {
+        while active.next().await.is_some() {
+            metrics.set_connections(active.len());
+        }
+    })
+    .await;
+    drop(active);
+    metrics.set_connections(0);
     let closed = listener.close().await;
     tracing::debug!(listener_id, worker_id, "c2s TCP worker listener stopped");
     result
@@ -506,6 +536,22 @@ async fn run_listener<A: ChunkAllocator + Clone>(
             )
         }))
         .and(closed)
+}
+
+fn rejection_reason(rejection: &AdmissionRejection) -> RejectReason {
+    match rejection {
+        AdmissionRejection::Attempt {
+            outcome: "rate_limited",
+            ..
+        } => RejectReason::ConnectionAttemptsPerIp,
+        AdmissionRejection::Attempt { .. } => RejectReason::AttemptTrackingFull,
+        AdmissionRejection::Unauthenticated { .. } => RejectReason::MaxUnauthenticatedConnections,
+        AdmissionRejection::PerIp {
+            outcome: "connection_limit",
+            ..
+        } => RejectReason::MaxConnectionsPerIp,
+        AdmissionRejection::PerIp { .. } => RejectReason::ConnectionTrackingFull,
+    }
 }
 
 enum ListenerEvent {

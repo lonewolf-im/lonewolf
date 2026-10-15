@@ -35,6 +35,7 @@ pub(super) use outcome::CloseOutcome;
 
 use super::AuthService;
 use super::connection_limit::ConnectionPermit;
+use super::metrics::C2sWorkerMetrics;
 use super::unauthenticated_limit::UnauthenticatedPermit;
 use crate::config::AuthMechanisms;
 use crate::config::limits::C2sLimitProfile;
@@ -43,12 +44,40 @@ use crate::router::{RouterHandle, release_deferred};
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum StreamPhase {
+    Establishing,
+    Authenticating,
+    Binding,
+    Bound,
+}
+
+impl StreamPhase {
+    pub(super) const ALL: [Self; 4] = [
+        Self::Establishing,
+        Self::Authenticating,
+        Self::Binding,
+        Self::Bound,
+    ];
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Establishing => "establishing",
+            Self::Authenticating => "authenticating",
+            Self::Binding => "binding",
+            Self::Bound => "bound",
+        }
+    }
+}
+
 struct ConnectionLifecycle {
     connection_id: u64,
     listener_id: usize,
     worker_id: usize,
     accepted_at: Instant,
-    stream_phase: &'static str,
+    phase: StreamPhase,
+    bound_at: Option<Instant>,
+    metrics: C2sWorkerMetrics,
     outcome: Option<CloseOutcome>,
 }
 
@@ -86,6 +115,7 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
     resource_binding_retries: NonZeroUsize,
     max_resources_per_account: NonZeroUsize,
     allocator: A,
+    metrics: C2sWorkerMetrics,
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +132,7 @@ impl<A: ChunkAllocator> StreamSettings<A> {
         timeouts: StreamTimeouts,
         max_resources_per_account: NonZeroUsize,
         allocator: A,
+        metrics: C2sWorkerMetrics,
     ) -> Self {
         Self {
             auth_mechanisms,
@@ -121,26 +152,31 @@ impl<A: ChunkAllocator> StreamSettings<A> {
             resource_binding_retries: profile.resource_binding_retries,
             max_resources_per_account,
             allocator,
+            metrics,
         }
     }
 }
 
 impl ConnectionLifecycle {
     fn established(&mut self, host: &str) {
-        self.stream_phase = "established";
+        let elapsed = self.accepted_at.elapsed();
+        self.metrics
+            .phase_completed(StreamPhase::Establishing, elapsed);
         tracing::info!(
             connection_type = "c2s",
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
             host,
-            establishment_ms = self.accepted_at.elapsed().as_millis(),
+            establishment_ms = elapsed.as_millis(),
             "connection established"
         );
     }
 
     fn authenticated(&mut self, host: &str, mechanism: SaslMechanism, started_at: Instant) {
-        self.stream_phase = "authenticated";
+        let elapsed = started_at.elapsed();
+        self.metrics
+            .phase_completed(StreamPhase::Authenticating, elapsed);
         tracing::info!(
             connection_type = "c2s",
             connection_id = self.connection_id,
@@ -148,20 +184,24 @@ impl ConnectionLifecycle {
             worker_id = self.worker_id,
             host,
             auth_mechanism = mechanism.name(),
-            authentication_ms = started_at.elapsed().as_millis(),
+            authentication_ms = elapsed.as_millis(),
             "connection authenticated"
         );
     }
 
     fn bound(&mut self, resource_requested: bool, started_at: Instant) {
-        self.stream_phase = "bound";
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(started_at);
+        self.metrics.phase_completed(StreamPhase::Binding, elapsed);
+        self.phase = StreamPhase::Bound;
+        self.bound_at = Some(now);
         tracing::info!(
             connection_type = "c2s",
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
             resource_requested,
-            binding_ms = started_at.elapsed().as_millis(),
+            binding_ms = elapsed.as_millis(),
             "resource bound"
         );
     }
@@ -173,6 +213,7 @@ impl StreamAdmission {
         unauthenticated_permit: UnauthenticatedPermit,
         listener_id: usize,
         worker_id: usize,
+        metrics: C2sWorkerMetrics,
     ) -> Self {
         Self {
             ip_permit,
@@ -182,7 +223,9 @@ impl StreamAdmission {
                 listener_id,
                 worker_id,
                 accepted_at: Instant::now(),
-                stream_phase: "establishing",
+                phase: StreamPhase::Establishing,
+                bound_at: None,
+                metrics,
                 outcome: None,
             },
         }
@@ -196,11 +239,15 @@ impl Drop for ConnectionLifecycle {
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
-            stream_phase = self.stream_phase,
+            stream_phase = self.phase.as_str(),
             outcome = self.outcome.map_or("cancelled", |outcome| outcome.as_str()),
             duration_ms = self.accepted_at.elapsed().as_millis(),
             "stream disconnected"
         );
+        self.metrics.connection_closed(self.phase, self.outcome);
+        if let Some(bound_at) = self.bound_at {
+            self.metrics.session_ended(bound_at.elapsed());
+        }
     }
 }
 
@@ -255,7 +302,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
         let phases = async {
             let mut established = establish(transport, &hosts, &settings, context.clone()).await?;
             lifecycle.established(established.session.host());
-            lifecycle.stream_phase = "authenticating";
+            lifecycle.phase = StreamPhase::Authenticating;
             context.phase_deadline = established
                 .auth_started_at
                 .checked_add(settings.authentication_timeout);
@@ -281,7 +328,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 mechanism,
                 established.auth_started_at,
             );
-            lifecycle.stream_phase = "binding";
+            lifecycle.phase = StreamPhase::Binding;
             unauthenticated_permit.take();
             let binding_started_at = Instant::now();
             context.phase_deadline = binding_started_at.checked_add(settings.binding_timeout);
@@ -305,7 +352,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             );
             Ok(bound_stream(bound, &mut work, recipients).await)
         };
-        let outcome = finish_phases(phases, &close_control).await;
+        let outcome = finish_phases(phases, &close_control, &settings.metrics).await;
         work.drain().await;
         drop(unauthenticated_permit);
         drop(ip_permit);
@@ -317,10 +364,12 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
 async fn finish_phases(
     phases: impl Future<Output = Result<CloseOutcome, CloseOutcome>>,
     close_control: &TcpStream,
+    metrics: &C2sWorkerMetrics,
 ) -> CloseOutcome {
     match AssertUnwindSafe(phases).catch_unwind().await {
         Ok(Ok(outcome) | Err(outcome)) => outcome,
         Err(_) => {
+            metrics.connection_panicked();
             let _ = SockRef::from(close_control).shutdown(Shutdown::Both);
             release_deferred();
             tracing::error!("connection task panicked");

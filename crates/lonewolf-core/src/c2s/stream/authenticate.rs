@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use futures_util::io::AsyncWrite;
 use lonewolf_auth::scram::SCRAM_POLICY_ITERATIONS;
 use lonewolf_auth::server::{BindingType, ClientFirst, Mechanism, ScramServer, ServerError};
 use lonewolf_storage::account::AccountKey;
@@ -16,8 +17,9 @@ use lonewolf_xmpp::stanza::{Element, NodeRef, XML_NAMESPACE};
 use super::certificate::CertificateMonitor;
 use super::establish::{Established, STARTTLS_FAILURE, is_starttls_element};
 use super::outcome::CloseOutcome;
-use super::session::{Session, namespace_error};
+use super::session::{Session, Writer, namespace_error};
 use crate::c2s::AuthService;
+use crate::c2s::metrics::C2sWorkerMetrics;
 use crate::config::AuthMechanisms;
 use crate::hosts::Hosts;
 use crate::hosts::client_identity::{ClientValidity, VerifiedClient};
@@ -43,6 +45,53 @@ impl SaslMechanism {
             Some(Self::External)
         } else {
             Mechanism::from_name(name).map(Self::Scram)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SaslFailure {
+    Aborted,
+    IncorrectEncoding,
+    InvalidAuthzid,
+    InvalidMechanism,
+    MalformedRequest,
+    NotAuthorized,
+    TemporaryAuthFailure,
+}
+
+impl SaslFailure {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Aborted,
+        Self::IncorrectEncoding,
+        Self::InvalidAuthzid,
+        Self::InvalidMechanism,
+        Self::MalformedRequest,
+        Self::NotAuthorized,
+        Self::TemporaryAuthFailure,
+    ];
+
+    pub(crate) fn condition(self) -> &'static str {
+        match self {
+            Self::Aborted => "aborted",
+            Self::IncorrectEncoding => "incorrect-encoding",
+            Self::InvalidAuthzid => "invalid-authzid",
+            Self::InvalidMechanism => "invalid-mechanism",
+            Self::MalformedRequest => "malformed-request",
+            Self::NotAuthorized => "not-authorized",
+            Self::TemporaryAuthFailure => "temporary-auth-failure",
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Aborted => "aborted",
+            Self::IncorrectEncoding => "incorrect_encoding",
+            Self::InvalidAuthzid => "invalid_authzid",
+            Self::InvalidMechanism => "invalid_mechanism",
+            Self::MalformedRequest => "malformed_request",
+            Self::NotAuthorized => "not_authorized",
+            Self::TemporaryAuthFailure => "temporary_auth_failure",
         }
     }
 }
@@ -87,6 +136,7 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
     auth: &AuthService,
     mechanisms: AuthMechanisms,
     retries: usize,
+    metrics: &C2sWorkerMetrics,
 ) -> Result<(AccountKey, SaslMechanism), CloseOutcome> {
     let Established {
         session,
@@ -111,9 +161,12 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         mechanisms,
         client: client.as_ref(),
         client_validity: None,
+        metrics,
+        attempt_mechanism: None,
     };
     let mut replacement = None;
     for _ in 0..1 + retries {
+        authentication.attempt_mechanism = None;
         let request = match replacement.take() {
             Some(request) => request,
             None => match authentication.read_request().await? {
@@ -127,6 +180,7 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         }
         match attempt {
             Attempt::Authenticated(account, mechanism) => {
+                metrics.authentication_succeeded(mechanism);
                 let validity = authentication.client_validity;
                 if let Some(validity) = validity {
                     let client = client.take().ok_or(CloseOutcome::InternalError)?;
@@ -154,6 +208,8 @@ struct Authentication<'a, A: ChunkAllocator> {
     mechanisms: AuthMechanisms,
     client: Option<&'a VerifiedClient>,
     client_validity: Option<ClientValidity>,
+    metrics: &'a C2sWorkerMetrics,
+    attempt_mechanism: Option<SaslMechanism>,
 }
 
 enum ExporterUse {
@@ -199,7 +255,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             }
             StreamEvent::Element(element) => match parse_sasl_message(&element) {
                 Ok(SaslMessage::Auth(request)) => return Ok(Some(request)),
-                Ok(SaslMessage::Abort) => "aborted",
+                Ok(SaslMessage::Abort) => SaslFailure::Aborted,
                 Ok(SaslMessage::Response(_)) => {
                     return Err(CloseOutcome::UnsupportedInput);
                 }
@@ -223,9 +279,10 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             }
             SaslMechanism::Scram(mechanism) => self.mechanisms.allows(*mechanism),
         }) else {
-            self.reject("invalid-mechanism").await?;
+            self.reject(SaslFailure::InvalidMechanism).await?;
             return Ok(Attempt::Rejected);
         };
+        self.attempt_mechanism = Some(mechanism);
         let initial = if request.initial.is_none() {
             self.session.writer.send(EMPTY_CHALLENGE).await?;
             match self.read_response().await? {
@@ -271,7 +328,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         let identity = match std::str::from_utf8(initial) {
             Ok(identity) => identity,
             Err(_) => {
-                self.reject("malformed-request").await?;
+                self.reject(SaslFailure::MalformedRequest).await?;
                 return Ok(Attempt::Rejected);
             }
         };
@@ -281,7 +338,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             match account_key_from_jid(identity) {
                 Some(account) => Some(account),
                 None => {
-                    self.reject("invalid-authzid").await?;
+                    self.reject(SaslFailure::InvalidAuthzid).await?;
                     return Ok(Attempt::Rejected);
                 }
             }
@@ -295,18 +352,18 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         {
             Ok(account) => account.clone(),
             Err(_) => {
-                self.reject("invalid-authzid").await?;
+                self.reject(SaslFailure::InvalidAuthzid).await?;
                 return Ok(Attempt::Rejected);
             }
         };
         match self.auth.account_exists(&account).await {
             Ok(true) => {}
             Ok(false) => {
-                self.reject("not-authorized").await?;
+                self.reject(SaslFailure::NotAuthorized).await?;
                 return Ok(Attempt::Rejected);
             }
             Err(_) => {
-                self.reject("temporary-auth-failure").await?;
+                self.reject(SaslFailure::TemporaryAuthFailure).await?;
                 return Ok(Attempt::Rejected);
             }
         }
@@ -320,11 +377,11 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         match self.auth.account_exists(&account).await {
             Ok(true) => {}
             Ok(false) => {
-                self.reject("not-authorized").await?;
+                self.reject(SaslFailure::NotAuthorized).await?;
                 return Ok(Attempt::Rejected);
             }
             Err(_) => {
-                self.reject("temporary-auth-failure").await?;
+                self.reject(SaslFailure::TemporaryAuthFailure).await?;
                 return Ok(Attempt::Rejected);
             }
         }
@@ -358,7 +415,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             Some(key) => match self.auth.scram(key, mechanism.hash()).await {
                 Ok(verifier) => verifier,
                 Err(_) => {
-                    self.reject("temporary-auth-failure").await?;
+                    self.reject(SaslFailure::TemporaryAuthFailure).await?;
                     return Ok(None);
                 }
             },
@@ -424,7 +481,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             let current = match self.auth.scram(&account, mechanism.hash()).await {
                 Ok(current) => current,
                 Err(_) => {
-                    self.reject("temporary-auth-failure").await?;
+                    self.reject(SaslFailure::TemporaryAuthFailure).await?;
                     return Ok(Attempt::Rejected);
                 }
             };
@@ -434,7 +491,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             {
                 // Authorization failures must not reveal an account before its credential is verified.
                 if matches!(identity.authorization, Authorization::Invalid) {
-                    self.reject("invalid-authzid").await?;
+                    self.reject(SaslFailure::InvalidAuthzid).await?;
                     return Ok(Attempt::Rejected);
                 }
                 if self
@@ -450,7 +507,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 ));
             }
         }
-        self.reject("not-authorized").await?;
+        self.reject(SaslFailure::NotAuthorized).await?;
         Ok(Attempt::Rejected)
     }
 
@@ -463,13 +520,13 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             StreamEvent::Element(element) => match parse_sasl_message(&element) {
                 Ok(SaslMessage::Response(response)) => return Ok(Response::Data(response)),
                 Ok(SaslMessage::Auth(request)) => return Ok(Response::Request(request)),
-                Ok(SaslMessage::Abort) => "aborted",
+                Ok(SaslMessage::Abort) => SaslFailure::Aborted,
                 Err(condition) => condition,
             },
             StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_) => {
                 return Err(CloseOutcome::UnsupportedInput);
             }
-            _ => "malformed-request",
+            _ => SaslFailure::MalformedRequest,
         };
         self.reject(failure).await?;
         Ok(Response::Rejected)
@@ -488,14 +545,14 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         Ok(event)
     }
 
-    async fn reject(&mut self, condition: &'static str) -> Result<(), CloseOutcome> {
-        let mut xml = String::with_capacity(SASL_NAMESPACE.len() + condition.len() + 48);
-        write!(
-            xml,
-            "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
+    async fn reject(&mut self, failure: SaslFailure) -> Result<(), CloseOutcome> {
+        send_sasl_failure(
+            &mut self.session.writer,
+            self.metrics,
+            self.attempt_mechanism,
+            failure,
         )
-        .map_err(|_| CloseOutcome::InternalError)?;
-        self.session.writer.send(&xml).await
+        .await
     }
 
     async fn send_sasl(&mut self, kind: &'static str, message: &str) -> Result<(), CloseOutcome> {
@@ -506,6 +563,24 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
         self.session.writer.send(&xml).await
     }
+}
+
+async fn send_sasl_failure<W: AsyncWrite + Unpin>(
+    writer: &mut Writer<W>,
+    metrics: &C2sWorkerMetrics,
+    mechanism: Option<SaslMechanism>,
+    failure: SaslFailure,
+) -> Result<(), CloseOutcome> {
+    let condition = failure.condition();
+    let mut xml = String::with_capacity(SASL_NAMESPACE.len() + condition.len() + 48);
+    write!(
+        xml,
+        "<failure xmlns='{SASL_NAMESPACE}'><{condition}/></failure>"
+    )
+    .map_err(|_| CloseOutcome::InternalError)?;
+    writer.send(&xml).await?;
+    metrics.authentication_failed(mechanism, failure);
+    Ok(())
 }
 
 pub(super) fn account_key(username: &str, host: &str) -> Option<AccountKey> {
@@ -531,12 +606,16 @@ fn account_key_from_jid(jid: &str) -> Option<AccountKey> {
     AccountKey::try_from(jid.resolve(&arena).ok()?).ok()
 }
 
-fn scram_failure(error: ServerError) -> &'static str {
+fn scram_failure(error: ServerError) -> SaslFailure {
     match error {
-        ServerError::Malformed => "malformed-request",
-        ServerError::UnsupportedBinding => "malformed-request",
-        ServerError::ChannelBindingMismatch | ServerError::InvalidProof => "not-authorized",
-        ServerError::HashMismatch | ServerError::RandomUnavailable => "temporary-auth-failure",
+        ServerError::Malformed => SaslFailure::MalformedRequest,
+        ServerError::UnsupportedBinding => SaslFailure::MalformedRequest,
+        ServerError::ChannelBindingMismatch | ServerError::InvalidProof => {
+            SaslFailure::NotAuthorized
+        }
+        ServerError::HashMismatch | ServerError::RandomUnavailable => {
+            SaslFailure::TemporaryAuthFailure
+        }
     }
 }
 
@@ -548,18 +627,21 @@ enum SaslMessage {
 
 fn parse_sasl_message<A: ChunkAllocator>(
     element: &Parsed<Element, A>,
-) -> Result<SaslMessage, &'static str> {
+) -> Result<SaslMessage, SaslFailure> {
     let view = element
         .value()
         .resolve(element.arena())
-        .map_err(|_| "malformed-request")?;
+        .map_err(|_| SaslFailure::MalformedRequest)?;
     if view.namespace() != SASL_NAMESPACE {
-        return Err("malformed-request");
+        return Err(SaslFailure::MalformedRequest);
     }
     let mut mechanism = None;
     let mut attribute_count = 0;
-    for attribute in view.attributes().map_err(|_| "malformed-request")? {
-        let attribute = attribute.map_err(|_| "malformed-request")?;
+    for attribute in view
+        .attributes()
+        .map_err(|_| SaslFailure::MalformedRequest)?
+    {
+        let attribute = attribute.map_err(|_| SaslFailure::MalformedRequest)?;
         if attribute.name == "lang" && attribute.namespace == XML_NAMESPACE {
             continue;
         }
@@ -569,11 +651,11 @@ fn parse_sasl_message<A: ChunkAllocator>(
         }
     }
     let mut content = None;
-    for child in view.children().map_err(|_| "malformed-request")? {
-        let child = child.map_err(|_| "malformed-request")?;
+    for child in view.children().map_err(|_| SaslFailure::MalformedRequest)? {
+        let child = child.map_err(|_| SaslFailure::MalformedRequest)?;
         match child {
             NodeRef::Text(text) if content.is_none() => content = Some(text),
-            _ => return Err("malformed-request"),
+            _ => return Err(SaslFailure::MalformedRequest),
         }
     }
     match view.name() {
@@ -582,7 +664,7 @@ fn parse_sasl_message<A: ChunkAllocator>(
             initial: None,
         })),
         "auth" if attribute_count == 1 => {
-            let mechanism = mechanism.ok_or("malformed-request")?;
+            let mechanism = mechanism.ok_or(SaslFailure::MalformedRequest)?;
             Ok(SaslMessage::Auth(AuthRequest {
                 mechanism: SaslMechanism::from_name(mechanism),
                 initial: if content.is_none_or(str::is_empty) {
@@ -594,17 +676,127 @@ fn parse_sasl_message<A: ChunkAllocator>(
         }
         "response" if attribute_count == 0 => Ok(SaslMessage::Response(decode_sasl_text(content)?)),
         "abort" if attribute_count == 0 && content.is_none() => Ok(SaslMessage::Abort),
-        _ => Err("malformed-request"),
+        _ => Err(SaslFailure::MalformedRequest),
     }
 }
 
-fn decode_sasl_text(text: Option<&str>) -> Result<Vec<u8>, &'static str> {
+fn decode_sasl_text(text: Option<&str>) -> Result<Vec<u8>, SaslFailure> {
     let text = text.unwrap_or_default();
     if text == "=" || text.is_empty() {
         return Ok(Vec::new());
     }
     if text.len() > 8_192 {
-        return Err("malformed-request");
+        return Err(SaslFailure::MalformedRequest);
     }
-    STANDARD.decode(text).map_err(|_| "incorrect-encoding")
+    STANDARD
+        .decode(text)
+        .map_err(|_| SaslFailure::IncorrectEncoding)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::error::Error;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use compio::runtime::Runtime;
+    use futures_util::poll;
+
+    use super::*;
+    use crate::c2s::metrics::C2sMetrics;
+
+    struct RejectionWriter<'a> {
+        flush_polled: &'a Cell<bool>,
+        fail: bool,
+    }
+
+    impl AsyncWrite for RejectionWriter<'_> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flush_polled.set(true);
+            if self.fail {
+                Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            panic!("SASL rejection must not close the transport")
+        }
+    }
+
+    #[test]
+    fn failed_sasl_rejection_flush_does_not_record_authentication_outcome()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let metrics = C2sMetrics::detached();
+            let worker = metrics.worker(0, 0);
+            let flush_polled = Cell::new(false);
+            let mut writer = Writer::new(
+                RejectionWriter {
+                    flush_polled: &flush_polled,
+                    fail: true,
+                },
+                "localhost".into(),
+            );
+            assert_eq!(
+                send_sasl_failure(&mut writer, &worker, None, SaslFailure::InvalidMechanism).await,
+                Err(CloseOutcome::TransportError),
+            );
+            assert!(flush_polled.get());
+            assert!(
+                !metrics
+                    .render()?
+                    .contains("lonewolf_c2s_authentications_total")
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cancelled_sasl_rejection_flush_does_not_record_authentication_outcome()
+    -> Result<(), Box<dyn Error>> {
+        Runtime::new()?.block_on(async {
+            let metrics = C2sMetrics::detached();
+            let worker = metrics.worker(0, 0);
+            let flush_polled = Cell::new(false);
+            let mut writer = Writer::new(
+                RejectionWriter {
+                    flush_polled: &flush_polled,
+                    fail: false,
+                },
+                "localhost".into(),
+            );
+            let mut rejection = Box::pin(send_sasl_failure(
+                &mut writer,
+                &worker,
+                None,
+                SaslFailure::InvalidMechanism,
+            ));
+            assert!(poll!(rejection.as_mut()).is_pending());
+            assert!(flush_polled.get());
+            assert!(
+                !metrics
+                    .render()?
+                    .contains("lonewolf_c2s_authentications_total")
+            );
+            drop(rejection);
+            assert!(
+                !metrics
+                    .render()?
+                    .contains("lonewolf_c2s_authentications_total")
+            );
+            Ok(())
+        })
+    }
 }

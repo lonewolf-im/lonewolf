@@ -18,6 +18,7 @@ use super::establish::{Established, STARTTLS_FAILURE, is_starttls_element};
 use super::header::{ResponseVersion, escape_attribute};
 use super::outcome::CloseOutcome;
 use super::session::{Session, Writer, namespace_error};
+use crate::c2s::metrics::C2sWorkerMetrics;
 use crate::hosts::Hosts;
 use crate::router::{Registration, RouterError, RouterHandle};
 
@@ -25,6 +26,45 @@ const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
 const BIND_FEATURE: &str = "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>";
 const BIND_FEATURES: &str =
     "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BindRejection {
+    BadRequest,
+    ServiceUnavailable,
+    ResourceConstraint,
+}
+
+impl BindRejection {
+    pub(crate) const ALL: [Self; 3] = [
+        Self::BadRequest,
+        Self::ServiceUnavailable,
+        Self::ResourceConstraint,
+    ];
+
+    pub(crate) fn error_type(self) -> &'static str {
+        match self {
+            Self::BadRequest => "modify",
+            Self::ServiceUnavailable => "cancel",
+            Self::ResourceConstraint => "wait",
+        }
+    }
+
+    pub(crate) fn condition(self) -> &'static str {
+        match self {
+            Self::BadRequest => "bad-request",
+            Self::ServiceUnavailable => "service-unavailable",
+            Self::ResourceConstraint => "resource-constraint",
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BadRequest => "bad_request",
+            Self::ServiceUnavailable => "service_unavailable",
+            Self::ResourceConstraint => "resource_constraint",
+        }
+    }
+}
 
 pub(super) struct Bound<A: ChunkAllocator> {
     pub(super) session: Session<A>,
@@ -78,6 +118,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 settings.max_resources_per_account,
                 1 + settings.resource_binding_retries.get(),
                 monitor.as_ref().map(|monitor| (&storage, monitor)),
+                &settings.metrics,
             );
             match &monitor {
                 Some(monitor) => monitor.interrupt(operation).await,
@@ -101,6 +142,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     })
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn bind_session<A: ChunkAllocator + Clone>(
     session: &mut Session<A>,
     hosts: &Hosts,
@@ -109,6 +151,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
     max_resources_per_account: NonZeroUsize,
     max_failures: usize,
     certificate: Option<(&RedbStorage, &CertificateMonitor)>,
+    metrics: &C2sWorkerMetrics,
 ) -> Result<(Registration<A>, bool), CloseOutcome> {
     let header = session.read_header(hosts).await?;
     if header.host != session.host() {
@@ -193,10 +236,10 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                 reject_bind(
                     &mut session.writer,
                     id,
-                    "modify",
-                    "bad-request",
+                    BindRejection::BadRequest,
                     &mut invalid_attempts,
                     max_failures,
+                    metrics,
                 )
                 .await?;
                 continue;
@@ -250,10 +293,10 @@ async fn bind_session<A: ChunkAllocator + Clone>(
             reject_bind(
                 &mut session.writer,
                 id,
-                "cancel",
-                "service-unavailable",
+                BindRejection::ServiceUnavailable,
                 &mut invalid_attempts,
                 max_failures,
+                metrics,
             )
             .await?;
             continue;
@@ -264,10 +307,10 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                 reject_bind(
                     &mut session.writer,
                     id,
-                    "modify",
-                    "bad-request",
+                    BindRejection::BadRequest,
                     &mut invalid_attempts,
                     max_failures,
+                    metrics,
                 )
                 .await?;
                 continue;
@@ -294,10 +337,10 @@ async fn bind_session<A: ChunkAllocator + Clone>(
                 reject_bind(
                     &mut session.writer,
                     id,
-                    "wait",
-                    "resource-constraint",
+                    BindRejection::ResourceConstraint,
                     &mut invalid_attempts,
                     max_failures,
+                    metrics,
                 )
                 .await?;
                 continue;
@@ -332,6 +375,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
         } else {
             send_bind_result(&mut session.writer, id, &registration).await?;
         }
+        metrics.binding_succeeded();
         return Ok((registration, requested.is_some()));
     }
 }
@@ -446,12 +490,13 @@ async fn send_bind_error(
 async fn reject_bind(
     writer: &mut Writer,
     id: &str,
-    error_type: &str,
-    condition: &str,
+    rejection: BindRejection,
     attempts: &mut usize,
     max_failures: usize,
+    metrics: &C2sWorkerMetrics,
 ) -> Result<(), CloseOutcome> {
-    send_bind_error(writer, id, error_type, condition).await?;
+    send_bind_error(writer, id, rejection.error_type(), rejection.condition()).await?;
+    metrics.binding_rejected(rejection);
     *attempts += 1;
     if *attempts == max_failures {
         return Err(CloseOutcome::BindingAttemptsExceeded);

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
+use lonewolf_auth::server::Mechanism;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric};
 use prometheus_client::metrics::{
@@ -14,7 +15,7 @@ use prometheus_client::metrics::{
 };
 use prometheus_client::registry::{Registry, Unit};
 
-use super::stream::{CloseOutcome, StreamPhase};
+use super::stream::{BindRejection, CloseOutcome, SaslFailure, SaslMechanism, StreamPhase};
 use super::unauthenticated_limit::UnauthenticatedLimiter;
 
 pub(super) const PHASE_BUCKETS: [f64; 13] = [
@@ -29,6 +30,30 @@ const NEGOTIATION_PHASES: [StreamPhase; 3] = [
     StreamPhase::Authenticating,
     StreamPhase::Binding,
 ];
+
+const MECHANISMS: [Option<SaslMechanism>; 6] = [
+    Some(SaslMechanism::External),
+    Some(SaslMechanism::Scram(Mechanism::Sha1)),
+    Some(SaslMechanism::Scram(Mechanism::Sha1Plus)),
+    Some(SaslMechanism::Scram(Mechanism::Sha256)),
+    Some(SaslMechanism::Scram(Mechanism::Sha256Plus)),
+    None,
+];
+
+fn mechanism_index(mechanism: Option<SaslMechanism>) -> usize {
+    match mechanism {
+        Some(SaslMechanism::External) => 0,
+        Some(SaslMechanism::Scram(Mechanism::Sha1)) => 1,
+        Some(SaslMechanism::Scram(Mechanism::Sha1Plus)) => 2,
+        Some(SaslMechanism::Scram(Mechanism::Sha256)) => 3,
+        Some(SaslMechanism::Scram(Mechanism::Sha256Plus)) => 4,
+        None => 5,
+    }
+}
+
+fn mechanism_label(mechanism: Option<SaslMechanism>) -> &'static str {
+    mechanism.map_or("none", SaslMechanism::name)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RejectReason {
@@ -66,6 +91,8 @@ struct C2sCounters {
     /// The last outcome slot counts streams dropped before they reported an outcome.
     closed: [[AtomicU64; CloseOutcome::COUNT + 1]; StreamPhase::ALL.len()],
     panics: AtomicU64,
+    authentications: [[AtomicU64; 1 + SaslFailure::ALL.len()]; MECHANISMS.len()],
+    bindings: [AtomicU64; 1 + BindRejection::ALL.len()],
 }
 
 impl Default for C2sCounters {
@@ -76,6 +103,8 @@ impl Default for C2sCounters {
             rejected: std::array::from_fn(|_| AtomicU64::new(0)),
             closed: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             panics: AtomicU64::new(0),
+            authentications: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            bindings: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -86,7 +115,6 @@ struct WorkerMetrics {
     session_duration: Histogram,
 }
 
-/// Recording handle for one listener on one worker.
 #[derive(Clone)]
 pub(super) struct C2sWorkerMetrics(Arc<CachePadded<WorkerMetrics>>);
 
@@ -114,6 +142,28 @@ impl C2sWorkerMetrics {
 
     pub(super) fn connection_panicked(&self) {
         self.0.counters.panics.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn authentication_succeeded(&self, mechanism: SaslMechanism) {
+        self.0.counters.authentications[mechanism_index(Some(mechanism))][0]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn authentication_failed(
+        &self,
+        mechanism: Option<SaslMechanism>,
+        failure: SaslFailure,
+    ) {
+        self.0.counters.authentications[mechanism_index(mechanism)][1 + failure as usize]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn binding_succeeded(&self) {
+        self.0.counters.bindings[0].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn binding_rejected(&self, rejection: BindRejection) {
+        self.0.counters.bindings[1 + rejection as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Ignores `StreamPhase::Bound`, which has no negotiation duration.
@@ -340,6 +390,84 @@ impl Collector for C2sCollector {
                     .encode(family.encode_family(&ListenerLabels { listener })?)?;
             }
         }
+        if metrics
+            .listeners
+            .iter()
+            .flat_map(|workers| workers.iter())
+            .any(|worker| {
+                worker
+                    .0
+                    .counters
+                    .authentications
+                    .iter()
+                    .flatten()
+                    .any(|counter| counter.load(Ordering::Relaxed) != 0)
+            })
+        {
+            let mut family = encoder.encode_descriptor(
+                "c2s_authentications",
+                "SASL authentication results, by listener, mechanism and outcome.",
+                None,
+                MetricType::Counter,
+            )?;
+            for (listener, workers) in metrics.listeners.iter().enumerate() {
+                for mechanism in MECHANISMS {
+                    for index in 0..=SaslFailure::ALL.len() {
+                        let value = sum(workers, |c| {
+                            &c.authentications[mechanism_index(mechanism)][index]
+                        });
+                        if value != 0 {
+                            let outcome = if index == 0 {
+                                "success"
+                            } else {
+                                SaslFailure::ALL[index - 1].as_str()
+                            };
+                            ConstCounter::new(value).encode(family.encode_family(
+                                &AuthenticationLabels {
+                                    listener,
+                                    mechanism: mechanism_label(mechanism),
+                                    outcome,
+                                },
+                            )?)?;
+                        }
+                    }
+                }
+            }
+        }
+        if metrics
+            .listeners
+            .iter()
+            .flat_map(|workers| workers.iter())
+            .any(|worker| {
+                worker
+                    .0
+                    .counters
+                    .bindings
+                    .iter()
+                    .any(|counter| counter.load(Ordering::Relaxed) != 0)
+            })
+        {
+            let mut family = encoder.encode_descriptor(
+                "c2s_resource_bindings",
+                "Resource binding results, by listener and outcome.",
+                None,
+                MetricType::Counter,
+            )?;
+            for (listener, workers) in metrics.listeners.iter().enumerate() {
+                for index in 0..=BindRejection::ALL.len() {
+                    let value = sum(workers, |c| &c.bindings[index]);
+                    if value != 0 {
+                        let outcome = if index == 0 {
+                            "success"
+                        } else {
+                            BindRejection::ALL[index - 1].as_str()
+                        };
+                        ConstCounter::new(value)
+                            .encode(family.encode_family(&BindingLabels { listener, outcome })?)?;
+                    }
+                }
+            }
+        }
         let mut family = encoder.encode_descriptor(
             "c2s_phase_duration",
             "Time to complete each stream negotiation phase.",
@@ -376,6 +504,17 @@ struct ClosedLabels {
     outcome: &'static str,
 }
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct AuthenticationLabels {
+    listener: usize,
+    mechanism: &'static str,
+    outcome: &'static str,
+}
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BindingLabels {
+    listener: usize,
+    outcome: &'static str,
+}
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PhaseLabels {
     phase: &'static str,
 }
@@ -383,6 +522,112 @@ struct PhaseLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_and_binding_outcomes_are_encoded_without_zero_series()
+    -> Result<(), fmt::Error> {
+        let metrics = C2sMetrics::detached();
+        let worker = metrics.worker(0, 0);
+        let empty = metrics.render()?;
+        assert!(!empty.contains("lonewolf_c2s_authentications"));
+        assert!(!empty.contains("lonewolf_c2s_resource_bindings"));
+        worker.authentication_failed(None, SaslFailure::InvalidMechanism);
+        worker.authentication_failed(
+            Some(SaslMechanism::Scram(Mechanism::Sha256)),
+            SaslFailure::NotAuthorized,
+        );
+        worker.authentication_succeeded(SaslMechanism::External);
+        worker.binding_succeeded();
+        worker.binding_rejected(BindRejection::ResourceConstraint);
+        let output = metrics.render()?;
+        let mut samples: Vec<_> = output
+            .lines()
+            .filter(|line| {
+                line.starts_with("lonewolf_c2s_authentications_total")
+                    || line.starts_with("lonewolf_c2s_resource_bindings_total")
+            })
+            .collect();
+        let mut expected = [
+            "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"none\",outcome=\"invalid_mechanism\"} 1",
+            "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"SCRAM-SHA-256\",outcome=\"not_authorized\"} 1",
+            "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"EXTERNAL\",outcome=\"success\"} 1",
+            "lonewolf_c2s_resource_bindings_total{listener=\"0\",outcome=\"success\"} 1",
+            "lonewolf_c2s_resource_bindings_total{listener=\"0\",outcome=\"resource_constraint\"} 1",
+        ];
+        samples.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(samples, expected, "{output}");
+        assert!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("# HELP "))
+                .all(|line| line.ends_with('.')),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mechanism_indexes_follow_the_label_order() {
+        let expected = [
+            "EXTERNAL",
+            "SCRAM-SHA-1",
+            "SCRAM-SHA-1-PLUS",
+            "SCRAM-SHA-256",
+            "SCRAM-SHA-256-PLUS",
+            "none",
+        ];
+        for (index, mechanism) in MECHANISMS.into_iter().enumerate() {
+            assert_eq!(mechanism_index(mechanism), index);
+            assert_eq!(mechanism_label(mechanism), expected[index]);
+            assert!(
+                MECHANISMS[..index]
+                    .iter()
+                    .all(|other| mechanism_label(*other) != mechanism_label(mechanism))
+            );
+        }
+    }
+
+    #[test]
+    fn failure_and_rejection_indexes_follow_the_all_order() {
+        let failures = [
+            ("aborted", "aborted"),
+            ("incorrect-encoding", "incorrect_encoding"),
+            ("invalid-authzid", "invalid_authzid"),
+            ("invalid-mechanism", "invalid_mechanism"),
+            ("malformed-request", "malformed_request"),
+            ("not-authorized", "not_authorized"),
+            ("temporary-auth-failure", "temporary_auth_failure"),
+        ];
+        for (index, failure) in SaslFailure::ALL.into_iter().enumerate() {
+            assert_eq!(failure as usize, index);
+            assert_eq!((failure.condition(), failure.as_str()), failures[index]);
+            for other in &SaslFailure::ALL[..index] {
+                assert_ne!(failure.condition(), other.condition());
+                assert_ne!(failure.as_str(), other.as_str());
+            }
+        }
+        let rejections = [
+            ("modify", "bad-request", "bad_request"),
+            ("cancel", "service-unavailable", "service_unavailable"),
+            ("wait", "resource-constraint", "resource_constraint"),
+        ];
+        for (index, rejection) in BindRejection::ALL.into_iter().enumerate() {
+            assert_eq!(rejection as usize, index);
+            assert_eq!(
+                (
+                    rejection.error_type(),
+                    rejection.condition(),
+                    rejection.as_str()
+                ),
+                rejections[index]
+            );
+            for other in &BindRejection::ALL[..index] {
+                assert_ne!(rejection.condition(), other.condition());
+                assert_ne!(rejection.as_str(), other.as_str());
+            }
+        }
+    }
 
     #[test]
     fn collector_reports_listener_counters_and_omits_zero_outcomes() -> Result<(), fmt::Error> {
@@ -453,6 +698,18 @@ mod tests {
             NonZeroUsize::MIN.saturating_add(1),
             Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN)),
         );
+        metrics
+            .worker(0, 0)
+            .authentication_succeeded(SaslMechanism::External);
+        metrics
+            .worker(0, 1)
+            .authentication_succeeded(SaslMechanism::External);
+        metrics
+            .worker(0, 0)
+            .binding_rejected(BindRejection::BadRequest);
+        metrics
+            .worker(0, 1)
+            .binding_rejected(BindRejection::BadRequest);
         metrics.worker(0, 0).connection_accepted();
         metrics.worker(0, 1).connection_accepted();
         metrics
@@ -462,6 +719,8 @@ mod tests {
             .worker(0, 1)
             .phase_completed(StreamPhase::Establishing, Duration::from_millis(2));
         let output = metrics.render()?;
+        assert!(output.lines().any(|line| line == "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"EXTERNAL\",outcome=\"success\"} 2"), "{output}");
+        assert!(output.lines().any(|line| line == "lonewolf_c2s_resource_bindings_total{listener=\"0\",outcome=\"bad_request\"} 2"), "{output}");
         assert!(
             output
                 .lines()
@@ -511,6 +770,8 @@ mod tests {
             "c2s_connections_rejected",
             "c2s_connections_closed",
             "c2s_connection_panics",
+            "c2s_authentications",
+            "c2s_resource_bindings",
         ] {
             assert!(!output.contains(family), "{output}");
         }

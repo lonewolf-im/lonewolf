@@ -120,3 +120,38 @@ fn admission_rejections_are_reported_by_limit() -> TestResult {
     drop(connections);
     suite.stop()
 }
+
+#[test]
+fn authentication_and_binding_outcomes_are_reported() -> TestResult {
+    let mut suite = C2sSuite::with_metrics_settings("", 1)?;
+    suite.create_account("alice", "pencil")?;
+    let mut client = suite.unauthenticated_client()?;
+    client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'/>")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-mechanism/></failure>",
+    )?;
+    let failure = client.scram("alice", "wrong", "SCRAM-SHA-256", None)?;
+    failure.assert_name("urn:ietf:params:xml:ns:xmpp-sasl", "failure");
+    client.authenticate("alice", "pencil")?;
+    let mut client = client.restart();
+    client
+        .open()?
+        .child("urn:ietf:params:xml:ns:xmpp-bind", "bind")?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    let mut second = suite.authenticated_client("alice", "pencil")?;
+    second.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
+    second.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    for sample in [
+        "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"none\",outcome=\"invalid_mechanism\"} 1",
+        "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"SCRAM-SHA-256\",outcome=\"not_authorized\"} 1",
+        "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"SCRAM-SHA-256\",outcome=\"success\"} 2",
+        "lonewolf_c2s_resource_bindings_total{listener=\"0\",outcome=\"success\"} 1",
+        "lonewolf_c2s_resource_bindings_total{listener=\"0\",outcome=\"resource_constraint\"} 1",
+    ] {
+        let body = suite.wait_for_metric(sample)?;
+        assert!(!body.contains("alice"), "{body}");
+    }
+    second.close()?;
+    client.close()?;
+    suite.stop()
+}

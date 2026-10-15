@@ -27,7 +27,9 @@ use futures_util::FutureExt;
 use lonewolf_util::arena::ChunkAllocator;
 use socket2::SockRef;
 
-use authenticate::{SaslMechanism, authenticate, sasl_features};
+pub(super) use authenticate::{SaslFailure, SaslMechanism};
+use authenticate::{authenticate, sasl_features};
+pub(super) use bind::BindRejection;
 use bind::bind_resource;
 use bound::bound_stream;
 use establish::establish;
@@ -316,6 +318,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                     &auth,
                     settings.auth_mechanisms,
                     settings.authentication_retries.get(),
+                    &settings.metrics,
                 )),
             )
             .await;

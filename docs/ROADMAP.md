@@ -48,8 +48,7 @@ numbers or require unrelated features to ship together.
 | --- | --- |
 | Current development foundation | Receiving C2S RFC scope |
 | Desktop discovery, profiles, and synchronization | Partial Core + IM |
-| S2S federation | Authenticated server-to-server interoperability |
-| Basic desktop IM | Basic Core + IM, including components, rooms, and uploads |
+| Basic desktop IM | Basic Core + IM, including federation, components, rooms, and uploads |
 | Resumption, archives, and blocking | Partial Advanced IM |
 | Advanced desktop IM | Advanced Core + IM, including capabilities, PEP, avatars, and bookmarks |
 | PostgreSQL storage and two-node cluster | Preserve desktop compliance across nodes |
@@ -74,7 +73,7 @@ The RFC baseline is [RFC 6120](https://www.rfc-editor.org/rfc/rfc6120.html),
 [RFC 7590](https://www.rfc-editor.org/rfc/rfc7590.html), with applicable
 [RFC 9266](https://www.rfc-editor.org/rfc/rfc9266.html) and
 [RFC 9325](https://www.rfc-editor.org/rfc/rfc9325.html) requirements. Federation
-remains a separate milestone.
+is part of Basic desktop IM.
 
 | XEP | Required scope | Basis |
 | --- | --- | --- |
@@ -109,27 +108,11 @@ Milestone completion criteria:
 - Disabled features are absent from discovery; unsupported requests return the
   appropriate errors.
 
-## S2S federation
-
-Implement authenticated server-to-server federation for messages, IQs,
-subscriptions, presence, and service domains, including their certificate
-identities and error behavior.
-
-Milestone completion criteria:
-
-- A different server implementation exchanges messages, subscription changes,
-  presence, and IQs with Lonewolf; unauthorized sender domains are rejected.
-- Federation failures and connection shutdown have bounded, verified outcomes.
-  Required deployment services are documented.
-
-Federation can ship with its required dependencies in a release whose only new
-capability is S2S support. Discovery, vCards, Carbons, components, rooms, and
-uploads follow their own dependencies and completion criteria. Federation alone
-does not establish Basic Core + IM compliance.
-
 ## Basic desktop IM
 
-Build on federation with components, then built-in MUC and upload services.
+Implement authenticated federation and components, then built-in MUC and upload
+services. Federation must cover messages, IQs, subscriptions, presence, and
+service domains, including their certificate identities and error behavior.
 
 | XEP | Required scope | Basis |
 | --- | --- | --- |
@@ -143,9 +126,11 @@ Build on federation with components, then built-in MUC and upload services.
 Milestone completion criteria:
 
 - Basic Core + IM requirements pass for the selected suite.
+- A different server implementation exchanges messages, subscription changes,
+  presence, and IQs with Lonewolf; unauthorized sender domains are rejected.
 - Desktop clients create, join, administer, and leave rooms and share files.
-- Component loss and interrupted uploads have bounded, verified outcomes.
-  Required deployment services are documented.
+- Component loss, federation failures, and interrupted uploads have bounded,
+  verified outcomes. Required deployment services are documented.
 
 ## Resumption, archives, and blocking
 

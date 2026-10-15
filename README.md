@@ -10,10 +10,10 @@
 
 </div>
 
-Lonewolf is an [XMPP](https://xmpp.org/) server you run yourself. It handles the
-core of instant messaging (accounts, contacts, presence, and message delivery),
-and it's built to be strict about the protocol, frugal with resources, and upfront
-about its limits.
+Lonewolf is a self-hosted [XMPP](https://xmpp.org/) server that runs alone. No
+database server to babysit, no runtime to install, no pack required. One binary
+and two lines of config get you running locally. It plays by the protocol's rules
+and bites back when a client gets greedy.
 
 > [!NOTE]
 > Lonewolf is early, pre-1.0 software. Today it can host chat between accounts on
@@ -22,11 +22,13 @@ about its limits.
 
 ## Why Lonewolf?
 
+- **Easy to run.** One server binary with embedded storage, no database server
+  or runtime to install, and just two lines of config for local testing.
 - **Correct by design.** Lonewolf follows the core XMPP RFCs
   ([RFC 6120](https://www.rfc-editor.org/rfc/rfc6120.html) and friends) closely,
   so standards-compliant clients behave the way you'd expect.
-- **Light on resources.** It's a native Rust binary with embedded storage. There's
-  no database server to set up and no runtime to install.
+- **Light on resources.** It's a native Rust binary built to be frugal with
+  memory and CPU.
 - **Limits you can see.** Connections, stanzas, rates, and resources all have
   explicit, configurable limits, so one misbehaving client can't quietly take
   down your server.

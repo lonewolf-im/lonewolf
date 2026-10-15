@@ -1,0 +1,16 @@
+[package]
+name = "lonewolf-metrics"
+description = "Prometheus metrics primitives and exposition for Lonewolf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-utils.workspace = true
+lonewolf-util.workspace = true
+nix = { workspace = true, features = ["resource"] }
+prometheus-client.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["feature"] }

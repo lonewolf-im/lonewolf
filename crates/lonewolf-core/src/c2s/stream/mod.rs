@@ -12,6 +12,7 @@ mod recipient_rate;
 mod renegotiation;
 mod session;
 mod stanza_rate;
+mod traffic;
 
 use std::future::Future;
 use std::net::Shutdown;
@@ -352,6 +353,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 settings.recipients_per_second,
                 settings.recipient_burst,
                 Instant::now(),
+                settings.metrics.clone(),
             );
             Ok(bound_stream(bound, &mut work, recipients).await)
         };

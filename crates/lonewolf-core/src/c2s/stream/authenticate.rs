@@ -748,6 +748,7 @@ mod tests {
                     fail: true,
                 },
                 "localhost".into(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
             );
             assert_eq!(
                 send_sasl_failure(&mut writer, &worker, None, SaslFailure::InvalidMechanism).await,
@@ -776,6 +777,7 @@ mod tests {
                     fail: false,
                 },
                 "localhost".into(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
             );
             let mut rejection = Box::pin(send_sasl_failure(
                 &mut writer,

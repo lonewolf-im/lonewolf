@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crossbeam_utils::CachePadded;
 use lonewolf_auth::server::Mechanism;
+use lonewolf_xmpp::stanza::StanzaKind;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric};
 use prometheus_client::metrics::{
@@ -30,6 +31,36 @@ const NEGOTIATION_PHASES: [StreamPhase; 3] = [
     StreamPhase::Authenticating,
     StreamPhase::Binding,
 ];
+
+const KINDS: [StanzaKind; 3] = [StanzaKind::Message, StanzaKind::Presence, StanzaKind::Iq];
+
+fn kind_index(kind: StanzaKind) -> usize {
+    match kind {
+        StanzaKind::Message => 0,
+        StanzaKind::Presence => 1,
+        StanzaKind::Iq => 2,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RateLimit {
+    IncomingStanzasPerConnection,
+    NewRecipientsPerConnection,
+}
+
+impl RateLimit {
+    pub(super) const ALL: [Self; 2] = [
+        Self::IncomingStanzasPerConnection,
+        Self::NewRecipientsPerConnection,
+    ];
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::IncomingStanzasPerConnection => "incoming_stanzas_per_connection",
+            Self::NewRecipientsPerConnection => "new_recipients_per_connection",
+        }
+    }
+}
 
 const MECHANISMS: [Option<SaslMechanism>; 6] = [
     Some(SaslMechanism::External),
@@ -93,6 +124,11 @@ struct C2sCounters {
     panics: AtomicU64,
     authentications: [[AtomicU64; 1 + SaslFailure::ALL.len()]; MECHANISMS.len()],
     bindings: [AtomicU64; 1 + BindRejection::ALL.len()],
+    stanzas_received: [AtomicU64; KINDS.len()],
+    stanzas_sent: [AtomicU64; KINDS.len()],
+    received_bytes: AtomicU64,
+    sent_bytes: AtomicU64,
+    rate_limited: [AtomicU64; RateLimit::ALL.len()],
 }
 
 impl Default for C2sCounters {
@@ -105,6 +141,11 @@ impl Default for C2sCounters {
             panics: AtomicU64::new(0),
             authentications: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             bindings: std::array::from_fn(|_| AtomicU64::new(0)),
+            stanzas_received: std::array::from_fn(|_| AtomicU64::new(0)),
+            stanzas_sent: std::array::from_fn(|_| AtomicU64::new(0)),
+            received_bytes: AtomicU64::new(0),
+            sent_bytes: AtomicU64::new(0),
+            rate_limited: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -164,6 +205,32 @@ impl C2sWorkerMetrics {
 
     pub(super) fn binding_rejected(&self, rejection: BindRejection) {
         self.0.counters.bindings[1 + rejection as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn stanza_received(&self, kind: StanzaKind) {
+        self.0.counters.stanzas_received[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn stanza_sent(&self, kind: StanzaKind) {
+        self.0.counters.stanzas_sent[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn bytes_received(&self, bytes: usize) {
+        self.0
+            .counters
+            .received_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub(super) fn bytes_sent(&self, bytes: usize) {
+        self.0
+            .counters
+            .sent_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub(super) fn rate_limited(&self, limit: RateLimit) {
+        self.0.counters.rate_limited[limit as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Ignores `StreamPhase::Bound`, which has no negotiation duration.
@@ -469,6 +536,74 @@ impl Collector for C2sCollector {
             }
         }
         let mut family = encoder.encode_descriptor(
+            "c2s_stanzas_received",
+            "Stanzas parsed from client streams, by listener and kind.",
+            None,
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for kind in KINDS {
+                ConstCounter::new(sum(workers, |c| &c.stanzas_received[kind_index(kind)])).encode(
+                    family.encode_family(&KindLabels {
+                        listener,
+                        kind: kind.as_str(),
+                    })?,
+                )?;
+            }
+        }
+        let mut family = encoder.encode_descriptor(
+            "c2s_stanzas_sent",
+            "Stanzas written to client streams, by listener and kind.",
+            None,
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for kind in KINDS {
+                ConstCounter::new(sum(workers, |c| &c.stanzas_sent[kind_index(kind)])).encode(
+                    family.encode_family(&KindLabels {
+                        listener,
+                        kind: kind.as_str(),
+                    })?,
+                )?;
+            }
+        }
+        let mut family = encoder.encode_descriptor(
+            "c2s_received",
+            "Bytes read from client sockets after STARTTLS, including TLS overhead.",
+            Some(&Unit::Bytes),
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            ConstCounter::new(sum(workers, |c| &c.received_bytes))
+                .encode(family.encode_family(&ListenerLabels { listener })?)?;
+        }
+        let mut family = encoder.encode_descriptor(
+            "c2s_sent",
+            "Bytes written to client sockets after STARTTLS, including TLS overhead.",
+            Some(&Unit::Bytes),
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            ConstCounter::new(sum(workers, |c| &c.sent_bytes))
+                .encode(family.encode_family(&ListenerLabels { listener })?)?;
+        }
+        let mut family = encoder.encode_descriptor(
+            "c2s_rate_limited",
+            "Stanzas delayed or rejected by a per-connection rate limit, by listener and limit.",
+            None,
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for limit in RateLimit::ALL {
+                ConstCounter::new(sum(workers, |c| &c.rate_limited[limit as usize])).encode(
+                    family.encode_family(&LimitLabels {
+                        listener,
+                        limit: limit.as_str(),
+                    })?,
+                )?;
+            }
+        }
+        let mut family = encoder.encode_descriptor(
             "c2s_phase_duration",
             "Time to complete each stream negotiation phase.",
             Some(&Unit::Seconds),
@@ -515,6 +650,16 @@ struct BindingLabels {
     outcome: &'static str,
 }
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct KindLabels {
+    listener: usize,
+    kind: &'static str,
+}
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct LimitLabels {
+    listener: usize,
+    limit: &'static str,
+}
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PhaseLabels {
     phase: &'static str,
 }
@@ -522,6 +667,81 @@ struct PhaseLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kind_and_limit_indexes_follow_their_order() {
+        for (index, kind) in KINDS.into_iter().enumerate() {
+            assert_eq!(kind_index(kind), index);
+            assert_eq!(kind.as_str(), ["message", "presence", "iq"][index]);
+        }
+        for (index, limit) in RateLimit::ALL.into_iter().enumerate() {
+            assert_eq!(limit as usize, index);
+            assert_eq!(
+                limit.as_str(),
+                [
+                    "incoming_stanzas_per_connection",
+                    "new_recipients_per_connection"
+                ][index]
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_counters_are_encoded_for_every_series() -> Result<(), fmt::Error> {
+        let metrics = C2sMetrics::detached();
+        let empty = metrics.render()?;
+        for kind in KINDS {
+            for direction in ["received", "sent"] {
+                assert!(
+                    empty.contains(&format!(
+                        "lonewolf_c2s_stanzas_{direction}_total{{listener=\"0\",kind=\"{}\"}} 0\n",
+                        kind.as_str()
+                    )),
+                    "{empty}"
+                );
+            }
+        }
+        for direction in ["received", "sent"] {
+            assert!(
+                empty.contains(&format!(
+                    "lonewolf_c2s_{direction}_bytes_total{{listener=\"0\"}} 0\n"
+                )),
+                "{empty}"
+            );
+        }
+        for limit in RateLimit::ALL {
+            assert!(
+                empty.contains(&format!(
+                    "lonewolf_c2s_rate_limited_total{{listener=\"0\",limit=\"{}\"}} 0\n",
+                    limit.as_str()
+                )),
+                "{empty}"
+            );
+        }
+        let worker = metrics.worker(0, 0);
+        worker.stanza_received(StanzaKind::Message);
+        worker.stanza_sent(StanzaKind::Iq);
+        worker.bytes_received(10);
+        worker.bytes_sent(7);
+        worker.rate_limited(RateLimit::IncomingStanzasPerConnection);
+        let body = metrics.render()?;
+        for sample in [
+            "lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"} 1\n",
+            "lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 1\n",
+            "lonewolf_c2s_received_bytes_total{listener=\"0\"} 10\n",
+            "lonewolf_c2s_sent_bytes_total{listener=\"0\"} 7\n",
+            "lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"incoming_stanzas_per_connection\"} 1\n",
+        ] {
+            assert!(body.contains(sample), "{body}");
+        }
+        assert!(
+            body.lines()
+                .filter(|line| line.starts_with("# HELP "))
+                .all(|line| line.ends_with('.')),
+            "{body}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn authentication_and_binding_outcomes_are_encoded_without_zero_series()
@@ -718,7 +938,23 @@ mod tests {
         metrics
             .worker(0, 1)
             .phase_completed(StreamPhase::Establishing, Duration::from_millis(2));
+        for worker in [metrics.worker(0, 0), metrics.worker(0, 1)] {
+            worker.stanza_received(StanzaKind::Message);
+            worker.stanza_sent(StanzaKind::Presence);
+            worker.bytes_received(4);
+            worker.bytes_sent(3);
+            worker.rate_limited(RateLimit::NewRecipientsPerConnection);
+        }
         let output = metrics.render()?;
+        for sample in [
+            "lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"} 2\n",
+            "lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"presence\"} 2\n",
+            "lonewolf_c2s_received_bytes_total{listener=\"0\"} 8\n",
+            "lonewolf_c2s_sent_bytes_total{listener=\"0\"} 6\n",
+            "lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"new_recipients_per_connection\"} 2\n",
+        ] {
+            assert!(output.contains(sample), "{output}");
+        }
         assert!(output.lines().any(|line| line == "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"EXTERNAL\",outcome=\"success\"} 2"), "{output}");
         assert!(output.lines().any(|line| line == "lonewolf_c2s_resource_bindings_total{listener=\"0\",outcome=\"bad_request\"} 2"), "{output}");
         assert!(

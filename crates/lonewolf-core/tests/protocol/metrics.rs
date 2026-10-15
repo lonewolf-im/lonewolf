@@ -138,9 +138,13 @@ fn authentication_and_binding_outcomes_are_reported() -> TestResult {
         .open()?
         .child("urn:ietf:params:xml:ns:xmpp-bind", "bind")?;
     assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    suite.wait_for_metric("lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"iq\"} 1")?;
+    suite.wait_for_metric("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 1")?;
     let mut second = suite.authenticated_client("alice", "pencil")?;
     second.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
     second.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    suite.wait_for_metric("lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"iq\"} 2")?;
+    suite.wait_for_metric("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 2")?;
     for sample in [
         "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"none\",outcome=\"invalid_mechanism\"} 1",
         "lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"SCRAM-SHA-256\",outcome=\"not_authorized\"} 1",
@@ -153,5 +157,78 @@ fn authentication_and_binding_outcomes_are_reported() -> TestResult {
     }
     second.close()?;
     client.close()?;
+    suite.stop()
+}
+
+#[test]
+fn stanza_byte_and_rate_limit_counters_are_reported() -> TestResult {
+    use std::time::{Duration, Instant};
+
+    let mut suite = C2sSuite::with_metrics_settings(
+        "new_recipients_per_connection = { per_second = 1, burst = 1 }",
+        10,
+    )?;
+    suite.create_account("alice", "pencil")?;
+    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    alice.send("<message to='bob@localhost' type='chat'/><message to='carol@localhost' type='chat'/><message to='dave@localhost' type='chat'/>")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (body, rejected) = loop {
+        let body = suite.scrape_metrics()?;
+        let rejected = sample_value(&body, "lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"new_recipients_per_connection\"}").unwrap_or(0.0);
+        if rejected >= 1.0
+            && sample_value(
+                &body,
+                "lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"}",
+            ) == Some(3.0)
+            && sample_value(
+                &body,
+                "lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"message\"}",
+            ) == Some(rejected)
+        {
+            break (body, rejected);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("missing stanza traffic metrics: {body}").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        sample_value(
+            &body,
+            "lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"}"
+        ),
+        Some(3.0),
+        "{body}"
+    );
+    assert_eq!(
+        sample_value(
+            &body,
+            "lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"message\"}"
+        ),
+        Some(rejected),
+        "{body}"
+    );
+    for direction in ["received", "sent"] {
+        assert!(
+            sample_value(
+                &body,
+                &format!("lonewolf_c2s_{direction}_bytes_total{{listener=\"0\"}}")
+            )
+            .is_some_and(|value| value > 0.0),
+            "{body}"
+        );
+    }
+    assert!(body.lines().any(|line| line.starts_with("lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"incoming_stanzas_per_connection\"} ")), "{body}");
+    for account in ["alice", "bob", "carol", "dave"] {
+        assert!(!body.contains(account), "{body}");
+    }
+    let mut replies = 0.0;
+    while replies < rejected {
+        let reply = alice.receive()?;
+        reply.assert_name("jabber:client", "message");
+        reply.child("jabber:client", "error")?;
+        replies += 1.0;
+    }
+    alice.close()?;
     suite.stop()
 }

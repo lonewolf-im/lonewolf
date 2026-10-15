@@ -728,6 +728,7 @@ fn session(
                 .shared(),
             phase_deadline: None,
         },
+        crate::c2s::metrics::C2sWorkerMetrics::detached(),
     ))
 }
 
@@ -753,7 +754,7 @@ fn tls_detection_during_first_header_and_sasl_restart_skips_rejection_xml() -> T
                 Ok(())
             });
             let mut transport = TlsAcceptor::from(fixture.server)
-                .accept(super::RecordGuard::new(Box::pin(AsyncStream::new(socket.clone())), socket.clone()))
+                .accept(super::RecordGuard::new(crate::c2s::stream::traffic::CountingIo::new(Box::pin(AsyncStream::new(socket.clone())), crate::c2s::metrics::C2sWorkerMetrics::detached()), socket.clone()))
                 .await?;
             let version = transport.get_ref().1.protocol_version();
             transport.get_mut().0.handshake_complete(version);
@@ -836,7 +837,7 @@ fn writer_send_flush_rejection_header_and_stanza_keep_the_detection_marker() -> 
             guard.handshake_complete(Some(ProtocolVersion::TLSv1_2));
             let error = guard.reject();
             assert!(super::is_detected(&error));
-            let mut writer = Writer::new(guard, "localhost".into());
+            let mut writer = Writer::new(guard, "localhost".into(), crate::c2s::metrics::C2sWorkerMetrics::detached());
             let result = match operation {
                 0 => writer.send("<message/>").await,
                 1 => writer.flush().await,
@@ -877,7 +878,10 @@ fn tls_close_preserves_detection_and_phase_timeout_precedence() -> TestResult {
             });
             let mut transport = TlsAcceptor::from(fixture.server)
                 .accept(super::RecordGuard::new(
-                    Box::pin(AsyncStream::new(socket.clone())),
+                    crate::c2s::stream::traffic::CountingIo::new(
+                        Box::pin(AsyncStream::new(socket.clone())),
+                        crate::c2s::metrics::C2sWorkerMetrics::detached(),
+                    ),
                     socket.clone(),
                 ))
                 .await?;

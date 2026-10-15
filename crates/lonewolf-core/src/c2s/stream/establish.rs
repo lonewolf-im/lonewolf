@@ -28,6 +28,7 @@ use super::session::{
     namespace_error, peer_stream_error,
 };
 use super::stanza_rate::StanzaLimiter;
+use super::traffic::CountingIo;
 use crate::hosts::Hosts;
 use crate::hosts::client_identity::VerifiedClient;
 
@@ -77,10 +78,12 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         parser,
         StanzaLimiter::new(settings.stanzas_per_second, settings.stanza_burst),
         closing,
+        settings.metrics.clone(),
     );
     let mut writer = Writer::new(
         Box::pin(AsyncStream::new(transport.clone())),
         hosts.default_host_name().to_owned(),
+        settings.metrics.clone(),
     );
     let plain = super::run_phase(
         context.phase_deadline,
@@ -177,7 +180,10 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             let acceptor = TlsAcceptor::from(tls_config);
             acceptor
                 .accept(RecordGuard::new(
-                    Box::pin(AsyncStream::new(transport.clone())),
+                    CountingIo::new(
+                        Box::pin(AsyncStream::new(transport.clone())),
+                        settings.metrics.clone(),
+                    ),
                     transport,
                 ))
                 .await
@@ -241,6 +247,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         StanzaLimiter::new(settings.stanzas_per_second, settings.stanza_burst),
         closing,
         context.clone(),
+        settings.metrics.clone(),
     );
     let opened = super::run_phase(
         context.phase_deadline,

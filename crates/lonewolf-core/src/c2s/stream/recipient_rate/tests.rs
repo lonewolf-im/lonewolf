@@ -13,7 +13,12 @@ fn count(value: usize) -> Result<NonZeroUsize, &'static str> {
 #[test]
 fn repeats_are_free_and_denials_do_not_enter_the_cache() -> TestResult {
     let now = Instant::now();
-    let mut limiter = RecipientLimiter::new(NonZeroUsize::MIN, count(3)?, now);
+    let mut limiter = RecipientLimiter::new(
+        NonZeroUsize::MIN,
+        count(3)?,
+        now,
+        crate::c2s::metrics::C2sWorkerMetrics::detached(),
+    );
     for recipient in ["alice@example.org", "bob@example.org", "carol@example.org"] {
         assert!(limiter.admit(recipient, now));
         assert!(limiter.admit(recipient, now));
@@ -31,7 +36,12 @@ fn repeats_are_free_and_denials_do_not_enter_the_cache() -> TestResult {
 #[test]
 fn refill_admits_at_the_exact_fractional_boundary() -> TestResult {
     let now = Instant::now();
-    let mut limiter = RecipientLimiter::new(count(3)?, count(2)?, now);
+    let mut limiter = RecipientLimiter::new(
+        count(3)?,
+        count(2)?,
+        now,
+        crate::c2s::metrics::C2sWorkerMetrics::detached(),
+    );
     assert!(limiter.admit("alice@example.org", now));
     assert!(limiter.admit("dave@example.org", now));
     assert!(!limiter.admit("bob@example.org", now + Duration::from_millis(100)));
@@ -45,7 +55,12 @@ fn refill_admits_at_the_exact_fractional_boundary() -> TestResult {
 #[test]
 fn the_sixty_fifth_admission_evicts_the_oldest_and_charges_it_again() -> TestResult {
     let now = Instant::now();
-    let mut limiter = RecipientLimiter::new(NonZeroUsize::MIN, count(66)?, now);
+    let mut limiter = RecipientLimiter::new(
+        NonZeroUsize::MIN,
+        count(66)?,
+        now,
+        crate::c2s::metrics::C2sWorkerMetrics::detached(),
+    );
     for index in 0..64 {
         assert!(limiter.admit(&format!("user{index}@example.org"), now));
     }
@@ -62,7 +77,12 @@ fn the_sixty_fifth_admission_evicts_the_oldest_and_charges_it_again() -> TestRes
 #[test]
 fn denials_do_not_evict_a_full_cache() -> TestResult {
     let now = Instant::now();
-    let mut limiter = RecipientLimiter::new(NonZeroUsize::MIN, count(64)?, now);
+    let mut limiter = RecipientLimiter::new(
+        NonZeroUsize::MIN,
+        count(64)?,
+        now,
+        crate::c2s::metrics::C2sWorkerMetrics::detached(),
+    );
     for index in 0..64 {
         assert!(limiter.admit(&format!("user{index}@example.org"), now));
     }
@@ -75,5 +95,23 @@ fn denials_do_not_evict_a_full_cache() -> TestResult {
     for index in 0..64 {
         assert!(limiter.admit(&format!("user{index}@example.org"), now));
     }
+    Ok(())
+}
+
+#[test]
+fn rejected_new_recipients_are_counted() -> TestResult {
+    let metrics = crate::c2s::metrics::C2sMetrics::detached();
+    let now = Instant::now();
+    let mut limiter = RecipientLimiter::new(
+        NonZeroUsize::MIN,
+        NonZeroUsize::MIN,
+        now,
+        metrics.worker(0, 0),
+    );
+    assert!(limiter.admit("alice@example.org", now));
+    assert!(limiter.admit("alice@example.org", now));
+    assert!(!limiter.admit("bob@example.org", now));
+    let body = metrics.render()?;
+    assert!(body.contains("lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"new_recipients_per_connection\"} 1\n"), "{body}");
     Ok(())
 }

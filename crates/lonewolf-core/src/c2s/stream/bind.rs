@@ -463,7 +463,7 @@ async fn send_bind_result<A: ChunkAllocator>(
     xml.push_str("'><jid>");
     escape_text(&mut xml, &jid);
     xml.push_str("</jid></bind></iq>");
-    writer.send(&xml).await
+    writer.send_stanza_xml(&xml, StanzaKind::Iq).await
 }
 
 async fn send_bind_error(
@@ -484,7 +484,7 @@ async fn send_bind_error(
     xml.push_str(" xmlns='");
     xml.push_str(STANZA_ERROR_NAMESPACE);
     xml.push_str("'/></error></iq>");
-    writer.send(&xml).await
+    writer.send_stanza_xml(&xml, StanzaKind::Iq).await
 }
 
 async fn reject_bind(

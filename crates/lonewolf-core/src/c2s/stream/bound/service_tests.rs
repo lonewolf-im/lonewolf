@@ -140,6 +140,7 @@ async fn session(fixture: &Fixture) -> TestResult<TestSession<'_>> {
             NonZeroUsize::MIN,
             NonZeroUsize::new(100).ok_or("zero burst")?,
             Instant::now(),
+            crate::c2s::metrics::C2sWorkerMetrics::detached(),
         ),
         available: false,
         priority: None,

@@ -4,9 +4,16 @@ Lonewolf's first priority is desktop instant messaging: Basic IM, then Advanced
 IM. The final target is a cluster-aware server that satisfies every server
 category in the selected XMPP compliance suite.
 
-This is a release plan. Versions identify cumulative milestones, with no fixed
-release dates. Each release retains the requirements of earlier releases. A
-milestone is complete only after its protocol and operational checks pass.
+This roadmap defines capability milestones and their intended implementation
+order, with no fixed release dates. Feature dependencies determine the required
+order. A milestone may span several releases, and a release may include work from
+several milestones. A milestone is complete only after its protocol and
+operational checks pass.
+
+Releases ship completed, verified features and receive version numbers when their
+scope is agreed. Development releases have no fixed count or assigned milestones;
+versions can continue through 0.10.0 and beyond. The 1.0 release requires every
+milestone in this roadmap to be complete.
 
 ## Compliance baseline
 
@@ -21,31 +28,37 @@ The XEP tables distinguish three reasons for inclusion:
 - **Supporting:** a dependency or protocol profile needed by a planned feature.
 - **Product:** an additional Lonewolf interoperability requirement.
 
-Every listed requirement is part of the release scope. Support means implementing
-the applicable server role and the dependencies required by that role. A client
-payload needs correct forwarding and storage where applicable; it does not imply
-that the server implements a client interface or decrypts message content.
+Every listed requirement is part of the roadmap's 1.0 scope. A compliance claim
+requires all applicable requirements and verification checks to pass, regardless
+of how many releases deliver them. Support means implementing the applicable
+server role and the dependencies required by that role. A client payload needs
+correct forwarding and storage where applicable; it does not imply that the
+server implements a client interface or decrypts message content.
 
 Implementation trackers must pin specification revisions, namespaces, applicable
 requirements, and verification evidence. Reassess this baseline before 1.0 and
 record any adopted specification changes explicitly.
 
-## Release sequence
+## Capability milestones
 
-| Version | Milestone | Compliance target |
-| --- | --- | --- |
-| 0.1.0 | Current development foundation | Receiving C2S RFC scope |
-| 0.2.0 | Desktop discovery, profiles, and synchronization | Partial Core + IM |
-| 0.3.0 | Federation, components, rooms, and uploads | Basic Core + IM |
-| 0.4.0 | Resumption, archives, and blocking | Partial Advanced IM |
-| 0.5.0 | Capabilities, PEP, avatars, and bookmarks | Advanced Core + IM |
-| 0.6.0 | PostgreSQL storage and two-node cluster | Preserve desktop compliance across nodes |
-| 0.7.0 | Mobile efficiency and push | Advanced Mobile |
-| 0.8.0 | Web transports and calling infrastructure | Advanced Web + A/V Calling |
-| 0.9.0 | Cluster recovery and release qualification | All categories under failure and load |
-| 1.0.0 | First stable release | All Advanced Server categories + cluster operation |
+The order below expresses implementation priority. It does not assign release
+numbers or require unrelated features to ship together.
 
-## 0.1.0: Current development foundation
+| Milestone | Compliance target |
+| --- | --- |
+| Current development foundation | Receiving C2S RFC scope |
+| Desktop discovery, profiles, and synchronization | Partial Core + IM |
+| S2S federation | Authenticated server-to-server interoperability |
+| Basic desktop IM | Basic Core + IM, including components, rooms, and uploads |
+| Resumption, archives, and blocking | Partial Advanced IM |
+| Advanced desktop IM | Advanced Core + IM, including capabilities, PEP, avatars, and bookmarks |
+| PostgreSQL storage and two-node cluster | Preserve desktop compliance across nodes |
+| Mobile efficiency and push | Advanced Mobile |
+| Web transports and calling infrastructure | Advanced Web + A/V Calling |
+| Cluster recovery and release qualification | All categories under failure and load |
+| 1.0.0: First stable release | All Advanced Server categories + cluster operation |
+
+## Current development foundation
 
 The workspace version is 0.1.0. This describes the implemented foundation, not a
 published release or a claim of full server compliance.
@@ -75,7 +88,7 @@ tests and explicit policy choices. The completed [C2S tracker
 #234](https://github.com/lonewolf-im/lonewolf/issues/234) are starting evidence;
 they do not establish S2S or extension compliance.
 
-## 0.2.0: Desktop discovery, profiles, and synchronization
+## Desktop discovery, profiles, and synchronization
 
 Implement discovery first, then vCards and Carbons. Use the existing per-host
 extension slots and discovery data.
@@ -88,7 +101,7 @@ extension slots and discovery data.
 | [XEP-0199: XMPP Ping](https://xmpp.org/extensions/xep-0199.html) | Server replies and routing of entity pings | Product |
 | [XEP-0297: Stanza Forwarding](https://xmpp.org/extensions/xep-0297.html) | Forwarded-message envelopes used by Carbons | Supporting |
 
-Release gate:
+Milestone completion criteria:
 
 - Two independent desktop clients discover the enabled features and use vCards.
 - Multiple resources synchronize eligible messages without recursive copies or
@@ -96,11 +109,27 @@ Release gate:
 - Disabled features are absent from discovery; unsupported requests return the
   appropriate errors.
 
-## 0.3.0: Basic desktop IM
+## S2S federation
 
-Implement authenticated federation and components, then built-in MUC and upload
-services. Federation must cover messages, IQs, subscriptions, presence, and
-service domains, including their certificate identities and error behavior.
+Implement authenticated server-to-server federation for messages, IQs,
+subscriptions, presence, and service domains, including their certificate
+identities and error behavior.
+
+Milestone completion criteria:
+
+- A different server implementation exchanges messages, subscription changes,
+  presence, and IQs with Lonewolf; unauthorized sender domains are rejected.
+- Federation failures and connection shutdown have bounded, verified outcomes.
+  Required deployment services are documented.
+
+Federation can ship with its required dependencies in a release whose only new
+capability is S2S support. Discovery, vCards, Carbons, components, rooms, and
+uploads follow their own dependencies and completion criteria. Federation alone
+does not establish Basic Core + IM compliance.
+
+## Basic desktop IM
+
+Build on federation with components, then built-in MUC and upload services.
 
 | XEP | Required scope | Basis |
 | --- | --- | --- |
@@ -111,16 +140,14 @@ service domains, including their certificate identities and error behavior.
 | [XEP-0004: Data Forms](https://xmpp.org/extensions/xep-0004.html) | Forms used by room configuration and later protocol profiles | Supporting |
 | [XEP-0128: Service Discovery Extensions](https://xmpp.org/extensions/xep-0128.html) | Extended room and upload discovery information | Supporting |
 
-Release gate:
+Milestone completion criteria:
 
 - Basic Core + IM requirements pass for the selected suite.
-- A different server implementation exchanges messages, subscription changes,
-  presence, and IQs with Lonewolf; unauthorized sender domains are rejected.
 - Desktop clients create, join, administer, and leave rooms and share files.
-- Component loss, federation failures, and interrupted uploads have bounded,
-  verified outcomes. Required deployment services are documented.
+- Component loss and interrupted uploads have bounded, verified outcomes.
+  Required deployment services are documented.
 
-## 0.4.0: Resumption, archives, and blocking
+## Resumption, archives, and blocking
 
 Implement Stream Management in the logical session and MAM through the archive
 and query boundaries. Keep the offline queue and message archive as distinct
@@ -134,7 +161,7 @@ stores with explicit retention and release rules.
 | [XEP-0359: Unique and Stable Stanza IDs](https://xmpp.org/extensions/xep-0359.html) | Trusted archive identifiers and preservation of client origin identifiers | Supporting |
 | [XEP-0059: Result Set Management](https://xmpp.org/extensions/xep-0059.html) | Bounded, stable archive pages | Supporting |
 
-Release gate:
+Milestone completion criteria:
 
 - Specify the acceptance event for each stanza class and its crash semantics;
   transport flush, client acknowledgement, and durable commit remain distinct.
@@ -145,7 +172,7 @@ Release gate:
 - Archive retention and account deletion preserve privacy and ordering. Measure
   storage admission and replay costs before changing capacity policy.
 
-## 0.5.0: Advanced desktop IM
+## Advanced desktop IM
 
 Implement capabilities and PEP before avatars and bookmarks. Extend MAM to room
 archives with room-specific access rules.
@@ -165,7 +192,7 @@ archives with room-specific access rules.
 | [XEP-0049: Private XML Storage](https://xmpp.org/extensions/xep-0049.html) | Legacy private data and bookmark compatibility | Product |
 | [XEP-0410: MUC Self-Ping](https://xmpp.org/extensions/xep-0410.html) | Occupant self-ping responses that reflect room membership | Suite |
 
-Release gate:
+Milestone completion criteria:
 
 - Advanced Core + IM requirements pass, including account and room MAM.
 - Avatars and bookmarks remain consistent across different desktop clients and
@@ -176,9 +203,10 @@ Release gate:
 Private XML Storage is a Lonewolf compatibility choice; the suite recommends it
 for legacy bookmarks. Direct TLS deployment records complement listener support.
 
-## 0.6.0: PostgreSQL storage and two-node cluster
+## PostgreSQL storage and two-node cluster
 
-No new XEP is introduced. All earlier features must work across node boundaries.
+No new XEP is introduced. Every feature included in a cluster release must work
+across node boundaries.
 
 Implement PostgreSQL (PgSQL) as a supported storage backend and verify it on one
 node before starting cross-node routing. Keep redb available for embedded,
@@ -189,7 +217,7 @@ Storage requirements:
 
 - Remove concrete redb dependencies from core storage selection and extension
   wiring so operators can select either backend through configuration.
-- Cover every persistent feature from earlier milestones, including accounts,
+- Cover every persistent feature in this roadmap, including accounts,
   rosters, offline messages, vCards, blocklists, archives, rooms, PEP, and bookmarks.
 - Preserve consistent snapshots, stable transactional reads, atomic writes,
   commit/effect ordering, and account deletion/recreation fences. Specify locking
@@ -203,9 +231,10 @@ Storage requirements:
 - Document database connection, TLS, credentials, and pool settings in
   `examples/lonewolf.toml` when the backend is implemented.
 
-Storage release gate: the same client workflows pass against redb and PostgreSQL
-on one node, with separate transaction and database-failure checks against a real
-PostgreSQL instance. Later features must support both backends.
+Storage completion criteria: the same client workflows pass against redb and
+PostgreSQL on one node, with separate transaction and database-failure checks
+against a real PostgreSQL instance. Once PostgreSQL is supported, every released
+persistent feature must support both backends.
 
 Select the cluster storage topology and ownership model separately. PostgreSQL
 provides a shared-storage option; cross-node ordering, ownership, and recovery
@@ -223,23 +252,24 @@ Cluster requirements:
 - Make sessions, resource conflicts, presence, Carbons, offline replay, archives,
   rooms, and administrative operations consistent across both nodes.
 
-Release gate: clients can connect to either node and complete the desktop
-workflows. Tests cover ownership transfer, stale-owner rejection, partitions,
-node loss, and cleanup. A load balancer alone does not satisfy this milestone.
+Cluster completion criteria: clients can connect to either node and complete the
+desktop workflows. Tests cover ownership transfer, stale-owner rejection,
+partitions, node loss, and cleanup. A load balancer alone does not satisfy this
+milestone.
 
-## 0.7.0: Mobile efficiency and push
+## Mobile efficiency and push
 
 | XEP | Required scope | Basis |
 | --- | --- | --- |
 | [XEP-0352: Client State Indication](https://xmpp.org/extensions/xep-0352.html) | Active/inactive state and bounded delivery scheduling | Suite |
 | [XEP-0357: Push Notifications](https://xmpp.org/extensions/xep-0357.html) | Authorized registrations, push-service publication, disablement, and cleanup | Suite |
 
-Release gate: Advanced Mobile requirements pass. Verify inactive clients,
-resumption, archive catch-up, federated push services, registration expiry or
-revocation, and provider failure. Notifications must respect blocking, privacy,
-and account deletion across nodes.
+Milestone completion criteria: Advanced Mobile requirements pass. Verify inactive
+clients, resumption, archive catch-up, federated push services, registration
+expiry or revocation, and provider failure. Notifications must respect blocking,
+privacy, and account deletion across nodes.
 
-## 0.8.0: Web transports and calling infrastructure
+## Web transports and calling infrastructure
 
 Implement WebSocket first, then BOSH. The server target includes both transports.
 Apply [RFC 7395](https://www.rfc-editor.org/rfc/rfc7395.html) to WebSocket framing
@@ -252,7 +282,7 @@ and stream behavior.
 | [XEP-0156: Discovering Alternative XMPP Connection Methods](https://xmpp.org/extensions/xep-0156.html) | Publish the supported connection endpoints | Product |
 | [XEP-0215: External Service Discovery](https://xmpp.org/extensions/xep-0215.html) | STUN/TURN service discovery and authorized temporary credentials | Suite |
 
-Release gate:
+Milestone completion criteria:
 
 - Advanced Web + A/V Calling server requirements pass.
 - Browser clients authenticate, exchange messages, reconnect, and close over
@@ -263,11 +293,11 @@ Release gate:
   behavior remain client responsibilities. The media service is a deployment
   dependency, with no mandatory in-process media implementation.
 
-## 0.9.0: Cluster recovery and release qualification
+## Cluster recovery and release qualification
 
 No new XEP is introduced. Qualify the full feature set under failure and load.
 
-Release gate:
+Milestone completion criteria:
 
 - Durable acceptance survives loss of one server node within the documented
   storage failure model. Unknown commit outcomes and retries have tested rules.
@@ -290,8 +320,9 @@ during every failure.
 
 ## 1.0.0: First stable release
 
-All earlier milestone requirements are mandatory. No new XEP is added solely for
-the version number.
+All roadmap milestone requirements are mandatory for 1.0, regardless of the
+number or order of development releases. No new XEP is added solely for the
+version number.
 
 Release gate:
 
@@ -310,7 +341,15 @@ Release gate:
 
 Create a tracker for each feature or architectural milestone, with ordered
 sub-issues, dependencies, routing labels, and acceptance criteria. A release may
-span several trackers. Discovery is the next implementation milestone.
+span several trackers or ship completed features from a tracker whose broader
+milestone remains open. Discovery is the next planned implementation milestone;
+the order may change when feature dependencies permit it.
+
+Define each release's scope and verification checks for the features and
+dependencies it includes. Verify their interaction with existing supported
+features, including failure and shutdown paths. Apply checks for deferred
+features when those features are introduced. Release notes must identify the
+shipped capabilities and the compliance level established by the evidence.
 
 Retain the single-node deployment throughout this roadmap. Preserve the project's
 allocation, logging, dependency, configuration-reference, and test-organization

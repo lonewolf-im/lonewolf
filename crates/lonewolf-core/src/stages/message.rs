@@ -14,6 +14,7 @@ use crate::delivery::{
     Pending, StoredDelivery, commit_and_store, report_failure, report_handler_failure,
     storage_failure,
 };
+use crate::router::metrics::MessageOutcome;
 use crate::router::{Destination, RoutedStanza, RouterError};
 
 pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
@@ -38,6 +39,23 @@ enum StorePreparation<A: ChunkAllocator> {
 
 /// Requires a stanza with an authenticated sender.
 pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    routed: RoutedStanza<A>,
+    kind: MessageType,
+) -> Result<DeliveryOutcome<A>, StageFailure> {
+    let result = deliver_unrecorded(stage, routed, kind).await;
+    let outcome = match &result {
+        Ok(DeliveryOutcome::Routed) => MessageOutcome::Routed,
+        Ok(DeliveryOutcome::Stored) => MessageOutcome::Stored,
+        Ok(DeliveryOutcome::Discarded) => MessageOutcome::Discarded,
+        Ok(DeliveryOutcome::Rejected { .. }) => MessageOutcome::Rejected,
+        Err(_) => MessageOutcome::Failed,
+    };
+    stage.router.metrics().message(outcome);
+    result
+}
+
+async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: MessageType,

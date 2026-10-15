@@ -332,6 +332,9 @@ impl CtlError {
             "not_found" => "account not found",
             "invalid_jid" => "invalid bare JID",
             "invalid_password" => "invalid password",
+            "weak_password" => {
+                "password must contain at least 15 characters and 3 distinct characters after SASLprep"
+            }
             "storage_unavailable" => "account storage is unavailable",
             "commit_unknown" => "account change outcome is unknown",
             "invalid_request" => "admin service rejected the request",
@@ -361,5 +364,20 @@ impl CtlError {
 impl fmt::Display for CtlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weak_password_api_code_has_a_stable_public_message() {
+        let error = CtlError::api(Some("weak_password"));
+        assert_eq!(error.code, "weak_password");
+        assert_eq!(
+            error.to_string(),
+            "password must contain at least 15 characters and 3 distinct characters after SASLprep"
+        );
     }
 }

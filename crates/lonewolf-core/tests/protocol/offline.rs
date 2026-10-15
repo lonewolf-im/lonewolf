@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::{ALTERNATE_PASSWORD, OTHER_PASSWORD};
+
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -21,8 +23,8 @@ use lonewolf_xmpp::jid::Jid;
 use super::support::{C2sSuite, Client, TestResult};
 
 fn accounts(suite: &C2sSuite) -> TestResult {
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "secret")
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", OTHER_PASSWORD)
 }
 
 fn barrier(client: &mut Client, full: &str) -> TestResult {
@@ -82,14 +84,14 @@ fn await_empty(client: &mut Client, owner: &str) -> TestResult {
 fn default_host_answers_roster_get_and_delivers_offline_messages_on_login() -> TestResult {
     let suite = C2sSuite::start()?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>")?;
     alice
         .send("<message to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
 
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -109,7 +111,7 @@ fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messag
         "'roster', 'offline', 'test-offline-inspect'",
         seed_replay_roster,
     )?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<presence/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
@@ -120,7 +122,7 @@ fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messag
         ))?;
     }
     barrier(&mut alice, "alice@localhost/desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -167,8 +169,8 @@ fn seed_replay_roster(directory: &Path) -> TestResult {
     let charlie = RosterJid::from(Jid::parse_in("charlie@localhost", &mut arena)?.resolve(&arena)?);
     let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?;
     let credentials = match (
-        ScramVerifier::derive(ScramHash::Sha1, "secret", [1; 16], iterations)?,
-        ScramVerifier::derive(ScramHash::Sha256, "secret", [2; 16], iterations)?,
+        ScramVerifier::derive(ScramHash::Sha1, OTHER_PASSWORD, [1; 16], iterations)?,
+        ScramVerifier::derive(ScramHash::Sha256, OTHER_PASSWORD, [2; 16], iterations)?,
     ) {
         (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) => {
             ScramCredentials::both(sha1, sha256)
@@ -180,8 +182,8 @@ fn seed_replay_roster(directory: &Path) -> TestResult {
         transaction.create_account(NewAccount { key: bob.clone(), credentials }).await?;
         let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?;
         let credentials = match (
-            ScramVerifier::derive(ScramHash::Sha1, "pencil", [1;16], iterations)?,
-            ScramVerifier::derive(ScramHash::Sha256, "pencil", [2;16], iterations)?,
+            ScramVerifier::derive(ScramHash::Sha1, ALTERNATE_PASSWORD, [1;16], iterations)?,
+            ScramVerifier::derive(ScramHash::Sha256, ALTERNATE_PASSWORD, [2;16], iterations)?,
         ) {
             (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) => ScramCredentials::both(sha1, sha256),
             _ => return Err("unexpected verifier hashes".into()),
@@ -224,7 +226,7 @@ fn corrupt_stored_records_are_logged_once_skipped_and_removed_without_ending_the
         ])
         },
     )?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -254,7 +256,7 @@ fn prefixed_stored_stanzas_are_logged_once_skipped_and_allow_valid_replay() -> T
             ])
         },
     )?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -284,8 +286,8 @@ fn replay_exceeds_mailbox_capacity_and_uses_stored_size_instead_of_the_receivers
             seed_offline_records(directory, &messages)
         },
     )?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -308,7 +310,7 @@ fn stored_messages_follow_contact_presence_and_pending_requests_without_repeatin
         "'roster', 'offline', 'test-offline-inspect'",
         seed_replay_roster,
     )?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<presence/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
@@ -319,7 +321,7 @@ fn stored_messages_follow_contact_presence_and_pending_requests_without_repeatin
         ))?;
     }
     barrier(&mut alice, "alice@localhost/desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence><priority>-1</priority></presence>")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>-1</priority></presence>")?;
     bob.expect_xml(
@@ -349,12 +351,12 @@ fn offline_only_host_replays_three_messages_after_the_echo_and_a_second_login_ge
 -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     for index in 0..3 {
         alice.send(&format!("<message to='bob@localhost' type='normal' id='stored-{index}'><body>Hello {index}</body></message>"))?;
     }
     barrier(&mut alice, "alice@localhost/desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -369,7 +371,7 @@ fn offline_only_host_replays_three_messages_after_the_echo_and_a_second_login_ge
     }
     await_empty(&mut bob, "bob@localhost/phone")?;
     bob.close()?;
-    let mut bob = suite.connect("bob", "secret", "tablet")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "tablet")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='bob@localhost'/>",
@@ -383,10 +385,10 @@ fn offline_only_host_replays_three_messages_after_the_echo_and_a_second_login_ge
 fn negative_initial_priority_defers_replay_until_it_is_raised_to_zero() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@localhost' type='chat' id='stored'/>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence><priority>-1</priority></presence>")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>-1</priority></presence>")?;
     inspect(&mut bob, "bob@localhost/phone", 1, 1, Some("bob@localhost"))?;
@@ -405,7 +407,7 @@ fn negative_initial_priority_defers_replay_until_it_is_raised_to_zero() -> TestR
 fn bare_normal_and_missing_full_chat_store_while_missing_full_normal_is_rejected() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send(
         "<message to='bob@localhost' type='normal' id='normal'><body>Hello</body></message>",
     )?;
@@ -413,7 +415,7 @@ fn bare_normal_and_missing_full_chat_store_while_missing_full_normal_is_rejected
         "<message to='bob@localhost/missing' type='chat' id='chat'><body>Hello</body></message>",
     )?;
     barrier(&mut alice, "alice@localhost/desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     inspect(
         &mut bob,
         "bob@localhost/phone",
@@ -431,7 +433,7 @@ fn bare_normal_and_missing_full_chat_store_while_missing_full_normal_is_rejected
         Some("bob@localhost/missing"),
     )?;
     bob.close()?;
-    let mut bob = suite.connect("bob", "secret", "missing")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "missing")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/missing' to='bob@localhost'/>",
@@ -459,9 +461,9 @@ fn missing_full_normal_is_rejected_without_storage_or_replay_for_every_sibling_s
         for priority in [None, Some(-1), Some(0)] {
             let suite = C2sSuite::with_extensions(extensions)?;
             accounts(&suite)?;
-            let mut alice = suite.connect("alice", "pencil", "desk")?;
+            let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
             let mut sibling = if let Some(priority) = priority {
-                let mut bob = suite.connect("bob", "secret", "phone")?;
+                let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
                 bob.send(&format!(
                     "<presence><priority>{priority}</priority></presence>"
                 ))?;
@@ -477,7 +479,7 @@ fn missing_full_normal_is_rejected_without_storage_or_replay_for_every_sibling_s
                 inspect(bob, "bob@localhost/phone", 0, 0, None)?;
                 bob.close()?;
             }
-            let mut bob = suite.connect("bob", "secret", "missing")?;
+            let mut bob = suite.connect("bob", OTHER_PASSWORD, "missing")?;
             inspect(&mut bob, "bob@localhost/missing", 0, 0, None)?;
             bob.send("<presence/>")?;
             bob.expect_xml(
@@ -497,14 +499,14 @@ fn standalone_chat_states_do_not_consume_the_two_message_quota() -> TestResult {
         "[hosts.localhost]\nextensions = ['offline', 'test-offline-inspect']\n[hosts.localhost.offline]\nmax_messages_per_account = 2",
     )?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@localhost' type='chat'><composing xmlns='http://jabber.org/protocol/chatstates'/></message>")?;
     alice.send("<message to='bob@localhost' type='chat'><active xmlns='http://jabber.org/protocol/chatstates'/><thread>discussion</thread></message>")?;
     alice.send("<message to='bob@localhost' type='chat' id='first'/>")?;
     alice.send("<message to='bob@localhost' type='chat' id='second'/>")?;
     alice.send("<message to='bob@localhost' type='chat' id='third'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost' to='alice@localhost/desk' id='third' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     inspect(&mut bob, "bob@localhost/phone", 2, 2, Some("bob@localhost"))?;
     bob.close()?;
     alice.close()
@@ -514,12 +516,12 @@ fn standalone_chat_states_do_not_consume_the_two_message_quota() -> TestResult {
 fn headline_groupchat_and_error_keep_their_existing_offline_behaviour() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@localhost' type='headline' id='headline'/>")?;
     alice.send("<message to='bob@localhost' type='error' id='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
     alice.send("<message to='bob@localhost' type='groupchat' id='groupchat'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost' to='alice@localhost/desk' id='groupchat' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
     bob.close()?;
     alice.close()
@@ -529,7 +531,7 @@ fn headline_groupchat_and_error_keep_their_existing_offline_behaviour() -> TestR
 fn unknown_local_accounts_silently_discard_normal_and_chat_messages() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     for kind in ["normal", "chat"] {
         alice.send(&format!(
             "<message to='unknown@localhost' type='{kind}' id='unknown'><body>Hello</body></message>"
@@ -543,7 +545,7 @@ fn unknown_local_accounts_silently_discard_normal_and_chat_messages() -> TestRes
 fn existing_offline_and_unknown_accounts_give_the_sender_the_same_silence() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     for kind in ["normal", "chat"] {
         for recipient in ["bob", "unknown"] {
             alice.send(&format!(
@@ -552,7 +554,7 @@ fn existing_offline_and_unknown_accounts_give_the_sender_the_same_silence() -> T
             barrier(&mut alice, "alice@localhost/desk")?;
         }
     }
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     inspect(&mut bob, "bob@localhost/phone", 2, 2, Some("bob@localhost"))?;
     bob.send("<presence/>")?;
     bob.expect_xml(
@@ -575,8 +577,8 @@ fn existing_offline_and_unknown_accounts_give_the_sender_the_same_silence() -> T
 fn negative_priority_recipient_gets_no_live_delivery_and_the_message_is_stored() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence><priority>-1</priority></presence>")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>-1</priority></presence>")?;
     alice
@@ -591,7 +593,7 @@ fn negative_priority_recipient_gets_no_live_delivery_and_the_message_is_stored()
 fn unavailable_sender_can_store_a_message_to_its_own_account() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='alice@localhost' type='chat' id='self'/>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
     inspect(
@@ -609,9 +611,9 @@ fn recipient_host_selects_the_handler_and_quota() -> TestResult {
     let suite = C2sSuite::with_hosts(
         "[hosts.localhost]\nextensions = []\n[hosts.'other.localhost']\nextensions = ['offline']\n[hosts.'other.localhost'.offline]\nmax_messages_per_account = 2\n[hosts.'other.localhost'.tls]\ncertificate_chain_path = 'certificate.pem'\nprivate_key_path = 'private-key.pem'",
     )?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account_jid("bob@other.localhost", "secret")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account_jid("bob@other.localhost", OTHER_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@other.localhost' type='chat' id='first'/>")?;
     alice.send("<message to='bob@other.localhost' type='chat' id='second'/>")?;
     alice.send("<message to='bob@other.localhost' type='chat' id='third'/>")?;
@@ -623,8 +625,8 @@ fn recipient_host_selects_the_handler_and_quota() -> TestResult {
 fn availability_fixed_before_store_commit_gets_the_chat_live_without_a_delay() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-slow-offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     alice
         .send("<message to='bob@localhost' type='chat' id='raced'><body>Hello</body></message>")?;
     suite.wait_for_log("test offline store waiting")?;
@@ -636,7 +638,7 @@ fn availability_fixed_before_store_commit_gets_the_chat_live_without_a_delay() -
     barrier(&mut alice, "alice@localhost/desk")?;
     await_empty(&mut bob, "bob@localhost/phone")?;
     bob.close()?;
-    let mut bob = suite.connect("bob", "secret", "tablet")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "tablet")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='bob@localhost'/>",
@@ -650,8 +652,8 @@ fn availability_fixed_before_store_commit_gets_the_chat_live_without_a_delay() -
 fn rejected_full_normal_stays_absent_when_a_sibling_becomes_eligible() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-slow-offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost/missing' type='normal' id='raced'/>")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
@@ -660,7 +662,7 @@ fn rejected_full_normal_stays_absent_when_a_sibling_becomes_eligible() -> TestRe
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='raced' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
     inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
     bob.close()?;
-    let mut bob = suite.connect("bob", "secret", "missing")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "missing")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/missing' to='bob@localhost'/>",
@@ -708,8 +710,8 @@ fn deleting_and_recreating_an_account_clears_backlog_when_offline_is_disabled() 
         seed_retained_offline_message,
     )?;
     suite.delete_account("bob")?;
-    suite.create_account("bob", "secret")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    suite.create_account("bob", OTHER_PASSWORD)?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
     bob.send("<iq type='set' id='push'><push xmlns='urn:lonewolf:test:offline'/></iq>")?;
     bob.expect_xml("<iq xmlns='jabber:client' type='result' id='push' to='bob@localhost/phone'><pushed xmlns='urn:lonewolf:test:offline' sequence='1'/></iq>")?;
@@ -720,12 +722,12 @@ fn deleting_and_recreating_an_account_clears_backlog_when_offline_is_disabled() 
 fn deleting_and_recreating_an_account_clears_messages_before_eligible_replay() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-offline-inspect'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@localhost' type='chat' id='old'/>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
     suite.delete_account("bob")?;
-    suite.create_account("bob", "secret")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    suite.create_account("bob", OTHER_PASSWORD)?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -739,10 +741,10 @@ fn deleting_and_recreating_an_account_clears_messages_before_eligible_replay() -
 fn sender_drains_more_than_mailbox_capacity_while_live_acknowledgement_is_blocked() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-blocked-offline-ack'")?;
     accounts(&suite)?;
-    suite.create_account("charlie", "secret")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
-    let mut charlie = suite.connect("charlie", "secret", "laptop")?;
+    suite.create_account("charlie", OTHER_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
+    let mut charlie = suite.connect("charlie", OTHER_PASSWORD, "laptop")?;
     alice.send("<presence/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
@@ -774,8 +776,8 @@ fn sender_drains_more_than_mailbox_capacity_while_live_acknowledgement_is_blocke
 fn failed_live_acknowledgement_retains_the_stored_copy_and_logs_once() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-blocked-offline-ack'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost' type='chat' id='raced'/>")?;
     suite.wait_for_log("test offline store waiting")?;
     bob.send("<presence/>")?;
@@ -805,7 +807,7 @@ fn unknown_message_type_round_trips_through_offline_storage_with_inherited_langu
     let suite = C2sSuite::start()?;
     accounts(&suite)?;
     let mut alice = suite.unauthenticated_client()?;
-    alice.authenticate("alice", "pencil")?;
+    alice.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut alice = alice.restart();
     alice.open_with(&super::support::OPEN.replace('>', " xml:lang='es'>"))?;
     alice.features()?;
@@ -813,7 +815,7 @@ fn unknown_message_type_round_trips_through_offline_storage_with_inherited_langu
     alice.send("<message to='bob@localhost' type='future-type' id='stored' custom='kept'><body>Hello</body><extra xmlns='urn:test:payload'>value</extra></message>")?;
     alice.send("<iq type='get' id='sentinel'><query xmlns='jabber:iq:roster'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' to='alice@localhost/desk' type='result' id='sentinel'><query xmlns='jabber:iq:roster'/></iq>")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",

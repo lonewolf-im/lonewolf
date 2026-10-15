@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::PASSWORD;
+
 use super::support::{C2sSuite, Client, TestResult};
 
 fn accounts(suite: &C2sSuite) -> TestResult {
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)
 }
 
 fn entries(client: &mut Client, full: &str, expected: &str) -> TestResult {
@@ -16,8 +18,8 @@ fn entries(client: &mut Client, full: &str, expected: &str) -> TestResult {
 fn messages_get_the_recipients_stanza_id() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-archive'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/res' to='bob@localhost'/>",
@@ -39,8 +41,8 @@ fn messages_get_the_recipients_stanza_id() -> TestResult {
 fn spoofed_stanza_ids_are_removed() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-archive'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     alice.send("<message type='chat' to='bob@localhost/res' id='spoof'><stanza-id xmlns='urn:xmpp:sid:0' by='bob@localhost' id='x'/><stanza-id xmlns='urn:xmpp:sid:0' by='other.example' id='y'/></message>")?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost/res' type='chat' id='spoof'><stanza-id xmlns='urn:xmpp:sid:0' by='other.example' id='y'/><stanza-id xmlns='urn:xmpp:sid:0' id='2' by='bob@localhost'/></message>")?;
     alice.close()?;
@@ -51,8 +53,8 @@ fn spoofed_stanza_ids_are_removed() -> TestResult {
 fn archive_rejection_stops_the_message() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-archive'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     alice.send(
         "<message type='chat' to='bob@localhost/res' id='reject'><body>reject</body></message>",
     )?;
@@ -67,9 +69,9 @@ fn archive_rejection_stops_the_message() -> TestResult {
 #[test]
 fn messages_within_one_account_are_archived_once() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-archive'")?;
-    suite.create_account("alice", "password")?;
-    let mut sender = suite.connect("alice", "password", "a")?;
-    let mut recipient = suite.connect("alice", "password", "b")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut sender = suite.connect("alice", PASSWORD, "a")?;
+    let mut recipient = suite.connect("alice", PASSWORD, "b")?;
     sender.send("<message type='chat' to='alice@localhost/b' id='self'/>")?;
     recipient.expect_xml("<message xmlns='jabber:client' from='alice@localhost/a' to='alice@localhost/b' type='chat' id='self'/>")?;
     entries(
@@ -85,7 +87,7 @@ fn messages_within_one_account_are_archived_once() -> TestResult {
 fn offline_messages_keep_their_stanza_id() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-archive'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
     alice
         .send("<message type='chat' to='bob@localhost' id='stored'><body>Hello</body></message>")?;
     entries(
@@ -93,7 +95,7 @@ fn offline_messages_keep_their_stanza_id() -> TestResult {
         "alice@localhost/res",
         "<entry owner='alice@localhost' direction='sent' id='1'/><entry owner='bob@localhost' direction='received' id='2'/>",
     )?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/res' to='bob@localhost'/>",
@@ -131,8 +133,8 @@ fn two_archive_handlers_prevent_startup() -> TestResult {
 fn without_an_archive_messages_are_unchanged() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "res")?;
-    let mut bob = suite.connect("bob", "password", "res")?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
+    let mut bob = suite.connect("bob", PASSWORD, "res")?;
     alice.send("<message type='chat' to='bob@localhost/res' id='spoof'><stanza-id xmlns='urn:xmpp:sid:0' by='bob@localhost' id='x'/><stanza-id xmlns='urn:xmpp:sid:0' by='other.example' id='y'/></message>")?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost/res' type='chat' id='spoof'><stanza-id xmlns='urn:xmpp:sid:0' by='bob@localhost' id='x'/><stanza-id xmlns='urn:xmpp:sid:0' by='other.example' id='y'/></message>")?;
     alice.close()?;
@@ -142,8 +144,8 @@ fn without_an_archive_messages_are_unchanged() -> TestResult {
 #[test]
 fn messages_to_and_from_services_are_archived() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-archive', 'test-service'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "res")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "res")?;
     alice
         .send("<message type='chat' to='echo.localhost' id='echo'><body>Hello</body></message>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='echo.localhost' to='alice@localhost/res' type='chat' id='echo'><body>Hello</body><stanza-id xmlns='urn:xmpp:sid:0' id='2' by='alice@localhost'/></message>")?;

@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::{ALTERNATE_PASSWORD, OTHER_PASSWORD, PASSWORD};
+
 use super::support::{C2sSuite, TestResult};
 
 #[test]
 fn ipv6_zone_destinations_return_recoverable_jid_malformed_errors() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     for destination in ["bob@[fe80::1%eth0]", "bob@[fe80::1%25eth0]/phone"] {
         for (kind, attributes, payload) in [
@@ -28,10 +30,10 @@ fn ipv6_zone_destinations_return_recoverable_jid_malformed_errors() -> TestResul
 #[test]
 fn full_jid_normal_and_chat_reach_unavailable_and_negative_priority_resources() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "secret")?;
-    let mut alice = suite.connect("alice", "pencil", "desktop")?;
-    let mut bob = suite.connect("bob", "secret", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", OTHER_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
 
     for priority in [None, Some(-1)] {
         if let Some(priority) = priority {
@@ -52,9 +54,9 @@ fn full_jid_normal_and_chat_reach_unavailable_and_negative_priority_resources() 
 #[test]
 fn bare_chat_reaches_the_highest_priority_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -89,9 +91,9 @@ fn bare_chat_reaches_the_highest_priority_resource() -> TestResult {
 #[test]
 fn bare_normal_reaches_the_highest_priority_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -126,9 +128,9 @@ fn bare_normal_reaches_the_highest_priority_resource() -> TestResult {
 #[test]
 fn unavailable_resource_stops_receiving_bare_messages() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -166,8 +168,8 @@ fn unavailable_resource_stops_receiving_bare_messages() -> TestResult {
 #[test]
 fn full_jid_delivery_ignores_unavailable_presence() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence/>"#)?;
     alice.expect_xml(
@@ -184,8 +186,8 @@ fn full_jid_delivery_ignores_unavailable_presence() -> TestResult {
 #[test]
 fn negative_priority_excludes_a_resource_from_bare_delivery() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence>
@@ -208,8 +210,8 @@ fn negative_priority_excludes_a_resource_from_bare_delivery() -> TestResult {
 #[test]
 fn full_jid_delivery_ignores_negative_priority() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence>
@@ -230,9 +232,9 @@ fn full_jid_delivery_ignores_negative_priority() -> TestResult {
 #[test]
 fn equal_priorities_route_chat_to_the_oldest_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -267,9 +269,9 @@ fn equal_priorities_route_chat_to_the_oldest_resource() -> TestResult {
 #[test]
 fn headline_reaches_every_available_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -305,9 +307,9 @@ fn headline_reaches_every_available_resource() -> TestResult {
 #[test]
 fn headline_skips_a_negative_priority_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -344,8 +346,8 @@ fn headline_skips_a_negative_priority_resource() -> TestResult {
 #[test]
 fn missing_full_jid_chat_falls_back_without_changing_the_destination() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence/>"#)?;
     alice.expect_xml(
@@ -360,8 +362,8 @@ fn missing_full_jid_chat_falls_back_without_changing_the_destination() -> TestRe
 #[test]
 fn missing_full_jid_normal_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence/>"#)?;
     alice.expect_xml(
@@ -378,8 +380,8 @@ fn missing_full_jid_normal_returns_service_unavailable() -> TestResult {
 #[test]
 fn missing_full_jid_headline_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence/>"#)?;
     alice.expect_xml(
@@ -396,8 +398,8 @@ fn missing_full_jid_headline_returns_service_unavailable() -> TestResult {
 #[test]
 fn missing_full_jid_groupchat_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence/>"#)?;
     alice.expect_xml(
@@ -414,8 +416,8 @@ fn missing_full_jid_groupchat_returns_service_unavailable() -> TestResult {
 #[test]
 fn unavailable_account_returns_service_unavailable_with_the_original_payload() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<message to='alice@localhost' from='mallory@localhost' type='chat' id='failed'>
@@ -431,9 +433,9 @@ fn unavailable_account_returns_service_unavailable_with_the_original_payload() -
 #[test]
 fn offline_account_returns_service_unavailable_with_the_original_payload() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("offline", "secret")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("offline", OTHER_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<message to='offline@localhost' from='mallory@localhost' type='normal' id='failed'>
@@ -449,8 +451,8 @@ fn offline_account_returns_service_unavailable_with_the_original_payload() -> Te
 #[test]
 fn unknown_account_returns_service_unavailable_with_the_original_payload() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<message to='missing@localhost' from='mallory@localhost' type='chat' id='failed'>
@@ -467,8 +469,8 @@ fn unknown_account_returns_service_unavailable_with_the_original_payload() -> Te
 fn missing_full_jid_without_fallback_returns_service_unavailable_with_the_original_payload()
 -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<message to='alice@localhost/missing' from='mallory@localhost' type='chat' id='failed'>
@@ -484,8 +486,8 @@ fn missing_full_jid_without_fallback_returns_service_unavailable_with_the_origin
 #[test]
 fn remote_messages_return_remote_server_not_found_with_the_original_payload() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     for target in [
         "alice@remote.example",
@@ -504,8 +506,8 @@ fn remote_messages_return_remote_server_not_found_with_the_original_payload() ->
 #[test]
 fn remote_error_stanzas_and_iq_results_are_silent_in_a_mixed_sequence() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     for target in [
         "bob@remote.example",
         "bob@remote.example/phone",
@@ -529,8 +531,8 @@ fn remote_error_stanzas_and_iq_results_are_silent_in_a_mixed_sequence() -> TestR
 #[test]
 fn remote_bare_groupchat_keeps_policy_rejections() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message type='groupchat' to='blocked@remote.example' id='blocked'><body>Keep</body></message>")?;
     alice.expect_xml("<message xmlns='jabber:client' type='error' id='blocked' from='blocked@remote.example' to='alice@localhost/desk'><body>Keep</body><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
     alice.close()
@@ -539,8 +541,8 @@ fn remote_bare_groupchat_keeps_policy_rejections() -> TestResult {
 #[test]
 fn server_domain_returns_service_unavailable_with_the_original_payload() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<message to='localhost' from='mallory@localhost' type='chat' id='failed'>
@@ -556,8 +558,8 @@ fn server_domain_returns_service_unavailable_with_the_original_payload() -> Test
 #[test]
 fn bare_groupchat_returns_service_unavailable_with_the_original_payload() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<message to='alice@localhost' from='mallory@localhost' type='groupchat' id='failed'>
@@ -573,8 +575,8 @@ fn bare_groupchat_returns_service_unavailable_with_the_original_payload() -> Tes
 #[test]
 fn bare_error_is_silently_dropped() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<message to='alice@localhost' type='error' id='silent'>
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -587,8 +589,8 @@ fn bare_error_is_silently_dropped() -> TestResult {
 #[test]
 fn unknown_account_error_is_silently_dropped() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<message to='missing@localhost' type='error' id='silent'>
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -601,8 +603,8 @@ fn unknown_account_error_is_silently_dropped() -> TestResult {
 #[test]
 fn missing_full_jid_error_is_silently_dropped() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<message to='alice@localhost/missing' type='error' id='silent'>
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -615,8 +617,8 @@ fn missing_full_jid_error_is_silently_dropped() -> TestResult {
 #[test]
 fn remote_error_is_silently_dropped() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<message to='alice@remote.example' type='error' id='silent'>
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -629,8 +631,8 @@ fn remote_error_is_silently_dropped() -> TestResult {
 #[test]
 fn unavailable_account_headline_is_silently_dropped() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<message to='alice@localhost' type='headline' id='silent'/>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
@@ -641,8 +643,8 @@ fn unavailable_account_headline_is_silently_dropped() -> TestResult {
 #[test]
 fn unknown_account_headline_is_silently_dropped() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<message to='missing@localhost' type='headline' id='silent'/>"#)?;
     alice.send(r#"<message to='alice@localhost/desk' type='normal' id='sentinel'/>"#)?;
@@ -653,8 +655,8 @@ fn unknown_account_headline_is_silently_dropped() -> TestResult {
 #[test]
 fn bare_error_is_dropped_but_full_jid_error_is_delivered() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence/>"#)?;
     alice.expect_xml(
@@ -676,8 +678,8 @@ fn bare_error_is_dropped_but_full_jid_error_is_delivered() -> TestResult {
 #[test]
 fn message_without_destination_routes_to_own_bare_jid() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence/>"#)?;
     alice.expect_xml(
@@ -695,8 +697,8 @@ fn message_without_destination_routes_to_own_bare_jid() -> TestResult {
 #[test]
 fn presence_sender_is_replaced_with_the_authenticated_full_jid() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence from='mallory@localhost/spy'><priority>7</priority></presence>"#)?;
     alice.expect_xml(
@@ -710,8 +712,8 @@ fn presence_sender_is_replaced_with_the_authenticated_full_jid() -> TestResult {
 #[test]
 fn presence_priority_above_maximum_does_not_make_the_resource_available() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence id='priority'>
@@ -731,8 +733,8 @@ fn presence_priority_above_maximum_does_not_make_the_resource_available() -> Tes
 #[test]
 fn presence_priority_below_minimum_does_not_make_the_resource_available() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence id='priority'>
@@ -752,8 +754,8 @@ fn presence_priority_below_minimum_does_not_make_the_resource_available() -> Tes
 #[test]
 fn presence_priority_nonnumeric_does_not_make_the_resource_available() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence id='priority'>
@@ -773,8 +775,8 @@ fn presence_priority_nonnumeric_does_not_make_the_resource_available() -> TestRe
 #[test]
 fn presence_priority_empty_does_not_make_the_resource_available() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence id='priority'>
@@ -794,8 +796,8 @@ fn presence_priority_empty_does_not_make_the_resource_available() -> TestResult 
 #[test]
 fn presence_priority_with_attributes_does_not_make_the_resource_available() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence id='priority'>
@@ -815,8 +817,8 @@ fn presence_priority_with_attributes_does_not_make_the_resource_available() -> T
 #[test]
 fn presence_priority_duplicate_does_not_make_the_resource_available() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<presence id='priority'>
@@ -836,8 +838,8 @@ fn presence_priority_duplicate_does_not_make_the_resource_available() -> TestRes
 #[test]
 fn directed_presence_does_not_change_local_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence to='alice@localhost'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
@@ -850,8 +852,8 @@ fn directed_presence_does_not_change_local_availability() -> TestResult {
 #[test]
 fn subscribe_presence_does_not_change_local_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence type='subscribe'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
@@ -864,8 +866,8 @@ fn subscribe_presence_does_not_change_local_availability() -> TestResult {
 #[test]
 fn subscribed_presence_does_not_change_local_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence type='subscribed'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
@@ -878,8 +880,8 @@ fn subscribed_presence_does_not_change_local_availability() -> TestResult {
 #[test]
 fn unsubscribe_presence_does_not_change_local_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence type='unsubscribe'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
@@ -892,8 +894,8 @@ fn unsubscribe_presence_does_not_change_local_availability() -> TestResult {
 #[test]
 fn unsubscribed_presence_does_not_change_local_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence type='unsubscribed'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
@@ -906,8 +908,8 @@ fn unsubscribed_presence_does_not_change_local_availability() -> TestResult {
 #[test]
 fn probe_presence_does_not_change_local_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence type='probe'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
@@ -920,8 +922,8 @@ fn probe_presence_does_not_change_local_availability() -> TestResult {
 #[test]
 fn error_presence_does_not_change_local_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<presence type='error'>
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -936,9 +938,9 @@ fn error_presence_does_not_change_local_availability() -> TestResult {
 #[test]
 fn stream_close_broadcasts_unavailable_and_releases_the_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -969,7 +971,7 @@ fn stream_close_broadcasts_unavailable_and_releases_the_resource() -> TestResult
 
     desktop.send(r#"<message to='alice@localhost' type='chat' id='remaining'/>"#)?;
     desktop.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' id='remaining' type='chat'/>"#)?;
-    let mut rebound = suite.connect("alice", "pencil", "phone")?;
+    let mut rebound = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
     rebound.close()?;
     desktop.close()
 }
@@ -977,9 +979,9 @@ fn stream_close_broadcasts_unavailable_and_releases_the_resource() -> TestResult
 #[test]
 fn tcp_disconnect_broadcasts_unavailable_and_releases_the_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut desktop = suite.connect("alice", "pencil", "desktop")?;
-    let mut phone = suite.connect("alice", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut desktop = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
 
     desktop.send(r#"<presence/>"#)?;
     desktop.expect_xml(
@@ -1009,7 +1011,7 @@ fn tcp_disconnect_broadcasts_unavailable_and_releases_the_resource() -> TestResu
 
     desktop.send(r#"<message to='alice@localhost' type='chat' id='remaining'/>"#)?;
     desktop.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' id='remaining' type='chat'/>"#)?;
-    let mut rebound = suite.connect("alice", "pencil", "phone")?;
+    let mut rebound = suite.connect("alice", ALTERNATE_PASSWORD, "phone")?;
     rebound.close()?;
     desktop.close()
 }
@@ -1017,8 +1019,8 @@ fn tcp_disconnect_broadcasts_unavailable_and_releases_the_resource() -> TestResu
 #[test]
 fn unsupported_unaddressed_iq_get_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='get' id='unsupported'>
@@ -1034,8 +1036,8 @@ fn unsupported_unaddressed_iq_get_returns_service_unavailable() -> TestResult {
 #[test]
 fn unsupported_server_iq_get_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='get' id='unsupported' to='localhost'>
@@ -1051,8 +1053,8 @@ fn unsupported_server_iq_get_returns_service_unavailable() -> TestResult {
 #[test]
 fn unsupported_remote_server_iq_get_returns_remote_server_not_found() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='get' id='unsupported' to='remote.example'>
@@ -1068,8 +1070,8 @@ fn unsupported_remote_server_iq_get_returns_remote_server_not_found() -> TestRes
 #[test]
 fn unsupported_bare_jid_iq_get_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='get' id='unsupported' to='alice@localhost'>
@@ -1085,8 +1087,8 @@ fn unsupported_bare_jid_iq_get_returns_service_unavailable() -> TestResult {
 #[test]
 fn full_jid_iq_get_reaches_its_sender_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='get' id='unsupported' to='alice@localhost/desk'>
@@ -1102,8 +1104,8 @@ fn full_jid_iq_get_reaches_its_sender_resource() -> TestResult {
 #[test]
 fn unsupported_unaddressed_iq_set_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='set' id='unsupported'>
@@ -1119,8 +1121,8 @@ fn unsupported_unaddressed_iq_set_returns_service_unavailable() -> TestResult {
 #[test]
 fn unsupported_server_iq_set_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='set' id='unsupported' to='localhost'>
@@ -1136,8 +1138,8 @@ fn unsupported_server_iq_set_returns_service_unavailable() -> TestResult {
 #[test]
 fn unsupported_remote_server_iq_set_returns_remote_server_not_found() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='set' id='unsupported' to='remote.example'>
@@ -1153,8 +1155,8 @@ fn unsupported_remote_server_iq_set_returns_remote_server_not_found() -> TestRes
 #[test]
 fn unsupported_bare_jid_iq_set_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='set' id='unsupported' to='alice@localhost'>
@@ -1170,8 +1172,8 @@ fn unsupported_bare_jid_iq_set_returns_service_unavailable() -> TestResult {
 #[test]
 fn full_jid_iq_set_reaches_its_sender_resource() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(
         r#"<iq from='mallory@localhost/spy' type='set' id='unsupported' to='alice@localhost/desk'>
@@ -1187,8 +1189,8 @@ fn full_jid_iq_set_reaches_its_sender_resource() -> TestResult {
 #[test]
 fn unsolicited_iq_result_is_ignored() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<iq type='result' id='orphan'/>"#)?;
     alice.close()
@@ -1197,8 +1199,8 @@ fn unsolicited_iq_result_is_ignored() -> TestResult {
 #[test]
 fn unsolicited_iq_error_is_ignored() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<iq type='error' id='orphan'>
         <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
@@ -1209,8 +1211,8 @@ fn unsolicited_iq_error_is_ignored() -> TestResult {
 #[test]
 fn pipelined_self_messages_drain_the_outbound_mailbox_in_order() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     let mut batch = String::new();
     for index in 0..64 {
         use std::fmt::Write;
@@ -1229,8 +1231,8 @@ fn pipelined_self_messages_drain_the_outbound_mailbox_in_order() -> TestResult {
 #[test]
 fn message_sender_is_replaced_with_the_authenticated_full_jid() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     alice.send(r#"<message from='mallory@localhost/spy' to='alice@localhost/desk' type='chat' id='spoof'><body>Hello</body></message>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='spoof' type='chat'>
@@ -1242,16 +1244,16 @@ fn message_sender_is_replaced_with_the_authenticated_full_jid() -> TestResult {
 #[test]
 fn unknown_message_type_uses_normal_routing_and_preserves_the_original_xml() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "secret")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", OTHER_PASSWORD)?;
     let mut alice = suite.unauthenticated_client()?;
-    alice.authenticate("alice", "pencil")?;
+    alice.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut alice = alice.restart();
     alice.open_with(&super::support::OPEN.replace('>', " xml:lang='es'>"))?;
     alice.features()?;
     alice.bind(Some("sender"))?;
-    let mut desktop = suite.connect("bob", "secret", "desktop")?;
-    let mut phone = suite.connect("bob", "secret", "phone")?;
+    let mut desktop = suite.connect("bob", OTHER_PASSWORD, "desktop")?;
+    let mut phone = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     desktop.send("<presence/>")?;
     desktop.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/desktop' to='bob@localhost'/>",
@@ -1278,10 +1280,10 @@ fn unknown_message_type_uses_normal_routing_and_preserves_the_original_xml() -> 
 #[test]
 fn directed_full_jid_iq_exchanges_preserve_envelopes_and_sender_order() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     bob.send("<presence to='alice@localhost/desk'/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost/desk'/>",
@@ -1308,10 +1310,10 @@ fn directed_full_jid_iq_exchanges_preserve_envelopes_and_sender_order() -> TestR
 #[test]
 fn missing_and_unauthorized_full_jid_iq_requests_have_the_same_error() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     for target in [
         "bob@localhost/phone",
         "bob@localhost/missing",
@@ -1329,10 +1331,10 @@ fn missing_and_unauthorized_full_jid_iq_requests_have_the_same_error() -> TestRe
 #[test]
 fn full_jid_iq_responses_ignore_presence_and_do_not_generate_error_loops() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     for priority in ["", "<priority>-1</priority>"] {
         if !priority.is_empty() {
             bob.send(&format!("<presence>{priority}</presence>"))?;
@@ -1360,10 +1362,10 @@ fn full_jid_iq_responses_ignore_presence_and_do_not_generate_error_loops() -> Te
 #[test]
 fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<presence/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
@@ -1395,13 +1397,13 @@ fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
 #[test]
 fn stored_stanzas_preserve_local_and_stream_namespace_bindings() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@localhost' id='stored-qname' xmlns:w='urn:types'><payload xmlns='urn:x' type='w:Example'><nested xmlns:w='urn:nested' type='w:Example'/></payload></message>")?;
     alice.send("<message to='alice@localhost/desk' id='barrier'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='barrier'/>")?;
-    let mut bob = suite.connect("bob", "pencil", "phone")?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -1431,12 +1433,12 @@ fn stored_stanzas_preserve_local_and_stream_namespace_bindings() -> TestResult {
 #[test]
 fn routed_stanzas_preserve_stream_qnames_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut bob = suite.connect("bob", "pencil", "phone")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
     for prefix in ["s", "stream", "ns0"] {
         let mut alice = suite.unauthenticated_client()?;
-        alice.authenticate("alice", "pencil")?;
+        alice.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut alice = alice.restart();
         alice.open_with(&format!("<{prefix}:stream xmlns:{prefix}='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:xml='http://www.w3.org/XML/1998/namespace' to='localhost' version='1.0'>"))?;
         alice.features()?;
@@ -1489,8 +1491,8 @@ fn routed_stanzas_preserve_stream_qnames_after_authentication() -> TestResult {
 #[test]
 fn opaque_extension_qnames_retain_namespace_context_after_authenticated_routing() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut alice = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='alice@localhost/desk' id='namespace-qname' xmlns:a='urn:ancestor'><payload xmlns='urn:example:payload' xmlns:t='urn:example:types' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:type='t:Example'><inherited xsi:type='a:Example'/><nested xmlns:a='urn:nested' xsi:type='a:Example'/><collision xmlns:ns0='urn:reserved' xsi:type='ns0:Example'/><textual>t:Example</textual><p:prefixed xmlns:p='urn:element' xmlns='urn:default' xsi:type='Example'/></payload></message>")?;
     let delivered = alice.receive()?;
     delivered.assert_name("jabber:client", "message");

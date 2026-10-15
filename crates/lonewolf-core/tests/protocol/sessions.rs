@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::PASSWORD;
+
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -23,8 +25,8 @@ use super::support::{C2sSuite, Client, TestResult};
 const DECORATION_NAMESPACE: &str = "urn:lonewolf:test:decoration";
 
 fn accounts(suite: &C2sSuite) -> TestResult {
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)
 }
 
 fn await_events(client: &mut Client, expected: &[&str]) -> TestResult {
@@ -57,8 +59,8 @@ fn await_events(client: &mut Client, expected: &[&str]) -> TestResult {
 fn session_events_follow_the_resource_lifecycle() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-session-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "a")?;
-    let mut bob = suite.connect("bob", "password", "b")?;
+    let mut alice = suite.connect("alice", PASSWORD, "a")?;
+    let mut bob = suite.connect("bob", PASSWORD, "b")?;
     alice.send("<presence id='initial'/>")?;
     assert_eq!(alice.receive()?.attribute("id"), Some("initial"));
     alice.send("<presence id='update'><show>away</show></presence>")?;
@@ -83,8 +85,8 @@ fn session_events_follow_the_resource_lifecycle() -> TestResult {
 fn sessions_without_explicit_unavailable_end_with_ended() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-session-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "a")?;
-    let mut bob = suite.connect("bob", "password", "b")?;
+    let mut alice = suite.connect("alice", PASSWORD, "a")?;
+    let mut bob = suite.connect("bob", PASSWORD, "b")?;
     alice.send("<presence id='initial'/>")?;
     assert_eq!(alice.receive()?.attribute("id"), Some("initial"));
     drop(alice);
@@ -104,8 +106,8 @@ fn seed_mutual_subscription(directory: &Path) -> TestResult {
         let mut transaction = storage.begin_write().await?;
         for (owner, contact) in [(&alice, &bob), (&bob, &alice)] {
             let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?;
-            let sha1 = ScramVerifier::derive(ScramHash::Sha1, "password", [1; 16], iterations)?;
-            let sha256 = ScramVerifier::derive(ScramHash::Sha256, "password", [2; 16], iterations)?;
+            let sha1 = ScramVerifier::derive(ScramHash::Sha1, PASSWORD, [1; 16], iterations)?;
+            let sha256 = ScramVerifier::derive(ScramHash::Sha256, PASSWORD, [2; 16], iterations)?;
             let credentials = match (sha1, sha256) {
                 (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) => {
                     ScramCredentials::both(sha1, sha256)
@@ -157,8 +159,8 @@ fn broadcast_presence_carries_the_decoration() -> TestResult {
         "'roster', 'test-decoration'",
         seed_mutual_subscription,
     )?;
-    let mut alice = suite.connect("alice", "password", "a")?;
-    let mut bob = suite.connect("bob", "password", "b")?;
+    let mut alice = suite.connect("alice", PASSWORD, "a")?;
+    let mut bob = suite.connect("bob", PASSWORD, "b")?;
     bob.send("<presence id='bob'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("bob"));
     alice.send(
@@ -183,8 +185,8 @@ fn failing_decorations_leave_the_presence_undecorated() -> TestResult {
         "'roster', 'test-decoration', 'test-failing-decoration'",
         seed_mutual_subscription,
     )?;
-    let mut alice = suite.connect("alice", "password", "a")?;
-    let mut bob = suite.connect("bob", "password", "b")?;
+    let mut alice = suite.connect("alice", PASSWORD, "a")?;
+    let mut bob = suite.connect("bob", PASSWORD, "b")?;
     bob.send("<presence id='bob'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("bob"));
     alice.send("<presence id='alice'/>")?;
@@ -208,8 +210,8 @@ fn failing_decorations_leave_the_presence_undecorated() -> TestResult {
 fn directed_presence_is_not_decorated() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-decoration'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "a")?;
-    let mut bob = suite.connect("bob", "password", "b")?;
+    let mut alice = suite.connect("alice", PASSWORD, "a")?;
+    let mut bob = suite.connect("bob", PASSWORD, "b")?;
     alice.send("<presence to='bob@localhost/b' id='directed'/>")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/a' to='bob@localhost/b' id='directed'/>")?;
     alice.close()?;

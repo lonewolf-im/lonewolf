@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::ALTERNATE_PASSWORD;
+
 use std::time::{Duration, Instant};
 
 use super::support::{C2sSuite, OPEN, TLS_NAMESPACE, TestResult};
@@ -83,7 +85,7 @@ fn starttls_after_tls_returns_tls_failure_and_closes() -> TestResult {
 #[test]
 fn starttls_during_authentication_returns_tls_failure_and_closes() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
@@ -101,8 +103,8 @@ fn starttls_during_authentication_returns_tls_failure_and_closes() -> TestResult
 #[test]
 fn starttls_after_authentication_returns_tls_failure_and_closes() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
     client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
@@ -127,8 +129,8 @@ fn stanza_size_limit_closes_the_stream_before_tls() -> TestResult {
 #[test]
 fn stanza_size_limit_closes_the_stream_after_binding() -> TestResult {
     let suite = C2sSuite::with_limits("max_stanza_bytes = 10000")?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(&format!("<message><body>{}", "x".repeat(10000)))?;
     client.expect_stream_error("policy-violation")
@@ -156,8 +158,8 @@ fn stream_footer_closes_the_connection_before_authentication() -> TestResult {
 #[test]
 fn stream_footer_closes_the_connection_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("</stream:stream>")?;
     client.expect_end()
@@ -166,8 +168,8 @@ fn stream_footer_closes_the_connection_before_binding() -> TestResult {
 #[test]
 fn stream_footer_closes_the_connection_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("</stream:stream>")?;
     client.expect_end()
@@ -207,9 +209,9 @@ fn idle_authentication_closes_at_the_configured_deadline() -> TestResult {
 #[test]
 fn idle_resource_binding_closes_at_the_configured_deadline() -> TestResult {
     let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 1")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let started = Instant::now();
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client
         .receive()?
@@ -253,9 +255,9 @@ fn completed_tls_without_a_restart_header_closes_tls_without_synthetic_xml() -> 
 #[test]
 fn sasl_success_without_a_restart_header_closes_tls_without_synthetic_xml() -> TestResult {
     let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 1")?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let started = Instant::now();
     client.expect_tls_close()?;
     client.expect_tcp_open()?;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::ALTERNATE_PASSWORD;
+
 use super::support::{C2sSuite, OPEN, TLS_NAMESPACE, TestResult};
 
 const OPENINGS_WITH_ADJACENT_ATTRIBUTES: [&str; 4] = [
@@ -34,10 +36,10 @@ fn adjacent_opening_attributes_return_not_well_formed_after_tls() -> TestResult 
 #[test]
 fn adjacent_opening_attributes_return_not_well_formed_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for opening in OPENINGS_WITH_ADJACENT_ATTRIBUTES {
         let mut client = suite.unauthenticated_client()?;
-        client.authenticate("alice", "pencil")?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
         client.open_with(opening)?;
         client.expect_stream_error("not-well-formed")?;
@@ -99,10 +101,10 @@ fn rejected_headers_negotiate_response_version_after_tls() -> TestResult {
 #[test]
 fn rejected_headers_negotiate_response_version_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for (opening, version, condition) in rejected_version_headers() {
         let mut client = suite.unauthenticated_client()?;
-        client.authenticate("alice", "pencil")?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
         let header = client.open_with(&opening)?;
         assert_eq!(header.attribute("version"), version, "{opening}");
@@ -114,7 +116,7 @@ fn rejected_headers_negotiate_response_version_after_authentication() -> TestRes
 #[test]
 fn higher_versions_wider_than_machine_integers_negotiate_one_zero_in_every_phase() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let opening = "<?xml version='1.99999999999999999999999999999'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='99999999999999999999999999999999999.99999999999999999999999999999'>";
     let mut plain = suite.tcp_client()?;
     assert_eq!(plain.open_with(opening)?.attribute("version"), Some("1.0"));
@@ -128,7 +130,7 @@ fn higher_versions_wider_than_machine_integers_negotiate_one_zero_in_every_phase
     encrypted.features()?;
     encrypted.close()?;
     let mut authenticated = suite.unauthenticated_client()?;
-    authenticated.authenticate("alice", "pencil")?;
+    authenticated.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut authenticated = authenticated.restart();
     assert_eq!(
         authenticated.open_with(opening)?.attribute("version"),
@@ -156,7 +158,7 @@ const HEADER_NAMESPACE_REJECTIONS: [(&str, &str); 6] = [
 #[test]
 fn allowed_header_namespaces_work_before_tls_after_tls_and_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for (root, declarations) in [
         (
             "stream:stream",
@@ -205,7 +207,7 @@ fn allowed_header_namespaces_work_before_tls_after_tls_and_after_authentication(
             encrypted.close_with_footer(&footer)?;
 
             let mut authenticated = suite.unauthenticated_client()?;
-            authenticated.authenticate("alice", "pencil")?;
+            authenticated.authenticate("alice", ALTERNATE_PASSWORD)?;
             let mut authenticated = authenticated.restart();
             assert_eq!(
                 authenticated.open_with(&opening)?.attribute("from"),
@@ -249,11 +251,11 @@ fn extra_header_namespaces_are_rejected_after_tls() -> TestResult {
 #[test]
 fn extra_header_namespaces_are_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for (declarations, condition) in HEADER_NAMESPACE_REJECTIONS {
         let opening = OPEN.replace('>', &format!(" {declarations}>"));
         let mut client = suite.unauthenticated_client()?;
-        client.authenticate("alice", "pencil")?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
         let header = client.open_with(&opening)?;
         header.assert_name("http://etherx.jabber.org/streams", "stream");
@@ -483,10 +485,10 @@ fn leading_feff_is_rejected_after_tls() -> TestResult {
 #[test]
 fn leading_feff_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for prefix in ["\u{feff}", "\u{feff}<?xml version='1.0' encoding='UTF-8'?>"] {
         let mut client = suite.unauthenticated_client()?;
-        client.authenticate("alice", "pencil")?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
         client.open_with(&format!("{prefix}{OPEN}"))?;
         client.expect_stream_error("not-well-formed")?;
@@ -843,9 +845,9 @@ fn non_xml_opening_is_rejected_after_tls() -> TestResult {
 #[test]
 fn unknown_host_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='unknown.example' version='1.0'>"#)?;
@@ -855,9 +857,9 @@ fn unknown_host_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn account_destination_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='alice@localhost' version='1.0'>"#)?;
@@ -867,9 +869,9 @@ fn account_destination_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn resource_destination_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost/phone' version='1.0'>"#)?;
@@ -879,9 +881,9 @@ fn resource_destination_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn malformed_destination_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='bad domain' version='1.0'>"#)?;
@@ -891,9 +893,9 @@ fn malformed_destination_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn old_version_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='0.9'>"#)?;
@@ -904,9 +906,9 @@ fn old_version_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn missing_version_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' >"#)?;
@@ -917,9 +919,9 @@ fn missing_version_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn signed_version_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='+1.0'>"#)?;
@@ -930,9 +932,9 @@ fn signed_version_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn nonnumeric_version_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.x'>"#)?;
@@ -943,9 +945,9 @@ fn nonnumeric_version_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn malformed_language_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang='en_US'>"#)?;
@@ -955,9 +957,9 @@ fn malformed_language_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn empty_language_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang=''>"#)?;
@@ -967,9 +969,9 @@ fn empty_language_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn malformed_sender_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' from='bad domain'>"#)?;
@@ -979,9 +981,9 @@ fn malformed_sender_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn duplicate_attribute_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#)?;
@@ -991,9 +993,9 @@ fn duplicate_attribute_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn server_content_namespace_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' to='localhost' version='1.0'>"#)?;
@@ -1003,9 +1005,9 @@ fn server_content_namespace_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn wrong_stream_namespace_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='urn:invalid:stream' xmlns='jabber:client' to='localhost' version='1.0'>"#)?;
@@ -1015,9 +1017,9 @@ fn wrong_stream_namespace_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn xml_version_1_1_is_accepted_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     let opening = format!("<?xml version='1.1'?>{OPEN}");
@@ -1030,9 +1032,9 @@ fn xml_version_1_1_is_accepted_after_authentication() -> TestResult {
 #[test]
 fn non_utf8_declaration_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<?xml version='1.0' encoding='ISO-8859-1'?>"#)?;
@@ -1042,9 +1044,9 @@ fn non_utf8_declaration_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn non_xml_opening_is_rejected_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with("!")?;
@@ -1054,9 +1056,9 @@ fn non_xml_opening_is_rejected_after_authentication() -> TestResult {
 #[test]
 fn restart_sender_must_match_the_authenticated_account() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' from='bob@localhost' to='localhost' version='1.0'>"#)?;
@@ -1067,11 +1069,11 @@ fn restart_sender_must_match_the_authenticated_account() -> TestResult {
 fn authenticated_restart_to_another_host_is_unknown() -> TestResult {
     let hosts = "[hosts.'other.localhost'.tls]\ncertificate_chain_path = 'certificate.pem'\nprivate_key_path = 'private-key.pem'";
     let suite = C2sSuite::with_hosts(hosts)?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
 
     for from in [None, Some("alice@localhost"), Some("bob@localhost")] {
         let mut client = suite.unauthenticated_client()?;
-        client.authenticate("alice", "pencil")?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
         let from_attribute = from.map_or_else(String::new, |from| format!(" from='{from}'"));
         let opening = format!(
@@ -1085,7 +1087,7 @@ fn authenticated_restart_to_another_host_is_unknown() -> TestResult {
     }
 
     let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", "pencil")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut client = client.restart();
     let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' from='bob@localhost' to='localhost' version='1.0'>"#)?;
     assert_eq!(header.attribute("from"), Some("localhost"));

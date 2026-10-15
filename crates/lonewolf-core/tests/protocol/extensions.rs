@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::PASSWORD;
+
 use std::time::{Duration, Instant};
 
 use crate::support::{C2sSuite, Client, TestResult};
@@ -40,10 +42,10 @@ fn wait_for_requester_outcome(client: &mut Client, expected: &str) -> TestResult
 #[test]
 fn detached_requests_receive_the_addressed_resources_answer() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/desk' timeout='5'/></iq>")?;
     alice.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
@@ -65,11 +67,11 @@ fn detached_requests_receive_the_addressed_resources_answer() -> TestResult {
 fn responses_from_other_entities_are_ignored() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
     for name in ["alice", "bob", "carol"] {
-        suite.create_account(name, "password")?;
+        suite.create_account(name, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/desk' timeout='5'/></iq>")?;
     alice.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
@@ -92,10 +94,10 @@ fn responses_from_other_entities_are_ignored() -> TestResult {
 #[test]
 fn unanswered_requests_time_out() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/desk' timeout='1'/></iq>")?;
     alice.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
@@ -109,9 +111,9 @@ fn unanswered_requests_time_out() -> TestResult {
 #[test]
 fn requests_to_absent_resources_fail() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='bob@localhost/absent' timeout='5'/></iq>")?;
     alice.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='ask' to='alice@localhost/desk'/>",
@@ -123,8 +125,8 @@ fn requests_to_absent_resources_fail() -> TestResult {
 #[test]
 fn detached_requests_to_the_initiating_resource_do_not_deadlock() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq-requester'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='ask'><ask xmlns='urn:lonewolf:test:requester' jid='alice@localhost/desk' timeout='5'/></iq>")?;
     let first = alice.receive()?;
     let second = alice.receive()?;
@@ -150,8 +152,8 @@ fn detached_requests_to_the_initiating_resource_do_not_deadlock() -> TestResult 
 #[test]
 fn iq_results_arrive_in_order_before_the_reply() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq-results'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send(
         "<iq type='get' id='results'><query xmlns='urn:lonewolf:test:results' count='3'/></iq>",
@@ -170,8 +172,8 @@ fn iq_results_arrive_in_order_before_the_reply() -> TestResult {
 #[test]
 fn misaddressed_iq_results_become_an_internal_error() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq-results'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<iq type='get' id='misaddressed'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='misaddressed' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -183,8 +185,8 @@ fn misaddressed_iq_results_become_an_internal_error() -> TestResult {
 #[test]
 fn iq_handlers_read_their_hosts_discovery_data() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-discovery', 'test-service'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' to='localhost' id='discovery'><query xmlns='urn:lonewolf:test:discovery'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='discovery' from='localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:discovery'><feature var='urn:lonewolf:test:a'/><feature var='urn:lonewolf:test:b'/><service jid='echo.localhost'/></query></iq>")?;
     alice.close()
@@ -193,10 +195,10 @@ fn iq_handlers_read_their_hosts_discovery_data() -> TestResult {
 #[test]
 fn precommit_handler_wait_keeps_healthy_outbound_delivery_progressing() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-precommit-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<iq type='set' id='stalled'><stall xmlns='urn:lonewolf:test:precommit'/></iq>")?;
     suite.wait_for_log("test precommit handler waiting")?;
 
@@ -220,12 +222,12 @@ fn precommit_handler_wait_keeps_healthy_outbound_delivery_progressing() -> TestR
 #[test]
 fn precommit_writer_admission_keeps_healthy_outbound_delivery_progressing() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-precommit-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    suite.create_account("charlie", "password")?;
-    let mut blocker = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
-    let mut sender = suite.connect("charlie", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    suite.create_account("charlie", PASSWORD)?;
+    let mut blocker = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+    let mut sender = suite.connect("charlie", PASSWORD, "desk")?;
     blocker.send(
         "<iq type='set' id='holding-writer'><stall xmlns='urn:lonewolf:test:precommit'/></iq>",
     )?;
@@ -256,10 +258,10 @@ fn precommit_writer_admission_keeps_healthy_outbound_delivery_progressing() -> T
 #[test]
 fn precommit_offline_store_keeps_healthy_outbound_delivery_progressing() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-slow-offline'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost' type='chat' id='stored'/>")?;
     suite.wait_for_log("test offline store waiting")?;
     for index in 0..96 {
@@ -282,10 +284,10 @@ fn precommit_offline_store_keeps_healthy_outbound_delivery_progressing() -> Test
 #[test]
 fn precommit_snapshot_preparation_keeps_delivery_ahead_of_the_presence_echo() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-precommit-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<presence id='initial'/>")?;
     for (phase, waiting) in [
         ("audience", "test precommit audience waiting"),
@@ -320,8 +322,8 @@ fn shutdown_cancels_precommit_handler_without_committing_staged_writes() -> Test
         database = directory.join("data/lonewolf.dat");
         Ok(())
     })?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice
         .send("<iq type='set' id='cancelled'><stall xmlns='urn:lonewolf:test:precommit'/></iq>")?;
     suite.wait_for_log("test precommit handler waiting")?;
@@ -391,8 +393,8 @@ certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
 "#,
     )?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='other-host' to='other.localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='other-host' from='other.localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='other.localhost'/></iq>")?;
     alice.close()
@@ -401,8 +403,8 @@ private_key_path = "private-key.pem"
 #[test]
 fn enabled_account_handler_receives_an_iq_request() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='extension-1'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='extension-1' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='alice@localhost'/></iq>")?;
     alice.close()
@@ -411,8 +413,8 @@ fn enabled_account_handler_receives_an_iq_request() -> TestResult {
 #[test]
 fn missing_account_requests_skip_registered_get_and_set_handlers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     for kind in ["get", "set"] {
         for namespace in ["urn:lonewolf:test:iq", "urn:lonewolf:test:unknown"] {
             alice.send(&format!("<iq type='{kind}' id='missing-{kind}' to='missing@localhost'><query xmlns='{namespace}'/></iq>"))?;
@@ -436,8 +438,8 @@ fn missing_account_requests_skip_registered_get_and_set_handlers() -> TestResult
 #[test]
 fn own_account_get_and_set_accept_omitted_and_explicit_targets() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     for (address, reply_address) in [
         ("", ""),
         (" to='alice@localhost'", " from='alice@localhost'"),
@@ -461,8 +463,8 @@ fn own_account_get_and_set_accept_omitted_and_explicit_targets() -> TestResult {
 #[test]
 fn subscription_presence_handlers_receive_authenticated_directed_requests() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-presence'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
         for target in [
@@ -491,8 +493,8 @@ certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
 "#,
     )?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<presence type='subscribe' id='other-host' to='bob@other.localhost'/>")?;
     alice.expect_xml("<presence xmlns='jabber:client' type='error' id='other-host' from='bob@other.localhost' to='alice@localhost/desk'><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
@@ -503,8 +505,8 @@ private_key_path = "private-key.pem"
 #[test]
 fn undirected_subscription_presence_does_not_enter_handlers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-presence'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<presence type='subscribe' id='undirected'/>")?;
     alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
@@ -516,8 +518,8 @@ fn undirected_subscription_presence_does_not_enter_handlers() -> TestResult {
 #[test]
 fn presence_extensions_do_not_intercept_availability() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-presence'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<presence/>")?;
     alice.expect_xml(
@@ -532,8 +534,8 @@ fn presence_extensions_do_not_intercept_availability() -> TestResult {
 #[test]
 fn get_and_set_with_the_same_payload_select_different_handlers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='get'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='get' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='alice@localhost'/></iq>")?;
     alice.send("<iq type='set' id='set'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
@@ -546,8 +548,8 @@ fn get_and_set_with_the_same_payload_select_different_handlers() -> TestResult {
 #[test]
 fn disabled_extension_returns_service_unavailable() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='disabled'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='disabled'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.close()
@@ -556,8 +558,8 @@ fn disabled_extension_returns_service_unavailable() -> TestResult {
 #[test]
 fn unknown_payload_namespace_does_not_match_a_handler() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='unknown'><query xmlns='urn:lonewolf:test:unknown'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='unknown'><query xmlns='urn:lonewolf:test:unknown'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.close()
@@ -566,8 +568,8 @@ fn unknown_payload_namespace_does_not_match_a_handler() -> TestResult {
 #[test]
 fn only_the_direct_payload_element_selects_the_handler() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send(
         "<iq type='get' id='nested'><other xmlns='urn:lonewolf:test:iq'><query/></other></iq>",
     )?;
@@ -578,9 +580,9 @@ fn only_the_direct_payload_element_selects_the_handler() -> TestResult {
 #[test]
 fn qualified_payload_and_authenticated_identity_reach_the_handler() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='a&amp;b' from='mallory@localhost/spy' to='bob@localhost'><t:query xmlns:t='urn:lonewolf:test:iq' value='one &amp; two'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='a&amp;b' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='bob@localhost' value='one &amp; two'/></iq>")?;
     alice.close()
@@ -589,8 +591,8 @@ fn qualified_payload_and_authenticated_identity_reach_the_handler() -> TestResul
 #[test]
 fn handler_errors_preserve_the_request_payload_and_address_the_bound_resource() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-error-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='denied' from='mallory@localhost/spy' to='alice@localhost'><deny xmlns='urn:lonewolf:test:iq'><detail>Keep &amp; escape</detail></deny></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='denied' from='alice@localhost' to='alice@localhost/desk'><deny xmlns='urn:lonewolf:test:iq'><detail>Keep &amp; escape</detail></deny><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.close()
@@ -599,8 +601,8 @@ fn handler_errors_preserve_the_request_payload_and_address_the_bound_resource() 
 #[test]
 fn server_scope_does_not_handle_account_requests() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-server-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='account'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='account'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send(
@@ -613,8 +615,8 @@ fn server_scope_does_not_handle_account_requests() -> TestResult {
 #[test]
 fn account_scope_does_not_handle_server_requests() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send(
         "<iq type='get' id='server' to='localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>",
     )?;
@@ -625,8 +627,8 @@ fn account_scope_does_not_handle_server_requests() -> TestResult {
 #[test]
 fn full_jid_requests_are_not_consumed_by_account_handlers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='resource' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='get' id='resource' from='alice@localhost/desk' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.close()
@@ -635,8 +637,8 @@ fn full_jid_requests_are_not_consumed_by_account_handlers() -> TestResult {
 #[test]
 fn remote_requests_are_not_consumed_by_local_handlers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq', 'test-server-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     for kind in ["get", "set"] {
         for target in [
             "bob@remote.example",
@@ -654,8 +656,8 @@ fn remote_requests_are_not_consumed_by_local_handlers() -> TestResult {
 #[test]
 fn iq_results_and_errors_do_not_enter_request_handlers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='result' id='result'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.send("<iq type='error' id='error'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<iq type='get' id='request'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
@@ -674,8 +676,8 @@ certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
 "#,
     )?;
-    suite.create_account("alice", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='other-host' to='other.localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-host' from='other.localhost'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<iq type='get' id='enabled-host' to='localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
@@ -690,8 +692,8 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
         ("set", "storage_unavailable", "roster_write"),
     ] {
         let suite = C2sSuite::with_extensions("'test-failure-iq'")?;
-        suite.create_account("alice", "password")?;
-        let mut alice = suite.connect("alice", "password", "desk")?;
+        suite.create_account("alice", PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
         alice.send(&format!("<iq type='{kind}' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail></iq>"))?;
         alice.expect_xml("<iq xmlns='jabber:client' type='error' to='alice@localhost/desk' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
         alice.send("<message to='alice@localhost/desk' id='still-open'/>")?;
@@ -725,10 +727,10 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
 #[test]
 fn shared_router_panic_stops_serving_and_reports_one_private_failure() -> TestResult {
     let mut suite = C2sSuite::with_extensions("'roster', 'test-router-failure'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
     alice.receive()?;
     alice
@@ -765,17 +767,17 @@ fn shared_router_panic_stops_serving_and_reports_one_private_failure() -> TestRe
 #[test]
 fn ordinary_connection_panic_leaves_router_and_other_connections_serving() -> TestResult {
     let mut suite = C2sSuite::with_extensions("'test-router-failure'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send(
         "<iq type='set' id='crash'><connection xmlns='urn:lonewolf:test:router-failure'/></iq>",
     )?;
     alice.drain()?;
     bob.send("<message to='bob@localhost/phone' type='chat' id='still-serving'/>")?;
     bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost/phone' type='chat' id='still-serving'/>")?;
-    let mut replacement = suite.connect("alice", "password", "desk")?;
+    let mut replacement = suite.connect("alice", PASSWORD, "desk")?;
     replacement.close()?;
     bob.close()?;
     let logs = suite.wait_for_log("connection task panicked")?;

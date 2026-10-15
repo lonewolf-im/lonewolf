@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::PASSWORD;
+
 use super::support::{C2sSuite, Client, TestResult};
 
 fn sentinel(from: &mut Client, to: &mut Client, target: &str) -> TestResult {
@@ -14,12 +16,12 @@ fn sentinel(from: &mut Client, to: &mut Client, target: &str) -> TestResult {
 fn presence_errors_reach_exact_and_available_resources_without_replies() -> TestResult {
     let suite = C2sSuite::start()?;
     for user in ["alice", "bob", "offline"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut desk = suite.connect("alice", "password", "desk")?;
-    let mut phone = suite.connect("alice", "password", "phone")?;
-    let mut tablet = suite.connect("alice", "password", "tablet")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut tablet = suite.connect("alice", PASSWORD, "tablet")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
 
     bob.send("<presence type='error' from='mallory@localhost/forged' to='alice@localhost/desk' id='full' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='fr'>indisponible</text></error></presence>")?;
     desk.expect_xml("<presence xmlns='jabber:client' type='error' from='bob@localhost/desk' to='alice@localhost/desk' id='full' xml:lang='fr'><status>bonjour</status><x xmlns='urn:test'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='fr'>indisponible</text></error></presence>")?;
@@ -61,11 +63,11 @@ fn presence_errors_reach_exact_and_available_resources_without_replies() -> Test
 fn presence_errors_keep_roster_state_cached_presence_and_later_broadcasts() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     for user in ["alice", "bob", "carol"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     bob.send("<presence id='bob'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("bob"));
     alice.send("<presence id='original'><show>away</show><priority>5</priority></presence>")?;
@@ -124,11 +126,11 @@ fn presence_errors_keep_roster_state_cached_presence_and_later_broadcasts() -> T
 fn directed_presence_reaches_a_full_and_a_bare_jid_and_broadcasts_skip_them() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     for user in ["alice", "bob", "carol"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     carol.send("<presence/>")?;
     carol.expect_xml(
         "<presence xmlns='jabber:client' from='carol@localhost/desk' to='carol@localhost'/>",
@@ -159,11 +161,11 @@ fn directed_presence_reaches_a_full_and_a_bare_jid_and_broadcasts_skip_them() ->
 fn directed_unavailable_presence_forgets_the_recipient() -> TestResult {
     let suite = C2sSuite::start()?;
     for user in ["alice", "bob", "carol"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
 
     alice.send("<presence to='bob@localhost/desk'/>")?;
     bob.expect_xml(
@@ -181,10 +183,10 @@ fn directed_unavailable_presence_forgets_the_recipient() -> TestResult {
 #[test]
 fn closing_the_stream_sends_unavailable_to_directed_recipients() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
 
     alice.send("<presence to='bob@localhost/desk'/>")?;
     bob.expect_xml(
@@ -200,8 +202,8 @@ fn closing_the_stream_sends_unavailable_to_directed_recipients() -> TestResult {
 fn remote_directed_presence_returns_remote_server_not_found() -> TestResult {
     for extensions in ["", "'roster'"] {
         let suite = C2sSuite::with_extensions(extensions)?;
-        suite.create_account("alice", "password")?;
-        let mut alice = suite.connect("alice", "password", "desk")?;
+        suite.create_account("alice", PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
         for target in [
             "bob@remote.example",
             "bob@remote.example/phone",
@@ -222,8 +224,8 @@ fn remote_directed_presence_returns_remote_server_not_found() -> TestResult {
 fn remote_probes_return_remote_server_not_found() -> TestResult {
     for extensions in ["", "'roster'"] {
         let suite = C2sSuite::with_extensions(extensions)?;
-        suite.create_account("alice", "password")?;
-        let mut alice = suite.connect("alice", "password", "desk")?;
+        suite.create_account("alice", PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
         for target in [
             "bob@remote.example",
             "bob@remote.example/phone",
@@ -242,11 +244,11 @@ fn remote_probes_return_remote_server_not_found() -> TestResult {
 fn directed_presence_to_an_absent_local_recipient_is_dropped_silently() -> TestResult {
     let suite = C2sSuite::start()?;
     for user in ["alice", "bob", "carol"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
 
     for target in [
         "nobody@localhost",
@@ -267,11 +269,11 @@ fn directed_presence_to_an_absent_local_recipient_is_dropped_silently() -> TestR
 #[test]
 fn repeated_directed_presence_and_the_own_account_are_told_once() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut phone = suite.connect("alice", "password", "phone")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
 
     alice.send("<presence to='bob@localhost/desk' id='first'/>")?;
     bob.expect_xml("<presence xmlns='jabber:client' id='first' from='alice@localhost/desk' to='bob@localhost/desk'/>")?;
@@ -294,12 +296,12 @@ fn repeated_directed_presence_and_the_own_account_are_told_once() -> TestResult 
 fn incoming_directed_unavailable_removes_only_its_full_recipient_grant() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     for user in ["alice", "bob", "carol"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut phone = suite.connect("bob", "password", "phone")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut phone = suite.connect("bob", PASSWORD, "phone")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     alice.send("<presence to='bob@localhost/desk'/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk'/>",
@@ -321,13 +323,13 @@ fn incoming_directed_unavailable_removes_only_its_full_recipient_grant() -> Test
 #[test]
 fn bare_directed_probes_reply_only_from_granting_resources_without_payload() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut desk = suite.connect("alice", "password", "desk")?;
-    let mut phone = suite.connect("alice", "password", "phone")?;
-    let mut ungranting = suite.connect("alice", "password", "tablet")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut sibling = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut ungranting = suite.connect("alice", PASSWORD, "tablet")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut sibling = suite.connect("bob", PASSWORD, "phone")?;
     desk.send("<presence id='private-broadcast'><status>private</status></presence>")?;
     assert_eq!(desk.receive()?.attribute("id"), Some("private-broadcast"));
     for (source, id) in [(&mut desk, "desk"), (&mut phone, "phone")] {
@@ -392,12 +394,12 @@ fn bare_directed_probes_reply_only_from_granting_resources_without_payload() -> 
 #[test]
 fn subscribed_bare_probes_preserve_current_presence_and_full_probes_are_minimal() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut sibling = suite.connect("alice", "password", "phone")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut phone = suite.connect("bob", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut sibling = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut phone = suite.connect("bob", PASSWORD, "phone")?;
     bob.send("<presence id='original' xml:lang='fr'><show>away</show><status>bonjour</status><x xmlns='urn:test'/></presence>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("original"));
     phone.send("<presence id='second'><priority>-1</priority></presence>")?;
@@ -485,12 +487,12 @@ fn subscribed_bare_probes_preserve_current_presence_and_full_probes_are_minimal(
 fn subscribed_full_probes_find_freshly_bound_resources_before_initial_presence() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     for user in ["alice", "bob", "carol"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut sibling = suite.connect("alice", "password", "phone")?;
-    let mut bob = suite.connect("bob", "password", "earlier")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut sibling = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "earlier")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     bob.send("<presence/>")?;
     bob.receive()?;
     alice.send("<presence type='subscribe' to='bob@localhost'/>")?;
@@ -499,7 +501,7 @@ fn subscribed_full_probes_find_freshly_bound_resources_before_initial_presence()
     sentinel(&mut bob, &mut alice, "alice@localhost/desk")?;
     bob.close()?;
 
-    let mut quiet = suite.connect("bob", "password", "quiet")?;
+    let mut quiet = suite.connect("bob", PASSWORD, "quiet")?;
     quiet.send("<iq type='get' id='persisted'><query xmlns='jabber:iq:roster'/></iq>")?;
     let roster = quiet.receive()?;
     let roster = roster.child("jabber:iq:roster", "query")?;
@@ -527,7 +529,7 @@ fn subscribed_full_probes_find_freshly_bound_resources_before_initial_presence()
     alice.send("<presence type='probe' to='bob@localhost/missing'/>")?;
     alice.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' type='unavailable'/>")?;
 
-    let mut phone = suite.connect("bob", "password", "phone")?;
+    let mut phone = suite.connect("bob", PASSWORD, "phone")?;
     phone.send("<presence id='sibling'><status>private</status><priority>2</priority><x xmlns='urn:test'/></presence>")?;
     assert_eq!(phone.receive()?.attribute("id"), Some("sibling"));
     alice.send("<presence type='probe' to='bob@localhost/quiet'/>")?;
@@ -559,11 +561,11 @@ fn subscribed_full_probes_find_freshly_bound_resources_before_initial_presence()
 fn policy_denials_suppress_authorized_full_probes_before_initial_presence() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-policy'")?;
     for user in ["alice", "spammer", "blocked"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "quiet")?;
-    let mut spammer = suite.connect("spammer", "password", "quiet")?;
-    let mut blocked = suite.connect("blocked", "password", "quiet")?;
+    let mut alice = suite.connect("alice", PASSWORD, "quiet")?;
+    let mut spammer = suite.connect("spammer", PASSWORD, "quiet")?;
+    let mut blocked = suite.connect("blocked", PASSWORD, "quiet")?;
     alice.send("<iq type='set' to='localhost' id='off'><toggle xmlns='urn:lonewolf:test:policy' enabled='false'/></iq>")?;
     assert_eq!(alice.receive()?.attribute("type"), Some("result"));
     for (owner, observer) in [(&mut alice, "spammer"), (&mut blocked, "alice")] {
@@ -596,10 +598,10 @@ fn policy_denials_suppress_authorized_full_probes_before_initial_presence() -> T
 #[test]
 fn probe_denials_preserve_preapproval_and_roster_version() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     alice.send("<presence type='subscribed' to='bob@localhost'/>")?;
     alice.send("<iq type='get' id='before'><query xmlns='jabber:iq:roster' ver=''/></iq>")?;
     let before = alice.receive()?;
@@ -648,12 +650,12 @@ fn a_probe_waiting_for_account_order_keeps_draining_a_healthy_reader() -> TestRe
         "incoming_stanzas_per_connection = { per_second = 100_000, burst = 100_000 }",
         |_| Ok(()),
     )?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut source = suite.connect("alice", "password", "desk")?;
-    let mut slow = suite.connect("alice", "password", "slow")?;
-    let mut requester = suite.connect("alice", "password", "phone")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut source = suite.connect("alice", PASSWORD, "desk")?;
+    let mut slow = suite.connect("alice", PASSWORD, "slow")?;
+    let mut requester = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     source.send("<presence id='source'><status>private</status></presence>")?;
     assert_eq!(source.receive()?.attribute("id"), Some("source"));
     requester.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
@@ -689,10 +691,10 @@ fn a_probe_waiting_for_account_order_keeps_draining_a_healthy_reader() -> TestRe
 #[test]
 fn cancelling_a_waiting_probe_releases_its_work_and_account_order() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    let mut source = suite.connect("alice", "password", "desk")?;
-    let mut slow = suite.connect("alice", "password", "slow")?;
-    let mut requester = suite.connect("alice", "password", "phone")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut source = suite.connect("alice", PASSWORD, "desk")?;
+    let mut slow = suite.connect("alice", PASSWORD, "slow")?;
+    let mut requester = suite.connect("alice", PASSWORD, "phone")?;
     source.send("<presence/>")?;
     source.receive()?;
     requester.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
@@ -713,11 +715,11 @@ fn cancelling_a_waiting_probe_releases_its_work_and_account_order() -> TestResul
 #[test]
 fn a_probe_behind_a_committed_revocation_reads_the_new_authorization() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")?;
-    let mut source = suite.connect("alice", "password", "desk")?;
-    let mut slow = suite.connect("alice", "password", "slow")?;
-    let mut requester = suite.connect("bob", "password", "desk")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut source = suite.connect("alice", PASSWORD, "desk")?;
+    let mut slow = suite.connect("alice", PASSWORD, "slow")?;
+    let mut requester = suite.connect("bob", PASSWORD, "desk")?;
     source.send("<presence id='source'><status>private</status></presence>")?;
     source.receive()?;
     requester.send("<presence type='subscribe' to='alice@localhost'/>")?;
@@ -753,12 +755,12 @@ fn directed_presence_quota_rejects_without_delivery_or_visibility_and_recovers()
         Ok(())
     })?;
     for user in ["alice", "bob", "carol"] {
-        suite.create_account(user, "password")?;
+        suite.create_account(user, PASSWORD)?;
     }
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut phone = suite.connect("alice", "password", "phone")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
-    let mut carol = suite.connect("carol", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
 
     for kind in ["", " type='unavailable'", " type='probe'"] {
         alice.send(&format!(

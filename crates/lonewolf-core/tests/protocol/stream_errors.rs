@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::ALTERNATE_PASSWORD;
+
 use super::support::{C2sSuite, TestResult};
 use std::io::Read as _;
 use std::net::Shutdown;
@@ -19,9 +21,9 @@ fn adjacent_attributes_return_not_well_formed_before_authentication() -> TestRes
 #[test]
 fn adjacent_attributes_return_not_well_formed_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for input in ["<message id='a'type='chat'/>", "<iq type='bogus'id='a'/>"] {
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
         client.send(input)?;
         client.expect_stream_error("not-well-formed")?;
     }
@@ -31,10 +33,10 @@ fn adjacent_attributes_return_not_well_formed_before_binding() -> TestResult {
 #[test]
 fn adjacent_attributes_prevent_delivery_and_trailing_iq_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut recipient = suite.connect("bob", "pencil", "phone")?;
-    let mut sender = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut recipient = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
+    let mut sender = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
 
     sender.send("<message to='bob@localhost/phone'id='missing-space'><body>probe</body></message><iq type='get' id='trailing'><query xmlns='jabber:iq:roster'/></iq>")?;
     sender.expect_stream_error("not-well-formed")?;
@@ -171,9 +173,9 @@ fn prefixed_content_returns_bad_namespace_prefix_before_authentication() -> Test
 #[test]
 fn prefixed_content_returns_bad_namespace_prefix_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for input in PREFIXED_CONTENT_STANZAS {
-        let mut client = suite.authenticated_client("alice", "pencil")?;
+        let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
         client.send(input)?;
         client.expect_stream_error("bad-namespace-prefix")?;
     }
@@ -183,11 +185,11 @@ fn prefixed_content_returns_bad_namespace_prefix_before_binding() -> TestResult 
 #[test]
 fn prefixed_content_returns_bad_namespace_prefix_without_delivery_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut recipient = suite.connect("bob", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut recipient = suite.connect("bob", ALTERNATE_PASSWORD, "desk")?;
     for input in PREFIXED_CONTENT_STANZAS {
-        let mut sender = suite.connect("alice", "pencil", "desk")?;
+        let mut sender = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
         sender.send(&format!(
             "{input}<message to='bob@localhost/desk' id='forbidden'/>"
         ))?;
@@ -204,9 +206,9 @@ fn prefixed_content_returns_bad_namespace_prefix_without_delivery_after_binding(
 #[test]
 fn explicit_unprefixed_content_routes_on_streams_without_a_default_namespace() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut recipient = suite.connect("bob", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut recipient = suite.connect("bob", ALTERNATE_PASSWORD, "desk")?;
     let opening = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0'>";
     let mut plain = suite.tcp_client()?;
     assert_eq!(plain.open_with(opening)?.attribute("xmlns"), None);
@@ -214,7 +216,7 @@ fn explicit_unprefixed_content_routes_on_streams_without_a_default_namespace() -
     let mut sender = plain.start_tls(&suite)?;
     assert_eq!(sender.open_with(opening)?.attribute("xmlns"), None);
     sender.features()?;
-    sender.authenticate("alice", "pencil")?;
+    sender.authenticate("alice", ALTERNATE_PASSWORD)?;
     let mut sender = sender.restart();
     assert_eq!(sender.open_with(opening)?.attribute("xmlns"), None);
     sender.features()?;
@@ -467,8 +469,8 @@ fn invalid_utf8_returns_unsupported_encoding_before_authentication() -> TestResu
 #[test]
 fn server_namespace_message_returns_invalid_namespace_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<message xmlns='jabber:server' from='alice@localhost' to='localhost'/>"#)?;
     client.expect_stream_error("invalid-namespace")
@@ -477,8 +479,8 @@ fn server_namespace_message_returns_invalid_namespace_before_binding() -> TestRe
 #[test]
 fn server_namespace_element_returns_invalid_namespace_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<other xmlns='jabber:server'/>"#)?;
     client.expect_stream_error("invalid-namespace")
@@ -487,8 +489,8 @@ fn server_namespace_element_returns_invalid_namespace_before_binding() -> TestRe
 #[test]
 fn rejected_iq_allows_correction_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<iq type='subscribe'/>"#)?;
     client.expect_xml("<iq xmlns='jabber:client' type='error' id=''><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -499,8 +501,8 @@ fn rejected_iq_allows_correction_before_binding() -> TestResult {
 #[test]
 fn unbound_prefix_returns_not_well_formed_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<x:message/>"#)?;
     client.expect_stream_error("not-well-formed")
@@ -509,8 +511,8 @@ fn unbound_prefix_returns_not_well_formed_before_binding() -> TestResult {
 #[test]
 fn mismatched_tags_returns_not_well_formed_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<message><body></message>"#)?;
     client.expect_stream_error("not-well-formed")
@@ -519,8 +521,8 @@ fn mismatched_tags_returns_not_well_formed_before_binding() -> TestResult {
 #[test]
 fn duplicate_attributes_returns_not_well_formed_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<message id='a' id='b'/>"#)?;
     client.expect_stream_error("not-well-formed")
@@ -529,8 +531,8 @@ fn duplicate_attributes_returns_not_well_formed_before_binding() -> TestResult {
 #[test]
 fn xml_comment_returns_restricted_xml_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<message><!--forbidden--></message>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -539,8 +541,8 @@ fn xml_comment_returns_restricted_xml_before_binding() -> TestResult {
 #[test]
 fn processing_instruction_returns_restricted_xml_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<message><?instruction value?></message>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -549,8 +551,8 @@ fn processing_instruction_returns_restricted_xml_before_binding() -> TestResult 
 #[test]
 fn doctype_returns_restricted_xml_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<!DOCTYPE message><message/>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -559,8 +561,8 @@ fn doctype_returns_restricted_xml_before_binding() -> TestResult {
 #[test]
 fn unknown_entity_returns_restricted_xml_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<message><body>&unknown;</body></message>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -569,8 +571,8 @@ fn unknown_entity_returns_restricted_xml_before_binding() -> TestResult {
 #[test]
 fn invalid_utf8_returns_unsupported_encoding_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send_bytes(b"<message>\xff</message>")?;
     client.expect_stream_error("unsupported-encoding")
@@ -579,8 +581,8 @@ fn invalid_utf8_returns_unsupported_encoding_before_binding() -> TestResult {
 #[test]
 fn server_namespace_message_returns_invalid_namespace_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<message xmlns='jabber:server' from='alice@localhost' to='localhost'/>"#)?;
     client.expect_stream_error("invalid-namespace")
@@ -589,8 +591,8 @@ fn server_namespace_message_returns_invalid_namespace_after_binding() -> TestRes
 #[test]
 fn server_namespace_element_returns_invalid_namespace_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<other xmlns='jabber:server'/>"#)?;
     client.expect_stream_error("invalid-namespace")
@@ -599,8 +601,8 @@ fn server_namespace_element_returns_invalid_namespace_after_binding() -> TestRes
 #[test]
 fn unbound_prefix_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<x:message/>"#)?;
     client.expect_stream_error("not-well-formed")
@@ -609,8 +611,8 @@ fn unbound_prefix_returns_not_well_formed_after_binding() -> TestResult {
 #[test]
 fn invalid_namespace_declarations_return_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("<message><x xmlns:p=''/></message>")?;
     client.expect_stream_error("not-well-formed")
@@ -619,8 +621,8 @@ fn invalid_namespace_declarations_return_not_well_formed_after_binding() -> Test
 #[test]
 fn invalid_xml_prefix_binding_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("<message xmlns:xml='urn:bad'/>")?;
     client.expect_stream_error("not-well-formed")
@@ -629,8 +631,8 @@ fn invalid_xml_prefix_binding_returns_not_well_formed_after_binding() -> TestRes
 #[test]
 fn undeclared_entity_in_attribute_returns_restricted_xml_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("<message to='&foo;'/>")?;
     client.expect_stream_error("restricted-xml")
@@ -639,8 +641,8 @@ fn undeclared_entity_in_attribute_returns_restricted_xml_after_binding() -> Test
 #[test]
 fn undeclared_entity_between_stanzas_returns_restricted_xml_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("&foo;")?;
     client.expect_stream_error("restricted-xml")
@@ -649,8 +651,8 @@ fn undeclared_entity_between_stanzas_returns_restricted_xml_after_binding() -> T
 #[test]
 fn malformed_entity_name_in_attribute_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("<message id='&123;'/>")?;
     client.expect_stream_error("not-well-formed")
@@ -659,8 +661,8 @@ fn malformed_entity_name_in_attribute_returns_not_well_formed_after_binding() ->
 #[test]
 fn malformed_entity_name_between_stanzas_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("&foo:bar;")?;
     client.expect_stream_error("not-well-formed")
@@ -669,8 +671,8 @@ fn malformed_entity_name_between_stanzas_returns_not_well_formed_after_binding()
 #[test]
 fn attribute_count_limit_returns_policy_violation_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
     let attributes = (0..257)
         .map(|index| format!(" a{index}='v'"))
         .collect::<String>();
@@ -683,8 +685,8 @@ fn attribute_count_limit_returns_policy_violation_after_binding() -> TestResult 
 #[test]
 fn mismatched_tags_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<message><body></message>"#)?;
     client.expect_stream_error("not-well-formed")
@@ -693,8 +695,8 @@ fn mismatched_tags_returns_not_well_formed_after_binding() -> TestResult {
 #[test]
 fn duplicate_attributes_returns_not_well_formed_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<message id='a' id='b'/>"#)?;
     client.expect_stream_error("not-well-formed")
@@ -703,8 +705,8 @@ fn duplicate_attributes_returns_not_well_formed_after_binding() -> TestResult {
 #[test]
 fn xml_comment_returns_restricted_xml_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<message><!--forbidden--></message>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -713,8 +715,8 @@ fn xml_comment_returns_restricted_xml_after_binding() -> TestResult {
 #[test]
 fn processing_instruction_returns_restricted_xml_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<message><?instruction value?></message>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -723,8 +725,8 @@ fn processing_instruction_returns_restricted_xml_after_binding() -> TestResult {
 #[test]
 fn doctype_returns_restricted_xml_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<!DOCTYPE message><message/>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -733,8 +735,8 @@ fn doctype_returns_restricted_xml_after_binding() -> TestResult {
 #[test]
 fn unknown_entity_returns_restricted_xml_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<message><body>&unknown;</body></message>"#)?;
     client.expect_stream_error("restricted-xml")
@@ -743,8 +745,8 @@ fn unknown_entity_returns_restricted_xml_after_binding() -> TestResult {
 #[test]
 fn invalid_utf8_returns_unsupported_encoding_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send_bytes(b"<message>\xff</message>")?;
     client.expect_stream_error("unsupported-encoding")
@@ -801,7 +803,7 @@ fn presence_is_not_authorized_before_authentication() -> TestResult {
 #[test]
 fn application_stanzas_during_empty_sasl_challenge_close_before_reauthentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
 
     for stanza in [
         "<message to='bob@localhost'><body>hello</body></message>",
@@ -826,7 +828,7 @@ fn application_stanzas_during_empty_sasl_challenge_close_before_reauthentication
 #[test]
 fn application_stanzas_during_scram_proof_challenge_close_before_reauthentication() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
 
     for stanza in [
         "<message to='bob@localhost'><body>hello</body></message>",
@@ -863,8 +865,8 @@ fn unknown_element_during_sasl_returns_malformed_request() -> TestResult {
 #[test]
 fn message_is_not_authorized_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<message/>")?;
     client.expect_stream_error("not-authorized")
@@ -873,8 +875,8 @@ fn message_is_not_authorized_before_binding() -> TestResult {
 #[test]
 fn presence_is_not_authorized_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<presence/>")?;
     client.expect_stream_error("not-authorized")
@@ -883,8 +885,8 @@ fn presence_is_not_authorized_before_binding() -> TestResult {
 #[test]
 fn other_is_not_authorized_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<other/>")?;
     client.expect_stream_error("not-authorized")
@@ -893,8 +895,8 @@ fn other_is_not_authorized_before_binding() -> TestResult {
 #[test]
 fn unknown_client_namespace_stanza_after_binding_closes_the_stream() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("<other/>")?;
     client.expect_stream_error("unsupported-stanza-type")
@@ -903,8 +905,8 @@ fn unknown_client_namespace_stanza_after_binding_closes_the_stream() -> TestResu
 #[test]
 fn unknown_extension_namespace_stanza_after_binding_closes_the_stream() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send("<other xmlns='urn:test:unknown'/>")?;
     client.expect_stream_error("unsupported-stanza-type")
@@ -913,8 +915,8 @@ fn unknown_extension_namespace_stanza_after_binding_closes_the_stream() -> TestR
 #[test]
 fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
     for (request, kind, id, condition, from) in [
         (
             "<iq><query xmlns='jabber:iq:roster'/></iq>",
@@ -1023,8 +1025,8 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
 #[test]
 fn malformed_responses_are_dropped_without_error_loops() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
     for response in [
         "<iq type='result'/>",
         "<iq type='result' id='two'><query/><query/></iq>",
@@ -1045,8 +1047,8 @@ fn malformed_responses_are_dropped_without_error_loops() -> TestResult {
 #[test]
 fn explicit_empty_ids_survive_valid_stanzas_and_error_replies() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
     client.send("<iq type='get' id=''><query xmlns='jabber:iq:roster'/></iq>")?;
     client.expect_xml("<iq xmlns='jabber:client' type='result' id='' to='alice@localhost/desktop'><query xmlns='jabber:iq:roster'/></iq>")?;
     client.send("<message to='alice@localhost/desktop' id=''/>")?;
@@ -1059,12 +1061,12 @@ fn explicit_empty_ids_survive_valid_stanzas_and_error_replies() -> TestResult {
 #[test]
 fn malformed_source_cannot_bypass_binding_identity_validation() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.authenticated_client("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     client.send("<iq type='set' id='bind' from='bad@'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desktop</resource></bind></iq>")?;
     client.expect_stream_error("invalid-from")?;
 
-    let mut replacement = suite.authenticated_client("alice", "pencil")?;
+    let mut replacement = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     assert_eq!(
         replacement.bind(Some("desktop"))?,
         "alice@localhost/desktop"
@@ -1075,8 +1077,8 @@ fn malformed_source_cannot_bypass_binding_identity_validation() -> TestResult {
 #[test]
 fn invalid_namespace_wins_over_recoverable_stanza_errors() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desktop")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
     client.send("<iq xmlns='jabber:server' type='future' to='bad@'/>")?;
     client.expect_stream_error("invalid-namespace")
 }
@@ -1084,8 +1086,8 @@ fn invalid_namespace_wins_over_recoverable_stanza_errors() -> TestResult {
 #[test]
 fn fatal_errors_in_rejected_envelopes_withdraw_the_bound_resource() -> TestResult {
     let suite = C2sSuite::with_limits("max_stanza_bytes = 10000")?;
-    suite.create_account("alice", "pencil")?;
-    let mut observer = suite.connect("alice", "pencil", "observer")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut observer = suite.connect("alice", ALTERNATE_PASSWORD, "observer")?;
     observer.send("<presence/>")?;
     observer.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
@@ -1115,7 +1117,7 @@ fn fatal_errors_in_rejected_envelopes_withdraw_the_bound_resource() -> TestResul
             "policy-violation",
         ),
     ] {
-        let mut client = suite.connect("alice", "pencil", "invalid")?;
+        let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "invalid")?;
         client.send("<presence/>")?;
         client.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>")?;
         client.expect_xml(
@@ -1134,7 +1136,7 @@ fn fatal_errors_in_rejected_envelopes_withdraw_the_bound_resource() -> TestResul
 #[test]
 fn peer_stream_errors_end_each_open_stream_phase_without_a_reciprocal_error() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for condition in ["policy-violation", "future-condition"] {
         let error = format!(
             "<stream:error><{condition} xmlns='urn:ietf:params:xml:ns:xmpp-streams'/><text xmlns='urn:ietf:params:xml:ns:xmpp-streams'>private peer error text</text></stream:error>"
@@ -1147,7 +1149,7 @@ fn peer_stream_errors_end_each_open_stream_phase_without_a_reciprocal_error() ->
             let mut client = if phase < 2 {
                 suite.unauthenticated_client()?
             } else {
-                suite.authenticated_client("alice", "pencil")?
+                suite.authenticated_client("alice", ALTERNATE_PASSWORD)?
             };
             if phase == 1 {
                 client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
@@ -1167,8 +1169,8 @@ fn peer_stream_errors_end_each_open_stream_phase_without_a_reciprocal_error() ->
 #[test]
 fn a_stream_error_in_another_namespace_is_not_a_peer_termination() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     client.send("<error xmlns='urn:example:wrong'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></error>")?;
     client.expect_stream_error("unsupported-stanza-type")
 }
@@ -1176,8 +1178,8 @@ fn a_stream_error_in_another_namespace_is_not_a_peer_termination() -> TestResult
 #[test]
 fn failed_parser_enters_tls_closure_without_interpreting_footer_text() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    let mut client = suite.connect("alice", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     client.send("<message><!--forbidden--></message>")?;
     client
         .receive()?
@@ -1192,7 +1194,7 @@ fn failed_parser_enters_tls_closure_without_interpreting_footer_text() -> TestRe
 #[test]
 fn xml_grammar_errors_close_every_phase_with_complete_and_fragmented_input() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for phase in 0..4 {
         for fragmented in [false, true] {
             for (prefix, suffix) in [
@@ -1215,7 +1217,7 @@ fn xml_grammar_errors_close_every_phase_with_complete_and_fragmented_input() -> 
                     let mut client = if phase == 1 {
                         suite.unauthenticated_client()?
                     } else {
-                        suite.authenticated_client("alice", "pencil")?
+                        suite.authenticated_client("alice", ALTERNATE_PASSWORD)?
                     };
                     if phase == 3 {
                         client.bind(Some("desk"))?;
@@ -1237,16 +1239,16 @@ fn xml_grammar_errors_close_every_phase_with_complete_and_fragmented_input() -> 
 #[test]
 fn malformed_xml_prevents_following_stanza_delivery() -> TestResult {
     let suite = C2sSuite::start()?;
-    suite.create_account("alice", "pencil")?;
-    suite.create_account("bob", "pencil")?;
-    let mut recipient = suite.connect("bob", "pencil", "desk")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut recipient = suite.connect("bob", ALTERNATE_PASSWORD, "desk")?;
     for malformed in [
         "<message><body></message>",
         "<message id='a' id='b'/>",
         "<message id='a<b'/>",
         "<message><body>]]></body></message>",
     ] {
-        let mut sender = suite.connect("alice", "pencil", "desk")?;
+        let mut sender = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
         sender.send(&format!(
             "{malformed}<message to='bob@localhost/desk' id='forbidden'/>"
         ))?;

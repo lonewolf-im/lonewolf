@@ -402,6 +402,27 @@ max_resources_per_account = {resources}
     }
 
     pub fn change_password(&self, username: &str, password: &str) -> TestResult {
+        assert!(
+            self.password_change_response(username, password)?
+                .starts_with("HTTP/1.1 204 ")
+        );
+        Ok(())
+    }
+
+    pub fn reject_weak_password_change(&self, username: &str, password: &str) -> TestResult {
+        let response = self.password_change_response(username, password)?;
+        assert!(response.starts_with("HTTP/1.1 400 "));
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or("missing response body")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body)?,
+            serde_json::json!({"error":{"code":"weak_password"}})
+        );
+        Ok(())
+    }
+
+    fn password_change_response(&self, username: &str, password: &str) -> TestResult<String> {
         let mut stream =
             UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
         stream.set_read_timeout(Some(TIMEOUT))?;
@@ -414,8 +435,7 @@ max_resources_per_account = {resources}
         )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
-        assert!(response.starts_with("HTTP/1.1 204 "), "{response}");
-        Ok(())
+        Ok(response)
     }
 
     pub fn delete_account(&self, username: &str) -> TestResult {

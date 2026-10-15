@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::PASSWORD;
+
 use super::support::{C2sSuite, Client, TestResult};
 
 fn accounts(suite: &C2sSuite) -> TestResult {
-    suite.create_account("alice", "password")?;
-    suite.create_account("bob", "password")
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)
 }
 
 fn events(client: &mut Client, resource: &str, expected: &str) -> TestResult {
@@ -21,8 +23,8 @@ fn available(bob: &mut Client) -> TestResult {
 fn local_messages_produce_sent_and_received_events() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-message-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     available(&mut bob)?;
     alice.send("<message type='chat' to='bob@localhost'><body>Hello</body></message>")?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat'><body>Hello</body></message>")?;
@@ -39,7 +41,7 @@ fn local_messages_produce_sent_and_received_events() -> TestResult {
 fn stored_messages_report_stored() -> TestResult {
     let suite = C2sSuite::with_extensions("'offline', 'test-message-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message type='chat' to='bob@localhost'><body>Hello</body></message>")?;
     events(
         &mut alice,
@@ -53,8 +55,8 @@ fn stored_messages_report_stored() -> TestResult {
 fn rejected_messages_produce_only_a_sent_event() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-message-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     alice.send("<message type='normal' to='bob@localhost/absent' id='reject'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/absent' to='alice@localhost/desk' type='error' id='reject'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
     events(
@@ -70,7 +72,7 @@ fn rejected_messages_produce_only_a_sent_event() -> TestResult {
 fn messages_stopped_by_policy_produce_no_events() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-policy', 'test-message-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message type='chat' to='blocked@localhost' id='blocked'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='blocked@localhost' to='alice@localhost/desk' type='error' id='blocked'><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
     events(&mut alice, "desk", "")?;
@@ -81,8 +83,8 @@ fn messages_stopped_by_policy_produce_no_events() -> TestResult {
 fn archive_ids_reach_observers() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-archive', 'test-message-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     available(&mut bob)?;
     alice.send("<message type='chat' to='bob@localhost'><body>Hello</body></message>")?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat'><body>Hello</body><stanza-id xmlns='urn:xmpp:sid:0' id='2' by='bob@localhost'/></message>")?;
@@ -99,9 +101,9 @@ fn archive_ids_reach_observers() -> TestResult {
 fn observer_deliveries_are_not_observed() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-message-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "a")?;
-    let mut sibling = suite.connect("alice", "password", "b")?;
-    let mut bob = suite.connect("bob", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "a")?;
+    let mut sibling = suite.connect("alice", PASSWORD, "b")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     sibling.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
     sibling.expect_xml("<iq xmlns='jabber:client' to='alice@localhost/b' type='result' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
     available(&mut bob)?;
@@ -122,7 +124,7 @@ fn observer_deliveries_are_not_observed() -> TestResult {
 fn service_messages_are_observed_on_both_sides() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-service', 'test-message-observer'")?;
     accounts(&suite)?;
-    let mut alice = suite.connect("alice", "password", "desk")?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message type='chat' to='room@echo.localhost'><body>Hello</body></message>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='room@echo.localhost' to='alice@localhost/desk' type='chat'><body>Hello</body></message>")?;
     events(

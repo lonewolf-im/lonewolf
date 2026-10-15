@@ -114,7 +114,7 @@ fn key(text: &str) -> Result<AccountKey, Box<dyn Error>> {
 async fn seed(storage: &RedbStorage, text: &str) -> TestResult {
     let verifier = ScramVerifier::derive(
         ScramHash::Sha256,
-        "initial",
+        "initial silver river valley",
         [1; 16],
         ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
     )?;
@@ -181,12 +181,12 @@ async fn assert_password(storage: &RedbStorage, password: &str) -> TestResult {
 #[test]
 fn account_lifecycle_uses_canonical_jids_and_never_returns_credentials() -> TestResult {
     with_server(|path, accounts| async move {
-        let input = json!({"jid":"Alice@EXAMPLE.ORG", "password":"first password"});
+        let input = json!({"jid":"Alice@EXAMPLE.ORG", "password":"first copper lantern meadow"});
         let reply = request(&path, "POST", "/v1/accounts", Some(input.clone())).await?;
         assert_eq!(reply.status, 201);
         assert_eq!(reply.body, json!({"jid":"alice@example.org"}));
         assert!(reply.headers.contains("cache-control: no-store"));
-        assert_password(&accounts, "first password").await?;
+        assert_password(&accounts, "first copper lantern meadow").await?;
 
         assert_eq!(
             request(&path, "POST", "/v1/accounts", Some(input))
@@ -202,12 +202,12 @@ fn account_lifecycle_uses_canonical_jids_and_never_returns_credentials() -> Test
             &path,
             "PUT",
             "/v1/accounts/alice%40example.org/password",
-            Some(json!({"password":"replacement"})),
+            Some(json!({"password":"violet cedar cloud orchard"})),
         )
         .await?;
         assert_eq!(reply.status, 204);
         assert_eq!(reply.body, Value::Null);
-        assert_password(&accounts, "replacement").await?;
+        assert_password(&accounts, "violet cedar cloud orchard").await?;
 
         assert_eq!(
             request(&path, "DELETE", "/v1/accounts/alice%40example.org", None)
@@ -245,7 +245,7 @@ fn ipv6_account_identities_reject_zones_without_aliasing_the_pure_address() -> T
             &path,
             "POST",
             "/v1/accounts",
-            Some(json!({"jid":"ALICE@[FE80::1]", "password":"initial"})),
+            Some(json!({"jid":"ALICE@[FE80::1]", "password":"initial silver river valley"})),
         )
         .await?;
         assert_eq!(reply.status, 201);
@@ -257,7 +257,7 @@ fn ipv6_account_identities_reject_zones_without_aliasing_the_pure_address() -> T
                 &path,
                 "POST",
                 "/v1/accounts",
-                Some(json!({"jid":format!("alice@[fe80::1%{zone}]"), "password":"replacement"})),
+                Some(json!({"jid":format!("alice@[fe80::1%{zone}]"), "password":"violet cedar cloud orchard"})),
             )
             .await?;
             assert_eq!(reply.status, 400);
@@ -269,7 +269,7 @@ fn ipv6_account_identities_reject_zones_without_aliasing_the_pure_address() -> T
                     &path,
                     "PUT",
                     &format!("{target}/password"),
-                    Some(json!({"password":"replacement"}))
+                    Some(json!({"password":"violet cedar cloud orchard"}))
                 )
                 .await?
                 .status,
@@ -574,7 +574,7 @@ fn shutdown_drains_an_accepted_request_and_removes_the_socket() -> TestResult {
         )?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
-            let body = r#"{"jid":"alice@example.org","password":"password"}"#;
+            let body = r#"{"jid":"alice@example.org","password":"ocean copper lantern meadow"}"#;
             let mut stream = UnixStream::connect(&path).await?;
             stream.write_all(format!("POST /v1/accounts HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{", body.len())).await.0?;
             assert_eq!(request(&path, "GET", "/v1/accounts", None).await?.status, 200);
@@ -590,6 +590,90 @@ fn shutdown_drains_an_accepted_request_and_removes_the_socket() -> TestResult {
         client_result?;
         assert!(!path.exists());
         assert!(account_exists(&storage, &key("alice@example.org")?).await?);
+        Ok(())
+    })
+}
+
+#[test]
+fn weak_creation_and_replacement_preserve_account_state() -> TestResult {
+    with_server(|path, accounts| async move {
+        let alice = key("alice@example.org")?;
+        for password in [
+            "a",
+            "password",
+            "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "abababababababababababab",
+        ] {
+            let reply = request(
+                &path,
+                "POST",
+                "/v1/accounts",
+                Some(json!({"jid":"alice@example.org", "password":password})),
+            )
+            .await?;
+            assert_eq!(reply.status, 400);
+            assert!(reply.body == json!({"error":{"code":"weak_password"}}));
+            assert!(!account_exists(&accounts, &alice).await?);
+        }
+        let reply = request(
+            &path,
+            "POST",
+            "/v1/accounts",
+            Some(json!({"jid":"alice@example.org", "password":"ocean copper lantern meadow"})),
+        )
+        .await?;
+        assert_eq!(reply.status, 201);
+        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+            let before = scram(&accounts, &alice, hash)
+                .await?
+                .ok_or("missing verifier")?;
+            let reply = request(
+                &path,
+                "PUT",
+                "/v1/accounts/alice%40example.org/password",
+                Some(json!({"password":"a"})),
+            )
+            .await?;
+            assert_eq!(reply.status, 400);
+            assert!(reply.body == json!({"error":{"code":"weak_password"}}));
+            let after = scram(&accounts, &alice, hash)
+                .await?
+                .ok_or("missing verifier")?;
+            match (before, after) {
+                (ScramVerifier::Sha1(before), ScramVerifier::Sha1(after)) => {
+                    assert_eq!(before.salt(), after.salt());
+                    assert_eq!(before.stored_key(), after.stored_key());
+                    assert_eq!(before.server_key(), after.server_key());
+                }
+                (ScramVerifier::Sha256(before), ScramVerifier::Sha256(after)) => {
+                    assert_eq!(before.salt(), after.salt());
+                    assert_eq!(before.stored_key(), after.stored_key());
+                    assert_eq!(before.server_key(), after.server_key());
+                }
+                _ => return Err("verifier hash changed".into()),
+            }
+        }
+        assert_password(&accounts, "ocean copper lantern meadow").await?;
+        for password in ["\u{ad}", "\u{7}"] {
+            let reply = request(
+                &path,
+                "PUT",
+                "/v1/accounts/alice%40example.org/password",
+                Some(json!({"password":password})),
+            )
+            .await?;
+            assert_eq!(reply.status, 400);
+            assert!(reply.body == json!({"error":{"code":"invalid_password"}}));
+        }
+        let reply = request(
+            &path,
+            "PUT",
+            "/v1/accounts/alice%40example.org/password",
+            Some(json!({"password":"violet cedar cloud orchard"})),
+        )
+        .await?;
+        assert_eq!(reply.status, 204);
+        assert_password(&accounts, "violet cedar cloud orchard").await?;
         Ok(())
     })
 }

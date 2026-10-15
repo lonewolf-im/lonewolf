@@ -16,7 +16,7 @@ use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::TcpListener;
 use compio::time::{sleep, timeout};
 
-use crate::core_dispatcher::{CoreDispatcher, TaskError};
+use crate::core_dispatcher::{CoreDispatcher, TaskError, current_worker_index};
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 
@@ -47,6 +47,23 @@ impl Drop for DropNotice {
             let _ = sender.send(thread::current().id());
         }
     }
+}
+
+#[test]
+fn current_worker_index_identifies_dispatcher_threads() -> TestResult {
+    run_test(async {
+        assert_eq!(current_worker_index(), None);
+        let dispatcher = multiple_workers()?;
+        let handle = dispatcher.handle();
+        for index in 0..handle.worker_count() {
+            let task = handle
+                .dispatch_at(index, |_| ready(current_worker_index()))
+                .await?;
+            assert_eq!(task.await?, Some(index));
+        }
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    })
 }
 
 #[test]

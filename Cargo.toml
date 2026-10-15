@@ -5,6 +5,7 @@ members = [
     "crates/lonewolf-auth",
     "crates/lonewolf-core",
     "crates/lonewolf-extension",
+    "crates/lonewolf-metrics",
     "crates/lonewolfctl",
     "crates/lonewolf-storage",
     "crates/lonewolf-util",
@@ -49,6 +50,7 @@ lonewolf-admin = { path = "crates/lonewolf-admin" }
 lonewolf-auth = { path = "crates/lonewolf-auth" }
 lonewolf-core = { path = "crates/lonewolf-core" }
 lonewolf-extension = { path = "crates/lonewolf-extension" }
+lonewolf-metrics = { path = "crates/lonewolf-metrics" }
 lonewolf-storage = { path = "crates/lonewolf-storage" }
 lonewolf-util = { path = "crates/lonewolf-util" }
 lonewolf-xmpp = { path = "crates/lonewolf-xmpp" }
@@ -57,6 +59,7 @@ parking_lot = { version = "0.12.5", default-features = false }
 pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }
 percent-encoding = "2.3.2"
 precis-profiles = { version = "0.2.0", default-features = false }
+prometheus-client = { version = "0.25.1", default-features = false }
 quick-xml = { version = "0.42.0", default-features = false, features = ["async-tokio"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
 rpassword = "7.5.4"

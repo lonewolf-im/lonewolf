@@ -4,6 +4,7 @@
 //!
 //! Only dispatched tasks are tracked; they must join their own child tasks.
 
+use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -22,6 +23,15 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
+
+thread_local! {
+    static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Returns the dispatcher worker index of the calling thread, or `None` on other threads.
+pub fn current_worker_index() -> Option<usize> {
+    CURRENT_WORKER.with(Cell::get)
+}
 
 type Job = Box<dyn FnOnce(WorkerContext) -> JoinHandle<bool> + Send>;
 type Stop = Shared<BoxFuture<'static, Instant>>;
@@ -273,6 +283,7 @@ fn start_worker(
     let thread = thread::Builder::new()
         .name(format!("lonewolf-core-{}", worker.index))
         .spawn(move || {
+            CURRENT_WORKER.with(|current| current.set(Some(worker.index)));
             let runtime = match initialize(worker) {
                 Ok(runtime) => runtime,
                 Err(error) => {

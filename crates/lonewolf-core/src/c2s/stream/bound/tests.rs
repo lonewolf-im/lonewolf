@@ -2490,6 +2490,7 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
                 .fix(vec![account.clone()], fixture.storage.begin_read())
                 .await?;
             let work = GetWork {
+                target_account: Some(account.clone()),
                 account,
                 transaction,
                 handler,
@@ -2526,4 +2527,221 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
         })?;
     }
     Ok(())
+}
+
+struct FailingAccountReads {
+    kind: Option<lonewolf_storage::StorageErrorKind>,
+    calls: AtomicUsize,
+}
+
+impl AccountReads for FailingAccountReads {
+    async fn account(
+        &self,
+        _: &AccountKey,
+    ) -> Result<Option<lonewolf_storage::account::Account>, AccountError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(match self.kind {
+            Some(kind) => AccountError::Storage(crate::delivery::failure_tests::seeded_error(kind)),
+            None => AccountError::NotFound,
+        })
+    }
+
+    async fn scram(
+        &self,
+        _: &AccountKey,
+        _: lonewolf_auth::scram::ScramHash,
+    ) -> Result<Option<ScramVerifier>, AccountError> {
+        Err(AccountError::NotFound)
+    }
+
+    async fn accounts_after(
+        &self,
+        _: Option<&AccountKey>,
+        _: NonZeroUsize,
+    ) -> Result<Vec<lonewolf_storage::account::Account>, AccountError> {
+        Err(AccountError::NotFound)
+    }
+}
+
+#[test]
+fn iq_account_guard_skips_server_scope_and_preserves_read_failures() -> TestResult {
+    use crate::delivery::failure_tests::{Capture, KINDS};
+    Runtime::new()?.block_on(async {
+        let mut arena = Arena::try_new(Default::default())?;
+        let target =
+            AccountKey::try_from(Jid::parse_in("missing@localhost", &mut arena)?.resolve(&arena)?)?;
+        for kind in KINDS.into_iter().map(Some).chain([None]) {
+            let transaction = FailingAccountReads {
+                kind,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(require_iq_account(&transaction, None).await, Ok(()));
+            assert_eq!(transaction.calls.load(Ordering::SeqCst), 0);
+            let Err(error) = require_iq_account(&transaction, Some(&target)).await else {
+                return Err("failed account reads must fail the IQ".into());
+            };
+            assert_eq!(error.condition(), StanzaErrorCondition::InternalServerError);
+            assert_eq!(transaction.calls.load(Ordering::SeqCst), 1);
+            match kind {
+                Some(kind) => {
+                    assert_eq!(
+                        error.failure(),
+                        Some(Failure {
+                            kind: FailureKind::Storage(kind),
+                            operation: "iq_account_read",
+                        })
+                    );
+                    let capture = Capture::default();
+                    let _subscriber = tracing::subscriber::set_default(capture.clone());
+                    report_handler_failure(&error, &target);
+                    capture.assert_one(FailureKind::Storage(kind), "iq_account_read");
+                }
+                None => assert_eq!(error.failure(), None),
+            }
+        }
+        Ok(())
+    })
+}
+
+struct AccountGet(AtomicUsize);
+
+impl IqHandler<GlobalChunkAllocator, RedbStorage> for AccountGet {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, GlobalChunkAllocator>,
+        transaction: &'a RedbRead,
+        _: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> lonewolf_extension::iq::IqFuture<'a, GlobalChunkAllocator> {
+        Box::pin(async move {
+            let target = AccountKey::try_from(request.target)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            assert!(
+                transaction
+                    .account(&target)
+                    .await
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                    .is_some()
+            );
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(IqReply::new(None, lonewolf_extension::Effects::none()))
+        })
+    }
+}
+
+fn account_get_work(
+    fixture: &Fixture,
+    transaction: RedbRead,
+    handler: Arc<AccountGet>,
+) -> TestResult<GetWork<GlobalChunkAllocator>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    let sender = Jid::parse_in("bob@localhost/phone", &mut arena)?;
+    let payload = Element::builder_in("query", "urn:lonewolf:test:iq", &mut arena)?.build()?;
+    let request = Stanza::builder_in(
+        StanzaType::Iq(IqType::Get),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .id(Some("account-snapshot"))?
+    .child(payload)?
+    .build()?;
+    Ok(GetWork {
+        account: fixture.registration.account().clone(),
+        target_account: Some(fixture.registration.account().clone()),
+        transaction,
+        handler,
+        discovery: Arc::new(Discovery::default()),
+        arena,
+        request,
+        sender,
+        response: Arena::try_new(Default::default())?,
+        delivery: RouterDelivery::new(
+            &fixture.router.handle(),
+            &GlobalChunkAllocator,
+            Some(&fixture.registration),
+        ),
+    })
+}
+
+#[test]
+fn iq_account_guard_and_get_handler_share_the_fixed_snapshot_across_deletion() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[]).await?;
+        let account = fixture.registration.account();
+        let handler = Arc::new(AccountGet(AtomicUsize::new(0)));
+        let (transaction, ticket) = fixture
+            .router
+            .handle()
+            .order()
+            .fix(vec![account.clone()], fixture.storage.begin_read())
+            .await?;
+        let work = account_get_work(&fixture, transaction, Arc::clone(&handler))?;
+        drop(ticket);
+        let mut deletion = fixture.storage.begin_write().await?;
+        deletion.delete_account(account).await?;
+        deletion.commit().await?;
+        let outcome = work
+            .run(Vec::new())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert!(matches!(outcome.reply, Ok(None)));
+        assert_eq!(handler.0.load(Ordering::SeqCst), 1);
+        let (transaction, ticket) = fixture
+            .router
+            .handle()
+            .order()
+            .fix(vec![account.clone()], fixture.storage.begin_read())
+            .await?;
+        let work = account_get_work(&fixture, transaction, Arc::clone(&handler))?;
+        drop(ticket);
+        let outcome = work
+            .run(Vec::new())
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert!(matches!(
+            outcome.reply,
+            Err(HandlerError::Stanza(
+                StanzaErrorCondition::ServiceUnavailable
+            ))
+        ));
+        assert!(outcome.results.is_empty());
+        assert_eq!(handler.0.load(Ordering::SeqCst), 1);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn iq_account_guard_reads_deletion_and_rollback_from_its_write_transaction() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[]).await?;
+        let account = fixture.registration.account();
+        let mut transaction = fixture.storage.begin_write().await?;
+        assert_eq!(
+            require_iq_account(&transaction, Some(account)).await,
+            Ok(())
+        );
+        transaction.delete_account(account).await?;
+        assert_eq!(
+            require_iq_account(&transaction, Some(account)).await,
+            Err(HandlerError::Stanza(
+                StanzaErrorCondition::ServiceUnavailable
+            ))
+        );
+        drop(transaction);
+        let mut transaction = fixture.storage.begin_write().await?;
+        assert_eq!(
+            require_iq_account(&transaction, Some(account)).await,
+            Ok(())
+        );
+        transaction.delete_account(account).await?;
+        transaction.commit().await?;
+        let transaction = fixture.storage.begin_write().await?;
+        assert_eq!(
+            require_iq_account(&transaction, Some(account)).await,
+            Err(HandlerError::Stanza(
+                StanzaErrorCondition::ServiceUnavailable
+            ))
+        );
+        drop(transaction);
+        fixture.finish().await
+    })
 }

@@ -157,7 +157,10 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
         }))?;
     }
     extensions.register(Arc::new(ConflictingIq))?;
-    extensions.register(Arc::new(TestIq))?;
+    extensions.register(Arc::new(TestIq {
+        gets: AtomicUsize::new(0),
+        sets: AtomicUsize::new(0),
+    }))?;
     extensions.register(Arc::new(TestIqResults))?;
     extensions.register(Arc::new(TestIqRequester {
         outcome: Arc::new(PlMutex::new(None)),
@@ -483,7 +486,10 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestHostService {
 
 struct ConflictingIq;
 
-struct TestIq;
+struct TestIq {
+    gets: AtomicUsize,
+    sets: AtomicUsize,
+}
 
 struct ServerIq;
 
@@ -1131,7 +1137,27 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
         _: &'a RedbRead,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async move { identity(&request, response).await })
+        Box::pin(async move {
+            if request
+                .payload
+                .attribute("calls", "")
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                == Some("true")
+            {
+                let payload = Element::builder_in("calls", NAMESPACE, response)
+                    .and_then(|builder| {
+                        builder.attribute("gets", "", &self.gets.load(Ordering::SeqCst).to_string())
+                    })
+                    .and_then(|builder| {
+                        builder.attribute("sets", "", &self.sets.load(Ordering::SeqCst).to_string())
+                    })
+                    .and_then(|builder| builder.build())
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                return Ok(IqReply::new(Some(payload), Effects::none()));
+            }
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            identity(&request, response).await
+        })
     }
 
     fn set<'a>(
@@ -1142,6 +1168,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
+            self.sets.fetch_add(1, Ordering::SeqCst);
             if request.payload.name() != ACCOUNT_SLOW.name {
                 return Ok(IqReply::new(None, Effects::none()));
             }

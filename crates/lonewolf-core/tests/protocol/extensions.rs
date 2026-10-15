@@ -409,6 +409,56 @@ fn enabled_account_handler_receives_an_iq_request() -> TestResult {
 }
 
 #[test]
+fn missing_account_requests_skip_registered_get_and_set_handlers() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    for kind in ["get", "set"] {
+        for namespace in ["urn:lonewolf:test:iq", "urn:lonewolf:test:unknown"] {
+            alice.send(&format!("<iq type='{kind}' id='missing-{kind}' to='missing@localhost'><query xmlns='{namespace}'/></iq>"))?;
+            let recipient = if namespace == "urn:lonewolf:test:iq" {
+                " to='alice@localhost/desk'"
+            } else {
+                ""
+            };
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='missing-{kind}' from='missing@localhost'{recipient}><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        }
+    }
+    alice.send("<iq type='result' id='missing-result' to='missing@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
+    alice.send("<iq type='error' id='missing-error' to='missing@localhost'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.send(
+        "<iq type='get' id='calls'><query xmlns='urn:lonewolf:test:iq' calls='true'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='calls' to='alice@localhost/desk'><calls xmlns='urn:lonewolf:test:iq' gets='0' sets='0'/></iq>")?;
+    alice.close()
+}
+
+#[test]
+fn own_account_get_and_set_accept_omitted_and_explicit_targets() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-iq'")?;
+    suite.create_account("alice", "password")?;
+    let mut alice = suite.connect("alice", "password", "desk")?;
+    for (address, reply_address) in [
+        ("", ""),
+        (" to='alice@localhost'", " from='alice@localhost'"),
+    ] {
+        alice.send(&format!(
+            "<iq type='get' id='own-get'{address}><query xmlns='urn:lonewolf:test:iq'/></iq>"
+        ))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='own-get'{reply_address} to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='alice@localhost'/></iq>"))?;
+        alice.send(&format!(
+            "<iq type='set' id='own-set'{address}><query xmlns='urn:lonewolf:test:iq'/></iq>"
+        ))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='own-set'{reply_address} to='alice@localhost/desk'/>"))?;
+    }
+    alice.send(
+        "<iq type='get' id='calls'><query xmlns='urn:lonewolf:test:iq' calls='true'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='calls' to='alice@localhost/desk'><calls xmlns='urn:lonewolf:test:iq' gets='2' sets='2'/></iq>")?;
+    alice.close()
+}
+
+#[test]
 fn subscription_presence_handlers_receive_authenticated_directed_requests() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-presence'")?;
     suite.create_account("alice", "password")?;
@@ -529,6 +579,7 @@ fn only_the_direct_payload_element_selects_the_handler() -> TestResult {
 fn qualified_payload_and_authenticated_identity_reach_the_handler() -> TestResult {
     let suite = C2sSuite::with_extensions("'test-iq'")?;
     suite.create_account("alice", "password")?;
+    suite.create_account("bob", "password")?;
     let mut alice = suite.connect("alice", "password", "desk")?;
     alice.send("<iq type='get' id='a&amp;b' from='mallory@localhost/spy' to='bob@localhost'><t:query xmlns:t='urn:lonewolf:test:iq' value='one &amp; two'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='a&amp;b' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='bob@localhost' value='one &amp; two'/></iq>")?;

@@ -22,7 +22,7 @@ use x509_cert::Certificate;
 use x509_cert::der::Decode;
 use zeroize::Zeroizing;
 
-use crate::config::{HostConfig, HostTlsConfig};
+use crate::config::{HostConfig, HostTlsConfig, HostTlsSource};
 use lonewolf_util::blocking::BlockingExecutor;
 
 pub mod client_identity;
@@ -260,34 +260,40 @@ fn load_certified_key(
     tls: &HostTlsConfig,
     provider: &rustls::crypto::CryptoProvider,
 ) -> Result<CertifiedKey, HostsError> {
+    let HostTlsSource::Files {
+        certificate_chain_path,
+        private_key_path,
+    } = &tls.source
+    else {
+        return Err(HostsError::ManagedCertificateUnavailable(domain.into()));
+    };
     let certificate_file =
-        File::open(&tls.certificate_chain_path).map_err(|source| HostsError::ReadCertificate {
+        File::open(certificate_chain_path).map_err(|source| HostsError::ReadCertificate {
             domain: domain.into(),
-            path: tls.certificate_chain_path.clone(),
+            path: certificate_chain_path.clone(),
             source,
         })?;
     let certificates = CertificateDer::pem_reader_iter(certificate_file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| HostsError::ReadCertificate {
             domain: domain.into(),
-            path: tls.certificate_chain_path.clone(),
+            path: certificate_chain_path.clone(),
             source: io::Error::other(source),
         })?;
     if certificates.is_empty() {
         return Err(HostsError::NoCertificates(domain.into()));
     }
 
-    let key_file =
-        File::open(&tls.private_key_path).map_err(|source| HostsError::ReadPrivateKey {
-            domain: domain.into(),
-            path: tls.private_key_path.clone(),
-            source,
-        })?;
+    let key_file = File::open(private_key_path).map_err(|source| HostsError::ReadPrivateKey {
+        domain: domain.into(),
+        path: private_key_path.clone(),
+        source,
+    })?;
     let key = PrivateKeyDer::from_pem_reader(key_file).map_err(|source| match source {
         PemError::NoItemsFound => HostsError::NoPrivateKey(domain.into()),
         source => HostsError::ReadPrivateKey {
             domain: domain.into(),
-            path: tls.private_key_path.clone(),
+            path: private_key_path.clone(),
             source: io::Error::other(source),
         },
     })?;
@@ -389,6 +395,7 @@ pub enum HostsError {
     DefaultRequired,
     UnknownDefault(String),
     MissingTls(String),
+    ManagedCertificateUnavailable(String),
     ReadCertificate {
         domain: String,
         path: PathBuf,
@@ -428,6 +435,10 @@ impl fmt::Display for HostsError {
                 )
             }
             Self::MissingTls(domain) => write!(formatter, "hosts.{domain}.tls is required"),
+            Self::ManagedCertificateUnavailable(domain) => write!(
+                formatter,
+                "managed TLS certificate for hosts.{domain} is unavailable"
+            ),
             Self::ReadCertificate {
                 domain,
                 path,

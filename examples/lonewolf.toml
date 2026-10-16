@@ -46,21 +46,74 @@
 # [hosts."example.com".offline]
 # max_messages_per_account = 100
 
-# Configure a PEM certificate chain and private key for each host except localhost.
+# Choose certificate files or automatic certificates for each host except localhost.
 # Localhost uses a new self-signed certificate on each start if you omit its TLS section.
+# The files provider requires both PEM paths.
 # Use a leaf certificate signed with RSA PKCS#1 v1.5 or ECDSA and SHA-256, SHA-384, or SHA-512.
 # Ed25519 certificates cannot provide the required SCRAM channel binding.
 # Relative paths start from the directory where Lonewolf was launched.
 # [hosts."example.com".tls]
+# provider = "files"
 # certificate_chain_path = "./certs/example.com.crt"
 # private_key_path = "./certs/example.com.key"
 
+# Use this provider-only example for automatic certificates instead of file paths.
+# Selecting this provider opts in to ACME account registration and subscriber terms.
+# Use a DNS domain with at least two labels; IP addresses and localhost are excluded.
+# ```toml
+# [hosts."example.com".tls]
+# provider = "letsencrypt"
+# ```
+
 # Request trusted client certificates while keeping password authentication available.
 # Both paths are required for this table. Use PEM trust anchors and current CRLs.
-# These paths are example values.
+# These paths are example values and work with either certificate provider.
 # [hosts."example.com".tls.client_auth]
 # trust_anchors_path = "./certs/client-roots.pem"
 # crls_path = "./certs/client-crls.pem"
+
+# [letsencrypt]
+
+# Choose local HTTP challenge endpoints for hosts with automatic certificates.
+# Validation always reaches public port 80 on every published A and AAAA address.
+# Forward that port to these endpoints when using a proxy or port mapping.
+# A proxy must preserve the original Host header and request path.
+# IPv6 endpoints accept IPv6 only. Local endpoints must not overlap each other,
+# client endpoints, or enabled metrics endpoints.
+# listen = ["0.0.0.0:80"]
+
+# Use a high loopback port when a local proxy forwards public port 80.
+# ```toml
+# [letsencrypt]
+# listen = ["127.0.0.1:8080"]
+# ```
+
+# Add an explicit IPv6 endpoint when publishing an AAAA address.
+# ```toml
+# [letsencrypt]
+# listen = ["0.0.0.0:80", "[::]:80"]
+# ```
+
+# Keep ACME accounts and certificates on durable storage across deployments.
+# Relative paths start from the directory where Lonewolf was launched.
+# state_path = "./data/lonewolf/acme.redb"
+
+# Choose the HTTPS certificate authority directory.
+# The exact URL selects a separate account and certificate cache.
+# directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+
+# Use staging to test issuance; its certificates require separate client trust.
+# ```toml
+# [letsencrypt]
+# directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+# ```
+
+# Add a PEM CA bundle when a private HTTPS directory needs extra trust.
+# This optional path has no default; the value below is an example.
+# ```toml
+# [letsencrypt]
+# ca_certificates_path = "./certs/acme-ca.pem"
+# ```
 
 # All numeric limits are positive integers.
 # [limits.c2s]

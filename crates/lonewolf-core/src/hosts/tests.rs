@@ -3,9 +3,9 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::config::{Config, HostConfig, HostTlsConfig};
+use crate::config::{Config, HostConfig, HostTlsConfig, HostTlsSource};
 use crate::hosts::test_support::{TestSigner, pem};
 use crate::hosts::{Hosts, HostsError};
 use graviola::signing::eddsa::Ed25519SigningKey;
@@ -13,6 +13,37 @@ use rcgen::{CertificateParams, PublicKeyData};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[test]
+fn managed_hosts_reject_unavailable_certificates_without_file_or_generated_fallback() -> TestResult
+{
+    for domain in ["example.com", "localhost"] {
+        let configured = BTreeMap::from([(
+            domain.into(),
+            HostConfig {
+                tls: Some(HostTlsConfig {
+                    source: HostTlsSource::LetsEncrypt,
+                    client_auth: Some(crate::config::ClientCertificateConfig {
+                        trust_anchors_path: "missing-roots.pem".into(),
+                        crls_path: "missing-crls.pem".into(),
+                    }),
+                }),
+                ..HostConfig::default()
+            },
+        )]);
+        let error = Hosts::new(&configured, None)
+            .err()
+            .ok_or("managed host accepted")?;
+        assert!(
+            matches!(&error, HostsError::ManagedCertificateUnavailable(name) if name == domain)
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("managed TLS certificate for hosts.{domain} is unavailable")
+        );
+    }
+    Ok(())
+}
 
 #[test]
 fn idn_host_initializes_with_an_alabel_certificate() -> TestResult {
@@ -266,8 +297,10 @@ fn certificate_files_are_checked_during_bootstrap() -> TestResult {
         .get_mut("example.com")
         .ok_or("missing host")?
         .tls = Some(HostTlsConfig {
-        certificate_chain_path: tls.certificate_chain_path,
-        private_key_path: PathBuf::from("missing.key"),
+        source: HostTlsSource::Files {
+            certificate_chain_path: file_paths(&tls)?.0.to_path_buf(),
+            private_key_path: PathBuf::from("missing.key"),
+        },
         client_auth: None,
     });
     assert!(matches!(
@@ -288,8 +321,10 @@ fn mismatched_private_key_is_rejected() -> TestResult {
         "example.com".into(),
         HostConfig {
             tls: Some(HostTlsConfig {
-                certificate_chain_path: tls.certificate_chain_path,
-                private_key_path: other.private_key_path,
+                source: HostTlsSource::Files {
+                    certificate_chain_path: file_paths(&tls)?.0.to_path_buf(),
+                    private_key_path: file_paths(&other)?.1.to_path_buf(),
+                },
                 client_auth: None,
             }),
             ..HostConfig::default()
@@ -316,14 +351,15 @@ fn empty_and_malformed_certificate_files_are_rejected() -> TestResult {
         },
     );
 
-    fs::write(&tls.certificate_chain_path, b"")?;
+    let (certificate_chain_path, _) = file_paths(&tls)?;
+    fs::write(certificate_chain_path, b"")?;
     assert!(matches!(
         Hosts::new(&config.hosts, None),
         Err(HostsError::NoCertificates(_))
     ));
 
     fs::write(
-        &tls.certificate_chain_path,
+        certificate_chain_path,
         b"-----BEGIN CERTIFICATE-----\n!\n-----END CERTIFICATE-----\n",
     )?;
     assert!(matches!(
@@ -331,14 +367,14 @@ fn empty_and_malformed_certificate_files_are_rejected() -> TestResult {
         Err(HostsError::ReadCertificate { .. })
     ));
 
-    fs::write(&tls.certificate_chain_path, pem("CERTIFICATE", b"not DER")?)?;
+    fs::write(certificate_chain_path, pem("CERTIFICATE", b"not DER")?)?;
     assert!(matches!(
         Hosts::new(&config.hosts, None),
         Err(HostsError::InvalidCertificate { .. })
     ));
 
     let restored = test_tls_files(&directory, "example.com", "restored")?;
-    fs::write(&restored.private_key_path, b"")?;
+    fs::write(file_paths(&restored)?.1, b"")?;
     config
         .hosts
         .get_mut("example.com")
@@ -395,8 +431,10 @@ fn hashless_certificate_signature_is_rejected_at_bootstrap() -> TestResult {
         "example.com".into(),
         HostConfig {
             tls: Some(HostTlsConfig {
-                certificate_chain_path,
-                private_key_path,
+                source: HostTlsSource::Files {
+                    certificate_chain_path,
+                    private_key_path,
+                },
                 client_auth: None,
             }),
             ..HostConfig::default()
@@ -472,6 +510,16 @@ fn test_tls_files(
     )
 }
 
+fn file_paths(tls: &HostTlsConfig) -> Result<(&Path, &Path), Box<dyn Error>> {
+    match &tls.source {
+        HostTlsSource::Files {
+            certificate_chain_path,
+            private_key_path,
+        } => Ok((certificate_chain_path, private_key_path)),
+        HostTlsSource::LetsEncrypt => Err("expected file TLS source".into()),
+    }
+}
+
 fn test_tls_parameters(
     directory: &TempDir,
     mut parameters: CertificateParams,
@@ -490,8 +538,10 @@ fn test_tls_parameters(
     )?;
     fs::write(&private_key_path, pem("PRIVATE KEY", private_key)?)?;
     Ok(HostTlsConfig {
-        certificate_chain_path,
-        private_key_path,
+        source: HostTlsSource::Files {
+            certificate_chain_path,
+            private_key_path,
+        },
         client_auth: None,
     })
 }

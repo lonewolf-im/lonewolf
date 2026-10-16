@@ -179,3 +179,22 @@ fn selected_dns_hosts_keep_case_insensitive_and_absent_sni_policy() -> TestResul
     }
     suite.stop()
 }
+
+#[test]
+fn pending_managed_host_rejects_starttls_before_proceed_without_disrupting_file_host() -> TestResult
+{
+    let mut suite = C2sSuite::with_hosts("[hosts.'example.com'.tls]\nprovider = 'letsencrypt'")?;
+    let mut pending = suite.tcp_client()?;
+    pending.open_with(&opening("example.com"))?;
+    pending.features()?.child(TLS_NAMESPACE, "starttls")?;
+    pending.send(&format!("<starttls xmlns='{TLS_NAMESPACE}'/>"))?;
+    pending.receive()?.assert_name(TLS_NAMESPACE, "failure");
+    pending.expect_footer()?;
+    pending.send("</stream:stream>")?;
+    pending.expect_eof()?;
+    suite.wait_for_log("outcome=\"starttls_rejected\"")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut healthy = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    healthy.close()?;
+    suite.stop()
+}

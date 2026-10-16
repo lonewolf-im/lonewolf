@@ -315,7 +315,6 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 CloseOutcome::AuthenticationTimeout,
                 context.interrupt(authenticate(
                     &mut established,
-                    &hosts,
                     &auth,
                     settings.auth_mechanisms,
                     settings.authentication_retries.get(),

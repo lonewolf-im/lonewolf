@@ -15,13 +15,12 @@ use lonewolf_xmpp::parser::{Parsed, StreamEvent};
 use lonewolf_xmpp::stanza::{Element, NodeRef, XML_NAMESPACE};
 
 use super::certificate::CertificateMonitor;
-use super::establish::{Established, STARTTLS_FAILURE, is_starttls_element};
+use super::establish::{Established, STARTTLS_FAILURE, TlsBinding, is_starttls_element};
 use super::outcome::CloseOutcome;
 use super::session::{Session, Writer, namespace_error};
 use crate::c2s::AuthService;
 use crate::c2s::metrics::C2sWorkerMetrics;
 use crate::config::AuthMechanisms;
-use crate::hosts::Hosts;
 use crate::hosts::client_identity::{ClientValidity, VerifiedClient};
 
 pub(super) const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
@@ -132,7 +131,6 @@ pub(super) fn sasl_features(
 /// A rejected request, an aborted exchange and a replaced request each cost one attempt.
 pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
     established: &mut Established<A>,
-    hosts: &Hosts,
     auth: &AuthService,
     mechanisms: AuthMechanisms,
     retries: usize,
@@ -147,16 +145,12 @@ pub(super) async fn authenticate<A: ChunkAllocator + Clone>(
         monitor,
     } = established;
     let host = session.host().to_owned();
-    let Some(endpoint) = hosts.tls_server_end_point(&host) else {
-        return Err(CloseOutcome::InternalError);
-    };
     let mut authentication = Authentication {
         session,
         host: &host,
         client_from: client_from.as_deref(),
-        exporter: &binding.exporter,
+        binding,
         exporter_use: ExporterUse::Unused,
-        endpoint,
         auth,
         mechanisms,
         client: client.as_ref(),
@@ -201,9 +195,8 @@ struct Authentication<'a, A: ChunkAllocator> {
     session: &'a mut Session<A>,
     host: &'a str,
     client_from: Option<&'a str>,
-    exporter: &'a [u8; 32],
+    binding: &'a TlsBinding,
     exporter_use: ExporterUse,
-    endpoint: &'a [u8],
     auth: &'a AuthService,
     mechanisms: AuthMechanisms,
     client: Option<&'a VerifiedClient>,
@@ -461,12 +454,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         server: &ScramServer,
         response: &[u8],
     ) -> Result<Attempt, CloseOutcome> {
-        let binding_data: &[u8] = match server.binding() {
-            Some(BindingType::TlsExporter) => self.exporter,
-            Some(BindingType::TlsServerEndPoint) => self.endpoint,
-            None => &[],
-        };
-        let final_message = match server.finish(response, binding_data) {
+        let final_message = match finish_scram(server, response, self.binding) {
             Ok(message) if identity.credential_known => Some(message),
             Ok(_) | Err(ServerError::InvalidProof | ServerError::ChannelBindingMismatch) => None,
             Err(error) => {
@@ -563,6 +551,19 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
         self.session.writer.send(&xml).await
     }
+}
+
+fn finish_scram(
+    server: &ScramServer,
+    response: &[u8],
+    binding: &TlsBinding,
+) -> Result<String, ServerError> {
+    let data: &[u8] = match server.binding() {
+        Some(BindingType::TlsExporter) => &binding.exporter,
+        Some(BindingType::TlsServerEndPoint) => &binding.server_end_point,
+        None => &[],
+    };
+    server.finish(response, data)
 }
 
 async fn send_sasl_failure<W: AsyncWrite + Unpin>(
@@ -706,6 +707,127 @@ mod tests {
 
     use super::*;
     use crate::c2s::metrics::C2sMetrics;
+
+    #[test]
+    fn endpoint_scram_uses_captured_tls_generation_after_publication() -> Result<(), Box<dyn Error>>
+    {
+        use crate::hosts::test_support::{handshake, managed_hosts, material};
+        use lonewolf_auth::scram::{ScramIterations, ScramVerifier};
+        use sha2::{Digest, Sha256};
+        use std::sync::Arc;
+        Runtime::new()?.block_on(async {
+            let hosts = managed_hosts()?;
+            let (a, key_a) = material(rcgen::CertificateParams::new(vec!["example.com".into()])?)?;
+            let (b, key_b) = material(rcgen::CertificateParams::new(vec!["example.com".into()])?)?;
+            hosts
+                .prepare_managed_certificate("example.com", vec![a.clone()], key_a)?
+                .activate();
+            let selected_a = hosts
+                .tls_handshake("example.com")
+                .await
+                .ok_or("missing A")?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(a)?;
+            roots.add(b.clone())?;
+            let config = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls_graviola::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+            let peer_a = handshake(Arc::clone(&config), Arc::clone(&selected_a.config))?;
+            let digest_a =
+                Sha256::digest(peer_a.peer_certificates().ok_or("missing A peer")?[0].as_ref());
+            hosts
+                .prepare_managed_certificate("example.com", vec![b], key_b)?
+                .activate();
+            let selected_b = hosts
+                .tls_handshake("example.com")
+                .await
+                .ok_or("missing B")?;
+            let peer_b = handshake(config, Arc::clone(&selected_b.config))?;
+            let digest_b =
+                Sha256::digest(peer_b.peer_certificates().ok_or("missing B peer")?[0].as_ref());
+            assert_ne!(digest_a, digest_b);
+            let binding_a = TlsBinding {
+                exporter: [0; 32],
+                server_end_point: selected_a.server_end_point,
+            };
+            let binding_b = TlsBinding {
+                exporter: [0; 32],
+                server_end_point: selected_b.server_end_point,
+            };
+            for mechanism in [Mechanism::Sha1Plus, Mechanism::Sha256Plus] {
+                let verifier = ScramVerifier::derive(
+                    mechanism.hash(),
+                    "pencil",
+                    [7; 16],
+                    ScramIterations::new(4096)?,
+                )?;
+                let first =
+                    ClientFirst::parse(mechanism, b"p=tls-server-end-point,,n=alice,r=nonce", true)
+                        .map_err(|error| format!("invalid first message: {error:?}"))?;
+                let (server, challenge) = first
+                    .start(verifier, "server")
+                    .map_err(|error| format!("cannot start SCRAM: {error:?}"))?;
+                let proof_a = endpoint_proof(mechanism.hash(), &challenge, &digest_a)?;
+                let proof_b = endpoint_proof(mechanism.hash(), &challenge, &digest_b)?;
+                assert!(finish_scram(&server, proof_a.as_bytes(), &binding_a).is_ok());
+                assert_eq!(
+                    finish_scram(&server, proof_b.as_bytes(), &binding_a),
+                    Err(ServerError::ChannelBindingMismatch)
+                );
+                assert!(finish_scram(&server, proof_b.as_bytes(), &binding_b).is_ok());
+            }
+            Ok(())
+        })
+    }
+
+    fn endpoint_proof(
+        hash: lonewolf_auth::scram::ScramHash,
+        challenge: &str,
+        digest: &[u8],
+    ) -> Result<String, Box<dyn Error>> {
+        use hmac::{Hmac, KeyInit, Mac};
+        use lonewolf_auth::scram::ScramHash;
+        use sha1::Sha1;
+        use sha2::{Digest, Sha256};
+        let mut channel = b"p=tls-server-end-point,,".to_vec();
+        channel.extend_from_slice(digest);
+        let without_proof = format!("c={},r=nonceserver", STANDARD.encode(channel));
+        let message = format!("n=alice,r=nonce,{challenge},{without_proof}");
+        let proof = match hash {
+            ScramHash::Sha1 => {
+                let mut salted = [0; 20];
+                pbkdf2::pbkdf2_hmac::<Sha1>(b"pencil", &[7; 16], 4096, &mut salted);
+                let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&salted)?;
+                mac.update(b"Client Key");
+                let mut key = mac.finalize().into_bytes();
+                let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&Sha1::digest(key))?;
+                mac.update(message.as_bytes());
+                for (byte, signature) in key.iter_mut().zip(mac.finalize().into_bytes()) {
+                    *byte ^= signature;
+                }
+                key.to_vec()
+            }
+            ScramHash::Sha256 => {
+                let mut salted = [0; 32];
+                pbkdf2::pbkdf2_hmac::<Sha256>(b"pencil", &[7; 16], 4096, &mut salted);
+                let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&salted)?;
+                mac.update(b"Client Key");
+                let mut key = mac.finalize().into_bytes();
+                let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&Sha256::digest(key))?;
+                mac.update(message.as_bytes());
+                for (byte, signature) in key.iter_mut().zip(mac.finalize().into_bytes()) {
+                    *byte ^= signature;
+                }
+                key.to_vec()
+            }
+        };
+        Ok(format!("{without_proof},p={}", STANDARD.encode(proof)))
+    }
 
     struct RejectionWriter<'a> {
         flush_polled: &'a Cell<bool>,

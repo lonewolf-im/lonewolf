@@ -10,13 +10,14 @@ use crate::hosts::test_support::{TestSigner, pem};
 use crate::hosts::{Hosts, HostsError};
 use graviola::signing::eddsa::Ed25519SigningKey;
 use rcgen::{CertificateParams, PublicKeyData};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use x509_cert::der::{Decode, Encode};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
-fn managed_hosts_reject_unavailable_certificates_without_file_or_generated_fallback() -> TestResult
-{
+fn pending_managed_hosts_still_validate_client_certificate_policy() -> TestResult {
     for domain in ["example.com", "localhost"] {
         let configured = BTreeMap::from([(
             domain.into(),
@@ -35,11 +36,7 @@ fn managed_hosts_reject_unavailable_certificates_without_file_or_generated_fallb
             .err()
             .ok_or("managed host accepted")?;
         assert!(
-            matches!(&error, HostsError::ManagedCertificateUnavailable(name) if name == domain)
-        );
-        assert_eq!(
-            error.to_string(),
-            format!("managed TLS certificate for hosts.{domain} is unavailable")
+            matches!(&error, HostsError::ClientCertificates { domain: name, .. } if name == domain)
         );
     }
     Ok(())
@@ -75,7 +72,9 @@ fn assert_host_identity(domain: &str, certificate_identity: &str) -> TestResult 
     assert!(hosts.is_local_host(domain));
     assert!(hosts.certified_key(domain).is_some());
     assert_eq!(
-        hosts.tls_server_end_point(domain).map(<[u8]>::len),
+        hosts
+            .tls_server_end_point(domain)
+            .map(|digest| digest.len()),
         Some(32)
     );
     Ok(())
@@ -178,7 +177,9 @@ fn single_host_is_the_default_and_has_generated_tls() -> TestResult {
     assert!(!hosts.is_local_host("other.example"));
     assert!(hosts.tls_config("localhost").is_none());
     assert_eq!(
-        hosts.tls_server_end_point("localhost").map(<[u8]>::len),
+        hosts
+            .tls_server_end_point("localhost")
+            .map(|digest| digest.len()),
         Some(32)
     );
     let localhost = hosts
@@ -485,11 +486,11 @@ fn cloned_hosts_share_the_loaded_registry() -> TestResult {
     let cloned = hosts.clone();
 
     assert_eq!(cloned.default_host_name(), "localhost");
-    assert!(std::ptr::eq(
-        hosts
+    assert!(std::sync::Arc::ptr_eq(
+        &hosts
             .certified_key("localhost")
             .ok_or("missing certificate")?,
-        cloned
+        &cloned
             .certified_key("localhost")
             .ok_or("missing cloned certificate")?
     ));
@@ -620,7 +621,6 @@ fn client_certificate_material_is_checked_during_bootstrap() -> TestResult {
 fn required_crls_cannot_be_missing_empty_malformed_stale_or_unusable_at_bootstrap() -> TestResult {
     use super::client_identity::tests::Fixture;
     use rustls::pki_types::pem::PemObject;
-    use x509_cert::der::{Decode, Encode};
     let fixture = Fixture::new()?;
     let mut tls = test_tls_files(&fixture.directory, "localhost", "crl")?;
     tls.client_auth = Some(fixture.config.clone());
@@ -678,13 +678,15 @@ fn refreshed_host_configs_keep_session_caches_separate() -> TestResult {
         config.hosts.get_mut("localhost").ok_or("missing host")?.tls = Some(tls);
         let hosts = Hosts::new(&config.hosts, None)?;
         let first = hosts
-            .tls_server_config("localhost")
+            .tls_handshake("localhost")
             .await
-            .ok_or("missing first TLS config")?;
+            .ok_or("missing first TLS config")?
+            .config;
         let second = hosts
-            .tls_server_config("localhost")
+            .tls_handshake("localhost")
             .await
-            .ok_or("missing second TLS config")?;
+            .ok_or("missing second TLS config")?
+            .config;
         assert!(first.require_ems && second.require_ems);
         assert!(!std::sync::Arc::ptr_eq(
             &first.session_storage,
@@ -698,15 +700,17 @@ fn refreshed_host_configs_keep_session_caches_separate() -> TestResult {
         let config = Config::default();
         let hosts = Hosts::new(&config.hosts, None)?;
         let first = hosts
-            .tls_server_config("localhost")
+            .tls_handshake("localhost")
             .await
-            .ok_or("missing cached TLS config")?;
+            .ok_or("missing cached TLS config")?
+            .config;
         let second = hosts
-            .tls_server_config("localhost")
+            .tls_handshake("localhost")
             .await
-            .ok_or("missing cached TLS config")?;
+            .ok_or("missing cached TLS config")?
+            .config;
         assert!(std::sync::Arc::ptr_eq(&first, &second));
-        assert!(hosts.tls_server_config("unknown").await.is_none());
+        assert!(hosts.tls_handshake("unknown").await.is_none());
         Ok(())
     })
 }
@@ -728,7 +732,9 @@ fn srv_client_identity_initializes_a_host_without_a_dns_identity() -> TestResult
     let hosts = Hosts::new(&configured, None)?;
     assert_eq!(hosts.default_host_name(), "example.com");
     assert_eq!(
-        hosts.tls_server_end_point("example.com").map(<[u8]>::len),
+        hosts
+            .tls_server_end_point("example.com")
+            .map(|digest| digest.len()),
         Some(32)
     );
     Ok(())
@@ -770,6 +776,324 @@ fn server_service_and_unusable_srv_ids_cannot_initialize_a_client_host() -> Test
                 ..
             })
         ));
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_publication_keeps_captured_generations_and_resumption_coherent() -> TestResult {
+    use super::test_support::{handshake, managed_hosts, material};
+    use std::sync::Arc;
+    compio::runtime::Runtime::new()?.block_on(async {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let hosts = managed_hosts()?;
+            assert!(hosts.is_local_host("example.com"));
+            assert!(hosts.certified_key("example.com").is_none());
+            assert!(hosts.tls_handshake("example.com").await.is_none());
+            assert!(hosts.tls_handshake("localhost").await.is_some());
+            let (a, key_a) = material(CertificateParams::new(vec!["example.com".into()])?)?;
+            let (b, key_b) = material(CertificateParams::new(vec!["example.com".into()])?)?;
+            let prepared_a =
+                hosts.prepare_managed_certificate("example.com", vec![a.clone()], key_a)?;
+            assert!(hosts.certified_key("example.com").is_none());
+            prepared_a.activate();
+            let selected_a = hosts
+                .tls_handshake("example.com")
+                .await
+                .ok_or("missing A")?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(a.clone())?;
+            roots.add(b.clone())?;
+            let client = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls_graviola::default_provider(),
+                ))
+                .with_protocol_versions(&[version])?
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+            let first = handshake(Arc::clone(&client), Arc::clone(&selected_a.config))?;
+            assert_eq!(first.handshake_kind(), Some(rustls::HandshakeKind::Full));
+            assert_eq!(first.peer_certificates().ok_or("missing A chain")?[0], a);
+            let second = handshake(Arc::clone(&client), Arc::clone(&selected_a.config))?;
+            assert_eq!(
+                second.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed)
+            );
+            hosts
+                .prepare_managed_certificate("example.com", vec![b.clone()], key_b)?
+                .activate();
+            let selected_b = hosts
+                .tls_handshake("example.com")
+                .await
+                .ok_or("missing B")?;
+            assert!(!Arc::ptr_eq(
+                &selected_a.config.session_storage,
+                &selected_b.config.session_storage
+            ));
+            assert!(!Arc::ptr_eq(
+                &selected_a.config.ticketer,
+                &selected_b.config.ticketer
+            ));
+            assert_ne!(selected_a.server_end_point, selected_b.server_end_point);
+            let captured = handshake(Arc::clone(&client), Arc::clone(&selected_a.config))?;
+            assert_eq!(
+                captured
+                    .peer_certificates()
+                    .ok_or("missing captured A chain")?[0],
+                a
+            );
+            assert_eq!(
+                selected_a.server_end_point.as_ref(),
+                &Sha256::digest(a.as_ref())[..]
+            );
+            let renewed = handshake(Arc::clone(&client), Arc::clone(&selected_b.config))?;
+            assert_eq!(renewed.handshake_kind(), Some(rustls::HandshakeKind::Full));
+            assert_eq!(renewed.peer_certificates().ok_or("missing B chain")?[0], b);
+            assert_eq!(
+                selected_b.server_end_point.as_ref(),
+                &Sha256::digest(b.as_ref())[..]
+            );
+            let repeated = handshake(client, selected_b.config)?;
+            assert_eq!(
+                repeated.handshake_kind(),
+                Some(rustls::HandshakeKind::Resumed)
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn managed_preparation_rejects_invalid_material_without_publication() -> TestResult {
+    use super::test_support::{managed_hosts, material};
+    use rustls::pki_types::CertificateDer;
+    use std::sync::Arc;
+    let hosts = managed_hosts()?;
+    let parameters = || CertificateParams::new(vec!["example.com".into()]);
+    let (good, key) = material(parameters()?)?;
+    hosts
+        .prepare_managed_certificate("example.com", vec![good.clone()], key.clone_key())?
+        .activate();
+    let original = hosts.certified_key("example.com").ok_or("missing key")?;
+    let original_digest = hosts
+        .tls_server_end_point("example.com")
+        .ok_or("missing digest")?;
+    let now = time::OffsetDateTime::now_utc();
+    let mut invalid = Vec::new();
+    for names in [
+        vec!["wrong.example"],
+        vec!["*.example.com"],
+        vec!["example.com", "extra.example"],
+        vec!["example.com", "192.0.2.1"],
+    ] {
+        let (certificate, key) = material(CertificateParams::new(
+            names.into_iter().map(String::from).collect::<Vec<_>>(),
+        )?)?;
+        invalid.push((vec![certificate], key));
+    }
+    let ip_parameters = super::test_support::san_parameters(vec![
+        x509_cert::ext::pkix::name::GeneralName::IpAddress(x509_cert::der::asn1::OctetString::new(
+            [192, 0, 2, 1],
+        )?),
+    ])?;
+    let (ip, ip_key) = material(ip_parameters)?;
+    invalid.push((vec![ip], ip_key));
+    let srv_parameters = super::test_support::san_parameters(vec![super::test_support::srv_name(
+        "_xmpp-client.example.com",
+    )?])?;
+    let (srv, srv_key) = material(srv_parameters)?;
+    invalid.push((vec![srv], srv_key));
+    for (start, end) in [
+        (now - time::Duration::days(2), now - time::Duration::days(1)),
+        (now + time::Duration::days(1), now + time::Duration::days(2)),
+    ] {
+        let mut parameters = parameters()?;
+        parameters.not_before = start;
+        parameters.not_after = end;
+        let (certificate, key) = material(parameters)?;
+        invalid.push((vec![certificate], key));
+    }
+    let (_, wrong_key) = material(parameters()?)?;
+    invalid.push((vec![good.clone()], wrong_key));
+    invalid.push((Vec::new(), key.clone_key()));
+    invalid.push((vec![CertificateDer::from(vec![1, 2, 3])], key.clone_key()));
+    invalid.push((
+        vec![good.clone(), CertificateDer::from(vec![1, 2, 3])],
+        key.clone_key(),
+    ));
+    let ed_key = Ed25519SigningKey::generate()?;
+    let signer = Ed25519TestSigner {
+        public_key: ed_key.public_key().as_bytes(),
+        key: ed_key,
+    };
+    let mut ed_parameters = parameters()?;
+    ed_parameters.serial_number = Some(1u64.into());
+    let unsupported = ed_parameters.self_signed(&signer)?;
+    let mut bytes = zeroize::Zeroizing::new([0; 512]);
+    let ed_key = rustls::pki_types::PrivatePkcs8KeyDer::from(
+        signer.key.to_pkcs8_der(&mut bytes[..])?.to_vec(),
+    );
+    assert!(matches!(
+        hosts.prepare_managed_certificate(
+            "example.com",
+            vec![unsupported.der().clone()],
+            ed_key.into()
+        ),
+        Err(HostsError::UnsupportedChannelBinding(_))
+    ));
+    for (chain, key) in invalid {
+        assert!(
+            hosts
+                .prepare_managed_certificate("example.com", chain, key)
+                .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &original,
+            &hosts.certified_key("example.com").ok_or("lost key")?
+        ));
+        assert!(Arc::ptr_eq(
+            &original_digest,
+            &hosts
+                .tls_server_end_point("example.com")
+                .ok_or("lost digest")?
+        ));
+    }
+    for name in ["unknown.example", "localhost"] {
+        assert!(matches!(
+            hosts.prepare_managed_certificate(name, vec![good.clone()], key.clone_key()),
+            Err(HostsError::NotManaged(_))
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_lifetime_intersects_the_whole_chain_and_expiry_blocks_new_admission() -> TestResult {
+    use super::test_support::{managed_hosts, material};
+    use rustls::pki_types::UnixTime;
+    compio::runtime::Runtime::new()?.block_on(async {
+        let hosts = managed_hosts()?;
+        let now = time::OffsetDateTime::now_utc().replace_nanosecond(0)?;
+        let mut leaf = CertificateParams::new(vec!["example.com".into()])?;
+        leaf.not_before = now - time::Duration::days(1);
+        leaf.not_after = now + time::Duration::days(1);
+        let (leaf, key) = material(leaf)?;
+        let mut issuer = CertificateParams::new(Vec::<String>::new())?;
+        issuer.not_before = now - time::Duration::hours(1);
+        issuer.not_after = now + time::Duration::hours(1);
+        let (issuer, _) = material(issuer)?;
+        let mut prepared = hosts.prepare_managed_certificate(
+            "example.com",
+            vec![leaf.clone(), issuer],
+            key.clone_key(),
+        )?;
+        assert_eq!(
+            prepared.validity(),
+            (
+                (now - time::Duration::hours(1)).unix_timestamp() as u64,
+                (now + time::Duration::hours(1)).unix_timestamp() as u64
+            )
+        );
+        assert!(hosts.tls_handshake("example.com").await.is_none());
+        prepared.activate();
+        let admitted = hosts
+            .tls_handshake("example.com")
+            .await
+            .ok_or("missing admitted generation")?;
+        prepared = hosts.prepare_managed_certificate(
+            "example.com",
+            vec![leaf.clone()],
+            key.clone_key(),
+        )?;
+        std::sync::Arc::get_mut(&mut prepared.snapshot)
+            .ok_or("shared prepared generation")?
+            .validity = Some((0, UnixTime::now().as_secs()));
+        prepared.activate();
+        assert!(hosts.tls_handshake("example.com").await.is_none());
+        assert!(!admitted.server_end_point.is_empty());
+        let mut expired_issuer = CertificateParams::new(Vec::<String>::new())?;
+        expired_issuer.not_after = now - time::Duration::hours(1);
+        let (expired_issuer, _) = material(expired_issuer)?;
+        assert!(
+            hosts
+                .prepare_managed_certificate("example.com", vec![leaf, expired_issuer], key)
+                .is_err()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn concurrent_handshake_readers_observe_only_complete_generations() -> TestResult {
+    use super::test_support::{managed_hosts, material};
+    use std::sync::{Arc, Barrier};
+    let hosts = managed_hosts()?;
+    let (a, key_a) = material(CertificateParams::new(vec!["example.com".into()])?)?;
+    let (b, key_b) = material(CertificateParams::new(vec!["example.com".into()])?)?;
+    hosts
+        .prepare_managed_certificate("example.com", vec![a.clone()], key_a.clone_key())?
+        .activate();
+    let digest_a = Sha256::digest(a.as_ref());
+    let digest_b = Sha256::digest(b.as_ref());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(a.clone())?;
+    roots.add(b.clone())?;
+    let mut client =
+        rustls::ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    client.resumption = rustls::client::Resumption::disabled();
+    let client = Arc::new(client);
+    let barrier = Arc::new(Barrier::new(5));
+    let readers = (0..4)
+        .map(|_| {
+            let hosts = hosts.clone();
+            let barrier = Arc::clone(&barrier);
+            let digest_a = digest_a.to_vec();
+            let digest_b = digest_b.to_vec();
+            let client = Arc::clone(&client);
+            std::thread::spawn(move || -> Result<(), String> {
+                let runtime = compio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+                barrier.wait();
+                runtime.block_on(async {
+                    for _ in 0..20 {
+                        let selected = hosts
+                            .tls_handshake("example.com")
+                            .await
+                            .ok_or("missing generation")?;
+                        let peer =
+                            super::test_support::handshake(Arc::clone(&client), selected.config)
+                                .map_err(|error| error.to_string())?;
+                        let certificate =
+                            &peer.peer_certificates().ok_or("missing peer certificate")?[0];
+                        let digest = Sha256::digest(certificate.as_ref());
+                        assert_eq!(selected.server_end_point.as_ref(), &digest[..]);
+                        assert!(
+                            selected.server_end_point.as_ref() == digest_a
+                                || selected.server_end_point.as_ref() == digest_b
+                        );
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for _ in 0..20 {
+        hosts
+            .prepare_managed_certificate("example.com", vec![b.clone()], key_b.clone_key())?
+            .activate();
+        hosts
+            .prepare_managed_certificate("example.com", vec![a.clone()], key_a.clone_key())?
+            .activate();
+    }
+    for reader in readers {
+        reader
+            .join()
+            .map_err(|_| "reader panicked")?
+            .map_err(std::io::Error::other)?;
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn, ready};
 use std::io;
@@ -15,6 +16,7 @@ use ::http::header::{
 };
 use ::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use compio::net::{TcpListener, TcpSocket, TcpStream};
+use compio::runtime::fd::PollFd;
 use compio::time::sleep_until;
 use compio_io::compat::AsyncStream;
 use futures_util::io::{AsyncRead, AsyncWrite};
@@ -37,7 +39,7 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const PATH_PREFIX: &str = "/.well-known/acme-challenge/";
 
 pub struct Http01Server {
-    listeners: Option<Vec<TcpListener>>,
+    listeners: Option<Vec<PollFd<TcpListener>>>,
     challenges: Challenges,
 }
 
@@ -65,8 +67,9 @@ impl Http01Server {
             socket.set_reuseaddr(true)?;
             socket.bind(address).await?;
             let listener = socket.listen(128).await?;
+            SockRef::from(&listener).set_nonblocking(true)?;
             if let Some(listeners) = server.listeners.as_mut() {
-                listeners.push(listener);
+                listeners.push(PollFd::new(listener)?);
             }
         }
         Ok(server)
@@ -76,7 +79,7 @@ impl Http01Server {
         self.listeners
             .iter()
             .flatten()
-            .map(TcpListener::local_addr)
+            .map(|listener| listener.local_addr())
             .collect()
     }
 
@@ -85,10 +88,10 @@ impl Http01Server {
     pub async fn run(mut self, shutdown: impl Future<Output = Instant>) -> io::Result<()> {
         let (mut connections, deadline) = {
             let listeners = self.listeners.as_deref().unwrap_or_default();
-            let next_accept = |index| accept_endpoint(index, &listeners[index]);
             accept_connections(
-                (0..listeners.len()).map(next_accept).collect(),
-                next_accept,
+                listeners.len(),
+                |index, retry| wait_endpoint(index, &listeners[index], retry),
+                |index| accept_nonblocking(&listeners[index]),
                 |stream, deadline| serve_connection(stream, self.challenges.clone(), deadline),
                 shutdown,
                 CONNECTION_TIMEOUT,
@@ -111,63 +114,111 @@ impl Drop for Http01Server {
     }
 }
 
-async fn accept_endpoint(index: usize, listener: &TcpListener) -> (usize, io::Result<TcpStream>) {
-    let accepted = retry_accept(
-        || async { listener.accept().await.map(|(stream, _)| stream) },
-        index,
-    )
-    .await;
-    (index, accepted)
+async fn wait_endpoint(
+    index: usize,
+    listener: &PollFd<TcpListener>,
+    retry: Option<Instant>,
+) -> (usize, io::Result<()>) {
+    if let Some(deadline) = retry {
+        sleep_until(deadline).await;
+    }
+    (index, listener.accept_ready().await)
 }
 
-async fn retry_accept<T, A, F>(mut accept: A, endpoint: usize) -> io::Result<T>
-where
-    A: FnMut() -> F,
-    F: Future<Output = io::Result<T>>,
-{
-    loop {
-        match accept().await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => match error.kind() {
-                io::ErrorKind::Interrupted
-                | io::ErrorKind::ConnectionAborted
-                | io::ErrorKind::ConnectionReset => {
-                    let mut yielded = false;
-                    poll_fn(|context| {
-                        if yielded {
-                            Poll::Ready(())
-                        } else {
-                            yielded = true;
-                            context.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                    })
-                    .await;
-                }
-                _ => {
-                    tracing::warn!(endpoint, error_kind = ?error.kind(), "HTTP-01 accept failed");
-                    sleep_until(Instant::now() + ACCEPT_RETRY_DELAY).await;
-                }
-            },
+struct Accepted<T> {
+    stream: T,
+    accepted_at: Instant,
+}
+
+fn accept_nonblocking(listener: &TcpListener) -> io::Result<Accepted<TcpStream>> {
+    accept_with(listener, TcpStream::from_std)
+}
+
+fn accept_with<T>(
+    listener: &TcpListener,
+    convert: impl FnOnce(std::net::TcpStream) -> io::Result<T>,
+) -> io::Result<Accepted<T>> {
+    let (socket, _) = SockRef::from(listener).accept()?;
+    let accepted_at = Instant::now();
+    // Compio sets the mode for its backend when it attaches the stream.
+    socket.set_nonblocking(false)?;
+    let stream: std::net::TcpStream = socket.into();
+    Ok(Accepted {
+        stream: convert(stream)?,
+        accepted_at,
+    })
+}
+
+#[derive(Default)]
+struct Admission(Rc<Cell<usize>>);
+
+impl Admission {
+    fn acquire(&self) -> Option<Permit> {
+        let active = self.0.get();
+        if active == MAX_CONNECTIONS {
+            return None;
+        }
+        self.0.set(active + 1);
+        Some(Permit(self.0.clone()))
+    }
+}
+
+struct Permit(Rc<Cell<usize>>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+struct Admitted<C> {
+    // The transport must drop before its capacity permit.
+    connection: Pin<Box<C>>,
+    _permit: Permit,
+}
+
+impl<C: Future<Output = ()>> Future for Admitted<C> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        self.connection.as_mut().poll(context)
+    }
+}
+
+fn retry_after(error: &io::Error, endpoint: usize) -> Option<Instant> {
+    match error.kind() {
+        io::ErrorKind::WouldBlock
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset => None,
+        _ => {
+            tracing::warn!(endpoint, error_kind = ?error.kind(), "HTTP-01 accept failed");
+            Some(Instant::now() + ACCEPT_RETRY_DELAY)
         }
     }
 }
 
-async fn accept_connections<T, A, AF, S, C>(
-    mut accepts: FuturesUnordered<AF>,
-    mut next_accept: A,
+async fn accept_connections<T, W, WF, A, S, C>(
+    endpoints: usize,
+    mut wait: W,
+    mut accept: A,
     mut serve: S,
     shutdown: impl Future<Output = Instant>,
     connection_timeout: Duration,
-) -> (FuturesUnordered<C>, Instant)
+) -> (FuturesUnordered<Admitted<C>>, Instant)
 where
-    A: FnMut(usize) -> AF,
-    AF: Future<Output = (usize, io::Result<T>)>,
+    W: FnMut(usize, Option<Instant>) -> WF,
+    WF: Future<Output = (usize, io::Result<()>)>,
+    A: FnMut(usize) -> io::Result<Accepted<T>>,
     S: FnMut(T, Instant) -> C,
     C: Future<Output = ()>,
 {
+    const WORK_PER_POLL: usize = 64;
     let mut shutdown = pin!(shutdown);
     let mut connections = FuturesUnordered::new();
+    let mut waiting = FuturesUnordered::new();
+    let mut ready: VecDeque<_> = (0..endpoints).collect();
+    let admission = Admission::default();
     let deadline = poll_fn(|context| {
         if let Poll::Ready(deadline) = shutdown.as_mut().poll(context) {
             return Poll::Ready(deadline);
@@ -176,14 +227,58 @@ where
         if let Poll::Ready(deadline) = shutdown.as_mut().poll(context) {
             return Poll::Ready(deadline);
         }
-        // Cancelling a pending accept can discard a new connection.
-        if connections.len() < MAX_CONNECTIONS
-            && let Poll::Ready(Some((index, result))) = Pin::new(&mut accepts).poll_next(context)
-        {
-            accepts.push(next_accept(index));
-            if let Ok(stream) = result {
-                connections.push(serve(stream, Instant::now() + connection_timeout));
+        let mut work = 0;
+        // Readiness operations cannot accept sockets, so they remain safe at capacity.
+        while work < WORK_PER_POLL / 2 {
+            match Pin::new(&mut waiting).poll_next(context) {
+                Poll::Ready(Some((index, Ok(())))) => ready.push_back(index),
+                Poll::Ready(Some((index, Err(error)))) => {
+                    let retry = retry_after(&error, index);
+                    waiting.push(wait(index, retry));
+                }
+                Poll::Ready(None) | Poll::Pending => break,
             }
+            work += 1;
+        }
+        while work < WORK_PER_POLL && !ready.is_empty() {
+            if let Poll::Ready(deadline) = shutdown.as_mut().poll(context) {
+                return Poll::Ready(deadline);
+            }
+            let Some(permit) = admission.acquire() else {
+                break;
+            };
+            let Some(index) = ready.pop_front() else {
+                break;
+            };
+            match accept(index) {
+                Ok(Accepted {
+                    stream,
+                    accepted_at,
+                }) => {
+                    connections.push(Admitted {
+                        connection: Box::pin(serve(stream, accepted_at + connection_timeout)),
+                        _permit: permit,
+                    });
+                    ready.push_back(index);
+                }
+                Err(error) => {
+                    drop(permit);
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                    ) {
+                        ready.push_back(index);
+                    } else {
+                        let retry = retry_after(&error, index);
+                        waiting.push(wait(index, retry));
+                    }
+                }
+            }
+            work += 1;
+        }
+        if work > 0 {
             context.waker().wake_by_ref();
         }
         Poll::Pending

@@ -467,152 +467,277 @@ fn real_slowloris_is_closed_at_five_second_deadline() -> TestResult {
     })
 }
 
-#[test]
-fn global_connection_limit_and_shutdown_are_deterministic() -> TestResult {
-    Runtime::new()?.block_on(async {
-        let accepts = Cell::new(0);
-        let active = Rc::new(Cell::new(0));
-        let peak = Cell::new(0);
-        let (stop, stopped) = oneshot::channel();
-        let stop = Cell::new(Some(stop));
-        let next_accept = |index| {
-            let accepts = &accepts;
-            async move {
-                accepts.set(accepts.get() + 1);
-                (index, Ok(()))
-            }
-        };
-        let (connections, _) = timeout(
-            Duration::from_secs(1),
-            accept_connections(
-                (0..3).map(next_accept).collect(),
-                next_accept,
-                |(), deadline| {
-                    assert!(deadline > Instant::now());
-                    active.set(active.get() + 1);
-                    peak.set(peak.get().max(active.get()));
-                    let active = active.clone();
-                    let stop = &stop;
-                    async move {
-                        struct Active(Rc<Cell<usize>>);
-                        impl Drop for Active {
-                            fn drop(&mut self) {
-                                self.0.set(self.0.get() - 1);
-                            }
-                        }
-                        let _active = Active(active.clone());
-                        if active.get() == MAX_CONNECTIONS {
-                            stop.take().unwrap().send(Instant::now()).unwrap();
-                        }
-                        pending::<()>().await;
-                    }
-                },
-                async { stopped.await.unwrap() },
-                CONNECTION_TIMEOUT,
-            ),
-        )
-        .await?;
-        assert_eq!(peak.get(), 32);
-        assert_eq!(accepts.get(), 32);
-        drop(connections);
-        assert_eq!(active.get(), 0);
-        Ok(())
-    })
+struct Model {
+    queued: RefCell<Vec<usize>>,
+    waits: RefCell<Vec<usize>>,
+    ready: RefCell<Vec<bool>>,
+    wait_wakers: RefCell<Vec<Option<std::task::Waker>>>,
+    live: Cell<usize>,
+    peak: Cell<usize>,
+    accepted: RefCell<Vec<(usize, Instant)>>,
+    completed: RefCell<Vec<bool>>,
+    service_wakers: RefCell<Vec<Option<std::task::Waker>>>,
+    readiness_completed: Cell<usize>,
+    clock: Cell<Instant>,
 }
 
-#[test]
-fn pending_accept_is_not_recreated_when_connections_complete() -> TestResult {
-    Runtime::new()?.block_on(async {
-        let created = Cell::new(0);
-        let completed = Cell::new(false);
-        let next_accept = |index| {
-            created.set(created.get() + 1);
-            let first = created.get() == 1;
-            async move {
-                if !first {
-                    pending::<()>().await;
-                }
-                (index, Ok(()))
-            }
-        };
-        let shutdown = poll_fn(|context| {
-            if completed.get() {
-                Poll::Ready(Instant::now())
+impl Model {
+    fn new(endpoints: usize) -> Rc<Self> {
+        Rc::new(Self {
+            queued: RefCell::new(vec![0; endpoints]),
+            waits: RefCell::new(vec![0; endpoints]),
+            ready: RefCell::new(vec![false; endpoints]),
+            wait_wakers: RefCell::new(vec![None; endpoints]),
+            live: Cell::new(0),
+            peak: Cell::new(0),
+            accepted: RefCell::new(Vec::new()),
+            completed: RefCell::new(Vec::new()),
+            service_wakers: RefCell::new(Vec::new()),
+            readiness_completed: Cell::new(0),
+            clock: Cell::new(Instant::now()),
+        })
+    }
+
+    fn incoming(&self, endpoint: usize, count: usize) {
+        self.queued.borrow_mut()[endpoint] += count;
+        self.ready.borrow_mut()[endpoint] = true;
+        if let Some(waker) = &self.wait_wakers.borrow()[endpoint] {
+            waker.wake_by_ref();
+        }
+    }
+
+    fn wait(
+        self: &Rc<Self>,
+        endpoint: usize,
+    ) -> impl Future<Output = (usize, io::Result<()>)> + use<> {
+        self.waits.borrow_mut()[endpoint] += 1;
+        let model = self.clone();
+        poll_fn(move |context| {
+            if model.ready.borrow_mut()[endpoint] {
+                model.ready.borrow_mut()[endpoint] = false;
+                model
+                    .readiness_completed
+                    .set(model.readiness_completed.get() + 1);
+                Poll::Ready((endpoint, Ok(())))
             } else {
-                context.waker().wake_by_ref();
+                model.wait_wakers.borrow_mut()[endpoint] = Some(context.waker().clone());
                 Poll::Pending
             }
-        });
-        let (connections, _) = timeout(
-            Duration::from_secs(1),
-            accept_connections(
-                [next_accept(0)].into_iter().collect(),
-                next_accept,
-                |(), _| async {
-                    completed.set(true);
-                },
-                shutdown,
-                CONNECTION_TIMEOUT,
-            ),
-        )
-        .await?;
-        assert!(connections.is_empty());
-        assert_eq!(created.get(), 2);
-        Ok(())
-    })
+        })
+    }
+
+    fn accept(self: &Rc<Self>, endpoint: usize) -> io::Result<Accepted<ModelSocket>> {
+        let mut queued = self.queued.borrow_mut();
+        if queued[endpoint] == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        queued[endpoint] -= 1;
+        if queued[endpoint] == 0 {
+            self.ready.borrow_mut()[endpoint] = false;
+        }
+        let id = self.accepted.borrow().len();
+        let accepted_at = self.clock.get();
+        self.accepted.borrow_mut().push((endpoint, accepted_at));
+        self.completed.borrow_mut().push(false);
+        self.service_wakers.borrow_mut().push(None);
+        self.live.set(self.live.get() + 1);
+        self.peak.set(self.peak.get().max(self.live.get()));
+        Ok(Accepted {
+            stream: ModelSocket {
+                model: self.clone(),
+                id,
+            },
+            accepted_at,
+        })
+    }
+
+    fn complete(&self, id: usize) {
+        self.completed.borrow_mut()[id] = true;
+        if let Some(waker) = &self.service_wakers.borrow()[id] {
+            waker.wake_by_ref();
+        }
+    }
+}
+
+struct ModelSocket {
+    model: Rc<Model>,
+    id: usize,
+}
+
+impl Future for ModelSocket {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        if self.model.completed.borrow()[self.id] {
+            Poll::Ready(())
+        } else {
+            self.model.service_wakers.borrow_mut()[self.id] = Some(context.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for ModelSocket {
+    fn drop(&mut self) {
+        self.model.live.set(self.model.live.get() - 1);
+    }
+}
+
+async fn drive_until<F: Future>(mut driver: Pin<&mut F>, condition: impl Fn() -> bool) {
+    timeout(
+        Duration::from_secs(2),
+        poll_fn(|context| {
+            assert!(driver.as_mut().poll(context).is_pending());
+            if condition() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .unwrap();
 }
 
 #[test]
-fn accept_errors_retry_without_starving_shutdown() -> TestResult {
+fn completed_readiness_at_capacity_never_owns_a_hidden_socket_or_refreshes_deadlines() -> TestResult
+{
     Runtime::new()?.block_on(async {
-        for kind in [
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::ConnectionReset,
-        ] {
-            let attempts = Cell::new(0);
-            let result = retry_accept(
-                || {
-                    attempts.set(attempts.get() + 1);
-                    ready(if attempts.get() == 1 {
-                        Err(io::Error::from(kind))
-                    } else {
-                        Ok(())
-                    })
-                },
-                0,
-            )
-            .await;
-            assert!(result.is_ok());
-            assert_eq!(attempts.get(), 2);
+        let model = Model::new(2);
+        model.incoming(0, 32);
+        let deadlines = RefCell::new(Vec::new());
+        let (stop, stopped) = oneshot::channel();
+        let mut driver = Box::pin(accept_connections(
+            2,
+            |index, retry| {
+                assert!(retry.is_none());
+                model.wait(index)
+            },
+            |index| model.accept(index),
+            |socket, deadline| {
+                deadlines.borrow_mut().push(deadline);
+                socket
+            },
+            async { stopped.await.unwrap() },
+            CONNECTION_TIMEOUT,
+        ));
+        drive_until(driver.as_mut(), || {
+            model.live.get() == 32 && model.wait_wakers.borrow()[1].is_some()
+        })
+        .await;
+        let original_deadline = deadlines.borrow()[0];
+        model.incoming(1, 1);
+        assert_eq!(model.accepted.borrow().len(), 32);
+        drive_until(driver.as_mut(), || model.readiness_completed.get() == 1).await;
+        assert_eq!(model.accepted.borrow().len(), 32);
+        assert_eq!(model.live.get(), 32);
+        let accepted_later = model.clock.get() + Duration::from_secs(1);
+        model.clock.set(accepted_later);
+        model.complete(0);
+        drive_until(driver.as_mut(), || model.accepted.borrow().len() == 33).await;
+        assert_eq!(model.accepted.borrow()[32], (1, accepted_later));
+        assert_eq!(deadlines.borrow()[32], accepted_later + CONNECTION_TIMEOUT);
+        assert_eq!(deadlines.borrow()[0], original_deadline);
+        assert_eq!(model.peak.get(), 32);
+        stop.send(Instant::now()).unwrap();
+        let (connections, _) = driver.await;
+        drop(connections);
+        assert_eq!(model.live.get(), 0);
+    });
+    Ok(())
+}
+
+#[test]
+fn idle_endpoints_do_not_reserve_capacity_and_pending_readiness_is_retained() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let model = Model::new(40);
+        model.incoming(39, 1);
+        let (stop, stopped) = oneshot::channel();
+        let mut driver = Box::pin(accept_connections(
+            40,
+            |index, _| model.wait(index),
+            |index| model.accept(index),
+            |socket, _| socket,
+            async { stopped.await.unwrap() },
+            CONNECTION_TIMEOUT,
+        ));
+        drive_until(driver.as_mut(), || {
+            model.live.get() == 1 && model.wait_wakers.borrow().iter().all(Option::is_some)
+        })
+        .await;
+        assert_eq!(model.accepted.borrow()[0].0, 39);
+        assert!(model.waits.borrow().iter().all(|&count| count == 1));
+        model.complete(0);
+        drive_until(driver.as_mut(), || model.live.get() == 0).await;
+        assert!(model.waits.borrow().iter().all(|&count| count == 1));
+        model.ready.borrow_mut()[1] = true;
+        model.wait_wakers.borrow()[1]
+            .as_ref()
+            .unwrap()
+            .wake_by_ref();
+        drive_until(driver.as_mut(), || model.waits.borrow()[1] == 2).await;
+        assert_eq!(model.live.get(), 0);
+        model.incoming(1, 1);
+        drive_until(driver.as_mut(), || model.live.get() == 1).await;
+        assert_eq!(model.accepted.borrow()[1].0, 1);
+        stop.send(Instant::now()).unwrap();
+        let (connections, _) = driver.await;
+        drop(connections);
+        assert_eq!(model.live.get(), 0);
+    });
+    Ok(())
+}
+
+#[test]
+fn admission_covers_transport_drop_and_conversion_errors_release_capacity() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let admission = Admission::default();
+        let permit = admission.acquire().unwrap();
+        struct Transport(Rc<Cell<usize>>);
+        impl Drop for Transport {
+            fn drop(&mut self) {
+                assert_eq!(self.0.get(), 1);
+            }
         }
+        let transport = Transport(admission.0.clone());
+        let connection = async move {
+            let _transport = transport;
+            pending::<()>().await;
+        };
+        let admitted = Admitted {
+            connection: Box::pin(connection),
+            _permit: permit,
+        };
+        drop(admitted);
+        assert_eq!(admission.0.get(), 0);
         let attempts = Cell::new(0);
-        assert!(
-            timeout(
-                Duration::from_millis(30),
-                retry_accept::<(), _, _>(
-                    || {
-                        attempts.set(attempts.get() + 1);
-                        ready(Err(io::Error::from(io::ErrorKind::Other)))
-                    },
-                    0
-                )
-            )
-            .await
-            .is_err()
-        );
+        let (stop, stopped) = oneshot::channel();
+        let stop = Cell::new(Some(stop));
+        let (connections, _) = accept_connections(
+            1,
+            |index, retry| {
+                assert!(retry.is_some());
+                stop.take().unwrap().send(Instant::now()).unwrap();
+                async move {
+                    pending::<()>().await;
+                    (index, Ok(()))
+                }
+            },
+            |_| -> io::Result<Accepted<()>> {
+                attempts.set(attempts.get() + 1);
+                let permit = admission.acquire().unwrap();
+                let socket = Transport(admission.0.clone());
+                drop(socket);
+                drop(permit);
+                Err(io::ErrorKind::Other.into())
+            },
+            |(), _| ready(()),
+            async { stopped.await.unwrap() },
+            CONNECTION_TIMEOUT,
+        )
+        .await;
+        assert!(connections.is_empty());
         assert_eq!(attempts.get(), 1);
-        assert!(
-            timeout(
-                Duration::from_millis(30),
-                retry_accept::<(), _, _>(
-                    || ready(Err(io::Error::from(io::ErrorKind::Interrupted))),
-                    0
-                )
-            )
-            .await
-            .is_err()
-        );
+        assert_eq!(admission.0.get(), 0);
     });
     Ok(())
 }
@@ -631,14 +756,14 @@ fn expired_deadlines_do_not_poll_io_or_accepts() -> TestResult {
             .await
             .is_none()
         );
-        let next_accept = |_: usize| {
-            poll_fn(|_| -> Poll<(usize, io::Result<()>)> {
-                panic!("polled accept after shutdown");
-            })
-        };
         let (connections, actual) = accept_connections(
-            [next_accept(0)].into_iter().collect(),
-            next_accept,
+            1,
+            |_, _| -> std::future::Ready<(usize, io::Result<()>)> {
+                panic!("waited after shutdown");
+            },
+            |_| -> io::Result<Accepted<()>> {
+                panic!("accepted after shutdown");
+            },
             |(), _| async {
                 panic!("served after shutdown");
             },
@@ -653,31 +778,183 @@ fn expired_deadlines_do_not_poll_io_or_accepts() -> TestResult {
 }
 
 #[test]
-fn other_accept_errors_retry_after_one_second() -> TestResult {
+fn accept_errors_use_bounded_retry_without_holding_capacity() -> TestResult {
     Runtime::new()?.block_on(async {
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::WouldBlock,
+        ] {
+            assert!(retry_after(&io::Error::from(kind), 0).is_none());
+        }
+        let model = Model::new(1);
         let attempts = Cell::new(0);
-        let started = Instant::now();
-        timeout(
+        let retry_deadline = Cell::new(None);
+        let (stop, stopped) = oneshot::channel();
+        let stop = Cell::new(Some(stop));
+        let (connections, _) = timeout(
             Duration::from_secs(3),
-            retry_accept(
-                || {
-                    attempts.set(attempts.get() + 1);
-                    ready(if attempts.get() == 1 {
-                        Err(io::Error::from(io::ErrorKind::Other))
-                    } else {
-                        Ok(())
-                    })
+            accept_connections(
+                1,
+                |index, retry| {
+                    retry_deadline.set(retry);
+                    async move {
+                        sleep_until(retry.unwrap()).await;
+                        (index, Ok(()))
+                    }
                 },
-                0,
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    if attempts.get() == 1 {
+                        return Err(io::ErrorKind::Other.into());
+                    }
+                    assert!(Instant::now() >= retry_deadline.get().unwrap());
+                    model.incoming(0, 1);
+                    model.accept(0)
+                },
+                |socket, _| {
+                    stop.take().unwrap().send(Instant::now()).unwrap();
+                    socket
+                },
+                async { stopped.await.unwrap() },
+                CONNECTION_TIMEOUT,
             ),
         )
         .await
-        .unwrap()
         .unwrap();
         assert_eq!(attempts.get(), 2);
-        assert!(started.elapsed() >= ACCEPT_RETRY_DELAY);
+        drop(connections);
+        assert_eq!(model.live.get(), 0);
     });
     Ok(())
+}
+
+#[test]
+fn more_than_32_loopback_endpoints_serve_the_last_endpoint() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (challenges, _one, _two) = challenges();
+        let addresses = vec!["127.0.0.1:0".parse()?; 40];
+        let server = Http01Server::bind(&addresses, challenges).await?;
+        let address = server.local_addrs()?[39];
+        let (stop, stopped) = oneshot::channel();
+        let task = compio::runtime::spawn(server.run(async { stopped.await.unwrap() }));
+        assert!(
+            request(
+                address,
+                get(&format!("{PATH_PREFIX}{TOKEN}"), "Host: one.example\r\n")
+            )
+            .await?
+            .starts_with("HTTP/1.1 200")
+        );
+        stop.send(Instant::now()).unwrap();
+        timeout(Duration::from_secs(2), task).await???;
+        Ok(())
+    })
+}
+
+#[test]
+fn two_loopback_listeners_do_not_accept_beyond_global_capacity() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (challenges, _one, _two) = challenges();
+        let server = Http01Server::bind(
+            &["127.0.0.1:0".parse()?, "127.0.0.1:0".parse()?],
+            challenges,
+        )
+        .await?;
+        let addresses = server.local_addrs()?;
+        let listeners = server.listeners.as_ref().unwrap();
+        let accepted = RefCell::new(Vec::new());
+        let releases = RefCell::new(Vec::new());
+        let b_waiting = Cell::new(false);
+        let b_ready = Cell::new(false);
+        let (stop, stopped) = oneshot::channel();
+        let mut driver = Box::pin(accept_connections(
+            2,
+            |index, retry| {
+                let b_waiting = &b_waiting;
+                let b_ready = &b_ready;
+                async move {
+                    if index == 1 {
+                        b_waiting.set(true);
+                    }
+                    let result = wait_endpoint(index, &listeners[index], retry).await;
+                    if index == 1 {
+                        b_ready.set(true);
+                    }
+                    result
+                }
+            },
+            |index| {
+                let connection = accept_nonblocking(&listeners[index])?;
+                accepted.borrow_mut().push(index);
+                Ok(connection)
+            },
+            |stream, _| {
+                let (release, released) = oneshot::channel();
+                releases.borrow_mut().push(Some(release));
+                async move {
+                    let _stream = stream;
+                    let _ = released.await;
+                }
+            },
+            async { stopped.await.unwrap() },
+            CONNECTION_TIMEOUT,
+        ));
+        let a = addresses[0];
+        let clients = blocking::unblock(move || -> io::Result<Vec<StdStream>> {
+            (0..32).map(|_| StdStream::connect(a)).collect()
+        })
+        .await?;
+        drive_until(driver.as_mut(), || {
+            accepted.borrow().len() == 32 && b_waiting.get()
+        })
+        .await;
+        let b = addresses[1];
+        let client_b = blocking::unblock(move || StdStream::connect(b)).await?;
+        drive_until(driver.as_mut(), || b_ready.get()).await;
+        assert_eq!(accepted.borrow().len(), 32);
+        releases.borrow_mut()[0].take().unwrap().send(()).unwrap();
+        drive_until(driver.as_mut(), || accepted.borrow().len() == 33).await;
+        assert_eq!(accepted.borrow()[32], 1);
+        stop.send(Instant::now()).unwrap();
+        let (connections, _) = driver.await;
+        drop(connections);
+        drop((clients, client_b));
+        Ok(())
+    })
+}
+
+#[test]
+fn real_conversion_failure_closes_socket_before_releasing_permit() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (challenges, _one, _two) = challenges();
+        let server = Http01Server::bind(&["127.0.0.1:0".parse()?], challenges).await?;
+        let address = server.local_addrs()?[0];
+        let mut client = blocking::unblock(move || StdStream::connect(address)).await?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let listener = &server.listeners.as_ref().unwrap()[0];
+        listener.accept_ready().await?;
+        let admission = Admission::default();
+        let permit = admission.acquire().unwrap();
+        let result = accept_with::<()>(listener, |stream| {
+            assert_eq!(admission.0.get(), 1);
+            drop(stream);
+            assert_eq!(admission.0.get(), 1);
+            Err(io::ErrorKind::Other.into())
+        });
+        assert!(result.is_err());
+        assert_eq!(admission.0.get(), 1);
+        drop(permit);
+        assert_eq!(admission.0.get(), 0);
+        blocking::unblock(move || -> io::Result<()> {
+            let mut byte = [0];
+            assert_eq!(client.read(&mut byte)?, 0);
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    })
 }
 
 #[test]

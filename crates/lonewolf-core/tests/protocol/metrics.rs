@@ -78,13 +78,14 @@ fn client_connection_lifecycle_is_reported() -> TestResult {
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     client.bind(Some("desk"))?;
-    let body = suite.wait_for_metric("lonewolf_c2s_connections{listener=\"0\"} 1")?;
+    let body =
+        suite.wait_for_metric("lonewolf_c2s_phase_duration_seconds_count{phase=\"binding\"} 1")?;
     for sample in [
+        "lonewolf_c2s_connections{listener=\"0\"} 1",
         "lonewolf_c2s_connections_accepted_total{listener=\"0\"} 1",
         "lonewolf_c2s_unauthenticated_connections 0",
         "lonewolf_c2s_phase_duration_seconds_count{phase=\"establishing\"} 1",
         "lonewolf_c2s_phase_duration_seconds_count{phase=\"authenticating\"} 1",
-        "lonewolf_c2s_phase_duration_seconds_count{phase=\"binding\"} 1",
     ] {
         assert!(body.lines().any(|line| line == sample), "{body}");
     }

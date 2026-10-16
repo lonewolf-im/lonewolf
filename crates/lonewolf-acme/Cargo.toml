@@ -13,6 +13,7 @@ compio = { workspace = true, features = ["net", "time"] }
 compio-io.workspace = true
 futures-channel.workspace = true
 futures-util = { workspace = true, features = ["io"] }
+getrandom.workspace = true
 graviola.workspace = true
 hmac.workspace = true
 http.workspace = true
@@ -35,9 +36,11 @@ serde_json.workspace = true
 sha2.workspace = true
 socket2.workspace = true
 tokio-util.workspace = true
+time.workspace = true
 tracing.workspace = true
 ureq.workspace = true
 webpki-roots.workspace = true
+x509-cert.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
@@ -45,4 +48,3 @@ blocking.workspace = true
 futures-executor.workspace = true
 p256 = { version = "0.13.2", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
 tempfile.workspace = true
-x509-cert.workspace = true

@@ -3,10 +3,10 @@
 use std::fmt;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv6Addr};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use http::Uri;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
@@ -100,7 +100,7 @@ impl fmt::Display for StateError {
 
 impl std::error::Error for StateError {}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CertificateMaterial {
     #[serde(with = "chain_bytes")]
@@ -109,7 +109,7 @@ pub struct CertificateMaterial {
     pub private_key_pkcs8: Zeroizing<Vec<u8>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedHost {
     #[serde(deserialize_with = "xmpp_name")]
@@ -118,7 +118,7 @@ pub struct ManagedHost {
     pub dns_name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredAccount {
     #[serde(with = "key_bytes")]
@@ -135,11 +135,13 @@ pub struct RetryState {
     pub not_before_unix: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingOrder {
     #[serde(with = "optional_url")]
     pub url: Option<String>,
+    #[serde(with = "replacement_intent")]
+    pub replaces: Option<String>,
     #[serde(with = "key_bytes")]
     pub key_pkcs8: Zeroizing<Vec<u8>>,
     #[serde(with = "csr_bytes")]
@@ -148,7 +150,7 @@ pub struct PendingOrder {
     pub expires_unix: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredCertificate {
     pub material: CertificateMaterial,
@@ -158,13 +160,92 @@ pub struct StoredCertificate {
     pub ari_check_at_unix: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredHost {
     pub host: ManagedHost,
     pub certificate: Option<StoredCertificate>,
     pub order: Option<PendingOrder>,
     pub retry: RetryState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CertificateValidity {
+    pub not_before_unix: u64,
+    pub not_after_unix: u64,
+}
+
+pub struct PreparedInstall<T> {
+    pub candidate: T,
+    pub validity: CertificateValidity,
+}
+
+pub trait Installer: Send + Sync + 'static {
+    type Prepared: Send + 'static;
+    /// Validates chain validity, identity, usages, key match, and binding material.
+    /// Returns validity from the same generation as the candidate.
+    fn prepare(
+        &self,
+        host: &ManagedHost,
+        material: &CertificateMaterial,
+    ) -> Result<PreparedInstall<Self::Prepared>, InstallError>;
+    /// Publishes a prepared generation without fallible work.
+    fn activate(&self, prepared: Self::Prepared);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallError {
+    NotYetValid,
+    Expired,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureKind {
+    Network,
+    Timeout,
+    RateLimited,
+    Authorization,
+    Protocol,
+    Material,
+    Account,
+    State,
+    Deferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptFailure {
+    pub kind: FailureKind,
+    pub status: Option<u16>,
+    pub state_error: Option<StateError>,
+    pub retry_not_before: Option<SystemTime>,
+    /// True only after the terminal order and retry update are durably committed.
+    pub terminal_order: bool,
+}
+
+impl fmt::Display for AttemptFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ACME attempt {:?}", self.kind)
+    }
+}
+
+impl std::error::Error for AttemptFailure {}
+
+impl From<StateError> for AttemptFailure {
+    fn from(error: StateError) -> Self {
+        Self {
+            kind: FailureKind::State,
+            status: None,
+            state_error: Some(error),
+            retry_not_before: None,
+            terminal_order: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptSuccess {
+    pub validity: CertificateValidity,
 }
 
 pub(crate) fn validate_url(value: &str) -> Result<(), StateError> {
@@ -288,6 +369,15 @@ impl StoredHost {
             }
         }
         if let Some(order) = &self.order {
+            if let Some(replaces) = &order.replaces {
+                validate_replacement(replaces)?;
+                let certificate = self.certificate.as_ref().ok_or(StateError::InvalidData)?;
+                let expected = crate::crypto::certificate_identifier(&certificate.material)
+                    .map_err(|_| StateError::InvalidData)?;
+                if expected.to_string() != *replaces {
+                    return Err(StateError::InvalidData);
+                }
+            }
             key(&order.key_pkcs8)?;
             if order.csr_der.is_empty() || order.csr_der.len() > MAX_RECORD {
                 return Err(StateError::InvalidData);
@@ -380,6 +470,50 @@ mod optional_url {
         #[derive(Deserialize)]
         struct Url(#[serde(deserialize_with = "url_string")] String);
         Option::<Url>::deserialize(deserializer).map(|value| value.map(|url| url.0))
+    }
+}
+
+fn validate_replacement(value: &str) -> Result<(), StateError> {
+    if value.len() > MAX_RECORD {
+        return Err(StateError::InvalidData);
+    }
+    let (aki, serial) = value.split_once('.').ok_or(StateError::InvalidData)?;
+    let aki = URL_SAFE_NO_PAD
+        .decode(aki)
+        .map_err(|_| StateError::InvalidData)?;
+    let serial = URL_SAFE_NO_PAD
+        .decode(serial)
+        .map_err(|_| StateError::InvalidData)?;
+    if aki.is_empty()
+        || serial.is_empty()
+        || serial.len() > 21
+        || serial[0] & 0x80 != 0
+        || serial.len() > 1 && serial[0] == 0 && serial[1] & 0x80 == 0
+    {
+        return Err(StateError::InvalidData);
+    }
+    Ok(())
+}
+
+mod replacement_intent {
+    use super::*;
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        fn identifier<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+            let value = bounded_string::<D, MAX_RECORD>(deserializer)?;
+            validate_replacement(&value).map_err(D::Error::custom)?;
+            Ok(value)
+        }
+        #[derive(Deserialize)]
+        struct Intent(#[serde(deserialize_with = "identifier")] String);
+        Option::<Intent>::deserialize(deserializer).map(|value| value.map(|intent| intent.0))
     }
 }
 

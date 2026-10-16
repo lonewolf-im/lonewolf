@@ -55,6 +55,7 @@ fn host(byte: u8) -> StoredHost {
             ari_check_at_unix: 30,
         }),
         order: Some(PendingOrder {
+            replaces: None,
             url: None,
             key_pkcs8: Zeroizing::new(vec![byte + 1; 8]),
             csr_der: vec![byte + 2; 8],
@@ -261,6 +262,83 @@ fn malformed_oversized_and_unknown_fields_are_not_missing_or_overwritten() -> Te
         assert!(matches!(block_on(store.account()), Err(StateError::CorruptData)));
         assert_eq!(block_on(store.save_account(account(1))), Err(StateError::CorruptData));
         assert!(matches!(block_on(store.account()), Err(StateError::CorruptData)));
+    }
+    Ok(())
+}
+
+#[test]
+fn replacement_intent_roundtrips_and_corrupt_intent_never_loads_or_overwrites() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.redb");
+    let signer = crate::crypto::CertificateSigner::generate()?;
+    let mut parameters = rcgen::CertificateParams::new(vec!["example.com".into()])?;
+    parameters.serial_number = Some(1u64.into());
+    parameters.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(vec![1, 2, 3]);
+    parameters.use_authority_key_identifier_extension = true;
+    let mut record = host(2);
+    record
+        .certificate
+        .as_mut()
+        .ok_or("missing certificate")?
+        .material = CertificateMaterial {
+        chain: vec![parameters.self_signed(&signer)?.der().to_vec()],
+        private_key_pkcs8: signer.pkcs8()?,
+    };
+    let expected = crate::crypto::certificate_identifier(
+        &record
+            .certificate
+            .as_ref()
+            .ok_or("missing certificate")?
+            .material,
+    )?
+    .to_string();
+    assert_eq!(expected, "AQID.AQ");
+    for intent in [None, Some(expected.clone())] {
+        record.order.as_mut().ok_or("missing order")?.replaces = intent.clone();
+        let store = open(&path)?;
+        block_on(store.save_host(record.clone()))?;
+        drop(store);
+        let store = open(&path)?;
+        assert_eq!(
+            restored_host(&store)?
+                .order
+                .ok_or("missing order")?
+                .replaces,
+            intent
+        );
+    }
+    let store = open(&path)?;
+    let original = serde_json::to_value(HostWrite {
+        directory_url: &store.inner.directory_url,
+        host: &record,
+    })?;
+    for scenario in 0..4 {
+        let mut value = original.clone();
+        match scenario {
+            0 => {
+                value["host"]["order"]
+                    .as_object_mut()
+                    .ok_or("missing order")?
+                    .remove("replaces");
+            }
+            1 => value["host"]["order"]["replaces"] = serde_json::json!("malformed"),
+            2 => value["host"]["order"]["replaces"] = serde_json::json!("AQID.Ag"),
+            _ => value["host"]["certificate"] = serde_json::Value::Null,
+        }
+        inject(
+            &store,
+            HOSTS,
+            store.inner.host_key("example.com"),
+            Zeroizing::new(serde_json::to_vec(&value)?),
+        )?;
+        assert!(matches!(
+            block_on(store.host("example.com".into())),
+            Err(StateError::CorruptData)
+        ));
+        assert_eq!(
+            block_on(store.save_host(record.clone())),
+            Err(StateError::CorruptData)
+        );
     }
     Ok(())
 }

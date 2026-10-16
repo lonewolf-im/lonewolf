@@ -6,6 +6,41 @@ use super::*;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+#[test]
+fn pending_replacement_intent_is_required_explicit_and_canonical() -> TestResult {
+    for replaces in [None, Some("AQID.AQ".to_owned())] {
+        let mut pending = host().order.ok_or("missing order")?;
+        pending.replaces = replaces.clone();
+        let mut value = serde_json::to_value(&pending)?;
+        assert!(value.get("replaces").is_some());
+        assert_eq!(value["replaces"], serde_json::to_value(&replaces)?);
+        let restored: PendingOrder = decode(&encode(&pending)?)?;
+        assert_eq!(restored.replaces, replaces);
+        value
+            .as_object_mut()
+            .ok_or("missing object")?
+            .remove("replaces");
+        assert!(matches!(
+            decode::<PendingOrder>(&serde_json::to_vec(&value)?),
+            Err(StateError::CorruptData)
+        ));
+    }
+    for identifier in [
+        "", "AQID", ".AQ", "AQID.", "AQID.AQ=", "AQID.gA", "AQID.AAE", "YR.AQ", "AQID.AB",
+    ] {
+        let mut value = serde_json::to_value(host().order.ok_or("missing order")?)?;
+        value["replaces"] = serde_json::Value::String(identifier.into());
+        assert!(
+            serde_json::from_value::<PendingOrder>(value).is_err(),
+            "{identifier}"
+        );
+    }
+    let mut value = serde_json::to_value(host().order.ok_or("missing order")?)?;
+    value["replaces"] = serde_json::Value::String("A".repeat(MAX_RECORD + 1));
+    assert!(serde_json::from_value::<PendingOrder>(value).is_err());
+    Ok(())
+}
+
 fn account() -> StoredAccount {
     StoredAccount {
         key_pkcs8: Zeroizing::new(vec![1, 2, 3]),
@@ -34,6 +69,7 @@ fn host() -> StoredHost {
             ari_check_at_unix: 100,
         }),
         order: Some(PendingOrder {
+            replaces: None,
             url: Some("https://ca.example/order/1".into()),
             key_pkcs8: Zeroizing::new(vec![7, 8, 9]),
             csr_der: vec![10, 11, 12],

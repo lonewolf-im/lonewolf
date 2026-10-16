@@ -16,7 +16,7 @@ pub(crate) async fn wait() -> io::Result<()> {
     let stopped = match poll!(stop.as_mut()) {
         Poll::Ready(result) => result,
         Poll::Pending => {
-            tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
+            tracing::debug!("shutdown signal handlers registered");
             stop.await
         }
     };
@@ -40,32 +40,32 @@ mod tests {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::{Context, SubscriberExt};
 
-    struct SignalAtReadiness(Signal);
+    struct SignalAtRegistration(Signal);
 
-    impl<S: Subscriber> Layer<S> for SignalAtReadiness {
+    impl<S: Subscriber> Layer<S> for SignalAtRegistration {
         fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
-            struct Readiness(bool);
-            impl Visit for Readiness {
+            struct Registration(bool);
+            impl Visit for Registration {
                 fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
                     if field.name() == "message"
-                        && format!("{value:?}").starts_with("waiting for stop signal")
+                        && format!("{value:?}").starts_with("shutdown signal handlers registered")
                     {
                         self.0 = true;
                     }
                 }
             }
-            let mut readiness = Readiness(false);
-            event.record(&mut readiness);
-            if readiness.0 {
+            let mut registration = Registration(false);
+            event.record(&mut registration);
+            if registration.0 {
                 raise(self.0).unwrap();
             }
         }
     }
 
-    fn signal_at_readiness(signal: Signal, test: &str) {
-        const CHILD: &str = "LONEWOLF_TEST_STOP_AT_READINESS";
+    fn signal_at_registration(signal: Signal, test: &str) {
+        const CHILD: &str = "LONEWOLF_TEST_STOP_AT_REGISTRATION";
         if std::env::var_os(CHILD).is_some() {
-            let subscriber = tracing_subscriber::registry().with(SignalAtReadiness(signal));
+            let subscriber = tracing_subscriber::registry().with(SignalAtRegistration(signal));
             let _subscriber = tracing::subscriber::set_default(subscriber);
             compio::runtime::Runtime::new().unwrap().block_on(async {
                 compio::time::timeout(Duration::from_secs(2), super::wait())
@@ -81,7 +81,8 @@ mod tests {
             .output()
             .unwrap();
         assert!(
-            output.status.success(),
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
             "{signal:?}: {}\n{}\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
@@ -90,18 +91,18 @@ mod tests {
     }
 
     #[test]
-    fn sigint_at_readiness_is_registered() {
-        signal_at_readiness(
+    fn sigint_at_registration_is_registered() {
+        signal_at_registration(
             Signal::SIGINT,
-            "shutdown::tests::sigint_at_readiness_is_registered",
+            "shutdown::tests::sigint_at_registration_is_registered",
         );
     }
 
     #[test]
-    fn sigterm_at_readiness_is_registered() {
-        signal_at_readiness(
+    fn sigterm_at_registration_is_registered() {
+        signal_at_registration(
             Signal::SIGTERM,
-            "shutdown::tests::sigterm_at_readiness_is_registered",
+            "shutdown::tests::sigterm_at_registration_is_registered",
         );
     }
 }

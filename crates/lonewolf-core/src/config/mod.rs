@@ -393,7 +393,7 @@ impl LetsEncryptConfig {
     }
 }
 
-fn managed_dns_name(domain: &str) -> Result<String, String> {
+pub(crate) fn managed_dns_name(domain: &str) -> Result<String, String> {
     let invalid =
         || "letsencrypt requires a DNS name with at least two labels, excluding localhost".into();
     let ascii = idna::domain_to_ascii_strict(domain).map_err(|_| invalid())?;

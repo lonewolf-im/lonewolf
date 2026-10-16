@@ -32,6 +32,10 @@ pub enum RunError {
     RouterShutdown(io::Error),
     RouterFailed(RouterFailure),
     Signal(io::Error),
+    Acme {
+        phase: &'static str,
+        source: Box<dyn Error + Send + Sync>,
+    },
     Admin(io::Error),
     Metrics(io::Error),
     C2s(io::Error),
@@ -77,6 +81,7 @@ impl fmt::Display for RunError {
             Self::RouterFailed(failure) => failure.fmt(formatter),
             Self::RouterShutdown(source) => write!(formatter, "cannot stop router: {source}"),
             Self::Metrics(source) => write!(formatter, "metrics service failed: {source}"),
+            Self::Acme { phase, source } => write!(formatter, "ACME {phase} failed: {source}"),
             Self::Admin(source) => write!(formatter, "admin service failed: {source}"),
             Self::C2s(source) => write!(formatter, "c2s listener service failed: {source}"),
             Self::Signal(source) => write!(formatter, "cannot wait for shutdown signal: {source}"),
@@ -95,7 +100,7 @@ impl fmt::Display for RunError {
 impl Error for RunError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Logging(source) => Some(source.as_ref()),
+            Self::Logging(source) | Self::Acme { source, .. } => Some(source.as_ref()),
             Self::RouterFailed(failure) => Some(failure),
             Self::Config(source) => Some(source),
             Self::Hosts(source) => Some(source),

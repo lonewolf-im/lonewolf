@@ -95,6 +95,7 @@ pub struct Manager<I: Installer> {
     installer: Arc<I>,
     hosts: Vec<StoredHost>,
     status: StatusHandle,
+    started: bool,
 }
 
 impl<I: Installer> Manager<I> {
@@ -166,6 +167,7 @@ impl<I: Installer> Manager<I> {
             if installed {
                 event(&mut status, HostEvent::Installed);
             }
+            tracing::info!(host = %host.xmpp_domain, phase = "load", outcome = if installed { "ready" } else { "unavailable" }, not_after = status.not_after_unix, "ACME certificate loaded");
             snapshots.push((host.xmpp_domain, status));
             hosts.push(record);
         }
@@ -180,6 +182,7 @@ impl<I: Installer> Manager<I> {
             installer: Arc::new(installer),
             hosts,
             status,
+            started: false,
         })
     }
 
@@ -187,10 +190,16 @@ impl<I: Installer> Manager<I> {
         self.status.clone()
     }
 
+    /// Runs once; fatal errors leave resources owned until an explicit drain.
     pub async fn run(
-        mut self,
+        &mut self,
         shutdown: impl Future<Output = Instant>,
     ) -> Result<(), ManagerError> {
+        if self.started {
+            return Err(ManagerError::Task);
+        }
+        self.started = true;
+        let cleanup = ClearChallenges(self.challenges.clone());
         let production = Production {
             issuer: self.issuer.clone(),
             installer: self.installer.clone(),
@@ -206,14 +215,17 @@ impl<I: Installer> Manager<I> {
             shutdown,
         )
         .await;
+        drop(cleanup);
+        let deadline = result?;
+        self.drain(deadline).await
+    }
+
+    /// Permanently closes admission and drains both resources using the caller's deadline.
+    pub async fn drain(&mut self, deadline: Instant) -> Result<(), ManagerError> {
+        self.started = true;
         self.challenges.clear();
-        let deadline = result
-            .as_ref()
-            .copied()
-            .unwrap_or_else(|_| Instant::now() + Duration::from_secs(5));
         let (store, transport) =
             join(self.store.drain(deadline), self.transport.drain(deadline)).await;
-        result?;
         store.map_err(|error| {
             if error == StateError::DeadlineElapsed {
                 ManagerError::Deadline
@@ -229,6 +241,20 @@ impl<I: Installer> Manager<I> {
             }
         })?;
         Ok(())
+    }
+}
+
+struct ClearChallenges(Challenges);
+
+impl Drop for ClearChallenges {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl<I: Installer> Drop for Manager<I> {
+    fn drop(&mut self) {
+        self.challenges.clear();
     }
 }
 
@@ -399,6 +425,7 @@ fn housekeeping(
                 && engine.publish_cache(host, clock.now()?)?
             {
                 published[index].1 = true;
+                tracing::info!(host = %host.host.xmpp_domain, phase = "cache", outcome = "ready", not_after = host.certificate.as_ref().map(|cert| cert.not_after_unix), "ACME certificate installed");
                 let mut snapshots = status.inner.lock();
                 snapshots[index].1.generation = snapshots[index].1.generation.saturating_add(1);
                 event(&mut snapshots[index].1, HostEvent::Installed);
@@ -423,6 +450,7 @@ fn housekeeping(
         if snapshot.state != current {
             snapshot.state = current;
             event(snapshot, HostEvent::Expiry);
+            tracing::warn!(host = %host.host.xmpp_domain, phase = "availability", outcome = ?current, not_after = snapshot.not_after_unix, "ACME certificate availability changed");
         }
     }
     Ok(now)
@@ -508,7 +536,11 @@ async fn drive(
             let mut snapshots = status.inner.lock();
             for (index, host) in hosts.iter().enumerate() {
                 let snapshot = &mut snapshots[index].1;
-                snapshot.next_attempt_unix = Some(issue_due(host, now).max(account_floor));
+                let next_attempt = issue_due(host, now).max(account_floor);
+                if snapshot.next_attempt_unix != Some(next_attempt) {
+                    tracing::debug!(host = %host.host.xmpp_domain, phase = "schedule", retry_seconds = next_attempt.saturating_sub(now), "ACME attempt scheduled");
+                }
+                snapshot.next_attempt_unix = Some(next_attempt);
             }
         }
         let mut next = now.saturating_add(60);
@@ -625,7 +657,9 @@ async fn drive(
                 Err(error) if error.state_error.is_some() || error.kind == FailureKind::State => {
                     return Err(fatal(error));
                 }
-                Err(_) => {}
+                Err(error) => {
+                    tracing::warn!(phase = "account", outcome = ?error.kind, "ACME account will retry");
+                }
             }
             continue;
         }
@@ -643,6 +677,7 @@ async fn drive(
             published[index] = (None, true);
             let mut snapshots = status.inner.lock();
             let snapshot = &mut snapshots[index].1;
+            tracing::info!(host = %hosts[index].host.xmpp_domain, phase = "issuance", outcome = if snapshot.generation == 0 { "issued" } else { "rotated" }, not_after = success.validity.not_after_unix, "ACME certificate installed");
             snapshot.successes = snapshot.successes.saturating_add(1);
             snapshot.generation = snapshot.generation.saturating_add(1);
             snapshot.not_after_unix = Some(success.validity.not_after_unix);
@@ -707,6 +742,9 @@ async fn drive(
                         }
                     }
                     Err(error) => {
+                        if error.kind != FailureKind::Deferred {
+                            tracing::warn!(host = %host.host.xmpp_domain, phase = "issuance", outcome = ?error.kind, retry_seconds = host.retry.not_before_unix.saturating_sub(now), "ACME certificate will retry");
+                        }
                         if error.state_error.is_some() {
                             return Err(fatal(error));
                         }
@@ -796,6 +834,7 @@ async fn drive(
                         }
                         Ok(None) => 43_200,
                         Err(error) => {
+                            tracing::warn!(host = %host.host.xmpp_domain, phase = "renewal_info", outcome = ?error.kind, "ACME renewal information will retry");
                             if error.state_error.is_some() {
                                 return Err(fatal(error));
                             }

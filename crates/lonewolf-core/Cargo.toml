@@ -19,6 +19,7 @@ graviola.workspace = true
 http.workspace = true
 idna.workspace = true
 oxilangtag.workspace = true
+lonewolf-acme.workspace = true
 lonewolf-admin.workspace = true
 lonewolf-auth.workspace = true
 lonewolf-extension.workspace = true

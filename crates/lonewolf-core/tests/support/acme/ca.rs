@@ -21,7 +21,7 @@ use rustls::pki_types::PrivatePkcs8KeyDer;
 use serde_json::{Value, json};
 use x509_cert::der::{Decode, Encode};
 
-use super::{TIMEOUT, TestResult};
+use super::{TIMEOUT, TestResult, prepare_blocking_stream};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum AcmeStage {
@@ -277,8 +277,7 @@ fn serve(
     root_pem: &str,
     shared: &Shared,
 ) -> TestResult {
-    socket.set_read_timeout(Some(TIMEOUT))?;
-    socket.set_write_timeout(Some(TIMEOUT))?;
+    prepare_blocking_stream(&socket)?;
     let mut tls = rustls::StreamOwned::new(rustls::ServerConnection::new(config)?, socket);
     let request = read_request(&mut tls)?;
     let stage = stage(&request.path)?;

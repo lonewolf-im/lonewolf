@@ -32,3 +32,47 @@ pub const PRE_APPROVAL_NAMESPACE: &str = "urn:xmpp:features:pre-approval";
 pub const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='xmpp.example.test' version='1.0'>";
 
 pub const STREAM_ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-streams";
+
+fn prepare_blocking_stream(socket: &std::net::TcpStream) -> std::io::Result<()> {
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(TIMEOUT))?;
+    socket.set_write_timeout(Some(TIMEOUT))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn accepted_nonblocking_stream_is_normalized_for_bounded_http_io() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let mut client = TcpStream::connect_timeout(&listener.local_addr()?, TIMEOUT)?;
+        client.set_read_timeout(Some(TIMEOUT))?;
+        client.set_write_timeout(Some(TIMEOUT))?;
+        let (mut accepted, _) = listener.accept()?;
+        accepted.set_nonblocking(true)?;
+        let mut byte = [0];
+        assert_eq!(
+            accepted.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        prepare_blocking_stream(&accepted)?;
+        assert!(!socket2::SockRef::from(&accepted).nonblocking()?);
+        assert_eq!(accepted.read_timeout()?, Some(TIMEOUT));
+        assert_eq!(accepted.write_timeout()?, Some(TIMEOUT));
+        client.write_all(b"GET /directory HTTP/1.1\r\nHost: ca.example.test\r\n\r\n")?;
+        let request = ca::read_request(&mut accepted)?;
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/directory");
+        assert_eq!(request.host, "ca.example.test");
+        accepted.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")?;
+        drop(accepted);
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        assert_eq!(response, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        Ok(())
+    }
+}

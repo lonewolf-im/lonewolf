@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::ca::read_request;
-use super::{TIMEOUT, TestResult};
+use super::{TIMEOUT, TestResult, prepare_blocking_stream};
 use parking_lot::Mutex as PlMutex;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -33,8 +33,7 @@ impl ChallengeProxy {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
                         let result = (|| -> TestResult {
-                            socket.set_read_timeout(Some(TIMEOUT))?;
-                            socket.set_write_timeout(Some(TIMEOUT))?;
+                            prepare_blocking_stream(&socket)?;
                             let request = read_request(&mut socket)?;
                             observed
                                 .lock()

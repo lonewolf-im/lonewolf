@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::error::Error;
+
+use super::*;
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+fn account() -> StoredAccount {
+    StoredAccount {
+        key_pkcs8: Zeroizing::new(vec![1, 2, 3]),
+        credentials_json: Some(Zeroizing::new(br#"{"credential":"secret"}"#.to_vec())),
+        retry: RetryState {
+            failures: 3,
+            not_before_unix: 42,
+        },
+    }
+}
+
+fn host() -> StoredHost {
+    StoredHost {
+        host: ManagedHost {
+            xmpp_domain: "example.com".into(),
+            dns_name: "example.com".into(),
+        },
+        certificate: Some(StoredCertificate {
+            material: CertificateMaterial {
+                chain: vec![vec![1, 2, 3]],
+                private_key_pkcs8: Zeroizing::new(vec![4, 5, 6]),
+            },
+            not_before_unix: 10,
+            not_after_unix: 20,
+            renew_at_unix: 0,
+            ari_check_at_unix: 100,
+        }),
+        order: Some(PendingOrder {
+            url: Some("https://ca.example/order/1".into()),
+            key_pkcs8: Zeroizing::new(vec![7, 8, 9]),
+            csr_der: vec![10, 11, 12],
+            started_unix: 30,
+            expires_unix: Some(25),
+        }),
+        retry: RetryState {
+            failures: 2,
+            not_before_unix: 100,
+        },
+    }
+}
+
+#[test]
+fn secret_records_round_trip_without_buffer_growth() -> TestResult {
+    let original = account();
+    let encoded = encode(&original)?;
+    assert_eq!(encoded.capacity(), MAX_RECORD);
+    let restored: StoredAccount = decode(&encoded)?;
+    restored.validate()?;
+    assert_eq!(restored.key_pkcs8.as_slice(), original.key_pkcs8.as_slice());
+    assert_eq!(restored.key_pkcs8.capacity(), MAX_KEY);
+    assert_eq!(
+        restored.credentials_json.as_deref(),
+        original.credentials_json.as_deref()
+    );
+    assert_eq!(
+        restored
+            .credentials_json
+            .as_ref()
+            .map(|value| value.capacity()),
+        Some(MAX_CREDENTIALS)
+    );
+    assert_eq!(restored.retry, original.retry);
+    Ok(())
+}
+
+#[test]
+fn expired_orders_and_independent_schedules_are_valid() -> TestResult {
+    let original = host();
+    original.validate()?;
+    let restored: StoredHost = decode(&encode(&original)?)?;
+    restored.validate()?;
+    assert_eq!(
+        restored
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.renew_at_unix),
+        Some(0)
+    );
+    assert_eq!(
+        restored
+            .certificate
+            .as_ref()
+            .map(|certificate| certificate.ari_check_at_unix),
+        Some(100)
+    );
+    assert_eq!(
+        restored.order.as_ref().and_then(|order| order.expires_unix),
+        Some(25)
+    );
+    Ok(())
+}
+
+#[test]
+fn credentials_require_one_complete_json_value() -> TestResult {
+    for value in [b"".as_slice(), b"{", b"{} {}", b"null trailing"] {
+        let mut input = account();
+        input.credentials_json = Some(Zeroizing::new(value.to_vec()));
+        assert_eq!(input.validate(), Err(StateError::InvalidData));
+    }
+    for value in [b"null".as_slice(), b"{} \n", b"[1,true,\"value\"]"] {
+        let mut input = account();
+        input.credentials_json = Some(Zeroizing::new(value.to_vec()));
+        input.validate()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn write_validation_bounds_all_material() {
+    let mut input = account();
+    input.key_pkcs8 = Zeroizing::new(vec![1; MAX_KEY + 1]);
+    assert_eq!(input.validate(), Err(StateError::InvalidData));
+    input.key_pkcs8.clear();
+    assert_eq!(input.validate(), Err(StateError::InvalidData));
+    let mut input = account();
+    input.credentials_json = Some(Zeroizing::new(vec![b' '; MAX_CREDENTIALS + 1]));
+    assert_eq!(input.validate(), Err(StateError::InvalidData));
+
+    for chain in [
+        Vec::new(),
+        vec![Vec::new()],
+        vec![vec![1]; 17],
+        vec![vec![1; MAX_CHAIN + 1]],
+    ] {
+        let mut input = host();
+        if let Some(certificate) = &mut input.certificate {
+            certificate.material.chain = chain;
+        }
+        assert_eq!(input.validate(), Err(StateError::InvalidData));
+    }
+    let mut input = host();
+    if let Some(order) = &mut input.order {
+        order.csr_der.clear();
+    }
+    assert_eq!(input.validate(), Err(StateError::InvalidData));
+}
+
+#[test]
+fn malformed_partial_secrets_and_oversized_decodes_fail_closed() -> TestResult {
+    for bytes in [
+        br#"{"key_pkcs8":[1,2,"secret"]}"#.as_slice(),
+        br#"{"key_pkcs8":[1,2"#,
+        br#"{"key_pkcs8":[1],"credentials_json":[1,"secret"]}"#,
+        br#"{"key_pkcs8":[1],"credentials_json":null,"retry":{"failures":0,"not_before_unix":0},"secret":"hidden"}"#,
+    ] {
+        assert!(matches!(decode::<StoredAccount>(bytes), Err(StateError::CorruptData)));
+    }
+    let mut input = account();
+    input.key_pkcs8 = Zeroizing::new(vec![1; MAX_KEY + 1]);
+    assert!(matches!(
+        decode::<StoredAccount>(&encode(&input)?),
+        Err(StateError::CorruptData)
+    ));
+    input = account();
+    input.credentials_json = Some(Zeroizing::new(vec![1; MAX_CREDENTIALS + 1]));
+    assert!(matches!(
+        decode::<StoredAccount>(&encode(&input)?),
+        Err(StateError::CorruptData)
+    ));
+    assert!(matches!(
+        decode::<StoredAccount>(&vec![0; MAX_RECORD + 1]),
+        Err(StateError::CorruptData)
+    ));
+    let input = vec![255_u8; MAX_RECORD];
+    assert!(matches!(encode(&input), Err(StateError::InvalidData)));
+    let mut input = host();
+    if let Some(certificate) = &mut input.certificate {
+        certificate.material.chain = vec![vec![1]; 17];
+    }
+    assert!(matches!(
+        decode::<StoredHost>(&encode(&input)?),
+        Err(StateError::CorruptData)
+    ));
+    Ok(())
+}
+
+#[test]
+fn timestamps_and_certificate_intervals_are_checked() {
+    assert_eq!(timestamp(u64::MAX), Err(StateError::InvalidData));
+    assert_eq!(timestamp(i64::MAX as u64 + 1), Err(StateError::InvalidData));
+    let mut input = account();
+    input.retry.not_before_unix = u64::MAX;
+    assert_eq!(input.validate(), Err(StateError::InvalidData));
+    let mut input = host();
+    if let Some(certificate) = &mut input.certificate {
+        certificate.not_after_unix = certificate.not_before_unix;
+    }
+    assert_eq!(input.validate(), Err(StateError::InvalidData));
+    let mut input = host();
+    if let Some(order) = &mut input.order {
+        order.expires_unix = Some(u64::MAX);
+    }
+    assert_eq!(input.validate(), Err(StateError::InvalidData));
+}
+
+#[test]
+fn urls_preserve_exact_spelling_and_reject_invalid_authorities() -> TestResult {
+    for url in [
+        "https://ca.example/directory",
+        "https://CA.example:443/directory?x=%2f",
+        "https://[::1]:443/directory",
+    ] {
+        validate_url(url)?;
+    }
+    for url in [
+        "http://ca.example/",
+        "https://user@ca.example/",
+        "https://ca.example/#fragment",
+        "https://ca.example:0/",
+        "https://ca.example:99999/",
+        "https://ca.example:/",
+        "https://[bad]/",
+        "https://ca.example/ bad",
+    ] {
+        assert_eq!(validate_url(url), Err(StateError::InvalidData));
+    }
+    assert_eq!(
+        validate_url(&format!("https://ca.example/{}", "a".repeat(MAX_URL))),
+        Err(StateError::InvalidData)
+    );
+    Ok(())
+}
+
+#[test]
+fn hosts_require_normalized_xmpp_and_matching_canonical_dns() -> TestResult {
+    for (xmpp, dns) in [
+        ("example.com", "example.com"),
+        ("bücher.example", "xn--bcher-kva.example"),
+    ] {
+        let mut input = host();
+        input.host.xmpp_domain = xmpp.into();
+        input.host.dns_name = dns.into();
+        input.validate()?;
+    }
+    for (xmpp, dns) in [
+        ("Example.com", "example.com"),
+        ("example.com", "other.example"),
+        ("user@example.com", "example.com"),
+        ("example.com/resource", "example.com"),
+        ("localhost", "localhost"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("example.localhost", "example.localhost"),
+        ("example.com", "Example.com"),
+        ("example.com.", "example.com."),
+    ] {
+        let mut input = host();
+        input.host.xmpp_domain = xmpp.into();
+        input.host.dns_name = dns.into();
+        assert_eq!(
+            input.validate(),
+            Err(StateError::InvalidData),
+            "{xmpp}, {dns}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn errors_contain_only_static_context_and_have_no_secret_source() {
+    for error in [
+        StateError::InvalidData,
+        StateError::CorruptData,
+        StateError::UnsupportedData,
+        StateError::Unavailable,
+        StateError::UnsafePath,
+        StateError::StateUncertain,
+        StateError::Closed,
+        StateError::DeadlineElapsed,
+        StateError::Other,
+    ] {
+        assert!(!error.to_string().contains("secret"));
+        assert!(error.source().is_none());
+    }
+}
+
+#[test]
+fn maximum_chain_and_secret_sizes_fit_the_encoded_record_bound() -> TestResult {
+    let mut input = host();
+    if let Some(certificate) = &mut input.certificate {
+        certificate.material.chain = vec![vec![255; MAX_CHAIN / 16]; 16];
+        certificate.material.private_key_pkcs8 = Zeroizing::new(vec![255; MAX_KEY]);
+    }
+    input.validate()?;
+    let encoded = encode(&input)?;
+    assert!(encoded.len() <= MAX_RECORD);
+    let restored: StoredHost = decode(&encoded)?;
+    restored.validate()?;
+    assert_eq!(
+        restored.certificate.as_ref().map(|certificate| certificate
+            .material
+            .chain
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()),
+        Some(MAX_CHAIN)
+    );
+
+    let mut input = account();
+    input.key_pkcs8 = Zeroizing::new(vec![255; MAX_KEY]);
+    let mut credentials = Zeroizing::new(Vec::with_capacity(MAX_CREDENTIALS));
+    credentials.push(b'"');
+    credentials.resize(MAX_CREDENTIALS - 1, b'x');
+    credentials.push(b'"');
+    input.credentials_json = Some(credentials);
+    input.validate()?;
+    let restored: StoredAccount = decode(&encode(&input)?)?;
+    restored.validate()?;
+    Ok(())
+}
+
+#[test]
+fn bounded_fields_reject_oversized_decodes() -> TestResult {
+    let mut input = host();
+    input.host.xmpp_domain = "x".repeat(1024);
+    assert!(matches!(
+        decode::<StoredHost>(&encode(&input)?),
+        Err(StateError::CorruptData)
+    ));
+    let mut input = host();
+    input.host.dns_name = "x".repeat(254);
+    assert!(matches!(
+        decode::<StoredHost>(&encode(&input)?),
+        Err(StateError::CorruptData)
+    ));
+    let mut input = host();
+    if let Some(order) = &mut input.order {
+        order.url = Some(format!("https://ca.example/{}", "x".repeat(MAX_URL)));
+    }
+    assert!(matches!(
+        decode::<StoredHost>(&encode(&input)?),
+        Err(StateError::CorruptData)
+    ));
+    let mut input = host();
+    if let Some(certificate) = &mut input.certificate {
+        certificate.material.chain = vec![vec![255; MAX_CHAIN + 1]];
+    }
+    assert!(matches!(
+        decode::<StoredHost>(&encode(&input)?),
+        Err(StateError::CorruptData)
+    ));
+    Ok(())
+}

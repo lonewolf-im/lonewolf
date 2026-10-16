@@ -1307,3 +1307,61 @@ fn held_account_read_preserves_local_validity_wakes_and_stop_priority() -> TestR
     }
     Ok(())
 }
+
+#[test]
+fn ari_error_classes_persist_backoff_without_resampling_schedule_or_changing_order() -> TestResult {
+    for kind in [
+        FailureKind::Network,
+        FailureKind::RateLimited,
+        FailureKind::Protocol,
+    ] {
+        for previous in 0..4 {
+            let mut record = host("example.com");
+            let mut certificate = cert(NOW - 100, NOW + 50000);
+            let window = AriWindow {
+                start_unix: NOW + 20000,
+                end_unix: NOW + 21000,
+                selected_unix: NOW + 20000,
+            };
+            certificate.ari_window = Some(window);
+            certificate.renew_at_unix = window.selected_unix;
+            certificate.fallback_at_unix = NOW + 25000;
+            certificate.ari_failures = previous;
+            record.certificate = Some(certificate);
+            record.order = Some(PendingOrder {
+                url: None,
+                replaces: None,
+                key_pkcs8: Zeroizing::new(vec![3]),
+                csr_der: vec![4],
+                started_unix: NOW,
+                expires_unix: None,
+            });
+            let original_order = serde_json::to_value(&record.order)?;
+            let script = make_script(
+                std::slice::from_ref(&record),
+                vec![Step::AriFailure(kind, None), Step::Hold],
+                2,
+            );
+            run(&script, vec![record])?;
+            let records = script.store.records.borrow();
+            let record = &records["example.com"];
+            let certificate = record.certificate.as_ref().ok_or("certificate")?;
+            let expected = if kind == FailureKind::Protocol {
+                43200
+            } else {
+                [60, 600, 6000, 43200][previous as usize]
+            };
+            assert_eq!(certificate.ari_failures, previous + 1);
+            assert_eq!(certificate.ari_check_at_unix, NOW + expected);
+            assert_eq!(certificate.renew_at_unix, window.selected_unix);
+            assert_eq!(certificate.ari_window, Some(window));
+            assert_eq!(certificate.fallback_at_unix, NOW + 25000);
+            assert_eq!(serde_json::to_value(&record.order)?, original_order);
+            assert_eq!(record.retry.failures, 0);
+            let second = &script.calls.borrow()[1];
+            assert_eq!(second.2, NOW + expected.min(20000));
+            assert_eq!(second.1, expected < 20000);
+        }
+    }
+    Ok(())
+}

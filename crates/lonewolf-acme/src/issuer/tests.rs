@@ -2311,3 +2311,246 @@ fn fractional_ari_windows_select_only_representable_seconds_inside_original_boun
     }
     assert_eq!(window_second(parse("1969-12-31T23:59:59.999Z")), None);
 }
+
+fn ari_directory_response() -> http::Response<Full<Bytes>> {
+    response(200,json!({"newNonce":"https://ca.example/nonce","newAccount":"https://ca.example/account","newOrder":"https://ca.example/new-order","renewalInfo":"https://ca.example/renewal"}).to_string())
+}
+
+fn restored_credentials() -> AccountCredentials {
+    let key = CertificateSigner::generate().unwrap().pkcs8().unwrap();
+    serde_json::from_slice(&credential_bytes(&key, DIRECTORY)).unwrap()
+}
+
+#[test]
+fn pinned_ari_rejects_unsafe_retry_after_without_panicking() {
+    block_on(async {
+        for header in [
+            "18446744073709551615",
+            "+18446744073709551615",
+            " 18446744073709551615 ",
+        ] {
+            let mut reply=response(200,json!({"suggestedWindow":{"start":"2027-01-15T08:00:00Z","end":"2027-01-15T08:01:40Z"}}).to_string());
+            reply
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, header.parse().unwrap());
+            let replies = Responses(Arc::new(PlMutex::new(VecDeque::from([
+                ari_directory_response(),
+                reply,
+            ]))));
+            let mut engine = Upstream::new(AriTransport(replies.clone()), DIRECTORY);
+            engine.restore(restored_credentials()).await.unwrap();
+            let error = engine
+                .renewal(&replacement_id(&ari_material()).unwrap())
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, FailureKind::Protocol);
+            assert_eq!(error.status, Some(200));
+            assert!(!error.terminal_order);
+            assert!(replies.0.lock().is_empty());
+            assert!(!error.to_string().contains(header));
+        }
+    });
+}
+
+#[test]
+fn pinned_order_refresh_rejects_unsafe_retry_after_and_preserves_resumable_order() {
+    block_on(async {
+        let (memory, challenges, clock, _, installer) = setup();
+        let (key_pkcs8, csr_der) = new_certificate_request(DNS).unwrap();
+        let pending = PendingOrder {
+            url: Some(ORDER.into()),
+            replaces: None,
+            key_pkcs8,
+            csr_der,
+            started_unix: NOW,
+            expires_unix: Some(EXPIRY),
+        };
+        let record = StoredHost {
+            host: host(),
+            certificate: None,
+            order: Some(pending.clone()),
+            retry: RetryState {
+                failures: 0,
+                not_before_unix: 0,
+            },
+        };
+        memory.records.lock().host = Some(record);
+        let order=json!({"status":"processing","authorizations":[],"identifiers":[{"type":"dns","value":DNS}],"expires":"2027-01-15T10:46:40Z","finalize":"https://ca.example/finalize"}).to_string();
+        let mut overflow = response(200, order.clone());
+        overflow.headers_mut().insert(
+            http::header::RETRY_AFTER,
+            "18446744073709551615".parse().unwrap(),
+        );
+        let replies = Responses(Arc::new(PlMutex::new(VecDeque::from([
+            ari_directory_response(),
+            response(200, ""),
+            response(200, order),
+            overflow,
+        ]))));
+        let mut engine = Upstream::new(replies.clone(), DIRECTORY);
+        let error = attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut engine,
+            host(),
+            &installer,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, FailureKind::Protocol);
+        assert_eq!(error.status, Some(200));
+        assert!(!error.terminal_order);
+        assert!(installer.active.lock().is_empty());
+        let records = memory.records.lock();
+        let stored = records.host.as_ref().unwrap();
+        assert_eq!(stored.order.as_ref().unwrap().url, pending.url);
+        assert_eq!(stored.order.as_ref().unwrap().key_pkcs8, pending.key_pkcs8);
+        assert_eq!(stored.retry.failures, 1);
+        assert!(stored.retry.not_before_unix >= NOW + 60);
+        assert!(replies.0.lock().is_empty());
+    });
+}
+
+#[test]
+fn response_boundary_preserves_accepted_retry_headers_status_and_bytes() {
+    block_on(async {
+        for header in [
+            "0",
+            "+120",
+            "invalid",
+            "-1",
+            "18446744073709551616",
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+        ] {
+            let mut reply = response(202, Bytes::from_static(b"unchanged response"));
+            reply
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, header.parse().unwrap());
+            let headers = reply.headers().clone();
+            let client = DirectoryClient {
+                transport: Responses(Arc::new(PlMutex::new(VecDeque::from([reply])))),
+                directory: DIRECTORY.parse().unwrap(),
+                observations: Arc::new(PlMutex::new(Observations::default())),
+            };
+            let mut reply = client
+                .request(request("GET", "https://ca.example/renewal/id"))
+                .await
+                .unwrap();
+            assert_eq!(reply.parts.status, 202);
+            assert_eq!(reply.parts.headers, headers);
+            assert_eq!(
+                reply.body.into_bytes().await.unwrap(),
+                b"unchanged response".as_slice()
+            );
+        }
+    });
+}
+
+#[test]
+fn pinned_ari_classifies_actual_error_status_for_problem_and_non_json_bodies() {
+    block_on(async {
+        for (status, kind) in [(503, FailureKind::Network), (429, FailureKind::RateLimited)] {
+            for body in [
+                "",
+                "<html>private server failure</html>",
+                r#"{"type":"urn:ietf:params:acme:error:malformed","detail":"private server failure"}"#,
+            ] {
+                let replies = Responses(Arc::new(PlMutex::new(VecDeque::from([
+                    ari_directory_response(),
+                    response(status, body),
+                ]))));
+                let mut engine = Upstream::new(AriTransport(replies.clone()), DIRECTORY);
+                engine.restore(restored_credentials()).await.unwrap();
+                let error = engine
+                    .renewal(&replacement_id(&ari_material()).unwrap())
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(error.status, Some(status));
+                assert_eq!(error.kind, kind);
+                assert!(!error.terminal_order);
+                assert!(!error.to_string().contains("private"));
+                assert!(replies.0.lock().is_empty());
+            }
+        }
+    });
+}
+
+#[test]
+fn pinned_ari_discards_directory_retry_hint_before_retaining_its_own_hint() {
+    #[derive(Clone)]
+    struct Hints {
+        responses: Responses,
+        hint: Arc<PlMutex<Option<SystemTime>>>,
+    }
+    impl AttemptTransport for Hints {
+        fn reset_retry_hint(&self) {
+            *self.hint.lock() = None;
+        }
+        fn retry_not_before(&self) -> Option<SystemTime> {
+            *self.hint.lock()
+        }
+    }
+    impl HttpClient for Hints {
+        fn request(
+            &self,
+            request: http::Request<instant_acme::BodyWrapper<Bytes>>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<instant_acme::BytesResponse, instant_acme::Error>>
+                    + Send,
+            >,
+        > {
+            let work = self.responses.request(request);
+            let hint = self.hint.clone();
+            Box::pin(async move {
+                let response = work.await?;
+                let seconds = response
+                    .parts
+                    .headers
+                    .get(http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let deadline = UNIX_EPOCH + Duration::from_secs(NOW + seconds);
+                let mut current = hint.lock();
+                *current = Some(current.map_or(deadline, |previous| previous.max(deadline)));
+                Ok(response)
+            })
+        }
+    }
+    block_on(async {
+        let mut directory = ari_directory_response();
+        directory
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, "9000".parse().unwrap());
+        let mut reply = response(503, "private remote failure");
+        reply
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, "120".parse().unwrap());
+        let transport = Hints {
+            responses: Responses(Arc::new(PlMutex::new(VecDeque::from([directory, reply])))),
+            hint: Arc::new(PlMutex::new(None)),
+        };
+        let mut engine = Upstream::new(AriTransport(transport.clone()), DIRECTORY);
+        engine.restore(restored_credentials()).await.unwrap();
+        assert_eq!(
+            transport.retry_not_before(),
+            Some(UNIX_EPOCH + Duration::from_secs(NOW + 9000))
+        );
+        let error = engine
+            .renewal(&replacement_id(&ari_material()).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, FailureKind::Network);
+        assert_eq!(error.status, Some(503));
+        assert_eq!(
+            error.retry_not_before,
+            Some(UNIX_EPOCH + Duration::from_secs(NOW + 120))
+        );
+    });
+}

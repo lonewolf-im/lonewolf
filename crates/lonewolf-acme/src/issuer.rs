@@ -969,6 +969,20 @@ impl<T: HttpClient> HttpClient for DirectoryClient<T> {
                         Some((response.parts.status.as_u16(), slot.is_some()));
                 }
             }
+            if response
+                .parts
+                .headers
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .is_some_and(|delay| {
+                    SystemTime::now()
+                        .checked_add(Duration::from_secs(delay))
+                        .is_none()
+                })
+            {
+                return Err(instant_acme::Error::Str("invalid retry deadline"));
+            }
             if response.parts.status.is_success() && (is_directory || slot.is_some()) {
                 let bytes = response
                     .body
@@ -1141,9 +1155,11 @@ impl<T: AttemptTransport> Engine for Upstream<T> {
         &mut self,
         identifier: &CertificateIdentifier<'_>,
     ) -> Result<RenewalWindow, AttemptFailure> {
+        self.reset_hint();
+        let observations = self.observations.clone();
         let account = self.account.as_ref().ok_or(StateError::CorruptData)?;
         let (info, delay) = account.renewal_info(identifier).await.map_err(|error| {
-            let mut failure = classify(error);
+            let mut failure = classify_observed(error, &observations, false);
             failure.retry_not_before = self.transport.retry_not_before();
             failure
         })?;

@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use compio::io::compat::{AsyncReadStream, AsyncStream};
@@ -48,6 +49,7 @@ pub(super) struct Established<A: ChunkAllocator> {
 
 pub(super) struct TlsBinding {
     pub(super) exporter: [u8; 32],
+    pub(super) server_end_point: Arc<[u8]>,
 }
 
 pub(super) async fn establish<A: ChunkAllocator + Clone>(
@@ -129,8 +131,12 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             writer.send(STARTTLS_FEATURES).await?;
             match reader.next_event().await? {
                 Some(StreamEvent::Element(element)) if is_starttls(&element) => {
+                    let Some(handshake) = hosts.tls_handshake(&header.host).await else {
+                        writer.send(STARTTLS_FAILURE).await?;
+                        return Err(CloseOutcome::StartTlsRejected);
+                    };
                     writer.send(STARTTLS_PROCEED).await?;
-                    Ok(header.host)
+                    Ok((header.host, handshake))
                 }
                 Some(StreamEvent::Element(element)) if is_starttls_element(&element) => {
                     writer.send(STARTTLS_FAILURE).await?;
@@ -147,7 +153,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         }),
     )
     .await;
-    let selected_host = match plain {
+    let (selected_host, handshake) = match plain {
         Ok(host) => host,
         Err(outcome) => {
             return Err(
@@ -173,11 +179,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
         context.interrupt(async {
-            let tls_config = hosts
-                .tls_server_config(&selected_host)
-                .await
-                .ok_or(CloseOutcome::InternalError)?;
-            let acceptor = TlsAcceptor::from(tls_config);
+            let acceptor = TlsAcceptor::from(handshake.config);
             acceptor
                 .accept(RecordGuard::new(
                     CountingIo::new(
@@ -291,7 +293,10 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         client,
         monitor: None,
         client_from: header.response_to,
-        binding: TlsBinding { exporter },
+        binding: TlsBinding {
+            exporter,
+            server_end_point: handshake.server_end_point,
+        },
         auth_started_at: Instant::now(),
     })
 }

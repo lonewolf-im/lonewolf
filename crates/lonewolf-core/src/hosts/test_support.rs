@@ -78,3 +78,79 @@ pub(in crate::hosts) fn san_parameters(
         ));
     Ok(parameters)
 }
+
+pub(crate) fn material(
+    mut parameters: rcgen::CertificateParams,
+) -> Result<
+    (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let signer = TestSigner::new()?;
+    parameters.serial_number = Some(1u64.into());
+    let certificate = parameters.self_signed(&signer)?;
+    let mut bytes = zeroize::Zeroizing::new([0; 512]);
+    let key = signer.key.to_pkcs8_der(&mut bytes[..])?;
+    Ok((
+        certificate.der().clone(),
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key.to_vec()).into(),
+    ))
+}
+
+pub(crate) fn managed_hosts() -> Result<super::Hosts, super::HostsError> {
+    let mut config = crate::config::Config::default();
+    config.hosts.insert(
+        "example.com".into(),
+        crate::config::HostConfig {
+            tls: Some(crate::config::HostTlsConfig {
+                source: crate::config::HostTlsSource::LetsEncrypt,
+                client_auth: None,
+            }),
+            ..crate::config::HostConfig::default()
+        },
+    );
+    super::Hosts::new(&config.hosts, Some("localhost"))
+}
+
+pub(crate) fn handshake(
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+) -> Result<rustls::ClientConnection, Box<dyn std::error::Error>> {
+    let mut client = rustls::ClientConnection::new(client_config, "example.com".try_into()?)?;
+    let mut server = rustls::ServerConnection::new(server_config)?;
+    let mut wire = Vec::new();
+    for _ in 0..32 {
+        wire.clear();
+        while client.wants_write() {
+            client.write_tls(&mut wire)?;
+        }
+        if !wire.is_empty() {
+            let mut input = std::io::Cursor::new(&wire);
+            while input.position() < wire.len() as u64 {
+                server.read_tls(&mut input)?;
+                server.process_new_packets()?;
+            }
+        }
+        wire.clear();
+        while server.wants_write() {
+            server.write_tls(&mut wire)?;
+        }
+        if !wire.is_empty() {
+            let mut input = std::io::Cursor::new(&wire);
+            while input.position() < wire.len() as u64 {
+                client.read_tls(&mut input)?;
+                client.process_new_packets()?;
+            }
+        }
+        if !client.is_handshaking()
+            && !server.is_handshaking()
+            && !client.wants_write()
+            && !server.wants_write()
+        {
+            return Ok(client);
+        }
+    }
+    Err("in-memory TLS handshake did not complete".into())
+}

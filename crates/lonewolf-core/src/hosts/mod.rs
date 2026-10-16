@@ -13,13 +13,17 @@ use std::sync::Arc;
 use graviola::hashing::{Hash, Sha256, Sha384, Sha512};
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
+use parking_lot::RwLock as PlRwLock;
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, PublicKeyData};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
-use rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::{
+    CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
+use x509_cert::ext::pkix::{SubjectAltName, name::GeneralName};
 use zeroize::Zeroizing;
 
 use crate::config::{HostConfig, HostTlsConfig, HostTlsSource};
@@ -41,12 +45,65 @@ pub struct Hosts {
 struct Host {
     domain: String,
     config: HostConfig,
-    certified_key: Arc<CertifiedKey>,
-    tls_server_config: Arc<rustls::ServerConfig>,
+    tls: Arc<PlRwLock<Option<Arc<TlsSnapshot>>>>,
     tls_builder: rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier>,
-    certificate_resolver: Arc<HostCertResolver>,
-    tls_server_end_point: Vec<u8>,
     client_certificate_policy: Option<Arc<ClientCertificatePolicy>>,
+}
+
+pub struct TlsHandshake {
+    pub config: Arc<rustls::ServerConfig>,
+    pub server_end_point: Arc<[u8]>,
+}
+
+struct TlsSnapshot {
+    certified_key: Arc<CertifiedKey>,
+    resolver: Arc<HostCertResolver>,
+    config: Arc<rustls::ServerConfig>,
+    server_end_point: Arc<[u8]>,
+    validity: Option<(u64, u64)>,
+}
+
+pub struct PreparedCertificate {
+    target: Arc<PlRwLock<Option<Arc<TlsSnapshot>>>>,
+    snapshot: Arc<TlsSnapshot>,
+    validity: (u64, u64),
+}
+
+impl PreparedCertificate {
+    /// Returns the usable certificate lifetime in Unix seconds.
+    pub fn validity(&self) -> (u64, u64) {
+        self.validity
+    }
+
+    /// Publishes the prepared generation without revalidation.
+    pub fn activate(self) {
+        let previous = self.target.write().replace(self.snapshot);
+        drop(previous);
+    }
+}
+
+impl fmt::Debug for TlsSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsSnapshot")
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for TlsHandshake {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TlsHandshake")
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for PreparedCertificate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedCertificate")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -91,26 +148,6 @@ impl Hosts {
         let blocking = BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() });
         for (domain, config) in hosts {
             let identity = tls_identity(domain)?;
-            let certified_key = match config.tls.as_ref() {
-                Some(tls) => load_certified_key(domain, tls, &provider)?,
-                None if domain == "localhost" => generate_localhost_key(&provider)?,
-                None => return Err(HostsError::MissingTls(domain.clone())),
-            };
-            certified_key
-                .end_entity_cert()
-                .and_then(|certificate| {
-                    verify_service_identity(certificate, &identity, XmppService::Client)
-                })
-                .map_err(|source| HostsError::InvalidCertificate {
-                    domain: domain.clone(),
-                    source,
-                })?;
-            let certified_key = Arc::new(certified_key);
-            let tls_server_end_point = certified_key
-                .cert
-                .first()
-                .and_then(|cert| tls_server_end_point(cert.as_ref()))
-                .ok_or_else(|| HostsError::UnsupportedChannelBinding(domain.clone()))?;
             let client_certificate_policy = config
                 .tls
                 .as_ref()
@@ -128,31 +165,35 @@ impl Hosts {
                     domain: domain.clone(),
                     source,
                 })?;
-            let verifier = client_certificate_policy.as_ref().map_or_else(
-                rustls::server::WebPkiClientVerifier::no_client_auth,
-                |policy| policy.verifier(),
-            );
             let tls_builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
                 .with_safe_default_protocol_versions()
                 .map_err(HostsError::TlsConfiguration)?;
-            let certificate_resolver = Arc::new(HostCertResolver {
-                identity,
-                certified_key: Arc::clone(&certified_key),
-            });
-            let mut tls_server_config = tls_builder
-                .clone()
-                .with_client_cert_verifier(verifier)
-                .with_cert_resolver(certificate_resolver.clone());
-            // TLS 1.2 exporters need an extended master secret for channel binding.
-            tls_server_config.require_ems = true;
+            let certified_key = match config.tls.as_ref() {
+                Some(HostTlsConfig {
+                    source: HostTlsSource::LetsEncrypt,
+                    ..
+                }) => None,
+                Some(tls) => Some(load_certified_key(domain, tls, &provider)?),
+                None if domain == "localhost" => Some(generate_localhost_key(&provider)?),
+                None => return Err(HostsError::MissingTls(domain.clone())),
+            };
+            let snapshot = certified_key
+                .map(|key| {
+                    make_snapshot(
+                        domain,
+                        identity,
+                        key,
+                        &tls_builder,
+                        client_certificate_policy.as_ref(),
+                        None,
+                    )
+                })
+                .transpose()?;
             sorted_hosts.push(Host {
                 domain: domain.clone(),
                 config: config.clone(),
-                certified_key,
-                tls_server_config: Arc::new(tls_server_config),
+                tls: Arc::new(PlRwLock::new(snapshot.map(Arc::new))),
                 tls_builder,
-                certificate_resolver,
-                tls_server_end_point,
                 client_certificate_policy,
             });
         }
@@ -182,28 +223,80 @@ impl Hosts {
         self.find_host(domain)?.config.tls.as_ref()
     }
 
-    pub fn certified_key(&self, domain: &str) -> Option<&CertifiedKey> {
-        Some(&self.find_host(domain)?.certified_key)
+    pub fn certified_key(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
+        let snapshot = self.snapshot(domain)?;
+        Some(Arc::clone(&snapshot.certified_key))
     }
 
-    pub async fn tls_server_config(&self, domain: &str) -> Option<Arc<rustls::ServerConfig>> {
+    /// Admission captures one generation before any client-verifier refresh.
+    pub async fn tls_handshake(&self, domain: &str) -> Option<TlsHandshake> {
         let host = self.find_host(domain)?;
-        let Some(policy) = &host.client_certificate_policy else {
-            return Some(Arc::clone(&host.tls_server_config));
+        let snapshot = self.snapshot(domain)?;
+        if snapshot.validity.is_some_and(|(start, end)| {
+            let now = UnixTime::now().as_secs();
+            now < start || now >= end
+        }) {
+            return None;
+        }
+        let config = if let Some(policy) = &host.client_certificate_policy {
+            let verifier = policy.handshake_verifier().await;
+            // Fresh resumption state prevents reuse of an older client-certificate verdict.
+            let mut config = host
+                .tls_builder
+                .clone()
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(snapshot.resolver.clone());
+            config.require_ems = true;
+            Arc::new(config)
+        } else {
+            Arc::clone(&snapshot.config)
         };
-        let verifier = policy.handshake_verifier().await;
-        // A new session cache prevents resuming an older certificate verdict.
-        let mut config = host
-            .tls_builder
-            .clone()
-            .with_client_cert_verifier(verifier)
-            .with_cert_resolver(host.certificate_resolver.clone());
-        config.require_ems = true;
-        Some(Arc::new(config))
+        Some(TlsHandshake {
+            config,
+            server_end_point: Arc::clone(&snapshot.server_end_point),
+        })
     }
 
-    pub fn tls_server_end_point(&self, domain: &str) -> Option<&[u8]> {
-        Some(&self.find_host(domain)?.tls_server_end_point)
+    pub fn tls_server_end_point(&self, domain: &str) -> Option<Arc<[u8]>> {
+        let snapshot = self.snapshot(domain)?;
+        Some(Arc::clone(&snapshot.server_end_point))
+    }
+
+    pub fn prepare_managed_certificate(
+        &self,
+        domain: &str,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<PreparedCertificate, HostsError> {
+        let host = self
+            .find_host(domain)
+            .filter(|host| {
+                matches!(
+                    host.config.tls.as_ref().map(|tls| &tls.source),
+                    Some(HostTlsSource::LetsEncrypt)
+                )
+            })
+            .ok_or_else(|| HostsError::NotManaged(domain.into()))?;
+        let identity = tls_identity(domain)?;
+        let validity = managed_validity(domain, &identity, &chain)?;
+        let key = certified_key(domain, chain, key, host.tls_builder.crypto_provider())?;
+        let snapshot = make_snapshot(
+            domain,
+            identity,
+            key,
+            &host.tls_builder,
+            host.client_certificate_policy.as_ref(),
+            Some(validity),
+        )?;
+        Ok(PreparedCertificate {
+            target: Arc::clone(&host.tls),
+            snapshot: Arc::new(snapshot),
+            validity,
+        })
+    }
+
+    fn snapshot(&self, domain: &str) -> Option<Arc<TlsSnapshot>> {
+        self.find_host(domain)?.tls.read().clone()
     }
 
     pub fn client_certificate_policy(&self, domain: &str) -> Option<&Arc<ClientCertificatePolicy>> {
@@ -217,6 +310,97 @@ impl Hosts {
             .ok()?;
         self.hosts.get(index)
     }
+}
+
+fn make_snapshot(
+    domain: &str,
+    identity: ServerName<'static>,
+    key: CertifiedKey,
+    builder: &rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier>,
+    policy: Option<&Arc<ClientCertificatePolicy>>,
+    validity: Option<(u64, u64)>,
+) -> Result<TlsSnapshot, HostsError> {
+    key.end_entity_cert()
+        .and_then(|certificate| {
+            verify_service_identity(certificate, &identity, XmppService::Client)
+        })
+        .map_err(|source| HostsError::InvalidCertificate {
+            domain: domain.into(),
+            source,
+        })?;
+    let endpoint = key
+        .cert
+        .first()
+        .and_then(|certificate| tls_server_end_point(certificate.as_ref()))
+        .ok_or_else(|| HostsError::UnsupportedChannelBinding(domain.into()))?;
+    let certified_key = Arc::new(key);
+    let resolver = Arc::new(HostCertResolver {
+        identity,
+        certified_key: Arc::clone(&certified_key),
+    });
+    let verifier = policy.map_or_else(
+        rustls::server::WebPkiClientVerifier::no_client_auth,
+        |policy| policy.verifier(),
+    );
+    let mut config = builder
+        .clone()
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(resolver.clone());
+    // TLS 1.2 exporters need an extended master secret for channel binding.
+    config.require_ems = true;
+    Ok(TlsSnapshot {
+        certified_key,
+        resolver,
+        config: Arc::new(config),
+        server_end_point: endpoint.into(),
+        validity,
+    })
+}
+
+fn managed_validity(
+    domain: &str,
+    identity: &ServerName<'_>,
+    chain: &[CertificateDer<'_>],
+) -> Result<(u64, u64), HostsError> {
+    let invalid = |source| HostsError::InvalidCertificate {
+        domain: domain.into(),
+        source,
+    };
+    let ServerName::DnsName(identity) = identity else {
+        return Err(invalid(rustls::CertificateError::NotValidForName.into()));
+    };
+    if chain.is_empty() {
+        return Err(HostsError::NoCertificates(domain.into()));
+    }
+    let mut start = 0;
+    let mut end = u64::MAX;
+    for (index, certificate) in chain.iter().enumerate() {
+        let parsed = Certificate::from_der(certificate.as_ref())
+            .map_err(|_| invalid(rustls::CertificateError::BadEncoding.into()))?;
+        if index == 0 {
+            let names = parsed
+                .tbs_certificate()
+                .get_extension::<SubjectAltName>()
+                .map_err(|_| invalid(rustls::CertificateError::BadEncoding.into()))?;
+            let exact_name = names.is_some_and(|(_, names)| {
+                matches!(names.0.as_slice(), [GeneralName::DnsName(name)] if name.as_str().eq_ignore_ascii_case(identity.as_ref()))
+            });
+            if !exact_name {
+                return Err(invalid(rustls::CertificateError::NotValidForName.into()));
+            }
+        }
+        let validity = parsed.tbs_certificate().validity();
+        start = start.max(validity.not_before.to_unix_duration().as_secs());
+        end = end.min(validity.not_after.to_unix_duration().as_secs());
+    }
+    let now = UnixTime::now().as_secs();
+    if now < start {
+        return Err(invalid(rustls::CertificateError::NotValidYet.into()));
+    }
+    if now >= end {
+        return Err(invalid(rustls::CertificateError::Expired.into()));
+    }
+    Ok((start, end))
 }
 
 fn tls_identity(domain: &str) -> Result<ServerName<'static>, HostsError> {
@@ -265,7 +449,7 @@ fn load_certified_key(
         private_key_path,
     } = &tls.source
     else {
-        return Err(HostsError::ManagedCertificateUnavailable(domain.into()));
+        return Err(HostsError::NotManaged(domain.into()));
     };
     let certificate_file =
         File::open(certificate_chain_path).map_err(|source| HostsError::ReadCertificate {
@@ -395,7 +579,7 @@ pub enum HostsError {
     DefaultRequired,
     UnknownDefault(String),
     MissingTls(String),
-    ManagedCertificateUnavailable(String),
+    NotManaged(String),
     ReadCertificate {
         domain: String,
         path: PathBuf,
@@ -435,10 +619,9 @@ impl fmt::Display for HostsError {
                 )
             }
             Self::MissingTls(domain) => write!(formatter, "hosts.{domain}.tls is required"),
-            Self::ManagedCertificateUnavailable(domain) => write!(
-                formatter,
-                "managed TLS certificate for hosts.{domain} is unavailable"
-            ),
+            Self::NotManaged(domain) => {
+                write!(formatter, "hosts.{domain} is not a managed TLS host")
+            }
             Self::ReadCertificate {
                 domain,
                 path,
@@ -504,6 +687,6 @@ impl Error for HostsError {
 }
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

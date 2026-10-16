@@ -1020,9 +1020,12 @@ fn blocked_handshake_crl_reload_obeys_establishment_timeout_and_late_results_are
     let material = block_crl_reads(&crls_path)?;
     let mut plain = super::support::PlainClient::tcp(&suite)?;
     plain.open()?;
-    let mut client = plain.start_tls_with_config(std::sync::Arc::clone(&suite.tls))?;
+    plain.send(&format!(
+        "<starttls xmlns='{}'/>",
+        super::support::TLS_NAMESPACE
+    ))?;
     let mut release = wait_for_crl_reader(&crls_path)?;
-    assert!(client.open_with(OPEN).is_err());
+    plain.expect_stream_error("policy-violation")?;
     suite.wait_for_log("outcome=\"establishment_timeout\"")?;
     release.write_all(&material)?;
     drop(release);
@@ -1055,10 +1058,17 @@ fn blocked_handshake_crl_reload_obeys_shutdown() -> TestResult {
     block_crl_reads(&crls_path)?;
     let mut plain = super::support::PlainClient::tcp(&suite)?;
     plain.open()?;
-    let mut client = plain.start_tls_with_config(std::sync::Arc::clone(&suite.tls))?;
+    plain.send(&format!(
+        "<starttls xmlns='{}'/>",
+        super::support::TLS_NAMESPACE
+    ))?;
     let _release = wait_for_crl_reader(&crls_path)?;
-    suite.stop()?;
-    assert!(client.open_with(OPEN).is_err());
+    std::thread::scope(|scope| -> TestResult {
+        let stopped = scope.spawn(|| suite.stop().map_err(|error| error.to_string()));
+        plain.expect_stream_error("system-shutdown")?;
+        stopped.join().map_err(|_| "shutdown worker panicked")??;
+        Ok(())
+    })?;
     suite.wait_for_log("outcome=\"system_shutdown\"")?;
     Ok(())
 }
@@ -1545,13 +1555,23 @@ fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_origin
     let started = std::time::Instant::now();
     let mut plain = suite.tcp_client()?;
     plain.open()?;
-    let mut client = plain.start_tls_with_config(with_client_certificate(
-        &suite.tls,
-        std::sync::Arc::clone(&certificates.trusted),
+    plain.send(&format!(
+        "<starttls xmlns='{}'/>",
+        super::support::TLS_NAMESPACE
     ))?;
     let mut handshake_release = wait_for_crl_reader(&path)?;
     handshake_release.write_all(&material)?;
     drop(handshake_release);
+    plain
+        .receive()?
+        .assert_name(super::support::TLS_NAMESPACE, "proceed");
+    let socket = plain.into_inner();
+    assert!(socket.buffer().is_empty());
+    let connection = rustls::ClientConnection::new(
+        with_client_certificate(&suite.tls, std::sync::Arc::clone(&certificates.trusted)),
+        rustls::pki_types::ServerName::try_from("localhost")?,
+    )?;
+    let mut client = Client::new(rustls::StreamOwned::new(connection, socket.into_inner()));
     let mut verification_release = std::thread::scope(|scope| -> TestResult<std::fs::File> {
         let (handshake_complete, completed) = std::sync::mpsc::channel();
         let closed = scope.spawn(move || -> Result<(), String> {

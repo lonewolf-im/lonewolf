@@ -506,9 +506,10 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
         let (socket, _) = listener.accept().await?;
         let mut transport = TlsAcceptor::from(
             hosts
-                .tls_server_config("localhost")
+                .tls_handshake("localhost")
                 .await
-                .ok_or("no TLS config")?,
+                .ok_or("no TLS config")?
+                .config,
         )
         .accept(super::renegotiation::RecordGuard::new(
             super::traffic::CountingIo::new(

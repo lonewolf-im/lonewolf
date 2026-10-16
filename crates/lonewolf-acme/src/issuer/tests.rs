@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use rustls::pki_types::Der;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use x509_cert::ext::pkix::AuthorityKeyIdentifier;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_executor::block_on;
@@ -117,6 +119,7 @@ struct FakeClock {
     start: Instant,
     sleeps: RefCell<Vec<Duration>>,
     jitter: Cell<u64>,
+    block_sleep: Cell<Option<Duration>>,
 }
 
 impl Default for FakeClock {
@@ -126,6 +129,7 @@ impl Default for FakeClock {
             start: Instant::now(),
             sleeps: RefCell::new(Vec::new()),
             jitter: Cell::new(0),
+            block_sleep: Cell::new(None),
         }
     }
 }
@@ -142,6 +146,13 @@ impl Clock for FakeClock {
     }
     async fn sleep(&self, duration: Duration) {
         self.sleeps.borrow_mut().push(duration);
+        if self
+            .block_sleep
+            .get()
+            .is_some_and(|minimum| duration >= minimum)
+        {
+            future::pending::<()>().await;
+        }
         self.elapsed.set(self.elapsed.get() + duration);
     }
 }
@@ -160,6 +171,8 @@ struct Script {
     replaced: Option<CertificateIdentifier<'static>>,
     hint: Cell<Option<SystemTime>>,
     next_hint: Option<SystemTime>,
+    hint_at: Option<&'static str>,
+    echo_at: Option<(&'static str, Option<CertificateIdentifier<'static>>)>,
     error: Option<(&'static str, AttemptFailure)>,
     new_orders: usize,
     resumes: usize,
@@ -214,6 +227,8 @@ impl Script {
             replaced: None,
             hint: Cell::new(None),
             next_hint: None,
+            hint_at: None,
+            echo_at: None,
             error: None,
             new_orders: 0,
             resumes: 0,
@@ -246,10 +261,19 @@ impl Script {
     }
     async fn step(&mut self, name: &'static str) -> Result<(), AttemptFailure> {
         self.gate.enter(name).await;
+        if self
+            .echo_at
+            .as_ref()
+            .is_some_and(|(stage, _)| *stage == name)
+        {
+            self.replaced = self.echo_at.take().unwrap().1;
+        }
         if self.error.as_ref().is_some_and(|(at, _)| *at == name) {
             return Err(self.error.take().unwrap().1);
         }
-        if let Some(hint) = self.next_hint.take() {
+        if self.hint_at.is_none_or(|stage| stage == name)
+            && let Some(hint) = self.next_hint.take()
+        {
             self.hint.set(Some(hint));
         }
         Ok(())
@@ -1184,6 +1208,13 @@ fn metadata_status_rules_and_wrong_identity_prevent_finalize_or_activation() {
 #[derive(Clone)]
 struct Responses(Arc<PlMutex<VecDeque<http::Response<Full<Bytes>>>>>);
 
+impl AttemptTransport for Responses {
+    fn reset_retry_hint(&self) {}
+    fn retry_not_before(&self) -> Option<SystemTime> {
+        None
+    }
+}
+
 impl HttpClient for Responses {
     fn request(
         &self,
@@ -1223,7 +1254,7 @@ fn observer_preserves_bytes_headers_status_and_ignores_unrelated_and_nonce_error
         let body = Bytes::from(serde_json::to_vec(&json!({"identifiers":[{"type":"dns","value":DNS}],"expires":"2027-01-15T08:00:00Z"})).unwrap());
         let observations = Arc::new(PlMutex::new(Observations::default()));
         let slot = Arc::new(PlMutex::new(None));
-        observations.lock().armed = Some((ORDER.parse().unwrap(), slot.clone()));
+        observations.lock().armed = Some((ORDER.parse().unwrap(), slot.clone(), false));
         let client = DirectoryClient {
             transport: Responses(Arc::new(PlMutex::new(VecDeque::from([
                 response(200, body.clone()),
@@ -1260,7 +1291,7 @@ fn observer_generation_ownership_ignores_late_and_other_attempt_responses() {
         );
         let observations = Arc::new(PlMutex::new(Observations::default()));
         let old = Arc::new(PlMutex::new(None));
-        observations.lock().armed = Some((ORDER.parse().unwrap(), old.clone()));
+        observations.lock().armed = Some((ORDER.parse().unwrap(), old.clone(), false));
         let client = DirectoryClient {
             transport: Responses(Arc::new(PlMutex::new(VecDeque::from([response(
                 200, body,
@@ -1270,7 +1301,7 @@ fn observer_generation_ownership_ignores_late_and_other_attempt_responses() {
         };
         let outstanding = client.request(request("POST", ORDER));
         let new = Arc::new(PlMutex::new(None));
-        observations.lock().armed = Some((ORDER.parse().unwrap(), new.clone()));
+        observations.lock().armed = Some((ORDER.parse().unwrap(), new.clone(), false));
         outstanding.await.unwrap();
         assert!(old.lock().is_none());
         assert!(new.lock().is_none());
@@ -1410,6 +1441,7 @@ fn optional_expiry_never_erases_the_durable_expiry() {
                 host: host(),
                 certificate: None,
                 order: Some(PendingOrder {
+                    replaces: None,
                     key_pkcs8,
                     csr_der,
                     url: None,
@@ -1602,7 +1634,7 @@ fn actual_order_status_controls_not_found_and_rate_limit_classification() {
         ] {
             let observations = Arc::new(PlMutex::new(Observations::default()));
             observations.lock().armed =
-                Some((ORDER.parse().unwrap(), Arc::new(PlMutex::new(None))));
+                Some((ORDER.parse().unwrap(), Arc::new(PlMutex::new(None)), false));
             let body = json!({"type":"urn:ietf:params:acme:error:malformed","status":body_status,"detail":"private CA detail"});
             let client = DirectoryClient {
                 transport: Responses(Arc::new(PlMutex::new(VecDeque::from([response(
@@ -1627,7 +1659,8 @@ fn actual_order_status_controls_not_found_and_rate_limit_classification() {
 fn nonce_success_and_transport_read_status_cannot_clear_an_order() {
     block_on(async {
         let observations = Arc::new(PlMutex::new(Observations::default()));
-        observations.lock().armed = Some((ORDER.parse().unwrap(), Arc::new(PlMutex::new(None))));
+        observations.lock().armed =
+            Some((ORDER.parse().unwrap(), Arc::new(PlMutex::new(None)), false));
         let client = DirectoryClient {
             transport: Responses(Arc::new(PlMutex::new(VecDeque::from([response(200, "")])))),
             directory: DIRECTORY.parse().unwrap(),
@@ -1653,4 +1686,438 @@ fn nonce_success_and_transport_read_status_cannot_clear_an_order() {
         assert_eq!(error.status, Some(404));
         assert!(!error.terminal_order);
     });
+}
+
+#[test]
+fn cancellation_during_hint_and_poll_sleeps_preserves_floor_for_a_fresh_engine() {
+    for stage in ["restore", "authorization", "ready", "finalize"] {
+        let (memory, challenges, clock, mut engine, installer) = setup();
+        clock.block_sleep.set(Some(Duration::from_secs(60)));
+        engine.next_hint = Some(UNIX_EPOCH + Duration::from_secs(NOW + 600));
+        engine.hint_at = Some(stage);
+        let future = attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut engine,
+            host(),
+            &installer,
+            None,
+        );
+        assert!(future.now_or_never().is_none());
+        assert_eq!(
+            clock.sleeps.borrow().last().copied(),
+            Some(Duration::from_secs(600) - clock.elapsed.get())
+        );
+        assert!(challenges.lookup(DNS, &"A".repeat(22)).is_none());
+        let pending = {
+            let records = memory.records.lock();
+            let host = records.host.as_ref().unwrap();
+            assert_eq!(host.retry.not_before_unix, NOW + 600);
+            assert_eq!(host.retry.failures, 1);
+            host.order.as_ref().unwrap().clone()
+        };
+        let mut resumed = Script::new(memory.clone(), challenges.clone());
+        resumed.status = engine.status;
+        let restarted = FakeClock::default();
+        restarted.elapsed.set(Duration::from_secs(61));
+        let error = block_on(attempt(
+            &memory,
+            &challenges,
+            &restarted,
+            &mut resumed,
+            host(),
+            &installer,
+            None,
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind, FailureKind::Deferred);
+        assert_eq!(
+            error.retry_not_before,
+            Some(UNIX_EPOCH + Duration::from_secs(NOW + 600))
+        );
+        assert_eq!(
+            (resumed.new_orders, resumed.resumes, resumed.finalizes),
+            (0, 0, 0)
+        );
+        restarted.elapsed.set(Duration::from_secs(600));
+        block_on(attempt(
+            &memory,
+            &challenges,
+            &restarted,
+            &mut resumed,
+            host(),
+            &installer,
+            None,
+        ))
+        .unwrap();
+        let records = memory.records.lock();
+        assert_eq!(
+            records
+                .host
+                .as_ref()
+                .unwrap()
+                .certificate
+                .as_ref()
+                .unwrap()
+                .material
+                .private_key_pkcs8,
+            pending.key_pkcs8
+        );
+        if pending.url.is_some() {
+            assert_eq!(resumed.new_orders, 0);
+        }
+        assert_eq!(engine.finalizes + resumed.finalizes, 1);
+    }
+}
+
+#[test]
+fn pinned_new_order_boundary_requires_one_valid_https_location() {
+    block_on(async {
+        for locations in [
+            vec![],
+            vec![ORDER, ORDER],
+            vec![ORDER, "https://ca.example/order/2"],
+            vec!["http://ca.example/order/1"],
+            vec!["/order/1"],
+            vec!["https://ca.example/order/1#fragment"],
+            vec![ORDER],
+        ] {
+            let (memory, challenges, clock, _, installer) = setup();
+            let directory = json!({"newNonce":"https://ca.example/nonce","newAccount":"https://ca.example/account","newOrder":"https://ca.example/new-order"});
+            let order = |status: &str| json!({"status":status,"authorizations":[],"identifiers":[{"type":"dns","value":DNS}],"expires":"2027-01-15T10:46:40Z","finalize":"https://ca.example/finalize","certificate":"https://ca.example/certificate"});
+            let mut new_order = response(201, order("ready").to_string());
+            for location in &locations {
+                new_order
+                    .headers_mut()
+                    .append(http::header::LOCATION, location.parse().unwrap());
+            }
+            let valid = locations.as_slice() == [ORDER];
+            let mut responses = VecDeque::from([
+                response(200, directory.to_string()),
+                response(200, ""),
+                new_order,
+            ]);
+            if valid {
+                responses.push_back(response(200, order("valid").to_string()));
+                responses.push_back(response(200, pem(&certificate())));
+            }
+            let transport = Responses(Arc::new(PlMutex::new(responses)));
+            let mut engine = Upstream::new(transport.clone(), DIRECTORY);
+            let result = attempt(
+                &memory,
+                &challenges,
+                &clock,
+                &mut engine,
+                host(),
+                &installer,
+                None,
+            )
+            .await;
+            if valid {
+                result.unwrap();
+                assert_eq!(installer.active.lock().len(), 1);
+            } else {
+                assert_eq!(result.unwrap_err().kind, FailureKind::Protocol);
+                assert!(installer.active.lock().is_empty());
+                let records = memory.records.lock();
+                assert!(
+                    records
+                        .host
+                        .as_ref()
+                        .unwrap()
+                        .order
+                        .as_ref()
+                        .unwrap()
+                        .url
+                        .is_none()
+                );
+            }
+            assert!(transport.0.lock().is_empty());
+            assert!(challenges.lookup(DNS, &"A".repeat(22)).is_none());
+        }
+    });
+}
+
+fn install_pending(memory: &Memory, replaces: bool, url: Option<&str>) -> PendingOrder {
+    let material = ari_material();
+    let identifier = replacement_id(&material).unwrap();
+    let (key_pkcs8, csr_der) = new_certificate_request(DNS).unwrap();
+    let pending = PendingOrder {
+        url: url.map(Into::into),
+        replaces: replaces.then(|| identifier.to_string()),
+        key_pkcs8,
+        csr_der,
+        started_unix: NOW,
+        expires_unix: Some(EXPIRY),
+    };
+    memory.records.lock().host = Some(StoredHost {
+        host: host(),
+        order: Some(pending.clone()),
+        certificate: Some(StoredCertificate {
+            material,
+            not_before_unix: NOW - 1000,
+            not_after_unix: NOW + 100_000,
+            renew_at_unix: NOW,
+            ari_check_at_unix: NOW,
+        }),
+        retry: RetryState {
+            failures: 0,
+            not_before_unix: 0,
+        },
+    });
+    pending
+}
+
+#[test]
+fn restart_keeps_original_replacement_intent_when_ari_capability_changes() {
+    for original_ari in [false, true] {
+        let (memory, challenges, clock, mut engine, installer) = setup();
+        install_pending(&memory, false, None);
+        memory.records.lock().host.as_mut().unwrap().order = None;
+        engine.ari = original_ari;
+        engine.error = Some(("ready", failure(FailureKind::Network)));
+        block_on(attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut engine,
+            host(),
+            &installer,
+            None,
+        ))
+        .unwrap_err();
+        let original = memory
+            .records
+            .lock()
+            .host
+            .as_ref()
+            .unwrap()
+            .order
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            original.replaces,
+            engine.replaced.as_ref().map(ToString::to_string)
+        );
+        let mut restarted = Script::new(memory.clone(), challenges.clone());
+        restarted.ari = !original_ari;
+        restarted.replaced = engine.replaced;
+        clock.elapsed.set(Duration::from_secs(60));
+        let supplied = if original_ari {
+            None
+        } else {
+            Some(
+                replacement_id(
+                    &memory
+                        .records
+                        .lock()
+                        .host
+                        .as_ref()
+                        .unwrap()
+                        .certificate
+                        .as_ref()
+                        .unwrap()
+                        .material,
+                )
+                .unwrap(),
+            )
+        };
+        block_on(attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut restarted,
+            host(),
+            &installer,
+            supplied,
+        ))
+        .unwrap();
+        assert_eq!((restarted.new_orders, restarted.resumes), (0, 1));
+        assert_eq!(
+            memory
+                .records
+                .lock()
+                .host
+                .as_ref()
+                .unwrap()
+                .certificate
+                .as_ref()
+                .unwrap()
+                .material
+                .private_key_pkcs8,
+            original.key_pkcs8
+        );
+    }
+}
+
+#[test]
+fn resumed_refreshed_and_finalized_echo_must_match_original_choice() {
+    for phase in ["resume", "refresh", "finalize"] {
+        for scenario in 0..3 {
+            let (memory, challenges, clock, mut engine, installer) = setup();
+            let original = install_pending(&memory, scenario != 0, Some(ORDER));
+            let expected = replacement_id(
+                &memory
+                    .records
+                    .lock()
+                    .host
+                    .as_ref()
+                    .unwrap()
+                    .certificate
+                    .as_ref()
+                    .unwrap()
+                    .material,
+            )
+            .unwrap();
+            engine.replaced = (scenario != 0).then_some(expected);
+            let bad = if scenario == 1 {
+                None
+            } else {
+                Some(
+                    CertificateIdentifier::new(Der::from(&b"other"[..]), Der::from(&[2][..]))
+                        .into_owned(),
+                )
+            };
+            engine.echo_at = Some((phase, bad));
+            let error = block_on(attempt(
+                &memory,
+                &challenges,
+                &clock,
+                &mut engine,
+                host(),
+                &installer,
+                None,
+            ))
+            .unwrap_err();
+            assert_eq!(error.kind, FailureKind::Protocol);
+            assert!(!error.terminal_order);
+            let records = memory.records.lock();
+            let pending = records.host.as_ref().unwrap().order.as_ref().unwrap();
+            assert_eq!(pending.replaces, original.replaces);
+            assert_eq!(pending.url, original.url);
+            assert_eq!(pending.key_pkcs8, original.key_pkcs8);
+            assert!(installer.active.lock().is_empty());
+            assert_eq!(engine.new_orders, 0);
+        }
+    }
+}
+
+#[test]
+fn orphan_intent_never_changes_with_directory_capability() {
+    for replacing in [false, true] {
+        let (memory, challenges, clock, mut engine, installer) = setup();
+        let pending = install_pending(&memory, replacing, None);
+        engine.ari = !replacing;
+        let result = block_on(attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut engine,
+            host(),
+            &installer,
+            None,
+        ));
+        if replacing {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, FailureKind::Protocol);
+            assert!(!error.terminal_order);
+            assert_eq!(engine.new_orders, 0);
+            assert_eq!(
+                memory
+                    .records
+                    .lock()
+                    .host
+                    .as_ref()
+                    .unwrap()
+                    .order
+                    .as_ref()
+                    .unwrap()
+                    .replaces,
+                pending.replaces
+            );
+            clock.elapsed.set(Duration::from_secs(60));
+            engine.ari = true;
+            block_on(attempt(
+                &memory,
+                &challenges,
+                &clock,
+                &mut engine,
+                host(),
+                &installer,
+                None,
+            ))
+            .unwrap();
+            assert_eq!(
+                engine.replaced.as_ref().map(ToString::to_string),
+                pending.replaces
+            );
+        } else {
+            result.unwrap();
+            assert!(engine.replaced.is_none());
+        }
+        assert_eq!(engine.csr, pending.csr_der);
+        assert_eq!(
+            memory
+                .records
+                .lock()
+                .host
+                .as_ref()
+                .unwrap()
+                .certificate
+                .as_ref()
+                .unwrap()
+                .material
+                .private_key_pkcs8,
+            pending.key_pkcs8
+        );
+    }
+}
+
+#[test]
+fn corrupt_persisted_choice_or_forged_caller_never_reaches_ca() {
+    for scenario in 0..3 {
+        let (memory, challenges, clock, mut engine, installer) = setup();
+        install_pending(&memory, true, Some(ORDER));
+        let forged =
+            CertificateIdentifier::new(Der::from(&b"other"[..]), Der::from(&[2][..])).into_owned();
+        let supplied = match scenario {
+            0 => {
+                memory
+                    .records
+                    .lock()
+                    .host
+                    .as_mut()
+                    .unwrap()
+                    .order
+                    .as_mut()
+                    .unwrap()
+                    .replaces = Some(forged.to_string());
+                None
+            }
+            1 => {
+                memory.records.lock().host.as_mut().unwrap().certificate = None;
+                None
+            }
+            _ => Some(forged),
+        };
+        let error = block_on(attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut engine,
+            host(),
+            &installer,
+            supplied,
+        ))
+        .unwrap_err();
+        if scenario < 2 {
+            assert_eq!(error.state_error, Some(StateError::CorruptData));
+        } else {
+            assert_eq!(error.kind, FailureKind::Material);
+        }
+        assert!(!engine.gate.events.borrow().contains(&"restore"));
+        assert_eq!((engine.new_orders, engine.resumes), (0, 0));
+    }
 }

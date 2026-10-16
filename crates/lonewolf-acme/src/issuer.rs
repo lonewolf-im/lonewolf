@@ -15,11 +15,10 @@ use instant_acme::{
     ChallengeType, HttpClient, Identifier, Key, NewOrder, Order, OrderStatus,
 };
 use parking_lot::Mutex as PlMutex;
-use rustls::pki_types::{Der, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Deserialize;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode, EncodeValue, SliceWriter};
-use x509_cert::ext::pkix::AuthorityKeyIdentifier;
+use x509_cert::der::Decode;
 use zeroize::Zeroizing;
 
 use crate::crypto::CertificateSigner;
@@ -386,7 +385,9 @@ async fn attempt<I: Installer>(
         .monotonic()
         .checked_add(ATTEMPT_BUDGET)
         .ok_or(StateError::InvalidData)?;
-    let mut record = store.host(&host.dns_name).await?.unwrap_or(StoredHost {
+    let stored = store.host(&host.dns_name).await?;
+    let existing = stored.is_some();
+    let mut record = stored.unwrap_or(StoredHost {
         host,
         certificate: None,
         order: None,
@@ -395,7 +396,13 @@ async fn attempt<I: Installer>(
             not_before_unix: 0,
         },
     });
-    record.validate()?;
+    record.validate().map_err(|error| {
+        if existing {
+            StateError::CorruptData
+        } else {
+            error
+        }
+    })?;
     let delay = reserve(&mut record.retry, clock)?;
     store.save_host(&record).await?;
     let mut driver = Driver {
@@ -433,7 +440,19 @@ async fn attempt<I: Installer>(
 }
 
 impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
-    async fn wait(&self, delay: Duration) -> Result<(), AttemptFailure> {
+    async fn persist_retry(&mut self) -> Result<(), AttemptFailure> {
+        refresh_retry(
+            &mut self.host.retry,
+            self.clock,
+            self.delay,
+            self.engine.hint(),
+        )?;
+        self.store.save_host(&self.host).await?;
+        Ok(())
+    }
+
+    async fn wait(&mut self, delay: Duration) -> Result<bool, AttemptFailure> {
+        self.persist_retry().await?;
         let hint = self.engine.hint();
         let delay = delay.max(
             hint.and_then(|hint| hint.duration_since(self.clock.now()).ok())
@@ -448,18 +467,13 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
         if !delay.is_zero() {
             self.clock.sleep(delay).await;
         }
-        Ok(())
+        Ok(!delay.is_zero())
     }
 
     async fn before(&mut self) -> Result<(), AttemptFailure> {
-        self.wait(Duration::ZERO).await?;
-        refresh_retry(
-            &mut self.host.retry,
-            self.clock,
-            self.delay,
-            self.engine.hint(),
-        )?;
-        self.store.save_host(&self.host).await?;
+        if self.wait(Duration::ZERO).await? {
+            self.persist_retry().await?;
+        }
         self.engine.reset_hint();
         Ok(())
     }
@@ -481,9 +495,42 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                 ..failure(FailureKind::Account)
             });
         }
+        if let Some(supplied) = &supplied {
+            let current = self
+                .host
+                .certificate
+                .as_ref()
+                .map(|certificate| replacement_id(&certificate.material))
+                .transpose()?;
+            if current.as_ref() != Some(supplied) {
+                return Err(failure(FailureKind::Material));
+            }
+        }
+        let persisted = self
+            .host
+            .order
+            .as_ref()
+            .and_then(|order| order.replaces.as_ref());
+        let original = if let Some(persisted) = persisted {
+            let certificate = self
+                .host
+                .certificate
+                .as_ref()
+                .ok_or(StateError::CorruptData)?;
+            let identifier =
+                replacement_id(&certificate.material).map_err(|_| StateError::CorruptData)?;
+            if identifier.to_string() != *persisted {
+                return Err(StateError::CorruptData.into());
+            }
+            Some(identifier)
+        } else {
+            None
+        };
         self.before().await?;
         self.engine.restore(credentials).await?;
-        let replacement = if self.engine.supports_ari() || supplied.is_some() {
+        let replacement = if self.host.order.is_some() {
+            original
+        } else if self.engine.supports_ari() {
             self.host
                 .certificate
                 .as_ref()
@@ -492,22 +539,12 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
         } else {
             None
         };
-        if supplied
-            .as_ref()
-            .is_some_and(|supplied| replacement.as_ref() != Some(supplied))
-        {
-            return Err(failure(FailureKind::Material));
-        }
-        let replacement = if self.engine.supports_ari() {
-            replacement
-        } else {
-            None
-        };
         if self.host.order.is_none() {
             let (key_pkcs8, csr_der) = new_certificate_request(&self.host.host.dns_name)
                 .map_err(|_| failure(FailureKind::Material))?;
             self.host.order = Some(PendingOrder {
                 url: None,
+                replaces: replacement.as_ref().map(ToString::to_string),
                 key_pkcs8,
                 csr_der,
                 started_unix: unix(self.clock.now())?,
@@ -523,6 +560,9 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
             });
         }
         let url = pending.url.clone();
+        if url.is_none() && replacement.is_some() && !self.engine.supports_ari() {
+            return Err(failure(FailureKind::Protocol));
+        }
         self.before().await?;
         let mut snapshot = if let Some(url) = url {
             self.engine.resume(&url).await?
@@ -746,31 +786,14 @@ fn parse_chain(pem: &str) -> Result<Vec<Vec<u8>>, AttemptFailure> {
 fn replacement_id(
     material: &CertificateMaterial,
 ) -> Result<CertificateIdentifier<'static>, AttemptFailure> {
-    let invalid = || failure(FailureKind::Material);
-    let leaf = material.chain.first().ok_or_else(invalid)?;
-    let certificate = Certificate::from_der(leaf).map_err(|_| invalid())?;
-    let (_, aki) = certificate
-        .tbs_certificate()
-        .get_extension::<AuthorityKeyIdentifier>()
-        .map_err(|_| invalid())?
-        .ok_or_else(invalid)?;
-    let aki = aki.key_identifier.ok_or_else(invalid)?;
-    let serial = certificate.tbs_certificate().serial_number();
-    let mut buffer = [0u8; 21];
-    let mut writer = SliceWriter::new(&mut buffer);
-    serial.encode_value(&mut writer).map_err(|_| invalid())?;
-    let content = writer.finish().map_err(|_| invalid())?;
-    if aki.as_bytes().is_empty() || content.is_empty() {
-        return Err(invalid());
-    }
-    Ok(CertificateIdentifier::new(Der::from(aki.as_bytes()), Der::from(content)).into_owned())
+    crate::crypto::certificate_identifier(material).map_err(|_| failure(FailureKind::Material))
 }
 
 #[derive(Default)]
 struct Observations {
     new_order: Option<http::Uri>,
     ari: bool,
-    armed: Option<(http::Uri, MetadataSlot)>,
+    armed: Option<(http::Uri, MetadataSlot, bool)>,
     request: Option<Arc<()>>,
     response_status: Option<(u16, bool)>,
 }
@@ -778,6 +801,7 @@ struct Observations {
 type MetadataSlot = Arc<PlMutex<Option<Result<OrderMetadata, AttemptFailure>>>>;
 
 struct OrderMetadata {
+    location: Option<String>,
     dns_name: String,
     expires_unix: Option<u64>,
 }
@@ -815,12 +839,26 @@ fn order_metadata(bytes: &[u8]) -> Result<OrderMetadata, AttemptFailure> {
     };
     crate::types::validate_dns(&dns_name).map_err(|_| failure(FailureKind::Protocol))?;
     Ok(OrderMetadata {
+        location: None,
         dns_name,
         expires_unix: match projection.expires {
             Expiry::Missing => None,
             Expiry::Present(value) => Some(value),
         },
     })
+}
+
+fn new_order_location(headers: &http::HeaderMap) -> Result<String, AttemptFailure> {
+    let mut locations = headers.get_all(http::header::LOCATION).iter();
+    let location = locations
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| failure(FailureKind::Protocol))?;
+    if locations.next().is_some() {
+        return Err(failure(FailureKind::Protocol));
+    }
+    validate_url(location).map_err(|_| failure(FailureKind::Protocol))?;
+    Ok(location.into())
 }
 
 struct DirectoryClient<T> {
@@ -839,20 +877,24 @@ impl<T: HttpClient> HttpClient for DirectoryClient<T> {
         let is_directory =
             request.method() == http::Method::GET && request.uri() == &self.directory;
         let generation = Arc::new(());
-        let (slot, operation) = {
+        let (slot, operation, require_location) = {
             let mut observations = self.observations.lock();
             observations.request = Some(generation.clone());
             observations.response_status = None;
             let slot = observations
                 .armed
                 .as_ref()
-                .filter(|(target, _)| {
+                .filter(|(target, _, _)| {
                     request.method() == http::Method::POST && request.uri() == target
                 })
-                .map(|(_, slot)| slot.clone());
+                .map(|(_, slot, _)| slot.clone());
             (
                 slot,
-                observations.armed.as_ref().map(|(_, slot)| slot.clone()),
+                observations.armed.as_ref().map(|(_, slot, _)| slot.clone()),
+                observations
+                    .armed
+                    .as_ref()
+                    .is_some_and(|(_, _, required)| *required),
             )
         };
         let work = self.transport.request(request);
@@ -863,7 +905,7 @@ impl<T: HttpClient> HttpClient for DirectoryClient<T> {
                 let mut observations = observations.lock();
                 let current_operation = match (operation.as_ref(), observations.armed.as_ref()) {
                     (None, None) => true,
-                    (Some(operation), Some((_, current))) => Arc::ptr_eq(operation, current),
+                    (Some(operation), Some((_, current, _))) => Arc::ptr_eq(operation, current),
                     _ => false,
                 };
                 if current_operation
@@ -905,9 +947,15 @@ impl<T: HttpClient> HttpClient for DirectoryClient<T> {
                     if observations
                         .armed
                         .as_ref()
-                        .is_some_and(|(_, active)| Arc::ptr_eq(active, &slot))
+                        .is_some_and(|(_, active, _)| Arc::ptr_eq(active, &slot))
                     {
-                        *slot.lock() = Some(order_metadata(&bytes));
+                        *slot.lock() = Some(order_metadata(&bytes).and_then(|mut metadata| {
+                            if require_location {
+                                metadata.location =
+                                    Some(new_order_location(&response.parts.headers)?);
+                            }
+                            Ok(metadata)
+                        }));
                     }
                 }
                 response = http::Response::from_parts(response.parts, Full::new(bytes)).into();
@@ -931,16 +979,30 @@ impl<'de> Deserialize<'de> for Endpoint {
     }
 }
 
-struct Upstream {
-    transport: AcmeHttpClient,
+trait AttemptTransport: HttpClient + Clone {
+    fn reset_retry_hint(&self);
+    fn retry_not_before(&self) -> Option<SystemTime>;
+}
+
+impl AttemptTransport for AcmeHttpClient {
+    fn reset_retry_hint(&self) {
+        AcmeHttpClient::reset_retry_hint(self);
+    }
+    fn retry_not_before(&self) -> Option<SystemTime> {
+        AcmeHttpClient::retry_not_before(self)
+    }
+}
+
+struct Upstream<T> {
+    transport: T,
     directory: String,
     observations: Arc<PlMutex<Observations>>,
     account: Option<Account>,
     order: Option<Order>,
 }
 
-impl Upstream {
-    fn new(transport: AcmeHttpClient, directory: &str) -> Self {
+impl<T: AttemptTransport> Upstream<T> {
+    fn new(transport: T, directory: &str) -> Self {
         Self {
             transport,
             directory: directory.into(),
@@ -968,16 +1030,17 @@ impl Upstream {
             .as_mut()
             .ok_or_else(|| failure(FailureKind::Protocol))
     }
-    fn arm(&self, target: &str) -> Result<(), AttemptFailure> {
+    fn arm(&self, target: &str, require_location: bool) -> Result<(), AttemptFailure> {
         validate_url(target).map_err(|_| failure(FailureKind::Protocol))?;
         self.observations.lock().armed = Some((
             target.parse().map_err(|_| failure(FailureKind::Protocol))?,
             Arc::new(PlMutex::new(None)),
+            require_location,
         ));
         Ok(())
     }
     fn snapshot(&mut self) -> Result<Snapshot, AttemptFailure> {
-        let (_, slot) = self
+        let (_, slot, _) = self
             .observations
             .lock()
             .armed
@@ -988,6 +1051,13 @@ impl Upstream {
             .take()
             .ok_or_else(|| failure(FailureKind::Protocol))??;
         let order = self.order()?;
+        if metadata
+            .location
+            .as_ref()
+            .is_some_and(|location| location != order.url())
+        {
+            return Err(failure(FailureKind::Protocol));
+        }
         let url = order.url().into();
         let state = order.state();
         Ok(Snapshot {
@@ -1000,7 +1070,7 @@ impl Upstream {
     }
 }
 
-impl Engine for Upstream {
+impl<T: AttemptTransport> Engine for Upstream<T> {
     fn directory(&self) -> &str {
         &self.directory
     }
@@ -1052,7 +1122,7 @@ impl Engine for Upstream {
             .new_order
             .clone()
             .ok_or_else(|| failure(FailureKind::Protocol))?;
-        self.arm(&endpoint.to_string())?;
+        self.arm(&endpoint.to_string(), true)?;
         let identifiers = [Identifier::Dns(dns.into())];
         let mut order = NewOrder::new(&identifiers);
         if let Some(replaces) = replaces {
@@ -1070,7 +1140,7 @@ impl Engine for Upstream {
     }
     async fn resume(&mut self, url: &str) -> Result<Snapshot, AttemptFailure> {
         let observations = self.observations.clone();
-        self.arm(url)?;
+        self.arm(url, false)?;
         self.order = Some(
             self.account
                 .as_ref()
@@ -1146,7 +1216,7 @@ impl Engine for Upstream {
     async fn refresh(&mut self) -> Result<Snapshot, AttemptFailure> {
         let observations = self.observations.clone();
         let url = self.order()?.url().to_owned();
-        self.arm(&url)?;
+        self.arm(&url, false)?;
         self.order()?
             .refresh()
             .await
@@ -1156,7 +1226,7 @@ impl Engine for Upstream {
     async fn finalize(&mut self, csr: &[u8]) -> Result<Snapshot, AttemptFailure> {
         let observations = self.observations.clone();
         let url = self.order()?.state().finalize.clone();
-        self.arm(&url)?;
+        self.arm(&url, false)?;
         self.order()?
             .finalize_csr(csr)
             .await

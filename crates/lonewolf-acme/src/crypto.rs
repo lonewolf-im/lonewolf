@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::CertificateMaterial;
 use graviola::hashing::{Hash, Sha256};
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
 use hmac::{KeyInit, Mac};
+use instant_acme::CertificateIdentifier;
 use instant_acme::{CryptoProvider, EcCurve, Jwk, JwkThumbFields, SigningAlgorithm};
 use rcgen::{CertificateParams, PublicKeyData};
-use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::pki_types::{Der, PrivatePkcs8KeyDer};
+use x509_cert::Certificate;
+use x509_cert::der::{Decode, EncodeValue, SliceWriter};
+use x509_cert::ext::pkix::AuthorityKeyIdentifier;
 use zeroize::Zeroizing;
 
 use crate::types::{AcmeError, AcmeErrorKind, validate_dns};
@@ -174,6 +179,29 @@ pub fn new_certificate_request(dns_name: &str) -> Result<(Zeroizing<Vec<u8>>, Ve
         .serialize_request(&signer)
         .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))?;
     Ok((signer.pkcs8()?, csr.der().to_vec()))
+}
+
+pub(crate) fn certificate_identifier(
+    material: &CertificateMaterial,
+) -> Result<CertificateIdentifier<'static>, AcmeError> {
+    let invalid = || AcmeError::new(AcmeErrorKind::InvalidInput);
+    let leaf = material.chain.first().ok_or_else(invalid)?;
+    let certificate = Certificate::from_der(leaf).map_err(|_| invalid())?;
+    let (_, aki) = certificate
+        .tbs_certificate()
+        .get_extension::<AuthorityKeyIdentifier>()
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    let aki = aki.key_identifier.ok_or_else(invalid)?;
+    let serial = certificate.tbs_certificate().serial_number();
+    let mut buffer = [0u8; 21];
+    let mut writer = SliceWriter::new(&mut buffer);
+    serial.encode_value(&mut writer).map_err(|_| invalid())?;
+    let content = writer.finish().map_err(|_| invalid())?;
+    if aki.as_bytes().is_empty() || content.is_empty() {
+        return Err(invalid());
+    }
+    Ok(CertificateIdentifier::new(Der::from(aki.as_bytes()), Der::from(content)).into_owned())
 }
 
 #[cfg(test)]

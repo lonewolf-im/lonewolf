@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use http::Uri;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
@@ -140,6 +140,8 @@ pub struct RetryState {
 pub struct PendingOrder {
     #[serde(with = "optional_url")]
     pub url: Option<String>,
+    #[serde(with = "replacement_intent")]
+    pub replaces: Option<String>,
     #[serde(with = "key_bytes")]
     pub key_pkcs8: Zeroizing<Vec<u8>>,
     #[serde(with = "csr_bytes")]
@@ -367,6 +369,15 @@ impl StoredHost {
             }
         }
         if let Some(order) = &self.order {
+            if let Some(replaces) = &order.replaces {
+                validate_replacement(replaces)?;
+                let certificate = self.certificate.as_ref().ok_or(StateError::InvalidData)?;
+                let expected = crate::crypto::certificate_identifier(&certificate.material)
+                    .map_err(|_| StateError::InvalidData)?;
+                if expected.to_string() != *replaces {
+                    return Err(StateError::InvalidData);
+                }
+            }
             key(&order.key_pkcs8)?;
             if order.csr_der.is_empty() || order.csr_der.len() > MAX_RECORD {
                 return Err(StateError::InvalidData);
@@ -459,6 +470,50 @@ mod optional_url {
         #[derive(Deserialize)]
         struct Url(#[serde(deserialize_with = "url_string")] String);
         Option::<Url>::deserialize(deserializer).map(|value| value.map(|url| url.0))
+    }
+}
+
+fn validate_replacement(value: &str) -> Result<(), StateError> {
+    if value.len() > MAX_RECORD {
+        return Err(StateError::InvalidData);
+    }
+    let (aki, serial) = value.split_once('.').ok_or(StateError::InvalidData)?;
+    let aki = URL_SAFE_NO_PAD
+        .decode(aki)
+        .map_err(|_| StateError::InvalidData)?;
+    let serial = URL_SAFE_NO_PAD
+        .decode(serial)
+        .map_err(|_| StateError::InvalidData)?;
+    if aki.is_empty()
+        || serial.is_empty()
+        || serial.len() > 21
+        || serial[0] & 0x80 != 0
+        || serial.len() > 1 && serial[0] == 0 && serial[1] & 0x80 == 0
+    {
+        return Err(StateError::InvalidData);
+    }
+    Ok(())
+}
+
+mod replacement_intent {
+    use super::*;
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        fn identifier<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+            let value = bounded_string::<D, MAX_RECORD>(deserializer)?;
+            validate_replacement(&value).map_err(D::Error::custom)?;
+            Ok(value)
+        }
+        #[derive(Deserialize)]
+        struct Intent(#[serde(deserialize_with = "identifier")] String);
+        Option::<Intent>::deserialize(deserializer).map(|value| value.map(|intent| intent.0))
     }
 }
 

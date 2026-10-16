@@ -56,6 +56,34 @@ impl Issuer {
         })
     }
 
+    pub(crate) async fn validate_cached_account(&self) -> Result<(), AttemptFailure> {
+        if let Some(account) = self.store.account().await? {
+            drop(
+                Key::from_pkcs8_der(
+                    PrivatePkcs8KeyDer::from(account.key_pkcs8.as_slice()),
+                    crypto_provider(),
+                )
+                .map_err(|_| StateError::CorruptData)?,
+            );
+            if account.credentials_json.is_some() {
+                drop(
+                    credentials(&account, &self.directory_url)
+                        .map_err(|_| StateError::CorruptData)?,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn renewal_info(
+        &self,
+        host: &StoredHost,
+    ) -> Result<Option<RenewalWindow>, AttemptFailure> {
+        let transport = self.transport.for_attempt();
+        let mut engine = Upstream::new(AriTransport(transport), &self.directory_url);
+        renewal_request(&self.store, &SystemClock, &mut engine, host).await
+    }
+
     /// The manager must serialize account initialization and recovery.
     pub async fn ensure_account(&self) -> Result<(), AttemptFailure> {
         let mut engine = Upstream::new(self.transport.for_attempt(), &self.directory_url);
@@ -183,6 +211,10 @@ trait Engine {
     fn reset_hint(&self);
     fn hint(&self) -> Option<SystemTime>;
     fn supports_ari(&self) -> bool;
+    async fn renewal(
+        &mut self,
+        identifier: &CertificateIdentifier<'_>,
+    ) -> Result<RenewalWindow, AttemptFailure>;
     async fn register(&mut self, key: &[u8]) -> Result<Zeroizing<Vec<u8>>, AttemptFailure>;
     async fn restore(&mut self, credentials: AccountCredentials) -> Result<(), AttemptFailure>;
     async fn new_order(
@@ -304,6 +336,35 @@ fn credentials(
     )
     .map_err(|_| AttemptFailure::from(StateError::CorruptData))?;
     Ok(credentials)
+}
+
+async fn renewal_request(
+    store: &impl Storage,
+    clock: &impl Clock,
+    engine: &mut impl Engine,
+    host: &StoredHost,
+) -> Result<Option<RenewalWindow>, AttemptFailure> {
+    let certificate = host.certificate.as_ref().ok_or(StateError::CorruptData)?;
+    if unix(clock.now())? >= certificate.not_after_unix {
+        return Ok(None);
+    }
+    let account = store.account().await?.ok_or(StateError::CorruptData)?;
+    engine
+        .restore(credentials(&account, engine.directory())?)
+        .await?;
+    let current = store.host(&host.host.dns_name).await?;
+    let now = unix(clock.now())?;
+    if !current
+        .as_ref()
+        .and_then(|host| host.certificate.as_ref())
+        .is_some_and(|current| {
+            current.material.chain == certificate.material.chain && now < current.not_after_unix
+        })
+    {
+        return Ok(None);
+    }
+    let identifier = replacement_id(&certificate.material)?;
+    engine.renewal(&identifier).await.map(Some)
 }
 
 async fn ensure_account(
@@ -658,6 +719,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                     let pem = self.engine.certificate().await?;
                     let chain = parse_chain(&pem)?;
                     let pending = self.host.order.as_mut().ok_or(StateError::CorruptData)?;
+                    let replaces = pending.replaces.clone();
                     let material = CertificateMaterial {
                         chain,
                         private_key_pkcs8: pending.key_pkcs8.clone(),
@@ -672,11 +734,15 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                     }
                     let renew_at_unix = fallback(validity, self.clock)?;
                     self.host.certificate = Some(StoredCertificate {
+                        replaces,
                         material,
                         not_before_unix: validity.not_before_unix,
                         not_after_unix: validity.not_after_unix,
                         renew_at_unix,
                         ari_check_at_unix: now,
+                        fallback_at_unix: renew_at_unix,
+                        ari_window: None,
+                        ari_failures: 0,
                     });
                     self.host.order = None;
                     self.host.retry = RetryState {
@@ -725,25 +791,10 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
 }
 
 fn fallback(validity: CertificateValidity, clock: &impl Clock) -> Result<u64, AttemptFailure> {
-    let lifetime = validity
-        .not_after_unix
-        .checked_sub(validity.not_before_unix)
-        .filter(|lifetime| *lifetime != 0)
-        .ok_or_else(|| failure(FailureKind::Material))?;
-    let offset = if lifetime >= 864000 {
-        (lifetime / 3) * 2 + (lifetime % 3) * 2 / 3
-    } else {
-        lifetime / 2
-    };
-    let jitter = clock.uniform(lifetime / 20)?;
-    let renewal = validity
-        .not_before_unix
-        .checked_add(offset)
-        .and_then(|base| base.checked_sub(jitter))
-        .ok_or_else(|| failure(FailureKind::Material))?;
-    wall(validity.not_after_unix)?;
-    wall(renewal)?;
-    Ok(renewal)
+    crate::schedule::fallback(validity, |maximum| {
+        clock.uniform(maximum).map_err(|_| StateError::Other)
+    })
+    .map_err(Into::into)
 }
 
 fn parse_chain(pem: &str) -> Result<Vec<Vec<u8>>, AttemptFailure> {
@@ -918,6 +969,20 @@ impl<T: HttpClient> HttpClient for DirectoryClient<T> {
                         Some((response.parts.status.as_u16(), slot.is_some()));
                 }
             }
+            if response
+                .parts
+                .headers
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .is_some_and(|delay| {
+                    SystemTime::now()
+                        .checked_add(Duration::from_secs(delay))
+                        .is_none()
+                })
+            {
+                return Err(instant_acme::Error::Str("invalid retry deadline"));
+            }
             if response.parts.status.is_success() && (is_directory || slot.is_some()) {
                 let bytes = response
                     .body
@@ -1085,6 +1150,26 @@ impl<T: AttemptTransport> Engine for Upstream<T> {
     }
     fn supports_ari(&self) -> bool {
         self.observations.lock().ari
+    }
+    async fn renewal(
+        &mut self,
+        identifier: &CertificateIdentifier<'_>,
+    ) -> Result<RenewalWindow, AttemptFailure> {
+        self.reset_hint();
+        let observations = self.observations.clone();
+        let account = self.account.as_ref().ok_or(StateError::CorruptData)?;
+        let (info, delay) = account.renewal_info(identifier).await.map_err(|error| {
+            let mut failure = classify_observed(error, &observations, false);
+            failure.retry_not_before = self.transport.retry_not_before();
+            failure
+        })?;
+        Ok(RenewalWindow {
+            start: window_second(info.suggested_window.start),
+            end: window_second(info.suggested_window.end),
+            delay: delay
+                .as_secs()
+                .saturating_add(u64::from(delay.subsec_nanos() != 0)),
+        })
     }
     async fn register(&mut self, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, AttemptFailure> {
         let observations = self.observations.clone();
@@ -1300,6 +1385,58 @@ fn classify_observed(
         result.status = None;
     }
     result
+}
+
+fn window_second(time: time::OffsetDateTime) -> Option<u64> {
+    u64::try_from(time.unix_timestamp())
+        .ok()?
+        .checked_add(u64::from(time.nanosecond() != 0))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RenewalWindow {
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+    pub delay: u64,
+}
+
+#[derive(Clone)]
+struct AriTransport<T>(T);
+
+impl<T: HttpClient> HttpClient for AriTransport<T> {
+    fn request(
+        &self,
+        request: http::Request<instant_acme::BodyWrapper<Bytes>>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<instant_acme::BytesResponse, instant_acme::Error>> + Send>,
+    > {
+        let is_get = request.method() == http::Method::GET;
+        let work = self.0.request(request);
+        Box::pin(async move {
+            let mut response = work.await?;
+            if is_get
+                && !response
+                    .parts
+                    .headers
+                    .contains_key(http::header::RETRY_AFTER)
+            {
+                response.parts.headers.insert(
+                    http::header::RETRY_AFTER,
+                    http::HeaderValue::from_static("43200"),
+                );
+            }
+            Ok(response)
+        })
+    }
+}
+
+impl<T: AttemptTransport> AttemptTransport for AriTransport<T> {
+    fn reset_retry_hint(&self) {
+        self.0.reset_retry_hint();
+    }
+    fn retry_not_before(&self) -> Option<SystemTime> {
+        self.0.retry_not_before()
+    }
 }
 
 #[cfg(test)]

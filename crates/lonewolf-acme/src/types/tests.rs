@@ -59,6 +59,7 @@ fn host() -> StoredHost {
             dns_name: "example.com".into(),
         },
         certificate: Some(StoredCertificate {
+            replaces: None,
             material: CertificateMaterial {
                 chain: vec![vec![1, 2, 3]],
                 private_key_pkcs8: Zeroizing::new(vec![4, 5, 6]),
@@ -67,6 +68,9 @@ fn host() -> StoredHost {
             not_after_unix: 20,
             renew_at_unix: 0,
             ari_check_at_unix: 100,
+            fallback_at_unix: 0,
+            ari_window: None,
+            ari_failures: 0,
         }),
         order: Some(PendingOrder {
             replaces: None,
@@ -382,5 +386,93 @@ fn bounded_fields_reject_oversized_decodes() -> TestResult {
         decode::<StoredHost>(&encode(&input)?),
         Err(StateError::CorruptData)
     ));
+    Ok(())
+}
+
+#[test]
+fn ari_schedule_rejects_invalid_window_and_timestamp_relationships() -> TestResult {
+    let original = host();
+    for window in [
+        AriWindow {
+            start_unix: 12,
+            end_unix: 12,
+            selected_unix: 12,
+        },
+        AriWindow {
+            start_unix: 12,
+            end_unix: 21,
+            selected_unix: 14,
+        },
+        AriWindow {
+            start_unix: 12,
+            end_unix: 18,
+            selected_unix: 18,
+        },
+        AriWindow {
+            start_unix: 12,
+            end_unix: 18,
+            selected_unix: 11,
+        },
+        AriWindow {
+            start_unix: 0,
+            end_unix: u64::MAX,
+            selected_unix: 0,
+        },
+    ] {
+        let mut record = original.clone();
+        let cert = record.certificate.as_mut().ok_or("certificate")?;
+        cert.renew_at_unix = window.selected_unix;
+        cert.ari_window = Some(window);
+        assert_eq!(record.validate(), Err(StateError::InvalidData));
+    }
+    let mut record = original.clone();
+    let cert = record.certificate.as_mut().ok_or("certificate")?;
+    cert.ari_window = Some(AriWindow {
+        start_unix: 12,
+        end_unix: 18,
+        selected_unix: 14,
+    });
+    assert_eq!(record.validate(), Err(StateError::InvalidData));
+    for field in ["fallback_at_unix", "ari_check_at_unix"] {
+        let mut value = serde_json::to_value(&original)?;
+        value["certificate"][field] = serde_json::json!(u64::MAX);
+        let restored: StoredHost = decode(&serde_json::to_vec(&value)?)?;
+        assert_eq!(restored.validate(), Err(StateError::InvalidData));
+    }
+    let mut value = serde_json::to_value(&original)?;
+    value["certificate"]["ari_window"] =
+        serde_json::json!({"start_unix":12,"end_unix":18,"selected_unix":14,"extra":0});
+    assert!(decode::<StoredHost>(&serde_json::to_vec(&value)?).is_err());
+    Ok(())
+}
+
+#[test]
+fn installed_replacement_relationship_requires_explicit_canonical_bounded_identifier() -> TestResult
+{
+    for replaces in [None, Some("AQID.AQ".to_owned())] {
+        let mut record = host();
+        record.certificate.as_mut().ok_or("certificate")?.replaces = replaces.clone();
+        let restored: StoredHost = decode(&encode(&record)?)?;
+        restored.validate()?;
+        assert_eq!(
+            restored.certificate.ok_or("certificate")?.replaces,
+            replaces
+        );
+    }
+    let mut value = serde_json::to_value(host())?;
+    value["certificate"]
+        .as_object_mut()
+        .ok_or("certificate")?
+        .remove("replaces");
+    assert!(decode::<StoredHost>(&serde_json::to_vec(&value)?).is_err());
+    for invalid in [
+        String::new(),
+        "AQID.AQ=".into(),
+        "AQID.AAE".into(),
+        "A".repeat(MAX_RECORD + 1),
+    ] {
+        value["certificate"]["replaces"] = serde_json::json!(invalid);
+        assert!(decode::<StoredHost>(&serde_json::to_vec(&value)?).is_err());
+    }
     Ok(())
 }

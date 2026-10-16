@@ -45,6 +45,7 @@ fn host(byte: u8) -> StoredHost {
             dns_name: "example.com".into(),
         },
         certificate: Some(StoredCertificate {
+            replaces: None,
             material: CertificateMaterial {
                 chain: vec![vec![byte; 8]],
                 private_key_pkcs8: Zeroizing::new(vec![byte; 8]),
@@ -53,6 +54,9 @@ fn host(byte: u8) -> StoredHost {
             not_after_unix: 20,
             renew_at_unix: 0,
             ari_check_at_unix: 30,
+            fallback_at_unix: 0,
+            ari_window: None,
+            ari_failures: 0,
         }),
         order: Some(PendingOrder {
             replaces: None,
@@ -691,5 +695,44 @@ fn exclusive_lock_rejects_another_process() -> TestResult {
         "{}",
         String::from_utf8_lossy(&result.stdout)
     );
+    Ok(())
+}
+
+#[test]
+fn restart_preserves_ari_window_selection_fallback_and_recheck_backoff() -> TestResult {
+    use crate::types::AriWindow;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.redb");
+    let mut record = host(2);
+    record.order = None;
+    record.retry = RetryState {
+        failures: 0,
+        not_before_unix: 0,
+    };
+    let certificate = record.certificate.as_mut().ok_or("certificate")?;
+    certificate.replaces = Some("AQID.AQ".into());
+    certificate.renew_at_unix = 14;
+    certificate.fallback_at_unix = 16;
+    certificate.ari_window = Some(AriWindow {
+        start_unix: 12,
+        end_unix: 18,
+        selected_unix: 14,
+    });
+    certificate.ari_failures = 3;
+    certificate.ari_check_at_unix = 6000;
+    let store = open(&path)?;
+    block_on(store.save_host(record.clone()))?;
+    drop(store);
+    let store = open(&path)?;
+    let restored = restored_host(&store)?;
+    assert!(restored.order.is_none());
+    assert_eq!(restored.retry.failures, 0);
+    let restored = restored.certificate.ok_or("certificate")?;
+    let expected = record.certificate.ok_or("certificate")?;
+    assert_eq!(restored.replaces, Some("AQID.AQ".into()));
+    assert_eq!(restored.ari_window, expected.ari_window);
+    assert_eq!(restored.fallback_at_unix, 16);
+    assert_eq!(restored.ari_check_at_unix, 6000);
+    assert_eq!(restored.ari_failures, 3);
     Ok(())
 }

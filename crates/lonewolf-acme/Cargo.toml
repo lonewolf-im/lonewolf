@@ -8,10 +8,14 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
-compio = { workspace = true, features = ["time"] }
-futures-util.workspace = true
+compio = { workspace = true, features = ["net", "time"] }
+compio-io.workspace = true
+futures-util = { workspace = true, features = ["io"] }
 graviola.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 idna.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
@@ -20,8 +24,13 @@ parking_lot.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+socket2.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+blocking.workspace = true
+futures-channel.workspace = true
 futures-executor.workspace = true
 tempfile.workspace = true

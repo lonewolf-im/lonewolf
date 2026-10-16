@@ -1133,11 +1133,17 @@ name = "lonewolf-acme"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blocking",
  "compio",
+ "compio-io",
+ "futures-channel",
  "futures-executor",
  "futures-util",
  "graviola",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "idna",
  "lonewolf-util",
  "lonewolf-xmpp",
@@ -1146,7 +1152,10 @@ dependencies = [
  "redb",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
+ "tokio-util",
+ "tracing",
  "zeroize",
 ]
 

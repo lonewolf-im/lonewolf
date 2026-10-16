@@ -1097,3 +1097,217 @@ fn concurrent_handshake_readers_observe_only_complete_generations() -> TestResul
     }
     Ok(())
 }
+
+#[test]
+fn managed_material_preparation_checks_structure_without_time_admission() -> TestResult {
+    use super::test_support::{managed_hosts, material};
+    let hosts = managed_hosts()?;
+    let now = time::OffsetDateTime::now_utc().replace_nanosecond(0)?;
+    for (start, end) in [
+        (now - time::Duration::days(2), now - time::Duration::days(1)),
+        (now + time::Duration::days(1), now + time::Duration::days(2)),
+    ] {
+        let mut leaf = CertificateParams::new(vec!["example.com".into()])?;
+        leaf.not_before = start;
+        leaf.not_after = end;
+        let (leaf, key) = material(leaf)?;
+        let prepared =
+            hosts.prepare_managed_material("example.com", vec![leaf.clone()], key.clone_key())?;
+        assert_eq!(
+            prepared.validity(),
+            (start.unix_timestamp() as u64, end.unix_timestamp() as u64)
+        );
+        assert!(hosts.certified_key("example.com").is_none());
+        assert!(
+            hosts
+                .prepare_managed_certificate("example.com", vec![leaf.clone()], key.clone_key())
+                .is_err()
+        );
+        let (_, wrong_key) = material(CertificateParams::new(vec!["example.com".into()])?)?;
+        assert!(
+            hosts
+                .prepare_managed_material("example.com", vec![leaf.clone()], wrong_key)
+                .is_err()
+        );
+        assert!(
+            hosts
+                .prepare_managed_material(
+                    "example.com",
+                    vec![
+                        leaf.clone(),
+                        rustls::pki_types::CertificateDer::from(vec![1, 2, 3])
+                    ],
+                    key.clone_key()
+                )
+                .is_err()
+        );
+        let mut wrong_name = CertificateParams::new(vec!["wrong.example".into()])?;
+        wrong_name.not_before = start;
+        wrong_name.not_after = end;
+        let (wrong, wrong_key) = material(wrong_name)?;
+        assert!(
+            hosts
+                .prepare_managed_material("example.com", vec![wrong], wrong_key)
+                .is_err()
+        );
+        let mut disjoint = CertificateParams::new(Vec::<String>::new())?;
+        disjoint.not_before = end;
+        disjoint.not_after = end + time::Duration::days(1);
+        let (disjoint, _) = material(disjoint)?;
+        assert!(
+            hosts
+                .prepare_managed_material("example.com", vec![leaf], key)
+                .is_ok()
+        );
+        let (leaf, key) = material({
+            let mut params = CertificateParams::new(vec!["example.com".into()])?;
+            params.not_before = start;
+            params.not_after = end;
+            params
+        })?;
+        assert!(
+            hosts
+                .prepare_managed_material("example.com", vec![leaf, disjoint], key)
+                .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_usage_extensions_apply_to_every_chain_member_including_unavailable_material()
+-> TestResult {
+    use super::test_support::{managed_hosts, material};
+    use rcgen::{CustomExtension, ExtendedKeyUsagePurpose, KeyUsagePurpose};
+    let hosts = managed_hosts()?;
+    let now = time::OffsetDateTime::now_utc();
+    let signature = vec![3, 2, 7, 128];
+    let signing = vec![3, 2, 2, 4];
+    let server = vec![48, 10, 6, 8, 43, 6, 1, 5, 5, 7, 3, 1];
+    let any = vec![48, 6, 6, 4, 85, 29, 37, 0];
+    for (start, end) in [
+        (now - time::Duration::days(2), now - time::Duration::days(1)),
+        (now + time::Duration::days(1), now + time::Duration::days(2)),
+        (now - time::Duration::days(1), now + time::Duration::days(1)),
+    ] {
+        for issuer in [false, true] {
+            for (oid, contents, valid) in [
+                (vec![2, 5, 29, 15], signature.clone(), !issuer),
+                (vec![2, 5, 29, 15], signing.clone(), issuer),
+                (vec![2, 5, 29, 15], vec![3, 1, 0], false),
+                (vec![2, 5, 29, 15], vec![1], false),
+                (vec![2, 5, 29, 37], server.clone(), true),
+                (vec![2, 5, 29, 37], any.clone(), false),
+                (vec![2, 5, 29, 37], vec![48, 0], false),
+                (vec![2, 5, 29, 37], vec![1], false),
+            ] {
+                for critical in [false, true] {
+                    let mut params = CertificateParams::new(vec!["example.com".into()])?;
+                    params.not_before = start;
+                    params.not_after = end;
+                    let mut extension = CustomExtension::from_oid_content(&oid, contents.clone());
+                    extension.set_criticality(critical);
+                    params.custom_extensions.push(extension);
+                    let (member, key) = material(params)?;
+                    let (chain, key) = if issuer {
+                        let mut leaf = CertificateParams::new(vec!["example.com".into()])?;
+                        leaf.not_before = start;
+                        leaf.not_after = end;
+                        let (leaf, key) = material(leaf)?;
+                        (vec![leaf, member], key)
+                    } else {
+                        (vec![member], key)
+                    };
+                    assert_eq!(
+                        hosts
+                            .prepare_managed_material("example.com", chain, key)
+                            .is_ok(),
+                        valid,
+                        "issuer={issuer}, oid={oid:?}, contents={contents:?}"
+                    );
+                }
+            }
+            for eku in [false, true] {
+                let mut params = CertificateParams::new(vec!["example.com".into()])?;
+                params.not_before = start;
+                params.not_after = end;
+                if eku {
+                    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+                    params
+                        .custom_extensions
+                        .push(CustomExtension::from_oid_content(
+                            &[2, 5, 29, 37],
+                            server.clone(),
+                        ));
+                } else {
+                    params.key_usages = vec![if issuer {
+                        KeyUsagePurpose::KeyCertSign
+                    } else {
+                        KeyUsagePurpose::DigitalSignature
+                    }];
+                    params
+                        .custom_extensions
+                        .push(CustomExtension::from_oid_content(
+                            &[2, 5, 29, 15],
+                            if issuer {
+                                signing.clone()
+                            } else {
+                                signature.clone()
+                            },
+                        ));
+                }
+                let (member, key) = material(params)?;
+                let (chain, key) = if issuer {
+                    let mut leaf = CertificateParams::new(vec!["example.com".into()])?;
+                    leaf.not_before = start;
+                    leaf.not_after = end;
+                    let (leaf, key) = material(leaf)?;
+                    (vec![leaf, member], key)
+                } else {
+                    (vec![member], key)
+                };
+                assert!(
+                    hosts
+                        .prepare_managed_material("example.com", chain, key)
+                        .is_err()
+                );
+            }
+        }
+        let mut leaf = CertificateParams::new(vec!["example.com".into()])?;
+        leaf.not_before = start;
+        leaf.not_after = end;
+        leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        leaf.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let (leaf, key) = material(leaf)?;
+        let mut issuer = CertificateParams::new(Vec::<String>::new())?;
+        issuer.not_before = start;
+        issuer.not_after = end;
+        issuer.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        issuer.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let (issuer, _) = material(issuer)?;
+        assert!(
+            hosts
+                .prepare_managed_material("example.com", vec![leaf, issuer], key)
+                .is_ok()
+        );
+    }
+    for reverse in [false, true] {
+        let mut invalid = CertificateParams::new(vec!["example.com".into()])?;
+        invalid.not_before = now;
+        invalid.not_after = if reverse {
+            now - time::Duration::days(1)
+        } else {
+            now
+        };
+        let (invalid, key) = material(invalid)?;
+        assert!(
+            hosts
+                .prepare_managed_material("example.com", vec![invalid], key)
+                .is_err()
+        );
+    }
+    Ok(())
+}

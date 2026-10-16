@@ -179,6 +179,7 @@ struct Script {
     finalizes: usize,
     ready_calls: usize,
     registration_keys: Vec<Vec<u8>>,
+    restore_host: Option<StoredHost>,
     csr: Vec<u8>,
     expired: bool,
     omit_expiry: bool,
@@ -235,6 +236,7 @@ impl Script {
             finalizes: 0,
             ready_calls: 0,
             registration_keys: Vec::new(),
+            restore_host: None,
             csr: Vec::new(),
             expired: false,
             omit_expiry: false,
@@ -293,6 +295,17 @@ impl Engine for Script {
     fn supports_ari(&self) -> bool {
         self.ari
     }
+    async fn renewal(
+        &mut self,
+        _: &CertificateIdentifier<'_>,
+    ) -> Result<RenewalWindow, AttemptFailure> {
+        self.step("renewal info").await?;
+        Ok(RenewalWindow {
+            start: Some(NOW),
+            end: Some(NOW + 100),
+            delay: 60,
+        })
+    }
     async fn register(&mut self, key: &[u8]) -> Result<Zeroizing<Vec<u8>>, AttemptFailure> {
         assert_eq!(
             self.memory
@@ -310,7 +323,11 @@ impl Engine for Script {
         Ok(credential_bytes(key, DIRECTORY))
     }
     async fn restore(&mut self, _: AccountCredentials) -> Result<(), AttemptFailure> {
-        self.step("restore").await
+        self.step("restore").await?;
+        if let Some(host) = self.restore_host.take() {
+            self.memory.records.lock().host = Some(host);
+        }
+        Ok(())
     }
     async fn new_order(
         &mut self,
@@ -784,6 +801,7 @@ fn material_and_commit_failures_never_activate() {
                 not_before_unix: 0,
             },
             certificate: Some(StoredCertificate {
+                replaces: None,
                 material: CertificateMaterial {
                     chain: vec![certificate()],
                     private_key_pkcs8: CertificateSigner::generate().unwrap().pkcs8().unwrap(),
@@ -792,6 +810,9 @@ fn material_and_commit_failures_never_activate() {
                 not_after_unix: old.not_after_unix,
                 renew_at_unix: NOW + 100,
                 ari_check_at_unix: NOW,
+                fallback_at_unix: 0,
+                ari_window: None,
+                ari_failures: 0,
             }),
         });
         installer.active.lock().push(old);
@@ -1574,11 +1595,15 @@ fn ari_replacement_is_derived_from_current_material_and_forgery_is_rejected() {
             host: host(),
             order: None,
             certificate: Some(StoredCertificate {
+                replaces: None,
                 material,
                 not_before_unix: NOW - 1000,
                 not_after_unix: NOW + 100_000,
                 renew_at_unix: NOW,
                 ari_check_at_unix: NOW,
+                fallback_at_unix: 0,
+                ari_window: None,
+                ari_failures: 0,
             }),
             retry: RetryState {
                 failures: 0,
@@ -1608,6 +1633,18 @@ fn ari_replacement_is_derived_from_current_material_and_forgery_is_rejected() {
             assert_eq!(engine.new_orders, 0);
         } else {
             outcome.unwrap();
+            let records = memory.records.lock();
+            let stored = records.host.as_ref().unwrap().certificate.as_ref().unwrap();
+            assert_eq!(
+                stored.replaces,
+                if scenario == 0 {
+                    Some(expected.to_string())
+                } else {
+                    None
+                }
+            );
+            assert_eq!(stored.renew_at_unix, stored.fallback_at_unix);
+            assert!(stored.ari_window.is_none());
             assert_eq!(
                 engine.replaced,
                 if scenario == 0 { Some(expected) } else { None }
@@ -1855,11 +1892,15 @@ fn install_pending(memory: &Memory, replaces: bool, url: Option<&str>) -> Pendin
         host: host(),
         order: Some(pending.clone()),
         certificate: Some(StoredCertificate {
+            replaces: None,
             material,
             not_before_unix: NOW - 1000,
             not_after_unix: NOW + 100_000,
             renew_at_unix: NOW,
             ari_check_at_unix: NOW,
+            fallback_at_unix: 0,
+            ari_window: None,
+            ari_failures: 0,
         }),
         retry: RetryState {
             failures: 0,
@@ -2120,4 +2161,153 @@ fn corrupt_persisted_choice_or_forged_caller_never_reaches_ca() {
         assert!(!engine.gate.events.borrow().contains(&"restore"));
         assert_eq!((engine.new_orders, engine.resumes), (0, 0));
     }
+}
+
+#[test]
+fn ari_rechecks_expiry_and_generation_after_account_restoration_before_get() {
+    struct JumpClock {
+        reads: Cell<usize>,
+        expire: bool,
+    }
+    impl Clock for JumpClock {
+        fn now(&self) -> SystemTime {
+            let count = self.reads.get();
+            self.reads.set(count + 1);
+            UNIX_EPOCH
+                + Duration::from_secs(if self.expire && count > 0 {
+                    NOW + 1000
+                } else {
+                    NOW
+                })
+        }
+        fn monotonic(&self) -> Instant {
+            Instant::now()
+        }
+        fn uniform(&self, _: u64) -> Result<u64, AttemptFailure> {
+            Ok(0)
+        }
+        async fn sleep(&self, _: Duration) {}
+    }
+    for expire in [false, true] {
+        let (memory, challenges, _, mut engine, _) = setup();
+        block_on(ensure_account(
+            &memory,
+            &FakeClock::default(),
+            &mut engine,
+            DIRECTORY,
+        ))
+        .unwrap();
+        let record = StoredHost {
+            host: host(),
+            certificate: Some(StoredCertificate {
+                replaces: None,
+                material: ari_material(),
+                not_before_unix: NOW - 100,
+                not_after_unix: NOW + 1000,
+                renew_at_unix: NOW + 500,
+                ari_check_at_unix: NOW,
+                fallback_at_unix: NOW + 500,
+                ari_window: None,
+                ari_failures: 0,
+            }),
+            order: None,
+            retry: RetryState {
+                failures: 0,
+                not_before_unix: 0,
+            },
+        };
+        memory.records.lock().host = Some(record.clone());
+        let mut engine = Script::new(memory.clone(), challenges);
+        if !expire {
+            let mut replaced = record.clone();
+            replaced.certificate.as_mut().unwrap().material = ari_material();
+            engine.restore_host = Some(replaced);
+        }
+        let clock = JumpClock {
+            reads: Cell::new(0),
+            expire,
+        };
+        assert!(
+            block_on(renewal_request(&memory, &clock, &mut engine, &record))
+                .unwrap()
+                .is_none()
+        );
+        assert!(engine.gate.events.borrow().contains(&"restore"));
+        assert!(!engine.gate.events.borrow().contains(&"renewal info"));
+    }
+}
+
+#[test]
+fn upstream_ari_uses_renewal_get_and_default_retry_after_without_fetching_explanation() {
+    for supported in [false, true] {
+        let material = ari_material();
+        let identifier = replacement_id(&material).unwrap();
+        let signer = CertificateSigner::generate().unwrap();
+        let key = signer.pkcs8().unwrap();
+        let stored = StoredAccount {
+            key_pkcs8: key.clone(),
+            credentials_json: Some(credential_bytes(&key, DIRECTORY)),
+            retry: RetryState {
+                failures: 0,
+                not_before_unix: 0,
+            },
+        };
+        let mut directory = json!({"newNonce":"https://ca.example/nonce","newAccount":"https://ca.example/account","newOrder":"https://ca.example/new-order"});
+        if supported {
+            directory["renewalInfo"] = json!("https://ca.example/renewal");
+        }
+        let mut ari=response(200,serde_json::to_vec(&json!({"suggestedWindow":{"start":"2027-01-15T08:00:00Z","end":"2027-01-15T08:01:40Z"},"explanationURL":"https://secret.invalid/private-token"})).unwrap());
+        ari.headers_mut().remove(http::header::RETRY_AFTER);
+        let responses = Responses(Arc::new(PlMutex::new(VecDeque::from([
+            response(200, serde_json::to_vec(&directory).unwrap()),
+            ari,
+        ]))));
+        let mut engine = Upstream::new(AriTransport(responses.clone()), DIRECTORY);
+        block_on(engine.restore(credentials(&stored, DIRECTORY).unwrap())).unwrap();
+        let result = block_on(engine.renewal(&identifier));
+        if supported {
+            let result = result.unwrap();
+            assert_eq!(result.start, Some(NOW));
+            assert_eq!(result.end, Some(NOW + 100));
+            assert!((43199..=43200).contains(&result.delay));
+            assert!(responses.0.lock().is_empty());
+        } else {
+            assert_eq!(result.err().unwrap().kind, FailureKind::Protocol);
+            assert_eq!(responses.0.lock().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn fractional_ari_windows_select_only_representable_seconds_inside_original_bounds() {
+    let parse = |text| {
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).unwrap()
+    };
+    for (start, end, expected) in [
+        (
+            "2027-01-15T08:00:00.001Z",
+            "2027-01-15T08:00:01.001Z",
+            Some((NOW + 1, NOW + 2)),
+        ),
+        (
+            "2027-01-15T08:00:00Z",
+            "2027-01-15T08:00:00.001Z",
+            Some((NOW, NOW + 1)),
+        ),
+        ("2027-01-15T08:00:00.001Z", "2027-01-15T08:00:00.999Z", None),
+        ("2027-01-15T08:00:00.001Z", "2027-01-15T08:00:01Z", None),
+    ] {
+        let start = parse(start);
+        let end = parse(end);
+        let before = window_second(start).unwrap();
+        let after = window_second(end).unwrap();
+        if let Some((first, last)) = expected {
+            assert_eq!((before, after), (first, last));
+            assert!(time::OffsetDateTime::from_unix_timestamp(before as i64).unwrap() >= start);
+            assert!(time::OffsetDateTime::from_unix_timestamp((after - 1) as i64).unwrap() < end);
+        } else {
+            assert!(before >= after);
+        }
+    }
+    assert_eq!(window_second(parse("1969-12-31T23:59:59.999Z")), None);
 }

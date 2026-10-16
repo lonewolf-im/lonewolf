@@ -23,7 +23,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
-use x509_cert::ext::pkix::{SubjectAltName, name::GeneralName};
+use x509_cert::ext::pkix::{ExtendedKeyUsage, KeyUsage, SubjectAltName, name::GeneralName};
 use zeroize::Zeroizing;
 
 use crate::config::{HostConfig, HostTlsConfig, HostTlsSource};
@@ -70,7 +70,7 @@ pub struct PreparedCertificate {
 }
 
 impl PreparedCertificate {
-    /// Returns the usable certificate lifetime in Unix seconds.
+    /// Returns the full-chain validity interval in Unix seconds.
     pub fn validity(&self) -> (u64, u64) {
         self.validity
     }
@@ -268,6 +268,30 @@ impl Hosts {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<PreparedCertificate, HostsError> {
+        let prepared = self.prepare_managed_material(domain, chain, key)?;
+        let now = UnixTime::now().as_secs();
+        let error = if now < prepared.validity.0 {
+            Some(rustls::CertificateError::NotValidYet)
+        } else if now >= prepared.validity.1 {
+            Some(rustls::CertificateError::Expired)
+        } else {
+            None
+        };
+        if let Some(source) = error {
+            return Err(HostsError::InvalidCertificate {
+                domain: domain.into(),
+                source: source.into(),
+            });
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn prepare_managed_material(
+        &self,
+        domain: &str,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<PreparedCertificate, HostsError> {
         let host = self
             .find_host(domain)
             .filter(|host| {
@@ -389,16 +413,38 @@ fn managed_validity(
                 return Err(invalid(rustls::CertificateError::NotValidForName.into()));
             }
         }
-        let validity = parsed.tbs_certificate().validity();
-        start = start.max(validity.not_before.to_unix_duration().as_secs());
-        end = end.min(validity.not_after.to_unix_duration().as_secs());
+        let tbs = parsed.tbs_certificate();
+        if let Some((_, usage)) = tbs
+            .get_extension::<KeyUsage>()
+            .map_err(|_| invalid(rustls::CertificateError::BadEncoding.into()))?
+            && !(if index == 0 {
+                usage.digital_signature()
+            } else {
+                usage.key_cert_sign()
+            })
+        {
+            return Err(invalid(rustls::CertificateError::InvalidPurpose.into()));
+        }
+        if let Some((_, usage)) = tbs
+            .get_extension::<ExtendedKeyUsage>()
+            .map_err(|_| invalid(rustls::CertificateError::BadEncoding.into()))?
+            && !usage.0.iter().any(|oid| {
+                *oid == x509_cert::der::asn1::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1")
+            })
+        {
+            return Err(invalid(rustls::CertificateError::InvalidPurpose.into()));
+        }
+        let validity = tbs.validity();
+        let before = validity.not_before.to_unix_duration().as_secs();
+        let after = validity.not_after.to_unix_duration().as_secs();
+        if before >= after {
+            return Err(invalid(rustls::CertificateError::BadEncoding.into()));
+        }
+        start = start.max(before);
+        end = end.min(after);
     }
-    let now = UnixTime::now().as_secs();
-    if now < start {
-        return Err(invalid(rustls::CertificateError::NotValidYet.into()));
-    }
-    if now >= end {
-        return Err(invalid(rustls::CertificateError::Expired.into()));
+    if start >= end {
+        return Err(invalid(rustls::CertificateError::BadEncoding.into()));
     }
     Ok((start, end))
 }

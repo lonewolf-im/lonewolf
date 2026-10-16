@@ -150,14 +150,27 @@ pub struct PendingOrder {
     pub expires_unix: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AriWindow {
+    pub start_unix: u64,
+    pub end_unix: u64,
+    pub selected_unix: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredCertificate {
+    #[serde(with = "replacement_intent")]
+    pub replaces: Option<String>,
     pub material: CertificateMaterial,
     pub not_before_unix: u64,
     pub not_after_unix: u64,
     pub renew_at_unix: u64,
     pub ari_check_at_unix: u64,
+    pub fallback_at_unix: u64,
+    pub ari_window: Option<AriWindow>,
+    pub ari_failures: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -182,8 +195,8 @@ pub struct PreparedInstall<T> {
 
 pub trait Installer: Send + Sync + 'static {
     type Prepared: Send + 'static;
-    /// Validates chain validity, identity, usages, key match, and binding material.
-    /// Returns validity from the same generation as the candidate.
+    /// Validates structure, identity, usages, key match, and binding material, regardless of current time.
+    /// Callers must check the returned validity before activation.
     fn prepare(
         &self,
         host: &ManagedHost,
@@ -349,6 +362,9 @@ impl StoredHost {
         }
         timestamp(self.retry.not_before_unix)?;
         if let Some(certificate) = &self.certificate {
+            if let Some(replaces) = &certificate.replaces {
+                validate_replacement(replaces)?;
+            }
             let chain = &certificate.material.chain;
             if chain.is_empty()
                 || chain.len() > 16
@@ -364,8 +380,21 @@ impl StoredHost {
                 certificate.not_after_unix,
                 certificate.renew_at_unix,
                 certificate.ari_check_at_unix,
+                certificate.fallback_at_unix,
             ] {
                 timestamp(value)?;
+            }
+            if let Some(window) = certificate.ari_window {
+                for value in [window.start_unix, window.end_unix, window.selected_unix] {
+                    timestamp(value)?;
+                }
+                if window.start_unix >= window.end_unix
+                    || window.end_unix > certificate.not_after_unix
+                    || !(window.start_unix..window.end_unix).contains(&window.selected_unix)
+                    || certificate.renew_at_unix != window.selected_unix
+                {
+                    return Err(StateError::InvalidData);
+                }
             }
         }
         if let Some(order) = &self.order {

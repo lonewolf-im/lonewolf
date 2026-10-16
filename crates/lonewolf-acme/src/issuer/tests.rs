@@ -921,6 +921,7 @@ fn cancellation_at_every_storage_and_protocol_boundary_drops_leases_and_reloads(
     ))
     .unwrap();
     let boundary_count = memory.gate.events.borrow().len();
+    let mut committed_candidate_observed = false;
     for boundary in 0..boundary_count {
         let (memory, challenges, clock, mut engine, installer) = setup();
         memory.gate.remaining.set(Some(boundary));
@@ -953,6 +954,23 @@ fn cancellation_at_every_storage_and_protocol_boundary_drops_leases_and_reloads(
             .as_ref()
             .is_some_and(|host| host.certificate.is_some() && host.order.is_none());
         if completed {
+            assert_eq!(memory.gate.events.borrow().last(), Some(&"host committed"));
+            let records = memory.records.lock();
+            let retained = records.host.as_ref().unwrap();
+            assert_eq!(retained.retry.failures, 0);
+            assert_eq!(retained.retry.not_before_unix, 0);
+            assert!(retained.order.is_none());
+            assert!(
+                !retained
+                    .certificate
+                    .as_ref()
+                    .unwrap()
+                    .material
+                    .chain
+                    .is_empty()
+            );
+            assert!(installer.active.lock().is_empty());
+            committed_candidate_observed = true;
             continue;
         }
         block_on(attempt(
@@ -988,10 +1006,12 @@ fn cancellation_at_every_storage_and_protocol_boundary_drops_leases_and_reloads(
             );
         }
     }
+    assert!(committed_candidate_observed);
 }
 
 #[test]
 fn account_cancellation_at_every_boundary_reuses_durable_key() {
+    let mut response_before_save_observed = false;
     for boundary in 0..7 {
         let (memory, _, clock, mut engine, _) = setup();
         memory.records.lock().account = None;
@@ -999,6 +1019,16 @@ fn account_cancellation_at_every_boundary_reuses_durable_key() {
         let outcome = ensure_account(&memory, &clock, &mut engine, DIRECTORY).now_or_never();
         if outcome.is_some() {
             continue;
+        }
+        if engine.registration_keys.len() == 1
+            && memory.gate.events.borrow().last() == Some(&"save account")
+        {
+            let records = memory.records.lock();
+            let account = records.account.as_ref().unwrap();
+            assert!(account.credentials_json.is_none());
+            assert!(account.retry.not_before_unix > NOW);
+            assert_eq!(account.key_pkcs8.as_slice(), engine.registration_keys[0]);
+            response_before_save_observed = true;
         }
         memory.gate.remaining.set(None);
         let old = memory
@@ -1016,6 +1046,7 @@ fn account_cancellation_at_every_boundary_reuses_durable_key() {
             );
         }
     }
+    assert!(response_before_save_observed);
 }
 
 #[test]

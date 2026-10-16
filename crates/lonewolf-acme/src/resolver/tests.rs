@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use parking_lot::Condvar as PlCondvar;
 use std::collections::HashSet;
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -156,4 +157,74 @@ fn process_pool_survives_transport_recreation() {
             std::ptr::from_ref(POOL.get().unwrap().as_ref().unwrap())
         );
     }
+}
+
+#[test]
+fn entered_dns_lookup_times_out_while_workers_remain_owned_then_cleans_up() {
+    struct Release(Arc<(PlMutex<bool>, PlCondvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.0.lock() = true;
+            self.0.1.notify_all();
+        }
+    }
+    struct WorkersGone(mpsc::Sender<()>);
+    impl Drop for WorkersGone {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let gate = Arc::new((PlMutex::new(false), PlCondvar::new()));
+    let release = Release(gate.clone());
+    let (entered, entries) = mpsc::channel();
+    let (finished, completions) = mpsc::channel();
+    let (gone, cleaned) = mpsc::channel();
+    let ownership = WorkersGone(gone);
+    let pool = Arc::new(
+        Pool::new(Arc::new(move |_, port| {
+            let _retained = &ownership;
+            entered.send(thread::current().id()).unwrap();
+            let mut open = gate.0.lock();
+            gate.1.wait_while(&mut open, |open| !*open);
+            finished.send(()).unwrap();
+            Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+        }))
+        .unwrap(),
+    );
+    let (returned, results) = mpsc::channel();
+    let mut callers = Vec::new();
+    for _ in 0..2 {
+        let pool = pool.clone();
+        let returned = returned.clone();
+        callers.push(thread::spawn(move || {
+            let result = resolve_with(
+                &pool,
+                "example.test",
+                443,
+                &ureq::config::Config::default(),
+                timeout(Duration::from_secs(1)),
+            );
+            returned
+                .send(matches!(result, Err(ureq::Error::Timeout(_))))
+                .unwrap();
+        }));
+    }
+    let first = entries.recv_timeout(Duration::from_secs(5)).unwrap();
+    let second = entries.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(first, second);
+    assert!(results.try_recv().is_err());
+    for _ in 0..2 {
+        assert!(results.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    for caller in callers {
+        caller.join().unwrap();
+    }
+    assert!(completions.try_recv().is_err());
+    drop(pool);
+    assert!(cleaned.try_recv().is_err());
+    drop(release);
+    for _ in 0..2 {
+        completions.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    cleaned.recv_timeout(Duration::from_secs(5)).unwrap();
 }

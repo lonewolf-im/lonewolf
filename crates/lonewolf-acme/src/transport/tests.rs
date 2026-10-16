@@ -558,3 +558,21 @@ fn fast_completion_and_early_cancellation_retire_timer_groups() {
         }
     });
 }
+
+#[test]
+fn completed_request_releases_admission_before_next_request_without_timer_poll() {
+    block_on(async {
+        let (certificate, key) = certificate("127.0.0.1", false);
+        let client = client_with_root(&certificate, GLOBAL_TIMEOUT);
+        for _ in 0..4 {
+            let (url, worker) = serve(server_config(certificate.clone(), key.clone()), |stream| {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+            });
+            client.request(request(&url)).await.unwrap();
+            assert_eq!(client.inner.admission.lock().active, 0);
+            worker.join().unwrap();
+        }
+    });
+}

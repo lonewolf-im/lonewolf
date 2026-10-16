@@ -25,6 +25,10 @@ allow = [
     "Zlib",
 ]
 
+[[licenses.exceptions]]
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
@@ -49,3 +53,4 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = ["https://github.com/djc/instant-acme"]

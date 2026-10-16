@@ -21,6 +21,55 @@ const MAX_CREDENTIALS: usize = 64 * 1024;
 const MAX_URL: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcmeErrorKind {
+    InvalidInput,
+    Crypto,
+    InvalidCaBundle,
+    Unavailable,
+    Timeout,
+    Closed,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcmeError {
+    kind: AcmeErrorKind,
+    status: Option<u16>,
+}
+
+impl AcmeError {
+    pub(crate) fn new(kind: AcmeErrorKind) -> Self {
+        Self { kind, status: None }
+    }
+
+    pub(crate) fn with_status(kind: AcmeErrorKind, status: u16) -> Self {
+        Self {
+            kind,
+            status: Some(status),
+        }
+    }
+
+    pub fn kind(&self) -> AcmeErrorKind {
+        self.kind
+    }
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+}
+
+impl fmt::Display for AcmeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ACME {:?}", self.kind)?;
+        if let Some(status) = self.status {
+            write!(formatter, " (status {status})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AcmeError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateError {
     InvalidData,
     CorruptData,

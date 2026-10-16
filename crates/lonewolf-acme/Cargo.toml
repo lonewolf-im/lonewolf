@@ -8,29 +8,41 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+bytes.workspace = true
 compio = { workspace = true, features = ["net", "time"] }
 compio-io.workspace = true
+futures-channel.workspace = true
 futures-util = { workspace = true, features = ["io"] }
 graviola.workspace = true
+hmac.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+httpdate.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 idna.workspace = true
+instant-acme.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
 nix.workspace = true
 parking_lot.workspace = true
+rcgen.workspace = true
 redb.workspace = true
+rustls.workspace = true
+rustls-graviola.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 socket2.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+ureq.workspace = true
+webpki-roots.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 blocking.workspace = true
-futures-channel.workspace = true
 futures-executor.workspace = true
+p256 = { version = "0.13.2", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
 tempfile.workspace = true
+x509-cert.workspace = true

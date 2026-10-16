@@ -183,7 +183,45 @@ fn selected_dns_hosts_keep_case_insensitive_and_absent_sni_policy() -> TestResul
 #[test]
 fn pending_managed_host_rejects_starttls_before_proceed_without_disrupting_file_host() -> TestResult
 {
-    let mut suite = C2sSuite::with_hosts("[hosts.'example.com'.tls]\nprovider = 'letsencrypt'")?;
+    let directory_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    directory_listener.set_nonblocking(true)?;
+    let directory_url = format!("https://{}/directory", directory_listener.local_addr()?);
+    let http_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let hosts = format!(
+        "[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n[letsencrypt]\nlisten = ['{}']\nstate_path = 'acme.redb'\ndirectory_url = '{directory_url}'",
+        http_reservation.local_addr()?,
+    );
+    let mut suite = C2sSuite::with_hosts_and_setup(&hosts, |directory| {
+        let not_before_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            .checked_add(86_400)
+            .ok_or("retry deadline overflow")?;
+        compio::runtime::Runtime::new()?.block_on(async {
+            let store =
+                lonewolf_acme::StateStore::open(directory.join("acme.redb"), directory_url).await?;
+            store
+                .save_host(lonewolf_acme::StoredHost {
+                    host: lonewolf_acme::ManagedHost {
+                        xmpp_domain: "example.com".into(),
+                        dns_name: "example.com".into(),
+                    },
+                    certificate: None,
+                    order: None,
+                    retry: lonewolf_acme::RetryState {
+                        failures: 1,
+                        not_before_unix,
+                    },
+                })
+                .await?;
+            store
+                .drain(std::time::Instant::now() + std::time::Duration::from_secs(5))
+                .await?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+        drop(http_reservation);
+        Ok(())
+    })?;
     let mut pending = suite.tcp_client()?;
     pending.open_with(&opening("example.com"))?;
     pending.features()?.child(TLS_NAMESPACE, "starttls")?;
@@ -196,5 +234,9 @@ fn pending_managed_host_rejects_starttls_before_proceed_without_disrupting_file_
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut healthy = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     healthy.close()?;
-    suite.stop()
+    suite.stop()?;
+    assert!(
+        matches!(directory_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    Ok(())
 }

@@ -12,6 +12,7 @@ use tracing_appender::non_blocking::ErrorCounter;
 
 use crate::BuildInfo;
 
+pub(crate) use acme::AcmeCollector;
 pub(crate) use pool::StanzaPoolCollector;
 pub(crate) use storage::StorageCollector;
 
@@ -72,6 +73,7 @@ impl Collector for LogCollector {
     }
 }
 
+mod acme;
 mod pool;
 mod storage;
 

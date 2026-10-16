@@ -654,7 +654,7 @@ fn load_activates_valid_cache_without_network_and_shutdown_ready_never_dispatche
         drop(store);
         let installer = install(now - 100, now + 100);
         let installed = installer.installed.clone();
-        let manager = Manager::load(
+        let mut manager = Manager::load(
             ManagerOptions {
                 directory_url: "https://unreachable.invalid/directory".into(),
                 state_path: path,
@@ -973,6 +973,15 @@ fn co_ready_stop_blocks_local_publication_and_clock_jumps_preserve_publication_i
 
 #[test]
 fn shutdown_clears_leases_and_uses_the_same_absolute_deadline_for_both_drains() -> TestResult {
+    held_transport_shutdown(false)
+}
+
+#[test]
+fn fatal_manager_failure_returns_before_held_transport_drain() -> TestResult {
+    held_transport_shutdown(true)
+}
+
+fn held_transport_shutdown(fatal: bool) -> TestResult {
     use instant_acme::HttpClient as _;
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -1003,7 +1012,7 @@ fn shutdown_clears_leases_and_uses_the_same_absolute_deadline_for_both_drains() 
         let directory = tempfile::tempdir()?;
         let host = host("example.com").host;
         let challenges = Challenges::new(std::slice::from_ref(&host))?;
-        let manager = Manager::load(
+        let mut manager = Manager::load(
             ManagerOptions {
                 directory_url: format!("https://{address}/directory"),
                 state_path: directory.path().join("state.redb"),
@@ -1037,9 +1046,31 @@ fn shutdown_clears_leases_and_uses_the_same_absolute_deadline_for_both_drains() 
         drop(request);
         let start = Instant::now();
         let deadline = start + Duration::from_millis(25);
+        if fatal {
+            store.drain(deadline).await?;
+            let result =
+                compio::time::timeout(Duration::from_millis(100), manager.run(pending())).await?;
+            assert_eq!(result, Err(ManagerError::State(StateError::Closed)));
+            assert!(start.elapsed() < Duration::from_millis(100));
+            assert_eq!(manager.drain(deadline).await, Err(ManagerError::Deadline));
+        } else {
+            assert_eq!(
+                manager.run(async { deadline }).await,
+                Err(ManagerError::Deadline)
+            );
+        }
+        let request = http::Request::builder()
+            .uri(format!("https://{address}/closed"))
+            .body(instant_acme::BodyWrapper::default())?;
         assert_eq!(
-            manager.run(async { deadline }).await,
-            Err(ManagerError::Deadline)
+            transport_error_kind(
+                transport
+                    .request(request)
+                    .await
+                    .err()
+                    .ok_or("transport remained open")?
+            ),
+            AcmeErrorKind::Closed
         );
         assert!(start.elapsed() < Duration::from_millis(500));
         assert!(challenges.lookup("example.com", &token).is_none());
@@ -1364,4 +1395,115 @@ fn ari_error_classes_persist_backoff_without_resampling_schedule_or_changing_ord
         }
     }
     Ok(())
+}
+
+#[test]
+fn cancelled_and_panicked_runs_keep_resources_drainable_and_cannot_restart() -> TestResult {
+    use instant_acme::HttpClient as _;
+    compio::runtime::Runtime::new()?.block_on(async {
+        for panics in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let host = host("example.com").host;
+            let challenges = Challenges::new(std::slice::from_ref(&host))?;
+            let mut manager = Manager::load(
+                ManagerOptions {
+                    directory_url: "https://127.0.0.1:9/directory".into(),
+                    state_path: directory.path().join("state.redb"),
+                    ca_certificates_path: None,
+                    hosts: vec![host],
+                },
+                challenges.clone(),
+                install(NOW, NOW + 1000),
+            )
+            .await?;
+            let store = manager.store.clone();
+            let transport = manager.transport.clone();
+            let token = "B".repeat(43);
+            let lease = challenges.publish(
+                "example.com",
+                &token,
+                &format!("{token}.{}", "A".repeat(43)),
+            )?;
+            if panics {
+                let polls = Cell::new(0);
+                let stop = poll_fn(|context| {
+                    polls.set(polls.get() + 1);
+                    if polls.get() > 1 {
+                        panic!("private panic payload");
+                    }
+                    context.waker().wake_by_ref();
+                    Poll::Pending::<Instant>
+                });
+                assert!(
+                    std::panic::AssertUnwindSafe(manager.run(stop))
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                );
+            } else {
+                let mut run = Box::pin(manager.run(pending()));
+                assert!(run.as_mut().now_or_never().is_none());
+                drop(run);
+            }
+            assert!(challenges.lookup("example.com", &token).is_none());
+            drop(lease);
+            assert_eq!(manager.run(pending()).await, Err(ManagerError::Task));
+            let deadline = Instant::now();
+            let _ = manager.drain(deadline).await;
+            assert_eq!(store.account().await.err(), Some(StateError::Closed));
+            let request = http::Request::builder()
+                .uri("https://127.0.0.1:9/closed")
+                .body(instant_acme::BodyWrapper::default())?;
+            assert_eq!(
+                transport_error_kind(
+                    transport
+                        .request(request)
+                        .await
+                        .err()
+                        .ok_or("transport open")?
+                ),
+                AcmeErrorKind::Closed
+            );
+            let _ = manager.drain(deadline).await;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn unstarted_manager_drain_is_permanent_and_clears_leases() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        let directory = tempfile::tempdir()?;
+        let host = host("example.com").host;
+        let challenges = Challenges::new(std::slice::from_ref(&host))?;
+        let mut manager = Manager::load(
+            ManagerOptions {
+                directory_url: "https://127.0.0.1:9/directory".into(),
+                state_path: directory.path().join("state.redb"),
+                ca_certificates_path: None,
+                hosts: vec![host],
+            },
+            challenges.clone(),
+            install(NOW, NOW + 1000),
+        )
+        .await?;
+        let token = "B".repeat(43);
+        let _lease = challenges.publish(
+            "example.com",
+            &token,
+            &format!("{token}.{}", "A".repeat(43)),
+        )?;
+        manager.drain(Instant::now()).await?;
+        assert!(challenges.lookup("example.com", &token).is_none());
+        assert_eq!(manager.run(pending()).await, Err(ManagerError::Task));
+        manager.drain(Instant::now()).await?;
+        Ok(())
+    })
+}
+
+fn transport_error_kind(error: instant_acme::Error) -> AcmeErrorKind {
+    let instant_acme::Error::Other(error) = error else {
+        panic!("unexpected error class");
+    };
+    error.downcast_ref::<AcmeError>().unwrap().kind()
 }

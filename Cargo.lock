@@ -1366,6 +1366,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "idna",
+ "lonewolf-acme",
  "lonewolf-admin",
  "lonewolf-auth",
  "lonewolf-extension",

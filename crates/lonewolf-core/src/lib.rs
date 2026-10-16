@@ -25,6 +25,7 @@ use lonewolf_util::pool::PooledChunkAllocator;
 use prometheus_client::registry::Registry;
 
 mod account_deletion;
+mod acme;
 mod c2s;
 pub mod config;
 mod delivery;
@@ -123,10 +124,22 @@ pub fn run_with_extensions(
             .map_err(RunError::Dispatcher)?;
         tracing::info!(worker_count = worker_count.get(), "core dispatcher started");
         runtime.block_on(async {
+            let mut stop_signal = pin!(shutdown::wait());
+            let mut acme = None;
             let mut listeners = None;
             let mut router = None;
             let mut shutdown_deadline = None;
             let result = async {
+                match startup_until_signal(
+                    acme::supervise("load", acme::AcmeServices::load(&config, hosts.clone())),
+                    stop_signal.as_mut(),
+                    &mut shutdown_deadline,
+                )
+                .await?
+                {
+                    Some(loaded) => acme = loaded,
+                    None => return Ok(()),
+                }
                 let storage = stores.storage(account_store)?;
                 for factory in lonewolf_extension::builtin() {
                     extensions
@@ -179,6 +192,11 @@ pub fn run_with_extensions(
                 server_metrics.registry().register_collector(Box::new(
                     metrics::StanzaPoolCollector::new(Arc::clone(&stanza_pool)),
                 ));
+                if let Some(acme) = &acme {
+                    server_metrics
+                        .registry()
+                        .register_collector(Box::new(metrics::AcmeCollector::new(acme.status())));
+                }
                 let metrics_server = if config.metrics.enabled {
                     Some(
                         lonewolf_metrics::MetricsServer::bind(config.metrics.address)
@@ -237,11 +255,15 @@ pub fn run_with_extensions(
                 );
                 let registry = server_metrics.into_registry();
                 run_services(
-                    admin,
-                    metrics_server.map(|server| (server, registry)),
+                    BackgroundServices {
+                        admin,
+                        metrics: metrics_server.map(|server| (server, registry)),
+                        acme: acme.as_mut(),
+                    },
                     listeners,
                     serving_router,
                     &mut shutdown_deadline,
+                    stop_signal.as_mut(),
                     account_deletion::run(
                         deletions,
                         &deletion_storage,
@@ -254,9 +276,19 @@ pub fn run_with_extensions(
             .await;
             let deadline =
                 shutdown_deadline.unwrap_or_else(|| Instant::now() + WORKER_SHUTDOWN_GRACE);
+            if let Err(RunError::Acme { phase, .. }) = &result {
+                tracing::error!(phase, "ACME service failed");
+            }
             if let Some(router) = &router {
                 router.stop();
             }
+            if let Some(listeners) = listeners.as_mut() {
+                listeners.stop(deadline);
+            }
+            let acme_stopped = match acme.as_mut() {
+                Some(acme) => acme.drain(deadline).await,
+                None => Ok(()),
+            };
             let listeners_stopped = match listeners {
                 Some(mut listeners) => {
                     listeners.stop(deadline);
@@ -285,6 +317,7 @@ pub fn run_with_extensions(
                 .and(stopped)
                 .and(listeners_stopped)
                 .and(router_stopped)
+                .and(acme_stopped)
         })?;
     }
 
@@ -292,14 +325,40 @@ pub fn run_with_extensions(
     Ok(())
 }
 
-async fn run_services<A: ChunkAllocator + Clone>(
+async fn startup_until_signal<T>(
+    load: impl Future<Output = Result<T, RunError>>,
+    signal: impl Future<Output = io::Result<()>>,
+    shutdown_deadline: &mut Option<Instant>,
+) -> Result<Option<T>, RunError> {
+    match select(pin!(signal), pin!(load)).await {
+        Either::Left((result, _)) => {
+            *shutdown_deadline = Some(Instant::now() + WORKER_SHUTDOWN_GRACE);
+            result.map_err(RunError::Signal)?;
+            Ok(None)
+        }
+        Either::Right((result, _)) => result.map(Some),
+    }
+}
+
+struct BackgroundServices<'a> {
     admin: Option<lonewolf_admin::Server>,
     metrics: Option<(lonewolf_metrics::MetricsServer, Arc<Registry>)>,
+    acme: Option<&'a mut acme::AcmeServices>,
+}
+
+async fn run_services<A: ChunkAllocator + Clone>(
+    background: BackgroundServices<'_>,
     listeners: &mut c2s::Listeners,
     router: &mut Router<A>,
     shutdown_deadline: &mut Option<Instant>,
+    stop_signal: impl Future<Output = io::Result<()>>,
     deletions: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
+    let BackgroundServices {
+        admin,
+        metrics,
+        acme,
+    } = background;
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
     let metrics_task = metrics.map(|(server, registry)| {
         compio::runtime::spawn(server.run(registry, async move {
@@ -325,10 +384,26 @@ async fn run_services<A: ChunkAllocator + Clone>(
         let (result, ()) = join(server, deletions).await;
         result
     });
-    let result = {
-        let shutdown = async {
+    let acme_enabled = acme.is_some();
+    let (stop_acme, acme_stopped) = oneshot::channel::<Instant>();
+    let acme_done = std::cell::Cell::new(false);
+    let mut acme_service = pin!(async {
+        match acme {
+            Some(acme) => {
+                let result = acme
+                    .run(async { acme_stopped.await.unwrap_or_else(|_| Instant::now()) })
+                    .await;
+                acme_done.set(true);
+                result
+            }
+            None => pending().await,
+        }
+    });
+    let (primary, services_done) = {
+        let external_shutdown = async {
+            tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
             let external = async {
-                match select(pin!(shutdown::wait()), pin!(listeners.failure())).await {
+                match select(pin!(stop_signal), pin!(listeners.failure())).await {
                     Either::Left((result, _)) => result.map_err(RunError::Signal),
                     Either::Right((error, _)) => Err(RunError::C2s(error)),
                 }
@@ -346,9 +421,14 @@ async fn run_services<A: ChunkAllocator + Clone>(
                 Either::Right((result, _)) => result,
             }
         };
+        let shutdown = async {
+            match select(pin!(external_shutdown), acme_service.as_mut()).await {
+                Either::Left((result, _)) | Either::Right((result, _)) => result,
+            }
+        };
         match select(services.as_mut(), pin!(shutdown)).await {
-            Either::Left((result, _)) => Either::Right(result),
-            Either::Right((result, _)) => Either::Left(result),
+            Either::Left((result, _)) => (result, true),
+            Either::Right((result, _)) => (result, false),
         }
     };
     let router_failure = match router.state() {
@@ -359,13 +439,15 @@ async fn run_services<A: ChunkAllocator + Clone>(
     let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
     *shutdown_deadline = Some(deadline);
     listeners.stop(deadline);
+    let _ = stop_acme.send(deadline);
     drop(stop_admin);
     drop(stop_metrics);
     let drain = async {
         let services = async {
-            match result {
-                Either::Left(result) if admin_enabled => result.and(services.await),
-                Either::Left(result) | Either::Right(result) => result,
+            if !services_done && admin_enabled {
+                services.await
+            } else {
+                Ok(())
             }
         };
         let metrics = async {
@@ -376,11 +458,21 @@ async fn run_services<A: ChunkAllocator + Clone>(
                 None => Ok(()),
             }
         };
-        let ((services, listeners), metrics) =
-            join(join(services, listeners.join()), metrics).await;
-        services.and(listeners.map_err(RunError::C2s)).and(metrics)
+        let acme = async {
+            if acme_enabled && !acme_done.get() {
+                acme_service.await
+            } else {
+                Ok(())
+            }
+        };
+        let (((services, listeners), metrics), acme) =
+            join(join(join(services, listeners.join()), metrics), acme).await;
+        services
+            .and(listeners.map_err(RunError::C2s))
+            .and(metrics)
+            .and(acme)
     };
-    drain_services_until(deadline, router_failure, drain).await
+    primary.and(drain_services_until(deadline, router_failure, drain).await)
 }
 
 async fn drain_services_until(
@@ -424,6 +516,27 @@ fn invalid_worker_count() -> io::Error {
 mod supervision_tests {
     use super::*;
     use router::RouterFailure;
+
+    #[test]
+    fn primary_acme_failure_survives_a_cleanup_deadline() -> io::Result<()> {
+        Runtime::new()?.block_on(async {
+            let primary = Err::<(), _>(RunError::Acme {
+                phase: "manager",
+                source: Box::new(lonewolf_acme::ManagerError::State(
+                    lonewolf_acme::StateError::StateUncertain,
+                )),
+            });
+            let result = primary.and(drain_services_until(Instant::now(), None, pending()).await);
+            assert!(matches!(
+                result,
+                Err(RunError::Acme {
+                    phase: "manager",
+                    ..
+                })
+            ));
+        });
+        Ok(())
+    }
 
     #[test]
     fn bounded_service_drain_keeps_observed_router_failure_primary() -> io::Result<()> {

@@ -9,7 +9,6 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::mpsc;
 use std::task::{Context, Waker};
-use std::thread;
 use std::time::Duration;
 
 use futures_executor::block_on;
@@ -430,13 +429,12 @@ fn submitted_work_retains_lock_after_cancellation_and_expired_drain() -> TestRes
     assert!(matches!(open(&path), Err(StateError::Unavailable)));
     assert!(matches!(block_on(store.account()), Err(StateError::Closed)));
     let weak = Arc::downgrade(&store.inner);
+    let executor = store.inner.executor.clone();
     drop(store);
     assert!(matches!(open(&path), Err(StateError::Unavailable)));
     release.send(())?;
-    let deadline = Instant::now() + TIMEOUT;
-    while weak.strong_count() != 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(1));
-    }
+    compio::runtime::Runtime::new()?
+        .block_on(async { compio::time::timeout(TIMEOUT, executor.run(|| ())).await })?;
     assert_eq!(weak.strong_count(), 0);
     let _reopened = open(&path)?;
     Ok(())

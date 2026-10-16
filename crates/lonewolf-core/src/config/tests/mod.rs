@@ -11,7 +11,7 @@ use std::process::Command;
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
     AccountConfig, ClientCertificateConfig, Config, ConfigError, HostConfig, HostTlsConfig,
-    MetricsConfig, StoreConfig, TcpListenerConfig, XmppConfig,
+    HostTlsSource, MetricsConfig, StoreConfig, TcpListenerConfig, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
 use lonewolf_extension::{Extensions, HostSelection};
@@ -663,13 +663,36 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     assert_eq!(Config::load(Some(&path))?, Config::default());
 
     let mut uncommented = String::with_capacity(reference.len());
+    let mut example = None;
+    let mut examples = Vec::new();
     for line in reference.lines() {
+        if line == "# ```toml" {
+            assert!(example.is_none());
+            example = Some(String::new());
+            continue;
+        }
+        if line == "# ```" {
+            examples.push(example.take().ok_or("missing example start")?);
+            continue;
+        }
         if let Some(setting) = line.strip_prefix("# ")
             && (setting.starts_with('[') || setting.contains(" = "))
         {
-            uncommented.push_str(setting);
-            uncommented.push('\n');
+            let contents = example.as_mut().unwrap_or(&mut uncommented);
+            contents.push_str(setting);
+            contents.push('\n');
         }
+    }
+    assert!(example.is_none());
+    assert_eq!(examples.len(), 5);
+    for example in examples {
+        let contents = if example.starts_with("[letsencrypt]") {
+            format!("[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n{example}")
+        } else {
+            example
+        };
+        let file = config_file(&contents)?;
+        Config::load(Some(file.path()))?;
     }
     assert!(!uncommented.is_empty());
     let mut documented: toml::Value = toml::from_str(&uncommented)?;
@@ -716,8 +739,10 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
                 ),
             ]),
             tls: Some(HostTlsConfig {
-                certificate_chain_path: PathBuf::from("./certs/example.com.crt"),
-                private_key_path: PathBuf::from("./certs/example.com.key"),
+                source: HostTlsSource::Files {
+                    certificate_chain_path: PathBuf::from("./certs/example.com.crt"),
+                    private_key_path: PathBuf::from("./certs/example.com.key"),
+                },
                 client_auth: Some(ClientCertificateConfig {
                     trust_anchors_path: PathBuf::from("./certs/client-roots.pem"),
                     crls_path: PathBuf::from("./certs/client-crls.pem"),
@@ -818,5 +843,189 @@ fn external_only_listener_accepts_client_auth_for_every_host_and_preserves_scram
     ] {
         assert!(!mechanisms.allows(mechanism));
     }
+    Ok(())
+}
+
+#[test]
+fn letsencrypt_defaults_and_partial_settings_preserve_exact_directory_identity() -> TestResult {
+    let defaults = Config::default().letsencrypt;
+    assert_eq!(
+        defaults.listen,
+        vec!["0.0.0.0:80".parse::<std::net::SocketAddr>()?]
+    );
+    assert_eq!(defaults.state_path, Path::new("./data/lonewolf/acme.redb"));
+    assert_eq!(
+        defaults.directory_url,
+        "https://acme-v02.api.letsencrypt.org/directory"
+    );
+    assert_eq!(defaults.ca_certificates_path, None);
+    for url in [
+        "https://acme-v02.api.letsencrypt.org/directory",
+        "https://acme-staging-v02.api.letsencrypt.org/directory",
+        "https://ca.example:8443/acme/directory?profile=test&mode=1",
+        "https://localhost:443/directory",
+        "https://ca.example:65535/directory",
+        "https://127.0.0.1:9443/directory",
+        "https://[::1]:9443/directory",
+        "https://[::1]/directory",
+        "https://ca.example",
+        "https://ca.example/",
+        "https://ca.example?profile=test",
+        "https://CA.example:0443/Directory?profile=%23test",
+    ] {
+        let file = config_file(&format!("[letsencrypt]\ndirectory_url = '{url}'"))?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(
+            config.letsencrypt,
+            crate::config::LetsEncryptConfig {
+                directory_url: url.into(),
+                ..defaults.clone()
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_directory_urls_are_rejected_even_without_managed_hosts() -> TestResult {
+    for url in [
+        "",
+        "http://ca.example/directory",
+        "/directory",
+        "ca.example/directory",
+        "https:///directory",
+        "https://:443/directory",
+        "https://user@ca.example/directory",
+        "https://user:password@ca.example/directory",
+        "https://@ca.example/directory",
+        "https://@/directory",
+        "https://user@/directory",
+        "https://ca.example/directory#fragment",
+        "https://ca.example/directory#",
+        "https://ca.example/#/directory",
+        "https://ca.example:0/directory",
+        "https://ca.example:65536/directory",
+        "https://ca.example:abc/directory",
+        "https://ca.example:/directory",
+        "https://ca.example:-1/directory",
+        "https://ca.example:+443/directory",
+        "https://ca.example:1x/directory",
+        "https://[::1]:0/directory",
+        "https://[::1]:abc/directory",
+        "https://[not-an-ip]/directory",
+        "https://[::1]extra:443/directory",
+        "https://ca.example\\other/directory",
+        " https://ca.example/directory",
+        "https://ca.example/directory ",
+        "https://ca.example/dir ectory",
+        "https://ca.example/\u{a0}directory",
+    ] {
+        let file = config_file(&format!("[letsencrypt]\ndirectory_url = '{url}'"))?;
+        assert!(Config::load(Some(file.path())).is_err(), "accepted {url:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn letsencrypt_rejects_invalid_shapes_paths_and_overlapping_listeners_while_inactive() -> TestResult
+{
+    for fields in [
+        "listen = ['127.0.0.1:0']",
+        "listen = ['[::1]:0']",
+        "listen = ['127.0.0.1:8080', '127.0.0.1:8080']",
+        "listen = ['0.0.0.0:8080', '127.0.0.1:8080']",
+        "listen = ['127.0.0.1:8080', '0.0.0.0:8080']",
+        "listen = ['[::]:8080', '[::1]:8080']",
+        "listen = ['[::1]:8080', '[::]:8080']",
+        "listen = ['localhost:8080']",
+        "listen = '0.0.0.0:80'",
+        "listen = ['[::1]']",
+        "state_path = ''",
+        "ca_certificates_path = ''",
+        "enabled = false",
+        "email = 'a@example.com'",
+        "terms = true",
+        "challenge = 'http-01'",
+        "renewal_interval_secs = 60",
+    ] {
+        let file = config_file(&format!("[letsencrypt]\n{fields}"))?;
+        assert!(
+            Config::load(Some(file.path())).is_err(),
+            "accepted {fields}"
+        );
+    }
+    let file = config_file("[letsencrypt]\nlisten = []")?;
+    Config::load(Some(file.path()))?;
+    Ok(())
+}
+
+#[test]
+fn letsencrypt_listener_conflicts_require_an_active_managed_host() -> TestResult {
+    let managed = "[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n";
+    for (rest, conflict) in [
+        ("[letsencrypt]\nlisten = []", true),
+        ("[letsencrypt]\nlisten = ['0.0.0.0:5222']", true),
+        ("[letsencrypt]\nlisten = ['127.0.0.1:5222']", true),
+        ("[[c2s.listeners]]\naddress = '127.0.0.1:80'", true),
+        (
+            "[letsencrypt]\nlisten = ['[::]:8080']\n[[c2s.listeners]]\naddress = '[::1]:8080'",
+            true,
+        ),
+        (
+            "[letsencrypt]\nlisten = ['[::1]:8080']\n[[c2s.listeners]]\naddress = '[::]:8080'",
+            true,
+        ),
+        ("[metrics]\nenabled = true\naddress = '127.0.0.1:80'", true),
+        (
+            "[letsencrypt]\nlisten = ['[::1]:8080']\n[metrics]\nenabled = true\naddress = '[::]:8080'",
+            true,
+        ),
+        (
+            "[letsencrypt]\nlisten = ['127.0.0.1:8080']\n[metrics]\nenabled = true\naddress = '0.0.0.0:8080'",
+            true,
+        ),
+        (
+            "[letsencrypt]\nlisten = ['127.0.0.1:8080', '127.0.0.2:8080', '[::1]:8080']",
+            false,
+        ),
+        ("[letsencrypt]\nlisten = ['0.0.0.0:80', '[::]:80']", false),
+        ("[[c2s.listeners]]\naddress = '[::]:80'", false),
+        ("[[c2s.listeners]]\naddress = '127.0.0.1:0'", false),
+        (
+            "[metrics]\nenabled = false\naddress = '127.0.0.1:80'",
+            false,
+        ),
+        ("[metrics]\nenabled = true\naddress = '[::]:80'", false),
+        (
+            "[letsencrypt]\nlisten = ['127.0.0.1:8080']\n[[c2s.listeners]]\naddress = '127.0.0.2:8080'",
+            false,
+        ),
+    ] {
+        let file = config_file(rest)?;
+        Config::load(Some(file.path()))?;
+        let file = config_file(&format!("{managed}{rest}"))?;
+        assert_eq!(Config::load(Some(file.path())).is_err(), conflict, "{rest}");
+    }
+    Ok(())
+}
+
+#[test]
+fn inactive_letsencrypt_configuration_does_not_bind_or_create_state() -> TestResult {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let directory = tempfile::tempdir()?;
+    let state = directory.path().join("absent/acme.redb");
+    let trust = directory.path().join("absent/ca.pem");
+    let file = config_file(&format!(
+        "[letsencrypt]\nlisten = ['{}']\nstate_path = '{}'\nca_certificates_path = '{}'",
+        listener.local_addr()?,
+        state.display(),
+        trust.display()
+    ))?;
+    let config = Config::load(Some(file.path()))?;
+    let hosts = crate::hosts::Hosts::new(&config.hosts, None)?;
+    assert!(hosts.is_local_host("localhost"));
+    assert!(!state.exists());
+    assert!(!trust.exists());
+    assert!(!directory.path().join("absent").exists());
     Ok(())
 }

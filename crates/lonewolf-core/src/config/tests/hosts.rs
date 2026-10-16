@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{
+    Config, ConfigError, HostConfig, HostTlsConfig, HostTlsSource, managed_dns_name,
+};
 
 use super::{TestResult, config_file};
 
@@ -43,8 +45,13 @@ private_key_path = "certs/chat.key"
         .tls
         .as_ref()
         .ok_or("missing TLS settings")?;
-    assert_eq!(tls.certificate_chain_path, Path::new("certs/chat.pem"));
-    assert_eq!(tls.private_key_path, Path::new("certs/chat.key"));
+    assert_eq!(
+        tls.source,
+        HostTlsSource::Files {
+            certificate_chain_path: "certs/chat.pem".into(),
+            private_key_path: "certs/chat.key".into(),
+        }
+    );
     assert!(tls.client_auth.is_none());
     Ok(())
 }
@@ -218,6 +225,201 @@ fn client_auth_paths_are_required_only_when_configured() -> TestResult {
             Config::load(Some(file.path())),
             Err(ConfigError::Invalid { .. })
         ));
+    }
+    Ok(())
+}
+
+#[test]
+fn certificate_providers_preserve_file_defaults_and_reject_conflicting_fields() -> TestResult {
+    for provider in ["", "provider = 'files'\n"] {
+        let file = config_file(&format!(
+            "[hosts.'example.com'.tls]\n{provider}certificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'"
+        ))?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(
+            config.hosts["example.com"]
+                .tls
+                .as_ref()
+                .ok_or("missing TLS")?
+                .source,
+            HostTlsSource::Files {
+                certificate_chain_path: "cert.pem".into(),
+                private_key_path: "key.pem".into(),
+            }
+        );
+    }
+    for fields in [
+        "provider = 'unknown'",
+        "provider = 'Files'\ncertificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'",
+        "provider = 'files'",
+        "provider = 'files'\ncertificate_chain_path = 'cert.pem'",
+        "provider = 'files'\nprivate_key_path = 'key.pem'",
+        "provider = 'letsencrypt'\ncertificate_chain_path = 'cert.pem'",
+        "provider = 'letsencrypt'\ncertificate_chain_path = ''",
+        "provider = 'letsencrypt'\nprivate_key_path = 'key.pem'",
+        "provider = 'letsencrypt'\nprivate_key_path = ''",
+        "provider = 'letsencrypt'\ncertificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'",
+        "provider = 'letsencrypt'\nenabled = true",
+        "provider = 'letsencrypt'\nsource = 'files'",
+    ] {
+        let file = config_file(&format!("[hosts.'example.com'.tls]\n{fields}"))?;
+        assert!(
+            matches!(
+                Config::load(Some(file.path())),
+                Err(ConfigError::Parse { .. })
+            ),
+            "{fields}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_host_names_use_strict_dns_identities_and_keep_unicode_routing() -> TestResult {
+    for (domain, ascii) in [
+        ("example.com", "example.com"),
+        ("chat.example", "chat.example"),
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("a-b.example", "a-b.example"),
+    ] {
+        let file = config_file(&format!("[hosts.'{domain}'.tls]\nprovider = 'letsencrypt'"))?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(managed_dns_name(domain)?, ascii);
+        assert!(matches!(
+            config.hosts[domain]
+                .tls
+                .as_ref()
+                .ok_or("missing TLS")?
+                .source,
+            HostTlsSource::LetsEncrypt
+        ));
+    }
+    let long_label = format!("{}.example", "a".repeat(64));
+    let long_name = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "a".repeat(63),
+        "a".repeat(63),
+        "a".repeat(63)
+    );
+    for domain in [
+        "",
+        "localhost",
+        "chat.localhost",
+        "a.b.localhost",
+        "singlelabel",
+        "192.0.2.1",
+        "[2001:db8::1]",
+        "*.example",
+        "chat.*.example",
+        "a..example",
+        ".example",
+        "example.com.",
+        "bad_name.example",
+        "-bad.example",
+        "bad-.example",
+        "EXAMPLE.COM",
+        "xn--bcher-kva.example",
+        "example/com",
+        "example@com",
+        &long_label,
+        &long_name,
+    ] {
+        let file = config_file(&format!("[hosts.'{domain}'.tls]\nprovider = 'letsencrypt'"))?;
+        assert!(
+            Config::load(Some(file.path())).is_err(),
+            "accepted {domain:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_alias_collisions_include_file_sources_in_either_order() -> TestResult {
+    for (ascii_managed, unicode_managed) in
+        [(true, true), (true, false), (false, true), (false, false)]
+    {
+        let source = |managed| {
+            if managed {
+                HostTlsSource::LetsEncrypt
+            } else {
+                HostTlsSource::Files {
+                    certificate_chain_path: "cert.pem".into(),
+                    private_key_path: "key.pem".into(),
+                }
+            }
+        };
+        let hosts = std::collections::BTreeMap::from([
+            (
+                "xn--bcher-kva.example".into(),
+                HostConfig {
+                    tls: Some(HostTlsConfig {
+                        source: source(ascii_managed),
+                        client_auth: None,
+                    }),
+                    ..HostConfig::default()
+                },
+            ),
+            (
+                "bücher.example".into(),
+                HostConfig {
+                    tls: Some(HostTlsConfig {
+                        source: source(unicode_managed),
+                        client_auth: None,
+                    }),
+                    ..HostConfig::default()
+                },
+            ),
+        ]);
+        let config = Config::default();
+        let validation = config
+            .letsencrypt
+            .validate(&hosts, &config.c2s, &config.metrics);
+        assert_eq!(validation.is_err(), ascii_managed || unicode_managed);
+        if let Err(reason) = validation {
+            assert!(reason.contains("same managed DNS identity"), "{reason}");
+        }
+    }
+    let file = config_file(
+        "[xmpp]\ndefault_host = 'bücher.example'\n[hosts.'bücher.example'.tls]\nprovider = 'letsencrypt'\n[hosts.'xn--bcher-kva.example'.tls]\nprovider = 'letsencrypt'",
+    )?;
+    assert!(Config::load(Some(file.path())).is_err());
+    Ok(())
+}
+
+#[test]
+fn managed_hosts_can_share_configuration_with_file_ip_and_localhost_hosts() -> TestResult {
+    let file = config_file(
+        "[xmpp]\ndefault_host = 'chat.example'\n[hosts.'chat.example'.tls]\nprovider = 'letsencrypt'\n[hosts.'other.example'.tls]\ncertificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'\n[hosts.'192.0.2.1'.tls]\ncertificate_chain_path = 'cert.pem'\nprivate_key_path = 'key.pem'\n[hosts.localhost]",
+    )?;
+    assert_eq!(Config::load(Some(file.path()))?.hosts.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn managed_client_auth_uses_the_existing_path_contract() -> TestResult {
+    let prefix = "[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n[hosts.'example.com'.tls.client_auth]\n";
+    let file = config_file(&format!(
+        "{prefix}trust_anchors_path = 'roots.pem'\ncrls_path = 'crls.pem'"
+    ))?;
+    let config = Config::load(Some(file.path()))?;
+    let client = config.hosts["example.com"]
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.client_auth.as_ref())
+        .ok_or("missing client auth")?;
+    assert_eq!(client.trust_anchors_path, Path::new("roots.pem"));
+    assert_eq!(client.crls_path, Path::new("crls.pem"));
+    for fields in [
+        "",
+        "trust_anchors_path = 'roots.pem'",
+        "crls_path = 'crls.pem'",
+        "trust_anchors_path = ''\ncrls_path = 'crls.pem'",
+        "trust_anchors_path = 'roots.pem'\ncrls_path = ''",
+        "trust_anchors_path = 'roots.pem'\ncrls_path = 'crls.pem'\nunknown = true",
+    ] {
+        let file = config_file(&format!("{prefix}{fields}"))?;
+        assert!(Config::load(Some(file.path())).is_err(), "{fields}");
     }
     Ok(())
 }

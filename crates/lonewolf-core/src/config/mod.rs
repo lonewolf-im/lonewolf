@@ -7,10 +7,11 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
+use http::Uri;
 use lonewolf_auth::server::Mechanism;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
@@ -39,6 +40,7 @@ pub struct Config {
     pub account: AccountConfig,
     pub admin: AdminConfig,
     pub metrics: MetricsConfig,
+    pub letsencrypt: LetsEncryptConfig,
 }
 
 impl Default for Config {
@@ -53,6 +55,7 @@ impl Default for Config {
             account: AccountConfig::default(),
             admin: AdminConfig::default(),
             metrics: MetricsConfig::default(),
+            letsencrypt: LetsEncryptConfig::default(),
         }
     }
 }
@@ -97,6 +100,8 @@ impl Config {
         self.validate_hosts()?;
         self.c2s.validate()?;
         self.metrics.validate(&self.c2s)?;
+        self.letsencrypt
+            .validate(&self.hosts, &self.c2s, &self.metrics)?;
         self.limits.validate()?;
         for (index, listener) in self.c2s.listeners.iter().enumerate() {
             if !listener.auth_mechanisms.has_scram() {
@@ -168,10 +173,19 @@ impl Config {
                 return Err(format!("hosts.{domain}.tls is required"));
             }
             if let Some(tls) = &host.tls {
-                if tls.certificate_chain_path.as_os_str().is_empty() {
-                    return Err(format!(
-                        "hosts.{domain}.tls.certificate_chain_path must not be empty"
-                    ));
+                if let HostTlsSource::Files {
+                    certificate_chain_path,
+                    private_key_path,
+                } = &tls.source
+                {
+                    for (name, path) in [
+                        ("certificate_chain_path", certificate_chain_path),
+                        ("private_key_path", private_key_path),
+                    ] {
+                        if path.as_os_str().is_empty() {
+                            return Err(format!("hosts.{domain}.tls.{name} must not be empty"));
+                        }
+                    }
                 }
                 if let Some(client) = &tls.client_auth {
                     for (name, path) in [
@@ -184,11 +198,6 @@ impl Config {
                             ));
                         }
                     }
-                }
-                if tls.private_key_path.as_os_str().is_empty() {
-                    return Err(format!(
-                        "hosts.{domain}.tls.private_key_path must not be empty"
-                    ));
                 }
             }
         }
@@ -222,13 +231,224 @@ impl Default for HostConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostTlsConfig {
-    pub certificate_chain_path: PathBuf,
-    pub private_key_path: PathBuf,
-    #[serde(default)]
+    pub source: HostTlsSource,
     pub client_auth: Option<ClientCertificateConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostTlsSource {
+    Files {
+        certificate_chain_path: PathBuf,
+        private_key_path: PathBuf,
+    },
+    LetsEncrypt,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawTlsProvider {
+    #[default]
+    Files,
+    LetsEncrypt,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHostTlsConfig {
+    #[serde(default)]
+    provider: RawTlsProvider,
+    certificate_chain_path: Option<PathBuf>,
+    private_key_path: Option<PathBuf>,
+    client_auth: Option<ClientCertificateConfig>,
+}
+
+impl<'de> Deserialize<'de> for HostTlsConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawHostTlsConfig::deserialize(deserializer)?;
+        let source = match raw.provider {
+            RawTlsProvider::Files => HostTlsSource::Files {
+                certificate_chain_path: raw
+                    .certificate_chain_path
+                    .ok_or_else(|| D::Error::missing_field("certificate_chain_path"))?,
+                private_key_path: raw
+                    .private_key_path
+                    .ok_or_else(|| D::Error::missing_field("private_key_path"))?,
+            },
+            RawTlsProvider::LetsEncrypt => {
+                if raw.certificate_chain_path.is_some() || raw.private_key_path.is_some() {
+                    return Err(D::Error::custom(
+                        "letsencrypt does not accept certificate_chain_path or private_key_path",
+                    ));
+                }
+                HostTlsSource::LetsEncrypt
+            }
+        };
+        Ok(Self {
+            source,
+            client_auth: raw.client_auth,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LetsEncryptConfig {
+    /// IPv6 listeners accept IPv6 only.
+    pub listen: Vec<SocketAddr>,
+    pub state_path: PathBuf,
+    /// The exact URL identifies a separate account and certificate cache.
+    pub directory_url: String,
+    pub ca_certificates_path: Option<PathBuf>,
+}
+
+impl Default for LetsEncryptConfig {
+    fn default() -> Self {
+        Self {
+            listen: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 80))],
+            state_path: PathBuf::from("./data/lonewolf/acme.redb"),
+            directory_url: "https://acme-v02.api.letsencrypt.org/directory".into(),
+            ca_certificates_path: None,
+        }
+    }
+}
+
+impl LetsEncryptConfig {
+    fn validate(
+        &self,
+        hosts: &BTreeMap<String, HostConfig>,
+        c2s: &C2sConfig,
+        metrics: &MetricsConfig,
+    ) -> Result<(), String> {
+        for (name, path) in [
+            ("state_path", Some(&self.state_path)),
+            ("ca_certificates_path", self.ca_certificates_path.as_ref()),
+        ] {
+            if path.is_some_and(|path| path.as_os_str().is_empty()) {
+                return Err(format!("letsencrypt.{name} must not be empty"));
+            }
+        }
+        validate_directory_url(&self.directory_url)?;
+        let managed = |host: &HostConfig| {
+            host.tls
+                .as_ref()
+                .is_some_and(|tls| matches!(tls.source, HostTlsSource::LetsEncrypt))
+        };
+        let active = hosts.values().any(managed);
+        if active && self.listen.is_empty() {
+            return Err(
+                "letsencrypt.listen must define at least one listener for managed hosts".into(),
+            );
+        }
+        for (index, &address) in self.listen.iter().enumerate() {
+            if address.port() == 0 {
+                return Err(format!(
+                    "letsencrypt.listen[{index}] must not use port zero"
+                ));
+            }
+            for (previous, &other) in self.listen[..index].iter().enumerate() {
+                if endpoints_overlap(address, other) {
+                    return Err(format!(
+                        "letsencrypt.listen[{index}] overlaps letsencrypt.listen[{previous}]"
+                    ));
+                }
+            }
+            if active {
+                for (other, listener) in c2s.listeners.iter().enumerate() {
+                    if endpoints_overlap(address, listener.address) {
+                        return Err(format!(
+                            "letsencrypt.listen[{index}] overlaps c2s.listeners[{other}]"
+                        ));
+                    }
+                }
+                if metrics.enabled && endpoints_overlap(address, metrics.address) {
+                    return Err(format!(
+                        "letsencrypt.listen[{index}] overlaps metrics.address"
+                    ));
+                }
+            }
+        }
+        if active {
+            let mut identities = BTreeMap::new();
+            for (domain, host) in hosts {
+                let is_managed = managed(host);
+                let name = match managed_dns_name(domain) {
+                    Ok(name) => name,
+                    Err(reason) if is_managed => {
+                        return Err(format!("hosts.{domain}.tls: {reason}"));
+                    }
+                    Err(_) => continue,
+                };
+                if let Some((other, other_managed)) = identities.insert(name, (domain, is_managed))
+                    && (is_managed || other_managed)
+                {
+                    return Err(format!(
+                        "hosts.{domain} and hosts.{other} have the same managed DNS identity"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn managed_dns_name(domain: &str) -> Result<String, String> {
+    let invalid =
+        || "letsencrypt requires a DNS name with at least two labels, excluding localhost".into();
+    let ascii = idna::domain_to_ascii_strict(domain).map_err(|_| invalid())?;
+    if ascii.parse::<IpAddr>().is_ok()
+        || ascii.len() > 253
+        || !ascii.contains('.')
+        || ascii.ends_with(".localhost")
+        || ascii.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label.as_bytes()[0].is_ascii_alphanumeric()
+                || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(ascii)
+}
+
+fn validate_directory_url(value: &str) -> Result<(), String> {
+    let invalid = || {
+        "letsencrypt.directory_url must be an HTTPS URL without userinfo, a fragment, whitespace, or port zero".into()
+    };
+    if value.chars().any(|ch| ch.is_whitespace() || ch == '#') {
+        return Err(invalid());
+    }
+    let uri: Uri = value.parse().map_err(|_| invalid())?;
+    let authority = uri.authority().ok_or_else(invalid)?;
+    if authority.as_str().contains('@') {
+        return Err(invalid());
+    }
+    let host = authority.host();
+    let valid_port = authority.as_str() == host
+        || authority.port().is_some_and(|port| {
+            port.as_u16() != 0
+                && port.as_str().bytes().all(|byte| byte.is_ascii_digit())
+                && authority.as_str().len() == host.len() + 1 + port.as_str().len()
+        });
+    let invalid_ipv6 = host.strip_prefix('[').is_some_and(|inner| {
+        inner
+            .strip_suffix(']')
+            .is_none_or(|address| address.parse::<std::net::Ipv6Addr>().is_err())
+    });
+    if uri.scheme_str() != Some("https")
+        || host.is_empty()
+        || !valid_port
+        || invalid_ipv6
+        || uri.path().is_empty()
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

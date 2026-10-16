@@ -177,8 +177,7 @@ impl instant_acme::HttpClient for AcmeHttpClient {
                 .checked_add(client.inner.request_timeout)
                 .ok_or_else(|| protocol_error(AcmeError::new(AcmeErrorKind::Timeout)))?;
             let operation = Arc::new(client.admit().map_err(protocol_error)?);
-            let (_cancel_timer, timeout) =
-                deadline_bridge(deadline, operation.clone()).map_err(protocol_error)?;
+            let (_cancel_timer, timeout) = deadline_bridge(deadline).map_err(protocol_error)?;
             let retry = client.retry.lock().clone();
             let (parts, body) = req.into_parts();
             if authority(&parts.uri).is_err() {
@@ -213,7 +212,6 @@ impl instant_acme::HttpClient for AcmeHttpClient {
 
 fn deadline_bridge(
     deadline: Instant,
-    operation: Arc<Operation>,
 ) -> Result<(oneshot::Sender<()>, oneshot::Receiver<()>), AcmeError> {
     let (cancel, cancelled) = oneshot::channel();
     let (expired, timeout) = oneshot::channel();
@@ -228,7 +226,6 @@ fn deadline_bridge(
                 if elapsed {
                     let _ = expired.send(());
                 }
-                drop(operation);
             })
             .detach();
     })

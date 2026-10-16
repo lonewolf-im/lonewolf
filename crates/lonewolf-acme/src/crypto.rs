@@ -168,6 +168,8 @@ pub fn new_certificate_request(dns_name: &str) -> Result<(Zeroizing<Vec<u8>>, Ve
     let mut parameters = CertificateParams::new(vec![dns_name.into()])
         .map_err(|_| AcmeError::new(AcmeErrorKind::InvalidInput))?;
     parameters.distinguished_name = rcgen::DistinguishedName::new();
+    parameters.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    parameters.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let csr = parameters
         .serialize_request(&signer)
         .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))?;

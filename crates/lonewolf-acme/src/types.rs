@@ -3,7 +3,7 @@
 use std::fmt;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv6Addr};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -100,7 +100,7 @@ impl fmt::Display for StateError {
 
 impl std::error::Error for StateError {}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CertificateMaterial {
     #[serde(with = "chain_bytes")]
@@ -109,7 +109,7 @@ pub struct CertificateMaterial {
     pub private_key_pkcs8: Zeroizing<Vec<u8>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedHost {
     #[serde(deserialize_with = "xmpp_name")]
@@ -118,7 +118,7 @@ pub struct ManagedHost {
     pub dns_name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredAccount {
     #[serde(with = "key_bytes")]
@@ -135,7 +135,7 @@ pub struct RetryState {
     pub not_before_unix: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingOrder {
     #[serde(with = "optional_url")]
@@ -148,7 +148,7 @@ pub struct PendingOrder {
     pub expires_unix: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredCertificate {
     pub material: CertificateMaterial,
@@ -158,13 +158,92 @@ pub struct StoredCertificate {
     pub ari_check_at_unix: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredHost {
     pub host: ManagedHost,
     pub certificate: Option<StoredCertificate>,
     pub order: Option<PendingOrder>,
     pub retry: RetryState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CertificateValidity {
+    pub not_before_unix: u64,
+    pub not_after_unix: u64,
+}
+
+pub struct PreparedInstall<T> {
+    pub candidate: T,
+    pub validity: CertificateValidity,
+}
+
+pub trait Installer: Send + Sync + 'static {
+    type Prepared: Send + 'static;
+    /// Validates chain validity, identity, usages, key match, and binding material.
+    /// Returns validity from the same generation as the candidate.
+    fn prepare(
+        &self,
+        host: &ManagedHost,
+        material: &CertificateMaterial,
+    ) -> Result<PreparedInstall<Self::Prepared>, InstallError>;
+    /// Publishes a prepared generation without fallible work.
+    fn activate(&self, prepared: Self::Prepared);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallError {
+    NotYetValid,
+    Expired,
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureKind {
+    Network,
+    Timeout,
+    RateLimited,
+    Authorization,
+    Protocol,
+    Material,
+    Account,
+    State,
+    Deferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptFailure {
+    pub kind: FailureKind,
+    pub status: Option<u16>,
+    pub state_error: Option<StateError>,
+    pub retry_not_before: Option<SystemTime>,
+    /// True only after the terminal order and retry update are durably committed.
+    pub terminal_order: bool,
+}
+
+impl fmt::Display for AttemptFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ACME attempt {:?}", self.kind)
+    }
+}
+
+impl std::error::Error for AttemptFailure {}
+
+impl From<StateError> for AttemptFailure {
+    fn from(error: StateError) -> Self {
+        Self {
+            kind: FailureKind::State,
+            status: None,
+            state_error: Some(error),
+            retry_not_before: None,
+            terminal_order: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptSuccess {
+    pub validity: CertificateValidity,
 }
 
 pub(crate) fn validate_url(value: &str) -> Result<(), StateError> {

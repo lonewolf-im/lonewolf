@@ -101,6 +101,10 @@ struct HostWrite<'a> {
 }
 
 impl StateStore {
+    pub(crate) fn directory_url(&self) -> &str {
+        &self.inner.directory_url
+    }
+
     pub async fn open(path: PathBuf, directory_url: String) -> Result<Self, StateError> {
         let executor = BlockingExecutor::new(NonZeroUsize::MIN);
         let shared = executor.clone();

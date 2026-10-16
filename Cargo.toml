@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lonewolf",
+    "crates/lonewolf-acme",
     "crates/lonewolf-admin",
     "crates/lonewolf-auth",
     "crates/lonewolf-core",
@@ -48,6 +49,7 @@ icu_properties = { version = "2.3.0", default-features = false, features = ["com
 idna = "1.1.0"
 oxilangtag = { version = "0.1.6", default-features = false }
 lonewolf-admin = { path = "crates/lonewolf-admin" }
+lonewolf-acme = { path = "crates/lonewolf-acme" }
 lonewolf-auth = { path = "crates/lonewolf-auth" }
 lonewolf-core = { path = "crates/lonewolf-core" }
 lonewolf-extension = { path = "crates/lonewolf-extension" }

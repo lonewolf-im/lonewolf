@@ -1,0 +1,27 @@
+[package]
+name = "lonewolf-acme"
+description = "Internal managed certificate state for Lonewolf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+compio = { workspace = true, features = ["time"] }
+futures-util.workspace = true
+graviola.workspace = true
+http.workspace = true
+idna.workspace = true
+lonewolf-util.workspace = true
+lonewolf-xmpp.workspace = true
+nix.workspace = true
+parking_lot.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
+tempfile.workspace = true

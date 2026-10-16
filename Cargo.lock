@@ -1129,6 +1129,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lonewolf-acme"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "compio",
+ "futures-executor",
+ "futures-util",
+ "graviola",
+ "http",
+ "idna",
+ "lonewolf-util",
+ "lonewolf-xmpp",
+ "nix",
+ "parking_lot",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "lonewolf-admin"
 version = "0.1.0"
 dependencies = [

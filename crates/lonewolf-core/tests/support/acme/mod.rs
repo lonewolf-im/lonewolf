@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#[path = "acme/ca.rs"]
 mod ca;
 #[allow(dead_code)]
-#[path = "client.rs"]
+#[path = "../client.rs"]
 mod client;
-#[path = "acme/process.rs"]
 pub mod process;
-#[path = "acme/proxy.rs"]
 mod proxy;
 #[allow(dead_code)]
-#[path = "tls.rs"]
+#[path = "../tls.rs"]
 pub mod tls;
 #[allow(dead_code)]
-#[path = "xml.rs"]
+#[path = "../xml.rs"]
 pub mod xml;
 
 pub use ca::{AcmeFault, AcmeStage, FakeAcmeCa, http_get};

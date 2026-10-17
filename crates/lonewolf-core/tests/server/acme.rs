@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#[path = "../support/acme.rs"]
+#[path = "../support/acme/mod.rs"]
 mod support;
 
 use support::process::peer;

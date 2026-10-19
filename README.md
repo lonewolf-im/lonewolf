@@ -10,25 +10,32 @@
 
 </div>
 
-Lonewolf is a self-hosted [XMPP](https://xmpp.org/) server that runs alone. No
-database server to babysit, no runtime to install, no pack required. One binary
-and two lines of config get you running locally. It plays by the protocol's rules
-and bites back when a client gets greedy.
+Lonewolf is a self-hosted [XMPP](https://xmpp.org/) server with a simple goal:
+combine easy setup and operation with high performance and a path to clustering.
+Start small, grow when you need to, and keep your server easy to run.
+
+Today, it runs alone. No database server to babysit, no runtime to install, no
+pack required. One binary and two lines of config get you running locally. It
+plays by the protocol's rules and bites back when a client gets greedy.
 
 > [!NOTE]
 > Lonewolf is early, pre-1.0 software. Today it can host chat between accounts on
 > domains you run. Federation with other XMPP servers is next on the
-> [roadmap](docs/ROADMAP.md). There are no releases yet, so you'll build from source.
+> [roadmap](docs/ROADMAP.md); clustering comes later. There are no releases yet,
+> so you'll build from source.
 
 ## Why Lonewolf?
 
 - **Easy to run.** One server binary with embedded storage, no database server
   or runtime to install, and just two lines of config for local testing.
+- **Room to grow.** The goal is to keep operation simple as your deployment grows,
+  from a standalone server to a cluster. PostgreSQL storage and multi-node
+  operation are on the [roadmap](docs/ROADMAP.md).
+- **Light on resources.** It's a native Rust binary built to be frugal with
+  memory and CPU.
 - **Correct by design.** Lonewolf follows the core XMPP RFCs
   ([RFC 6120](https://www.rfc-editor.org/rfc/rfc6120.html) and friends) closely,
   so standards-compliant clients behave the way you'd expect.
-- **Light on resources.** It's a native Rust binary built to be frugal with
-  memory and CPU.
 - **Limits you can see.** Connections, stanzas, rates, and resources all have
   explicit, configurable limits, so one misbehaving client can't quietly take
   down your server.

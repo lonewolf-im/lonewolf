@@ -23,7 +23,10 @@ fn account(value: &str) -> TestResult<AccountKey> {
 }
 
 fn admit(order: &Arc<Order>, accounts: &[&AccountKey]) -> Ticket {
-    order.admit(accounts.iter().map(|account| (*account).clone()).collect())
+    order.admit(
+        accounts.iter().map(|account| (*account).clone()).collect(),
+        false,
+    )
 }
 
 fn block_on<F: Future>(future: F) -> TestResult<F::Output> {
@@ -191,5 +194,45 @@ fn tickets_follow_the_order_in_which_views_are_fixed() -> TestResult {
     assert!(!is_ready(&mut fast_ticket));
     drop(slow_ticket);
     assert!(is_ready(&mut fast_ticket));
+    Ok(())
+}
+
+#[test]
+fn global_ticket_waits_for_prior_work_and_blocks_later_accounts() -> TestResult {
+    let order = Order::new();
+    let alice = account("alice@example.com")?;
+    let bob = account("bob@example.com")?;
+    let older = admit(&order, &[&alice]);
+    let mut barrier = order.admit(Vec::new(), true);
+    let mut related = admit(&order, &[&alice]);
+    let mut unrelated = admit(&order, &[&bob]);
+    let mut empty = admit(&order, &[]);
+    assert!(!is_ready(&mut barrier));
+    for ticket in [&mut related, &mut unrelated, &mut empty] {
+        assert!(!is_ready(ticket));
+    }
+    drop(older);
+    assert!(is_ready(&mut barrier));
+    assert!(!is_ready(&mut unrelated));
+    drop(barrier);
+    for ticket in [&mut related, &mut unrelated, &mut empty] {
+        assert!(is_ready(ticket));
+    }
+    Ok(())
+}
+
+#[test]
+fn dropped_waiting_global_ticket_releases_successors_and_failed_fix_admits_nothing() -> TestResult {
+    let order = Order::new();
+    let alice = account("alice@example.com")?;
+    let older = admit(&order, &[&alice]);
+    let barrier = order.admit(Vec::new(), true);
+    let mut unrelated = admit(&order, &[]);
+    assert!(!is_ready(&mut unrelated));
+    drop(barrier);
+    assert!(is_ready(&mut unrelated));
+    assert!(block_on(order.fix_all(async { Err::<(), _>("failed") }))?.is_err());
+    assert_eq!(order.lines.lock().waiting.len(), 2);
+    drop(older);
     Ok(())
 }

@@ -33,11 +33,14 @@
 
 # extensions = ["roster", "offline"]
 
-# Limit distinct pending subscription senders per account to bound requests awaiting approval.
-# Choose a positive count. At capacity, new senders receive a resource-constraint error.
-# Existing senders can still update their requests.
-# Keep roster in this host's extension list when configuring its limit.
+# Adjust roster limits to bound stored contacts and requests awaiting approval.
+# Keep roster in this host's extension list when configuring these limits.
 # [hosts."example.com".roster]
+# Increase this positive count for larger address books. Each item allows up to eight groups.
+# max_items = 1000
+# Increase this positive byte budget for larger names and groups; stored contact keys also count.
+# max_bytes = 1048576
+# Limit distinct pending senders. At capacity, only existing senders can update requests.
 # max_pending_subscription_requests = 100
 
 # Adjust the number of stored messages per account to suit clients that stay offline.

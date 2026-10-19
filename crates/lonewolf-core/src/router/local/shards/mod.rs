@@ -375,6 +375,17 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         .await
     }
 
+    pub(crate) async fn retire_tagged(
+        &self,
+        account: &AccountKey,
+        tag: SessionTag,
+    ) -> Result<(), RouterError> {
+        self.with_shard(self.shard_index(account.as_str()), |shard| {
+            shard.retire_tagged(account, tag)
+        })
+        .await
+    }
+
     pub(crate) async fn deliver_to_tagged(
         &self,
         account: &AccountKey,

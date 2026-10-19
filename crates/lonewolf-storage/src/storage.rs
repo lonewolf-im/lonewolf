@@ -15,8 +15,8 @@ use crate::roster::{RosterReads, RosterWrites};
 /// [`Self::begin_write`]. A transaction must hold storage work only: awaiting
 /// anything else while one is open can stall every other write on the store.
 pub trait Storage: Clone + Send + Sync + 'static {
-    type Read: ReadTransaction;
-    type Write: WriteTransaction;
+    type Read: ReadTransaction + 'static;
+    type Write: WriteTransaction + RosterWrites<Snapshot = Self::Read>;
 
     /// Opens a read transaction over one consistent snapshot.
     fn begin_read(&self) -> impl Future<Output = Result<Self::Read, StorageError>> + Send;

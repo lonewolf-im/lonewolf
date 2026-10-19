@@ -817,6 +817,17 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
+    pub(crate) async fn retire_tagged(
+        &self,
+        account: &AccountKey,
+        tag: SessionTag,
+    ) -> Result<(), RouterError> {
+        if !self.hosts.is_local_host(account.domain()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        self.local.retire_tagged(account, tag).await
+    }
+
     /// The builder must use the supplied full JID and must not block the calling thread.
     /// Build failures retire all tagged sessions; mailbox failures retire the affected session.
     pub(crate) async fn route_to_tagged(

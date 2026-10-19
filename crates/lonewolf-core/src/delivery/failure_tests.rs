@@ -190,13 +190,18 @@ impl OfflineWrites for FailedCommit {
 }
 
 impl RosterReads for FailedCommit {
-    async fn roster(&self, _owner: &AccountKey) -> Result<RosterSnapshot, RosterError> {
+    async fn roster(
+        &self,
+        _owner: &AccountKey,
+        _quota: lonewolf_storage::roster::RosterQuota,
+    ) -> Result<RosterSnapshot, RosterError> {
         unreachable!("commit test cannot use storage operations")
     }
     async fn roster_item(
         &self,
         _owner: &AccountKey,
         _jid: &RosterJid,
+        _quota: lonewolf_storage::roster::RosterQuota,
     ) -> Result<Option<RosterItem>, RosterError> {
         unreachable!("commit test cannot use storage operations")
     }
@@ -213,13 +218,60 @@ impl RosterReads for FailedCommit {
     ) -> Result<Option<PendingSubscription>, RosterError> {
         unreachable!("commit test cannot use storage operations")
     }
+    async fn roster_version(
+        &self,
+        _: &AccountKey,
+    ) -> Result<lonewolf_storage::roster::RosterVersion, lonewolf_storage::roster::RosterError>
+    {
+        unreachable!()
+    }
+    async fn roster_subscription(
+        &self,
+        _: &AccountKey,
+        _: &lonewolf_storage::roster::RosterJid,
+    ) -> Result<
+        Option<lonewolf_storage::roster::RosterSubscription>,
+        lonewolf_storage::roster::RosterError,
+    > {
+        unreachable!()
+    }
+    async fn next_roster_subscription(
+        &self,
+        _: &AccountKey,
+        _: Option<&lonewolf_storage::roster::RosterJid>,
+    ) -> Result<
+        Option<(
+            lonewolf_storage::roster::RosterJid,
+            lonewolf_storage::roster::RosterSubscription,
+        )>,
+        lonewolf_storage::roster::RosterError,
+    > {
+        unreachable!()
+    }
+    async fn next_pending_sender(
+        &self,
+        _: &AccountKey,
+        _: Option<&lonewolf_storage::roster::RosterJid>,
+    ) -> Result<Option<lonewolf_storage::roster::RosterJid>, lonewolf_storage::roster::RosterError>
+    {
+        unreachable!()
+    }
+    async fn pending_request_exists(
+        &self,
+        _: &AccountKey,
+        _: &lonewolf_storage::roster::RosterJid,
+    ) -> Result<bool, lonewolf_storage::roster::RosterError> {
+        unreachable!()
+    }
 }
 
 impl RosterWrites for FailedCommit {
+    type Snapshot = Self;
     async fn put_roster_item(
         &mut self,
         _owner: &AccountKey,
         _item: &RosterItem,
+        _quota: lonewolf_storage::roster::RosterQuota,
     ) -> Result<RosterVersion, RosterError> {
         unreachable!("commit test cannot use storage operations")
     }
@@ -247,6 +299,42 @@ impl RosterWrites for FailedCommit {
     }
     async fn clear_roster(&mut self, _owner: &AccountKey) -> Result<(), RosterError> {
         unreachable!("commit test cannot use storage operations")
+    }
+    async fn set_roster_subscription(
+        &mut self,
+        _: &Self::Snapshot,
+        _: &AccountKey,
+        _: &lonewolf_storage::roster::RosterJid,
+        _: lonewolf_storage::roster::RosterSubscription,
+    ) -> Result<
+        Option<lonewolf_storage::roster::RosterVersion>,
+        lonewolf_storage::roster::RosterError,
+    > {
+        unreachable!()
+    }
+    async fn transition_roster_subscription(
+        &mut self,
+        _: &AccountKey,
+        _: &lonewolf_storage::roster::RosterJid,
+        _: lonewolf_storage::roster::RosterSubscription,
+        _: lonewolf_storage::roster::RosterSubscription,
+    ) -> Result<
+        Option<lonewolf_storage::roster::RosterVersion>,
+        lonewolf_storage::roster::RosterError,
+    > {
+        unreachable!()
+    }
+    async fn remove_roster_subscription(
+        &mut self,
+        _: &AccountKey,
+        _: &lonewolf_storage::roster::RosterJid,
+    ) -> Result<
+        Option<
+            lonewolf_storage::roster::RosterMutation<lonewolf_storage::roster::RosterSubscription>,
+        >,
+        lonewolf_storage::roster::RosterError,
+    > {
+        unreachable!()
     }
 }
 

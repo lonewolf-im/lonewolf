@@ -112,3 +112,31 @@ fn factory_applies_defaults_and_host_specific_pending_limits() -> Result<(), Box
     }
     Ok(())
 }
+
+#[test]
+fn roster_quota_options_have_finite_defaults_and_validate_overrides() -> Result<(), Box<dyn Error>>
+{
+    use crate::roster::RosterOptions;
+    let defaults: RosterOptions = toml::from_str("")?;
+    assert_eq!(defaults.max_items.get(), 1000);
+    assert_eq!(defaults.max_bytes.get(), 1_048_576);
+    assert_eq!(defaults.max_pending_subscription_requests.get(), 100);
+    let options: RosterOptions = toml::from_str("max_items=2\nmax_bytes=128")?;
+    assert_eq!(options.max_items.get(), 2);
+    assert_eq!(options.max_bytes.get(), 128);
+    for invalid in [
+        "max_items=0",
+        "max_bytes=0",
+        "max_items=-1",
+        "max_bytes=-1",
+        "max_items='unlimited'",
+        "max_bytes=1.5",
+        "max_items=18446744073709551616",
+    ] {
+        assert!(
+            toml::from_str::<RosterOptions>(invalid).is_err(),
+            "{invalid}"
+        );
+    }
+    Ok(())
+}

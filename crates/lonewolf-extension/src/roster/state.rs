@@ -11,7 +11,13 @@ use lonewolf_storage::roster::{
     RosterVersion, SubscriptionState,
 };
 
-pub(super) type ItemMutation = Option<RosterMutation<RosterItem>>;
+#[derive(Debug)]
+pub(super) enum ItemChange {
+    Push(RosterMutation<RosterItem>),
+    Unavailable { version: RosterVersion },
+}
+
+pub(super) type ItemMutation = Option<ItemChange>;
 
 pub(super) enum RequestOutcome {
     /// `approved` is absent when the requester had no pending request to resolve.
@@ -121,51 +127,84 @@ pub(super) fn grant(mut subscription: RosterSubscription) -> Option<RosterSubscr
     Some(subscription)
 }
 
-/// Creates a bare item when absent; `update` returning `None` leaves storage unchanged.
 pub(super) async fn update_subscription<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     owner: &AccountKey,
     jid: &RosterJid,
     update: impl FnOnce(RosterSubscription) -> Option<RosterSubscription>,
 ) -> Result<ItemMutation, RosterError> {
-    let item = transaction
-        .roster_item(owner, jid)
-        .await?
-        .unwrap_or_else(|| bare_item(jid.clone()));
-    write_subscription(transaction, owner, item, update).await
+    let current = transaction.roster_subscription(owner, jid).await?;
+    write_subscription(roster, transaction, owner, jid, current, update).await
 }
 
 pub(super) async fn update_existing_subscription<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     owner: &AccountKey,
     jid: &RosterJid,
     update: impl FnOnce(RosterSubscription) -> Option<RosterSubscription>,
 ) -> Result<ItemMutation, RosterError> {
-    let Some(item) = transaction.roster_item(owner, jid).await? else {
+    let Some(current) = transaction.roster_subscription(owner, jid).await? else {
         return Ok(None);
     };
-    write_subscription(transaction, owner, item, update).await
+    write_subscription(roster, transaction, owner, jid, Some(current), update).await
 }
 
 async fn write_subscription<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     owner: &AccountKey,
-    mut item: RosterItem,
+    jid: &RosterJid,
+    current: Option<RosterSubscription>,
     update: impl FnOnce(RosterSubscription) -> Option<RosterSubscription>,
 ) -> Result<ItemMutation, RosterError> {
-    let Some(subscription) = update(item.subscription) else {
+    let Some(subscription) = update(current.unwrap_or_default()) else {
         return Ok(None);
     };
+    if current == Some(subscription) {
+        return Ok(None);
+    }
+    let mut item = match current {
+        None => bare_item(jid.clone()),
+        Some(expected) => match transaction
+            .roster_item(owner, jid, roster.quota(owner))
+            .await
+        {
+            Ok(Some(item)) => item,
+            Ok(None) => {
+                return Err(lonewolf_storage::StorageError::new(
+                    lonewolf_storage::StorageErrorKind::CorruptData,
+                )
+                .into());
+            }
+            Err(RosterError::QuotaExceeded) => {
+                let version = transaction
+                    .transition_roster_subscription(owner, jid, expected, subscription)
+                    .await?
+                    .ok_or_else(|| {
+                        lonewolf_storage::StorageError::new(
+                            lonewolf_storage::StorageErrorKind::CorruptData,
+                        )
+                    })?;
+                return Ok(Some(ItemChange::Unavailable { version }));
+            }
+            Err(error) => return Err(error),
+        },
+    };
     item.subscription = subscription;
-    let version = transaction.put_roster_item(owner, &item).await?;
-    Ok(Some(RosterMutation {
+    let version = transaction
+        .put_roster_item(owner, &item, roster.quota(owner))
+        .await?;
+    Ok(Some(ItemChange::Push(RosterMutation {
         version,
         value: item,
-    }))
+    })))
 }
 
 /// Leaves storage unchanged when no request was pending.
 pub(super) async fn resolve_pending<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     owner: &AccountKey,
     sender: &RosterJid,
@@ -174,10 +213,12 @@ pub(super) async fn resolve_pending<W: WriteTransaction>(
     if !transaction.remove_pending_request(owner, sender).await? {
         return Ok(None);
     }
-    update_subscription(transaction, owner, sender, update).await
+    update_subscription(roster, transaction, owner, sender, update).await
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(super) async fn request_subscription<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     requester: &AccountKey,
     requester_jid: RosterJid,
@@ -187,25 +228,38 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
     max_pending_subscription_requests: NonZeroUsize,
 ) -> Result<RequestOutcome, RosterError> {
     let contact_view = transaction
-        .roster_item(contact, &requester_jid)
-        .await?
-        .map(|item| item.subscription);
+        .roster_subscription(contact, &requester_jid)
+        .await?;
     if contact_view.is_some_and(|subscription| grants(subscription.state)) {
-        let approved =
-            update_existing_subscription(transaction, requester, contact_jid, approve_pending_out)
-                .await?;
+        let approved = update_existing_subscription(
+            roster,
+            transaction,
+            requester,
+            contact_jid,
+            approve_pending_out,
+        )
+        .await?;
         return Ok(RequestOutcome::AutoApproved { approved });
     }
     if contact_view.is_some_and(|subscription| subscription.approved) {
-        let grantor =
-            update_existing_subscription(transaction, contact, &requester_jid, |subscription| {
+        let grantor = update_existing_subscription(
+            roster,
+            transaction,
+            contact,
+            &requester_jid,
+            |subscription| {
                 let mut granted = grant(subscription)?;
                 granted.approved = false;
                 Some(granted)
-            })
-            .await?;
-        let requester =
-            update_subscription(transaction, requester, contact_jid, |mut subscription| {
+            },
+        )
+        .await?;
+        let requester = update_subscription(
+            roster,
+            transaction,
+            requester,
+            contact_jid,
+            |mut subscription| {
                 subscription.state = match subscription.state {
                     SubscriptionState::None => SubscriptionState::To,
                     SubscriptionState::From => SubscriptionState::Both,
@@ -213,8 +267,9 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
                 };
                 subscription.pending_out = false;
                 Some(subscription)
-            })
-            .await?;
+            },
+        )
+        .await?;
         return Ok(RequestOutcome::PreApproved { grantor, requester });
     }
     let stored = transaction
@@ -232,19 +287,26 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
         Err(RosterError::NoAccount) => return Ok(RequestOutcome::ContactMissing),
         Err(error) => return Err(error),
     }
-    let push = update_subscription(transaction, requester, contact_jid, |mut subscription| {
-        if subscription.pending_out || subscribed_to(subscription.state) {
-            return None;
-        }
-        subscription.pending_out = true;
-        Some(subscription)
-    })
+    let push = update_subscription(
+        roster,
+        transaction,
+        requester,
+        contact_jid,
+        |mut subscription| {
+            if subscription.pending_out || subscribed_to(subscription.state) {
+                return None;
+            }
+            subscription.pending_out = true;
+            Some(subscription)
+        },
+    )
     .await?;
     Ok(RequestOutcome::Pending { push })
 }
 
 /// Also denies pending requests; `subscriber` identifies the contact's local account.
 pub(super) async fn cancel_subscription<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     grantor: &AccountKey,
     contact: &RosterJid,
@@ -252,14 +314,14 @@ pub(super) async fn cancel_subscription<W: WriteTransaction>(
 ) -> Result<Cancellation, RosterError> {
     let pending = transaction.remove_pending_request(grantor, contact).await?;
     let granted = transaction
-        .roster_item(grantor, contact)
+        .roster_subscription(grantor, contact)
         .await?
-        .is_some_and(|item| grants(item.subscription.state));
+        .is_some_and(|item| grants(item.state));
     let route = subscriber.is_some() && (pending || granted);
     let send_unavailable = route && granted;
     let same_item = subscriber.is_some_and(|(account, _)| account == grantor);
     let grantor_mutation =
-        update_existing_subscription(transaction, grantor, contact, |mut subscription| {
+        update_existing_subscription(roster, transaction, grantor, contact, |mut subscription| {
             let old = subscription;
             subscription.state = without_from(subscription.state);
             subscription.approved = false;
@@ -272,12 +334,18 @@ pub(super) async fn cancel_subscription<W: WriteTransaction>(
         .await?;
     let subscriber_mutation = match subscriber {
         Some((account, grantor_jid)) if route && !same_item => {
-            update_existing_subscription(transaction, account, grantor_jid, |mut subscription| {
-                let old = subscription;
-                subscription.state = without_to(subscription.state);
-                subscription.pending_out = false;
-                (subscription != old).then_some(subscription)
-            })
+            update_existing_subscription(
+                roster,
+                transaction,
+                account,
+                grantor_jid,
+                |mut subscription| {
+                    let old = subscription;
+                    subscription.state = without_to(subscription.state);
+                    subscription.pending_out = false;
+                    (subscription != old).then_some(subscription)
+                },
+            )
             .await?
         }
         _ => None,
@@ -292,6 +360,7 @@ pub(super) async fn cancel_subscription<W: WriteTransaction>(
 
 /// Also retracts pending requests; `recipient` identifies the contact's local account.
 pub(super) async fn unsubscribe<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     subscriber: &AccountKey,
     contact: &RosterJid,
@@ -304,15 +373,19 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
                 .remove_pending_request(account, subscriber_jid)
                 .await?;
             let granted = transaction
-                .roster_item(account, subscriber_jid)
+                .roster_subscription(account, subscriber_jid)
                 .await?
-                .is_some_and(|item| grants(item.subscription.state));
+                .is_some_and(|item| grants(item.state));
             (removed, granted)
         }
         None => (false, false),
     };
-    let subscriber_mutation =
-        update_existing_subscription(transaction, subscriber, contact, |mut subscription| {
+    let subscriber_mutation = update_existing_subscription(
+        roster,
+        transaction,
+        subscriber,
+        contact,
+        |mut subscription| {
             let old = subscription;
             subscription.state = without_to(subscription.state);
             subscription.pending_out = false;
@@ -320,11 +393,13 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
                 subscription.state = without_from(subscription.state);
             }
             (subscription != old).then_some(subscription)
-        })
-        .await?;
+        },
+    )
+    .await?;
     let contact_mutation = match recipient {
         Some((account, subscriber_jid)) if prior_grant && !same_item => {
             update_existing_subscription(
+                roster,
                 transaction,
                 account,
                 subscriber_jid,
@@ -348,13 +423,17 @@ pub(super) async fn unsubscribe<W: WriteTransaction>(
 
 /// Clears both sides' pending requests and subscriptions; an absent item leaves storage unchanged.
 pub(super) async fn remove_item<W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     owner: &AccountKey,
     owner_jid: &RosterJid,
     contact: &RosterJid,
     contact_account: Option<&AccountKey>,
 ) -> Result<Option<Removal>, RosterError> {
-    let Some(removed) = transaction.remove_roster_item(owner, contact).await? else {
+    let Some(removed) = transaction
+        .remove_roster_subscription(owner, contact)
+        .await?
+    else {
         return Ok(None);
     };
     let pending_request = transaction.remove_pending_request(owner, contact).await?;
@@ -364,7 +443,7 @@ pub(super) async fn remove_item<W: WriteTransaction>(
             transaction
                 .remove_pending_request(account, owner_jid)
                 .await?;
-            update_existing_subscription(transaction, account, owner_jid, |old| {
+            update_existing_subscription(roster, transaction, account, owner_jid, |old| {
                 contact_before = Some(old);
                 // The pre-approval is the contact's own decision, so only the contact clears it.
                 let cleared = RosterSubscription {
@@ -380,7 +459,7 @@ pub(super) async fn remove_item<W: WriteTransaction>(
     };
     Ok(Some(Removal {
         version: removed.version,
-        subscription: removed.value.subscription,
+        subscription: removed.value,
         pending_request,
         contact_before,
         contact: contact_mutation,

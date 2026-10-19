@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::roster::RosterQuota;
+
 mod backend;
 
 use std::error::Error;
@@ -298,7 +300,9 @@ fn committed_state_survives_reopening() -> TestResult {
                 )
                 .await?;
             writer.delete_account(&deleted).await?;
-            writer.put_roster_item(&alice, &bob).await?;
+            writer
+                .put_roster_item(&alice, &bob, RosterQuota::default())
+                .await?;
             writer
                 .put_pending_request(&alice, request.clone(), std::num::NonZeroUsize::MAX)
                 .await?;
@@ -321,7 +325,7 @@ fn committed_state_survives_reopening() -> TestResult {
             assert!(reader.scram(&deleted, hash).await?.is_none());
             assert!(reader.scram(&other, hash).await?.is_some());
         }
-        let snapshot = reader.roster(&alice).await?;
+        let snapshot = reader.roster(&alice, RosterQuota::default()).await?;
         assert_eq!(snapshot.version.get(), 1);
         assert_eq!(snapshot.items, [bob]);
         assert_eq!(reader.pending_requests(&alice).await?, [request]);
@@ -435,7 +439,11 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         );
         assert_worker_threads(&backend)?;
         writer
-            .put_roster_item(&alice, &item("bob@example.com", None, &[])?)
+            .put_roster_item(
+                &alice,
+                &item("bob@example.com", None, &[])?,
+                RosterQuota::default(),
+            )
             .await?;
         assert_worker_threads(&backend)?;
         writer
@@ -446,9 +454,21 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
             )
             .await?;
         assert_worker_threads(&backend)?;
-        assert_eq!(writer.roster(&alice).await?.items.len(), 1);
+        assert_eq!(
+            writer
+                .roster(&alice, RosterQuota::default())
+                .await?
+                .items
+                .len(),
+            1
+        );
         assert_worker_threads(&backend)?;
-        assert!(writer.roster_item(&alice, &bob).await?.is_some());
+        assert!(
+            writer
+                .roster_item(&alice, &bob, RosterQuota::default())
+                .await?
+                .is_some()
+        );
         assert_worker_threads(&backend)?;
         assert_eq!(writer.pending_requests(&alice).await?.len(), 1);
         assert_worker_threads(&backend)?;
@@ -467,9 +487,21 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
             1
         );
         assert_worker_threads(&backend)?;
-        assert_eq!(reader.roster(&alice).await?.items.len(), 1);
+        assert_eq!(
+            reader
+                .roster(&alice, RosterQuota::default())
+                .await?
+                .items
+                .len(),
+            1
+        );
         assert_worker_threads(&backend)?;
-        assert!(reader.roster_item(&alice, &bob).await?.is_some());
+        assert!(
+            reader
+                .roster_item(&alice, &bob, RosterQuota::default())
+                .await?
+                .is_some()
+        );
         assert_worker_threads(&backend)?;
         assert_eq!(reader.pending_requests(&alice).await?.len(), 1);
         assert_worker_threads(&backend)?;

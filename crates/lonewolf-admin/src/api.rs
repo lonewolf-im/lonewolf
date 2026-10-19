@@ -719,6 +719,7 @@ mod tests {
         async fn roster(
             &self,
             _: &AccountKey,
+            _quota: lonewolf_storage::roster::RosterQuota,
         ) -> Result<roster::RosterSnapshot, roster::RosterError> {
             unreachable!()
         }
@@ -727,6 +728,7 @@ mod tests {
             &self,
             _: &AccountKey,
             _: &roster::RosterJid,
+            _quota: lonewolf_storage::roster::RosterQuota,
         ) -> Result<Option<roster::RosterItem>, roster::RosterError> {
             unreachable!()
         }
@@ -745,13 +747,62 @@ mod tests {
         ) -> Result<Option<roster::PendingSubscription>, roster::RosterError> {
             unreachable!()
         }
+        async fn roster_version(
+            &self,
+            _: &AccountKey,
+        ) -> Result<lonewolf_storage::roster::RosterVersion, lonewolf_storage::roster::RosterError>
+        {
+            unreachable!()
+        }
+        async fn roster_subscription(
+            &self,
+            _: &AccountKey,
+            _: &lonewolf_storage::roster::RosterJid,
+        ) -> Result<
+            Option<lonewolf_storage::roster::RosterSubscription>,
+            lonewolf_storage::roster::RosterError,
+        > {
+            unreachable!()
+        }
+        async fn next_roster_subscription(
+            &self,
+            _: &AccountKey,
+            _: Option<&lonewolf_storage::roster::RosterJid>,
+        ) -> Result<
+            Option<(
+                lonewolf_storage::roster::RosterJid,
+                lonewolf_storage::roster::RosterSubscription,
+            )>,
+            lonewolf_storage::roster::RosterError,
+        > {
+            unreachable!()
+        }
+        async fn next_pending_sender(
+            &self,
+            _: &AccountKey,
+            _: Option<&lonewolf_storage::roster::RosterJid>,
+        ) -> Result<
+            Option<lonewolf_storage::roster::RosterJid>,
+            lonewolf_storage::roster::RosterError,
+        > {
+            unreachable!()
+        }
+        async fn pending_request_exists(
+            &self,
+            _: &AccountKey,
+            _: &lonewolf_storage::roster::RosterJid,
+        ) -> Result<bool, lonewolf_storage::roster::RosterError> {
+            unreachable!()
+        }
     }
 
     impl RosterWrites for MemoryTransaction {
+        type Snapshot = Self;
         async fn put_roster_item(
             &mut self,
             _: &AccountKey,
             _: &roster::RosterItem,
+            _: lonewolf_storage::roster::RosterQuota,
         ) -> Result<roster::RosterVersion, roster::RosterError> {
             unreachable!()
         }
@@ -779,6 +830,44 @@ mod tests {
             unreachable!()
         }
         async fn clear_roster(&mut self, _: &AccountKey) -> Result<(), roster::RosterError> {
+            unreachable!()
+        }
+        async fn set_roster_subscription(
+            &mut self,
+            _: &Self::Snapshot,
+            _: &AccountKey,
+            _: &lonewolf_storage::roster::RosterJid,
+            _: lonewolf_storage::roster::RosterSubscription,
+        ) -> Result<
+            Option<lonewolf_storage::roster::RosterVersion>,
+            lonewolf_storage::roster::RosterError,
+        > {
+            unreachable!()
+        }
+        async fn transition_roster_subscription(
+            &mut self,
+            _: &AccountKey,
+            _: &lonewolf_storage::roster::RosterJid,
+            _: lonewolf_storage::roster::RosterSubscription,
+            _: lonewolf_storage::roster::RosterSubscription,
+        ) -> Result<
+            Option<lonewolf_storage::roster::RosterVersion>,
+            lonewolf_storage::roster::RosterError,
+        > {
+            unreachable!()
+        }
+        async fn remove_roster_subscription(
+            &mut self,
+            _: &AccountKey,
+            _: &lonewolf_storage::roster::RosterJid,
+        ) -> Result<
+            Option<
+                lonewolf_storage::roster::RosterMutation<
+                    lonewolf_storage::roster::RosterSubscription,
+                >,
+            >,
+            lonewolf_storage::roster::RosterError,
+        > {
             unreachable!()
         }
     }

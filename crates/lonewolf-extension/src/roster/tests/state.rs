@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_storage::roster::RosterQuota;
+
 use std::error::Error;
 
 use futures_executor::block_on;
@@ -14,6 +16,15 @@ use super::{TestRoster, account, create_account, item, pending, roster as empty_
 use crate::roster::state::{self, RequestOutcome};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+impl state::ItemChange {
+    fn into_push(self) -> lonewolf_storage::roster::RosterMutation<RosterItem> {
+        match self {
+            Self::Push(mutation) => mutation,
+            Self::Unavailable { .. } => panic!("expected readable roster metadata"),
+        }
+    }
+}
 
 fn roster() -> (tempfile::TempDir, TestRoster) {
     let (directory, roster) = empty_roster();
@@ -69,7 +80,8 @@ fn set_subscription(
         ..state::bare_item(contact.clone())
     };
     write(roster, async |tx| {
-        tx.put_roster_item(owner, &item).await?;
+        tx.put_roster_item(owner, &item, RosterQuota::default())
+            .await?;
         Ok(())
     })
 }
@@ -95,13 +107,20 @@ fn subscription_update_creates_a_bare_item_when_absent() -> TestResult {
     let owner = account("alice@example.com");
     let contact = jid("bob@example.com");
     let created = write(&roster, async |tx| {
-        state::update_subscription(tx, &owner, &contact, |current| {
-            assert_eq!(current, RosterSubscription::default());
-            Some(subscription(SubscriptionState::From))
-        })
+        state::update_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &contact,
+            |current| {
+                assert_eq!(current, RosterSubscription::default());
+                Some(subscription(SubscriptionState::From))
+            },
+        )
         .await
     })?
-    .ok_or("subscription was not changed")?;
+    .ok_or("subscription was not changed")?
+    .into_push();
     assert_eq!(created.version.get(), 1);
     assert_eq!(
         created.value,
@@ -120,9 +139,13 @@ fn existing_subscription_update_leaves_an_absent_item_absent() -> TestResult {
     let owner = account("alice@example.com");
     let contact = jid("bob@example.com");
     let skipped = write(&roster, async |tx| {
-        state::update_existing_subscription(tx, &owner, &contact, |_| {
-            Some(subscription(SubscriptionState::From))
-        })
+        state::update_existing_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &contact,
+            |_| Some(subscription(SubscriptionState::From)),
+        )
         .await
     })?;
     assert!(skipped.is_none());
@@ -142,7 +165,8 @@ fn subscription_update_preserves_editable_fields() -> TestResult {
         ..state::bare_item(contact.clone())
     };
     write(&roster, async |tx| {
-        tx.put_roster_item(&owner, &named).await?;
+        tx.put_roster_item(&owner, &named, RosterQuota::default())
+            .await?;
         Ok(())
     })?;
     let changed = RosterSubscription {
@@ -151,9 +175,17 @@ fn subscription_update_preserves_editable_fields() -> TestResult {
         approved: true,
     };
     let updated = write(&roster, async |tx| {
-        state::update_subscription(tx, &owner, &contact, |_| Some(changed)).await
+        state::update_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &contact,
+            |_| Some(changed),
+        )
+        .await
     })?
-    .ok_or("subscription was not changed")?;
+    .ok_or("subscription was not changed")?
+    .into_push();
     assert_eq!(updated.version.get(), 2);
     assert_eq!(
         updated.value,
@@ -173,39 +205,70 @@ fn subscription_update_reads_and_changes_state_in_one_write() -> TestResult {
     let contact = jid("bob@example.com");
     let first = write(&roster, async |tx| {
         assert!(
-            state::update_subscription(tx, &owner, &contact, |_| None)
+            state::update_subscription(
+                &crate::roster::Roster::default(),
+                tx,
+                &owner,
+                &contact,
+                |_| None
+            )
+            .await?
+            .is_none()
+        );
+        assert!(
+            tx.roster_item(&owner, &contact, RosterQuota::default())
                 .await?
                 .is_none()
         );
-        assert!(tx.roster_item(&owner, &contact).await?.is_none());
-        state::update_subscription(tx, &owner, &contact, |current| {
-            assert_eq!(current, RosterSubscription::default());
-            Some(RosterSubscription {
-                state: SubscriptionState::To,
-                pending_out: true,
-                approved: false,
-            })
-        })
+        state::update_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &contact,
+            |current| {
+                assert_eq!(current, RosterSubscription::default());
+                Some(RosterSubscription {
+                    state: SubscriptionState::To,
+                    pending_out: true,
+                    approved: false,
+                })
+            },
+        )
         .await
     })?
-    .ok_or("subscription was not changed")?;
+    .ok_or("subscription was not changed")?
+    .into_push();
     assert_eq!(first.version.get(), 1);
 
     let second = write(&roster, async |tx| {
-        state::update_subscription(tx, &owner, &contact, |mut current| {
-            assert_eq!(current.state, SubscriptionState::To);
-            current.pending_out = false;
-            Some(current)
-        })
+        state::update_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &contact,
+            |mut current| {
+                assert_eq!(current.state, SubscriptionState::To);
+                current.pending_out = false;
+                Some(current)
+            },
+        )
         .await
     })?
-    .ok_or("subscription was not changed")?;
+    .ok_or("subscription was not changed")?
+    .into_push();
     assert_eq!(second.version.get(), 2);
     assert_eq!(second.value.subscription.state, SubscriptionState::To);
     assert!(!second.value.subscription.pending_out);
     assert!(
         write(&roster, async |tx| {
-            state::update_subscription(tx, &owner, &contact, |_| None).await
+            state::update_subscription(
+                &crate::roster::Roster::default(),
+                tx,
+                &owner,
+                &contact,
+                |_| None,
+            )
+            .await
         })?
         .is_none()
     );
@@ -219,10 +282,16 @@ fn resolving_without_a_pending_request_writes_nothing() -> TestResult {
     let owner = account("alice@example.com");
     let sender = jid("bob@example.com");
     let resolution = write(&roster, async |tx| {
-        state::resolve_pending(tx, &owner, &sender, |mut current| {
-            current.state = SubscriptionState::From;
-            Some(current)
-        })
+        state::resolve_pending(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &sender,
+            |mut current| {
+                current.state = SubscriptionState::From;
+                Some(current)
+            },
+        )
         .await
     })?;
     assert!(resolution.is_none());
@@ -242,13 +311,20 @@ fn resolving_a_pending_request_removes_it_and_applies_the_transition() -> TestRe
         request("bob@example.com", b"<presence type='subscribe'/>"),
     )?;
     let resolved = write(&roster, async |tx| {
-        state::resolve_pending(tx, &owner, &sender, |mut current| {
-            current.state = SubscriptionState::From;
-            Some(current)
-        })
+        state::resolve_pending(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &sender,
+            |mut current| {
+                current.state = SubscriptionState::From;
+                Some(current)
+            },
+        )
         .await
     })?
-    .ok_or("missing pending request")?;
+    .ok_or("missing pending request")?
+    .into_push();
     assert_eq!(resolved.version.get(), 1);
     assert_eq!(resolved.value.subscription.state, SubscriptionState::From);
     assert!(pending(&roster, &owner).is_empty());
@@ -260,7 +336,14 @@ fn resolving_a_pending_request_removes_it_and_applies_the_transition() -> TestRe
         request("bob@example.com", b"<presence type='subscribe'/>"),
     )?;
     let denied = write(&roster, async |tx| {
-        state::resolve_pending(tx, &owner, &sender, |_| None).await
+        state::resolve_pending(
+            &crate::roster::Roster::default(),
+            tx,
+            &owner,
+            &sender,
+            |_| None,
+        )
+        .await
     })?;
     assert!(denied.is_none());
     assert!(pending(&roster, &owner).is_empty());
@@ -277,6 +360,7 @@ fn subscription_request_updates_the_sender_and_recipient_in_one_transaction() ->
     let bob_jid = RosterJid::from(&bob);
     let outcome = write(&roster, async |tx| {
         state::request_subscription(
+            &crate::roster::Roster::default(),
             tx,
             &alice,
             RosterJid::from(&alice),
@@ -290,6 +374,7 @@ fn subscription_request_updates_the_sender_and_recipient_in_one_transaction() ->
     let RequestOutcome::Pending { push: Some(push) } = outcome else {
         return Err("subscription was not changed".into());
     };
+    let push = push.into_push();
     assert_eq!(push.version.get(), 1);
     assert!(push.value.subscription.pending_out);
     assert_eq!(item(&roster, &alice, &bob_jid), Some(push.value));
@@ -300,6 +385,7 @@ fn subscription_request_updates_the_sender_and_recipient_in_one_transaction() ->
 
     let repeated = write(&roster, async |tx| {
         state::request_subscription(
+            &crate::roster::Roster::default(),
             tx,
             &alice,
             RosterJid::from(&alice),
@@ -340,6 +426,7 @@ fn established_subscription_requests_are_automatically_approved_without_changes(
 
         let outcome = write(&roster, async |tx| {
             state::request_subscription(
+                &crate::roster::Roster::default(),
                 tx,
                 &alice,
                 RosterJid::from(&alice),
@@ -402,6 +489,7 @@ fn automatic_approval_resolves_an_outstanding_request() -> TestResult {
 
         let outcome = write(&roster, async |tx| {
             state::request_subscription(
+                &crate::roster::Roster::default(),
                 tx,
                 &alice,
                 RosterJid::from(&alice),
@@ -418,6 +506,7 @@ fn automatic_approval_resolves_an_outstanding_request() -> TestResult {
         else {
             return Err("outstanding request was not approved".into());
         };
+        let approved = approved.into_push();
         assert_eq!(approved.version.get(), 2);
         assert_eq!(approved.value.subscription.state, approved_state);
         assert!(!approved.value.subscription.pending_out);
@@ -437,6 +526,7 @@ fn denying_a_pending_request_clears_both_sides_without_changing_the_grantor_rost
     let bob_jid = RosterJid::from(&bob);
     write(&roster, async |tx| {
         state::request_subscription(
+            &crate::roster::Roster::default(),
             tx,
             &alice,
             RosterJid::from(&alice),
@@ -449,12 +539,22 @@ fn denying_a_pending_request_clears_both_sides_without_changing_the_grantor_rost
     })?;
 
     let cancellation = write(&roster, async |tx| {
-        state::cancel_subscription(tx, &bob, &alice_jid, Some((&alice, &bob_jid))).await
+        state::cancel_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &bob,
+            &alice_jid,
+            Some((&alice, &bob_jid)),
+        )
+        .await
     })?;
     assert!(cancellation.route);
     assert!(!cancellation.send_unavailable);
     assert!(cancellation.grantor.is_none());
-    let cleared = cancellation.subscriber.ok_or("missing roster change")?;
+    let cleared = cancellation
+        .subscriber
+        .ok_or("missing roster change")?
+        .into_push();
     assert_eq!(cleared.version.get(), 2);
     assert_eq!(cleared.value.subscription.state, SubscriptionState::None);
     assert!(!cleared.value.subscription.pending_out);
@@ -462,7 +562,14 @@ fn denying_a_pending_request_clears_both_sides_without_changing_the_grantor_rost
     assert_eq!(version(&roster, &bob), 0);
 
     let repeated = write(&roster, async |tx| {
-        state::cancel_subscription(tx, &bob, &alice_jid, Some((&alice, &bob_jid))).await
+        state::cancel_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &bob,
+            &alice_jid,
+            Some((&alice, &bob_jid)),
+        )
+        .await
     })?;
     assert!(!repeated.route);
     assert_eq!(version(&roster, &alice), 2);
@@ -486,7 +593,14 @@ fn revoking_a_mutual_subscription_keeps_the_reverse_grant() -> TestResult {
     }
 
     let cancellation = write(&roster, async |tx| {
-        state::cancel_subscription(tx, &bob, &alice_jid, Some((&alice, &bob_jid))).await
+        state::cancel_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &bob,
+            &alice_jid,
+            Some((&alice, &bob_jid)),
+        )
+        .await
     })?;
     assert!(cancellation.route);
     assert!(cancellation.send_unavailable);
@@ -494,6 +608,7 @@ fn revoking_a_mutual_subscription_keeps_the_reverse_grant() -> TestResult {
         cancellation
             .grantor
             .ok_or("missing grantor change")?
+            .into_push()
             .value
             .subscription
             .state,
@@ -503,6 +618,7 @@ fn revoking_a_mutual_subscription_keeps_the_reverse_grant() -> TestResult {
         cancellation
             .subscriber
             .ok_or("missing subscriber change")?
+            .into_push()
             .value
             .subscription
             .state,
@@ -543,7 +659,14 @@ fn denying_a_crossed_request_keeps_the_reverse_subscription() -> TestResult {
     )?;
 
     let cancellation = write(&roster, async |tx| {
-        state::cancel_subscription(tx, &bob, &alice_jid, Some((&alice, &bob_jid))).await
+        state::cancel_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &bob,
+            &alice_jid,
+            Some((&alice, &bob_jid)),
+        )
+        .await
     })?;
     assert!(cancellation.route);
     assert!(!cancellation.send_unavailable);
@@ -552,6 +675,7 @@ fn denying_a_crossed_request_keeps_the_reverse_subscription() -> TestResult {
         cancellation
             .subscriber
             .ok_or("missing sender change")?
+            .into_push()
             .value
             .subscription,
         subscription(SubscriptionState::From)
@@ -579,7 +703,14 @@ fn clearing_preapproval_does_not_notify_the_contact() -> TestResult {
     )?;
 
     let cancellation = write(&roster, async |tx| {
-        state::cancel_subscription(tx, &bob, &alice_jid, Some((&alice, &bob_jid))).await
+        state::cancel_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &bob,
+            &alice_jid,
+            Some((&alice, &bob_jid)),
+        )
+        .await
     })?;
     assert!(!cancellation.route);
     assert!(!cancellation.send_unavailable);
@@ -588,6 +719,7 @@ fn clearing_preapproval_does_not_notify_the_contact() -> TestResult {
         !cancellation
             .grantor
             .ok_or("missing grantor change")?
+            .into_push()
             .value
             .subscription
             .approved
@@ -615,7 +747,14 @@ fn cancellation_clears_the_grantor_when_the_subscriber_is_missing() -> TestResul
     )?;
 
     let cancellation = write(&roster, async |tx| {
-        state::cancel_subscription(tx, &bob, &alice_jid, None).await
+        state::cancel_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &bob,
+            &alice_jid,
+            None,
+        )
+        .await
     })?;
     assert!(!cancellation.route);
     assert!(!cancellation.send_unavailable);
@@ -624,6 +763,7 @@ fn cancellation_clears_the_grantor_when_the_subscriber_is_missing() -> TestResul
         cancellation
             .grantor
             .ok_or("missing grantor change")?
+            .into_push()
             .value
             .subscription
             .state,
@@ -657,9 +797,19 @@ fn cancellation_removes_only_the_from_direction() -> TestResult {
         )?;
 
         let cancellation = write(&roster, async |tx| {
-            state::cancel_subscription(tx, &owner, &contact, None).await
+            state::cancel_subscription(
+                &crate::roster::Roster::default(),
+                tx,
+                &owner,
+                &contact,
+                None,
+            )
+            .await
         })?;
-        let mutation = cancellation.grantor.ok_or("missing grantor change")?;
+        let mutation = cancellation
+            .grantor
+            .ok_or("missing grantor change")?
+            .into_push();
         let persisted = item(&roster, &owner, &contact).ok_or("missing roster item")?;
         assert_eq!(
             persisted.subscription,
@@ -674,7 +824,14 @@ fn cancellation_removes_only_the_from_direction() -> TestResult {
         assert_eq!(version(&roster, &owner), 2);
 
         let repeated = write(&roster, async |tx| {
-            state::cancel_subscription(tx, &owner, &contact, None).await
+            state::cancel_subscription(
+                &crate::roster::Roster::default(),
+                tx,
+                &owner,
+                &contact,
+                None,
+            )
+            .await
         })?;
         assert!(repeated.grantor.is_none());
         assert!(repeated.subscriber.is_none());
@@ -702,12 +859,22 @@ fn self_subscription_cancellation_writes_one_final_roster_version() -> TestResul
     )?;
 
     let cancellation = write(&roster, async |tx| {
-        state::cancel_subscription(tx, &alice, &alice_jid, Some((&alice, &alice_jid))).await
+        state::cancel_subscription(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &alice_jid,
+            Some((&alice, &alice_jid)),
+        )
+        .await
     })?;
     assert!(cancellation.route);
     assert!(cancellation.send_unavailable);
     assert!(cancellation.subscriber.is_none());
-    let grantor = cancellation.grantor.ok_or("missing roster change")?;
+    let grantor = cancellation
+        .grantor
+        .ok_or("missing roster change")?
+        .into_push();
     assert_eq!(grantor.version.get(), 2);
     assert_eq!(grantor.value.subscription, RosterSubscription::default());
     assert_eq!(version(&roster, &alice), 2);
@@ -736,21 +903,41 @@ fn unsubscribe_keeps_the_reverse_grant_and_does_not_advance_versions_twice() -> 
     }
 
     let withdrawal = write(&roster, async |tx| {
-        state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
+        state::unsubscribe(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &bob_jid,
+            Some((&bob, &alice_jid)),
+        )
+        .await
     })?;
     assert!(withdrawal.notify_contact);
     assert!(withdrawal.send_unavailable);
-    let subscriber = withdrawal.subscriber.ok_or("missing subscriber change")?;
+    let subscriber = withdrawal
+        .subscriber
+        .ok_or("missing subscriber change")?
+        .into_push();
     assert_eq!(subscriber.version.get(), 2);
     assert_eq!(subscriber.value.subscription.state, SubscriptionState::From);
     assert!(subscriber.value.subscription.approved);
-    let contact = withdrawal.contact.ok_or("missing contact change")?;
+    let contact = withdrawal
+        .contact
+        .ok_or("missing contact change")?
+        .into_push();
     assert_eq!(contact.version.get(), 2);
     assert_eq!(contact.value.subscription.state, SubscriptionState::To);
     assert!(contact.value.subscription.approved);
 
     let repeated = write(&roster, async |tx| {
-        state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
+        state::unsubscribe(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &bob_jid,
+            Some((&bob, &alice_jid)),
+        )
+        .await
     })?;
     assert!(!repeated.notify_contact);
     assert!(!repeated.send_unavailable);
@@ -784,9 +971,19 @@ fn unsubscribe_removes_only_the_to_direction() -> TestResult {
         )?;
 
         let withdrawal = write(&roster, async |tx| {
-            state::unsubscribe(tx, &owner, &contact, None).await
+            state::unsubscribe(
+                &crate::roster::Roster::default(),
+                tx,
+                &owner,
+                &contact,
+                None,
+            )
+            .await
         })?;
-        let mutation = withdrawal.subscriber.ok_or("missing subscriber change")?;
+        let mutation = withdrawal
+            .subscriber
+            .ok_or("missing subscriber change")?
+            .into_push();
         let persisted = item(&roster, &owner, &contact).ok_or("missing roster item")?;
         assert_eq!(
             persisted.subscription,
@@ -801,7 +998,14 @@ fn unsubscribe_removes_only_the_to_direction() -> TestResult {
         assert_eq!(version(&roster, &owner), 2);
 
         let repeated = write(&roster, async |tx| {
-            state::unsubscribe(tx, &owner, &contact, None).await
+            state::unsubscribe(
+                &crate::roster::Roster::default(),
+                tx,
+                &owner,
+                &contact,
+                None,
+            )
+            .await
         })?;
         assert!(repeated.subscriber.is_none());
         assert!(repeated.contact.is_none());
@@ -824,12 +1028,22 @@ fn unsubscribe_from_self_writes_one_roster_version() -> TestResult {
     )?;
 
     let withdrawal = write(&roster, async |tx| {
-        state::unsubscribe(tx, &alice, &alice_jid, Some((&alice, &alice_jid))).await
+        state::unsubscribe(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &alice_jid,
+            Some((&alice, &alice_jid)),
+        )
+        .await
     })?;
     assert!(withdrawal.notify_contact);
     assert!(withdrawal.send_unavailable);
     assert!(withdrawal.contact.is_none());
-    let subscriber = withdrawal.subscriber.ok_or("missing roster change")?;
+    let subscriber = withdrawal
+        .subscriber
+        .ok_or("missing roster change")?
+        .into_push();
     assert_eq!(subscriber.version.get(), 2);
     assert_eq!(subscriber.value.subscription.state, SubscriptionState::None);
     assert_eq!(version(&roster, &alice), 2);
@@ -849,12 +1063,22 @@ fn unsubscribe_clears_a_stale_subscription_after_the_contact_is_deleted() -> Tes
     )?;
 
     let withdrawal = write(&roster, async |tx| {
-        state::unsubscribe(tx, &alice, &bob_jid, None).await
+        state::unsubscribe(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &bob_jid,
+            None,
+        )
+        .await
     })?;
     assert!(!withdrawal.notify_contact);
     assert!(!withdrawal.send_unavailable);
     assert!(withdrawal.contact.is_none());
-    let subscriber = withdrawal.subscriber.ok_or("missing roster change")?;
+    let subscriber = withdrawal
+        .subscriber
+        .ok_or("missing roster change")?
+        .into_push();
     assert_eq!(subscriber.value.subscription.state, SubscriptionState::None);
     assert_eq!(version(&roster, &alice), 2);
     Ok(())
@@ -891,14 +1115,22 @@ fn item_removal_clears_the_contact_and_both_pending_requests() -> TestResult {
     )?;
 
     let removal = write(&roster, async |tx| {
-        state::remove_item(tx, &alice, &alice_jid, &bob_jid, Some(&bob)).await
+        state::remove_item(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &alice_jid,
+            &bob_jid,
+            Some(&bob),
+        )
+        .await
     })?
     .ok_or("missing removal")?;
     assert_eq!(removal.version.get(), 2);
     assert_eq!(removal.subscription.state, SubscriptionState::Both);
     assert_eq!(removal.contact_before, Some(preapproved));
     assert!(removal.pending_request);
-    let contact = removal.contact.ok_or("missing contact change")?;
+    let contact = removal.contact.ok_or("missing contact change")?.into_push();
     assert_eq!(contact.version.get(), 2);
     assert_eq!(
         contact.value.subscription,
@@ -939,7 +1171,15 @@ fn item_removal_without_a_local_contact_changes_only_the_owner() -> TestResult {
     )?;
 
     let removal = write(&roster, async |tx| {
-        state::remove_item(tx, &alice, &alice_jid, &bob_jid, None).await
+        state::remove_item(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &alice_jid,
+            &bob_jid,
+            None,
+        )
+        .await
     })?
     .ok_or("missing removal")?;
     assert_eq!(removal.version.get(), 2);
@@ -960,7 +1200,15 @@ fn removing_a_missing_item_writes_nothing() -> TestResult {
     let bob_jid = RosterJid::from(&bob);
     assert!(
         write(&roster, async |tx| {
-            state::remove_item(tx, &alice, &alice_jid, &bob_jid, Some(&bob)).await
+            state::remove_item(
+                &crate::roster::Roster::default(),
+                tx,
+                &alice,
+                &alice_jid,
+                &bob_jid,
+                Some(&bob),
+            )
+            .await
         })?
         .is_none()
     );
@@ -1008,6 +1256,7 @@ fn a_pre_approved_request_grants_the_requester_and_consumes_the_pre_approval() -
 
         let outcome = write(&roster, async |tx| {
             state::request_subscription(
+                &crate::roster::Roster::default(),
                 tx,
                 &alice,
                 alice_jid.clone(),
@@ -1025,6 +1274,8 @@ fn a_pre_approved_request_grants_the_requester_and_consumes_the_pre_approval() -
         else {
             return Err("request was not answered from the pre-approval".into());
         };
+        let grantor = grantor.into_push();
+        let requester = requester.into_push();
         assert_eq!(grantor.value.subscription, subscription(grantor_after));
         assert_eq!(
             requester.value.subscription,
@@ -1055,6 +1306,7 @@ fn pending_overflow_preserves_both_rosters_and_reverse_requests() -> TestResult 
                         groups: vec!["Friends".into()],
                         ..state::bare_item(bob_jid.clone())
                     },
+                    RosterQuota::default(),
                 )
                 .await
             })?;
@@ -1067,6 +1319,7 @@ fn pending_overflow_preserves_both_rosters_and_reverse_requests() -> TestResult 
             let mut tx = roster.storage.begin_write().await?;
             assert!(matches!(
                 state::request_subscription(
+                    &crate::roster::Roster::default(),
                     &mut tx,
                     &alice,
                     RosterJid::from(&alice),
@@ -1129,6 +1382,7 @@ fn granted_and_preapproved_requests_bypass_a_full_pending_queue() -> TestResult 
         )?;
         let outcome = write(&roster, async |tx| {
             state::request_subscription(
+                &crate::roster::Roster::default(),
                 tx,
                 &alice,
                 alice_jid,
@@ -1215,7 +1469,14 @@ fn pending_withdrawal_notifies_without_revoking_the_reverse_grant() -> TestResul
         let before_alice = version(&roster, &alice);
         let before_bob = version(&roster, &bob);
         let withdrawal = write(&roster, async |tx| {
-            state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
+            state::unsubscribe(
+                &crate::roster::Roster::default(),
+                tx,
+                &alice,
+                &bob_jid,
+                Some((&bob, &alice_jid)),
+            )
+            .await
         })?;
         let prior_grant = contact_state.is_some_and(state::grants);
         assert!(withdrawal.notify_contact);
@@ -1273,7 +1534,14 @@ fn pending_withdrawal_notifies_without_revoking_the_reverse_grant() -> TestResul
         }
         let versions = (version(&roster, &alice), version(&roster, &bob));
         let repeated = write(&roster, async |tx| {
-            state::unsubscribe(tx, &alice, &bob_jid, Some((&bob, &alice_jid))).await
+            state::unsubscribe(
+                &crate::roster::Roster::default(),
+                tx,
+                &alice,
+                &bob_jid,
+                Some((&bob, &alice_jid)),
+            )
+            .await
         })?;
         assert!(!repeated.notify_contact);
         assert!(!repeated.send_unavailable);
@@ -1301,12 +1569,22 @@ fn pending_self_withdrawal_preserves_preapproval_and_writes_once() -> TestResult
     )?;
     put_pending(&roster, &alice, request("alice@example.com", b"request"))?;
     let withdrawal = write(&roster, async |tx| {
-        state::unsubscribe(tx, &alice, &alice_jid, Some((&alice, &alice_jid))).await
+        state::unsubscribe(
+            &crate::roster::Roster::default(),
+            tx,
+            &alice,
+            &alice_jid,
+            Some((&alice, &alice_jid)),
+        )
+        .await
     })?;
     assert!(withdrawal.notify_contact);
     assert!(!withdrawal.send_unavailable);
     assert!(withdrawal.contact.is_none());
-    let mutation = withdrawal.subscriber.ok_or("missing subscriber change")?;
+    let mutation = withdrawal
+        .subscriber
+        .ok_or("missing subscriber change")?
+        .into_push();
     assert_eq!(mutation.version.get(), 2);
     assert_eq!(
         mutation.value.subscription,
@@ -1317,5 +1595,139 @@ fn pending_self_withdrawal_preserves_preapproval_and_writes_once() -> TestResult
         }
     );
     assert!(pending(&roster, &alice).is_empty());
+    Ok(())
+}
+
+#[test]
+fn subscription_quota_failure_rolls_back_both_accounts() -> TestResult {
+    use crate::roster::{Roster, RosterLimits};
+    use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
+    let (_directory, fixture) = roster();
+    let alice = account("alice@example.com");
+    let bob = account("bob@example.com");
+    set_subscription(
+        &fixture,
+        &alice,
+        &jid("other@example.com"),
+        subscription(SubscriptionState::None),
+    )?;
+    let policy = Roster::new(BTreeMap::from([(
+        "example.com".into(),
+        RosterLimits {
+            max_items: NonZeroUsize::MIN,
+            max_bytes: NonZeroUsize::new(1024).unwrap(),
+            ..Default::default()
+        },
+    )]));
+    for preapproved in [false, true] {
+        if preapproved {
+            set_subscription(
+                &fixture,
+                &bob,
+                &jid(alice.as_str()),
+                RosterSubscription {
+                    approved: true,
+                    ..Default::default()
+                },
+            )?;
+        }
+        let alice_before = snapshot(&fixture, &alice);
+        let bob_before = snapshot(&fixture, &bob);
+        let pending_before = pending(&fixture, &bob);
+        block_on(async {
+            let mut tx = fixture.storage.begin_write().await?;
+            let result = state::request_subscription(
+                &policy,
+                &mut tx,
+                &alice,
+                jid(alice.as_str()),
+                &bob,
+                &jid(bob.as_str()),
+                stanza(b"request"),
+                NonZeroUsize::new(100).unwrap(),
+            )
+            .await;
+            assert!(matches!(result, Err(RosterError::QuotaExceeded)));
+            Ok::<_, Box<dyn Error>>(())
+        })?;
+        assert_eq!(snapshot(&fixture, &alice), alice_before);
+        assert_eq!(snapshot(&fixture, &bob), bob_before);
+        assert_eq!(pending(&fixture, &bob), pending_before);
+    }
+    Ok(())
+}
+
+#[test]
+fn subscription_admission_resolves_each_owners_host_quota() -> TestResult {
+    use crate::roster::{Roster, RosterLimits};
+    use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
+    let (_directory, fixture) = roster();
+    let alice = account("alice@example.com");
+    let bob = account("bob@other.example");
+    create_account(&fixture, &bob);
+    for owner in [&alice, &bob] {
+        set_subscription(
+            &fixture,
+            owner,
+            &jid("other@remote.invalid"),
+            Default::default(),
+        )?;
+    }
+    let policy = Roster::new(BTreeMap::from([
+        (
+            "example.com".into(),
+            RosterLimits {
+                max_items: NonZeroUsize::new(2).unwrap(),
+                max_bytes: NonZeroUsize::new(1024).unwrap(),
+                ..Default::default()
+            },
+        ),
+        (
+            "other.example".into(),
+            RosterLimits {
+                max_items: NonZeroUsize::MIN,
+                max_bytes: NonZeroUsize::new(128).unwrap(),
+                ..Default::default()
+            },
+        ),
+    ]));
+    write(&fixture, async |tx| {
+        state::request_subscription(
+            &policy,
+            tx,
+            &alice,
+            jid(alice.as_str()),
+            &bob,
+            &jid(bob.as_str()),
+            stanza(b"request"),
+            NonZeroUsize::new(100).unwrap(),
+        )
+        .await?;
+        Ok(())
+    })?;
+    assert_eq!(snapshot(&fixture, &alice).items.len(), 2);
+    assert_eq!(snapshot(&fixture, &bob).items.len(), 1);
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        assert!(matches!(
+            state::request_subscription(
+                &policy,
+                &mut tx,
+                &bob,
+                jid(bob.as_str()),
+                &alice,
+                &jid(alice.as_str()),
+                stanza(b"reverse"),
+                NonZeroUsize::new(100).unwrap()
+            )
+            .await,
+            Err(RosterError::QuotaExceeded)
+        ));
+        Ok::<_, Box<dyn Error>>(())
+    })?;
+    assert!(pending(&fixture, &alice).is_empty());
+    assert_eq!(snapshot(&fixture, &bob).items.len(), 1);
     Ok(())
 }

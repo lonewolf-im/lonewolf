@@ -12,8 +12,8 @@ use std::sync::Arc;
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::roster::{
-    RosterError, RosterItem, RosterJid, RosterMutation, RosterReads, RosterSnapshot,
-    RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
+    RosterError, RosterItem, RosterJid, RosterMutation, RosterQuota, RosterReads, RosterSnapshot,
+    RosterVersion, RosterWrites, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
@@ -59,12 +59,16 @@ const IQ_ROUTES: [IqRoute; 2] = [
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RosterLimits {
+    pub max_items: NonZeroUsize,
+    pub max_bytes: NonZeroUsize,
     pub max_pending_subscription_requests: NonZeroUsize,
 }
 
 impl Default for RosterLimits {
     fn default() -> Self {
         Self {
+            max_items: RosterQuota::default().max_items,
+            max_bytes: RosterQuota::default().max_bytes,
             max_pending_subscription_requests: DEFAULT_MAX_PENDING_SUBSCRIPTION_REQUESTS,
         }
     }
@@ -75,12 +79,16 @@ pub struct RosterFactory;
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RosterOptions {
+    max_items: NonZeroUsize,
+    max_bytes: NonZeroUsize,
     max_pending_subscription_requests: NonZeroUsize,
 }
 
 impl Default for RosterOptions {
     fn default() -> Self {
         Self {
+            max_items: RosterQuota::default().max_items,
+            max_bytes: RosterQuota::default().max_bytes,
             max_pending_subscription_requests: RosterLimits::default()
                 .max_pending_subscription_requests,
         }
@@ -107,6 +115,8 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for RosterFactory {
                 limits.insert(
                     host.domain.into(),
                     RosterLimits {
+                        max_items: options.max_items,
+                        max_bytes: options.max_bytes,
                         max_pending_subscription_requests: options
                             .max_pending_subscription_requests,
                     },
@@ -123,6 +133,14 @@ pub struct Roster {
 }
 
 impl Roster {
+    fn quota(&self, owner: &AccountKey) -> RosterQuota {
+        let limits = self.limits.get(owner.domain()).copied().unwrap_or_default();
+        RosterQuota {
+            max_items: limits.max_items,
+            max_bytes: limits.max_bytes,
+        }
+    }
+
     /// Hosts without a limits entry use the default.
     pub fn new(limits: BTreeMap<Box<str>, RosterLimits>) -> Self {
         Self { limits }
@@ -178,10 +196,10 @@ async fn granting_contacts(
             continue;
         };
         let granted = transaction
-            .roster_item(&account, &owner)
+            .roster_subscription(&account, &owner)
             .await
             .map_err(|error| roster_error(error, "roster_read"))?
-            .is_some_and(|item| state::grants(item.subscription.state));
+            .is_some_and(|item| state::grants(item.state));
         if granted {
             contacts.push(account);
         }
@@ -221,9 +239,16 @@ impl<A: ChunkAllocator, S: Storage> AccountHandler<A, S> for Roster {
         &'a self,
         transaction: &'a mut S::Write,
         account: &'a AccountKey,
+        before: Arc<S::Read>,
         hosts: &'a dyn HostLookup,
-    ) -> ExtensionFuture<'a, Result<Effects<A>, HandlerError>> {
-        Box::pin(subscription::forget_account(transaction, account, hosts))
+    ) -> ExtensionFuture<'a, Result<crate::Deliver<A>, HandlerError>> {
+        Box::pin(subscription::forget_account(
+            self,
+            transaction,
+            account,
+            before,
+            hosts,
+        ))
     }
 }
 
@@ -241,8 +266,20 @@ where
         Box::pin(async move {
             let owner = owner_of(&request)?;
             let known = xml::parse_get(request.payload)?;
+            let current = transaction
+                .roster_version(&owner)
+                .await
+                .map_err(|error| roster_error(error, "roster_read"))?;
+            if known
+                .is_some_and(|known| known.parse::<u64>().map(RosterVersion::new) == Ok(current))
+            {
+                let effects = Effects::new(vec![owner], |delivery| {
+                    delivery.tag_session(SessionTag::Interested)
+                });
+                return Ok(IqReply::new(None, effects));
+            }
             let snapshot = transaction
-                .roster(&owner)
+                .roster(&owner, self.quota(&owner))
                 .await
                 .map_err(|error| roster_error(error, "roster_read"))?;
             let item_count = snapshot.items.len();
@@ -285,10 +322,10 @@ where
                 xml::RosterSet::Update(update) => {
                     require_account(transaction, &owner).await?;
                     let subscription = transaction
-                        .roster_item(&owner, &update.jid)
+                        .roster_subscription(&owner, &update.jid)
                         .await
                         .map_err(|error| roster_error(error, "roster_write"))?
-                        .map_or_else(RosterSubscription::default, |item| item.subscription);
+                        .unwrap_or_default();
                     let item = RosterItem {
                         jid: update.jid,
                         name: update.name,
@@ -296,7 +333,7 @@ where
                         subscription,
                     };
                     let version = transaction
-                        .put_roster_item(&owner, &item)
+                        .put_roster_item(&owner, &item, self.quota(&owner))
                         .await
                         .map_err(|error| roster_error(error, "roster_write"))?;
                     let mutation = RosterMutation {
@@ -318,9 +355,15 @@ where
                 }
                 xml::RosterSet::Remove(contact) => {
                     let owner_jid = RosterJid::from(request.sender.bare());
-                    let effects =
-                        subscription::remove_item(transaction, owner, contact, owner_jid, hosts)
-                            .await?;
+                    let effects = subscription::remove_item(
+                        self,
+                        transaction,
+                        owner,
+                        contact,
+                        owner_jid,
+                        hosts,
+                    )
+                    .await?;
                     Ok(IqReply::new(None, effects))
                 }
             }
@@ -341,10 +384,10 @@ where
     ) -> PresenceFuture<'a, bool> {
         Box::pin(async move {
             Ok(transaction
-                .roster_item(owner, &RosterJid::from(observer.bare()))
+                .roster_subscription(owner, &RosterJid::from(observer.bare()))
                 .await
                 .map_err(|error| roster_error(error, "roster_read"))?
-                .is_some_and(|item| state::grants(item.subscription.state)))
+                .is_some_and(|item| state::grants(item.state)))
         })
     }
 
@@ -357,7 +400,7 @@ where
             let owner = AccountKey::try_from(update.sender.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             let snapshot = transaction
-                .roster(&owner)
+                .roster(&owner, self.quota(&owner))
                 .await
                 .map_err(|error| roster_error(error, "roster_read"))?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
@@ -387,7 +430,7 @@ where
         transaction: &'a mut S::Write,
         _hosts: &'a dyn HostLookup,
     ) -> SendFuture<'a, A> {
-        Box::pin(subscription::send_subscription(transaction, request))
+        Box::pin(subscription::send_subscription(self, transaction, request))
     }
 
     fn receive<'a>(
@@ -406,6 +449,7 @@ where
                         .copied()
                         .unwrap_or_default();
                     subscription::request_subscription(
+                        self,
                         transaction,
                         parties,
                         request.stanza,
@@ -414,13 +458,16 @@ where
                     .await
                 }
                 PresenceRequestType::Subscribed => {
-                    subscription::approve_subscription(transaction, parties, request.stanza).await
+                    subscription::approve_subscription(self, transaction, parties, request.stanza)
+                        .await
                 }
                 PresenceRequestType::Unsubscribed => {
-                    subscription::cancel_subscription(transaction, parties, request.stanza).await
+                    subscription::cancel_subscription(self, transaction, parties, request.stanza)
+                        .await
                 }
                 PresenceRequestType::Unsubscribe => {
-                    subscription::withdraw_subscription(transaction, parties, request.stanza).await
+                    subscription::withdraw_subscription(self, transaction, parties, request.stanza)
+                        .await
                 }
                 PresenceRequestType::Available
                 | PresenceRequestType::Unavailable
@@ -429,6 +476,20 @@ where
                 }
             }
         })
+    }
+}
+
+async fn push_change<A: ChunkAllocator>(
+    owner: &AccountKey,
+    change: state::ItemChange,
+    delivery: &dyn Delivery<A>,
+) -> Result<(), DeliveryError> {
+    match change {
+        state::ItemChange::Push(mutation) => push_roster(owner, mutation, delivery).await,
+        state::ItemChange::Unavailable { version } => {
+            tracing::debug!(roster_version=version.get(),owner_jid=?owner.as_str(),"roster push exceeds metadata limits");
+            delivery.retire_tagged(owner, SessionTag::Interested).await
+        }
     }
 }
 
@@ -503,7 +564,9 @@ fn storage_error(error: lonewolf_storage::StorageError, operation: &'static str)
 fn roster_error(error: RosterError, operation: &'static str) -> HandlerError {
     match error {
         RosterError::ValueTooLarge => StanzaErrorCondition::NotAcceptable.into(),
-        RosterError::PendingLimitExceeded => StanzaErrorCondition::ResourceConstraint.into(),
+        RosterError::PendingLimitExceeded | RosterError::QuotaExceeded => {
+            StanzaErrorCondition::ResourceConstraint.into()
+        }
         RosterError::NoAccount => StanzaErrorCondition::Forbidden.into(),
         RosterError::Storage(error) => storage_error(error, operation),
     }

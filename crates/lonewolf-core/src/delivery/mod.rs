@@ -510,6 +510,15 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
         })
     }
 
+    fn retire_tagged<'a>(&'a self, account: &'a AccountKey, tag: SessionTag) -> DeliveryFuture<'a> {
+        Box::pin(async move {
+            self.router
+                .retire_tagged(account, tag)
+                .await
+                .map_err(|_| DeliveryError)
+        })
+    }
+
     fn current_presence<'a>(
         &'a self,
         from: &'a AccountKey,

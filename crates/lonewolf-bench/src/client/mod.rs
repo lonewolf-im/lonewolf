@@ -97,7 +97,7 @@ impl CorrelationId {
             return None;
         }
         let mut run_nonce = [0; 16];
-        for (i, pair) in nonce.as_bytes().chunks_exact(2).enumerate() {
+        for (i, pair) in nonce.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             fn digit(byte: u8) -> Option<u8> {
                 match byte {
                     b'0'..=b'9' => Some(byte - b'0'),

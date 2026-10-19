@@ -204,7 +204,7 @@ impl Exchange {
             *byte ^= signature;
         }
         let encoded_proof = Zeroizing::new(STANDARD.encode(&proof[..]));
-        let response = Zeroizing::new(format!("{final_without_proof},p={}", &*encoded_proof));
+        let response = Zeroizing::new(format!("{final_without_proof},p={}", *encoded_proof));
         let mut verifier = Hmac::<Sha256>::new_from_slice(&keys.server[..])
             .map_err(|_| failure("scram_crypto"))?;
         verifier.update(auth.as_bytes());

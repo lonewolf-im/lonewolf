@@ -194,7 +194,7 @@ async fn connect_inner(
     let auth = Zeroizing::new(format!(
         "<auth xmlns='{}' mechanism='SCRAM-SHA-256'>{}</auth>",
         xml::SASL_NS,
-        &*exchange.first
+        *exchange.first
     ));
     write_all(&mut write, auth.as_bytes()).await?;
     let challenge = exchange.challenge(&xml::sasl(&mut parser, "challenge").await?)?;
@@ -202,7 +202,7 @@ async fn connect_inner(
     let response = Zeroizing::new(format!(
         "<response xmlns='{}'>{}</response>",
         xml::SASL_NS,
-        &*proof.response
+        *proof.response
     ));
     write_all(&mut write, response.as_bytes()).await?;
     proof.verify(&xml::sasl(&mut parser, "success").await?)?;

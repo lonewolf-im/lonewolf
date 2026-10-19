@@ -1,0 +1,32 @@
+schema_version = 1
+environment_id = "local-release"
+
+[target]
+mode = "local"
+server_binary = "../../target/release/lonewolf"
+server_profile = "release"
+server_features = []
+server_workers = 2
+stanza_pool_size_mib = 8
+
+[scenario]
+kind = "idle"
+connections = 2
+
+[measurement]
+warmup_ms = 0
+duration_ms = 2000
+operation_timeout_ms = 10000
+setup_timeout_ms = 30000
+shutdown_timeout_ms = 10000
+ramp_rate_per_second = 20
+connect_concurrency = 2
+driver_workers = 2
+max_in_flight = 16
+dispatch_quantum_us = 1000
+max_dispatch_batch = 16
+max_schedule_lag_ms = 1000
+
+[metrics]
+interval_ms = 1000
+timeout_ms = 2000

@@ -80,6 +80,13 @@ jobs:
       - name: Build release binaries
         run: cargo build --workspace --all-features --release --locked
 
+      - name: Smoke release benchmark workflows
+        timeout-minutes: 5
+        run: |
+          target_dir="$(cargo metadata --no-deps --locked --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+          output_parent="$(mktemp -d "${RUNNER_TEMP}/benchmark-smoke.XXXXXX")"
+          bash scripts/benchmark-smoke.sh --server-binary "$target_dir/release/lonewolf" --bench-binary "$target_dir/release/lonewolf-bench" --output "$output_parent/results"
+
   dependencies:
     name: Dependency policy
     runs-on: ubuntu-latest

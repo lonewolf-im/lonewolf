@@ -49,6 +49,10 @@ pub struct C2sSuite {
 }
 
 impl C2sSuite {
+    pub fn fixture_path(&self) -> &Path {
+        self.directory.path()
+    }
+
     pub fn start() -> TestResult<Self> {
         Self::configured("", "")
     }
@@ -381,8 +385,7 @@ max_resources_per_account = {resources}
     }
 
     pub fn create_account_jid(&self, jid: &str, password: &str) -> TestResult {
-        let mut stream =
-            UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
+        let mut stream = UnixStream::connect(self.fixture_path().join("run/lonewolf/admin.sock"))?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
         let body = serde_json::json!({
@@ -423,8 +426,7 @@ max_resources_per_account = {resources}
     }
 
     fn password_change_response(&self, username: &str, password: &str) -> TestResult<String> {
-        let mut stream =
-            UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
+        let mut stream = UnixStream::connect(self.fixture_path().join("run/lonewolf/admin.sock"))?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
         let body = serde_json::json!({ "password": password }).to_string();
@@ -439,8 +441,7 @@ max_resources_per_account = {resources}
     }
 
     pub fn delete_account(&self, username: &str) -> TestResult {
-        let mut stream =
-            UnixStream::connect(self.directory.path().join("run/lonewolf/admin.sock"))?;
+        let mut stream = UnixStream::connect(self.fixture_path().join("run/lonewolf/admin.sock"))?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
         write!(

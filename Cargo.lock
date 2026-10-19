@@ -1394,14 +1394,28 @@ dependencies = [
 name = "lonewolf-bench"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
+ "futures-rustls",
+ "getrandom 0.4.3",
  "hdrhistogram",
+ "hmac 0.13.0",
  "http",
+ "lonewolf-util",
+ "lonewolf-xmpp",
+ "pbkdf2",
+ "rustls",
+ "rustls-graviola",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "stringprep",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
+ "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

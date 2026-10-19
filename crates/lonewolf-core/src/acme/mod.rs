@@ -74,6 +74,18 @@ impl AcmeServices {
         let http = Http01Server::bind(&config.letsencrypt.listen, challenges.clone())
             .await
             .map_err(|error| io_failure("HTTP bind", error))?;
+        Self::load_bound(config, hosts, managed, challenges, http)
+            .await
+            .map(Some)
+    }
+
+    async fn load_bound(
+        config: &Config,
+        hosts: Hosts,
+        managed: Vec<ManagedHost>,
+        challenges: Challenges,
+        http: Http01Server,
+    ) -> Result<Self, RunError> {
         let manager = Manager::load(
             ManagerOptions {
                 directory_url: config.letsencrypt.directory_url.clone(),
@@ -100,11 +112,11 @@ impl AcmeServices {
             );
         }
         let status = manager.status();
-        Ok(Some(Self {
+        Ok(Self {
             http: Some(http),
             manager,
             status,
-        }))
+        })
     }
 
     pub(crate) fn status(&self) -> StatusHandle {

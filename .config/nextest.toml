@@ -2,6 +2,13 @@
 protocol-servers = { max-threads = 8 }
 
 [[profile.default.overrides]]
+filter = '''
+(package(lonewolf-core) & test(/^acme::tests::(startup_failure_releases_bound_listener_and_open_cache|loaded_unstarted_service_releases_sockets_and_can_drain_with_expired_deadline|startup_signal_drops_partial_resources_and_late_cache_completion_cannot_activate)$/))
+| (package(lonewolf-acme) & test(/^http::tests::(bound_endpoints_share_challenges_and_release_sockets_on_shutdown|bind_failure_releases_earlier_listeners_and_challenges|cancellation_clears_challenges_and_pending_accepts|ipv6_listener_is_ipv6_only_when_available)$/))
+'''
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
 filter = 'binary(protocol)'
 test-group = 'protocol-servers'
 

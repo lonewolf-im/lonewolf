@@ -208,3 +208,303 @@ async fn drop_kills_and_reaps_after_cancelled_stop() -> TestResult {
     );
     Ok(())
 }
+
+#[derive(Default)]
+pub(super) struct PreparationProbe {
+    directory: std::sync::Mutex<Option<PathBuf>>,
+    dropped: AtomicBool,
+    cpu_steps: std::sync::atomic::AtomicUsize,
+    transactions: std::sync::atomic::AtomicUsize,
+    commits: std::sync::atomic::AtomicUsize,
+    pause_cpu: Option<usize>,
+    admission: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    cpu_release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    transaction_release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<BenchResult<()>>>>,
+}
+
+pub(super) struct PreparationOwners(Arc<PreparationProbe>);
+impl Drop for PreparationOwners {
+    fn drop(&mut self) {
+        self.0.dropped.store(true, Ordering::Release);
+    }
+}
+
+impl PreparationProbe {
+    pub(super) fn owners(
+        self: &Arc<Self>,
+        directory: &std::path::Path,
+    ) -> BenchResult<PreparationOwners> {
+        *self
+            .directory
+            .lock()
+            .map_err(|_| failure("test_probe_lock"))? = Some(directory.to_owned());
+        Ok(PreparationOwners(self.clone()))
+    }
+    fn admit(&self) -> BenchResult<()> {
+        let sender = self
+            .admission
+            .lock()
+            .map_err(|_| failure("test_probe_lock"))?
+            .take()
+            .ok_or_else(|| failure("test_probe_admission"))?;
+        sender.send(()).map_err(|_| failure("test_probe_admission"))
+    }
+    pub(super) fn cpu_started(&self) -> BenchResult<()> {
+        let step = self.cpu_steps.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.pause_cpu == Some(step) {
+            self.admit()?;
+            let release = self
+                .cpu_release
+                .lock()
+                .map_err(|_| failure("test_probe_lock"))?
+                .take()
+                .ok_or_else(|| failure("test_probe_release"))?;
+            release.recv().map_err(|_| failure("test_probe_release"))?;
+        }
+        Ok(())
+    }
+    pub(super) async fn transaction_started(&self) -> BenchResult<()> {
+        self.transactions.fetch_add(1, Ordering::AcqRel);
+        let release = self
+            .transaction_release
+            .lock()
+            .map_err(|_| failure("test_probe_lock"))?
+            .take();
+        if let Some(release) = release {
+            self.admit()?;
+            release.await.map_err(|_| failure("test_probe_release"))??;
+        }
+        Ok(())
+    }
+    pub(super) fn transaction_finished(&self) {
+        self.commits.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+async fn poll_once<F: std::future::Future>(
+    mut work: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx))).await
+}
+
+async fn poll_to_admission<F: std::future::Future<Output = BenchResult<LocalFixture>>>(
+    mut work: std::pin::Pin<&mut F>,
+    admission: &mut tokio::sync::oneshot::Receiver<()>,
+) -> TestResult {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match admission.try_recv() {
+            Ok(()) => return Ok(()),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                return Err("admission closed".into());
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+        if let std::task::Poll::Ready(result) = poll_once(work.as_mut()).await {
+            return Err(match result {
+                Err(error) => error.into(),
+                Ok(_) => "preparation completed before admission".into(),
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("admission wall deadline".into());
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn preparation_stops_retain_resources_until_the_admitted_cpu_unit_finishes() -> TestResult {
+    for mode in ["standalone_deadline", "run_deadline", "interruption"] {
+        let config = config()?;
+        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let (admission, mut admitted) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let probe = Arc::new(PreparationProbe {
+            pause_cpu: Some(3),
+            admission: std::sync::Mutex::new(Some(admission)),
+            cpu_release: std::sync::Mutex::new(Some(blocked)),
+            ..Default::default()
+        });
+        let (signal, mut interruption) = watch::channel(false);
+        let context = if mode == "standalone_deadline" {
+            "fixture_setup_deadline"
+        } else {
+            "setup_deadline"
+        };
+        let mut control = PreparationControl {
+            deadline: Instant::now() + Duration::from_secs(10),
+            interruption: (mode != "standalone_deadline").then_some(&mut interruption),
+            deadline_context: context,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            probe: Some(probe.clone()),
+        };
+        let cancelled = control.cancelled.clone();
+        let mut work = Box::pin(LocalFixture::prepare_inner(&config, &cpu, &mut control));
+        poll_to_admission(work.as_mut(), &mut admitted).await?;
+        let directory = probe
+            .directory
+            .lock()
+            .map_err(|_| "probe lock")?
+            .clone()
+            .ok_or("directory")?;
+        if mode == "interruption" {
+            signal.send_replace(true);
+        } else {
+            tokio::time::advance(Duration::from_secs(11)).await;
+        }
+        assert!(poll_once(work.as_mut()).await.is_pending());
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(directory.exists());
+        assert!(!probe.dropped.load(Ordering::Acquire));
+        assert!(RedbStorage::open(directory.join("accounts.redb")).is_err());
+        release.send(())?;
+        let error = match work.await {
+            Err(error) => error,
+            Ok(_) => return Err("stopped preparation succeeded".into()),
+        };
+        assert_eq!(
+            error.context(),
+            if mode == "interruption" {
+                "interrupted"
+            } else {
+                context
+            }
+        );
+        assert!(probe.dropped.load(Ordering::Acquire));
+        assert!(!directory.exists());
+        assert_eq!(probe.cpu_steps.load(Ordering::Acquire), 3);
+        assert_eq!(probe.transactions.load(Ordering::Acquire), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn standalone_expiry_and_queued_cancellation_do_not_run_unadmitted_cpu_work() -> TestResult {
+    for standalone in [true, false] {
+        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let occupied_cpu = cpu.clone();
+        let (entered, mut started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let occupied = tokio::spawn(async move {
+            occupied_cpu
+                .run(move || {
+                    let _ = entered.send(());
+                    let _ = blocked.recv();
+                })
+                .await;
+        });
+        while started.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+        if standalone {
+            let mut config = config()?;
+            config.measurement.setup_timeout_ms = 1;
+            let mut work = Box::pin(LocalFixture::prepare(&config, &cpu));
+            assert!(poll_once(work.as_mut()).await.is_pending());
+            tokio::time::advance(Duration::from_millis(2)).await;
+            assert!(poll_once(work.as_mut()).await.is_pending());
+            release.send(())?;
+            let error = match work.await {
+                Err(error) => error,
+                Ok(_) => return Err("expired preparation succeeded".into()),
+            };
+            assert_eq!(error.context(), "fixture_setup_deadline");
+        } else {
+            let (signal, mut interruption) = watch::channel(false);
+            let mut control = PreparationControl {
+                deadline: Instant::now() + Duration::from_secs(10),
+                interruption: Some(&mut interruption),
+                deadline_context: "setup_deadline",
+                cancelled: Arc::new(AtomicBool::new(false)),
+                probe: None,
+            };
+            let meaningful = Arc::new(AtomicBool::new(false));
+            let ran = meaningful.clone();
+            let mut work = Box::pin(control.run_cpu(&cpu, move |_| {
+                ran.store(true, Ordering::Release);
+                Ok(())
+            }));
+            assert!(poll_once(work.as_mut()).await.is_pending());
+            signal.send_replace(true);
+            assert!(poll_once(work.as_mut()).await.is_pending());
+            release.send(())?;
+            assert!(
+                work.await
+                    .is_err_and(|error| error.context() == "interrupted")
+            );
+            assert!(!meaningful.load(Ordering::Acquire));
+        }
+        occupied.await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopped_preparation_finishes_the_whole_transaction_without_starting_the_next_batch()
+-> TestResult {
+    for (interrupt, storage_error) in [(true, false), (true, true), (false, true)] {
+        let mut config = config()?;
+        config.scenario = ScenarioConfig::Idle { connections: 257 };
+        config.measurement.setup_timeout_ms = 120_000;
+        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let (admission, mut admitted) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let probe = Arc::new(PreparationProbe {
+            admission: std::sync::Mutex::new(Some(admission)),
+            transaction_release: std::sync::Mutex::new(Some(blocked)),
+            ..Default::default()
+        });
+        let (signal, mut interruption) = watch::channel(false);
+        let mut control = PreparationControl {
+            deadline: Instant::now() + Duration::from_secs(120),
+            interruption: Some(&mut interruption),
+            deadline_context: "setup_deadline",
+            cancelled: Arc::new(AtomicBool::new(false)),
+            probe: Some(probe.clone()),
+        };
+        let mut work = Box::pin(LocalFixture::prepare_inner(&config, &cpu, &mut control));
+        poll_to_admission(work.as_mut(), &mut admitted).await?;
+        let directory = probe
+            .directory
+            .lock()
+            .map_err(|_| "probe lock")?
+            .clone()
+            .ok_or("directory")?;
+        if interrupt {
+            signal.send_replace(true);
+        }
+        assert!(poll_once(work.as_mut()).await.is_pending());
+        assert!(directory.exists());
+        assert!(!probe.dropped.load(Ordering::Acquire));
+        assert!(!directory.join("lonewolf.toml").exists());
+        release
+            .send(if storage_error {
+                Err(failure("test_storage_failure"))
+            } else {
+                Ok(())
+            })
+            .map_err(|_| "release closed")?;
+        let error = match work.await {
+            Err(error) => error,
+            Ok(_) => return Err("stopped transaction succeeded".into()),
+        };
+        assert_eq!(
+            error.context(),
+            if interrupt {
+                "interrupted"
+            } else {
+                "test_storage_failure"
+            }
+        );
+        assert!(!directory.exists());
+        assert!(probe.dropped.load(Ordering::Acquire));
+        assert_eq!(probe.cpu_steps.load(Ordering::Acquire), 3);
+        assert_eq!(probe.transactions.load(Ordering::Acquire), 1);
+        assert_eq!(
+            probe.commits.load(Ordering::Acquire),
+            usize::from(!storage_error)
+        );
+    }
+    Ok(())
+}

@@ -9,11 +9,7 @@ pub mod fixture;
 pub mod measurement;
 pub mod report;
 
-use config::RunConfig;
-use error::{BenchError, BenchResult};
-use report::RunReport;
-use std::path::Path;
+pub mod run;
+pub mod scenario;
 
-pub async fn run(_config: RunConfig, _output: &Path) -> BenchResult<RunReport> {
-    Err(BenchError::staged())
-}
+pub use run::run;

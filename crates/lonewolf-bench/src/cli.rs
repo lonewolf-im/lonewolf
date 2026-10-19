@@ -57,7 +57,7 @@ pub enum AccountsCommand {
 }
 
 impl Cli {
-    pub fn execute(self) -> BenchResult<()> {
+    pub fn execute(self) -> BenchResult<u8> {
         match self.command {
             Command::Run {
                 config,
@@ -77,8 +77,9 @@ impl Cli {
                     .map_err(|_| {
                         BenchError::new(ErrorCode::Runtime, "cannot construct driver runtime")
                     })?;
-                runtime.block_on(crate::run(config, &output))?;
-                Ok(())
+                let report = runtime.block_on(crate::run(config, &output))?;
+                println!("{:?}", report.status);
+                Ok(report.status.exit_code())
             }
             Command::Accounts {
                 command:
@@ -88,7 +89,9 @@ impl Cli {
                         count,
                         output,
                     },
-            } => crate::accounts::generate_credentials(&domain, &prefix, count, &output),
+            } => {
+                crate::accounts::generate_credentials(&domain, &prefix, count, &output).map(|()| 0)
+            }
             Command::Compare { output, .. } => {
                 validate_new_output(&output)?;
                 Err(BenchError::staged())
@@ -122,7 +125,7 @@ impl Cli {
                     "confirmed_created={}; uncertain_last_create={}",
                     summary.confirmed_created, summary.uncertain_last_create
                 );
-                Ok(())
+                Ok(0)
             }
         }
     }
@@ -210,7 +213,7 @@ mod tests {
         let config_path = directory.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='absent'\n[scenario]\nkind='idle'",
+            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='absent'\n[scenario]\nkind='messages'",
         )?;
         let result = Cli {
             command: Command::Run {
@@ -222,6 +225,34 @@ mod tests {
         .execute();
         assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
         assert!(!directory.path().join("new").exists());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod run_exit_tests {
+    use super::*;
+
+    #[test]
+    fn run_returns_failed_status_after_writing_partial_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='/absent/lonewolf'\n[scenario]\nkind='idle'\nconnections=1",
+        )?;
+        let output = directory.path().join("output");
+        let status = Cli {
+            command: Command::Run {
+                config: config_path,
+                output: output.clone(),
+                server_binary: None,
+            },
+        }
+        .execute()?;
+        assert_eq!(status, 1);
+        assert!(output.join("result.json").is_file());
         Ok(())
     }
 }

@@ -27,7 +27,7 @@ lonewolf-metrics.workspace = true
 lonewolf-storage.workspace = true
 lonewolf-util.workspace = true
 lonewolf-xmpp.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["user"] }
 parking_lot.workspace = true
 prometheus-client.workspace = true
 rcgen.workspace = true

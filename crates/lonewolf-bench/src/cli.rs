@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    config::{RunConfig, absolute_path, normalize_dns, printable, validate_new_output},
+    config::{RunConfig, absolute_path, validate_new_output},
     error::{BenchError, BenchResult, ErrorCode},
 };
 use clap::{Parser, Subcommand};
@@ -88,24 +88,42 @@ impl Cli {
                         count,
                         output,
                     },
-            } => {
-                normalize_dns(&domain)?;
-                if !printable(&prefix, 128) || !(1..=crate::config::MAX_ACCOUNTS).contains(&count) {
-                    return Err(BenchError::new(
-                        ErrorCode::InvalidConfig,
-                        "invalid account generation parameters",
-                    ));
-                }
-                validate_new_output(&output)?;
-                Err(BenchError::staged())
-            }
+            } => crate::accounts::generate_credentials(&domain, &prefix, count, &output),
             Command::Compare { output, .. } => {
                 validate_new_output(&output)?;
                 Err(BenchError::staged())
             }
             Command::Accounts {
-                command: AccountsCommand::Provision { .. },
-            } => Err(BenchError::staged()),
+                command:
+                    AccountsCommand::Provision {
+                        socket,
+                        credentials,
+                    },
+            } => {
+                let result = (|| {
+                    let credentials =
+                        crate::accounts::CredentialSet::read(&credentials, None, None)?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| {
+                            BenchError::new(
+                                ErrorCode::Runtime,
+                                "cannot construct provisioning runtime",
+                            )
+                        })?;
+                    runtime.block_on(crate::accounts::provision_accounts(&socket, &credentials))
+                })();
+                let summary = result.map_err(|error| {
+                    let summary = error.provision_summary().unwrap_or_default();
+                    error.with_provision_summary(summary)
+                })?;
+                println!(
+                    "confirmed_created={}; uncertain_last_create={}",
+                    summary.confirmed_created, summary.uncertain_last_create
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -185,32 +203,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("new");
         let output = output.to_str().ok_or("test path encoding")?;
-        for args in [
-            vec![
-                "accounts",
-                "generate",
-                "--domain",
-                "localhost",
-                "--prefix",
-                "bench",
-                "--count",
-                "1",
-                "--output",
-                output,
-            ],
-            vec![
-                "accounts",
-                "provision",
-                "--socket",
-                "absent",
-                "--credentials",
-                "absent",
-            ],
-            vec!["compare", "absent", "absent", "--output", output],
-        ] {
-            let result = Cli::try_parse_from(std::iter::once("bench").chain(args))?.execute();
-            assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
-        }
+        let result =
+            Cli::try_parse_from(["bench", "compare", "absent", "absent", "--output", output])?
+                .execute();
+        assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
         let config_path = directory.path().join("config.toml");
         std::fs::write(
             &config_path,

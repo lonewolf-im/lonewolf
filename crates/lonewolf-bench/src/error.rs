@@ -34,15 +34,33 @@ impl ErrorCode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProvisionSummary {
+    pub confirmed_created: usize,
+    pub uncertain_last_create: bool,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct BenchError {
     pub code: ErrorCode,
     context: &'static str,
+    provision_summary: Option<ProvisionSummary>,
 }
 
 impl BenchError {
     pub const fn new(code: ErrorCode, context: &'static str) -> Self {
-        Self { code, context }
+        Self {
+            code,
+            context,
+            provision_summary: None,
+        }
+    }
+    pub const fn with_provision_summary(mut self, summary: ProvisionSummary) -> Self {
+        self.provision_summary = Some(summary);
+        self
+    }
+    pub const fn provision_summary(&self) -> Option<ProvisionSummary> {
+        self.provision_summary
     }
     pub const fn context(&self) -> &'static str {
         self.context
@@ -56,7 +74,15 @@ impl BenchError {
 }
 impl fmt::Display for BenchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code.as_str(), self.context)
+        write!(f, "{}: {}", self.code.as_str(), self.context)?;
+        if let Some(summary) = self.provision_summary {
+            write!(
+                f,
+                "; confirmed_created={}; uncertain_last_create={}",
+                summary.confirmed_created, summary.uncertain_last_create
+            )?;
+        }
+        Ok(())
     }
 }
 impl fmt::Debug for BenchError {

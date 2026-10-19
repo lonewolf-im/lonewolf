@@ -2,7 +2,6 @@
 
 use std::error::Error;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -268,7 +267,6 @@ fn scripted_server(
                 body.len()
             )?;
             stream.write_all(&body)?;
-            stream.shutdown(Shutdown::Write)?;
         }
         Ok(())
     }))

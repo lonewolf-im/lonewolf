@@ -300,12 +300,29 @@ impl<R: Read> XmlStream<R> {
     where
         R: CloseTransport,
     {
-        let error = self.receive()?;
-        error.assert_name(STREAM_NAMESPACE, "error");
-        assert_eq!(error.children.len(), 1, "{error:?}");
-        error.child(super::STREAM_ERRORS, condition)?;
-        self.expect_footer()?;
-        self.complete_close(true)
+        self.expect_stream_error_after_stanzas(condition, 0)
+    }
+
+    pub fn expect_stream_error_after_stanzas(
+        &mut self,
+        condition: &str,
+        max_stanzas: usize,
+    ) -> TestResult
+    where
+        R: CloseTransport,
+    {
+        for _ in 0..=max_stanzas {
+            let error = self.receive()?;
+            if error.namespace == STREAM_NAMESPACE && error.name == "error" {
+                assert_eq!(error.children.len(), 1, "{error:?}");
+                error.child(super::STREAM_ERRORS, condition)?;
+                self.expect_footer()?;
+                return self.complete_close(true);
+            }
+            assert_eq!(error.namespace, "jabber:client", "{error:?}");
+            assert_eq!(error.name, "presence", "{error:?}");
+        }
+        Err("stream error did not follow bounded notifications".into())
     }
 
     pub fn close(&mut self) -> TestResult

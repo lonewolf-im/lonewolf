@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::roster::RosterQuota;
+
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::thread;
@@ -26,7 +28,9 @@ pub(crate) fn uncommitted_writes_are_visible_only_inside_their_transaction<S: St
         writer
             .create_account(new_account("alice@example.com", 10)?)
             .await?;
-        let version = writer.put_roster_item(&alice, &bob_item).await?;
+        let version = writer
+            .put_roster_item(&alice, &bob_item, RosterQuota::default())
+            .await?;
         writer
             .put_pending_request(
                 &alice,
@@ -39,8 +43,16 @@ pub(crate) fn uncommitted_writes_are_visible_only_inside_their_transaction<S: St
             writer.accounts_after(None, NonZeroUsize::MAX).await?.len(),
             1
         );
-        assert_eq!(writer.roster(&alice).await?.version, version);
-        assert_eq!(writer.roster_item(&alice, &bob).await?, Some(bob_item));
+        assert_eq!(
+            writer.roster(&alice, RosterQuota::default()).await?.version,
+            version
+        );
+        assert_eq!(
+            writer
+                .roster_item(&alice, &bob, RosterQuota::default())
+                .await?,
+            Some(bob_item)
+        );
         assert_eq!(writer.pending_requests(&alice).await?.len(), 1);
         assert!(writer.pending_request(&alice, &bob).await?.is_some());
 
@@ -52,8 +64,20 @@ pub(crate) fn uncommitted_writes_are_visible_only_inside_their_transaction<S: St
                 .await?
                 .is_empty()
         );
-        assert_eq!(reader.roster(&alice).await?.version.get(), 0);
-        assert!(reader.roster_item(&alice, &bob).await?.is_none());
+        assert_eq!(
+            reader
+                .roster(&alice, RosterQuota::default())
+                .await?
+                .version
+                .get(),
+            0
+        );
+        assert!(
+            reader
+                .roster_item(&alice, &bob, RosterQuota::default())
+                .await?
+                .is_none()
+        );
         assert!(reader.pending_requests(&alice).await?.is_empty());
         assert!(reader.pending_request(&alice, &bob).await?.is_none());
 
@@ -61,7 +85,14 @@ pub(crate) fn uncommitted_writes_are_visible_only_inside_their_transaction<S: St
         assert!(reader.account(&alice).await?.is_none());
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_some());
-        assert_eq!(reader.roster(&alice).await?.version.get(), 1);
+        assert_eq!(
+            reader
+                .roster(&alice, RosterQuota::default())
+                .await?
+                .version
+                .get(),
+            1
+        );
         assert!(reader.pending_request(&alice, &bob).await?.is_some());
         Ok(())
     })
@@ -79,7 +110,11 @@ pub(crate) fn dropping_a_write_transaction_aborts_every_write<S: Storage>(
             .create_account(new_account("alice@example.com", 10)?)
             .await?;
         writer
-            .put_roster_item(&alice, &item("bob@example.com", None, &[])?)
+            .put_roster_item(
+                &alice,
+                &item("bob@example.com", None, &[])?,
+                RosterQuota::default(),
+            )
             .await?;
         writer.commit().await?;
 
@@ -90,7 +125,11 @@ pub(crate) fn dropping_a_write_transaction_aborts_every_write<S: Storage>(
             .create_account(new_account("bob@example.com", 20)?)
             .await?;
         writer
-            .put_roster_item(&bob, &item("alice@example.com", None, &[])?)
+            .put_roster_item(
+                &bob,
+                &item("alice@example.com", None, &[])?,
+                RosterQuota::default(),
+            )
             .await?;
         writer
             .put_pending_request(
@@ -105,10 +144,29 @@ pub(crate) fn dropping_a_write_transaction_aborts_every_write<S: Storage>(
 
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_some());
-        assert_eq!(reader.roster(&alice).await?.version.get(), 1);
-        assert!(reader.roster_item(&alice, &bob_jid).await?.is_some());
+        assert_eq!(
+            reader
+                .roster(&alice, RosterQuota::default())
+                .await?
+                .version
+                .get(),
+            1
+        );
+        assert!(
+            reader
+                .roster_item(&alice, &bob_jid, RosterQuota::default())
+                .await?
+                .is_some()
+        );
         assert!(reader.account(&bob).await?.is_none());
-        assert_eq!(reader.roster(&bob).await?.version.get(), 0);
+        assert_eq!(
+            reader
+                .roster(&bob, RosterQuota::default())
+                .await?
+                .version
+                .get(),
+            0
+        );
         assert!(reader.pending_requests(&bob).await?.is_empty());
         Ok(())
     })
@@ -124,7 +182,11 @@ pub(crate) fn commit_persists_account_and_roster_writes_together<S: Storage>(
         for owner in ["alice@example.com", "carol@example.com"] {
             writer.create_account(new_account(owner, 10)?).await?;
             writer
-                .put_roster_item(&key(owner)?, &item("bob@example.com", None, &[])?)
+                .put_roster_item(
+                    &key(owner)?,
+                    &item("bob@example.com", None, &[])?,
+                    RosterQuota::default(),
+                )
                 .await?;
             writer
                 .put_pending_request(
@@ -143,12 +205,19 @@ pub(crate) fn commit_persists_account_and_roster_writes_together<S: Storage>(
 
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_none());
-        let cleared = reader.roster(&alice).await?;
+        let cleared = reader.roster(&alice, RosterQuota::default()).await?;
         assert_eq!(cleared.version.get(), 0);
         assert!(cleared.items.is_empty());
         assert!(reader.pending_requests(&alice).await?.is_empty());
         assert!(reader.account(&carol).await?.is_some());
-        assert_eq!(reader.roster(&carol).await?.items.len(), 1);
+        assert_eq!(
+            reader
+                .roster(&carol, RosterQuota::default())
+                .await?
+                .items
+                .len(),
+            1
+        );
         assert_eq!(reader.pending_requests(&carol).await?.len(), 1);
         Ok(())
     })
@@ -166,14 +235,30 @@ pub(crate) fn a_read_transaction_keeps_its_snapshot_across_commits<S: Storage>(
 
         let mut writer = storage.begin_write().await?;
         writer.replace_credentials(&alice, credentials(20)).await?;
-        writer.put_roster_item(&alice, &update).await?;
+        writer
+            .put_roster_item(&alice, &update, RosterQuota::default())
+            .await?;
         writer.commit().await?;
 
         assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 13)?;
-        assert_eq!(reader.roster(&alice).await?.version.get(), 0);
+        assert_eq!(
+            reader
+                .roster(&alice, RosterQuota::default())
+                .await?
+                .version
+                .get(),
+            0
+        );
         let current = storage.begin_read().await?;
         assert_scram(current.scram(&alice, ScramHash::Sha256).await?, 23)?;
-        assert_eq!(current.roster(&alice).await?.version.get(), 1);
+        assert_eq!(
+            current
+                .roster(&alice, RosterQuota::default())
+                .await?
+                .version
+                .get(),
+            1
+        );
         Ok(())
     })
 }
@@ -260,7 +345,7 @@ pub(crate) fn transactions_can_be_driven_from_other_threads<S: Storage>(storage:
     on_worker(writer.create_account(new_account("alice@example.com", 10)?))??;
     on_worker(writer.replace_credentials(&alice, credentials(20)))??;
     assert_scram(on_worker(writer.scram(&alice, ScramHash::Sha256))??, 23)?;
-    on_worker(writer.put_roster_item(&alice, &bob))??;
+    on_worker(writer.put_roster_item(&alice, &bob, RosterQuota::default()))??;
     on_worker(writer.commit())??;
 
     let reader = on_worker(storage.begin_read())??;
@@ -274,7 +359,12 @@ pub(crate) fn transactions_can_be_driven_from_other_threads<S: Storage>(storage:
         on_worker(reader.accounts_after(None, NonZeroUsize::MAX))??.len(),
         1
     );
-    assert_eq!(on_worker(reader.roster(&alice))??.items.len(), 1);
+    assert_eq!(
+        on_worker(reader.roster(&alice, RosterQuota::default()))??
+            .items
+            .len(),
+        1
+    );
     Ok(())
 }
 

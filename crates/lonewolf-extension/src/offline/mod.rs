@@ -113,14 +113,15 @@ impl<A: ChunkAllocator, S: Storage> AccountHandler<A, S> for Offline {
         &'a self,
         transaction: &'a mut S::Write,
         account: &'a AccountKey,
+        _before: Arc<S::Read>,
         _hosts: &'a dyn HostLookup,
-    ) -> ExtensionFuture<'a, Result<Effects<A>, HandlerError>> {
+    ) -> ExtensionFuture<'a, Result<crate::Deliver<A>, HandlerError>> {
         Box::pin(async move {
             transaction
                 .clear_offline_messages(account)
                 .await
                 .map_err(|error| offline_error(error, "offline_clear"))?;
-            Ok(Effects::none())
+            Ok(Effects::none().deliver)
         })
     }
 }

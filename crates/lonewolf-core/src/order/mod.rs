@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -8,17 +8,10 @@ use futures_channel::oneshot;
 use lonewolf_storage::account::AccountKey;
 use parking_lot::Mutex as PlMutex;
 
-/// Orders deliveries per account by the moment each unit of work fixed its view of
-/// storage, so a client never learns of an older change after a newer one.
-///
-/// Work takes a numbered ticket for the accounts it addresses, under the same lock
-/// that commits its transaction or opens its snapshot. Deliveries run once the ticket
-/// is at the head of every account's line. A ticket waits only for smaller tickets, so
-/// waiting can never cycle.
+/// Orders deliveries by fixed storage view; deletion barriers also order unrelated accounts.
 pub(crate) struct Order {
     lines: PlMutex<Lines>,
-    /// Fixing a view and taking its ticket happen under this lock, so ticket order is
-    /// commit order even when the store lets writers commit concurrently.
+    /// Prevents a later commit from taking an earlier delivery ticket.
     fixing: async_lock::Mutex<()>,
 }
 
@@ -26,7 +19,8 @@ pub(crate) struct Order {
 struct Lines {
     next: u64,
     queues: HashMap<AccountKey, VecDeque<u64>>,
-    waiting: HashMap<u64, Waiting>,
+    waiting: BTreeMap<u64, Waiting>,
+    globals: BTreeSet<u64>,
 }
 
 struct Waiting {
@@ -34,7 +28,7 @@ struct Waiting {
     ready: Option<oneshot::Sender<()>>,
 }
 
-/// A place in the delivery order for a set of accounts; dropping it releases the place.
+/// Dropping a ticket releases its place without delivering its effects.
 pub(crate) struct Ticket {
     order: Arc<Order>,
     id: u64,
@@ -49,8 +43,7 @@ impl Order {
         })
     }
 
-    /// Runs `fix`, which commits a transaction or opens a snapshot, and takes the
-    /// ticket for `accounts` in the same step.
+    /// Fixes a storage view and its account ticket under one ordering lock.
     pub(crate) async fn fix<T, E>(
         self: &Arc<Self>,
         accounts: Vec<AccountKey>,
@@ -58,14 +51,27 @@ impl Order {
     ) -> Result<(T, Ticket), E> {
         let _fixing = self.fixing.lock().await;
         let value = fix.await?;
-        Ok((value, self.admit(accounts)))
+        Ok((value, self.admit(accounts, false)))
     }
 
-    fn admit(self: &Arc<Self>, accounts: Vec<AccountKey>) -> Ticket {
+    /// A deletion barrier waits for all older tickets and blocks all later deliveries.
+    pub(crate) async fn fix_all<T, E>(
+        self: &Arc<Self>,
+        fix: impl Future<Output = Result<T, E>>,
+    ) -> Result<(T, Ticket), E> {
+        let _fixing = self.fixing.lock().await;
+        let value = fix.await?;
+        Ok((value, self.admit(Vec::new(), true)))
+    }
+
+    fn admit(self: &Arc<Self>, accounts: Vec<AccountKey>, global: bool) -> Ticket {
         let (ready, readiness) = oneshot::channel();
         let mut lines = self.lines.lock();
         let id = lines.next;
         lines.next += 1;
+        if global {
+            lines.globals.insert(id);
+        }
         for account in &accounts {
             lines
                 .queues
@@ -93,21 +99,39 @@ impl Order {
         let Some(waiting) = lines.waiting.remove(&id) else {
             return;
         };
-        let mut heads = Vec::with_capacity(waiting.accounts.len());
+        let global = lines.globals.remove(&id);
         for account in &waiting.accounts {
             let Some(queue) = lines.queues.get_mut(account) else {
                 continue;
             };
             queue.retain(|ticket| *ticket != id);
-            match queue.front() {
-                Some(head) => heads.push(*head),
-                None => {
-                    lines.queues.remove(account);
-                }
+            let head = queue.front().copied();
+            if head.is_none() {
+                lines.queues.remove(account);
+            }
+            if let Some(head) = head {
+                lines.wake_if_first(head);
             }
         }
-        for head in heads {
-            lines.wake_if_first(head);
+        if !global {
+            if let Some(next) = lines.globals.first().copied() {
+                lines.wake_if_first(next);
+            }
+            return;
+        }
+        let mut after = None;
+        loop {
+            let next = match after {
+                None => lines.waiting.keys().next().copied(),
+                Some(last) => lines
+                    .waiting
+                    .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    .next()
+                    .map(|(&id, _)| id),
+            };
+            let Some(next) = next else { break };
+            lines.wake_if_first(next);
+            after = Some(next);
         }
     }
 }
@@ -117,6 +141,12 @@ impl Lines {
         let Some(waiting) = self.waiting.get(&id) else {
             return;
         };
+        if self.globals.range(..id).next().is_some() {
+            return;
+        }
+        if self.globals.contains(&id) && self.waiting.keys().next().copied() != Some(id) {
+            return;
+        }
         let first_everywhere = waiting
             .accounts
             .iter()
@@ -133,8 +163,7 @@ impl Lines {
 }
 
 impl Ticket {
-    /// Resolves once every earlier ticket for the same accounts has been released.
-    /// A dropped `turn` future keeps the place, so the wait can resume later.
+    /// Cancellation keeps the ticket in order so this wait can resume.
     pub(crate) async fn turn(&mut self) {
         if let Some(ready) = self.ready.as_mut() {
             let _ = ready.await;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_storage::roster::RosterQuota;
+
 use std::alloc::Layout;
 use std::error::Error;
 use std::num::NonZeroUsize;
@@ -267,9 +269,9 @@ fn remote_presence_without_roster_rejects_before_writer_admission_and_keeps_stat
             name: Some("Alice".into()),
             groups: Vec::new(),
             subscription: RosterSubscription { state: SubscriptionState::Both, pending_out: true, approved: true },
-        }).await?;
+        }, RosterQuota::default()).await?;
         transaction.commit().await?;
-        let before = fixture.storage.begin_read().await?.roster(owner).await?;
+        let before = fixture.storage.begin_read().await?.roster(owner, RosterQuota::default()).await?;
         let held = fixture.storage.begin_write().await?;
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         outbox.liveness = registration.liveness();
@@ -306,7 +308,7 @@ fn remote_presence_without_roster_rejects_before_writer_admission_and_keeps_stat
         }
         drop(session);
         drop(held);
-        let after = fixture.storage.begin_read().await?.roster(owner).await?;
+        let after = fixture.storage.begin_read().await?.roster(owner, RosterQuota::default()).await?;
         assert_eq!(after, before);
         assert_eq!(fixture.count().await?, 0);
         fixture.finish().await
@@ -1836,6 +1838,7 @@ fn iq_visibility_reads_prior_roster_revocation_while_delivery_waits_on_order() -
                         ..Default::default()
                     },
                 },
+                RosterQuota::default(),
             )
             .await?;
         transaction.commit().await?;
@@ -2061,7 +2064,9 @@ fn subscription_admission_linearizes_at_lookup_before_or_after_replacement() -> 
                     .await?
                     .is_empty()
             );
-            let roster = snapshot.roster(fixture.registration.account()).await?;
+            let roster = snapshot
+                .roster(fixture.registration.account(), RosterQuota::default())
+                .await?;
             assert_eq!(roster.version.get(), 2);
             assert!(!roster.items[0].subscription.pending_out);
             drop(snapshot);
@@ -2134,7 +2139,9 @@ fn subscription_admission_ignores_deleted_accounts_and_does_not_survive_rollback
             drop(tx);
             let snapshot = fixture.storage.begin_read().await?;
             assert_eq!(snapshot.pending_requests(target.account()).await?.len(), 1);
-            let roster = snapshot.roster(fixture.registration.account()).await?;
+            let roster = snapshot
+                .roster(fixture.registration.account(), RosterQuota::default())
+                .await?;
             assert_eq!(roster.version.get(), 1);
             assert!(roster.items[0].subscription.pending_out);
             assert!(fixture.registration.take_queued().is_empty());
@@ -2207,7 +2214,7 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
         );
         assert_eq!(
             snapshot
-                .roster(fixture.registration.account())
+                .roster(fixture.registration.account(), RosterQuota::default())
                 .await?
                 .version
                 .get(),
@@ -2228,14 +2235,12 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
                 &Default::default(),
                 &mut deletion,
                 target.account(),
+                Arc::new(fixture.storage.begin_read().await?),
                 &RouterDelivery::new(&router, &GlobalChunkAllocator, None),
             )
             .await
             .map_err(|error| format!("{error:?}"))?;
-        let ((), mut retirement) = router
-            .order()
-            .fix(cleanup.accounts, deletion.commit())
-            .await?;
+        let ((), mut retirement) = router.order().fix_all(deletion.commit()).await?;
         assert!(retirement.turn().now_or_never().is_none());
         drop(blocker);
         retirement.turn().await;
@@ -2247,7 +2252,7 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
             notification.stanza.resolve()?.stanza_type(),
             StanzaType::Presence(PresenceType::Unsubscribe)
         );
-        (cleanup.deliver)(&RouterDelivery::new(&router, &GlobalChunkAllocator, None)).await?;
+        cleanup(&RouterDelivery::new(&router, &GlobalChunkAllocator, None)).await?;
         router.retire_account(target.account()).await?;
         drop(retirement);
         fixture.work.drain().await;
@@ -2263,8 +2268,21 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
             .register(target.account(), Some("desk"), NonZeroUsize::MIN)
             .await?;
         let snapshot = fixture.storage.begin_read().await?;
-        assert!(snapshot.roster(target.account()).await?.items.is_empty());
-        assert_eq!(snapshot.roster(target.account()).await?.version.get(), 0);
+        assert!(
+            snapshot
+                .roster(target.account(), RosterQuota::default())
+                .await?
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot
+                .roster(target.account(), RosterQuota::default())
+                .await?
+                .version
+                .get(),
+            0
+        );
         assert!(
             snapshot
                 .pending_requests(target.account())
@@ -2375,7 +2393,7 @@ fn admitted_pending_withdrawal_keeps_healthy_effects_under_mailbox_pressure_and_
         );
         assert_eq!(
             snapshot
-                .roster(fixture.registration.account())
+                .roster(fixture.registration.account(), RosterQuota::default())
                 .await?
                 .version
                 .get(),

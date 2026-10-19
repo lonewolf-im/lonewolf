@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_storage::roster::RosterQuota;
+
 mod options;
 mod state;
 
@@ -46,6 +48,8 @@ struct TestRoster {
 #[derive(Default)]
 struct RecordingDelivery {
     tags: RefCell<Vec<SessionTag>>,
+    retired: RefCell<Vec<AccountKey>>,
+    retirement_unavailable: RefCell<Vec<usize>>,
     pushes: RefCell<Vec<String>>,
     controls: RefCell<Vec<String>>,
     unavailable: Cell<usize>,
@@ -55,7 +59,7 @@ struct RecordingDelivery {
 
 impl HostLookup for RecordingDelivery {
     fn is_local_host(&self, domain: &str) -> bool {
-        domain == "example.com"
+        domain == "example.com" || domain == "other.example"
     }
 }
 
@@ -102,7 +106,15 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         _: SessionTag,
         build: StanzaFactory<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
-        self.record_push(&format!("{}/desk", account.as_str()), build);
+        let result = self.record_push(&format!("{}/desk", account.as_str()), build);
+        Box::pin(async { result })
+    }
+
+    fn retire_tagged<'a>(&'a self, account: &'a AccountKey, _: SessionTag) -> DeliveryFuture<'a> {
+        self.retired.borrow_mut().push(account.clone());
+        self.retirement_unavailable
+            .borrow_mut()
+            .push(self.unavailable.get());
         Box::pin(async { Ok(()) })
     }
 
@@ -122,11 +134,15 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
 }
 
 impl RecordingDelivery {
-    fn record_push(&self, to: &str, mut build: StanzaFactory<GlobalChunkAllocator>) {
+    fn record_push(
+        &self,
+        to: &str,
+        mut build: StanzaFactory<GlobalChunkAllocator>,
+    ) -> Result<(), DeliveryError> {
         let mut arena =
             Arena::try_new(ArenaConfig::default()).unwrap_or_else(|error| panic!("{error}"));
         let to = Jid::parse_in(to, &mut arena).unwrap_or_else(|error| panic!("{error}"));
-        let push = build(to, &mut arena).unwrap_or_else(|error| panic!("{error}"));
+        let push = build(to, &mut arena)?;
         let mut xml = String::new();
         push.resolve(&arena)
             .and_then(|push| {
@@ -135,6 +151,7 @@ impl RecordingDelivery {
             })
             .unwrap_or_else(|error| panic!("{error}"));
         self.pushes.borrow_mut().push(xml);
+        Ok(())
     }
 }
 
@@ -148,7 +165,7 @@ fn roster() -> (tempfile::TempDir, TestRoster) {
 fn snapshot(roster: &TestRoster, owner: &AccountKey) -> RosterSnapshot {
     block_on(async {
         let transaction = roster.storage.begin_read().await?;
-        transaction.roster(owner).await
+        transaction.roster(owner, RosterQuota::default()).await
     })
     .unwrap_or_else(|error: RosterError| panic!("{error}"))
 }
@@ -156,7 +173,9 @@ fn snapshot(roster: &TestRoster, owner: &AccountKey) -> RosterSnapshot {
 fn item(roster: &TestRoster, owner: &AccountKey, jid: &RosterJid) -> Option<RosterItem> {
     block_on(async {
         let transaction = roster.storage.begin_read().await?;
-        transaction.roster_item(owner, jid).await
+        transaction
+            .roster_item(owner, jid, RosterQuota::default())
+            .await
     })
     .unwrap_or_else(|error: RosterError| panic!("{error}"))
 }
@@ -332,7 +351,9 @@ fn put_item(roster: &TestRoster, owner: &AccountKey, jid: &str) -> RosterVersion
     let item = subscribed(RosterJid::from(&account(jid)), SubscriptionState::None);
     block_on(async {
         let mut transaction = roster.storage.begin_write().await?;
-        let version = transaction.put_roster_item(owner, &item).await?;
+        let version = transaction
+            .put_roster_item(owner, &item, RosterQuota::default())
+            .await?;
         transaction.commit().await?;
         Ok::<_, RosterError>(version)
     })
@@ -639,12 +660,14 @@ fn only_the_initial_transition_collects_granted_contacts() {
             .put_roster_item(
                 &alice_account,
                 &subscribed(RosterJid::from(bob), SubscriptionState::To),
+                RosterQuota::default(),
             )
             .await?;
         transaction
             .put_roster_item(
                 &bob_account,
                 &subscribed(RosterJid::from(alice.bare()), SubscriptionState::From),
+                RosterQuota::default(),
             )
             .await?;
         transaction.commit().await.map_err(RosterError::from)
@@ -704,30 +727,35 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
             .put_roster_item(
                 alice,
                 &subscribed(RosterJid::from(bob), SubscriptionState::To),
+                RosterQuota::default(),
             )
             .await?;
         repository
             .put_roster_item(
                 bob,
                 &subscribed(RosterJid::from(alice), SubscriptionState::From),
+                RosterQuota::default(),
             )
             .await?;
         repository
             .put_roster_item(
                 alice,
                 &subscribed(RosterJid::from(carol), SubscriptionState::Both),
+                RosterQuota::default(),
             )
             .await?;
         repository
             .put_roster_item(
                 carol,
                 &subscribed(RosterJid::from(alice), SubscriptionState::Both),
+                RosterQuota::default(),
             )
             .await?;
         repository
             .put_roster_item(
                 alice,
                 &subscribed(RosterJid::from(dave), SubscriptionState::Both),
+                RosterQuota::default(),
             )
             .await?;
         repository.commit().await.map_err(RosterError::from)
@@ -745,6 +773,7 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
             &Roster::default(),
             &mut transaction,
             alice,
+            Arc::new(roster.storage.begin_read().await?),
             &delivery,
         )
         .await
@@ -753,11 +782,7 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
         Ok::<_, Box<dyn std::error::Error>>(effects)
     })
     .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(
-        names(&effects.accounts),
-        ["alice@example.com", "bob@example.com", "carol@example.com"]
-    );
-    let result = block_on((effects.deliver)(&delivery));
+    let result = block_on(effects(&delivery));
     assert!(result.is_err(), "{result:?}");
 
     let alice_roster = snapshot(&roster, alice);
@@ -795,6 +820,7 @@ fn visibility_uses_owner_grant_and_keeps_its_read_snapshot() {
             .put_roster_item(
                 &observer,
                 &subscribed(RosterJid::from(&owner), SubscriptionState::Both),
+                RosterQuota::default(),
             )
             .await?;
         transaction.commit().await?;
@@ -813,7 +839,11 @@ fn visibility_uses_owner_grant_and_keeps_its_read_snapshot() {
         ] {
             let mut transaction = roster.storage.begin_write().await?;
             transaction
-                .put_roster_item(&owner, &subscribed(RosterJid::from(&observer), state))
+                .put_roster_item(
+                    &owner,
+                    &subscribed(RosterJid::from(&observer), state),
+                    RosterQuota::default(),
+                )
                 .await?;
             transaction.commit().await?;
             let snapshot = roster.storage.begin_read().await?;
@@ -866,7 +896,9 @@ fn probe_visibility_preserves_pending_requests_preapproval_and_versions()
         let mut item = subscribed(RosterJid::from(&observer), SubscriptionState::None);
         item.subscription.approved = true;
         item.subscription.pending_out = true;
-        transaction.put_roster_item(&owner, &item).await?;
+        transaction
+            .put_roster_item(&owner, &item, RosterQuota::default())
+            .await?;
         transaction
             .put_pending_request(
                 &owner,
@@ -879,7 +911,7 @@ fn probe_visibility_preserves_pending_requests_preapproval_and_versions()
             .await?;
         transaction.commit().await?;
         let transaction = roster.storage.begin_read().await?;
-        let before = transaction.roster(&owner).await?;
+        let before = transaction.roster(&owner, RosterQuota::default()).await?;
         let pending = transaction.pending_requests(&owner).await?;
         let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
         catalog.register(Arc::new(Roster::default()))?;
@@ -900,7 +932,10 @@ fn probe_visibility_preserves_pending_requests_preapproval_and_versions()
             .await
             .map_err(|error| format!("{error:?}"))?
         );
-        assert_eq!(transaction.roster(&owner).await?, before);
+        assert_eq!(
+            transaction.roster(&owner, RosterQuota::default()).await?,
+            before
+        );
         assert_eq!(transaction.pending_requests(&owner).await?, pending);
         Ok(())
     })
@@ -924,11 +959,13 @@ fn withdrawal_effects_notify_pending_contacts_only_after_commit()
                 tx.put_roster_item(
                     &bob,
                     &subscribed(RosterJid::from(&alice), SubscriptionState::From),
+                    RosterQuota::default(),
                 )
                 .await?;
                 tx.put_roster_item(
                     &alice,
                     &subscribed(RosterJid::from(&bob), SubscriptionState::To),
+                    RosterQuota::default(),
                 )
                 .await?;
                 tx.commit().await?;
@@ -1057,13 +1094,18 @@ impl lonewolf_storage::account::AccountReads for FailingReads {
 }
 
 impl RosterReads for FailingReads {
-    async fn roster(&self, _owner: &AccountKey) -> Result<RosterSnapshot, RosterError> {
+    async fn roster(
+        &self,
+        _owner: &AccountKey,
+        _quota: lonewolf_storage::roster::RosterQuota,
+    ) -> Result<RosterSnapshot, RosterError> {
         Err(read_failure(self.0).into())
     }
     async fn roster_item(
         &self,
         _owner: &AccountKey,
         _jid: &RosterJid,
+        _quota: lonewolf_storage::roster::RosterQuota,
     ) -> Result<Option<RosterItem>, RosterError> {
         Err(read_failure(self.0).into())
     }
@@ -1078,6 +1120,51 @@ impl RosterReads for FailingReads {
         _owner: &AccountKey,
         _sender: &RosterJid,
     ) -> Result<Option<PendingSubscription>, RosterError> {
+        Err(read_failure(self.0).into())
+    }
+    async fn roster_version(
+        &self,
+        _: &AccountKey,
+    ) -> Result<lonewolf_storage::roster::RosterVersion, lonewolf_storage::roster::RosterError>
+    {
+        Err(read_failure(self.0).into())
+    }
+    async fn roster_subscription(
+        &self,
+        _: &AccountKey,
+        _: &lonewolf_storage::roster::RosterJid,
+    ) -> Result<
+        Option<lonewolf_storage::roster::RosterSubscription>,
+        lonewolf_storage::roster::RosterError,
+    > {
+        Err(read_failure(self.0).into())
+    }
+    async fn next_roster_subscription(
+        &self,
+        _: &AccountKey,
+        _: Option<&lonewolf_storage::roster::RosterJid>,
+    ) -> Result<
+        Option<(
+            lonewolf_storage::roster::RosterJid,
+            lonewolf_storage::roster::RosterSubscription,
+        )>,
+        lonewolf_storage::roster::RosterError,
+    > {
+        Err(read_failure(self.0).into())
+    }
+    async fn next_pending_sender(
+        &self,
+        _: &AccountKey,
+        _: Option<&lonewolf_storage::roster::RosterJid>,
+    ) -> Result<Option<lonewolf_storage::roster::RosterJid>, lonewolf_storage::roster::RosterError>
+    {
+        Err(read_failure(self.0).into())
+    }
+    async fn pending_request_exists(
+        &self,
+        _: &AccountKey,
+        _: &lonewolf_storage::roster::RosterJid,
+    ) -> Result<bool, lonewolf_storage::roster::RosterError> {
         Err(read_failure(self.0).into())
     }
 }
@@ -1181,7 +1268,9 @@ fn sender_preapproval_preserves_fields_and_rolls_back_before_commit()
         stored.subscription.pending_out = true;
         block_on(async {
             let mut transaction = roster.storage.begin_write().await?;
-            transaction.put_roster_item(&owner, &stored).await?;
+            transaction
+                .put_roster_item(&owner, &stored, RosterQuota::default())
+                .await?;
             transaction.commit().await?;
             Ok::<_, Box<dyn std::error::Error>>(())
         })?;
@@ -1266,7 +1355,12 @@ fn sender_preapproval_preserves_fields_and_rolls_back_before_commit()
                     .await?
                     .is_none()
             );
-            assert!(read.roster(&account(target)).await?.items.is_empty());
+            assert!(
+                read.roster(&account(target), RosterQuota::default())
+                    .await?
+                    .items
+                    .is_empty()
+            );
             assert!(read.pending_requests(&account(target)).await?.is_empty());
             Ok::<_, Box<dyn std::error::Error>>(())
         })?;
@@ -1297,7 +1391,11 @@ fn sender_hook_classifies_grants_pending_requests_and_target_forms_without_write
                     let mut transaction = roster.storage.begin_write().await?;
                     if let Some(state) = state {
                         transaction
-                            .put_roster_item(&owner, &subscribed(contact.clone(), state))
+                            .put_roster_item(
+                                &owner,
+                                &subscribed(contact.clone(), state),
+                                RosterQuota::default(),
+                            )
                             .await?;
                     }
                     if has_pending {
@@ -1339,8 +1437,20 @@ fn sender_hook_classifies_grants_pending_requests_and_target_forms_without_write
                         }
                     }
                     if should_continue || granted || kind == PresenceRequestType::Unsubscribed {
-                        assert_eq!(transaction.roster(&owner).await?.version, before.version);
-                        assert_eq!(transaction.roster(&owner).await?.items, before.items);
+                        assert_eq!(
+                            transaction
+                                .roster(&owner, RosterQuota::default())
+                                .await?
+                                .version,
+                            before.version
+                        );
+                        assert_eq!(
+                            transaction
+                                .roster(&owner, RosterQuota::default())
+                                .await?
+                                .items,
+                            before.items
+                        );
                     }
                     transaction.commit().await?;
                     Ok::<_, Box<dyn std::error::Error>>(())
@@ -1355,15 +1465,27 @@ fn sender_hook_classifies_grants_pending_requests_and_target_forms_without_write
                     let call = SubscribeCall::new("alice@example.com/desk", target);
                     block_on(async {
                         let mut transaction = roster.storage.begin_write().await?;
-                        let before = transaction.roster(&owner).await?;
+                        let before = transaction.roster(&owner, RosterQuota::default()).await?;
                         assert!(matches!(
                             sender_hook(&call, kind, &mut transaction, &delivery)
                                 .await
                                 .map_err(|error| format!("{error:?}"))?,
                             PresenceSend::Continue
                         ));
-                        assert_eq!(transaction.roster(&owner).await?.version, before.version);
-                        assert_eq!(transaction.roster(&owner).await?.items, before.items);
+                        assert_eq!(
+                            transaction
+                                .roster(&owner, RosterQuota::default())
+                                .await?
+                                .version,
+                            before.version
+                        );
+                        assert_eq!(
+                            transaction
+                                .roster(&owner, RosterQuota::default())
+                                .await?
+                                .items,
+                            before.items
+                        );
                         Ok::<_, Box<dyn std::error::Error>>(())
                     })?;
                 }
@@ -1446,10 +1568,416 @@ fn sender_hook_creates_only_preapprovals_and_requires_a_live_sender()
                 Err(HandlerError::Stanza(StanzaErrorCondition::Forbidden))
             ));
         }
-        assert!(transaction.roster(&owner).await?.items.is_empty());
+        assert!(
+            transaction
+                .roster(&owner, RosterQuota::default())
+                .await?
+                .items
+                .is_empty()
+        );
         transaction.commit().await?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
     assert_eq!(delivery.pushes.borrow().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn default_roster_quota_fits_response_arena_with_group_and_escape_expansion()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lonewolf_storage::roster::{MAX_GROUPS_PER_ITEM, RosterQuota};
+    for skewed in [false, true] {
+        let mut items = Vec::new();
+        let mut bytes = 0usize;
+        for i in 0..1000 {
+            let jid = RosterJid::from(&account(&format!("contact{i:04}@example.com")));
+            let mut item = subscribed(jid, SubscriptionState::Both);
+            item.subscription.pending_out = true;
+            item.subscription.approved = true;
+            item.groups = (0..MAX_GROUPS_PER_ITEM)
+                .map(|_| Box::<str>::from("<&\"'\t\n"))
+                .collect();
+            bytes += "owner@example.com".len()
+                + 1
+                + item.jid.as_str().len()
+                + 10
+                + item.groups.iter().map(|g| 4 + g.len()).sum::<usize>();
+            items.push(item);
+        }
+        let remaining = RosterQuota::default().max_bytes.get() - bytes;
+        if skewed {
+            items[0].name = Some("&".repeat(remaining).into_boxed_str());
+        } else {
+            for item in &mut items {
+                item.name = Some("&".repeat(remaining / 1000).into_boxed_str());
+            }
+        }
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        let query = super::xml::build_response(items, Some(RosterVersion::new(1)), &mut arena)
+            .map_err(|e| format!("{e:?}"))?;
+        let mut xml = String::new();
+        query.resolve(&arena)?.write_xml(&mut xml)?;
+        assert!(arena.stats().reserved_bytes <= lonewolf_util::arena::DEFAULT_MAX_RESERVED_BYTES);
+        assert!(xml.len() > RosterQuota::default().max_bytes.get());
+    }
+    Ok(())
+}
+
+#[test]
+fn cleanup_replays_pinned_metadata_once_for_overlap_and_pending_only_contacts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, fixture) = roster();
+    let alice = account("alice@example.com");
+    let bob = account("bob@example.com");
+    let carol = account("carol@example.com");
+    for owner in [&alice, &bob, &carol] {
+        create_account(&fixture, owner);
+    }
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        for contact in [
+            "alice@example.com",
+            "bob@example.com",
+            "missing@example.com",
+            "remote@remote.invalid",
+        ] {
+            tx.put_roster_item(
+                &alice,
+                &subscribed(RosterJid::from(&account(contact)), SubscriptionState::Both),
+                Default::default(),
+            )
+            .await?;
+        }
+        let mut bob_item = subscribed(RosterJid::from(&alice), SubscriptionState::Both);
+        bob_item.name = Some("Before".into());
+        tx.put_roster_item(&bob, &bob_item, Default::default())
+            .await?;
+        tx.put_roster_item(
+            &carol,
+            &subscribed(RosterJid::from(&alice), SubscriptionState::Both),
+            Default::default(),
+        )
+        .await?;
+        for sender in [&bob, &carol] {
+            tx.put_pending_request(
+                &alice,
+                PendingSubscription {
+                    sender: RosterJid::from(sender),
+                    stanza: b"pending".as_slice().into(),
+                },
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    let delivery = RecordingDelivery::default();
+    let deliver = block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        let before = Arc::new(fixture.storage.begin_read().await?);
+        tx.delete_account(&alice).await?;
+        let deliver = TestAccountHandler::forget_account(
+            &Roster::default(),
+            &mut tx,
+            &alice,
+            before,
+            &delivery,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(deliver)
+    })?;
+    assert_eq!(snapshot(&fixture, &bob).version.get(), 2);
+    assert_eq!(snapshot(&fixture, &carol).version.get(), 2);
+    assert_eq!(
+        item(&fixture, &carol, &RosterJid::from(&alice))
+            .ok_or("missing")?
+            .subscription
+            .state,
+        SubscriptionState::From
+    );
+    assert!(pending(&fixture, &alice).is_empty());
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        let mut changed = subscribed(RosterJid::from(&alice), SubscriptionState::None);
+        changed.name = Some("After".into());
+        tx.put_roster_item(&bob, &changed, Default::default())
+            .await?;
+        tx.commit().await?;
+        deliver(&delivery).await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    let pushes = delivery.pushes.borrow();
+    assert_eq!(pushes.len(), 2);
+    assert!(pushes[0].contains("Before"));
+    assert!(!pushes[0].contains("After"));
+    assert!(pushes.iter().all(|push| push.contains("roster-2")));
+    assert_eq!(delivery.controls.borrow().len(), 3);
+    Ok(())
+}
+
+#[test]
+fn current_version_get_skips_legacy_metadata_and_uses_its_consistent_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
+    let (_directory, fixture) = roster();
+    let owner = account("alice@example.com");
+    create_account(&fixture, &owner);
+    let first = put_item(&fixture, &owner, "bob@example.com");
+    let policy = Roster::new(BTreeMap::from([(
+        "example.com".into(),
+        super::RosterLimits {
+            max_items: NonZeroUsize::MIN,
+            max_bytes: NonZeroUsize::MIN,
+            ..Default::default()
+        },
+    )]));
+    let before = block_on(fixture.storage.begin_read())?;
+    put_item(&fixture, &owner, "carol@example.com");
+    block_on(async {
+        let mut call = IqCall::versioned(&first.get().to_string());
+        let sender = call.sender.resolve(&call.request)?;
+        let payload = call.query.resolve(&call.request)?;
+        let discovery = Discovery::default();
+        let request = IqRequest {
+            sender,
+            target: sender.bare(),
+            discovery: &discovery,
+            payload,
+        };
+        let reply = <Roster as IqHandler<GlobalChunkAllocator, RedbStorage>>::get(
+            &policy,
+            request,
+            &before,
+            &mut call.response,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        assert!(reply.payload.is_none());
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+#[test]
+fn cleanup_quota_retirement_uses_counterpart_host_and_continues()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
+    let (_directory, fixture) = roster();
+    let alice = account("alice@example.com");
+    let bob = account("bob@example.com");
+    let carol = account("carol@other.example");
+    for owner in [&alice, &bob, &carol] {
+        create_account(&fixture, owner);
+    }
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        for contact in [&bob, &carol] {
+            tx.put_roster_item(
+                &alice,
+                &subscribed(RosterJid::from(contact), SubscriptionState::Both),
+                Default::default(),
+            )
+            .await?;
+            tx.put_roster_item(
+                contact,
+                &subscribed(RosterJid::from(&alice), SubscriptionState::Both),
+                Default::default(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    let policy = Roster::new(BTreeMap::from([(
+        "example.com".into(),
+        super::RosterLimits {
+            max_bytes: NonZeroUsize::MIN,
+            ..Default::default()
+        },
+    )]));
+    let delivery = RecordingDelivery::default();
+    let deliver = block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        let before = Arc::new(fixture.storage.begin_read().await?);
+        tx.delete_account(&alice).await?;
+        let deliver =
+            TestAccountHandler::forget_account(&policy, &mut tx, &alice, before, &delivery)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(deliver)
+    })?;
+    block_on(deliver(&delivery))?;
+    assert_eq!(*delivery.retired.borrow(), vec![bob.clone()]);
+    let pushes = delivery.pushes.borrow();
+    assert_eq!(pushes.len(), 1);
+    assert!(pushes[0].contains("carol@other.example/desk"));
+    assert_eq!(delivery.controls.borrow().len(), 4);
+    assert_eq!(snapshot(&fixture, &bob).version.get(), 2);
+    assert_eq!(snapshot(&fixture, &carol).version.get(), 2);
+    Ok(())
+}
+
+#[test]
+fn legacy_transition_retirements_follow_notifications_and_survive_delivery_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
+    for fail in [false, true] {
+        for kind in [
+            PresenceRequestType::Unsubscribe,
+            PresenceRequestType::Unsubscribed,
+        ] {
+            let (_directory, fixture) = roster();
+            let alice = account("alice@example.com");
+            let bob = account("bob@example.com");
+            for owner in [&alice, &bob] {
+                create_account(&fixture, owner);
+            }
+            block_on(async {
+                let mut tx = fixture.storage.begin_write().await?;
+                for (owner, contact) in [(&alice, &bob), (&bob, &alice)] {
+                    let mut item = subscribed(RosterJid::from(contact), SubscriptionState::Both);
+                    item.name = Some("x".repeat(256).into_boxed_str());
+                    tx.put_roster_item(owner, &item, Default::default()).await?;
+                    tx.put_pending_request(
+                        owner,
+                        PendingSubscription {
+                            sender: RosterJid::from(contact),
+                            stanza: b"pending".as_slice().into(),
+                        },
+                        NonZeroUsize::new(10).ok_or("invalid")?,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+            let policy = Roster::new(BTreeMap::from([(
+                "example.com".into(),
+                super::RosterLimits {
+                    max_bytes: NonZeroUsize::new(128).ok_or("invalid")?,
+                    ..Default::default()
+                },
+            )]));
+            let delivery = RecordingDelivery {
+                failing_deliveries: Cell::new(usize::from(fail)),
+                ..Default::default()
+            };
+            let call = SubscribeCall::new("alice@example.com/desk", "bob@example.com");
+            let effects = block_on(async {
+                let mut tx = fixture.storage.begin_write().await?;
+                let view = call.stanza.resolve()?;
+                let effects = TestPresenceHandler::receive(
+                    &policy,
+                    PresenceRequest {
+                        kind,
+                        sender: view.from()?.ok_or("missing")?,
+                        target: view.to()?.ok_or("missing")?,
+                        stanza: &call.stanza,
+                    },
+                    &mut tx,
+                    &delivery,
+                )
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+                tx.commit().await?;
+                Ok::<_, Box<dyn std::error::Error>>(effects)
+            })?;
+            let result = block_on((effects.deliver)(&delivery));
+            assert_eq!(result.is_err(), fail);
+            let retired = delivery.retired.borrow();
+            assert_eq!(retired.len(), 2);
+            assert!(
+                delivery
+                    .retirement_unavailable
+                    .borrow()
+                    .iter()
+                    .all(|count| *count == delivery.unavailable.get())
+            );
+            assert!(retired.contains(&alice));
+            assert!(retired.contains(&bob));
+            assert!(delivery.pushes.borrow().is_empty());
+            for owner in [&alice, &bob] {
+                let current = snapshot(&fixture, owner);
+                assert_eq!(current.version.get(), 2);
+                assert_eq!(
+                    current.items[0].name.as_deref(),
+                    Some("x".repeat(256).as_str())
+                );
+            }
+            let pending_owner = if kind == PresenceRequestType::Unsubscribe {
+                &bob
+            } else {
+                &alice
+            };
+            assert!(pending(&fixture, pending_owner).is_empty());
+            assert_eq!(
+                delivery.unavailable.get(),
+                usize::from(kind == PresenceRequestType::Unsubscribed || !fail)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn legacy_self_preapproval_transitions_twice_and_retires_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, fixture) = roster();
+    let owner = account("alice@example.com");
+    create_account(&fixture, &owner);
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        let mut item = subscribed(RosterJid::from(&owner), SubscriptionState::None);
+        item.name = Some("x".repeat(256).into_boxed_str());
+        item.subscription.approved = true;
+        tx.put_roster_item(&owner, &item, Default::default())
+            .await?;
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    let policy = Roster::new(std::collections::BTreeMap::from([(
+        "example.com".into(),
+        super::RosterLimits {
+            max_bytes: std::num::NonZeroUsize::new(128).ok_or("invalid")?,
+            ..Default::default()
+        },
+    )]));
+    let delivery = RecordingDelivery::default();
+    let call = SubscribeCall::new("alice@example.com/desk", "alice@example.com");
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        let view = call.stanza.resolve()?;
+        let effects = TestPresenceHandler::receive(
+            &policy,
+            PresenceRequest {
+                kind: PresenceRequestType::Subscribe,
+                sender: view.from()?.ok_or("missing")?,
+                target: view.to()?.ok_or("missing")?,
+                stanza: &call.stanza,
+            },
+            &mut tx,
+            &delivery,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        tx.commit().await?;
+        (effects.deliver)(&delivery).await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    let current = snapshot(&fixture, &owner);
+    assert_eq!(current.version.get(), 3);
+    assert_eq!(current.items[0].subscription.state, SubscriptionState::Both);
+    assert!(!current.items[0].subscription.approved);
+    assert_eq!(
+        current.items[0].name.as_deref(),
+        Some("x".repeat(256).as_str())
+    );
+    assert_eq!(*delivery.retired.borrow(), vec![owner]);
     Ok(())
 }

@@ -12,7 +12,6 @@ use lonewolf_xmpp::stanza::{
 use super::NAMESPACE;
 use crate::delivery::DeliveryError;
 
-/// The user-managed fields of one item, as a roster set carries them.
 pub(super) struct RosterItemUpdate {
     pub(super) jid: RosterJid,
     pub(super) name: Option<Box<str>>,
@@ -24,7 +23,6 @@ pub(super) enum RosterSet {
     Remove(RosterJid),
 }
 
-/// Checks a roster get and returns the version the client holds, when it sent one.
 pub(super) fn parse_get<'a, A: ChunkAllocator>(
     payload: ElementRef<'a, Arena<A>>,
 ) -> Result<Option<&'a str>, StanzaErrorCondition> {
@@ -116,7 +114,6 @@ pub(super) fn parse_set<A: ChunkAllocator>(
     Ok(RosterSet::Update(RosterItemUpdate { jid, name, groups }))
 }
 
-/// Builds the full roster, stamped with `version` when the client asked for versioning.
 pub(super) fn build_response<A: ChunkAllocator>(
     items: Vec<RosterItem>,
     version: Option<RosterVersion>,
@@ -125,28 +122,26 @@ pub(super) fn build_response<A: ChunkAllocator>(
     let mut built = Vec::with_capacity(items.len());
     for item in items {
         built.push(
-            build_item(&item, response).map_err(|_| StanzaErrorCondition::InternalServerError)?,
+            build_item(&item, response).map_err(|_| StanzaErrorCondition::ResourceConstraint)?,
         );
     }
     let mut query = Element::builder_in("query", NAMESPACE, response)
-        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        .map_err(|_| StanzaErrorCondition::ResourceConstraint)?;
     if let Some(version) = version {
         query = query
             .attribute("ver", "", &version.get().to_string())
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            .map_err(|_| StanzaErrorCondition::ResourceConstraint)?;
     }
     for item in built {
         query = query
             .child(item)
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            .map_err(|_| StanzaErrorCondition::ResourceConstraint)?;
     }
     query
         .build()
-        .map_err(|_| StanzaErrorCondition::InternalServerError)
+        .map_err(|_| StanzaErrorCondition::ResourceConstraint)
 }
 
-/// Wraps one roster item in the push addressed to `to`, stamped with the version the
-/// change produced.
 pub(super) fn build_push<A: ChunkAllocator>(
     to: Jid,
     item: Element,
@@ -177,7 +172,6 @@ pub(super) fn build_removed_item<A: ChunkAllocator>(
         .build()
 }
 
-/// Builds the `unsubscribe` and `unsubscribed` presence from `owner` to `contact`.
 pub(super) fn subscription_withdrawals<A: ChunkAllocator>(
     owner: &AccountKey,
     contact: &AccountKey,
@@ -208,7 +202,6 @@ pub(super) fn subscription_withdrawals<A: ChunkAllocator>(
     ))
 }
 
-/// Builds the `subscribed` reply the server sends on behalf of the request target.
 pub(super) fn approval_reply<A: ChunkAllocator>(
     request: &RoutedStanza<A>,
     mut arena: Arena<A>,

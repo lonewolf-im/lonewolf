@@ -55,10 +55,17 @@ pub struct RedbRead {
 /// The store's open write transaction; operations and the commit run on the writer thread.
 /// Being the only one open keeps everything it reads stable until it commits.
 pub struct RedbWrite {
+    inner: Arc<Inner>,
     transaction: Arc<RedbWriteTransaction>,
     writes: BlockingExecutor,
     _writer: MutexGuardArc<()>,
     metrics: Arc<StoreMetrics>,
+}
+
+impl RedbRead {
+    pub(crate) fn snapshot(&self) -> Arc<RedbReadTransaction> {
+        Arc::clone(&self.transaction)
+    }
 }
 
 impl RedbStorage {
@@ -166,6 +173,7 @@ impl Storage for RedbStorage {
             .write_wait_duration()
             .observe(started.elapsed().as_secs_f64());
         Ok(RedbWrite {
+            inner: Arc::clone(&self.inner),
             transaction: Arc::new(transaction),
             writes: self.inner.writes.clone(),
             _writer: writer,
@@ -189,6 +197,19 @@ impl RedbRead {
 }
 
 impl RedbWrite {
+    pub(crate) fn run_with_snapshot<T: Send + 'static, E: From<StorageError> + Send + 'static>(
+        &self,
+        operation: impl FnOnce(&RedbWriteTransaction, &RedbReadTransaction) -> Result<T, E>
+        + Send
+        + 'static,
+    ) -> impl Future<Output = Result<T, E>> + Send {
+        let inner = Arc::clone(&self.inner);
+        self.run(move |transaction| {
+            let before = inner.database.begin_read().map_err(storage_error)?;
+            operation(transaction, &before)
+        })
+    }
+
     pub(crate) fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&RedbWriteTransaction) -> T + Send + 'static,
@@ -208,6 +229,7 @@ impl WriteTransaction for RedbWrite {
             writes,
             _writer,
             metrics,
+            inner: _,
         } = self;
         // An operation future dropped before it finished may still hold the
         // transaction on the writer thread; committing around it is unsafe.

@@ -177,6 +177,10 @@ impl Delivery<GlobalChunkAllocator> for NoDelivery {
         Box::pin(async { Ok(()) })
     }
 
+    fn retire_tagged<'a>(&'a self, _: &'a AccountKey, _: SessionTag) -> DeliveryFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn current_presence<'a>(&'a self, _: &'a AccountKey, _: &'a AccountKey) -> DeliveryFuture<'a> {
         Box::pin(async { Ok(()) })
     }

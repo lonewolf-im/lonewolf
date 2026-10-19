@@ -491,10 +491,15 @@ fn forgetting_account_clears_messages_and_the_sequence_in_the_deletion_transacti
         let mut transaction = test.storage.begin_write().await?;
         transaction.delete_account(&owner).await?;
         let effects = extension
-            .forget_account(&mut transaction, &owner, &test)
+            .forget_account(
+                &mut transaction,
+                &owner,
+                std::sync::Arc::new(test.storage.begin_read().await?),
+                &test,
+            )
             .await
             .map_err(|error| format!("{error:?}"))?;
-        assert!(effects.accounts.is_empty());
+        drop(effects);
         assert_eq!(transaction.offline_count(&owner).await?, 0);
         transaction.commit().await?;
         assert!(test.backlog(&owner).await?.is_none());

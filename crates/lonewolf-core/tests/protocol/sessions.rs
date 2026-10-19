@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_storage::roster::RosterQuota;
+
 use crate::support::PASSWORD;
 
 use std::fs;
@@ -133,6 +135,7 @@ fn seed_mutual_subscription(directory: &Path) -> TestResult {
                             approved: false,
                         },
                     },
+                    RosterQuota::default(),
                 )
                 .await?;
         }

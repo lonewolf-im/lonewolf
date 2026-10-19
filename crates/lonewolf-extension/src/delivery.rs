@@ -184,6 +184,9 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
         build: StanzaFactory<A>,
     ) -> DeliveryFuture<'a>;
 
+    /// Evicts tagged resources whose committed roster state cannot be sent safely.
+    fn retire_tagged<'a>(&'a self, account: &'a AccountKey, tag: SessionTag) -> DeliveryFuture<'a>;
+
     /// Delivers the presence of every available resource of `from` to `to`.
     fn current_presence<'a>(
         &'a self,

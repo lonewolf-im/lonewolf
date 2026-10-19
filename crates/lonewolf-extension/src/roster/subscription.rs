@@ -1,20 +1,63 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
-use lonewolf_storage::WriteTransaction;
 use lonewolf_storage::account::{AccountKey, AccountReads};
-use lonewolf_storage::roster::RosterJid;
+use lonewolf_storage::roster::{
+    RosterError, RosterJid, RosterMutation, RosterReads, RosterSubscription, RosterVersion,
+    SubscriptionState,
+};
+use lonewolf_storage::{ReadTransaction, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
 use super::state::{self, Cancellation, Removal, RequestOutcome, grants};
-use super::{account_exists, push_removal, push_roster, require_account, roster_error, xml};
+use super::{
+    account_exists, push_change, push_removal, push_roster, require_account, roster_error, xml,
+};
 use crate::Effects;
 use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
 use crate::presence::{PresenceRequest, PresenceRequestType, PresenceSend};
 
+#[derive(Default)]
+struct Retirements {
+    accounts: Vec<AccountKey>,
+}
+
+impl Retirements {
+    fn extract(&mut self, owner: &AccountKey, change: &mut state::ItemMutation) {
+        if matches!(change, Some(state::ItemChange::Unavailable { .. })) {
+            if !self.accounts.contains(owner) {
+                if self.accounts.is_empty() {
+                    self.accounts.reserve_exact(2);
+                }
+                self.accounts.push(owner.clone());
+            }
+            *change = None;
+        }
+    }
+
+    async fn finish<A: ChunkAllocator>(
+        self,
+        result: Result<(), DeliveryError>,
+        delivery: &dyn Delivery<A>,
+    ) -> Result<(), DeliveryError> {
+        let mut failure = result.err();
+        for account in self.accounts {
+            if let Err(error) = delivery
+                .retire_tagged(&account, SessionTag::Interested)
+                .await
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
 pub(super) async fn send_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     request: PresenceRequest<'_, A>,
 ) -> Result<PresenceSend<A>, HandlerError> {
@@ -31,23 +74,24 @@ pub(super) async fn send_subscription<A: ChunkAllocator, W: WriteTransaction>(
     let contact = RosterJid::from(request.target);
     require_account(transaction, &owner).await?;
     let item = transaction
-        .roster_item(&owner, &contact)
+        .roster_subscription(&owner, &contact)
         .await
         .map_err(|error| roster_error(error, "roster_read"))?;
     let pending = transaction
-        .pending_request(&owner, &contact)
+        .pending_request_exists(&owner, &contact)
         .await
         .map_err(|error| roster_error(error, "roster_read"))?;
-    let granted = item.is_some_and(|item| grants(item.subscription.state));
+    let granted = item.is_some_and(|item| grants(item.state));
     let mutation = match request.kind {
         PresenceRequestType::Subscribed if granted => None,
-        PresenceRequestType::Subscribed if pending.is_none() => {
-            state::update_subscription(transaction, &owner, &contact, state::pre_approve)
+        PresenceRequestType::Subscribed if !pending => {
+            state::update_subscription(roster, transaction, &owner, &contact, state::pre_approve)
                 .await
                 .map_err(|error| roster_error(error, "roster_write"))?
         }
-        PresenceRequestType::Unsubscribed if !granted && pending.is_none() => {
+        PresenceRequestType::Unsubscribed if !granted && !pending => {
             state::update_existing_subscription(
+                roster,
                 transaction,
                 &owner,
                 &contact,
@@ -68,10 +112,17 @@ pub(super) async fn send_subscription<A: ChunkAllocator, W: WriteTransaction>(
         vec![owner.clone()],
         move |delivery| {
             Box::pin(async move {
-                if let Some(mutation) = mutation {
-                    push_roster(&owner, mutation, delivery).await?;
+                let mut retirements = Retirements::default();
+                let mut mutation = mutation;
+                retirements.extract(&owner, &mut mutation);
+                let result = async {
+                    if let Some(mutation) = mutation {
+                        push_change(&owner, mutation, delivery).await?;
+                    }
+                    Ok(())
                 }
-                Ok(())
+                .await;
+                retirements.finish(result, delivery).await
             })
         },
     )))
@@ -115,6 +166,7 @@ async fn check_parties(
 }
 
 pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     parties: Parties,
     stanza: &RoutedStanza<A>,
@@ -137,6 +189,7 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
         target_jid,
     } = parties;
     let outcome = match state::request_subscription(
+        roster,
         transaction,
         &sender,
         sender_jid,
@@ -175,41 +228,58 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
             "roster operation committed"
         );
         Box::pin(async move {
-            match outcome {
-                RequestOutcome::Pending { push } => {
-                    delivery.to_available(stanza).await?;
-                    if let Some(mutation) = push {
-                        push_roster(&sender, mutation, delivery).await?;
-                    }
-                    Ok(())
-                }
-                RequestOutcome::AutoApproved {
-                    approved: Some(mutation),
-                } => {
-                    let approval = xml::approval_reply(&stanza, delivery.arena()?)?;
-                    delivery.to_tagged(SessionTag::Interested, approval).await?;
-                    push_roster(&sender, mutation, delivery).await?;
-                    delivery.current_presence(&target, &sender).await
-                }
+            let mut retirements = Retirements::default();
+            let mut outcome = outcome;
+            let auto_changed =
+                matches!(&outcome, RequestOutcome::AutoApproved { approved: Some(_) });
+            match &mut outcome {
+                RequestOutcome::Pending { push } => retirements.extract(&sender, push),
+                RequestOutcome::AutoApproved { approved } => retirements.extract(&sender, approved),
                 RequestOutcome::PreApproved { grantor, requester } => {
-                    if let Some(mutation) = grantor {
-                        push_roster(&target, mutation, delivery).await?;
-                    }
-                    let approval = xml::approval_reply(&stanza, delivery.arena()?)?;
-                    delivery.to_tagged(SessionTag::Interested, approval).await?;
-                    if let Some(mutation) = requester {
-                        push_roster(&sender, mutation, delivery).await?;
-                    }
-                    delivery.current_presence(&target, &sender).await
+                    retirements.extract(&target, grantor);
+                    retirements.extract(&sender, requester);
                 }
-                RequestOutcome::AutoApproved { approved: None }
-                | RequestOutcome::ContactMissing => Ok(()),
+                RequestOutcome::ContactMissing => {}
             }
+            let result = async {
+                match outcome {
+                    RequestOutcome::Pending { push } => {
+                        delivery.to_available(stanza).await?;
+                        if let Some(mutation) = push {
+                            push_change(&sender, mutation, delivery).await?;
+                        }
+                        Ok(())
+                    }
+                    RequestOutcome::AutoApproved { approved } if auto_changed => {
+                        let approval = xml::approval_reply(&stanza, delivery.arena()?)?;
+                        delivery.to_tagged(SessionTag::Interested, approval).await?;
+                        if let Some(mutation) = approved {
+                            push_change(&sender, mutation, delivery).await?;
+                        }
+                        delivery.current_presence(&target, &sender).await
+                    }
+                    RequestOutcome::PreApproved { grantor, requester } => {
+                        if let Some(mutation) = grantor {
+                            push_change(&target, mutation, delivery).await?;
+                        }
+                        let approval = xml::approval_reply(&stanza, delivery.arena()?)?;
+                        delivery.to_tagged(SessionTag::Interested, approval).await?;
+                        if let Some(mutation) = requester {
+                            push_change(&sender, mutation, delivery).await?;
+                        }
+                        delivery.current_presence(&target, &sender).await
+                    }
+                    RequestOutcome::AutoApproved { .. } | RequestOutcome::ContactMissing => Ok(()),
+                }
+            }
+            .await;
+            retirements.finish(result, delivery).await
         })
     }))
 }
 
 pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     parties: Parties,
     stanza: &RoutedStanza<A>,
@@ -235,6 +305,7 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
         target_jid,
     } = parties;
     let target_mutation = state::update_subscription(
+        roster,
         transaction,
         &target,
         &sender_jid,
@@ -242,15 +313,22 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
     )
     .await
     .map_err(|error| roster_error(error, "roster_write"))?;
-    let sender_mutation = state::resolve_pending(transaction, &sender, &target_jid, state::grant)
-        .await
-        .map_err(|error| roster_error(error, "roster_write"))?;
+    let sender_mutation =
+        state::resolve_pending(roster, transaction, &sender, &target_jid, state::grant)
+            .await
+            .map_err(|error| roster_error(error, "roster_write"))?;
     // An approval with no request to resolve is kept as a pre-approval and never routed.
     let pre_approval = match sender_mutation {
         Some(_) => None,
-        None => state::update_subscription(transaction, &sender, &target_jid, state::pre_approve)
-            .await
-            .map_err(|error| roster_error(error, "roster_write"))?,
+        None => state::update_subscription(
+            roster,
+            transaction,
+            &sender,
+            &target_jid,
+            state::pre_approve,
+        )
+        .await
+        .map_err(|error| roster_error(error, "roster_write"))?,
     };
     let stanza = stanza.clone();
     Ok(Effects::new(accounts, move |delivery| {
@@ -273,23 +351,41 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
             "roster operation committed"
         );
         Box::pin(async move {
-            if let Some(mutation) = target_mutation {
-                delivery.to_tagged(SessionTag::Interested, stanza).await?;
-                push_roster(&target, mutation, delivery).await?;
+            let mut retirements = Retirements::default();
+            let mut target_mutation = target_mutation;
+            let mut sender_mutation = sender_mutation;
+            let mut pre_approval = pre_approval;
+            let target_changed = target_mutation.is_some();
+            let sender_changed = sender_mutation.is_some();
+            retirements.extract(&target, &mut target_mutation);
+            retirements.extract(&sender, &mut sender_mutation);
+            retirements.extract(&sender, &mut pre_approval);
+            let result = async {
+                if target_changed {
+                    delivery.to_tagged(SessionTag::Interested, stanza).await?;
+                }
+                if let Some(mutation) = target_mutation {
+                    push_change(&target, mutation, delivery).await?;
+                }
+                if let Some(mutation) = sender_mutation {
+                    push_change(&sender, mutation, delivery).await?;
+                }
+                if sender_changed {
+                    delivery.current_presence(&sender, &target).await?;
+                }
+                if let Some(mutation) = pre_approval {
+                    push_change(&sender, mutation, delivery).await?;
+                }
+                Ok(())
             }
-            if let Some(mutation) = sender_mutation {
-                push_roster(&sender, mutation, delivery).await?;
-                delivery.current_presence(&sender, &target).await?;
-            }
-            if let Some(mutation) = pre_approval {
-                push_roster(&sender, mutation, delivery).await?;
-            }
-            Ok(())
+            .await;
+            retirements.finish(result, delivery).await
         })
     }))
 }
 
 pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     parties: Parties,
     stanza: &RoutedStanza<A>,
@@ -303,6 +399,7 @@ pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
         target_jid,
     } = parties;
     let outcome = state::cancel_subscription(
+        roster,
         transaction,
         &sender,
         &target_jid,
@@ -327,24 +424,33 @@ pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
             "roster operation committed"
         );
         Box::pin(async move {
-            if outcome.send_unavailable {
-                delivery.unavailable_presence(&sender, &target).await?;
+            let mut retirements = Retirements::default();
+            let mut outcome = outcome;
+            retirements.extract(&target, &mut outcome.subscriber);
+            retirements.extract(&sender, &mut outcome.grantor);
+            let result = async {
+                if outcome.send_unavailable {
+                    delivery.unavailable_presence(&sender, &target).await?;
+                }
+                if outcome.route {
+                    delivery.to_tagged(SessionTag::Interested, stanza).await?;
+                }
+                if let Some(mutation) = outcome.subscriber {
+                    push_change(&target, mutation, delivery).await?;
+                }
+                if let Some(mutation) = outcome.grantor {
+                    push_change(&sender, mutation, delivery).await?;
+                }
+                Ok(())
             }
-            if outcome.route {
-                delivery.to_tagged(SessionTag::Interested, stanza).await?;
-            }
-            if let Some(mutation) = outcome.subscriber {
-                push_roster(&target, mutation, delivery).await?;
-            }
-            if let Some(mutation) = outcome.grantor {
-                push_roster(&sender, mutation, delivery).await?;
-            }
-            Ok(())
+            .await;
+            retirements.finish(result, delivery).await
         })
     }))
 }
 
 pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     parties: Parties,
     stanza: &RoutedStanza<A>,
@@ -358,6 +464,7 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
         target_jid,
     } = parties;
     let outcome = state::unsubscribe(
+        roster,
         transaction,
         &sender,
         &target_jid,
@@ -382,25 +489,34 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
             "roster operation committed"
         );
         Box::pin(async move {
-            if outcome.notify_contact {
-                delivery.to_tagged(SessionTag::Interested, stanza).await?;
+            let mut retirements = Retirements::default();
+            let mut outcome = outcome;
+            retirements.extract(&target, &mut outcome.contact);
+            retirements.extract(&sender, &mut outcome.subscriber);
+            let result = async {
+                if outcome.notify_contact {
+                    delivery.to_tagged(SessionTag::Interested, stanza).await?;
+                }
+                if let Some(mutation) = outcome.contact {
+                    push_change(&target, mutation, delivery).await?;
+                }
+                if let Some(mutation) = outcome.subscriber {
+                    push_change(&sender, mutation, delivery).await?;
+                }
+                if outcome.send_unavailable {
+                    delivery.unavailable_presence(&target, &sender).await?;
+                }
+                Ok(())
             }
-            if let Some(mutation) = outcome.contact {
-                push_roster(&target, mutation, delivery).await?;
-            }
-            if let Some(mutation) = outcome.subscriber {
-                push_roster(&sender, mutation, delivery).await?;
-            }
-            if outcome.send_unavailable {
-                delivery.unavailable_presence(&target, &sender).await?;
-            }
-            Ok(())
+            .await;
+            retirements.finish(result, delivery).await
         })
     }))
 }
 
 /// Withdraw and cancel in the same order as separate subscription requests.
 pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
     transaction: &mut W,
     owner: AccountKey,
     contact: RosterJid,
@@ -410,6 +526,7 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
     require_account(transaction, &owner).await?;
     let contact_account = stored_local_account(transaction, &contact, hosts).await?;
     let removal = state::remove_item(
+        roster,
         transaction,
         &owner,
         &owner_jid,
@@ -431,109 +548,364 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
             "roster operation committed"
         );
         Box::pin(async move {
-            push_removal(&owner, contact, removal.version, delivery).await?;
-            if let Some(contact_account) = contact_account {
-                let contact_granted =
-                    notify_removed_contact(&owner, &contact_account, removal, delivery).await?;
-                if contact_granted {
-                    delivery
-                        .unavailable_presence(&contact_account, &owner)
-                        .await?;
-                }
+            let mut retirements = Retirements::default();
+            let mut removal = removal;
+            if let Some(contact) = &contact_account {
+                retirements.extract(contact, &mut removal.contact);
             }
-            Ok(())
+            let result = async {
+                push_removal(&owner, contact, removal.version, delivery).await?;
+                if let Some(contact_account) = contact_account {
+                    let contact_granted =
+                        notify_removed_contact(&owner, &contact_account, removal, delivery).await?;
+                    if contact_granted {
+                        delivery
+                            .unavailable_presence(&contact_account, &owner)
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            retirements.finish(result, delivery).await
         })
     }))
 }
 
-/// Continue cleanup notifications after a failure and return the first error.
-pub(super) async fn forget_account<A: ChunkAllocator, W: WriteTransaction>(
+#[derive(Clone, Copy)]
+struct CleanupProjection {
+    owner: Option<RosterSubscription>,
+    pending: bool,
+    counterpart: Option<RosterSubscription>,
+    changed: Option<RosterSubscription>,
+}
+
+fn cleanup_projection(
+    owner: Option<RosterSubscription>,
+    pending: bool,
+    counterpart: Option<RosterSubscription>,
+) -> CleanupProjection {
+    let changed = counterpart.and_then(|old| {
+        let next = if owner.is_some() {
+            RosterSubscription {
+                state: SubscriptionState::None,
+                pending_out: false,
+                approved: old.approved,
+            }
+        } else {
+            RosterSubscription {
+                state: match old.state {
+                    SubscriptionState::To => SubscriptionState::None,
+                    SubscriptionState::Both => SubscriptionState::From,
+                    state => state,
+                },
+                pending_out: false,
+                approved: old.approved,
+            }
+        };
+        (next != old).then_some(next)
+    });
+    CleanupProjection {
+        owner,
+        pending,
+        counterpart,
+        changed,
+    }
+}
+
+async fn cleanup_version(
+    before: &impl RosterReads,
+    contact: &AccountKey,
+) -> Result<RosterVersion, RosterError> {
+    before
+        .roster_version(contact)
+        .await?
+        .get()
+        .checked_add(1)
+        .map(RosterVersion::new)
+        .ok_or(RosterError::ValueTooLarge)
+}
+
+async fn prepare_cleanup<W: WriteTransaction>(
+    transaction: &mut W,
+    before: &W::Snapshot,
+    owner: &AccountKey,
+    owner_jid: &RosterJid,
+    contact: &RosterJid,
+    projection: CleanupProjection,
+    counterpart: Option<&AccountKey>,
+) -> Result<(), HandlerError> {
+    let operation = async {
+        if projection.owner.is_some() {
+            transaction
+                .remove_roster_subscription(owner, contact)
+                .await?;
+        }
+        transaction.remove_pending_request(owner, contact).await?;
+        if let Some(account) = counterpart {
+            if projection.owner.is_some() {
+                transaction
+                    .remove_pending_request(account, owner_jid)
+                    .await?;
+            }
+            if let Some(subscription) = projection.changed {
+                let expected = cleanup_version(before, account).await?;
+                let actual = transaction
+                    .set_roster_subscription(before, account, owner_jid, subscription)
+                    .await?;
+                if actual != Some(expected) {
+                    return Err(lonewolf_storage::StorageError::new(
+                        lonewolf_storage::StorageErrorKind::CorruptData,
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok::<_, RosterError>(())
+    }
+    .await;
+    operation.map_err(|error| roster_error(error, "roster_cleanup"))
+}
+
+pub(super) async fn forget_account<
+    A: ChunkAllocator,
+    W: WriteTransaction + lonewolf_storage::roster::RosterWrites<Snapshot = R>,
+    R: ReadTransaction + 'static,
+>(
+    roster: &super::Roster,
     transaction: &mut W,
     account: &AccountKey,
+    before: Arc<R>,
     hosts: &dyn HostLookup,
-) -> Result<Effects<A>, HandlerError> {
-    let account_jid = RosterJid::from(account);
-    let items = transaction
-        .roster(account)
+) -> Result<crate::Deliver<A>, HandlerError> {
+    let owner_jid = RosterJid::from(account);
+    let mut after = None;
+    let mut item_count = 0usize;
+    while let Some((contact, subscription)) = before
+        .next_roster_subscription(account, after.as_ref())
         .await
-        .map_err(|error| roster_error(error, "roster_write"))?
-        .items;
-    let requests = transaction
-        .pending_requests(account)
-        .await
-        .map_err(|error| roster_error(error, "roster_write"))?;
-    let item_count = items.len();
-    let pending_count = requests.len();
-    let mut removals = Vec::new();
-    for item in items {
-        let contact = stored_local_account(transaction, &item.jid, hosts).await?;
-        let removal = state::remove_item(
+        .map_err(|e| roster_error(e, "roster_cleanup"))?
+    {
+        let counterpart = stored_local_account(before.as_ref(), &contact, hosts)
+            .await?
+            .filter(|contact| contact != account);
+        let other = match &counterpart {
+            Some(other) => before
+                .roster_subscription(other, &owner_jid)
+                .await
+                .map_err(|e| roster_error(e, "roster_cleanup"))?,
+            None => None,
+        };
+        let pending = before
+            .pending_request_exists(account, &contact)
+            .await
+            .map_err(|e| roster_error(e, "roster_cleanup"))?;
+        prepare_cleanup(
             transaction,
+            before.as_ref(),
             account,
-            &account_jid,
-            &item.jid,
-            contact.as_ref(),
+            &owner_jid,
+            &contact,
+            cleanup_projection(Some(subscription), pending, other),
+            counterpart.as_ref(),
         )
-        .await
-        .map_err(|error| roster_error(error, "roster_write"))?;
-        if let (Some(removal), Some(contact)) = (removal, contact) {
-            removals.push((contact, removal));
-        }
+        .await?;
+        after = Some(contact);
+        item_count += 1;
     }
-    let mut cancellations = Vec::new();
-    for request in requests {
-        let sender = stored_local_account(transaction, &request.sender, hosts).await?;
-        let cancellation = state::cancel_subscription(
-            transaction,
-            account,
-            &request.sender,
-            sender.as_ref().map(|sender| (sender, &account_jid)),
-        )
+    after = None;
+    let mut pending_count = 0usize;
+    while let Some(sender) = before
+        .next_pending_sender(account, after.as_ref())
         .await
-        .map_err(|error| roster_error(error, "roster_write"))?;
-        if let Some(sender) = sender {
-            cancellations.push((sender, cancellation));
+        .map_err(|e| roster_error(e, "roster_cleanup"))?
+    {
+        if before
+            .roster_subscription(account, &sender)
+            .await
+            .map_err(|e| roster_error(e, "roster_cleanup"))?
+            .is_none()
+        {
+            let counterpart = stored_local_account(before.as_ref(), &sender, hosts)
+                .await?
+                .filter(|contact| contact != account);
+            let other = match &counterpart {
+                Some(other) => before
+                    .roster_subscription(other, &owner_jid)
+                    .await
+                    .map_err(|e| roster_error(e, "roster_cleanup"))?,
+                None => None,
+            };
+            prepare_cleanup(
+                transaction,
+                before.as_ref(),
+                account,
+                &owner_jid,
+                &sender,
+                cleanup_projection(None, true, other),
+                counterpart.as_ref(),
+            )
+            .await?;
         }
+        after = Some(sender);
+        pending_count += 1;
     }
     transaction
         .clear_roster(account)
         .await
-        .map_err(|error| roster_error(error, "roster_write"))?;
-    let mut accounts = Vec::with_capacity(1 + removals.len() + cancellations.len());
-    accounts.push(account.clone());
-    accounts.extend(removals.iter().map(|(contact, _)| contact.clone()));
-    accounts.extend(cancellations.iter().map(|(sender, _)| sender.clone()));
+        .map_err(|e| roster_error(e, "roster_cleanup"))?;
     let owner = account.clone();
-    Ok(Effects::new(accounts, move |delivery| {
-        tracing::info!(
-            operation = "cleanup",
-            outcome = "committed",
-            item_count,
-            pending_count,
-            removal_count = removals.len(),
-            cancellation_count = cancellations.len(),
-            owner_jid = ?owner.as_str(),
-            "roster operation committed"
-        );
+    let quotas = super::Roster::new(roster.limits.clone());
+    Ok(Box::new(move |delivery| {
         Box::pin(async move {
+            tracing::info!(operation="cleanup",outcome="committed",item_count,pending_count,owner_jid=?owner.as_str(),"roster operation committed");
             let mut failure = None;
-            for (contact, removal) in removals {
-                if let Err(error) =
-                    notify_removed_contact(&owner, &contact, removal, delivery).await
-                {
-                    failure.get_or_insert(error);
+            let mut after = None;
+            while let Some((contact, subscription)) = before
+                .next_roster_subscription(&owner, after.as_ref())
+                .await
+                .map_err(|_| DeliveryError)?
+            {
+                let counterpart = stored_local_account(before.as_ref(), &contact, delivery)
+                    .await
+                    .map_err(|_| DeliveryError)?
+                    .filter(|contact| contact != &owner);
+                if let Some(counterpart) = counterpart {
+                    let other = before
+                        .roster_subscription(&counterpart, &owner_jid)
+                        .await
+                        .map_err(|_| DeliveryError)?;
+                    let pending = before
+                        .pending_request_exists(&owner, &contact)
+                        .await
+                        .map_err(|_| DeliveryError)?;
+                    let projection = cleanup_projection(Some(subscription), pending, other);
+                    let removal = Removal {
+                        version: RosterVersion::new(0),
+                        subscription: projection.owner.unwrap_or_default(),
+                        pending_request: projection.pending,
+                        contact_before: projection.counterpart,
+                        contact: None,
+                    };
+                    if let Err(error) =
+                        notify_removed_contact(&owner, &counterpart, removal, delivery).await
+                    {
+                        failure.get_or_insert(error);
+                        after = Some(contact);
+                        continue;
+                    }
+                    if let Err(error) = replay_cleanup_push(
+                        &quotas,
+                        before.as_ref(),
+                        &counterpart,
+                        &owner_jid,
+                        projection.changed,
+                        delivery,
+                    )
+                    .await
+                    {
+                        failure.get_or_insert(error);
+                    }
                 }
+                after = Some(contact);
             }
-            for (sender, cancellation) in cancellations {
-                if let Err(error) =
-                    notify_cancelled_requester(&owner, &sender, cancellation, delivery).await
+            after = None;
+            while let Some(sender) = before
+                .next_pending_sender(&owner, after.as_ref())
+                .await
+                .map_err(|_| DeliveryError)?
+            {
+                if before
+                    .roster_subscription(&owner, &sender)
+                    .await
+                    .map_err(|_| DeliveryError)?
+                    .is_none()
                 {
-                    failure.get_or_insert(error);
+                    let counterpart = stored_local_account(before.as_ref(), &sender, delivery)
+                        .await
+                        .map_err(|_| DeliveryError)?
+                        .filter(|contact| contact != &owner);
+                    if let Some(counterpart) = counterpart {
+                        let other = before
+                            .roster_subscription(&counterpart, &owner_jid)
+                            .await
+                            .map_err(|_| DeliveryError)?;
+                        let projection = cleanup_projection(None, true, other);
+                        let cancellation = Cancellation {
+                            route: true,
+                            send_unavailable: false,
+                            grantor: None,
+                            subscriber: None,
+                        };
+                        if let Err(error) =
+                            notify_cancelled_requester(&owner, &counterpart, cancellation, delivery)
+                                .await
+                        {
+                            failure.get_or_insert(error);
+                            after = Some(sender);
+                            continue;
+                        }
+                        if let Err(error) = replay_cleanup_push(
+                            &quotas,
+                            before.as_ref(),
+                            &counterpart,
+                            &owner_jid,
+                            projection.changed,
+                            delivery,
+                        )
+                        .await
+                        {
+                            failure.get_or_insert(error);
+                        }
+                    }
                 }
+                after = Some(sender);
             }
             failure.map_or(Ok(()), Err)
         })
     }))
+}
+
+async fn replay_cleanup_push<A: ChunkAllocator>(
+    roster: &super::Roster,
+    before: &impl RosterReads,
+    contact: &AccountKey,
+    owner: &RosterJid,
+    changed: Option<RosterSubscription>,
+    delivery: &dyn Delivery<A>,
+) -> Result<(), DeliveryError> {
+    let Some(subscription) = changed else {
+        return Ok(());
+    };
+    let mutation = async {
+        let version = cleanup_version(before, contact).await?;
+        let mut item = before
+            .roster_item(contact, owner, roster.quota(contact))
+            .await?
+            .ok_or_else(|| {
+                lonewolf_storage::StorageError::new(lonewolf_storage::StorageErrorKind::CorruptData)
+            })?;
+        item.subscription = subscription;
+        Ok::<_, RosterError>(RosterMutation {
+            version,
+            value: item,
+        })
+    }
+    .await;
+    match mutation {
+        Ok(mutation) => push_roster(contact, mutation, delivery).await,
+        Err(RosterError::QuotaExceeded) => {
+            delivery
+                .retire_tagged(contact, SessionTag::Interested)
+                .await
+        }
+        Err(_) => {
+            let _ = delivery
+                .retire_tagged(contact, SessionTag::Interested)
+                .await;
+            Err(DeliveryError)
+        }
+    }
 }
 
 async fn stored_local_account(
@@ -562,7 +934,7 @@ async fn notify_cancelled_requester<A: ChunkAllocator>(
             .await?;
     }
     if let Some(mutation) = cancellation.subscriber {
-        push_roster(sender, mutation, delivery).await?;
+        push_change(sender, mutation, delivery).await?;
     }
     Ok(())
 }
@@ -596,7 +968,7 @@ async fn notify_removed_contact<A: ChunkAllocator>(
         }
     }
     if let Some(mutation) = removal.contact {
-        push_roster(contact, mutation, delivery).await?;
+        push_change(contact, mutation, delivery).await?;
     }
     Ok(contact_granted)
 }

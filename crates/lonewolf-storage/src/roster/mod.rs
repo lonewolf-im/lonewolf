@@ -14,6 +14,25 @@ mod key;
 
 pub use key::RosterJid;
 
+/// Bounds XML node metadata independently of stored string bytes.
+pub const MAX_GROUPS_PER_ITEM: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RosterQuota {
+    pub max_items: NonZeroUsize,
+    /// Includes each encoded owner/contact key and item value.
+    pub max_bytes: NonZeroUsize,
+}
+
+impl Default for RosterQuota {
+    fn default() -> Self {
+        Self {
+            max_items: const { NonZeroUsize::new(1_000).unwrap() },
+            max_bytes: const { NonZeroUsize::new(2_097_152).unwrap() },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SubscriptionState {
     #[default]
@@ -87,23 +106,57 @@ impl fmt::Debug for PendingSubscription {
 pub enum RosterError {
     ValueTooLarge,
     PendingLimitExceeded,
+    QuotaExceeded,
     /// The owner of the written state has no account record.
     NoAccount,
     Storage(StorageError),
 }
 
 pub trait RosterReads {
-    /// Reads one consistent roster version and item set.
+    /// Rejects raw count and byte overflow before decoding each item.
     fn roster(
         &self,
         owner: &AccountKey,
+        quota: RosterQuota,
     ) -> impl Future<Output = Result<RosterSnapshot, RosterError>> + Send;
 
     fn roster_item(
         &self,
         owner: &AccountKey,
         jid: &RosterJid,
+        quota: RosterQuota,
     ) -> impl Future<Output = Result<Option<RosterItem>, RosterError>> + Send;
+
+    fn roster_version(
+        &self,
+        owner: &AccountKey,
+    ) -> impl Future<Output = Result<RosterVersion, RosterError>> + Send;
+
+    fn roster_subscription(
+        &self,
+        owner: &AccountKey,
+        jid: &RosterJid,
+    ) -> impl Future<Output = Result<Option<RosterSubscription>, RosterError>> + Send;
+
+    /// Returns one header after the exclusive cursor without decoding metadata.
+    fn next_roster_subscription(
+        &self,
+        owner: &AccountKey,
+        after: Option<&RosterJid>,
+    ) -> impl Future<Output = Result<Option<(RosterJid, RosterSubscription)>, RosterError>> + Send;
+
+    /// Returns one sender after the exclusive cursor without copying its stanza.
+    fn next_pending_sender(
+        &self,
+        owner: &AccountKey,
+        after: Option<&RosterJid>,
+    ) -> impl Future<Output = Result<Option<RosterJid>, RosterError>> + Send;
+
+    fn pending_request_exists(
+        &self,
+        owner: &AccountKey,
+        sender: &RosterJid,
+    ) -> impl Future<Output = Result<bool, RosterError>> + Send;
 
     /// Returns pending requests in sender order.
     fn pending_requests(
@@ -120,12 +173,39 @@ pub trait RosterReads {
 
 /// Roster writes, each taking effect when the transaction commits.
 pub trait RosterWrites {
-    /// Replaces the item and advances the owner's version; rejects owners without an account.
+    type Snapshot: crate::ReadTransaction;
+    /// Advances the version only after admission; non-growing replacements may recover over-budget accounts.
     fn put_roster_item(
         &mut self,
         owner: &AccountKey,
         item: &RosterItem,
+        quota: RosterQuota,
     ) -> impl Future<Output = Result<RosterVersion, RosterError>> + Send;
+
+    /// Rejects a stale source and copies its unchanged metadata without decoding it.
+    fn set_roster_subscription(
+        &mut self,
+        before: &Self::Snapshot,
+        owner: &AccountKey,
+        jid: &RosterJid,
+        subscription: RosterSubscription,
+    ) -> impl Future<Output = Result<Option<RosterVersion>, RosterError>> + Send;
+
+    /// Changes only the expected header while preserving the committed metadata bytes.
+    fn transition_roster_subscription(
+        &mut self,
+        owner: &AccountKey,
+        jid: &RosterJid,
+        expected: RosterSubscription,
+        subscription: RosterSubscription,
+    ) -> impl Future<Output = Result<Option<RosterVersion>, RosterError>> + Send;
+
+    /// Removes legacy rows without decoding metadata or applying snapshot quotas.
+    fn remove_roster_subscription(
+        &mut self,
+        owner: &AccountKey,
+        jid: &RosterJid,
+    ) -> impl Future<Output = Result<Option<RosterMutation<RosterSubscription>>, RosterError>> + Send;
 
     /// Removes an item and returns `None` without advancing the version if absent.
     fn remove_roster_item(
@@ -160,6 +240,7 @@ pub trait RosterWrites {
 impl fmt::Display for RosterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::QuotaExceeded => formatter.write_str("roster quota exceeded"),
             Self::ValueTooLarge => formatter.write_str("roster value is too large"),
             Self::NoAccount => formatter.write_str("roster owner has no account"),
             Self::PendingLimitExceeded => {
@@ -173,7 +254,10 @@ impl fmt::Display for RosterError {
 impl Error for RosterError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ValueTooLarge | Self::NoAccount | Self::PendingLimitExceeded => None,
+            Self::ValueTooLarge
+            | Self::NoAccount
+            | Self::PendingLimitExceeded
+            | Self::QuotaExceeded => None,
             Self::Storage(error) => Some(error),
         }
     }

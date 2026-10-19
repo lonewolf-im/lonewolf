@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_storage::roster::RosterQuota;
+
 use crate::support::PASSWORD;
 
 mod pending_limits;
@@ -110,6 +112,7 @@ fn seed_roster(directory: &Path) -> TestResult {
                         approved: true,
                     },
                 },
+                RosterQuota::default(),
             )
             .await?;
         repository.commit().await?;
@@ -143,6 +146,7 @@ fn seed_mutual_subscription(directory: &Path) -> TestResult {
                             approved: false,
                         },
                     },
+                    RosterQuota::default(),
                 )
                 .await?;
         }
@@ -172,6 +176,7 @@ fn seed_many_contacts(directory: &Path) -> TestResult {
                         groups: Vec::new(),
                         subscription: RosterSubscription::default(),
                     },
+                    RosterQuota::default(),
                 )
                 .await?;
         }
@@ -202,6 +207,7 @@ fn seed_large_roster(directory: &Path) -> TestResult {
                         groups: Vec::new(),
                         subscription: RosterSubscription::default(),
                     },
+                    RosterQuota::default(),
                 )
                 .await?;
         }
@@ -258,7 +264,7 @@ fn seed_interrupted_subscription_approval(directory: &Path) -> TestResult {
         let mut repository = storage.begin_write().await?;
         seed_accounts(&mut repository, &[&alice_account, &bob_account]).await?;
         repository
-            .put_roster_item(&alice_account, &RosterItem { jid: bob_contact.clone(), name: None, groups: Vec::new(), subscription: RosterSubscription { state: SubscriptionState::To, pending_out: false, approved: false, } })
+            .put_roster_item(&alice_account, &RosterItem { jid: bob_contact.clone(), name: None, groups: Vec::new(), subscription: RosterSubscription { state: SubscriptionState::To, pending_out: false, approved: false, } }, RosterQuota::default())
             .await?;
         repository
             .put_pending_request(
@@ -302,6 +308,7 @@ fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult
                         approved: false,
                     },
                 },
+                RosterQuota::default(),
             )
             .await?;
         repository
@@ -317,6 +324,7 @@ fn seed_pending_request_with_existing_permission(directory: &Path) -> TestResult
                         approved: false,
                     },
                 },
+                RosterQuota::default(),
             )
             .await?;
         repository.commit().await?;
@@ -3060,6 +3068,7 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
                         approved: false,
                     },
                 },
+                RosterQuota::default(),
             )
             .await?;
         repository
@@ -3075,6 +3084,7 @@ fn seed_unhosted_contact(directory: &Path) -> TestResult {
                         approved: false,
                     },
                 },
+                RosterQuota::default(),
             )
             .await?;
         repository.commit().await?;
@@ -3134,6 +3144,7 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
                     groups: Vec::new(),
                     subscription: RosterSubscription::default(),
                 },
+                RosterQuota::default(),
             )
             .await?;
         repository
@@ -3149,6 +3160,7 @@ fn seed_one_sided_contact_subscription(directory: &Path) -> TestResult {
                         approved: false,
                     },
                 },
+                RosterQuota::default(),
             )
             .await?;
         repository.commit().await?;
@@ -3613,4 +3625,432 @@ private_key_path = "private-key.pem"
         }
     }
     Ok(())
+}
+
+#[test]
+fn roster_set_enforces_shared_item_and_byte_quota() -> TestResult {
+    for (max_items, max_bytes) in [(1, 1024), (10, 60)] {
+        let suite = C2sSuite::with_hosts(&format!(
+            "[hosts.localhost]\nextensions=['roster']\n[hosts.localhost.roster]\nmax_items={max_items}\nmax_bytes={max_bytes}"
+        ))?;
+        suite.create_account("alice", PASSWORD)?;
+        suite.create_account("bob", PASSWORD)?;
+        let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+        let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+        let barrier = std::sync::Barrier::new(2);
+        let outcomes = thread::scope(|scope| -> TestResult<Vec<bool>> {
+            let mut workers = Vec::new();
+            for (client, contact) in [
+                (&mut desk, "one@remote.invalid"),
+                (&mut phone, "two@remote.invalid"),
+            ] {
+                let barrier = &barrier;
+                workers.push(scope.spawn(move || -> Result<bool,String> {
+                    (|| -> TestResult<bool> {
+                        barrier.wait();
+                        client.send(&format!("<iq type='set' id='add'><query xmlns='jabber:iq:roster'><item jid='{contact}'/></query></iq>"))?;
+                        let response=client.receive()?;
+                        assert_eq!(response.attribute("id"),Some("add"));
+                        match response.attribute("type") {
+                            Some("result")=>Ok(true),
+                            Some("error")=> {
+                                response.child("jabber:client","error")?.child("urn:ietf:params:xml:ns:xmpp-stanzas","resource-constraint")?;
+                                Ok(false)
+                            }
+                            _=>Err("unexpected quota reply".into()),
+                        }
+                    })().map_err(|e|e.to_string())
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .map_err(|_| "writer panicked")?
+                        .map_err(Into::into)
+                })
+                .collect()
+        })?;
+        assert_eq!(outcomes.iter().filter(|accepted| **accepted).count(), 1);
+        let contact = if outcomes[0] {
+            "one@remote.invalid"
+        } else {
+            "two@remote.invalid"
+        };
+        request_roster(
+            &mut desk,
+            "committed",
+            &format!(
+                "<iq xmlns='jabber:client' type='result' id='committed' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='{contact}' subscription='none'/></query></iq>"
+            ),
+        )?;
+        let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+        bob.send("<iq type='set' id='other'><query xmlns='jabber:iq:roster'><item jid='else@remote.invalid'/></query></iq>")?;
+        bob.expect_xml(
+            "<iq xmlns='jabber:client' type='result' id='other' to='bob@localhost/desk'/>",
+        )?;
+        desk.close()?;
+        phone.close()?;
+        bob.close()?;
+    }
+    Ok(())
+}
+
+fn seed_oversized_roster(directory: &Path) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice =
+        AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+    let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+    let carol =
+        AccountKey::try_from(Jid::parse_in("carol@localhost", &mut arena)?.resolve(&arena)?)?;
+    Runtime::new()?.block_on(async {
+        let mut tx = storage.begin_write().await?;
+        seed_accounts(&mut tx, &[&alice, &bob, &carol]).await?;
+        for contact in [
+            "bob@localhost",
+            "missing@localhost",
+            "remote@remote.invalid",
+        ] {
+            let jid = RosterJid::from(Jid::parse_in(contact, &mut arena)?.resolve(&arena)?);
+            tx.put_roster_item(
+                &alice,
+                &RosterItem {
+                    jid,
+                    name: Some("x".repeat(4096).into_boxed_str()),
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::Both,
+                        ..Default::default()
+                    },
+                },
+                RosterQuota::default(),
+            )
+            .await?;
+        }
+        tx.put_roster_item(
+            &bob,
+            &RosterItem {
+                jid: RosterJid::from(&alice),
+                name: None,
+                groups: Vec::new(),
+                subscription: RosterSubscription {
+                    state: SubscriptionState::Both,
+                    ..Default::default()
+                },
+            },
+            RosterQuota::default(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn oversized_roster_does_not_block_account_deletion() -> TestResult {
+    let suite = C2sSuite::with_hosts_and_setup(
+        "[hosts.localhost]\nextensions=['roster']\n[hosts.localhost.roster]\nmax_items=1\nmax_bytes=128",
+        seed_oversized_roster,
+    )?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    request_roster(
+        &mut bob,
+        "before",
+        "<iq xmlns='jabber:client' type='result' id='before' to='bob@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='both'/></query></iq>",
+    )?;
+    suite.delete_account("alice")?;
+    alice.expect_stream_error("not-authorized")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='unsubscribe'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='unsubscribed'/>")?;
+    let push = expect_roster_push(
+        &mut bob,
+        "bob@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+    )?;
+    bob.send(&format!("<iq type='result' id='{push}'/>"))?;
+    request_roster(
+        &mut bob,
+        "after",
+        "<iq xmlns='jabber:client' type='result' id='after' to='bob@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='alice@localhost' subscription='none'/></query></iq>",
+    )?;
+    request_roster(
+        &mut carol,
+        "unrelated",
+        "<iq xmlns='jabber:client' type='result' id='unrelated' to='carol@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut fresh = suite.connect("alice", PASSWORD, "new")?;
+    request_roster(
+        &mut fresh,
+        "fresh",
+        "<iq xmlns='jabber:client' type='result' id='fresh' to='alice@localhost/new'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    fresh.close()?;
+    bob.close()?;
+    carol.close()
+}
+
+fn seed_legacy_subscription_metadata(
+    directory: &Path,
+    owner_large: bool,
+    groups: bool,
+    no_op: bool,
+) -> TestResult {
+    fs::create_dir(directory.join("data"))?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice =
+        AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+    let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+    Runtime::new()?.block_on(async {
+        let mut tx = storage.begin_write().await?;
+        seed_accounts(&mut tx, &[&alice, &bob]).await?;
+        for (owner, contact) in [(&alice, &bob), (&bob, &alice)] {
+            tx.put_roster_item(
+                owner,
+                &RosterItem {
+                    jid: RosterJid::from(contact),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: if no_op && owner == &bob {
+                            SubscriptionState::None
+                        } else {
+                            SubscriptionState::Both
+                        },
+                        ..Default::default()
+                    },
+                },
+                Default::default(),
+            )
+            .await?;
+            tx.put_pending_request(
+                owner,
+                PendingSubscription {
+                    sender: RosterJid::from(contact),
+                    stanza: format!(
+                        "<presence xmlns='jabber:client' from='{}' to='{}' type='subscribe'/>",
+                        contact.as_str(),
+                        owner.as_str()
+                    )
+                    .into_bytes()
+                    .into_boxed_slice(),
+                },
+                std::num::NonZeroUsize::new(10).ok_or("invalid limit")?,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    let (owner, contact) = if owner_large {
+        (&alice, &bob)
+    } else {
+        (&bob, &alice)
+    };
+    let mut encoded = vec![if no_op && owner == &bob { 0 } else { 3 }, 0];
+    if groups {
+        encoded.extend_from_slice(&u32::MAX.to_le_bytes());
+        encoded.extend_from_slice(&9u32.to_le_bytes());
+        for i in 0..9u8 {
+            encoded.extend_from_slice(&1u32.to_le_bytes());
+            encoded.push(b'a' + i);
+        }
+    } else {
+        encoded.extend_from_slice(&256u32.to_le_bytes());
+        encoded.extend_from_slice(&[b'x'; 256]);
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let tx = storage.as_ref().begin_write()?;
+    let table = redb::TableDefinition::<&str, &[u8]>::new("lonewolf_roster_items");
+    tx.open_table(table)?.insert(
+        format!("{}\0{}", owner.as_str(), contact.as_str()).as_str(),
+        encoded.as_slice(),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn mark_roster_version(client: &mut Client, name: &str, version: u64) -> TestResult {
+    client.send(&format!(
+        "<iq type='get' id='version'><query xmlns='jabber:iq:roster' ver='{version}'/></iq>"
+    ))?;
+    client.expect_xml(&format!(
+        "<iq xmlns='jabber:client' type='result' id='version' to='{name}@localhost/desk'/>"
+    ))
+}
+
+#[test]
+fn legacy_metadata_does_not_block_removal_or_subscription_recovery() -> TestResult {
+    for groups in [false, true] {
+        for owner_large in [false, true] {
+            for action in ["remove", "unsubscribe", "unsubscribed"] {
+                let suite = C2sSuite::with_hosts_and_setup(
+                    "[hosts.localhost]\nextensions=['roster']\n[hosts.localhost.roster]\nmax_bytes=128",
+                    |directory| {
+                        seed_legacy_subscription_metadata(directory, owner_large, groups, false)
+                    },
+                )?;
+                let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+                let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+                mark_roster_version(&mut alice, "alice", 1)?;
+                mark_roster_version(&mut bob, "bob", 1)?;
+                if action == "remove" {
+                    alice.send("<iq type='set' id='remove'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='remove'/></query></iq>")?;
+                    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='remove' to='alice@localhost/desk'/>")?;
+                    expect_roster_push(
+                        &mut alice,
+                        "alice@localhost/desk",
+                        "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='remove'/>",
+                    )?;
+                    if owner_large {
+                        bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='unsubscribe'/>")?;
+                        bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='unsubscribed'/>")?;
+                        expect_roster_push(
+                            &mut bob,
+                            "bob@localhost/desk",
+                            "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+                        )?;
+                        bob.close()?;
+                    } else {
+                        bob.expect_stream_error_after_stanzas("internal-server-error", 2)?;
+                    }
+                    alice.close()?;
+                } else {
+                    alice.send(&format!("<presence type='{action}' to='bob@localhost'/>"))?;
+                    if owner_large {
+                        bob.expect_xml(&format!("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='{action}'/>"))?;
+                    }
+                    let (alice_state, bob_state) = if action == "unsubscribe" {
+                        ("from", "to")
+                    } else {
+                        ("to", "from")
+                    };
+                    if owner_large {
+                        expect_roster_push(
+                            &mut bob,
+                            "bob@localhost/desk",
+                            &format!(
+                                "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='{bob_state}'/>"
+                            ),
+                        )?;
+                        alice.expect_stream_error("internal-server-error")?;
+                        bob.close()?;
+                    } else {
+                        expect_roster_push(
+                            &mut alice,
+                            "alice@localhost/desk",
+                            &format!(
+                                "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='{alice_state}'/>"
+                            ),
+                        )?;
+                        bob.expect_stream_error_after_stanzas("internal-server-error", 2)?;
+                        alice.close()?;
+                    }
+                }
+                for name in ["alice", "bob"] {
+                    let mut fresh = suite.connect(name, PASSWORD, "desk")?;
+                    mark_roster_version(&mut fresh, name, 2)?;
+                    fresh.close()?;
+                }
+            }
+        }
+        let suite = C2sSuite::with_hosts_and_setup(
+            "[hosts.localhost]\nextensions=['roster']\n[hosts.localhost.roster]\nmax_bytes=128",
+            |directory| seed_legacy_subscription_metadata(directory, false, groups, true),
+        )?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+        mark_roster_version(&mut alice, "alice", 1)?;
+        mark_roster_version(&mut bob, "bob", 1)?;
+        alice.send("<iq type='set' id='remove'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='remove'/></query></iq>")?;
+        alice.expect_xml(
+            "<iq xmlns='jabber:client' type='result' id='remove' to='alice@localhost/desk'/>",
+        )?;
+        expect_roster_push(
+            &mut alice,
+            "alice@localhost/desk",
+            "<item xmlns='jabber:iq:roster' jid='bob@localhost' subscription='remove'/>",
+        )?;
+        bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='unsubscribed'/>")?;
+        mark_roster_version(&mut bob, "bob", 1)?;
+        alice.close()?;
+        bob.close()?;
+    }
+    Ok(())
+}
+
+fn seed_corrupt_reciprocal_metadata(directory: &Path) -> TestResult {
+    seed_oversized_roster(directory)?;
+    let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let alice =
+        AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+    let carol =
+        AccountKey::try_from(Jid::parse_in("carol@localhost", &mut arena)?.resolve(&arena)?)?;
+    Runtime::new()?.block_on(async {
+        let mut tx = storage.begin_write().await?;
+        for (owner, contact) in [(&alice, &carol), (&carol, &alice)] {
+            tx.put_roster_item(
+                owner,
+                &RosterItem {
+                    jid: RosterJid::from(contact),
+                    name: None,
+                    groups: Vec::new(),
+                    subscription: RosterSubscription {
+                        state: SubscriptionState::Both,
+                        ..Default::default()
+                    },
+                },
+                Default::default(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    let tx = storage.as_ref().begin_write()?;
+    tx.open_table(redb::TableDefinition::<&str, &[u8]>::new(
+        "lonewolf_roster_items",
+    ))?
+    .insert("bob@localhost\0alice@localhost", [3, 0].as_slice())?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[test]
+fn account_deletion_retires_corrupt_reciprocal_metadata_and_continues_healthy_notifications()
+-> TestResult {
+    let suite = C2sSuite::with_hosts_and_setup(
+        "[hosts.localhost]\nextensions=['roster']\n[hosts.localhost.roster]\nmax_bytes=128",
+        seed_corrupt_reciprocal_metadata,
+    )?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    mark_roster_version(&mut bob, "bob", 1)?;
+    mark_roster_version(&mut carol, "carol", 1)?;
+    suite.delete_account("alice")?;
+    bob.expect_stream_error_after_stanzas("internal-server-error", 2)?;
+    carol.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='carol@localhost' type='unsubscribe'/>")?;
+    carol.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='carol@localhost' type='unsubscribed'/>")?;
+    expect_roster_push(
+        &mut carol,
+        "carol@localhost/desk",
+        "<item xmlns='jabber:iq:roster' jid='alice@localhost' subscription='none'/>",
+    )?;
+    mark_roster_version(&mut carol, "carol", 2)?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    mark_roster_version(&mut bob, "bob", 2)?;
+    assert!(
+        suite
+            .wait_for_log("account_deletion_effects")?
+            .contains("internal operation failed")
+    );
+    bob.close()?;
+    carol.close()
 }

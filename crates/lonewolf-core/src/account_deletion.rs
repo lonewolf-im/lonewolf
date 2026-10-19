@@ -76,16 +76,16 @@ async fn delete<A: ChunkAllocator + Clone>(
     let handlers = router.account_handlers(account.domain());
     let delivery = RouterDelivery::new(router, allocator, None);
     let mut transaction = storage.begin_write().await?;
+    let before = Arc::new(storage.begin_read().await?);
     let existed = match transaction.delete_account(account).await {
         Ok(()) => true,
         Err(AccountError::NotFound) => false,
         Err(error) => return Err(error.into()),
     };
-    let mut accounts = vec![account.clone()];
     let mut deliveries = Vec::with_capacity(handlers.len());
     for (name, handler) in handlers {
         let effects = handler
-            .forget_account(&mut transaction, account, &delivery)
+            .forget_account(&mut transaction, account, Arc::clone(&before), &delivery)
             .await
             .map_err(|error| {
                 if error.failure().is_some() {
@@ -99,8 +99,7 @@ async fn delete<A: ChunkAllocator + Clone>(
                 }
                 deleter_error("an extension could not forget the account")
             })?;
-        accounts.extend(effects.accounts);
-        deliveries.push((name, effects.deliver));
+        deliveries.push((name, effects));
     }
     transaction
         .clear_offline_messages(account)
@@ -109,7 +108,7 @@ async fn delete<A: ChunkAllocator + Clone>(
             OfflineError::Storage(error) => DeleterError::from(error),
             error => DeleterError::Other(Box::new(error)),
         })?;
-    let ((), mut ticket) = router.order().fix(accounts, transaction.commit()).await?;
+    let ((), mut ticket) = router.order().fix_all(transaction.commit()).await?;
     tracing::info!(
         operation = "cleanup",
         outcome = "committed",

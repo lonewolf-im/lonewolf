@@ -130,9 +130,10 @@ impl AccountHandler<GlobalChunkAllocator, RedbStorage> for Fake {
         &'a self,
         _transaction: &'a mut RedbWrite,
         _account: &'a AccountKey,
+        _before: Arc<lonewolf_storage::RedbRead>,
         _hosts: &'a dyn HostLookup,
-    ) -> ExtensionFuture<'a, Result<Effects<GlobalChunkAllocator>, HandlerError>> {
-        Box::pin(async { Ok(Effects::none()) })
+    ) -> ExtensionFuture<'a, Result<crate::Deliver<GlobalChunkAllocator>, HandlerError>> {
+        Box::pin(async { Ok(Effects::none().deliver) })
     }
 }
 

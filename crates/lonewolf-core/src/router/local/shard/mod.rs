@@ -1203,6 +1203,18 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         snapshot
     }
 
+    pub(super) fn retire_tagged(&mut self, account: &AccountKey, tag: SessionTag) {
+        let Some(sessions) = self.accounts.get(account.as_str()) else {
+            return;
+        };
+        let failed = sessions
+            .iter()
+            .filter(|(_, session)| session.tags.contains(tag))
+            .map(|(resource, session)| (resource.clone(), session.token, RetireCause::Evicted))
+            .collect::<Vec<_>>();
+        self.remove_batch(account.as_str(), &failed);
+    }
+
     pub(super) fn deliver_to_tagged(
         &mut self,
         account: &AccountKey,
@@ -1249,12 +1261,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             deliveries.push((resource.clone(), session.token, stanza));
         }
         if let Some(error) = build_error {
-            let failed = sessions
-                .iter()
-                .filter(|(_, session)| session.tags.contains(tag))
-                .map(|(resource, session)| (resource.clone(), session.token, RetireCause::Evicted))
-                .collect::<Vec<_>>();
-            self.remove_batch(account.as_str(), &failed);
+            self.retire_tagged(account, tag);
             return Err(error);
         }
         if let Some(sessions) = self.accounts.get(account.as_str()) {

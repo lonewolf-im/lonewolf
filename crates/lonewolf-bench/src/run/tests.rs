@@ -59,6 +59,10 @@ async fn failed_setup_returns_private_partial_report_without_invented_metadata_o
     let output = directory.path().join("output");
     let report = run(config(1)?, &output).await?;
     assert_eq!(report.status, RunStatus::Failed);
+    assert_eq!(
+        report.config.instrumentation,
+        Some(crate::telemetry::instrumentation_metadata(true))
+    );
     assert_eq!(fs::metadata(&output)?.permissions().mode() & 0o777, 0o700);
     assert_eq!(
         fs::metadata(output.join("result.json"))?
@@ -149,6 +153,10 @@ async fn interrupted_preflight_has_no_setup_counts_or_measurement_window() -> Te
     .await?;
     assert_eq!(report.status, RunStatus::Interrupted);
     assert_eq!(report.phases[0].status, PhaseStatus::Cancelled);
+    assert_eq!(
+        report.config.instrumentation,
+        Some(crate::telemetry::instrumentation_metadata(true))
+    );
     assert_eq!(report.counters, CounterReport::default());
     assert_eq!(report.dataset.account_count, 2);
     assert!(report.environment.is_none());

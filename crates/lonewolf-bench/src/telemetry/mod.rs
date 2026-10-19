@@ -35,6 +35,18 @@ pub const RAW_CAPACITY: usize = 64 * 1024 * 1024;
 pub const CONTROL_CAPACITY: usize = 8;
 const BODY_CAPACITY: usize = 1024 * 1024;
 
+pub(crate) fn instrumentation_metadata(server_metrics_enabled: bool) -> InstrumentationMetadata {
+    InstrumentationMetadata {
+        policy_version: 1,
+        server_metrics_enabled,
+        generator_metrics_enabled: true,
+        raw_capacity_bytes: RAW_CAPACITY as u64,
+        control_capacity: CONTROL_CAPACITY as u64,
+        response_body_limit_bytes: BODY_CAPACITY as u64,
+        result_limit_bytes: crate::report::artifacts::RESULT_LIMIT as u64,
+    }
+}
+
 #[derive(Clone)]
 pub struct MetricsEndpoint {
     address: SocketAddr,

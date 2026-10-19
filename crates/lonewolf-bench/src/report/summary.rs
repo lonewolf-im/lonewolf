@@ -113,6 +113,13 @@ pub fn render(report: &RunReport) -> String {
         );
     }
     text.push_str("\n## Sampled resources\n\n");
+    let _ = writeln!(
+        text,
+        "Configured instrumentation: {:?}. Collection interval/timeout: {}/{} ms. These settings describe intent, not collection success.\n",
+        report.config.instrumentation,
+        report.config.metrics.interval_ms,
+        report.config.metrics.timeout_ms
+    );
     for (scope, r) in [
         ("server", &report.telemetry.server),
         ("generator", &report.telemetry.generator),

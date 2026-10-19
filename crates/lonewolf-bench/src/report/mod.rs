@@ -175,6 +175,35 @@ pub struct RunReport {
     pub artifacts: BTreeMap<ArtifactKind, ArtifactMetadata>,
 }
 
+impl RunReport {
+    pub fn read(directory: &std::path::Path) -> crate::error::BenchResult<Self> {
+        use crate::error::{BenchError, ErrorCode};
+        use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
+        let error = |context| BenchError::new(ErrorCode::IncompatibleComparison, context);
+        match std::fs::symlink_metadata(directory.join(".incomplete")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(error("incomplete_publication")),
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(directory.join("result.json"))
+            .map_err(|_| error("result_open"))?;
+        let metadata = file.metadata().map_err(|_| error("result_metadata"))?;
+        if !metadata.is_file() || metadata.len() > artifacts::RESULT_LIMIT as u64 {
+            return Err(error("result_size_or_type"));
+        }
+        let mut bytes = Vec::new();
+        file.take(artifacts::RESULT_LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| error("result_read"))?;
+        if bytes.len() > artifacts::RESULT_LIMIT {
+            return Err(error("result_size_or_type"));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| error("result_schema"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SanitizedConfig {
@@ -182,9 +211,26 @@ pub struct SanitizedConfig {
     pub schema_version: u32,
     pub environment_id: String,
     pub target_mode: TargetMode,
+    #[serde(deserialize_with = "strict_config::scenario")]
     pub scenario: ScenarioConfig,
+    #[serde(deserialize_with = "strict_config::measurement")]
     pub measurement: MeasurementConfig,
+    #[serde(deserialize_with = "strict_config::metrics")]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub instrumentation: Option<InstrumentationMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentationMetadata {
+    pub policy_version: u32,
+    pub server_metrics_enabled: bool,
+    pub generator_metrics_enabled: bool,
+    pub raw_capacity_bytes: u64,
+    pub control_capacity: u64,
+    pub response_body_limit_bytes: u64,
+    pub result_limit_bytes: u64,
 }
 
 impl From<&RunConfig> for SanitizedConfig {
@@ -199,6 +245,12 @@ impl From<&RunConfig> for SanitizedConfig {
             scenario: config.scenario.clone(),
             measurement: config.measurement.clone(),
             metrics: config.metrics.clone(),
+            instrumentation: Some(crate::telemetry::instrumentation_metadata(
+                match &config.target {
+                    TargetConfig::Local { .. } => true,
+                    TargetConfig::Remote { metrics_url, .. } => metrics_url.is_some(),
+                },
+            )),
         }
     }
 }
@@ -542,7 +594,7 @@ mod finite_option {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 mod version_one {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -584,4 +636,5 @@ mod three_figures {
 
 pub mod artifacts;
 pub mod metadata;
+mod strict_config;
 pub mod summary;

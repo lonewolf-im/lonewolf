@@ -3,6 +3,7 @@
 pub mod accounts;
 pub mod cli;
 pub mod client;
+pub mod compare;
 pub mod config;
 pub mod error;
 pub mod fixture;

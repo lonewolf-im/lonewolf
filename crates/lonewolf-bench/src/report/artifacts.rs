@@ -124,7 +124,7 @@ impl ArtifactWriter {
         );
         Ok(())
     }
-    fn publish(
+    pub(crate) fn publish(
         &self,
         name: &str,
         write: impl FnOnce(&mut dyn Write) -> BenchResult<()>,
@@ -171,6 +171,29 @@ impl ArtifactWriter {
             return Err(failure());
         }
         self.publish("result.json", |writer| {
+            let mut writer = LimitedWriter {
+                inner: writer,
+                remaining: RESULT_LIMIT,
+            };
+            serde_json::to_writer_pretty(&mut writer, report).map_err(|_| failure())
+        })?;
+        #[cfg(test)]
+        self.inject(Fault::Marker)?;
+        fs::remove_file(self.output.join(".incomplete")).map_err(|_| failure())
+    }
+
+    pub(crate) fn finish_comparison(
+        self,
+        report: &crate::compare::ComparisonReport,
+        markdown: &str,
+    ) -> BenchResult<()> {
+        if markdown.len() > RESULT_LIMIT {
+            return Err(failure());
+        }
+        self.publish("comparison.md", |writer| {
+            writer.write_all(markdown.as_bytes()).map_err(|_| failure())
+        })?;
+        self.publish("comparison.json", |writer| {
             let mut writer = LimitedWriter {
                 inner: writer,
                 remaining: RESULT_LIMIT,
@@ -326,6 +349,54 @@ mod tests {
         let link = directory.path().join("link");
         symlink(&output, &link)?;
         assert!(ArtifactWriter::create(&link).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    #[test]
+    fn compare_publication_faults_keep_marker_staging_and_completed_files() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let run: RunReport = serde_json::from_value(crate::report::tests::report_fixture()?)?;
+        let comparison = crate::compare::compare_runs(&run, &run);
+        for (index, fault) in [
+            Fault::Write,
+            Fault::Flush,
+            Fault::Sync,
+            Fault::Link,
+            Fault::Unlink,
+            Fault::Marker,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = directory.path().join(index.to_string());
+            let mut writer = ArtifactWriter::create(&output)?;
+            writer.fault = Some(fault);
+            assert!(writer.finish_comparison(&comparison, "summary").is_err());
+            assert!(output.join(".incomplete").exists());
+            if fault == Fault::Marker {
+                assert!(output.join("comparison.json").is_file());
+            } else {
+                assert!(output.join(".comparison.md.partial").is_file());
+            }
+        }
+        for name in [
+            "comparison.md",
+            "comparison.json",
+            ".comparison.md.partial",
+            ".comparison.json.partial",
+        ] {
+            let output = directory.path().join(format!("existing-{name}"));
+            let writer = ArtifactWriter::create(&output)?;
+            fs::write(output.join(name), b"untouched")?;
+            assert!(writer.finish_comparison(&comparison, "summary").is_err());
+            assert_eq!(fs::read(output.join(name))?, b"untouched");
+            assert!(output.join(".incomplete").exists());
+        }
         Ok(())
     }
 }

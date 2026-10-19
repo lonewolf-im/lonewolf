@@ -1,0 +1,126 @@
+{
+  "a": [
+    {
+      "name": "preflight",
+      "start_offset_ns": 3233858,
+      "end_offset_ns": 8985864877,
+      "planned_end_offset_ns": 120000000000
+    },
+    {
+      "name": "target_setup",
+      "start_offset_ns": 8985873383,
+      "end_offset_ns": 10961587543,
+      "planned_end_offset_ns": 120000000000
+    },
+    {
+      "name": "account_priming_connections",
+      "start_offset_ns": 10961589562,
+      "end_offset_ns": 12364696841,
+      "planned_end_offset_ns": 120000000000
+    },
+    {
+      "name": "warmup",
+      "start_offset_ns": 12367130783,
+      "end_offset_ns": 12368834757,
+      "planned_end_offset_ns": 12367130783
+    },
+    {
+      "name": "warmup_drain",
+      "start_offset_ns": 12367130783,
+      "end_offset_ns": 12370739734,
+      "planned_end_offset_ns": 22367130783
+    },
+    {
+      "name": "measurement",
+      "start_offset_ns": 12374899470,
+      "end_offset_ns": 14476400442,
+      "planned_end_offset_ns": 14474899470
+    },
+    {
+      "name": "measurement_drain",
+      "start_offset_ns": 14474899470,
+      "end_offset_ns": 14478536020,
+      "planned_end_offset_ns": 24474899470
+    },
+    {
+      "name": "connection_shutdown",
+      "start_offset_ns": 14478539956,
+      "end_offset_ns": 14482114633,
+      "planned_end_offset_ns": 19478536937
+    },
+    {
+      "name": "local_child_shutdown",
+      "start_offset_ns": 14490653249,
+      "end_offset_ns": 14503594614,
+      "planned_end_offset_ns": 19490652806
+    },
+    {
+      "name": "artifact_finalization",
+      "start_offset_ns": 14503924032,
+      "end_offset_ns": 14508993407,
+      "planned_end_offset_ns": null
+    }
+  ],
+  "b": [
+    {
+      "name": "preflight",
+      "start_offset_ns": 2613413,
+      "end_offset_ns": 9076432617,
+      "planned_end_offset_ns": 120000000000
+    },
+    {
+      "name": "target_setup",
+      "start_offset_ns": 9076439026,
+      "end_offset_ns": 11053939315,
+      "planned_end_offset_ns": 120000000000
+    },
+    {
+      "name": "account_priming_connections",
+      "start_offset_ns": 11053942716,
+      "end_offset_ns": 12463686940,
+      "planned_end_offset_ns": 120000000000
+    },
+    {
+      "name": "warmup",
+      "start_offset_ns": 12466129152,
+      "end_offset_ns": 12467832778,
+      "planned_end_offset_ns": 12466129152
+    },
+    {
+      "name": "warmup_drain",
+      "start_offset_ns": 12466129152,
+      "end_offset_ns": 12470010069,
+      "planned_end_offset_ns": 22466129152
+    },
+    {
+      "name": "measurement",
+      "start_offset_ns": 12474121793,
+      "end_offset_ns": 14575263480,
+      "planned_end_offset_ns": 14574121793
+    },
+    {
+      "name": "measurement_drain",
+      "start_offset_ns": 14574121793,
+      "end_offset_ns": 14577091598,
+      "planned_end_offset_ns": 24574121793
+    },
+    {
+      "name": "connection_shutdown",
+      "start_offset_ns": 14577094859,
+      "end_offset_ns": 14579135208,
+      "planned_end_offset_ns": 19577092364
+    },
+    {
+      "name": "local_child_shutdown",
+      "start_offset_ns": 14592272556,
+      "end_offset_ns": 14605257319,
+      "planned_end_offset_ns": 19592272115
+    },
+    {
+      "name": "artifact_finalization",
+      "start_offset_ns": 14605438650,
+      "end_offset_ns": 14610515782,
+      "planned_end_offset_ns": null
+    }
+  ]
+}

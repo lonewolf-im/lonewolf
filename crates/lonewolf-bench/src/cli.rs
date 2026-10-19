@@ -92,9 +92,14 @@ impl Cli {
             } => {
                 crate::accounts::generate_credentials(&domain, &prefix, count, &output).map(|()| 0)
             }
-            Command::Compare { output, .. } => {
-                validate_new_output(&output)?;
-                Err(BenchError::staged())
+            Command::Compare {
+                baseline_dir,
+                candidate_dir,
+                output,
+            } => {
+                let report =
+                    crate::compare::compare_directories(&baseline_dir, &candidate_dir, &output)?;
+                Ok(if report.eligible { 0 } else { 2 })
             }
             Command::Accounts {
                 command:
@@ -202,14 +207,15 @@ mod tests {
     }
 
     #[test]
-    fn staged_commands_return_explicit_errors() -> Result<(), Box<dyn std::error::Error>> {
+    fn compare_persists_refusal_and_returns_exit_two() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("new");
         let output = output.to_str().ok_or("test path encoding")?;
         let result =
             Cli::try_parse_from(["bench", "compare", "absent", "absent", "--output", output])?
                 .execute();
-        assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
+        assert_eq!(result?, 2);
+        assert!(directory.path().join("new/comparison.json").is_file());
         Ok(())
     }
 }

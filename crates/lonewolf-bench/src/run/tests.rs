@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use std::os::unix::fs::PermissionsExt;
+use std::{fs, os::unix::fs::PermissionsExt};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -46,6 +46,8 @@ fn context_with_events(
         setup_attempts: 0,
         setup_failures: 0,
         message_phase: None,
+        telemetry: None,
+        telemetry_buffer: None,
     };
     Ok((context, signal, observed))
 }
@@ -135,11 +137,11 @@ async fn invalid_external_inputs_preserve_partial_evidence_and_status_precedence
 async fn interrupted_preflight_has_no_setup_counts_or_measurement_window() -> TestResult {
     let directory = tempfile::tempdir()?;
     let output = directory.path().join("output");
-    acquire_output(&output)?;
+    let writer = ArtifactWriter::create(&output)?;
     let (_signal, interruption) = watch::channel(true);
     let report = execute(
         config(2)?,
-        &output,
+        writer,
         RunObserver::default(),
         interruption,
         None,
@@ -157,12 +159,12 @@ async fn interrupted_preflight_has_no_setup_counts_or_measurement_window() -> Te
 async fn artifact_failure_retains_all_reasons_and_an_incomplete_marker() -> TestResult {
     let directory = tempfile::tempdir()?;
     let output = directory.path().join("output");
-    acquire_output(&output)?;
+    let writer = ArtifactWriter::create(&output)?;
     fs::write(output.join("result.json"), b"existing")?;
     let (_signal, interruption) = watch::channel(true);
     let report = execute(
         config(1)?,
-        &output,
+        writer,
         RunObserver::default(),
         interruption,
         None,
@@ -297,12 +299,12 @@ fn nullable_metadata_and_strict_remote_descriptor_validation() -> TestResult {
     assert!(encoded["driver"]["system"]["arch"].is_null());
     assert_eq!(serde_json::from_value::<RunReport>(encoded)?, report);
     let mut descriptor = descriptor()?;
-    validate_descriptor(&descriptor, "test")?;
+    descriptor.validate("test")?;
     descriptor.server.arch = None;
-    assert!(validate_descriptor(&descriptor, "test").is_err());
+    assert!(descriptor.validate("test").is_err());
     descriptor.server.arch = Some("test".into());
     descriptor.server_settings.max_connections_per_ip = 0;
-    assert!(validate_descriptor(&descriptor, "test").is_err());
+    assert!(descriptor.validate("test").is_err());
     Ok(())
 }
 
@@ -358,7 +360,14 @@ async fn later_credential_or_target_failure_preserves_validated_environment_and_
     );
     assert!(report.dataset.account_jids_sha256.is_none());
     crate::accounts::generate_credentials("localhost", "test", 3, &credentials)?;
-    let hash = CredentialSet::read(&credentials, Some("localhost"), Some(2))?.jids_sha256();
+    let selected =
+        CredentialSet::read(&credentials, Some("localhost"), Some(2))?.into_prepared()?;
+    let hash = canonical_hash(
+        &selected
+            .iter()
+            .map(PreparedAccount::bare_jid)
+            .collect::<Vec<_>>(),
+    )?;
     let peer = tokio::spawn(async move {
         let (socket, _) = listener.accept().await?;
         drop(socket);
@@ -522,6 +531,80 @@ fn churn_dataset_resource_policy_matches_unique_cycle_resources() -> TestResult 
     assert_eq!(
         initial_report(&config).dataset.resource_policy,
         "unique_resource_per_cycle:bench-RUN_NONCE-PHASE-SEQUENCE"
+    );
+    Ok(())
+}
+
+#[test]
+fn observed_restart_invalidates_even_when_telemetry_already_contains_the_reason() -> TestResult {
+    let (mut context, _signal) = context(1)?;
+    let mut telemetry = context.report.telemetry.clone();
+    telemetry.identity_changes = 1;
+    telemetry.quality = TelemetryStatus::Partial;
+    telemetry.reasons = vec![RunReason {
+        code: ReasonCode::ServerRestarted,
+        context: Some("server_restarted".into()),
+    }];
+    context.apply_telemetry(telemetry, Vec::new(), None);
+    assert_eq!(context.report.status, RunStatus::Invalid);
+    assert_eq!(
+        context
+            .report
+            .reasons
+            .iter()
+            .filter(|r| r.code == ReasonCode::ServerRestarted)
+            .count(),
+        1
+    );
+    let (mut context, _signal) = self::context(1)?;
+    let mut telemetry = context.report.telemetry.clone();
+    telemetry.quality = TelemetryStatus::Partial;
+    telemetry.reasons = vec![RunReason {
+        code: ReasonCode::TelemetryPartial,
+        context: Some("output_limit".into()),
+    }];
+    context.apply_telemetry(telemetry, Vec::new(), None);
+    assert_eq!(context.report.status, RunStatus::Passed);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn connection_observations_survive_failed_close_and_interruption() -> TestResult {
+    let (mut context, signal) = context(1)?;
+    let original = context.report.target.clone();
+    assert_eq!(original.negotiated_tls, None);
+    assert_eq!(original.cipher, None);
+    assert_eq!(original.observed_scram_iterations, None);
+    context.connections.simulated(None, Duration::from_secs(10));
+    context.apply_connection_observations(connections::ConnectionObservations {
+        negotiated_tls: Some(rustls::ProtocolVersion::TLSv1_3),
+        cipher: Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+        observed_scram_iterations: Some(600000),
+    });
+    assert_eq!(context.report.status, RunStatus::Passed);
+    assert_eq!(context.report.target.cache_primed, original.cache_primed);
+    signal.send_replace(true);
+    context
+        .close_connections(Instant::now() + Duration::from_millis(10))
+        .await;
+    assert_eq!(context.report.status, RunStatus::Failed);
+    assert_eq!(
+        context.report.target.negotiated_tls.as_deref(),
+        Some("TLSv1_3")
+    );
+    assert_eq!(
+        context.report.target.cipher.as_deref(),
+        Some("TLS13_AES_256_GCM_SHA384")
+    );
+    assert_eq!(
+        context.report.target.observed_scram_iterations,
+        Some(600000)
+    );
+    context.retain_error(failure("interrupted"));
+    assert_eq!(context.report.status, RunStatus::Interrupted);
+    assert_eq!(
+        context.report.target.observed_scram_iterations,
+        Some(600000)
     );
     Ok(())
 }

@@ -3,7 +3,7 @@
 use super::*;
 use serde_json::{Value, json};
 
-fn report_fixture() -> Result<Value, Box<dyn std::error::Error>> {
+pub(super) fn report_fixture() -> Result<Value, Box<dyn std::error::Error>> {
     let config: RunConfig = toml::from_str(
         "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='/secret/binary'\n[scenario]\nkind='idle'",
     )?;
@@ -195,4 +195,181 @@ fn resource_observations_keep_exact_peaks_and_fractional_derivations()
     summary.incremental_rss_per_connection_bytes.value = Some(f64::NAN);
     assert!(serde_json::to_value(summary).is_err());
     Ok(())
+}
+
+#[test]
+fn canonical_hashes_exclude_secret_material_and_sort_objects()
+-> Result<(), Box<dyn std::error::Error>> {
+    use metadata::canonical_hash;
+    let a = json!({"z":["a@localhost","b@localhost"],"a":1});
+    let b = json!({"a":1,"z":["a@localhost","b@localhost"]});
+    assert_eq!(canonical_hash(&a)?, canonical_hash(&b)?);
+    assert_ne!(
+        canonical_hash(&a)?,
+        canonical_hash(&json!({"a":1,"z":["b@localhost","a@localhost"]}))?
+    );
+    let directory = tempfile::tempdir()?;
+    let mut hashes = Vec::new();
+    for index in 0..2 {
+        let path = directory.path().join(index.to_string());
+        crate::accounts::generate_credentials("localhost", "test", 2, &path)?;
+        let accounts = crate::accounts::CredentialSet::read(&path, Some("localhost"), Some(2))?
+            .into_prepared()?;
+        hashes.push(canonical_hash(
+            &accounts
+                .iter()
+                .map(crate::client::PreparedAccount::bare_jid)
+                .collect::<Vec<_>>(),
+        )?);
+    }
+    assert_eq!(hashes[0], hashes[1]);
+    Ok(())
+}
+
+#[test]
+fn local_binary_hash_and_unknown_build_never_infer_from_release_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    std::fs::create_dir(directory.path().join("release"))?;
+    let binary = directory.path().join("release/lonewolf");
+    std::fs::write(&binary, b"actual target binary")?;
+    let mut config = crate::run::tests::config(1)?;
+    if let TargetConfig::Local { server_binary, .. } = &mut config.target {
+        *server_binary = binary;
+    }
+    let observed = metadata::collect_metadata(&config)?;
+    let build = observed
+        .target
+        .declared_build
+        .as_ref()
+        .ok_or("declaration")?;
+    assert_eq!(build.profile, "unknown");
+    assert!(build.features.is_none());
+    assert!(build.toolchain.is_none());
+    assert_eq!(
+        observed.target.local_binary_sha256.as_deref(),
+        Some(metadata::hash_bytes(b"actual target binary").as_str())
+    );
+    assert_ne!(
+        observed.target.local_binary_sha256,
+        observed.driver.executable_sha256
+    );
+    if let TargetConfig::Local {
+        server_profile,
+        server_features,
+        ..
+    } = &mut config.target
+    {
+        *server_profile = "release".into();
+        *server_features = Some(vec![]);
+    }
+    let observed = metadata::collect_metadata(&config)?;
+    let build = observed.target.declared_build.ok_or("declaration")?;
+    assert_eq!(build.profile, "release");
+    assert_eq!(build.features, Some(vec![]));
+    assert_eq!(build.toolchain, None);
+    Ok(())
+}
+
+#[test]
+fn strict_remote_descriptor_requires_present_fields_and_complete_settings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("descriptor.json");
+    let descriptor = report_fixture()?["environment"].clone();
+    std::fs::write(&path, serde_json::to_vec(&descriptor)?)?;
+    let parsed = EnvironmentDescriptor::read(&path)?;
+    parsed.validate("test")?;
+    assert!(parsed.validate("other").is_err());
+    for (parent, key) in [
+        ("server", "arch"),
+        ("server", "cpu_model"),
+        ("server_build", "features"),
+        ("server_settings", "resource_binding_retries"),
+    ] {
+        let mut invalid = descriptor.clone();
+        invalid[parent].as_object_mut().ok_or("object")?.remove(key);
+        std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
+        assert!(EnvironmentDescriptor::read(&path).is_err());
+    }
+    let mut invalid = descriptor.clone();
+    invalid["server"]["secret"] = json!("PRIVATE_SENTINEL");
+    std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
+    assert!(EnvironmentDescriptor::read(&path).is_err());
+    std::fs::write(&path, vec![b' '; 1_048_577])?;
+    assert!(EnvironmentDescriptor::read(&path).is_err());
+    Ok(())
+}
+
+#[test]
+fn summary_puts_coverage_and_failures_before_successful_quantiles()
+-> Result<(), Box<dyn std::error::Error>> {
+    let report: RunReport = serde_json::from_value(report_fixture()?)?;
+    let summary = summary::render(&report);
+    assert!(
+        summary.find("Receipt coverage").ok_or("coverage")?
+            < summary.find("Successful-only latency").ok_or("latency")?
+    );
+    assert!(summary.contains("67108864"));
+    assert!(summary.contains("Unknown profile/features"));
+    assert!(!summary.contains("/secret/binary"));
+    Ok(())
+}
+
+#[test]
+fn all_eight_rates_use_exact_nominal_window_and_distinct_populations() {
+    use crate::measurement::{LedgerTopology, MeasurementResult};
+    use std::{num::NonZeroU32, time::Duration};
+    let counters = CounterReport {
+        planned: 11,
+        dispatched_in_window: 10,
+        write_succeeded_in_window: 9,
+        received_in_window: 8,
+        received_on_time: 7,
+        login_in_window: 6,
+        login_succeeded: 5,
+        closed_cleanly: 4,
+        ..CounterReport::default()
+    };
+    let result = MeasurementResult {
+        counters,
+        latencies: Default::default(),
+        reasons: vec![],
+    };
+    let messages = result.rates(
+        Duration::from_millis(100),
+        101,
+        LedgerTopology::Messages {
+            pairs: NonZeroU32::MIN,
+        },
+    );
+    assert_eq!(messages.window_seconds, Some(0.1));
+    assert_eq!(messages.offered_rate_per_second, Some(101));
+    assert_eq!(messages.planned_per_second, Some(110.0));
+    assert_eq!(messages.dispatched_in_window_per_second, Some(100.0));
+    assert_eq!(messages.write_succeeded_in_window_per_second, Some(90.0));
+    assert_eq!(messages.received_in_window_per_second, Some(80.0));
+    assert_eq!(messages.cohort_receipts_per_second, Some(70.0));
+    let churn = result.rates(
+        Duration::from_millis(100),
+        101,
+        LedgerTopology::Churn {
+            accounts: NonZeroU32::MIN,
+        },
+    );
+    assert_eq!(churn.login_in_window_per_second, Some(60.0));
+    assert_eq!(churn.cohort_logins_per_second, Some(50.0));
+    assert_eq!(churn.closed_cycles_per_second, Some(40.0));
+    assert_eq!(
+        result
+            .rates(
+                Duration::ZERO,
+                101,
+                LedgerTopology::Churn {
+                    accounts: NonZeroU32::MIN
+                }
+            )
+            .window_seconds,
+        None
+    );
 }

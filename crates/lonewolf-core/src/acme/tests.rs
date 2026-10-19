@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
-use lonewolf_acme::{RetryState, StateStore, StoredCertificate, StoredHost};
+use lonewolf_acme::{AcmeErrorKind, RetryState, StateStore, StoredCertificate, StoredHost};
 use parking_lot::Mutex as PlMutex;
 use rcgen::CertificateParams;
 use zeroize::Zeroizing;
@@ -189,14 +189,33 @@ fn startup_failure_releases_bound_listener_and_open_cache() -> TestResult {
     Runtime::new()?.block_on(async {
         let directory = tempfile::tempdir()?;
         let mut config = config(directory.path());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let address = listener.local_addr()?;
-        drop(listener);
-        config.letsencrypt.listen = vec![address];
         config.letsencrypt.ca_certificates_path = Some(directory.path().join("missing-trust.pem"));
         let hosts = Hosts::new(&config.hosts, None)?;
-        assert!(AcmeServices::load(&config, hosts).await.is_err());
+        let managed = managed_hosts(&config)?;
+        let challenges = Challenges::new(&managed)?;
+        let http = Http01Server::bind(&config.letsencrypt.listen, challenges.clone()).await?;
+        let address = http.local_addrs()?[0];
+        assert_eq!(
+            std::net::TcpListener::bind(address).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let error = AcmeServices::load_bound(&config, hosts, managed, challenges, http)
+            .await
+            .err()
+            .ok_or("unexpected startup success")?;
+        let RunError::Acme {
+            phase: "load",
+            source,
+        } = error
+        else {
+            return Err("unexpected startup failure".into());
+        };
+        let Some(ManagerError::Transport(error)) = source.downcast_ref::<ManagerError>() else {
+            return Err("unexpected manager failure".into());
+        };
+        assert_eq!(error.kind(), AcmeErrorKind::InvalidCaBundle);
         let _listener = std::net::TcpListener::bind(address)?;
+        assert!(config.letsencrypt.state_path.exists());
         let _store = StateStore::open(
             config.letsencrypt.state_path,
             config.letsencrypt.directory_url,

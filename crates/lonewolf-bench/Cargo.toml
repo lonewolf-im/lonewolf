@@ -7,13 +7,27 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
+futures-rustls.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+lonewolf-util.workspace = true
+lonewolf-xmpp.workspace = true
+pbkdf2.workspace = true
+rustls.workspace = true
+rustls-graviola = { version = "0.4.0", default-features = false }
+sha2.workspace = true
+stringprep.workspace = true
+tokio-util.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
 clap.workspace = true
 hdrhistogram.workspace = true
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
 
 [dev-dependencies]
 tempfile.workspace = true

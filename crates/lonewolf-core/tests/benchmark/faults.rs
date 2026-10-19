@@ -9,6 +9,7 @@ use lonewolf_bench::{
     },
 };
 use std::{
+    io,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -188,16 +189,149 @@ enum HttpFault {
     CounterDrop,
     Large,
 }
+impl HttpFault {
+    fn allows_response_disconnect(self) -> bool {
+        matches!(
+            self,
+            Self::SlowHeaders | Self::SlowBody | Self::Oversized | Self::BadStatus
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResponseStart {
+    Immediate,
+    AfterReset,
+}
+
+fn peer_disconnected(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
+}
+
+async fn wait_for_http_close(stream: &mut tokio::net::TcpStream) -> io::Result<()> {
+    let mut byte = [0];
+    match stream.read(&mut byte).await? {
+        0 => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected HTTP request bytes",
+        )),
+    }
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    fault: HttpFault,
+    sequence: usize,
+    partial_body: &tokio::sync::mpsc::UnboundedSender<()>,
+) -> io::Result<()> {
+    let response = async {
+        if matches!(fault, HttpFault::SlowHeaders) {
+            return wait_for_http_close(stream).await;
+        }
+        let cpu = if matches!(fault, HttpFault::CounterDrop) && sequence > 0 {
+            0
+        } else {
+            10 + sequence
+        };
+        let start = if matches!(fault, HttpFault::Restart) && sequence > 0 {
+            2
+        } else {
+            1
+        };
+        let build = if matches!(fault, HttpFault::BuildChange) && sequence > 0 {
+            "b"
+        } else {
+            "a"
+        };
+        let mut body = format!("process_start_time_seconds {start}\nprocess_cpu_seconds_total {cpu}\nprocess_resident_memory_bytes 1000\nprocess_open_fds 5\nlonewolf_build_info{{commit=\"{build}\",branch=\"test\",version=\"test\"}} 1\nlonewolf_c2s_connections{{listener=\"0\"}} 2\nlonewolf_c2s_connections{{listener=\"1\"}} 3\n# EOF\n");
+        match fault {
+            HttpFault::Missing => body = "# EOF\n".into(),
+            HttpFault::BadEof => body = "process_cpu_seconds_total 1\n".into(),
+            HttpFault::Oversized => body = "x".repeat(1_048_577),
+            HttpFault::Large => body = format!("# {}\n{body}", "x".repeat(1_000_000)),
+            _ => {}
+        }
+        let length = if matches!(fault, HttpFault::SlowBody) {
+            body.len() + 10000
+        } else {
+            body.len()
+        };
+        let status = if matches!(fault, HttpFault::BadStatus) {
+            "503 Unavailable"
+        } else {
+            "200 OK"
+        };
+        stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/openmetrics-text\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+        if matches!(fault, HttpFault::SlowBody) {
+            stream.write_all(b"partial-secret-body-sentinel").await?;
+            let _ = partial_body.send(());
+            wait_for_http_close(stream).await
+        } else {
+            stream.write_all(body.as_bytes()).await
+        }
+    }
+    .await;
+    match response {
+        Err(error) if fault.allows_response_disconnect() && peer_disconnected(&error) => Ok(()),
+        other => other,
+    }
+}
+
+async fn http_exchange(
+    stream: &mut tokio::net::TcpStream,
+    fault: HttpFault,
+    sequence: usize,
+    requests: &tokio::sync::mpsc::UnboundedSender<String>,
+    partial_body: &tokio::sync::mpsc::UnboundedSender<()>,
+    response_start: ResponseStart,
+) -> io::Result<()> {
+    let mut request = Vec::new();
+    loop {
+        let mut bytes = [0; 1024];
+        let count = stream.read(&mut bytes).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&bytes[..count]);
+        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if request.len() > 8192 {
+            return Err(io::Error::other("request bound"));
+        }
+    }
+    let _ = requests.send(String::from_utf8_lossy(&request).into_owned());
+    if matches!(response_start, ResponseStart::AfterReset) {
+        let mut byte = [0];
+        let result = timeout(Duration::from_secs(5), stream.read(&mut byte)).await?;
+        if !matches!(result, Err(error) if error.kind() == io::ErrorKind::ConnectionReset) {
+            return Err(io::Error::other("expected TCP reset before HTTP response"));
+        }
+    }
+    write_http_response(stream, fault, sequence, partial_body).await
+}
+
 struct HttpServer {
     url: String,
     stop: tokio::sync::watch::Sender<bool>,
-    task: Option<tokio::task::JoinHandle<Result<(), std::io::Error>>>,
+    task: Option<tokio::task::JoinHandle<io::Result<()>>>,
     requests: tokio::sync::mpsc::UnboundedReceiver<String>,
+    partial_bodies: tokio::sync::mpsc::UnboundedReceiver<()>,
     closed: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
 }
 impl HttpServer {
     async fn start(fault: HttpFault) -> TestResult<Self> {
+        Self::with_response_start(fault, ResponseStart::Immediate).await
+    }
+    async fn with_response_start(
+        fault: HttpFault,
+        response_start: ResponseStart,
+    ) -> TestResult<Self> {
         let address = tokio::net::lookup_host(("localhost", 0))
             .await?
             .next()
@@ -207,6 +341,7 @@ impl HttpServer {
         let address = listener.local_addr()?;
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let (send, requests) = tokio::sync::mpsc::unbounded_channel();
+        let (partial_body, partial_bodies) = tokio::sync::mpsc::unbounded_channel();
         let active = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicUsize::new(0));
         let (task_active, task_closed) = (active.clone(), closed.clone());
@@ -215,61 +350,25 @@ impl HttpServer {
             let mut sequence = 0;
             loop {
                 tokio::select! {
-                    _=stopped.changed()=>break,
-                    connection=listener.accept()=>{
-                        let (mut stream,_)=connection?;
-                        let send=send.clone();
-                        let (active,closed)=(task_active.clone(),task_closed.clone());
-                        let current=sequence;
-                        sequence+=1;
+                    _ = stopped.changed() => break,
+                    connection = listener.accept() => {
+                        let (mut stream, _) = connection?;
+                        let (send, partial_body) = (send.clone(), partial_body.clone());
+                        let (active, closed) = (task_active.clone(), task_closed.clone());
+                        let current = sequence;
+                        sequence += 1;
                         children.spawn(async move {
-                            active.fetch_add(1,Ordering::AcqRel);
-                            let result=async {
-                                let mut request=vec![];
-                                loop {
-                                    let mut bytes=[0;1024];
-                                    let count=stream.read(&mut bytes).await?;
-                                    if count==0 {return Ok(());}
-                                    request.extend_from_slice(&bytes[..count]);
-                                    if request.windows(4).any(|w|w==b"\r\n\r\n") {break;}
-                                    if request.len()>8192 {return Err(std::io::Error::other("request bound"));}
-                                }
-                                let _=send.send(String::from_utf8_lossy(&request).into_owned());
-                                if matches!(fault,HttpFault::SlowHeaders) {
-                                    let mut byte=[0];
-                                    assert_eq!(stream.read(&mut byte).await?,0);
-                                    return Ok(());
-                                }
-                                let cpu=if matches!(fault,HttpFault::CounterDrop)&&current>0 {0}else{10+current};
-                                let start=if matches!(fault,HttpFault::Restart)&&current>0 {2}else{1};
-                                let build=if matches!(fault,HttpFault::BuildChange)&&current>0 {"b"}else{"a"};
-                                let mut body=format!("process_start_time_seconds {start}\nprocess_cpu_seconds_total {cpu}\nprocess_resident_memory_bytes 1000\nprocess_open_fds 5\nlonewolf_build_info{{commit=\"{build}\",branch=\"test\",version=\"test\"}} 1\nlonewolf_c2s_connections{{listener=\"0\"}} 2\nlonewolf_c2s_connections{{listener=\"1\"}} 3\n# EOF\n");
-                                if matches!(fault,HttpFault::Missing) {body="# EOF\n".into();}
-                                if matches!(fault,HttpFault::BadEof) {body="process_cpu_seconds_total 1\n".into();}
-                                if matches!(fault,HttpFault::Oversized) {body="x".repeat(1_048_577);}
-                                if matches!(fault,HttpFault::Large) {body=format!("# {}\n{body}","x".repeat(1_000_000));}
-                                let length=if matches!(fault,HttpFault::SlowBody) {body.len()+10000}else{body.len()};
-                                let status=if matches!(fault,HttpFault::BadStatus) {"503 Unavailable"}else{"200 OK"};
-                                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/openmetrics-text\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
-                                if matches!(fault,HttpFault::SlowBody) {
-                                    stream.write_all(b"partial-secret-body-sentinel").await?;
-                                    let mut byte=[0];
-                                    assert_eq!(stream.read(&mut byte).await?,0);
-                                }else{
-                                    // The collector may close the socket as soon as it sees an oversized body.
-                                    let _=stream.write_all(body.as_bytes()).await;
-                                }
-                                Ok::<_,std::io::Error>(())
-                            }.await;
-                            active.fetch_sub(1,Ordering::AcqRel);
-                            closed.fetch_add(1,Ordering::AcqRel);
+                            active.fetch_add(1, Ordering::AcqRel);
+                            let result = http_exchange(&mut stream, fault, current, &send, &partial_body, response_start).await;
+                            active.fetch_sub(1, Ordering::AcqRel);
+                            closed.fetch_add(1, Ordering::AcqRel);
                             result
                         });
                     }
                 }
             }
             while let Some(result) = children.join_next().await {
-                result.map_err(std::io::Error::other)??;
+                result.map_err(io::Error::other)??;
             }
             Ok(())
         });
@@ -278,6 +377,7 @@ impl HttpServer {
             stop,
             task: Some(task),
             requests,
+            partial_bodies,
             closed,
             active,
         })
@@ -286,6 +386,12 @@ impl HttpServer {
         Ok(timeout(Duration::from_secs(10), self.requests.recv())
             .await?
             .ok_or("HTTP request")?)
+    }
+    async fn partial_body(&mut self) -> TestResult {
+        timeout(Duration::from_secs(10), self.partial_bodies.recv())
+            .await?
+            .ok_or("HTTP partial body")?;
+        Ok(())
     }
     async fn finish(mut self) -> TestResult {
         self.stop.send_replace(true);
@@ -304,6 +410,7 @@ impl Drop for HttpServer {
         }
     }
 }
+
 fn phase() -> PhaseSampleRequest {
     PhaseSampleRequest {
         phase: PhaseName::Measurement,
@@ -311,6 +418,59 @@ fn phase() -> PhaseSampleRequest {
         window: None,
         achieved_connections: 0,
     }
+}
+
+#[tokio::test]
+async fn pre_response_reset_is_allowed_only_for_intentionally_interrupted_http() -> TestResult {
+    for fault in [HttpFault::SlowBody, HttpFault::Valid] {
+        let mut http = HttpServer::with_response_start(fault, ResponseStart::AfterReset).await?;
+        let authority = http
+            .url
+            .strip_prefix("http://")
+            .and_then(|url| url.strip_suffix("/metrics"))
+            .ok_or("authority")?
+            .to_owned();
+        let mut client = timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&authority),
+        )
+        .await??;
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        assert!(
+            http.request()
+                .await?
+                .starts_with("GET /metrics HTTP/1.1\r\n")
+        );
+        assert_eq!(http.active.load(Ordering::Acquire), 1);
+        socket2::SockRef::from(&client).set_linger(Some(Duration::ZERO))?;
+        drop(client);
+        let active = http.active.clone();
+        let closed = http.closed.clone();
+        let result = http.finish().await;
+        if matches!(fault, HttpFault::SlowBody) {
+            result?;
+        } else {
+            let error = result.err().ok_or("normal HTTP response hid TCP reset")?;
+            assert!(
+                error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(peer_disconnected)
+            );
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(closed.load(Ordering::Acquire), 1);
+        assert!(
+            timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect(&authority),
+            )
+            .await?
+            .is_err()
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -381,6 +541,7 @@ async fn mid_body_cancellation_joins_http_driver_before_artifact_publication() -
         allocate_buffer()?,
     )?;
     http.request().await?;
+    http.partial_body().await?;
     let (report, raw) = sampler.stop(Instant::now()).await?;
     assert_ne!(report.quality, TelemetryStatus::Complete);
     timeout(Duration::from_secs(2), async {
@@ -678,6 +839,7 @@ async fn actual_cli_ctrl_c_during_pending_setup_closes_http_before_returning() -
         ],
     )?;
     http.request().await?;
+    http.partial_body().await?;
     process.signal()?;
     let result = tokio::task::spawn_blocking(move || process.wait().map_err(|e| e.to_string()))
         .await?

@@ -13,17 +13,10 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[tokio::test]
 async fn unsupported_scenarios_fail_before_output_or_target_effects() -> TestResult {
     let directory = tempfile::tempdir()?;
-    for scenario in [
-        ScenarioConfig::Messages {
-            pairs: 1,
-            rate_per_second: 1,
-            body_bytes: 1,
-        },
-        ScenarioConfig::Churn {
-            accounts: 1,
-            rate_per_second: 1,
-        },
-    ] {
+    for scenario in [ScenarioConfig::Churn {
+        accounts: 1,
+        rate_per_second: 1,
+    }] {
         let mut config = config(1)?;
         config.scenario = scenario;
         let output = directory.path().join("output");

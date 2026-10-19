@@ -45,6 +45,7 @@ fn context_with_events(
         measurement_window: None,
         setup_attempts: 0,
         setup_failures: 0,
+        message_phase: None,
     };
     Ok((context, signal, observed))
 }
@@ -199,7 +200,10 @@ fn workload_event_capacity_is_checked_and_overflow_is_sticky() -> TestResult {
     let (sender, mut receiver) = EventSender::new(1, invalid.clone());
     sender.emit(RunEvent::Received {
         index: 0,
-        at: Instant::now(),
+        event: crate::client::ReceivedEvent {
+            at: Instant::now(),
+            kind: crate::client::ReceivedKind::Unexpected,
+        },
     });
     sender.emit(RunEvent::ConnectionClosed {
         index: 0,
@@ -210,7 +214,10 @@ fn workload_event_capacity_is_checked_and_overflow_is_sticky() -> TestResult {
     drop(receiver);
     sender.emit(RunEvent::Received {
         index: 0,
-        at: Instant::now(),
+        event: crate::client::ReceivedEvent {
+            at: Instant::now(),
+            kind: crate::client::ReceivedKind::Unexpected,
+        },
     });
     assert!(invalid.load(Ordering::Acquire));
     Ok(())
@@ -395,7 +402,10 @@ async fn global_event_receiver_closes_and_cancelled_waits_keep_the_queue() -> Te
     );
     sender.emit(RunEvent::Received {
         index: 42,
-        at: Instant::now(),
+        event: crate::client::ReceivedEvent {
+            at: Instant::now(),
+            kind: crate::client::ReceivedKind::Unexpected,
+        },
     });
     assert!(matches!(
         receiver.recv().await,
@@ -446,7 +456,13 @@ async fn warmup_settlement_drains_invalid_events_beyond_the_hot_loop_batch() -> 
     let phase = context.start_phase(PhaseName::Warmup, None);
     let at = Instant::now();
     for _ in 0..3 {
-        sender.emit(RunEvent::Received { index: 0, at });
+        sender.emit(RunEvent::Received {
+            index: 0,
+            event: crate::client::ReceivedEvent {
+                at,
+                kind: crate::client::ReceivedKind::Unexpected,
+            },
+        });
     }
     sender.emit(RunEvent::Invalid { index: 0, at });
     context.consume_events();

@@ -224,7 +224,7 @@ async fn fragmented_coalesced_parser_restart_retains_buffer_and_limits_xml() -> 
             .err()
             .ok_or("accepted oversized XML")?
             .context(),
-        "xml_read"
+        "xml_protocol"
     );
     Ok(())
 }
@@ -794,6 +794,63 @@ async fn empty_payload_rejects_nested_body_content() -> TestResult {
         assert!(
             matches!(event.kind, ReceivedKind::Chat { route_valid, .. } if route_valid == valid)
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn message_writer_escapes_attributes_omits_from_and_counts_serialized_bytes() -> TestResult {
+    let (transport, _) = probe(None, false);
+    let output = transport.bytes.clone();
+    let mut writer = Writer::new(transport, Retirement::new());
+    writer.configure_messages(
+        Arc::from([MessageRoute {
+            to: "receiver@example.test/r<&'\"".into(),
+        }]),
+        Arc::from("xxx"),
+    )?;
+    let (sink, mut events) = sink(2);
+    writer.send(&command(), &sink).await?;
+    let bytes = output.lock().map_err(|_| "output lock")?;
+    let text = std::str::from_utf8(&bytes)?;
+    assert!(text.contains("to='receiver@example.test/r&lt;&amp;&apos;&quot;'"));
+    assert!(!text.contains("from="));
+    assert!(text.ends_with("<body>xxx</body></message>"));
+    assert!(matches!(
+        events.try_recv()?,
+        WriterEvent::WriteStarted { .. }
+    ));
+    assert!(
+        matches!(events.try_recv()?, WriterEvent::WriteCompleted { bytes: count, .. } if count == bytes.len() && count > 3)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn foreign_namespace_and_non_chat_messages_cannot_be_receipts() -> TestResult {
+    for stanza in [
+        chat().replacen("<message", "<message xmlns='foreign'", 1),
+        chat().replace("type='chat'", "type='normal'"),
+        chat().replace("<body>xxx</body>", "<body>x<nested/>xx</body>"),
+    ] {
+        let text = format!("{HEADER}{stanza}");
+        let mut parser = xml::parser(text.as_bytes());
+        xml::next(&mut parser).await?;
+        let event = xml::received(
+            xml::next(&mut parser).await?,
+            "receiver@example.test/resource",
+            Some(&ReceiveRoute {
+                from: "sender@example.test/resource".into(),
+                body_bytes: 3,
+            }),
+        )?;
+        assert!(!matches!(
+            event.kind,
+            ReceivedKind::Chat {
+                route_valid: true,
+                ..
+            }
+        ));
     }
     Ok(())
 }

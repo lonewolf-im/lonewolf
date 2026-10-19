@@ -9,7 +9,8 @@ use crate::{
     accounts::CredentialSet,
     client::{PreparedAccount, ResolvedTarget, remote_tls_config},
     config::{
-        MeasurementConfig, RunConfig, TargetConfig, printable, validate_build, validate_new_output,
+        MeasurementConfig, RunConfig, ScenarioConfig, TargetConfig, printable, validate_build,
+        validate_new_output,
     },
     error::{BenchError, BenchResult, ErrorCode},
     fixture::{LocalFixture, StopOutcome, preflight_descriptors},
@@ -57,12 +58,13 @@ pub struct RunContext {
     cpu: BlockingExecutor,
     origin: Instant,
     setup_deadline: Instant,
-    events: EventReceiver,
-    invalid: Arc<AtomicBool>,
-    interruption: watch::Receiver<bool>,
+    pub(crate) events: EventReceiver,
+    pub(crate) invalid: Arc<AtomicBool>,
+    pub(crate) interruption: watch::Receiver<bool>,
     pub(crate) measurement_window: Option<(Instant, Instant)>,
     setup_attempts: u64,
     setup_failures: u64,
+    pub(crate) message_phase: Option<crate::scenario::messages::MessagePhase>,
 }
 
 pub async fn run(config: RunConfig, output: &Path) -> BenchResult<RunReport> {
@@ -112,6 +114,7 @@ async fn execute(
         measurement_window: None,
         setup_attempts: 0,
         setup_failures: 0,
+        message_phase: None,
     };
     let mut signal_task = None;
     let phase = context.start_phase(PhaseName::Preflight, Some(setup_deadline));
@@ -233,7 +236,15 @@ impl RunContext {
         }
         self.finish_phase(phase, phase_status(&outcome));
         outcome?;
-        crate::scenario::idle::run(self).await?;
+        match self.config.scenario {
+            ScenarioConfig::Idle { .. } => {
+                crate::scenario::idle::run(self).await?;
+            }
+            ScenarioConfig::Messages { .. } => {
+                crate::scenario::messages::run(self).await?;
+            }
+            ScenarioConfig::Churn { .. } => return Err(BenchError::staged()),
+        }
         Ok(())
     }
 
@@ -316,25 +327,7 @@ impl RunContext {
     async fn cleanup(&mut self) {
         let timeout = Duration::from_millis(self.config.measurement.shutdown_timeout_ms);
         let deadline = Instant::now() + timeout;
-        let phase = self.start_phase(PhaseName::ConnectionShutdown, Some(deadline));
-        let summary = self.connections.close_all(deadline).await;
-        while let Ok(event) = self.events.try_recv() {
-            self.consume(event);
-        }
-        self.consume_events();
-        self.report.phases[phase].counters.closed_cleanly = summary.clean;
-        self.report.phases[phase].counters.close_failed = summary.failed;
-        if summary.failed > 0 {
-            self.reason(ReasonCode::WorkloadFailure, "connection_close_failed");
-        }
-        self.finish_phase(
-            phase,
-            if summary.failed > 0 {
-                PhaseStatus::Failed
-            } else {
-                PhaseStatus::Completed
-            },
-        );
+        self.close_connections(deadline).await;
         // One CPU permit makes this a barrier for all previously admitted jobs.
         self.cpu.run(|| ()).await;
         let phase = self.start_phase(
@@ -360,6 +353,36 @@ impl RunContext {
         self.accounts.clear();
     }
 
+    pub(crate) async fn close_connections(&mut self, deadline: Instant) {
+        if self
+            .report
+            .phases
+            .iter()
+            .any(|phase| phase.name == PhaseName::ConnectionShutdown)
+        {
+            return;
+        }
+        let phase = self.start_phase(PhaseName::ConnectionShutdown, Some(deadline));
+        let summary = self.connections.close_all(deadline).await;
+        while let Ok(event) = self.events.try_recv() {
+            self.consume(event);
+        }
+        self.consume_events();
+        self.report.phases[phase].counters.closed_cleanly = summary.clean;
+        self.report.phases[phase].counters.close_failed = summary.failed;
+        if summary.failed > 0 {
+            self.reason(ReasonCode::WorkloadFailure, "connection_close_failed");
+        }
+        self.finish_phase(
+            phase,
+            if summary.failed > 0 {
+                PhaseStatus::Failed
+            } else {
+                PhaseStatus::Completed
+            },
+        );
+    }
+
     pub(crate) fn consume_events(&mut self) {
         self.consume_prefix(self.config.measurement.max_dispatch_batch as usize);
     }
@@ -377,10 +400,14 @@ impl RunContext {
         self.observer.active_connections(self.connections.active());
     }
 
-    fn consume(&mut self, event: RunEvent) {
+    pub(crate) fn consume(&mut self, event: RunEvent) {
+        if let Some(phase) = &mut self.message_phase {
+            let _ = phase.observe(event);
+            return;
+        }
         let (at, disconnected, unexpected) = match event {
             RunEvent::ConnectionClosed { at, .. } => (at, true, false),
-            RunEvent::Received { at, .. } => (at, false, true),
+            RunEvent::Received { event, .. } => (event.at, false, true),
             RunEvent::Invalid { .. } => {
                 self.invalid.store(true, Ordering::Release);
                 self.reason(ReasonCode::EventOverflow, "reader_event_overflow");
@@ -435,7 +462,7 @@ impl RunContext {
         .await
     }
 
-    async fn settle_until(&mut self, deadline: Instant) -> BenchResult<()> {
+    pub(crate) async fn settle_until(&mut self, deadline: Instant) -> BenchResult<()> {
         self.connections.begin_barrier();
         while !self.connections.settled() {
             tokio::select! {
@@ -534,6 +561,7 @@ impl RunContext {
                 .phases
                 .iter_mut()
                 .find(|p| p.name == PhaseName::Measurement)
+                && matches!(self.config.scenario, ScenarioConfig::Idle { .. })
             {
                 phase.counters = self.report.counters.clone();
             }
@@ -554,10 +582,10 @@ impl RunContext {
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64
     }
-    fn start_phase(&mut self, name: PhaseName, deadline: Option<Instant>) -> usize {
+    pub(crate) fn start_phase(&mut self, name: PhaseName, deadline: Option<Instant>) -> usize {
         self.start_phase_at(name, Instant::now(), deadline)
     }
-    fn start_phase_at(
+    pub(crate) fn start_phase_at(
         &mut self,
         name: PhaseName,
         start: Instant,
@@ -576,7 +604,7 @@ impl RunContext {
         self.observer.phase_started(name);
         index
     }
-    fn finish_phase(&mut self, index: usize, status: PhaseStatus) {
+    pub(crate) fn finish_phase(&mut self, index: usize, status: PhaseStatus) {
         let end = self.offset(Instant::now());
         let phase = &mut self.report.phases[index];
         phase.end_offset_ns = Some(end);
@@ -595,7 +623,7 @@ impl RunContext {
         };
         self.reason(code, error.context());
     }
-    fn reason(&mut self, code: ReasonCode, context: &'static str) {
+    pub(crate) fn reason(&mut self, code: ReasonCode, context: &'static str) {
         if self
             .report
             .reasons
@@ -862,10 +890,20 @@ fn initial_report(config: &RunConfig) -> RunReport {
         dataset: DatasetIdentity {
             account_jids_sha256: None,
             account_count: config.account_count() as u64,
-            pair_count: None,
-            resource_policy: "one_bound_resource_per_account:bench".into(),
+            pair_count: match config.scenario {
+                ScenarioConfig::Messages { pairs, .. } => Some(pairs as u64),
+                _ => None,
+            },
+            resource_policy: match config.scenario {
+                ScenarioConfig::Messages { .. } => "one_bound_resource_per_account:run_nonce",
+                _ => "one_bound_resource_per_account:bench",
+            }
+            .into(),
             availability_policy: "unavailable_no_presence".into(),
-            body_bytes: None,
+            body_bytes: match config.scenario {
+                ScenarioConfig::Messages { body_bytes, .. } => Some(body_bytes as u64),
+                _ => None,
+            },
         },
         counters: CounterReport::default(),
         rates: RateReport::default(),

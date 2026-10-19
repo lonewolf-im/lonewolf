@@ -22,6 +22,7 @@ use tokio::{sync::mpsc, time::Instant};
 use crate::error::{BenchError, BenchResult, ErrorCode};
 
 pub use scram::{KeyMode, PreparedAccount};
+pub(crate) use transport::MessageSetup;
 pub use transport::{
     ClientSession, SessionReader, SessionWriter, TlsTransport, connect, local_tls_config,
     remote_tls_config, shutdown,

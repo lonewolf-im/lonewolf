@@ -214,6 +214,8 @@ pub struct CounterReport {
     pub skipped_account_busy: u64,
     pub cancelled_before_dispatch: u64,
     pub write_succeeded: u64,
+    pub message_body_bytes_write_succeeded: u64,
+    pub serialized_stanza_bytes_write_succeeded: u64,
     pub write_failed: u64,
     pub write_cancelled: u64,
     pub received_on_time: u64,

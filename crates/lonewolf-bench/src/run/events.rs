@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{client::OperationId, report::PhaseName};
+use crate::{
+    client::{OperationId, ReceivedEvent},
+    report::PhaseName,
+};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::{
     num::NonZeroUsize,
@@ -14,7 +17,7 @@ use tokio::{
     time::Instant,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum RunEvent {
     WriteStarted {
         index: u32,
@@ -26,10 +29,11 @@ pub enum RunEvent {
         operation: OperationId,
         at: Instant,
         succeeded: bool,
+        bytes: usize,
     },
     Received {
         index: u32,
-        at: Instant,
+        event: ReceivedEvent,
     },
     ConnectionClosed {
         index: u32,

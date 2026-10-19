@@ -14,10 +14,6 @@ Lonewolf is a self-hosted [XMPP](https://xmpp.org/) server with a simple goal:
 combine easy setup and operation with high performance and a path to clustering.
 Start small, grow when you need to, and keep your server easy to run.
 
-Today, it runs alone. No database server to babysit, no runtime to install, no
-pack required. One binary and two lines of config get you running locally. It
-plays by the protocol's rules and bites back when a client gets greedy.
-
 > [!NOTE]
 > Lonewolf is early, pre-1.0 software. Today it can host chat between accounts on
 > domains you run. Federation with other XMPP servers is next on the

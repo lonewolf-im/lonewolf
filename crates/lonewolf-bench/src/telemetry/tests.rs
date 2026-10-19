@@ -363,3 +363,40 @@ fn connection_gauge_sums_distinct_listeners_and_rejects_whole_invalid_aggregates
     }
     Ok(())
 }
+
+#[test]
+fn compare_instrumentation_policy_v1_matches_all_collector_limits() {
+    for enabled in [false, true] {
+        let metadata = instrumentation_metadata(enabled);
+        assert_eq!(
+            metadata,
+            InstrumentationMetadata {
+                policy_version: 1,
+                server_metrics_enabled: enabled,
+                generator_metrics_enabled: true,
+                raw_capacity_bytes: 67_108_864,
+                control_capacity: 8,
+                response_body_limit_bytes: 1_048_576,
+                result_limit_bytes: 33_554_432
+            }
+        );
+        assert_eq!(metadata.raw_capacity_bytes, RAW_CAPACITY as u64);
+        assert_eq!(metadata.control_capacity, CONTROL_CAPACITY as u64);
+        assert_eq!(metadata.response_body_limit_bytes, BODY_CAPACITY as u64);
+        assert_eq!(
+            metadata.result_limit_bytes,
+            crate::report::artifacts::RESULT_LIMIT as u64
+        );
+    }
+}
+
+#[test]
+fn compare_instrumentation_body_limit_matches_parser_boundary() -> TestResult {
+    let limit = instrumentation_metadata(true).response_body_limit_bytes as usize;
+    let mut body = format!("#{}\n# EOF\n", "x".repeat(limit - 8));
+    assert_eq!(body.len(), limit);
+    parse_snapshot(&body)?;
+    body.push('\n');
+    assert!(parse_snapshot(&body).is_err());
+    Ok(())
+}

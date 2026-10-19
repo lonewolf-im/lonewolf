@@ -3,7 +3,7 @@
 use super::*;
 use serde_json::{Value, json};
 
-pub(super) fn report_fixture() -> Result<Value, Box<dyn std::error::Error>> {
+pub(crate) fn report_fixture() -> Result<Value, Box<dyn std::error::Error>> {
     let config: RunConfig = toml::from_str(
         "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='/secret/binary'\n[scenario]\nkind='idle'",
     )?;
@@ -372,4 +372,102 @@ fn all_eight_rates_use_exact_nominal_window_and_distinct_populations() {
             .window_seconds,
         None
     );
+}
+
+#[test]
+fn compare_report_settings_require_every_member_without_changing_operator_defaults()
+-> Result<(), Box<dyn std::error::Error>> {
+    for scenario in [
+        json!({"kind":"idle","connections":1}),
+        json!({"kind":"messages","pairs":1,"rate_per_second":1,"body_bytes":4}),
+        json!({"kind":"churn","accounts":1,"rate_per_second":1}),
+    ] {
+        let mut report = report_fixture()?;
+        report["config"]["scenario"] = scenario;
+        for section in ["scenario", "measurement", "metrics", "instrumentation"] {
+            let members: Vec<_> = report["config"][section]
+                .as_object()
+                .ok_or("object")?
+                .keys()
+                .cloned()
+                .collect();
+            for member in members {
+                for remove in [true, false] {
+                    let mut bad = report.clone();
+                    let object = bad["config"][section].as_object_mut().ok_or("object")?;
+                    if remove {
+                        object.remove(&member);
+                    } else {
+                        object.insert(member.clone(), Value::Null);
+                    }
+                    assert!(
+                        serde_json::from_value::<RunReport>(bad).is_err(),
+                        "{section}.{member}; removed={remove}"
+                    );
+                }
+            }
+            let mut bad = report.clone();
+            bad["config"][section]["unexpected"] = json!(true);
+            assert!(serde_json::from_value::<RunReport>(bad).is_err());
+        }
+        for value in [None, Some(Value::Null)] {
+            let mut old = report.clone();
+            let config = old["config"].as_object_mut().ok_or("config")?;
+            if let Some(value) = value {
+                config.insert("instrumentation".into(), value);
+            } else {
+                config.remove("instrumentation");
+            }
+            assert!(
+                serde_json::from_value::<RunReport>(old)?
+                    .config
+                    .instrumentation
+                    .is_none()
+            );
+        }
+    }
+    let config: RunConfig = toml::from_str(
+        "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='server'\n[scenario]\nkind='idle'",
+    )?;
+    assert_eq!(config.measurement, MeasurementConfig::default());
+    assert_eq!(config.metrics, MetricsConfig::default());
+    assert!(matches!(
+        config.scenario,
+        ScenarioConfig::Idle { connections: 100 }
+    ));
+    Ok(())
+}
+
+#[test]
+fn compare_instrumentation_records_configured_intent_without_urls_or_observations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut config: RunConfig = toml::from_str(
+        "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='server'\n[scenario]\nkind='idle'",
+    )?;
+    for remote in [None, Some(false), Some(true)] {
+        if let Some(enabled) = remote {
+            config.target = TargetConfig::Remote {
+                connect_host: "example.test".into(),
+                port: 5222,
+                xmpp_domain: "example.test".into(),
+                credentials_file: "SECRET-CREDENTIALS".into(),
+                environment_file: "environment".into(),
+                ca_pem: None,
+                metrics_url: enabled
+                    .then(|| "http://USER:PASSWORD@example.test/metrics?token=SECRET".into()),
+            };
+        }
+        let report = metadata::initial_report(&config);
+        let policy = report.config.instrumentation.as_ref().ok_or("policy")?;
+        assert_eq!(policy.server_metrics_enabled, remote.unwrap_or(true));
+        assert!(policy.generator_metrics_enabled);
+        assert_eq!(report.target.observed_scram_iterations, None);
+        assert_eq!(report.target.negotiated_tls, None);
+        assert!(summary::render(&report).contains("describe intent"));
+        let serialized = serde_json::to_string(&report)?;
+        for secret in ["PASSWORD", "SECRET-CREDENTIALS", "token=SECRET"] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+    Ok(())
 }

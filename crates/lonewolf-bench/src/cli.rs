@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{
+    config::{RunConfig, absolute_path, normalize_dns, printable, validate_new_output},
+    error::{BenchError, BenchResult, ErrorCode},
+};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(version, about)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    Run {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        server_binary: Option<PathBuf>,
+    },
+    Accounts {
+        #[command(subcommand)]
+        command: AccountsCommand,
+    },
+    Compare {
+        baseline_dir: PathBuf,
+        candidate_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AccountsCommand {
+    Generate {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        prefix: String,
+        #[arg(long)]
+        count: usize,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Provision {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        credentials: PathBuf,
+    },
+}
+
+impl Cli {
+    pub fn execute(self) -> BenchResult<()> {
+        match self.command {
+            Command::Run {
+                config,
+                output,
+                server_binary,
+            } => {
+                let config = RunConfig::load(&config, server_binary.as_deref())?;
+                let cwd = std::env::current_dir().map_err(|_| {
+                    BenchError::new(ErrorCode::InvalidPath, "working directory is unavailable")
+                })?;
+                let output = absolute_path(&cwd, &output)?;
+                validate_new_output(&output)?;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(config.measurement.driver_workers)
+                    .enable_all()
+                    .build()
+                    .map_err(|_| {
+                        BenchError::new(ErrorCode::Runtime, "cannot construct driver runtime")
+                    })?;
+                runtime.block_on(crate::run(config, &output))?;
+                Ok(())
+            }
+            Command::Accounts {
+                command:
+                    AccountsCommand::Generate {
+                        domain,
+                        prefix,
+                        count,
+                        output,
+                    },
+            } => {
+                normalize_dns(&domain)?;
+                if !printable(&prefix, 128) || !(1..=crate::config::MAX_ACCOUNTS).contains(&count) {
+                    return Err(BenchError::new(
+                        ErrorCode::InvalidConfig,
+                        "invalid account generation parameters",
+                    ));
+                }
+                validate_new_output(&output)?;
+                Err(BenchError::staged())
+            }
+            Command::Compare { output, .. } => {
+                validate_new_output(&output)?;
+                Err(BenchError::staged())
+            }
+            Command::Accounts {
+                command: AccountsCommand::Provision { .. },
+            } => Err(BenchError::staged()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_and_version_do_not_load_configuration() {
+        for flag in ["--help", "--version"] {
+            let result = Cli::try_parse_from(["lonewolf-bench", flag]);
+            assert!(matches!(result, Err(error) if error.exit_code() == 0));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "lonewolf-bench",
+                "run",
+                "--config",
+                "missing",
+                "--output",
+                "new",
+                "--help"
+            ])
+            .is_err_and(|error| error.exit_code() == 0)
+        );
+    }
+
+    #[test]
+    fn commands_are_explicit_and_reject_unrequested_options() {
+        for args in [
+            vec![
+                "run",
+                "--config",
+                "x",
+                "--output",
+                "y",
+                "--server-binary",
+                "server",
+            ],
+            vec![
+                "accounts",
+                "generate",
+                "--domain",
+                "localhost",
+                "--prefix",
+                "a",
+                "--count",
+                "10",
+                "--output",
+                "x",
+            ],
+            vec![
+                "accounts",
+                "provision",
+                "--socket",
+                "x",
+                "--credentials",
+                "y",
+            ],
+            vec!["compare", "baseline", "candidate", "--output", "result"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("bench").chain(args)).is_ok());
+        }
+        for option in [
+            "--password",
+            "--insecure",
+            "--admin-url",
+            "--server-command",
+        ] {
+            assert!(Cli::try_parse_from(["bench", "run", option]).is_err());
+        }
+    }
+
+    #[test]
+    fn staged_commands_return_explicit_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("new");
+        let output = output.to_str().ok_or("test path encoding")?;
+        for args in [
+            vec![
+                "accounts",
+                "generate",
+                "--domain",
+                "localhost",
+                "--prefix",
+                "bench",
+                "--count",
+                "1",
+                "--output",
+                output,
+            ],
+            vec![
+                "accounts",
+                "provision",
+                "--socket",
+                "absent",
+                "--credentials",
+                "absent",
+            ],
+            vec!["compare", "absent", "absent", "--output", output],
+        ] {
+            let result = Cli::try_parse_from(std::iter::once("bench").chain(args))?.execute();
+            assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
+        }
+        let config_path = directory.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='absent'\n[scenario]\nkind='idle'",
+        )?;
+        let result = Cli {
+            command: Command::Run {
+                config: config_path,
+                output: directory.path().join("new"),
+                server_binary: None,
+            },
+        }
+        .execute();
+        assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
+        assert!(!directory.path().join("new").exists());
+        Ok(())
+    }
+}

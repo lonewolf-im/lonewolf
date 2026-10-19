@@ -4,6 +4,7 @@ members = [
     "crates/lonewolf-acme",
     "crates/lonewolf-admin",
     "crates/lonewolf-auth",
+    "crates/lonewolf-bench",
     "crates/lonewolf-core",
     "crates/lonewolf-extension",
     "crates/lonewolf-metrics",
@@ -41,6 +42,7 @@ futures-rustls = { version = "0.26.0", default-features = false }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
 graviola = "0.4.1"
+hdrhistogram = { version = "7.6.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
 http = { version = "1.4.2", default-features = false, features = ["std"] }
 httpdate = "1.0.3"
@@ -54,6 +56,7 @@ oxilangtag = { version = "0.1.6", default-features = false }
 lonewolf-admin = { path = "crates/lonewolf-admin" }
 lonewolf-acme = { path = "crates/lonewolf-acme" }
 lonewolf-auth = { path = "crates/lonewolf-auth" }
+lonewolf-bench = { path = "crates/lonewolf-bench" }
 lonewolf-core = { path = "crates/lonewolf-core" }
 lonewolf-extension = { path = "crates/lonewolf-extension" }
 lonewolf-metrics = { path = "crates/lonewolf-metrics" }

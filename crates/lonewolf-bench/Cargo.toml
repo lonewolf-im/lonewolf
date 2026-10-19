@@ -1,0 +1,20 @@
+[package]
+name = "lonewolf-bench"
+description = "Reproducible Unix XMPP workload measurements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+hdrhistogram.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

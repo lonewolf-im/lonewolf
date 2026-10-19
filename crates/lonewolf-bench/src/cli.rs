@@ -210,21 +210,6 @@ mod tests {
             Cli::try_parse_from(["bench", "compare", "absent", "absent", "--output", output])?
                 .execute();
         assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
-        let config_path = directory.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='absent'\n[scenario]\nkind='churn'",
-        )?;
-        let result = Cli {
-            command: Command::Run {
-                config: config_path,
-                output: directory.path().join("new"),
-                server_binary: None,
-            },
-        }
-        .execute();
-        assert!(result.is_err_and(|error| error.code == ErrorCode::NotImplemented));
-        assert!(!directory.path().join("new").exists());
         Ok(())
     }
 }

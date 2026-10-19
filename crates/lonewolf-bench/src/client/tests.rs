@@ -72,6 +72,7 @@ fn configure<W: AsyncWrite + Unpin>(writer: &mut Writer<W>) -> BenchResult<()> {
 #[tokio::test]
 async fn scram_rfc7677_vector_prime_reuse_and_signature_verification() -> TestResult {
     let mut account = account()?;
+    assert_eq!(account.cached_scram_iterations(), None);
     let exchange = Exchange::with_nonce(&account, NONCE.to_owned())?;
     let challenge = exchange.challenge(&STANDARD.encode(CHALLENGE))?;
     let proof = exchange
@@ -82,12 +83,14 @@ async fn scram_rfc7677_vector_prime_reuse_and_signature_verification() -> TestRe
         "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
     );
     proof.verify(&STANDARD.encode(SERVER_PROOF))?;
+    assert_eq!(account.cached_scram_iterations(), Some(4096));
     let exchange = Exchange::with_nonce(&account, NONCE.to_owned())?;
     let challenge = exchange.challenge(&STANDARD.encode(CHALLENGE))?;
     let proof = exchange
         .respond(&mut account, challenge, KeyMode::Reuse, &cpu())
         .await?;
     proof.verify(&STANDARD.encode(SERVER_PROOF))?;
+    assert_eq!(account.cached_scram_iterations(), Some(4096));
     Ok(())
 }
 
@@ -129,6 +132,7 @@ async fn scram_rejects_cache_mismatch_unprimed_reuse_and_bad_server_signatures()
                 .context(),
             "scram_parameters_changed"
         );
+        assert_eq!(account.cached_scram_iterations(), Some(4096));
     }
     Ok(())
 }
@@ -852,5 +856,45 @@ async fn foreign_namespace_and_non_chat_messages_cannot_be_receipts() -> TestRes
             }
         ));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reused_scram_keys_do_not_admit_cpu_work_and_new_exchanges_have_fresh_nonces() -> TestResult
+{
+    let mut account = account()?;
+    let executor = cpu();
+    let exchange = Exchange::with_nonce(&account, NONCE.to_owned())?;
+    let challenge = exchange.challenge(&STANDARD.encode(CHALLENGE))?;
+    exchange
+        .respond(&mut account, challenge, KeyMode::Prime, &executor)
+        .await?
+        .verify(&STANDARD.encode(SERVER_PROOF))?;
+    let first = Exchange::new(&account)?;
+    let second = Exchange::new(&account)?;
+    assert!(*first.first != *second.first);
+    let (release, gate) = std::sync::mpsc::channel();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let blocked_executor = executor.clone();
+    let occupied = tokio::spawn(async move {
+        blocked_executor
+            .run(move || {
+                let _ = entered.send(());
+                gate.recv_timeout(Duration::from_secs(5))
+            })
+            .await
+    });
+    started.await?;
+    let exchange = Exchange::with_nonce(&account, NONCE.to_owned())?;
+    let challenge = exchange.challenge(&STANDARD.encode(CHALLENGE))?;
+    let result = timeout(
+        Duration::from_secs(1),
+        exchange.respond(&mut account, challenge, KeyMode::Reuse, &executor),
+    )
+    .await;
+    release.send(())?;
+    occupied.await??;
+    result??.verify(&STANDARD.encode(SERVER_PROOF))?;
+    assert_eq!(account.cached_scram_iterations(), Some(4096));
     Ok(())
 }

@@ -511,3 +511,17 @@ async fn stopped_fixture_retains_finalized_safe_logs_through_artifact_finalizati
     context.finish_phase(artifact, PhaseStatus::Completed);
     Ok(())
 }
+
+#[test]
+fn churn_dataset_resource_policy_matches_unique_cycle_resources() -> TestResult {
+    let mut config = config(2)?;
+    config.scenario = ScenarioConfig::Churn {
+        accounts: 2,
+        rate_per_second: 1,
+    };
+    assert_eq!(
+        initial_report(&config).dataset.resource_policy,
+        "unique_resource_per_cycle:bench-RUN_NONCE-PHASE-SEQUENCE"
+    );
+    Ok(())
+}

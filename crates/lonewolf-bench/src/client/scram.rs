@@ -60,6 +60,10 @@ impl PreparedAccount {
         &self.bare_jid
     }
 
+    pub(crate) fn cached_scram_iterations(&self) -> Option<u32> {
+        self.cache.as_ref().map(|cache| cache.iterations)
+    }
+
     pub(super) async fn keys(
         &mut self,
         challenge: &Challenge,

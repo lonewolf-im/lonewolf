@@ -54,16 +54,16 @@ pub struct RunContext {
     pub connections: ConnectionSet,
     pub observer: RunObserver,
     pub report: RunReport,
-    fixture: Option<LocalFixture>,
-    cpu: BlockingExecutor,
+    pub(crate) fixture: Option<LocalFixture>,
+    pub(crate) cpu: BlockingExecutor,
     origin: Instant,
-    setup_deadline: Instant,
+    pub(crate) setup_deadline: Instant,
     pub(crate) events: EventReceiver,
     pub(crate) invalid: Arc<AtomicBool>,
     pub(crate) interruption: watch::Receiver<bool>,
     pub(crate) measurement_window: Option<(Instant, Instant)>,
-    setup_attempts: u64,
-    setup_failures: u64,
+    pub(crate) setup_attempts: u64,
+    pub(crate) setup_failures: u64,
     pub(crate) message_phase: Option<crate::scenario::messages::MessagePhase>,
 }
 
@@ -215,18 +215,26 @@ impl RunContext {
             PhaseName::AccountPrimingConnections,
             Some(self.setup_deadline),
         );
-        let outcome = match ConnectionSet::establish(self, self.config.account_count()).await {
-            Ok(()) => self.connected_barrier().await,
-            error => error,
+        let churn = matches!(self.config.scenario, ScenarioConfig::Churn { .. });
+        let outcome = if churn {
+            crate::scenario::churn::prime(self).await
+        } else {
+            match ConnectionSet::establish(self, self.config.account_count()).await {
+                Ok(()) => self.connected_barrier().await,
+                error => error,
+            }
         };
-        self.report.phases[phase].counters.connection_attempts = self.setup_attempts;
-        self.report.phases[phase].counters.login_failed = self.setup_failures;
-        self.report.phases[phase].counters.requested_connections =
-            self.config.account_count() as u64;
-        self.report.phases[phase].counters.established_connections =
-            self.connections.established() as u64;
-        self.report.phases[phase].counters.login_succeeded = self.connections.established() as u64;
-        self.report.phases[phase].counters.peak_connections = self.connections.peak();
+        if !churn {
+            self.report.phases[phase].counters.connection_attempts = self.setup_attempts;
+            self.report.phases[phase].counters.login_failed = self.setup_failures;
+            self.report.phases[phase].counters.requested_connections =
+                self.config.account_count() as u64;
+            self.report.phases[phase].counters.established_connections =
+                self.connections.established() as u64;
+            self.report.phases[phase].counters.login_succeeded =
+                self.connections.established() as u64;
+            self.report.phases[phase].counters.peak_connections = self.connections.peak();
+        }
         if outcome
             .as_ref()
             .is_err_and(|error| error.context() == "interrupted")
@@ -243,7 +251,9 @@ impl RunContext {
             ScenarioConfig::Messages { .. } => {
                 crate::scenario::messages::run(self).await?;
             }
-            ScenarioConfig::Churn { .. } => return Err(BenchError::staged()),
+            ScenarioConfig::Churn { .. } => {
+                crate::scenario::churn::run(self).await?;
+            }
         }
         Ok(())
     }
@@ -540,6 +550,9 @@ impl RunContext {
     }
 
     pub(crate) fn refresh_measurement(&mut self) {
+        if matches!(self.config.scenario, ScenarioConfig::Churn { .. }) {
+            return;
+        }
         if let Some((start, end)) = self.measurement_window {
             self.report.counters.connections_at_measurement_start =
                 self.connections.active_at(start);
@@ -896,7 +909,10 @@ fn initial_report(config: &RunConfig) -> RunReport {
             },
             resource_policy: match config.scenario {
                 ScenarioConfig::Messages { .. } => "one_bound_resource_per_account:run_nonce",
-                _ => "one_bound_resource_per_account:bench",
+                ScenarioConfig::Churn { .. } => {
+                    "unique_resource_per_cycle:bench-RUN_NONCE-PHASE-SEQUENCE"
+                }
+                ScenarioConfig::Idle { .. } => "one_bound_resource_per_account:bench",
             }
             .into(),
             availability_policy: "unavailable_no_presence".into(),

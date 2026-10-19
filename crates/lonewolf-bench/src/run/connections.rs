@@ -65,7 +65,17 @@ struct OwnedConnection {
     task: Option<JoinHandle<ShutdownSummary>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConnectionObservations {
+    pub(crate) negotiated_tls: Option<rustls::ProtocolVersion>,
+    pub(crate) cipher: Option<rustls::CipherSuite>,
+    pub(crate) observed_scram_iterations: Option<u32>,
+}
+
 pub struct ConnectionSet {
+    tls_observation_count: usize,
+    common_tls_version: Option<rustls::ProtocolVersion>,
+    common_cipher: Option<rustls::CipherSuite>,
     entries: Vec<OwnedConnection>,
     control: watch::Sender<Control>,
     epoch: u64,
@@ -87,6 +97,9 @@ impl ConnectionSet {
         let entries = Vec::new();
         let (control, _) = watch::channel(Control::Observe(0));
         Self {
+            tls_observation_count: 0,
+            common_tls_version: None,
+            common_cipher: None,
             entries,
             control,
             epoch: 0,
@@ -108,6 +121,7 @@ impl ConnectionSet {
 
     fn admit(&mut self, index: u32, session: ClientSession) {
         let (reader, writer, identity) = session.into_parts();
+        self.record_tls_observation(&identity.tls);
         let (commands, receiver) = mpsc::channel(1);
         let (state, observed) = watch::channel(ActorState {
             epoch: self.epoch,
@@ -198,6 +212,55 @@ impl ConnectionSet {
         })
     }
 
+    fn record_tls_observation(&mut self, tls: &client::NegotiatedTls) {
+        if self.tls_observation_count == 0 {
+            self.common_tls_version = Some(tls.version);
+            self.common_cipher = Some(tls.cipher);
+        } else {
+            if self.common_tls_version != Some(tls.version) {
+                self.common_tls_version = None;
+            }
+            if self.common_cipher != Some(tls.cipher) {
+                self.common_cipher = None;
+            }
+        }
+        self.tls_observation_count += 1;
+    }
+
+    pub(crate) fn common_observations(
+        &self,
+        selected_accounts: &[PreparedAccount],
+        selected_count: usize,
+    ) -> ConnectionObservations {
+        if selected_count == 0
+            || self.entries.len() != selected_count
+            || selected_accounts.len() != selected_count
+        {
+            return ConnectionObservations::default();
+        }
+        self.observations_for_complete_cohort(
+            selected_count,
+            common_value(
+                selected_accounts
+                    .iter()
+                    .map(PreparedAccount::cached_scram_iterations),
+            ),
+        )
+    }
+
+    fn observations_for_complete_cohort(
+        &self,
+        selected_count: usize,
+        observed_scram_iterations: Option<u32>,
+    ) -> ConnectionObservations {
+        let tls_complete = self.tls_observation_count == selected_count;
+        ConnectionObservations {
+            negotiated_tls: tls_complete.then_some(self.common_tls_version).flatten(),
+            cipher: tls_complete.then_some(self.common_cipher).flatten(),
+            observed_scram_iterations,
+        }
+    }
+
     pub async fn establish(context: &mut RunContext, count: usize) -> BenchResult<()> {
         if count != context.config.account_count() {
             return Err(failure("connection_count_mismatch"));
@@ -234,6 +297,8 @@ impl ConnectionSet {
             scenario: &context.config.scenario,
         })
         .await;
+        let observations = context.connections.common_observations(accounts, count);
+        context.apply_connection_observations(observations);
         context
             .connections
             .entries
@@ -278,6 +343,14 @@ impl Drop for ConnectionSet {
             }
         }
     }
+}
+
+fn common_value<T: Copy + Eq>(values: impl IntoIterator<Item = Option<T>>) -> Option<T> {
+    let mut values = values.into_iter();
+    let value = values.next()??;
+    values
+        .all(|candidate| candidate == Some(value))
+        .then_some(value)
 }
 
 type Attempt<'a, T> = Pin<Box<dyn Future<Output = (u32, BenchResult<T>)> + Send + 'a>>;
@@ -1156,6 +1229,191 @@ mod tests {
             context.report.phases[phase].counters,
             context.report.counters
         );
+        Ok(())
+    }
+
+    fn tls(version: rustls::ProtocolVersion, cipher: rustls::CipherSuite) -> client::NegotiatedTls {
+        client::NegotiatedTls { version, cipher }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selected_cohort_observations_require_exact_account_and_admission_counts()
+    -> BenchResult<()> {
+        let (mut context, _signal) = crate::run::tests::context(2)?;
+        let accounts = [
+            PreparedAccount::new("one@localhost", "test".into())?,
+            PreparedAccount::new("two@localhost", "test".into())?,
+        ];
+        let facts = tls(
+            rustls::ProtocolVersion::TLSv1_3,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+        );
+        assert_eq!(
+            context.connections.common_observations(&accounts, 0),
+            ConnectionObservations::default()
+        );
+        assert_eq!(
+            context.connections.common_observations(&accounts, 2),
+            ConnectionObservations::default()
+        );
+        context.connections.simulated(None, Duration::ZERO);
+        context.connections.record_tls_observation(&facts);
+        let one = context.connections.common_observations(&accounts[..1], 1);
+        assert_eq!(one.negotiated_tls, Some(facts.version));
+        assert_eq!(one.cipher, Some(facts.cipher));
+        assert_eq!(one.observed_scram_iterations, None);
+        assert_eq!(
+            context.connections.common_observations(&accounts, 2),
+            ConnectionObservations::default()
+        );
+        context.connections.simulated(None, Duration::ZERO);
+        assert_eq!(
+            context.connections.common_observations(&accounts[..1], 2),
+            ConnectionObservations::default()
+        );
+        let missing = context.connections.common_observations(&accounts, 2);
+        assert_eq!(missing, ConnectionObservations::default());
+        context.connections.record_tls_observation(&facts);
+        let all = context.connections.common_observations(&accounts, 2);
+        assert_eq!(all.negotiated_tls, Some(facts.version));
+        assert_eq!(all.cipher, Some(facts.cipher));
+        assert_eq!(all.observed_scram_iterations, None);
+        context
+            .connections
+            .close_all(Instant::now() + Duration::from_secs(1))
+            .await;
+        Ok(())
+    }
+
+    #[test]
+    fn iteration_consensus_requires_every_selected_value_and_is_sticky_across_disagreement() {
+        for values in [vec![Some(600000)], vec![Some(600000), Some(600000)]] {
+            assert_eq!(common_value(values), Some(600000));
+        }
+        for values in [
+            vec![],
+            vec![None],
+            vec![Some(600000), None],
+            vec![Some(600000), Some(700000)],
+            vec![Some(600000), Some(700000), Some(600000)],
+        ] {
+            assert_eq!(common_value(values), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_consensus_fields_and_iterations_stay_independent_after_a_b_a() -> BenchResult<()> {
+        let (mut context, _signal) = crate::run::tests::context(3)?;
+        let a = tls(
+            rustls::ProtocolVersion::TLSv1_3,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+        );
+        let mut b = a.clone();
+        b.version = rustls::ProtocolVersion::TLSv1_2;
+        for facts in [&a, &b, &a] {
+            context.connections.record_tls_observation(facts);
+        }
+        let snapshot = context
+            .connections
+            .observations_for_complete_cohort(3, Some(600000));
+        assert_eq!(
+            snapshot,
+            ConnectionObservations {
+                negotiated_tls: None,
+                cipher: Some(a.cipher),
+                observed_scram_iterations: Some(600000)
+            }
+        );
+        let (mut context, _signal) = crate::run::tests::context(3)?;
+        b = a.clone();
+        b.cipher = rustls::CipherSuite::TLS13_AES_128_GCM_SHA256;
+        for facts in [&a, &b, &a] {
+            context.connections.record_tls_observation(facts);
+        }
+        let snapshot = context
+            .connections
+            .observations_for_complete_cohort(3, Some(600000));
+        assert_eq!(
+            snapshot,
+            ConnectionObservations {
+                negotiated_tls: Some(a.version),
+                cipher: None,
+                observed_scram_iterations: Some(600000)
+            }
+        );
+        assert_eq!(
+            context
+                .connections
+                .observations_for_complete_cohort(3, None)
+                .negotiated_tls,
+            Some(a.version)
+        );
+        assert_eq!(
+            context
+                .connections
+                .observations_for_complete_cohort(3, None)
+                .observed_scram_iterations,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_admission_preserves_handshake_facts_after_ramp_cancellation()
+    -> BenchResult<()> {
+        let (mut context, signal) = crate::run::tests::context(1)?;
+        let invalid = context.invalid.clone();
+        let mut interruption = context.interruption.clone();
+        let mut launched = false;
+        let (mut attempts, mut failures) = (0, 0);
+        let facts = tls(
+            rustls::ProtocolVersion::TLSv1_3,
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+        );
+        let outcome = ramp(
+            Ramp {
+                count: 1,
+                deadline: Instant::now() + Duration::from_secs(1),
+                concurrency: 1,
+                rate: 1,
+                policy: DispatchPolicy::default(),
+                interruption: &mut interruption,
+                attempts: &mut attempts,
+                failures: &mut failures,
+                invalid: &invalid,
+            },
+            || {
+                if launched {
+                    return None;
+                }
+                launched = true;
+                Some(Box::pin(async { (0, Ok(())) }))
+            },
+            |_, ()| {
+                context.connections.simulated(None, Duration::ZERO);
+                context.connections.record_tls_observation(&facts);
+                signal.send_replace(true);
+            },
+        )
+        .await;
+        assert!(outcome.is_err_and(|error| error.context() == "interrupted"));
+        let accounts = [PreparedAccount::new("one@localhost", "test".into())?];
+        let snapshot = context.connections.common_observations(&accounts, 1);
+        context.apply_connection_observations(snapshot);
+        assert_eq!(
+            context.report.target.negotiated_tls.as_deref(),
+            Some("TLSv1_3")
+        );
+        assert_eq!(
+            context.report.target.cipher.as_deref(),
+            Some("TLS13_AES_256_GCM_SHA384")
+        );
+        assert!(!context.report.target.cache_primed);
+        assert_eq!(context.report.status, crate::report::RunStatus::Passed);
+        context
+            .connections
+            .close_all(Instant::now() + Duration::from_secs(1))
+            .await;
         Ok(())
     }
 }

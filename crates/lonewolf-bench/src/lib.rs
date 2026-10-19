@@ -13,3 +13,5 @@ pub mod run;
 pub mod scenario;
 
 pub use run::run;
+
+pub mod telemetry;

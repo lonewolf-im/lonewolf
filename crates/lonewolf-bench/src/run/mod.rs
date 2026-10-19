@@ -5,29 +5,36 @@ pub mod events;
 #[cfg(test)]
 pub(crate) mod tests;
 
+#[cfg(test)]
+use crate::report::metadata::system_metadata;
 use crate::{
     accounts::CredentialSet,
     client::{PreparedAccount, ResolvedTarget, remote_tls_config},
-    config::{
-        MeasurementConfig, RunConfig, ScenarioConfig, TargetConfig, printable, validate_build,
-        validate_new_output,
-    },
+    config::{MeasurementConfig, RunConfig, ScenarioConfig, TargetConfig},
     error::{BenchError, BenchResult, ErrorCode},
     fixture::{LocalFixture, StopOutcome, preflight_descriptors},
     measurement::DispatchPolicy,
     report::*,
 };
+use crate::{
+    report::{
+        artifacts::ArtifactWriter,
+        metadata::{canonical_hash, collect_metadata, initial_report},
+    },
+    telemetry::{
+        MetricsEndpoint, PhaseSampleRequest, SamplerConfig, TelemetrySampler, allocate_buffer,
+    },
+};
 use connections::ConnectionSet;
 use events::{EventReceiver, EventSender, RunEvent, RunObserver};
 use lonewolf_util::blocking::BlockingExecutor;
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::OpenOptions,
     future::Future,
-    io::{BufWriter, Read, Write},
+    io::Read,
     num::NonZeroUsize,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::Path,
     sync::{
         Arc,
@@ -64,6 +71,8 @@ pub struct RunContext {
     pub(crate) measurement_window: Option<(Instant, Instant)>,
     pub(crate) setup_attempts: u64,
     pub(crate) setup_failures: u64,
+    pub(crate) telemetry: Option<TelemetrySampler>,
+    pub(crate) telemetry_buffer: Option<Vec<u8>>,
     pub(crate) message_phase: Option<crate::scenario::messages::MessagePhase>,
 }
 
@@ -78,15 +87,15 @@ pub async fn run_with_observer(
 ) -> BenchResult<RunReport> {
     config.validate()?;
     crate::scenario::validate_supported(&config.scenario)?;
-    acquire_output(output)?;
+    let writer = ArtifactWriter::create(output)?;
     let (sender, interruption) = watch::channel(false);
     let signal = signals(sender);
-    execute(config, output, observer, interruption, Some(signal)).await
+    execute(config, writer, observer, interruption, Some(signal)).await
 }
 
 async fn execute(
     config: RunConfig,
-    output: &Path,
+    writer: ArtifactWriter,
     observer: RunObserver,
     interruption: watch::Receiver<bool>,
     signal: Option<BenchResult<tokio::task::JoinHandle<()>>>,
@@ -115,6 +124,8 @@ async fn execute(
         setup_attempts: 0,
         setup_failures: 0,
         message_phase: None,
+        telemetry: None,
+        telemetry_buffer: None,
     };
     let mut signal_task = None;
     let phase = context.start_phase(PhaseName::Preflight, Some(setup_deadline));
@@ -144,8 +155,20 @@ async fn execute(
     context.consume_events();
     context.refresh_measurement();
     let phase = context.start_phase(PhaseName::ArtifactFinalization, None);
-    context.finish_phase(phase, PhaseStatus::Completed);
-    if publish(output, &context.report).is_err() {
+    let raw = context.telemetry_buffer.take().unwrap_or_default();
+    let preparation = writer.prepare_data(
+        &mut context.report,
+        &raw,
+        context
+            .fixture
+            .as_ref()
+            .and_then(LocalFixture::sanitized_server_log),
+    );
+    context.finish_phase(phase, phase_status(&preparation));
+    let publication = preparation
+        .and_then(|()| writer.prepare_summary(&mut context.report))
+        .and_then(|()| writer.finish(&context.report));
+    if publication.is_err() {
         context.reason(ReasonCode::ArtifactFailure, "result_publication_failed");
         context.report.phases[phase].status = PhaseStatus::Failed;
     }
@@ -166,7 +189,22 @@ impl RunContext {
         if self.report.started_at_utc.is_none() {
             self.reason(ReasonCode::SetupFailure, "utc_time_unavailable");
         }
-        self.report.driver.system = system_metadata();
+        let metadata = collect_metadata(&self.config)?;
+        self.report.driver = metadata.driver;
+        self.report.target = metadata.target;
+        if self
+            .report
+            .target
+            .declared_build
+            .as_ref()
+            .is_some_and(|build| build.profile == "unknown" || build.features.is_none())
+        {
+            self.reason(
+                ReasonCode::UnknownServerBuild,
+                "server_profile_or_features_unknown",
+            );
+        }
+        self.telemetry_buffer = Some(allocate_buffer()?);
         self.connections.reserve(self.config.account_count())?;
         let workers = match self.config.target {
             TargetConfig::Local { server_workers, .. } => Some(server_workers),
@@ -182,10 +220,12 @@ impl RunContext {
             ..
         } = &self.config.target
         {
-            let descriptor: EnvironmentDescriptor =
-                serde_json::from_slice(&read_bounded(environment_file, 1_048_576)?)
-                    .map_err(|_| invalid_input("remote_descriptor_schema"))?;
-            validate_descriptor(&descriptor, &self.config.environment_id)?;
+            let descriptor = EnvironmentDescriptor::read(environment_file)?;
+            descriptor.validate(&self.config.environment_id)?;
+            self.report.driver.sources.insert(
+                "server_build".into(),
+                "operator_environment_descriptor".into(),
+            );
             self.report.target.declared_build = Some(descriptor.server_build.clone());
             self.report.environment = Some(descriptor);
             let credentials = CredentialSet::read(
@@ -194,10 +234,28 @@ impl RunContext {
                 Some(self.config.account_count()),
             )
             .map_err(|_| invalid_input("remote_credentials_invalid"))?;
-            self.report.dataset.account_jids_sha256 = Some(credentials.jids_sha256());
             self.accounts = credentials
                 .into_prepared()
                 .map_err(|_| invalid_input("remote_credentials_invalid"))?;
+            self.report.dataset.account_jids_sha256 = Some(canonical_hash(
+                &self
+                    .accounts
+                    .iter()
+                    .map(PreparedAccount::bare_jid)
+                    .collect::<Vec<_>>(),
+            )?);
+        }
+        if self
+            .report
+            .target
+            .declared_build
+            .as_ref()
+            .is_some_and(|build| build.profile == "unknown" || build.features.is_none())
+        {
+            self.reason(
+                ReasonCode::UnknownServerBuild,
+                "server_profile_or_features_unknown",
+            );
         }
         identity?;
         if self.report.started_at_utc.is_none() {
@@ -274,13 +332,16 @@ impl RunContext {
                     .fixture
                     .as_mut()
                     .ok_or_else(|| failure("fixture_owner"))?;
-                let settings = fixture.sanitized_server_settings();
-                let mut hash = Sha256::new();
-                for account in fixture.credentials() {
-                    hash.update(account.bare_jid().as_bytes());
-                    hash.update(b"\n");
-                }
-                self.report.dataset.account_jids_sha256 = Some(hex(&hash.finalize()));
+                let mut settings = fixture.sanitized_server_settings();
+                settings.tls_min = settings.tls_min.trim_start_matches("TLSv").to_owned();
+                settings.tls_max = settings.tls_max.trim_start_matches("TLSv").to_owned();
+                self.report.dataset.account_jids_sha256 = Some(canonical_hash(
+                    &fixture
+                        .credentials()
+                        .iter()
+                        .map(PreparedAccount::bare_jid)
+                        .collect::<Vec<_>>(),
+                )?);
                 self.report.environment = Some(EnvironmentDescriptor {
                     schema_version: 1,
                     environment_id: self.config.environment_id.clone(),
@@ -331,13 +392,112 @@ impl RunContext {
                 });
             }
         }
+        self.start_telemetry().await;
         self.check_running()
+    }
+
+    async fn start_telemetry(&mut self) {
+        let url = match &self.config.target {
+            TargetConfig::Local { .. } => self
+                .fixture
+                .as_ref()
+                .map(|fixture| fixture.metrics_url().to_owned()),
+            TargetConfig::Remote { metrics_url, .. } => metrics_url.clone(),
+        };
+        let endpoint = if let Some(url) = url {
+            bounded(
+                &mut self.interruption,
+                self.setup_deadline,
+                MetricsEndpoint::resolve(&url),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
+        if let Some(buffer) = self.telemetry_buffer.take() {
+            match TelemetrySampler::start(
+                SamplerConfig {
+                    endpoint,
+                    timing: self.config.metrics.clone(),
+                },
+                self.origin,
+                buffer,
+            ) {
+                Ok(mut sampler) => {
+                    sampler.ready().await;
+                    self.telemetry = Some(sampler);
+                }
+                Err(_) => self.reason(ReasonCode::TelemetryUnavailable, "sampler_start_failed"),
+            }
+        }
+    }
+
+    async fn stop_telemetry(&mut self, deadline: Instant) {
+        if let Some(sampler) = self.telemetry.take() {
+            match sampler.stop_observed(deadline).await {
+                Ok((report, raw, identity)) => self.apply_telemetry(report, raw, identity),
+                Err(_) => self.reason(ReasonCode::TelemetryUnavailable, "sampler_join_failed"),
+            }
+        }
+    }
+
+    fn apply_connection_observations(&mut self, observations: connections::ConnectionObservations) {
+        self.report.target.negotiated_tls = observations
+            .negotiated_tls
+            .map(|value| format!("{value:?}"));
+        self.report.target.cipher = observations.cipher.map(|value| format!("{value:?}"));
+        self.report.target.observed_scram_iterations = observations.observed_scram_iterations;
+    }
+
+    fn apply_telemetry(
+        &mut self,
+        report: TelemetryReport,
+        raw: Vec<u8>,
+        identity: Option<crate::telemetry::openmetrics::MetricSnapshot>,
+    ) {
+        self.report
+            .reasons
+            .retain(|r| r.code != ReasonCode::TelemetryUnavailable);
+        for reason in &report.reasons {
+            if !self.report.reasons.contains(reason) {
+                self.report.reasons.push(reason.clone());
+            }
+        }
+        self.report.telemetry_status = report.quality;
+        if report.identity_changes > 0 {
+            self.report.status = RunStatus::Invalid;
+            self.reason(ReasonCode::ServerRestarted, "server_restarted");
+        }
+        if let Some(identity) = identity {
+            self.report.target.observed_build = identity.build;
+            self.report.target.observed_process_start_time_seconds = identity.process_start;
+        }
+        self.report.telemetry = report;
+        self.telemetry_buffer = Some(raw);
+    }
+
+    fn notify_telemetry(&self, phase: PhaseName, at: Instant) {
+        if let Some(sampler) = &self.telemetry {
+            let _ = sampler.try_notify(PhaseSampleRequest {
+                phase,
+                scheduled_at: at,
+                window: self.measurement_window,
+                achieved_connections: if matches!(self.config.scenario, ScenarioConfig::Idle { .. })
+                {
+                    self.connections.established() as u64
+                } else {
+                    0
+                },
+            });
+        }
     }
 
     async fn cleanup(&mut self) {
         let timeout = Duration::from_millis(self.config.measurement.shutdown_timeout_ms);
         let deadline = Instant::now() + timeout;
         self.close_connections(deadline).await;
+        self.stop_telemetry(Instant::now() + timeout).await;
         // One CPU permit makes this a barrier for all previously admitted jobs.
         self.cpu.run(|| ()).await;
         let phase = self.start_phase(
@@ -615,6 +775,7 @@ impl RunContext {
             rates: RateReport::default(),
         });
         self.observer.phase_started(name);
+        self.notify_telemetry(name, start);
         index
     }
     pub(crate) fn finish_phase(&mut self, index: usize, status: PhaseStatus) {
@@ -623,6 +784,10 @@ impl RunContext {
         phase.end_offset_ns = Some(end);
         phase.status = status;
         self.observer.phase_finished(phase.name);
+        let name = phase.name;
+        if matches!(name, PhaseName::Measurement | PhaseName::ConnectionShutdown) {
+            self.notify_telemetry(name, Instant::now());
+        }
     }
     fn retain_error(&mut self, error: BenchError) {
         let code = match (error.code, error.context()) {
@@ -709,40 +874,6 @@ fn signals(sender: watch::Sender<bool>) -> BenchResult<tokio::task::JoinHandle<(
     }))
 }
 
-fn acquire_output(output: &Path) -> BenchResult<()> {
-    validate_new_output(output)?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(output)
-        .map_err(|_| BenchError::new(ErrorCode::InvalidPath, "output_directory_create"))?;
-    Ok(())
-}
-
-fn publish(output: &Path, report: &RunReport) -> BenchResult<()> {
-    let error = || BenchError::new(ErrorCode::ArtifactFailure, "result_publication_failed");
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(output.join(".incomplete"))
-        .map_err(|_| error())?;
-    let staging = output.join(".result.json.partial");
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&staging)
-        .map_err(|_| error())?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, report).map_err(|_| error())?;
-    writer.flush().map_err(|_| error())?;
-    writer.get_ref().sync_all().map_err(|_| error())?;
-    fs::hard_link(&staging, output.join("result.json")).map_err(|_| error())?;
-    fs::remove_file(staging).map_err(|_| error())?;
-    fs::remove_file(output.join(".incomplete")).map_err(|_| error())?;
-    Ok(())
-}
-
 fn read_bounded(path: &Path, limit: u64) -> BenchResult<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
@@ -765,225 +896,6 @@ fn read_bounded(path: &Path, limit: u64) -> BenchResult<Vec<u8>> {
     Ok(data)
 }
 
-fn validate_descriptor(
-    descriptor: &EnvironmentDescriptor,
-    environment_id: &str,
-) -> BenchResult<()> {
-    let system = &descriptor.server;
-    let build = &descriptor.server_build;
-    let settings = &descriptor.server_settings;
-    if descriptor.schema_version != 1
-        || descriptor.environment_id != environment_id
-        || !system
-            .os_release
-            .as_deref()
-            .is_some_and(|v| printable(v, 1024))
-        || !system.arch.as_deref().is_some_and(|v| printable(v, 128))
-        || !printable(&build.revision, 1024)
-        || settings.workers == 0
-        || settings.stanza_pool_size_mib == 0
-        || !printable(&settings.logging_level, 32)
-        || !printable(&settings.storage_backend, 64)
-        || settings.max_unauthenticated_connections == 0
-        || settings.max_resources_per_account == 0
-        || settings.max_connections_per_ip == 0
-        || settings.max_stanza_bytes == 0
-        || settings.connection_establishment_timeout_secs == 0
-        || settings.authentication_timeout_secs == 0
-        || settings.resource_binding_timeout_secs == 0
-        || settings.connection_attempts_per_ip.rate_per_second == 0
-        || settings.connection_attempts_per_ip.burst == 0
-        || settings.incoming_stanzas_per_connection.rate_per_second == 0
-        || settings.incoming_stanzas_per_connection.burst == 0
-        || settings.new_recipients_per_connection.rate_per_second == 0
-        || settings.new_recipients_per_connection.burst == 0
-        || settings.incoming_xml_per_connection.bytes_per_second == 0
-        || settings.incoming_xml_per_connection.burst_bytes == 0
-        || !settings.host_extensions.iter().all(|v| printable(v, 128))
-        || !settings
-            .offered_auth_mechanisms
-            .iter()
-            .any(|v| v == "SCRAM-SHA-256")
-        || !settings
-            .offered_auth_mechanisms
-            .iter()
-            .all(|v| printable(v, 128))
-        || !matches!(settings.tls_min.as_str(), "1.2" | "1.3")
-        || !matches!(settings.tls_max.as_str(), "1.2" | "1.3")
-    {
-        return Err(invalid_input("remote_descriptor_invalid"));
-    }
-    validate_build(
-        &build.profile,
-        build.toolchain.as_deref(),
-        build.features.as_deref(),
-    )
-    .map_err(|_| invalid_input("remote_descriptor_build"))
-}
-
-fn initial_report(config: &RunConfig) -> RunReport {
-    let mode = match config.target {
-        TargetConfig::Local { .. } => TargetMode::Local,
-        TargetConfig::Remote { .. } => TargetMode::Remote,
-    };
-    let (domain, endpoint, build) = match &config.target {
-        TargetConfig::Local {
-            server_revision,
-            server_profile,
-            server_toolchain,
-            server_features,
-            ..
-        } => (
-            "localhost".into(),
-            None,
-            Some(ServerBuildDeclaration {
-                revision: server_revision.clone(),
-                profile: server_profile.clone(),
-                toolchain: server_toolchain.clone(),
-                features: server_features.clone(),
-            }),
-        ),
-        TargetConfig::Remote {
-            xmpp_domain,
-            connect_host,
-            port,
-            ..
-        } => (
-            xmpp_domain.clone(),
-            Some(format!("{connect_host}:{port}")),
-            None,
-        ),
-    };
-    RunReport {
-        schema_version: 1,
-        measurement_version: 1,
-        run_id: None,
-        started_at_utc: None,
-        status: RunStatus::Passed,
-        reasons: vec![RunReason {
-            code: ReasonCode::TelemetryUnavailable,
-            context: None,
-        }],
-        telemetry_status: TelemetryStatus::Unavailable,
-        phases: Vec::with_capacity(10),
-        config: SanitizedConfig::from(config),
-        driver: DriverMetadata {
-            executable_sha256: None,
-            package_version: env!("CARGO_PKG_VERSION").into(),
-            revision: env!("LONEWOLF_BENCH_REVISION").into(),
-            build_profile: env!("LONEWOLF_BENCH_PROFILE").into(),
-            build_target: env!("LONEWOLF_BENCH_TARGET").into(),
-            rustc: env!("LONEWOLF_BENCH_RUSTC").into(),
-            worker_count: config.measurement.driver_workers,
-            scheduler_policy: policy(&config.measurement).metadata(),
-            available_parallelism: std::thread::available_parallelism()
-                .ok()
-                .map(NonZeroUsize::get),
-            rlimit_nofile_soft: None,
-            rlimit_nofile_hard: None,
-            system: unknown_system(),
-            sources: BTreeMap::new(),
-        },
-        target: TargetMetadata {
-            mode,
-            xmpp_domain: domain,
-            configured_endpoint: endpoint,
-            negotiated_tls: None,
-            cipher: None,
-            auth_mechanism: "SCRAM-SHA-256".into(),
-            resumption: false,
-            cache_primed: false,
-            observed_scram_iterations: None,
-            observed_build: None,
-            observed_process_start_time_seconds: None,
-            local_binary_sha256: None,
-            declared_build: build,
-        },
-        environment: None,
-        dataset: DatasetIdentity {
-            account_jids_sha256: None,
-            account_count: config.account_count() as u64,
-            pair_count: match config.scenario {
-                ScenarioConfig::Messages { pairs, .. } => Some(pairs as u64),
-                _ => None,
-            },
-            resource_policy: match config.scenario {
-                ScenarioConfig::Messages { .. } => "one_bound_resource_per_account:run_nonce",
-                ScenarioConfig::Churn { .. } => {
-                    "unique_resource_per_cycle:bench-RUN_NONCE-PHASE-SEQUENCE"
-                }
-                ScenarioConfig::Idle { .. } => "one_bound_resource_per_account:bench",
-            }
-            .into(),
-            availability_policy: "unavailable_no_presence".into(),
-            body_bytes: match config.scenario {
-                ScenarioConfig::Messages { body_bytes, .. } => Some(body_bytes as u64),
-                _ => None,
-            },
-        },
-        counters: CounterReport::default(),
-        rates: RateReport::default(),
-        latencies: BTreeMap::new(),
-        telemetry: TelemetryReport {
-            quality: TelemetryStatus::Unavailable,
-            samples_ok: 0,
-            samples_failed: 0,
-            missed_ticks: 0,
-            queue_overflows: 0,
-            bytes: 0,
-            total_scrape_duration_ms: 0,
-            server: ResourceSummary::default(),
-            generator: ResourceSummary::default(),
-            policy_rejections: BTreeMap::new(),
-            identity_changes: 0,
-            reasons: vec![RunReason {
-                code: ReasonCode::TelemetryUnavailable,
-                context: None,
-            }],
-        },
-        artifacts: BTreeMap::new(),
-    }
-}
-
-fn unknown_system() -> SystemMetadata {
-    SystemMetadata {
-        os_release: None,
-        kernel: None,
-        arch: None,
-        cpu_model: None,
-        logical_cpus: None,
-        memory_bytes: None,
-        virtualization: None,
-        storage_description: None,
-        cpu_affinity: None,
-        cpu_quota: None,
-    }
-}
-fn system_metadata() -> SystemMetadata {
-    let mut system = unknown_system();
-    let mut name = std::mem::MaybeUninit::<nix::libc::utsname>::uninit();
-    // uname initializes all fields only on success.
-    if unsafe { nix::libc::uname(name.as_mut_ptr()) } == 0 {
-        let name = unsafe { name.assume_init() };
-        let field = |value: &[nix::libc::c_char]| {
-            let bytes: Vec<_> = value
-                .iter()
-                .take_while(|c| **c != 0)
-                .map(|c| *c as u8)
-                .collect();
-            String::from_utf8(bytes).ok().filter(|v| printable(v, 1024))
-        };
-        system.kernel = field(&name.release);
-        system.os_release = field(&name.sysname)
-            .zip(system.kernel.as_deref())
-            .map(|(os, release)| format!("{os} {release}"));
-        system.arch = field(&name.machine);
-    }
-    system.logical_cpus = std::thread::available_parallelism()
-        .ok()
-        .map(|n| n.get() as u64);
-    system
-}
 fn utc_now() -> Option<String> {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

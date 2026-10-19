@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, GlobalChunkAllocator};
 use lonewolf_xmpp::{
     jid::Jid,
-    parser::{ParserConfig, StreamEvent, XmppParser},
+    parser::{ParseError, ParserConfig, StreamEvent, XmppParser},
     stanza::{
         CLIENT_NAMESPACE, ElementRef, IqType, MessageType, NodeRef, STREAM_NAMESPACE, StanzaType,
     },
@@ -78,7 +78,15 @@ pub(super) async fn next<R: AsyncRead + Unpin>(parser: &mut Parser<R>) -> BenchR
     parser
         .next_event()
         .await
-        .map_err(|_| failure("xml_read"))?
+        .map_err(|error| {
+            failure(
+                if error.is_transport_error() || matches!(error, ParseError::UnexpectedEof) {
+                    "xml_read"
+                } else {
+                    "xml_protocol"
+                },
+            )
+        })?
         .ok_or_else(|| failure("stream_ended"))
 }
 

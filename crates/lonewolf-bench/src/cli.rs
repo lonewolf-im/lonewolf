@@ -213,7 +213,7 @@ mod tests {
         let config_path = directory.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='absent'\n[scenario]\nkind='messages'",
+            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='absent'\n[scenario]\nkind='churn'",
         )?;
         let result = Cli {
             command: Command::Run {

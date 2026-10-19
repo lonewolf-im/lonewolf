@@ -92,6 +92,10 @@ impl ClientSession {
         Ok(())
     }
 
+    pub(crate) fn configure_messages(&mut self, setup: &MessageSetup) -> BenchResult<()> {
+        self.writer.configure_prepared_messages(setup)
+    }
+
     pub fn into_parts(self) -> (SessionReader, SessionWriter, SessionIdentity) {
         let reader = SessionReader::start(
             self.reader,
@@ -403,6 +407,46 @@ impl Drop for SessionReader {
     }
 }
 
+pub(crate) struct MessageSetup {
+    routes: Arc<[MessageRoute]>,
+    payload: Arc<str>,
+    stanza_capacity: usize,
+}
+
+impl MessageSetup {
+    pub(crate) fn new(routes: Arc<[MessageRoute]>, payload: Arc<str>) -> BenchResult<Self> {
+        if !payload.bytes().all(|byte| byte == b'x') || payload.len() > 262_000 {
+            return Err(failure("payload_invalid"));
+        }
+        let mut escaped = String::new();
+        let mut max_to_bytes = 0;
+        for route in routes.iter() {
+            if xml::canonical_jid(&route.to)? != route.to || !route.to.contains('/') {
+                return Err(failure("route_invalid"));
+            }
+            escaped.clear();
+            xml::escape(&mut escaped, &route.to)?;
+            max_to_bytes = max_to_bytes.max(escaped.len());
+        }
+        let stanza_capacity = max_to_bytes
+            + payload.len()
+            + 55
+            + "<message type='chat' to='' id=''><body></body></message>".len();
+        if stanza_capacity > 262_144 {
+            return Err(failure("stanza_size"));
+        }
+        Ok(Self {
+            routes,
+            payload,
+            stanza_capacity,
+        })
+    }
+
+    pub(crate) fn payload(&self) -> Arc<str> {
+        self.payload.clone()
+    }
+}
+
 pub struct Writer<W: AsyncWrite + Unpin> {
     transport: Option<W>,
     retirement: Retirement,
@@ -429,16 +473,16 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         routes: Arc<[MessageRoute]>,
         payload: Arc<str>,
     ) -> BenchResult<()> {
-        if !payload.bytes().all(|byte| byte == b'x') || payload.len() > 262_000 {
-            return Err(failure("payload_invalid"));
-        }
-        for route in routes.iter() {
-            if xml::canonical_jid(&route.to)? != route.to || !route.to.contains('/') {
-                return Err(failure("route_invalid"));
-            }
-        }
-        self.routes = routes;
-        self.payload = payload;
+        let setup = MessageSetup::new(routes, payload)?;
+        self.configure_prepared_messages(&setup)
+    }
+
+    fn configure_prepared_messages(&mut self, setup: &MessageSetup) -> BenchResult<()> {
+        self.buffer
+            .try_reserve(setup.stanza_capacity.saturating_sub(self.buffer.len()))
+            .map_err(|_| failure("writer_buffer_allocation"))?;
+        self.routes = setup.routes.clone();
+        self.payload = setup.payload.clone();
         Ok(())
     }
 
@@ -616,6 +660,38 @@ mod ownership_tests {
     use crate::client::{BodyValidation, CorrelationId, TrafficPhase};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn prepared_messages_validate_once_before_sharing_routes_and_payload() -> TestResult {
+        for to in [
+            "receiver@example.test",
+            "RECEIVER@example.test/resource",
+            "bad jid",
+        ] {
+            assert!(
+                MessageSetup::new(
+                    Arc::from([MessageRoute { to: to.into() }]),
+                    Arc::from("xxx")
+                )
+                .is_err()
+            );
+        }
+        assert!(MessageSetup::new(Arc::from([]), Arc::from("xyx")).is_err());
+        let setup = MessageSetup::new(
+            Arc::from([MessageRoute {
+                to: "receiver@example.test/resource".into(),
+            }]),
+            Arc::from("xxx"),
+        )?;
+        for _ in 0..2 {
+            let mut writer = Writer::new(tokio::io::sink(), Retirement::new());
+            writer.configure_prepared_messages(&setup)?;
+            assert!(writer.buffer.capacity() >= setup.stanza_capacity);
+            assert!(Arc::ptr_eq(&writer.routes, &setup.routes));
+            assert!(Arc::ptr_eq(&writer.payload, &setup.payload));
+        }
+        Ok(())
+    }
 
     struct DropProbe(Arc<AtomicBool>);
 

@@ -59,6 +59,8 @@ struct ActorState {
 
 struct OwnedConnection {
     handle: Option<ClientHandle>,
+    index: u32,
+    jid: String,
     state: watch::Receiver<ActorState>,
     task: Option<JoinHandle<ShutdownSummary>>,
 }
@@ -69,6 +71,7 @@ pub struct ConnectionSet {
     epoch: u64,
     peak: u64,
     shutdown_summary: ShutdownSummary,
+    message_payload: Option<Arc<str>>,
     active: Arc<AtomicU64>,
     observer: RunObserver,
     events: EventSender,
@@ -89,6 +92,7 @@ impl ConnectionSet {
             epoch: 0,
             peak: 0,
             shutdown_summary: ShutdownSummary::default(),
+            message_payload: None,
             active: Arc::new(AtomicU64::new(0)),
             observer,
             events,
@@ -103,7 +107,7 @@ impl ConnectionSet {
     }
 
     fn admit(&mut self, index: u32, session: ClientSession) {
-        let (reader, writer, _) = session.into_parts();
+        let (reader, writer, identity) = session.into_parts();
         let (commands, receiver) = mpsc::channel(1);
         let (state, observed) = watch::channel(ActorState {
             epoch: self.epoch,
@@ -130,9 +134,39 @@ impl ConnectionSet {
         );
         self.entries.push(OwnedConnection {
             handle: Some(ClientHandle { index, commands }),
+            index,
+            jid: identity.bound_jid,
             state: observed,
             task: Some(task),
         });
+    }
+
+    pub(crate) fn message_payload(&self) -> BenchResult<Arc<str>> {
+        self.message_payload
+            .clone()
+            .ok_or_else(|| failure("message_payload_missing"))
+    }
+
+    pub(crate) fn identities(&self) -> impl Iterator<Item = (u32, &str)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.index, entry.jid.as_str()))
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        index: u32,
+        command: WriteCommand,
+    ) -> Result<(), mpsc::error::TrySendError<WriteCommand>> {
+        match self
+            .entries
+            .get(index as usize)
+            .filter(|entry| entry.index == index)
+            .and_then(|entry| entry.handle.as_ref())
+        {
+            Some(handle) => handle.commands.try_send(command),
+            None => Err(mpsc::error::TrySendError::Closed(command)),
+        }
     }
 
     pub fn established(&self) -> usize {
@@ -189,8 +223,21 @@ impl ConnectionSet {
             interruption: &mut context.interruption,
             attempts: &mut context.setup_attempts,
             failures: &mut context.setup_failures,
+            resource: match context.config.scenario {
+                crate::config::ScenarioConfig::Messages { .. } => context
+                    .report
+                    .run_id
+                    .as_deref()
+                    .ok_or_else(|| failure("message_nonce"))?,
+                _ => "bench",
+            },
+            scenario: &context.config.scenario,
         })
         .await;
+        context
+            .connections
+            .entries
+            .sort_unstable_by_key(|entry| entry.index);
         context.consume_events();
         context.report.target.cache_primed =
             outcome.is_ok() && context.connections.established() == count;
@@ -247,6 +294,8 @@ struct Establish<'a> {
     interruption: &'a mut watch::Receiver<bool>,
     attempts: &'a mut u64,
     failures: &'a mut u64,
+    resource: &'a str,
+    scenario: &'a crate::config::ScenarioConfig,
 }
 
 async fn establish_accounts(setup: Establish<'_>) -> BenchResult<()> {
@@ -262,9 +311,36 @@ async fn establish_accounts(setup: Establish<'_>) -> BenchResult<()> {
         interruption,
         attempts,
         failures,
+        resource,
+        scenario,
     } = setup;
     let count = accounts.len();
     let invalid = connections.invalid.clone();
+    let messages = match scenario {
+        crate::config::ScenarioConfig::Messages { body_bytes, .. } => {
+            let routes: Arc<[client::MessageRoute]> = accounts
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| client::MessageRoute {
+                    to: format!("{}/{resource}", pair[1].bare_jid()),
+                })
+                .collect();
+            let senders: Arc<[String]> = accounts
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| format!("{}/{resource}", pair[0].bare_jid()))
+                .collect();
+            let setup = Arc::new(client::MessageSetup::new(
+                routes,
+                Arc::<str>::from("x".repeat(*body_bytes)),
+            )?);
+            connections.message_payload = Some(setup.payload());
+            Some((setup, senders, *body_bytes))
+        }
+        _ => None,
+    };
     let mut accounts = accounts.iter_mut().enumerate();
     ramp(
         Ramp {
@@ -280,11 +356,24 @@ async fn establish_accounts(setup: Establish<'_>) -> BenchResult<()> {
         },
         || {
             let (index, account) = accounts.next()?;
+            let messages = messages.clone();
             Some(Box::pin(async move {
                 let result =
-                    client::connect(target, account, "bench", KeyMode::Prime, deadline, cpu)
+                    client::connect(target, account, resource, KeyMode::Prime, deadline, cpu)
                         .await
-                        .map(|(session, _)| session);
+                        .and_then(|(mut session, _)| {
+                            if let Some((setup, senders, body_bytes)) = messages {
+                                if index % 2 == 1 {
+                                    session.set_receive_route(client::ReceiveRoute {
+                                        from: senders[index / 2].clone(),
+                                        body_bytes,
+                                    })?;
+                                } else {
+                                    session.configure_messages(&setup)?;
+                                }
+                            }
+                            Ok(session)
+                        });
                 (index as u32, result)
             }))
         },
@@ -476,19 +565,20 @@ impl Actor {
                 received = reader.next() => { if let Some(at) = receive(index, received, &events) { spontaneous = Some(at); break None; } }
                 command = commands.recv(), if !commands.is_closed() => {
                     if let Some(command) = command {
-                        let result = tokio::select! {
-                            biased;
-                            _ = control.changed() => Err(failure("write_cancelled")),
-                            result = writer.send(&command, &writes) => result,
-                        };
+                        let result = send_until_shutdown(writer.send(&command, &writes), &mut control).await;
                         while let Ok(event) = written.try_recv() {
                             events.emit(match event {
                                 WriterEvent::WriteStarted { operation, at } => RunEvent::WriteStarted { index, operation, at },
-                                WriterEvent::WriteCompleted { operation, at, .. } => RunEvent::WriteFinished { index, operation, at, succeeded: true },
-                                WriterEvent::WriteFailed { operation, at } => RunEvent::WriteFinished { index, operation, at, succeeded: false },
+                                WriterEvent::WriteCompleted { operation, at, bytes } => RunEvent::WriteFinished { index, operation, at, succeeded: true, bytes },
+                                WriterEvent::WriteFailed { operation, at } => RunEvent::WriteFinished { index, operation, at, succeeded: false, bytes: 0 },
                             });
                         }
-                        if result.is_err() { spontaneous = Some(Instant::now()); break None; }
+                        if result.is_err() {
+                            let at = Instant::now();
+                            events.emit(RunEvent::ConnectionClosed { index, at });
+                            spontaneous = Some(at);
+                            break None;
+                        }
                     }
                 }
             }
@@ -500,10 +590,7 @@ impl Actor {
         }
         let mut received = |event: client::ReceivedEvent| {
             if !matches!(event.kind, ReceivedKind::StreamEnd) {
-                events.emit(RunEvent::Received {
-                    index,
-                    at: event.at,
-                });
+                events.emit(RunEvent::Received { index, event });
             }
             Ok(())
         };
@@ -551,6 +638,24 @@ impl Actor {
     }
 }
 
+async fn send_until_shutdown(
+    sending: impl Future<Output = BenchResult<()>>,
+    control: &mut watch::Receiver<Control>,
+) -> BenchResult<()> {
+    tokio::pin!(sending);
+    loop {
+        tokio::select! {
+            biased;
+            changed = control.changed() => {
+                if changed.is_err() || matches!(*control.borrow(), Control::Shutdown(_)) {
+                    return Err(failure("write_cancelled"));
+                }
+            }
+            result = &mut sending => return result,
+        }
+    }
+}
+
 fn mirror_reader_invalid(
     reader: &SessionReader,
     index: u32,
@@ -584,16 +689,31 @@ fn receive(
     events: &EventSender,
 ) -> Option<Instant> {
     match result {
+        Ok(event) if matches!(event.kind, ReceivedKind::StreamError) => {
+            let at = event.at;
+            events.emit(RunEvent::Received { index, event });
+            events.emit(RunEvent::ConnectionClosed { index, at });
+            Some(at)
+        }
+        Err(error) if error.context() == "xml_protocol" => {
+            let at = Instant::now();
+            events.emit(RunEvent::Received {
+                index,
+                event: client::ReceivedEvent {
+                    at,
+                    kind: ReceivedKind::StreamError,
+                },
+            });
+            events.emit(RunEvent::ConnectionClosed { index, at });
+            Some(at)
+        }
         Ok(event)
             if !matches!(
                 event.kind,
                 ReceivedKind::StreamEnd | ReceivedKind::StreamError
             ) =>
         {
-            events.emit(RunEvent::Received {
-                index,
-                at: event.at,
-            });
+            events.emit(RunEvent::Received { index, event });
             None
         }
         result => {
@@ -609,8 +729,28 @@ fn receive(
 #[cfg(test)]
 impl ConnectionSet {
     pub(crate) fn simulated(&mut self, close_after: Option<Duration>, shutdown_delay: Duration) {
+        self.simulate(close_after, shutdown_delay, None);
+    }
+
+    pub(crate) fn simulated_messages(&mut self) {
+        self.simulate(None, Duration::ZERO, Some(false));
+    }
+
+    pub(crate) fn simulated_lagged_messages(&mut self) {
+        self.simulate(None, Duration::ZERO, Some(true));
+    }
+
+    fn simulate(
+        &mut self,
+        close_after: Option<Duration>,
+        shutdown_delay: Duration,
+        messages: Option<bool>,
+    ) {
         let index = self.entries.len() as u32;
-        let (commands, _) = mpsc::channel(1);
+        if messages.is_some() {
+            self.message_payload = Some(Arc::from("xxx"));
+        }
+        let (commands, mut pending) = mpsc::channel(1);
         let (state, observed) = watch::channel(ActorState {
             epoch: self.epoch,
             bound_at: Instant::now(),
@@ -626,6 +766,7 @@ impl ConnectionSet {
         let closed = close_after.map(|delay| Instant::now() + delay);
         let task = tokio::spawn(async move {
             let mut disconnected = false;
+            let mut retained = Vec::new();
             loop {
                 let current = *control.borrow_and_update();
                 match current {
@@ -633,6 +774,9 @@ impl ConnectionSet {
                         state.send_modify(|state| state.epoch = epoch);
                     }
                     Control::Shutdown(deadline) => {
+                        for event in retained.drain(..) {
+                            events.emit(event);
+                        }
                         let graceful = timeout_at(deadline, tokio::time::sleep(shutdown_delay))
                             .await
                             .is_ok();
@@ -661,6 +805,18 @@ impl ConnectionSet {
                 }
                 tokio::select! {
                     _ = control.changed() => {},
+                    command = pending.recv(), if messages.is_some() && !pending.is_closed() => {
+                        if let Some(WriteCommand::Message(command)) = command {
+                            let at = Instant::now();
+                            events.emit(RunEvent::WriteStarted { index, operation: command.operation, at });
+                            let receipt = RunEvent::Received { index: index + 1, event: client::ReceivedEvent {
+                                at,
+                                kind: ReceivedKind::Chat { correlation: Some(command.operation), from: Some(format!("test{index}@localhost/bench")), to: Some(format!("test{}@localhost/bench", index + 1)), body: client::BodyValidation { bytes: 3, ascii_x: true }, route_valid: true },
+                            } };
+                            if messages == Some(true) { retained.push(receipt); } else { events.emit(receipt); }
+                            events.emit(RunEvent::WriteFinished { index, operation: command.operation, at, succeeded: true, bytes: 120 });
+                        }
+                    },
                     _ = async { if let Some(at) = closed { sleep_until(at).await; } else { std::future::pending::<()>().await; } }, if !disconnected => {
                         disconnected = true;
                         observer.active_connections(active.fetch_sub(1, Ordering::AcqRel) - 1);
@@ -673,6 +829,8 @@ impl ConnectionSet {
         });
         self.entries.push(OwnedConnection {
             handle: Some(ClientHandle { index, commands }),
+            index,
+            jid: format!("test{index}@localhost/bench"),
             state: observed,
             task: Some(task),
         });
@@ -684,6 +842,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::sleep;
+
+    #[tokio::test(start_paused = true)]
+    async fn observation_preserves_the_pending_write_and_shutdown_cancels_it() -> BenchResult<()> {
+        let (control, mut observed) = watch::channel(Control::Observe(0));
+        let (release, completed) = tokio::sync::oneshot::channel();
+        let sending = async { completed.await.map_err(|_| failure("write_test")) };
+        let future = send_until_shutdown(sending, &mut observed);
+        tokio::pin!(future);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut future)
+                .await
+                .is_err()
+        );
+        control.send_replace(Control::Observe(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut future)
+                .await
+                .is_err()
+        );
+        release
+            .send(())
+            .map_err(|_| failure("write_cancelled_by_observation"))?;
+        future.await?;
+        let mut observed = control.subscribe();
+        let future = send_until_shutdown(std::future::pending(), &mut observed);
+        tokio::pin!(future);
+        control.send_replace(Control::Shutdown(Instant::now()));
+        assert!(
+            future
+                .await
+                .is_err_and(|error| error.context() == "write_cancelled")
+        );
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn absolute_ramp_is_bounded_and_waits_for_all_bind_results() -> BenchResult<()> {
@@ -941,6 +1133,8 @@ mod tests {
         });
         context.connections.entries.push(OwnedConnection {
             handle: None,
+            index: 0,
+            jid: "test@localhost/bench".into(),
             state: observed,
             task: None,
         });

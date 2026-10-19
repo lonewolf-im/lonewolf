@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod idle;
+pub mod messages;
 
 use crate::{
     config::ScenarioConfig,
@@ -9,8 +10,8 @@ use crate::{
 
 pub fn validate_supported(scenario: &ScenarioConfig) -> BenchResult<()> {
     match scenario {
-        ScenarioConfig::Idle { .. } => Ok(()),
-        ScenarioConfig::Messages { .. } | ScenarioConfig::Churn { .. } => Err(BenchError::staged()),
+        ScenarioConfig::Idle { .. } | ScenarioConfig::Messages { .. } => Ok(()),
+        ScenarioConfig::Churn { .. } => Err(BenchError::staged()),
     }
 }
 

@@ -173,12 +173,35 @@ fn stanza_byte_and_rate_limit_counters_are_reported() -> TestResult {
     )?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
-    alice.send("<message to='bob@localhost' type='chat'/><message to='carol@localhost' type='chat'/><message to='dave@localhost' type='chat'/>")?;
+    alice.send("<message to='bob@localhost' type='chat'/><message to='carol@localhost' type='chat'/><message to='dave@localhost' type='chat'/><iq type='get' id='metrics-barrier'><query xmlns='urn:test:metrics-barrier'/></iq>")?;
+    let mut replies = 0_u32;
+    loop {
+        let reply = alice.receive()?;
+        if reply.attribute("id") == Some("metrics-barrier") {
+            reply.assert_xml("<iq xmlns='jabber:client' type='error' id='metrics-barrier'><query xmlns='urn:test:metrics-barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            break;
+        }
+        reply.assert_name("jabber:client", "message");
+        assert_eq!(reply.attribute("type"), Some("error"), "{reply:?}");
+        assert!(
+            matches!(
+                reply.attribute("from"),
+                Some("bob@localhost" | "carol@localhost" | "dave@localhost")
+            ),
+            "{reply:?}"
+        );
+        reply
+            .child("jabber:client", "error")?
+            .child("urn:ietf:params:xml:ns:xmpp-stanzas", "policy-violation")?;
+        assert!(replies < 3, "unexpected extra rejection: {reply:?}");
+        replies += 1;
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     let (body, rejected) = loop {
         let body = suite.scrape_metrics()?;
         let rejected = sample_value(&body, "lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"new_recipients_per_connection\"}").unwrap_or(0.0);
         if rejected >= 1.0
+            && rejected == f64::from(replies)
             && sample_value(
                 &body,
                 "lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"message\"}",
@@ -224,13 +247,6 @@ fn stanza_byte_and_rate_limit_counters_are_reported() -> TestResult {
     assert!(body.lines().any(|line| line.starts_with("lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"incoming_stanzas_per_connection\"} ")), "{body}");
     for account in ["alice", "bob", "carol", "dave"] {
         assert!(!body.contains(account), "{body}");
-    }
-    let mut replies = 0.0;
-    while replies < rejected {
-        let reply = alice.receive()?;
-        reply.assert_name("jabber:client", "message");
-        reply.child("jabber:client", "error")?;
-        replies += 1.0;
     }
     alice.close()?;
     suite.stop()

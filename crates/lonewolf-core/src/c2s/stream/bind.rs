@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::pin::pin;
 
 use futures_util::future::{Either, select};
+use futures_util::io::AsyncWrite;
 use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
@@ -117,7 +118,8 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 router,
                 settings.max_resources_per_account,
                 1 + settings.resource_binding_retries.get(),
-                monitor.as_ref().map(|monitor| (&storage, monitor)),
+                &storage,
+                monitor.as_ref(),
                 &settings.metrics,
             );
             match &monitor {
@@ -150,7 +152,8 @@ async fn bind_session<A: ChunkAllocator + Clone>(
     router: &RouterHandle<A>,
     max_resources_per_account: NonZeroUsize,
     max_failures: usize,
-    certificate: Option<(&RedbStorage, &CertificateMonitor)>,
+    storage: &RedbStorage,
+    certificate: Option<&CertificateMonitor>,
     metrics: &C2sWorkerMetrics,
 ) -> Result<(Registration<A>, bool), CloseOutcome> {
     let header = session.read_header(hosts).await?;
@@ -191,7 +194,7 @@ async fn bind_session<A: ChunkAllocator + Clone>(
     }
     let mut invalid_attempts = 0;
     loop {
-        if let Some((_, monitor)) = certificate {
+        if let Some(monitor) = certificate {
             monitor.check()?;
         }
         let parsed = match session.next_event().await? {
@@ -347,37 +350,46 @@ async fn bind_session<A: ChunkAllocator + Clone>(
             }
             Err(_) => return Err(CloseOutcome::InternalError),
         };
-        if let Some((storage, monitor)) = certificate {
-            monitor.check()?;
-            if storage
-                .begin_read()
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?
-                .account(account)
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?
-                .is_none()
-            {
-                return Err(CloseOutcome::AccountDeleted);
-            }
-            match select(
-                pin!(registration.wait_retired()),
-                pin!(send_bind_result(&mut session.writer, id, &registration)),
-            )
-            .await
-            {
-                Either::Left((Ok(retired), _)) => {
-                    return Err(retired.cause.into());
-                }
-                Either::Left(_) => return Err(CloseOutcome::InternalError),
-                Either::Right((result, _)) => result?,
-            }
-        } else {
-            send_bind_result(&mut session.writer, id, &registration).await?;
-        }
+        let registration =
+            complete_binding(&mut session.writer, storage, certificate, registration, id).await?;
         metrics.binding_succeeded();
         return Ok((registration, requested.is_some()));
     }
+}
+
+async fn complete_binding<A: ChunkAllocator, W: AsyncWrite + Unpin>(
+    writer: &mut Writer<W>,
+    storage: &RedbStorage,
+    certificate: Option<&CertificateMonitor>,
+    registration: Registration<A>,
+    id: &str,
+) -> Result<Registration<A>, CloseOutcome> {
+    if let Some(monitor) = certificate {
+        monitor.check()?;
+    }
+    // Register before this read so a later deletion can retire the session.
+    if storage
+        .begin_read()
+        .await
+        .map_err(|_| CloseOutcome::InternalError)?
+        .account(registration.account())
+        .await
+        .map_err(|_| CloseOutcome::InternalError)?
+        .is_none()
+    {
+        return Err(CloseOutcome::AccountDeleted);
+    }
+    match select(
+        pin!(registration.wait_retired()),
+        pin!(send_bind_result(writer, id, &registration)),
+    )
+    .await
+    {
+        Either::Left((Ok(retired), _)) => return Err(retired.cause.into()),
+        Either::Left(_) => return Err(CloseOutcome::InternalError),
+        Either::Right((result, _)) => result?,
+    }
+    Ok(registration)
 }
 
 fn requested_resource<'a, R: ArenaRead>(
@@ -447,8 +459,8 @@ fn requested_resource<'a, R: ArenaRead>(
     Ok(resource.filter(|text| !text.is_empty()))
 }
 
-async fn send_bind_result<A: ChunkAllocator>(
-    writer: &mut Writer,
+async fn send_bind_result<A: ChunkAllocator, W: AsyncWrite + Unpin>(
+    writer: &mut Writer<W>,
     id: &str,
     registration: &Registration<A>,
 ) -> Result<(), CloseOutcome> {
@@ -512,5 +524,163 @@ fn escape_text(output: &mut String, text: &str) {
             '>' => output.push_str("&gt;"),
             _ => output.push(ch),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use compio::runtime::Runtime;
+    use futures_channel::oneshot;
+    use futures_util::future::join;
+    use lonewolf_auth::scram::{
+        SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
+    };
+    use lonewolf_storage::WriteTransaction;
+    use lonewolf_storage::account::{AccountWrites, NewAccount};
+    use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
+    use lonewolf_xmpp::jid::Jid;
+
+    use super::*;
+    use crate::c2s::metrics::C2sMetrics;
+    use crate::config::Config;
+    use crate::router::Router;
+    use crate::router::local::LocalRouter;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    struct PendingOutput(Option<oneshot::Sender<()>>);
+
+    impl AsyncWrite for PendingOutput {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if let Some(entered) = self.0.take() {
+                let _ = entered.send(());
+            }
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            panic!("binding must not close the transport")
+        }
+    }
+
+    #[test]
+    fn deleted_account_rejects_provisional_registration_and_releases_resource_slot() -> TestResult {
+        Runtime::new()?.block_on(async {
+            let directory = tempfile::tempdir()?;
+            let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
+            let config = Config::default();
+            let router = Router::new(
+                Hosts::new(&config.hosts, None)?,
+                LocalRouter::new(GlobalChunkAllocator),
+            );
+            let router = router.handle();
+            let mut arena = Arena::try_new(ArenaConfig::default())?;
+            let account = AccountKey::try_from(
+                Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?,
+            )?;
+            let registration = router
+                .register(&account, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            let mut writer = Writer::new(
+                futures_util::io::Cursor::new(Vec::new()),
+                "localhost".into(),
+                C2sWorkerMetrics::detached(),
+            );
+            assert!(matches!(
+                complete_binding(&mut writer, &storage, None, registration, "bind").await,
+                Err(CloseOutcome::AccountDeleted)
+            ));
+            assert!(router.resource_match(&account, "desk").await?.is_none());
+            let replacement = router
+                .register(&account, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            assert_eq!(replacement.full_jid(), "alice@localhost/desk");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn account_deletion_cancels_pending_bind_result_and_releases_resource_slot() -> TestResult {
+        Runtime::new()?.block_on(async {
+            let directory = tempfile::tempdir()?;
+            let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
+            let config = Config::default();
+            let router = Router::new(
+                Hosts::new(&config.hosts, None)?,
+                LocalRouter::new(GlobalChunkAllocator),
+            );
+            let router = router.handle();
+            let mut arena = Arena::try_new(ArenaConfig::default())?;
+            let account = AccountKey::try_from(
+                Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?,
+            )?;
+            let mut transaction = storage.begin_write().await?;
+            transaction
+                .create_account(NewAccount {
+                    key: account.clone(),
+                    credentials: ScramCredentials::new(ScramVerifier::Sha1(
+                        ScramSha1Verifier::new([1; 16], SCRAM_POLICY_ITERATIONS, [2; 20], [3; 20]),
+                    )),
+                })
+                .await?;
+            transaction.commit().await?;
+            let registration = router
+                .register(&account, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            let unrelated =
+                AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+            let bob = router
+                .register(&unrelated, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            let metrics = C2sMetrics::detached();
+            let (entered, pending) = oneshot::channel();
+            let mut writer = Writer::new(
+                PendingOutput(Some(entered)),
+                "localhost".into(),
+                metrics.worker(0, 0),
+            );
+            let deletion = async {
+                pending.await?;
+                let mut transaction = storage.begin_write().await?;
+                transaction.delete_account(&account).await?;
+                transaction.commit().await?;
+                router.retire_account(&account).await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            };
+            let (bound, deleted) = compio::time::timeout(
+                std::time::Duration::from_secs(5),
+                join(
+                    complete_binding(&mut writer, &storage, None, registration, "bind"),
+                    deletion,
+                ),
+            )
+            .await?;
+            deleted?;
+            assert!(matches!(bound, Err(CloseOutcome::AccountDeleted)));
+            assert!(router.resource_match(&account, "desk").await?.is_none());
+            assert!(bob.liveness().is_alive());
+            assert!(
+                metrics
+                    .render()?
+                    .contains("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 0\n")
+            );
+            let replacement = router
+                .register(&account, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            assert_eq!(replacement.full_jid(), "alice@localhost/desk");
+            Ok(())
+        })
     }
 }

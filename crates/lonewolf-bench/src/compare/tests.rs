@@ -607,10 +607,11 @@ fn compare_instrumentation_policy_is_recognized_and_each_field_has_path() -> Tes
 fn compare_directory_reader_is_bounded_strict_private_and_does_not_modify_inputs() -> TestResult {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("input");
-    fs::create_dir(&input)?;
-    let run = fixture()?;
-    let bytes = serde_json::to_vec(&run)?;
-    fs::write(input.join("result.json"), &bytes)?;
+    let mut run = fixture()?;
+    let writer = artifacts::ArtifactWriter::create(&input)?;
+    writer.prepare(&mut run, b"", None)?;
+    writer.finish(&run)?;
+    let bytes = fs::read(input.join("result.json"))?;
     let output = directory.path().join("output");
     let report = compare_directories(&input, &input, &output)?;
     assert!(report.eligible);
@@ -1208,6 +1209,47 @@ fn compare_nominal_drain_exception_rejects_wrong_boundaries_and_other_overlaps()
         bad.phases[timed].end_offset_ns = Some(nominal + 1);
         bad.phases[drain].start_offset_ns = nominal;
         assert!(!compare_runs(&idle, &bad).eligible);
+    }
+    Ok(())
+}
+
+#[test]
+fn intact_directory_inputs_retain_status_and_unknown_instrumentation_refusals() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    for (name, status, old) in [
+        ("failed", RunStatus::Failed, false),
+        ("invalid", RunStatus::Invalid, false),
+        ("interrupted", RunStatus::Interrupted, false),
+        ("old", RunStatus::Passed, true),
+    ] {
+        let root = directory.path().join(name);
+        let mut run = fixture()?;
+        run.status = status;
+        if old {
+            run.config.instrumentation = None;
+        }
+        let writer = artifacts::ArtifactWriter::create(&root)?;
+        writer.prepare(&mut run, b"", None)?;
+        writer.finish(&run)?;
+        assert_eq!(RunReport::read(&root)?.status, status);
+        let comparison = compare_directories(
+            &root,
+            &root,
+            &directory.path().join(format!("compare-{name}")),
+        )?;
+        assert!(!comparison.eligible);
+        assert!(comparison.metrics.is_empty());
+        let required = if old {
+            "config.instrumentation"
+        } else {
+            "status"
+        };
+        assert!(
+            comparison
+                .refusals
+                .iter()
+                .any(|r| r.context.as_deref().is_some_and(|s| s.contains(required)))
+        );
     }
     Ok(())
 }

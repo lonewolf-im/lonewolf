@@ -41,8 +41,26 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
 
 [dev-dependencies]
+async-lock.workspace = true
+tracing.workspace = true
+compio = { workspace = true, features = ["time"] }
+futures-executor.workspace = true
+idna.workspace = true
+lonewolf-acme.workspace = true
+lonewolf-core.workspace = true
+lonewolf-extension.workspace = true
+parking_lot.workspace = true
+quick-xml.workspace = true
+sha1.workspace = true
+socket2.workspace = true
+time.workspace = true
+x509-cert.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "benchmark_accounts"
 path = "../lonewolf-core/tests/benchmark/accounts.rs"
+
+[[test]]
+name = "benchmark_remote"
+path = "../lonewolf-core/tests/benchmark/remote.rs"

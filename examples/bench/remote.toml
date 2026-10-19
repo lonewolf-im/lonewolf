@@ -1,0 +1,36 @@
+# Replace the illustrative endpoint and descriptor with verified deployment facts.
+schema_version = 1
+environment_id = "illustrative-vps"
+
+[target]
+mode = "remote"
+connect_host = "xmpp.example.test"
+port = 5222
+xmpp_domain = "example.test"
+credentials_file = "private/credentials.json"
+environment_file = "remote-environment.json"
+metrics_url = "http://metrics.example.test:9090/metrics"
+
+[scenario]
+kind = "messages"
+pairs = 1
+rate_per_second = 2
+body_bytes = 256
+
+[measurement]
+warmup_ms = 10000
+duration_ms = 60000
+operation_timeout_ms = 10000
+setup_timeout_ms = 30000
+shutdown_timeout_ms = 10000
+ramp_rate_per_second = 20
+connect_concurrency = 2
+driver_workers = 2
+max_in_flight = 16
+dispatch_quantum_us = 1000
+max_dispatch_batch = 16
+max_schedule_lag_ms = 1000
+
+[metrics]
+interval_ms = 1000
+timeout_ms = 2000

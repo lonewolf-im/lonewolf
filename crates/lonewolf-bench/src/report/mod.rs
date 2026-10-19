@@ -4,6 +4,8 @@ use crate::config::{MeasurementConfig, MetricsConfig, RunConfig, ScenarioConfig,
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod reader;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -177,30 +179,7 @@ pub struct RunReport {
 
 impl RunReport {
     pub fn read(directory: &std::path::Path) -> crate::error::BenchResult<Self> {
-        use crate::error::{BenchError, ErrorCode};
-        use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt};
-        let error = |context| BenchError::new(ErrorCode::IncompatibleComparison, context);
-        match std::fs::symlink_metadata(directory.join(".incomplete")) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err(error("incomplete_publication")),
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(directory.join("result.json"))
-            .map_err(|_| error("result_open"))?;
-        let metadata = file.metadata().map_err(|_| error("result_metadata"))?;
-        if !metadata.is_file() || metadata.len() > artifacts::RESULT_LIMIT as u64 {
-            return Err(error("result_size_or_type"));
-        }
-        let mut bytes = Vec::new();
-        file.take(artifacts::RESULT_LIMIT as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| error("result_read"))?;
-        if bytes.len() > artifacts::RESULT_LIMIT {
-            return Err(error("result_size_or_type"));
-        }
-        serde_json::from_slice(&bytes).map_err(|_| error("result_schema"))
+        reader::read(directory)
     }
 }
 

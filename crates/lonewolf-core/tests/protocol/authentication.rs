@@ -816,6 +816,65 @@ fn account_deletion_rejects_old_proof_before_authzid_validation() -> TestResult 
 }
 
 #[test]
+fn scram_account_deletion_before_binding_rejects_session() -> TestResult {
+    let (suite, certificates, _) = external_suite("")?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "desk")?;
+    for (mechanism, binding, certificate) in [
+        ("SCRAM-SHA-1", None, false),
+        ("SCRAM-SHA-256", None, false),
+        ("SCRAM-SHA-1-PLUS", Some("tls-server-end-point"), false),
+        ("SCRAM-SHA-256-PLUS", Some("tls-exporter"), false),
+        ("SCRAM-SHA-256", None, true),
+    ] {
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        let mut alice = if certificate {
+            certificate_client(&suite, std::sync::Arc::clone(&certificates.trusted), None)?
+        } else {
+            suite.unauthenticated_client()?
+        };
+        alice
+            .scram("alice", ALTERNATE_PASSWORD, mechanism, binding)?
+            .assert_name(SASL_NAMESPACE, "success");
+        let mut alice = alice.restart();
+        alice.open()?;
+        suite.delete_account("alice")?;
+        alice.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq><message to='bob@localhost/desk' type='chat' id='revoked'/>")?;
+        alice.receive()?.child(STREAM_ERRORS, "not-authorized")?;
+        alice.expect_end()?;
+        bob.send("<message to='alice@localhost/desk' type='chat' id='gone'/><message to='bob@localhost/desk' type='chat' id='healthy'/>")?;
+        let rejected = bob.receive()?;
+        assert_eq!(rejected.attribute("id"), Some("gone"));
+        assert_eq!(rejected.attribute("type"), Some("error"));
+        bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost/desk' type='chat' id='healthy'/>")?;
+        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+        suite
+            .connect("alice", ALTERNATE_PASSWORD, "desk")?
+            .close()?;
+        suite.delete_account("alice")?;
+    }
+    bob.close()
+}
+
+#[test]
+fn scram_account_deletion_after_binding_retires_only_its_session() -> TestResult {
+    let suite = C2sSuite::with_extensions("")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "desk")?;
+    suite.delete_account("alice")?;
+    alice.receive()?.child(STREAM_ERRORS, "not-authorized")?;
+    alice.expect_end()?;
+    bob.send("<message to='alice@localhost/desk' type='chat' id='gone'/><message to='bob@localhost/desk' type='chat' id='healthy'/>")?;
+    let rejected = bob.receive()?;
+    assert_eq!(rejected.attribute("id"), Some("gone"));
+    assert_eq!(rejected.attribute("type"), Some("error"));
+    bob.expect_xml("<message xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost/desk' type='chat' id='healthy'/>")?;
+    bob.close()
+}
+
+#[test]
 fn protected_from_must_match_the_authenticated_account() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;

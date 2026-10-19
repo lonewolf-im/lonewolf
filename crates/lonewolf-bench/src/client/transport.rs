@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    future::{Future, poll_fn},
     num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -21,15 +23,16 @@ use tokio::{
     net::TcpStream,
     sync::{mpsc, watch},
     task::JoinHandle,
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, sleep_until, timeout},
 };
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use zeroize::Zeroizing;
 
 use super::{
-    BenchResult, ConnectTimings, EventSink, KeyMode, MessageRoute, NegotiatedTls, PreparedAccount,
-    ReceiveRoute, ReceivedEvent, ReceivedKind, ResolvedTarget, SessionIdentity, WriteCommand,
-    WriterEvent, failure, micros, scram::Exchange, xml,
+    BenchResult, ConnectFailureKind, ConnectObservation, ConnectStage, ConnectTimings, EventSink,
+    KeyMode, MessageRoute, NegotiatedTls, PreparedAccount, ReceiveRoute, ReceivedEvent,
+    ReceivedKind, ResolvedTarget, SessionIdentity, StageFailure, WriteCommand, WriterEvent,
+    failure, micros, scram::Exchange, xml,
 };
 
 pub type TlsTransport = Compat<futures_rustls::client::TlsStream<Compat<TcpStream>>>;
@@ -69,6 +72,27 @@ fn tls_config(roots: RootCertStore) -> BenchResult<Arc<ClientConfig>> {
     config.resumption = Resumption::disabled();
     config.enable_early_data = false;
     Ok(Arc::new(config))
+}
+
+impl ConnectObservation {
+    fn timings(&self) -> ConnectTimings {
+        let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (
+            self.connect_started_at,
+            self.tcp_connected_at,
+            self.tls_ready_at,
+            self.authenticated_at,
+            self.bound_at,
+        ) else {
+            unreachable!("successful login has every protocol boundary");
+        };
+        ConnectTimings {
+            tcp_us: micros(t1.duration_since(t0)),
+            starttls_us: micros(t2.duration_since(t1)),
+            authenticate_us: micros(t3.duration_since(t2)),
+            bind_us: micros(t4.duration_since(t3)),
+            total_us: micros(t4.duration_since(t0)),
+        }
+    }
 }
 
 pub struct ClientSession {
@@ -117,12 +141,92 @@ pub async fn connect(
     deadline: Instant,
     cpu: &BlockingExecutor,
 ) -> BenchResult<(ClientSession, ConnectTimings)> {
-    timeout_at(
+    connect_observed(
+        target,
+        account,
+        resource,
+        key_mode,
         deadline,
-        connect_inner(target, account, resource, key_mode, cpu),
+        cpu,
+        &mut ConnectObservation::default(),
     )
     .await
-    .map_err(|_| failure("connect_deadline"))?
+    .map_err(|failure| failure.error)
+}
+
+pub(crate) async fn connect_observed(
+    target: &ResolvedTarget,
+    account: &mut PreparedAccount,
+    resource: &str,
+    key_mode: KeyMode,
+    deadline: Instant,
+    cpu: &BlockingExecutor,
+    observation: &mut ConnectObservation,
+) -> Result<(ClientSession, ConnectTimings), StageFailure> {
+    let mut attempt = ConnectAttempt {
+        observation,
+        deadline,
+        expired: false,
+    };
+    let result = before_deadline(
+        deadline,
+        connect_inner(target, account, resource, key_mode, cpu, &mut attempt),
+    )
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        other => {
+            let (kind, error) = match other {
+                Ok(Err(error)) => (
+                    if attempt.expired {
+                        ConnectFailureKind::Deadline
+                    } else {
+                        ConnectFailureKind::Error
+                    },
+                    error,
+                ),
+                Err(()) => (ConnectFailureKind::Deadline, failure("connect_deadline")),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            Err(attempt.observation.failure(kind, error))
+        }
+    }
+}
+
+async fn before_deadline<T>(deadline: Instant, work: impl Future<Output = T>) -> Result<T, ()> {
+    let mut work = std::pin::pin!(work);
+    let mut timer = std::pin::pin!(sleep_until(deadline));
+    poll_fn(|cx| {
+        if Instant::now() >= deadline {
+            return Poll::Ready(Err(()));
+        }
+        if let Poll::Ready(value) = work.as_mut().poll(cx) {
+            return Poll::Ready(Ok(value));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            Poll::Ready(Err(()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+struct ConnectAttempt<'a> {
+    observation: &'a mut ConnectObservation,
+    deadline: Instant,
+    expired: bool,
+}
+
+impl ConnectObservation {
+    fn failure(&self, kind: ConnectFailureKind, error: crate::error::BenchError) -> StageFailure {
+        StageFailure {
+            stage: self.stage,
+            kind,
+            at: Instant::now(),
+            error,
+        }
+    }
 }
 
 async fn connect_inner(
@@ -131,8 +235,9 @@ async fn connect_inner(
     resource: &str,
     key_mode: KeyMode,
     cpu: &BlockingExecutor,
+    attempt: &mut ConnectAttempt<'_>,
 ) -> BenchResult<(ClientSession, ConnectTimings)> {
-    let start = Instant::now();
+    let observation = &mut attempt.observation;
     let server_name =
         ServerName::try_from(target.xmpp_domain.clone()).map_err(|_| failure("tls_identity"))?;
     if !matches!(server_name, ServerName::DnsName(_)) {
@@ -146,14 +251,28 @@ async fn connect_inner(
     {
         return Err(failure("account_domain"));
     }
-    let stream = TcpStream::connect(target.address)
-        .await
-        .map_err(|_| failure("tcp_connect"))?;
+    let mut connecting = std::pin::pin!(TcpStream::connect(target.address));
+    let stream = poll_fn(|cx| {
+        if Instant::now() >= attempt.deadline {
+            attempt.expired = true;
+            return Poll::Ready(Err(failure("connect_deadline")));
+        }
+        if observation.connect_started_at.is_none() {
+            observation.connect_started_at = Some(Instant::now());
+            observation.stage = Some(ConnectStage::Tcp);
+        }
+        connecting
+            .as_mut()
+            .poll(cx)
+            .map(|result| result.map_err(|_| failure("tcp_connect")))
+    })
+    .await?;
+    let tcp_at = Instant::now();
+    observation.tcp_connected_at = Some(tcp_at);
+    observation.stage = Some(ConnectStage::Starttls);
     stream
         .set_nodelay(true)
         .map_err(|_| failure("tcp_nodelay"))?;
-    let tcp_us = micros(start.elapsed());
-    let tls_start = Instant::now();
     let (read, mut write) = tokio::io::split(stream);
     let mut parser = xml::parser(read);
     let header = xml::stream_header(&target.xmpp_domain)?;
@@ -188,10 +307,11 @@ async fn connect_inner(
             .ok_or_else(|| failure("tls_negotiation"))?
             .suite(),
     };
-    let starttls_us = micros(tls_start.elapsed());
+    let tls_at = Instant::now();
+    observation.tls_ready_at = Some(tls_at);
+    observation.stage = Some(ConnectStage::Authenticate);
     let (read, mut write) = tokio::io::split(tls.compat());
     let mut parser = xml::parser(read);
-    let auth_start = Instant::now();
     write_all(&mut write, header.as_bytes()).await?;
     xml::features(&mut parser, &target.xmpp_domain, "mechanisms", xml::SASL_NS).await?;
     let exchange = Exchange::new(account)?;
@@ -210,8 +330,9 @@ async fn connect_inner(
     ));
     write_all(&mut write, response.as_bytes()).await?;
     proof.verify(&xml::sasl(&mut parser, "success").await?)?;
-    let authenticate_us = micros(auth_start.elapsed());
-    let bind_start = Instant::now();
+    let auth_at = Instant::now();
+    observation.authenticated_at = Some(auth_at);
+    observation.stage = Some(ConnectStage::Bind);
     parser = parser.restart().map_err(|_| failure("stream_restart"))?;
     write_all(&mut write, header.as_bytes()).await?;
     xml::features(&mut parser, &target.xmpp_domain, "bind", xml::BIND_NS).await?;
@@ -222,18 +343,14 @@ async fn connect_inner(
     bind.push_str("</resource></bind></iq>");
     write_all(&mut write, bind.as_bytes()).await?;
     let bound_jid = xml::binding(&mut parser, &expected).await?;
+    let bound_at = Instant::now();
+    observation.bound_at = Some(bound_at);
     let identity = SessionIdentity {
         bound_jid,
         tls: negotiated,
     };
     let writer = Writer::new(write, Retirement::new());
-    let timings = ConnectTimings {
-        tcp_us,
-        starttls_us,
-        authenticate_us,
-        bind_us: micros(bind_start.elapsed()),
-        total_us: micros(start.elapsed()),
-    };
+    let timings = observation.timings();
     Ok((
         ClientSession {
             reader: parser,
@@ -1021,6 +1138,173 @@ mod ownership_tests {
         for (i, event) in observed.iter().enumerate() {
             assert_receipt(event, at, i as u64 + 6);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use std::{future::pending, num::NonZeroUsize};
+    use tokio::io::AsyncReadExt;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn adjacent_boundaries_include_all_overhead_and_only_floor_individually() {
+        let start = Instant::now();
+        let observation = ConnectObservation {
+            connect_started_at: Some(start),
+            tcp_connected_at: Some(start + Duration::from_nanos(1_999)),
+            tls_ready_at: Some(start + Duration::from_nanos(4_998)),
+            authenticated_at: Some(start + Duration::from_nanos(8_997)),
+            bound_at: Some(start + Duration::from_nanos(13_996)),
+            stage: Some(ConnectStage::Bind),
+        };
+        let t = observation.timings();
+        assert_eq!(
+            (
+                t.tcp_us,
+                t.starttls_us,
+                t.authenticate_us,
+                t.bind_us,
+                t.total_us
+            ),
+            (1, 2, 3, 4, 13)
+        );
+        assert_eq!(
+            t.total_us - (t.tcp_us + t.starttls_us + t.authenticate_us + t.bind_us),
+            3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_work_is_never_polled_and_generic_errors_keep_each_active_stage() -> TestResult
+    {
+        for stage in [
+            ConnectStage::Tcp,
+            ConnectStage::Starttls,
+            ConnectStage::Authenticate,
+            ConnectStage::Bind,
+        ] {
+            let mut observation = ConnectObservation::default();
+            let deadline = Instant::now() + Duration::from_millis(1);
+            let result = before_deadline(deadline, async {
+                observation.stage = Some(stage);
+                pending::<BenchResult<()>>().await
+            })
+            .await;
+            assert!(result.is_err());
+            let failure =
+                observation.failure(ConnectFailureKind::Deadline, failure("connect_deadline"));
+            assert_eq!(
+                (failure.stage, failure.kind),
+                (Some(stage), ConnectFailureKind::Deadline)
+            );
+            assert_eq!(failure.at, deadline);
+            let result = before_deadline(deadline + Duration::from_secs(1), async {
+                Err::<(), _>(super::failure("xml_read"))
+            })
+            .await
+            .map_err(|_| "unexpected expiry")?;
+            let failure = observation.failure(ConnectFailureKind::Error, result.unwrap_err());
+            assert_eq!(
+                (failure.stage, failure.error.context()),
+                (Some(stage), "xml_read")
+            );
+        }
+        let polled = std::cell::Cell::new(false);
+        assert!(
+            before_deadline(Instant::now(), async {
+                polled.set(true);
+            })
+            .await
+            .is_err()
+        );
+        assert!(!polled.get());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpolled_and_expired_connects_have_no_stage_or_tcp_timestamp() -> TestResult {
+        let target = ResolvedTarget {
+            address: "127.0.0.1:9".parse()?,
+            xmpp_domain: "example.test".into(),
+            tls: remote_tls_config(None)?,
+        };
+        let mut account = PreparedAccount::new("user@example.test", "password".into())?;
+        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let mut observation = ConnectObservation::default();
+        let unpolled = connect_observed(
+            &target,
+            &mut account,
+            "bench",
+            KeyMode::Prime,
+            Instant::now() + Duration::from_secs(1),
+            &cpu,
+            &mut observation,
+        );
+        drop(unpolled);
+        assert!(observation.connect_started_at.is_none());
+        assert!(observation.stage.is_none());
+        let result = connect_observed(
+            &target,
+            &mut account,
+            "bench",
+            KeyMode::Prime,
+            Instant::now(),
+            &cpu,
+            &mut observation,
+        )
+        .await;
+        let failure = result.err().ok_or("expired connection succeeded")?;
+        assert_eq!(
+            (failure.kind, failure.stage, failure.error.context()),
+            (ConnectFailureKind::Deadline, None, "connect_deadline")
+        );
+        assert!(observation.connect_started_at.is_none());
+        assert_eq!(account.cached_scram_iterations(), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_tcp_poll_is_recorded_once_and_cancellation_drops_transport() -> TestResult {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let target = ResolvedTarget {
+            address: listener.local_addr()?,
+            xmpp_domain: "example.test".into(),
+            tls: remote_tls_config(None)?,
+        };
+        let mut account = PreparedAccount::new("user@example.test", "password".into())?;
+        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let mut observation = ConnectObservation::default();
+        let before = Instant::now();
+        let mut work = Box::pin(connect_observed(
+            &target,
+            &mut account,
+            "bench",
+            KeyMode::Prime,
+            before + Duration::from_secs(2),
+            &cpu,
+            &mut observation,
+        ));
+        let accepted = tokio::select! {result=listener.accept()=>result?, _=&mut work=>return Err("unexpected connect completion".into())};
+        let mut peer = accepted.0;
+        let mut bytes = [0; 1024];
+        tokio::select! {result=peer.read(&mut bytes)=>{assert!(result?>0);}, _=&mut work=>return Err("unexpected connect completion".into())};
+        drop(work);
+        assert_eq!(observation.stage, Some(ConnectStage::Starttls));
+        assert!(
+            observation
+                .connect_started_at
+                .is_some_and(|at| at >= before)
+        );
+        assert!(observation.tcp_connected_at >= observation.connect_started_at);
+        assert!(observation.tls_ready_at.is_none());
+        assert_eq!(
+            timeout(Duration::from_secs(1), peer.read(&mut bytes)).await??,
+            0
+        );
         Ok(())
     }
 }

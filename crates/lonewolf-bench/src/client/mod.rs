@@ -22,11 +22,11 @@ use tokio::{sync::mpsc, time::Instant};
 use crate::error::{BenchError, BenchResult, ErrorCode};
 
 pub use scram::{KeyMode, PreparedAccount};
-pub(crate) use transport::MessageSetup;
 pub use transport::{
     ClientSession, SessionReader, SessionWriter, TlsTransport, connect, local_tls_config,
     remote_tls_config, shutdown,
 };
+pub(crate) use transport::{MessageSetup, connect_observed};
 
 pub struct ResolvedTarget {
     pub address: SocketAddr,
@@ -43,6 +43,39 @@ pub struct ConnectTimings {
     pub authenticate_us: u64,
     pub bind_us: u64,
     pub total_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectStage {
+    Tcp,
+    Starttls,
+    Authenticate,
+    Bind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectFailureKind {
+    Error,
+    Deadline,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ConnectObservation {
+    pub(crate) stage: Option<ConnectStage>,
+    pub(crate) connect_started_at: Option<Instant>,
+    pub(crate) tcp_connected_at: Option<Instant>,
+    pub(crate) tls_ready_at: Option<Instant>,
+    pub(crate) authenticated_at: Option<Instant>,
+    pub(crate) bound_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StageFailure {
+    pub(crate) stage: Option<ConnectStage>,
+    pub(crate) kind: ConnectFailureKind,
+    pub(crate) at: Instant,
+    pub(crate) error: BenchError,
 }
 
 #[derive(Clone, Debug)]

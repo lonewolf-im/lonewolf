@@ -3,29 +3,28 @@
 use super::*;
 use crate::{
     report::{CounterReport, PhaseName, PhaseStatus, RunStatus},
-    run::tests::{config, context},
+    run::tests::context,
 };
 use std::time::Duration;
 use tokio::time::Instant;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-#[tokio::test]
-async fn unsupported_scenarios_fail_before_output_or_target_effects() -> TestResult {
-    let directory = tempfile::tempdir()?;
-    for scenario in [ScenarioConfig::Churn {
-        accounts: 1,
-        rate_per_second: 1,
-    }] {
-        let mut config = config(1)?;
-        config.scenario = scenario;
-        let output = directory.path().join("output");
-        assert!(
-            crate::run(config, &output)
-                .await
-                .is_err_and(|error| error.code == crate::error::ErrorCode::NotImplemented)
-        );
-        assert!(!output.exists());
+#[test]
+fn all_scenarios_are_supported() -> TestResult {
+    for scenario in [
+        ScenarioConfig::Idle { connections: 1 },
+        ScenarioConfig::Messages {
+            pairs: 1,
+            rate_per_second: 1,
+            body_bytes: 1,
+        },
+        ScenarioConfig::Churn {
+            accounts: 1,
+            rate_per_second: 1,
+        },
+    ] {
+        validate_supported(&scenario)?;
     }
     Ok(())
 }

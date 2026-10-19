@@ -523,6 +523,10 @@ impl LocalFixture {
     pub fn metrics_url(&self) -> &str {
         &self.metrics
     }
+    pub(crate) fn take_credentials(&mut self) -> Vec<PreparedAccount> {
+        std::mem::take(&mut self.accounts)
+    }
+
     pub fn credentials(&mut self) -> &mut [PreparedAccount] {
         &mut self.accounts
     }

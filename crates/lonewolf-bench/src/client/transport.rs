@@ -278,6 +278,17 @@ pub struct SessionReader {
 }
 
 impl SessionReader {
+    #[cfg(test)]
+    pub(crate) fn test_stream(input: tokio::io::DuplexStream, capacity: NonZeroUsize) -> Self {
+        Self::start(
+            xml::parser(input),
+            "test@localhost/bench".into(),
+            None,
+            Retirement::new(),
+            capacity,
+        )
+    }
+
     pub(super) fn start<R: AsyncRead + Unpin + Send + 'static>(
         mut parser: xml::Parser<R>,
         bound_jid: String,

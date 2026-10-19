@@ -29,7 +29,8 @@ impl MeasurementResult {
             .iter()
             .fold(RunStatus::Passed, |status, reason| {
                 status.combine(match reason.code {
-                    ReasonCode::SchedulerMiss
+                    ReasonCode::InvalidConfig
+                    | ReasonCode::SchedulerMiss
                     | ReasonCode::EventOverflow
                     | ReasonCode::AccountingError
                     | ReasonCode::HistogramError

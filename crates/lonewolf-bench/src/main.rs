@@ -17,7 +17,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     match cli.execute() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("{error}");
             ExitCode::from(error.exit_code())

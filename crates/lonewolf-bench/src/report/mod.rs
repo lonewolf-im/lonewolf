@@ -37,6 +37,14 @@ pub enum TelemetryStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseName {
+    Preflight,
+    TargetSetup,
+    AccountPrimingConnections,
+    WarmupDrain,
+    MeasurementDrain,
+    ConnectionShutdown,
+    LocalChildShutdown,
+    ArtifactFinalization,
     Setup,
     Ramp,
     Warmup,
@@ -115,6 +123,7 @@ pub enum LatencyKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
+    InvalidConfig,
     TargetFailure,
     SetupFailure,
     WorkloadFailure,
@@ -148,16 +157,16 @@ pub struct RunReport {
     pub schema_version: u32,
     #[serde(with = "version_one")]
     pub measurement_version: u32,
-    pub run_id: String,
+    pub run_id: Option<String>,
     pub status: RunStatus,
     pub reasons: Vec<RunReason>,
     pub telemetry_status: TelemetryStatus,
-    pub started_at_utc: String,
+    pub started_at_utc: Option<String>,
     pub phases: Vec<PhaseReport>,
     pub config: SanitizedConfig,
     pub driver: DriverMetadata,
     pub target: TargetMetadata,
-    pub environment: EnvironmentDescriptor,
+    pub environment: Option<EnvironmentDescriptor>,
     pub dataset: DatasetIdentity,
     pub counters: CounterReport,
     pub rates: RateReport,
@@ -332,9 +341,9 @@ pub struct DriverMetadata {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemMetadata {
-    pub os_release: String,
+    pub os_release: Option<String>,
     pub kernel: Option<String>,
-    pub arch: String,
+    pub arch: Option<String>,
     pub cpu_model: Option<String>,
     pub logical_cpus: Option<u64>,
     pub memory_bytes: Option<u64>,
@@ -370,7 +379,7 @@ pub struct TargetMetadata {
     #[serde(with = "finite_option")]
     pub observed_process_start_time_seconds: Option<f64>,
     pub local_binary_sha256: Option<String>,
-    pub declared_build: ServerBuildDeclaration,
+    pub declared_build: Option<ServerBuildDeclaration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -431,7 +440,7 @@ pub struct ByteRateLimitSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetIdentity {
-    pub account_jids_sha256: String,
+    pub account_jids_sha256: Option<String>,
     pub account_count: u64,
     pub pair_count: Option<u64>,
     pub resource_policy: String,
@@ -507,7 +516,7 @@ pub struct ArtifactMetadata {
 pub struct RunMetadata {
     pub driver: DriverMetadata,
     pub target: TargetMetadata,
-    pub environment: EnvironmentDescriptor,
+    pub environment: Option<EnvironmentDescriptor>,
     pub dataset: DatasetIdentity,
 }
 

@@ -28,14 +28,22 @@ use nix::{
 };
 use process::{Collector, Startup};
 use std::{
+    future::Future,
     net::{Ipv4Addr, SocketAddr},
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::{
+    sync::watch,
+    time::{Instant, sleep, sleep_until},
+};
 use zeroize::Zeroizing;
 
 fn failure(context: &'static str) -> BenchError {
@@ -113,19 +121,121 @@ pub struct LocalFixture {
     reaped: bool,
     started: bool,
 }
+struct PreparationControl<'a> {
+    deadline: Instant,
+    interruption: Option<&'a mut watch::Receiver<bool>>,
+    deadline_context: &'static str,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    probe: Option<Arc<tests::PreparationProbe>>,
+}
+
+impl PreparationControl<'_> {
+    fn check(&self) -> BenchResult<()> {
+        let result = if self
+            .interruption
+            .as_ref()
+            .is_some_and(|receiver| *receiver.borrow())
+        {
+            Err(failure("interrupted"))
+        } else if Instant::now() >= self.deadline || self.cancelled.load(Ordering::Acquire) {
+            Err(failure(self.deadline_context))
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.cancelled.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    async fn wait<T>(&mut self, work: impl Future<Output = BenchResult<T>>) -> BenchResult<T> {
+        self.check()?;
+        let mut work = std::pin::pin!(work);
+        let stop = tokio::select! {
+            biased;
+            _ = async {
+                match &mut self.interruption {
+                    Some(receiver) => { let _ = receiver.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => failure("interrupted"),
+            _ = sleep_until(self.deadline) => failure(self.deadline_context),
+            result = &mut work => {
+                let value = result?;
+                self.check()?;
+                return Ok(value);
+            }
+        };
+        self.cancelled.store(true, Ordering::Release);
+        let _ = work.await;
+        Err(stop)
+    }
+
+    async fn run_cpu<T: Send + 'static>(
+        &mut self,
+        cpu: &BlockingExecutor,
+        operation: impl FnOnce(&AtomicBool) -> BenchResult<T> + Send + 'static,
+    ) -> BenchResult<T> {
+        let cancelled = self.cancelled.clone();
+        let deadline = self.deadline;
+        let context = self.deadline_context;
+        #[cfg(test)]
+        let probe = self.probe.clone();
+        self.wait(cpu.run(move || {
+            if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return Err(failure(context));
+            }
+            #[cfg(test)]
+            if let Some(probe) = probe {
+                probe.cpu_started()?;
+            }
+            operation(&cancelled)
+        }))
+        .await
+    }
+}
+
 impl LocalFixture {
     pub async fn prepare(config: &RunConfig, cpu: &BlockingExecutor) -> BenchResult<Self> {
         config.validate()?;
         let deadline = Instant::now() + Duration::from_millis(config.measurement.setup_timeout_ms);
-        timeout_at(deadline, Self::prepare_inner(config, cpu, deadline))
-            .await
-            .map_err(|_| failure("fixture_setup_deadline"))?
+        let mut control = PreparationControl {
+            deadline,
+            interruption: None,
+            deadline_context: "fixture_setup_deadline",
+            cancelled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            probe: None,
+        };
+        Self::prepare_inner(config, cpu, &mut control).await
     }
-    async fn prepare_inner(
+
+    pub(crate) async fn prepare_for_run(
         config: &RunConfig,
         cpu: &BlockingExecutor,
         deadline: Instant,
+        interruption: &mut watch::Receiver<bool>,
     ) -> BenchResult<Self> {
+        let mut control = PreparationControl {
+            deadline,
+            interruption: Some(interruption),
+            deadline_context: "setup_deadline",
+            cancelled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            probe: None,
+        };
+        Self::prepare_inner(config, cpu, &mut control).await
+    }
+
+    async fn prepare_inner(
+        config: &RunConfig,
+        cpu: &BlockingExecutor,
+        control: &mut PreparationControl<'_>,
+    ) -> BenchResult<Self> {
+        control.check()?;
+        let deadline = control.deadline;
+        let deadline_context = control.deadline_context;
         config.validate()?;
         validate_limits(config)?;
         let TargetConfig::Local {
@@ -145,8 +255,8 @@ impl LocalFixture {
             return Err(failure("fixture_server_binary"));
         }
         let count = config.account_count();
-        let (directory, certificate, credentials) = cpu
-            .run(move || {
+        let (directory, certificate, credentials) = control
+            .run_cpu(cpu, move |_| {
                 let directory = tempfile::Builder::new()
                     .prefix("lonewolf-bench-")
                     .permissions(std::fs::Permissions::from_mode(0o700))
@@ -157,11 +267,20 @@ impl LocalFixture {
                 Ok::<_, BenchError>((directory, certificate, credentials))
             })
             .await?;
+        #[cfg(test)]
+        let _owners = control
+            .probe
+            .as_ref()
+            .map(|probe| probe.owners(directory.path()))
+            .transpose()?;
         let path = directory.path().join("accounts.redb");
-        let storage = cpu
-            .run(move || RedbStorage::open(path).map_err(|_| failure("fixture_storage")))
+        let storage = control
+            .run_cpu(cpu, move |_| {
+                RedbStorage::open(path).map_err(|_| failure("fixture_storage"))
+            })
             .await?;
         for chunk in credentials.accounts.chunks(256) {
+            control.check()?;
             let secrets: Vec<_> = chunk
                 .iter()
                 .map(|account| {
@@ -171,14 +290,14 @@ impl LocalFixture {
                     )
                 })
                 .collect();
-            let batch = cpu
-                .run(move || {
+            let batch = control
+                .run_cpu(cpu, move |cancelled| {
                     let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())
                         .map_err(|_| failure("fixture_scram_policy"))?;
                     let mut batch = Vec::with_capacity(secrets.len());
                     for (jid, password) in secrets {
-                        if Instant::now() >= deadline {
-                            return Err(failure("fixture_setup_deadline"));
+                        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                            return Err(failure(deadline_context));
                         }
                         let mut arena = Arena::try_new(ArenaConfig::default())
                             .map_err(|_| failure("fixture_arena"))?;
@@ -195,31 +314,51 @@ impl LocalFixture {
                     Ok::<_, BenchError>(batch)
                 })
                 .await?;
-            let mut transaction = storage
-                .begin_write()
-                .await
-                .map_err(|_| failure("fixture_storage"))?;
-            for account in batch {
-                transaction
-                    .create_account(account)
-                    .await
-                    .map_err(|_| failure("fixture_storage"))?;
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(|_| failure("fixture_storage"))?;
+            #[cfg(test)]
+            let probe = control.probe.clone();
+            control
+                .wait(async {
+                    let mut transaction = storage
+                        .begin_write()
+                        .await
+                        .map_err(|_| failure("fixture_storage"))?;
+                    #[cfg(test)]
+                    if let Some(probe) = &probe {
+                        probe.transaction_started().await?;
+                    }
+                    for account in batch {
+                        transaction
+                            .create_account(account)
+                            .await
+                            .map_err(|_| failure("fixture_storage"))?;
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .map_err(|_| failure("fixture_storage"))?;
+                    #[cfg(test)]
+                    if let Some(probe) = &probe {
+                        probe.transaction_finished();
+                    }
+                    Ok(())
+                })
+                .await?;
         }
+        control.check()?;
         drop(storage);
+        let accounts = credentials.into_prepared()?;
+        control.check()?;
         let settings = settings(*server_workers, *stanza_pool_size_mib);
         let config_path = directory.path().join("lonewolf.toml");
+        control.check()?;
         tls::write_private(&config_path, server_config(&settings).as_bytes())?;
+        control.check()?;
         Ok(Self {
             directory: Some(directory),
             binary,
             config_path,
             setup_deadline: deadline,
-            accounts: credentials.into_prepared()?,
+            accounts,
             settings,
             certificate,
             child: None,

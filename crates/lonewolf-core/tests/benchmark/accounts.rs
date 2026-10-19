@@ -6,7 +6,7 @@ use lonewolf_bench::accounts::{
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::net::UnixListener,
+    os::unix::net::{UnixListener, UnixStream},
     path::Path,
     process::{Command, Output},
     thread,
@@ -59,6 +59,12 @@ fn reply(status: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+fn prepare_blocking_stream(stream: &UnixStream) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))
+}
+
 fn mock(
     socket: &Path,
     replies: Vec<Vec<u8>>,
@@ -81,8 +87,7 @@ fn mock(
                     Err(error) => return Err(error),
                 }
             };
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            prepare_blocking_stream(&stream)?;
             requests.push(read_request(&mut stream)?);
             let _ = stream.write_all(&reply);
         }
@@ -374,5 +379,40 @@ fn provision_cli_reports_partial_conflicting_and_uncertain_creates() -> TestResu
         );
         assert_eq!(fs::read(&credentials)?, original);
     }
+    Ok(())
+}
+
+#[test]
+fn accepted_nonblocking_socket_is_normalized_for_bounded_admin_http() -> TestResult {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let directory = tempfile::tempdir()?;
+    let socket = directory.path().join("admin.sock");
+    let listener = UnixListener::bind(&socket)?;
+    listener.set_nonblocking(true)?;
+    let mut client = UnixStream::connect(&socket)?;
+    prepare_blocking_stream(&client)?;
+    let (mut accepted, _) = listener.accept()?;
+    accepted.set_nonblocking(true)?;
+    let mut byte = [0];
+    assert!(
+        matches!(accepted.read(&mut byte), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    prepare_blocking_stream(&accepted)?;
+    assert!(
+        !OFlag::from_bits_truncate(fcntl(&accepted, FcntlArg::F_GETFL)?)
+            .contains(OFlag::O_NONBLOCK)
+    );
+    assert_eq!(accepted.read_timeout()?, Some(Duration::from_secs(5)));
+    assert_eq!(accepted.write_timeout()?, Some(Duration::from_secs(5)));
+    client.write_all(
+        b"POST /v1/accounts HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+    )?;
+    assert!(read_request(&mut accepted)?.starts_with(b"POST /v1/accounts HTTP/1.1\r\n"));
+    let response = reply("201 Created", "{}");
+    accepted.write_all(&response)?;
+    drop(accepted);
+    let mut received = Vec::new();
+    client.read_to_end(&mut received)?;
+    assert_eq!(received, response);
     Ok(())
 }

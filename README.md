@@ -17,8 +17,7 @@ Start small, grow when you need to, and keep your server easy to run.
 > [!NOTE]
 > Lonewolf is early, pre-1.0 software. Today it can host chat between accounts on
 > domains you run. Federation with other XMPP servers is next on the
-> [roadmap](docs/ROADMAP.md); clustering comes later. There are no releases yet,
-> so you'll build from source.
+> [roadmap](docs/ROADMAP.md); clustering comes later.
 
 ## Why Lonewolf?
 

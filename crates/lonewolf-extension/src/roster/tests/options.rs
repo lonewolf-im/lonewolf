@@ -119,7 +119,7 @@ fn roster_quota_options_have_finite_defaults_and_validate_overrides() -> Result<
     use crate::roster::RosterOptions;
     let defaults: RosterOptions = toml::from_str("")?;
     assert_eq!(defaults.max_items.get(), 1000);
-    assert_eq!(defaults.max_bytes.get(), 1_048_576);
+    assert_eq!(defaults.max_bytes.get(), 2_097_152);
     assert_eq!(defaults.max_pending_subscription_requests.get(), 100);
     let options: RosterOptions = toml::from_str("max_items=2\nmax_bytes=128")?;
     assert_eq!(options.max_items.get(), 2);

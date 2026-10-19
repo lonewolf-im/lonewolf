@@ -39,7 +39,7 @@
 # Increase this positive count for larger address books. Each item allows up to eight groups.
 # max_items = 1000
 # Increase this positive byte budget for larger names and groups; stored contact keys also count.
-# max_bytes = 1048576
+# max_bytes = 2097152
 # Limit distinct pending senders. At capacity, only existing senders can update requests.
 # max_pending_subscription_requests = 100
 

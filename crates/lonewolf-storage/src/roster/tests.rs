@@ -569,3 +569,36 @@ fn repeated_legacy_header_transitions_preserve_metadata_and_use_current_version(
     }
     Ok(())
 }
+
+#[test]
+fn default_roster_byte_quota_admits_two_mib_and_rejects_further_growth() -> TestResult {
+    let storage = storage()?;
+    let owner = key("alice@example.com")?;
+    let limit = RosterQuota::default();
+    assert_eq!(limit.max_bytes.get(), 2_097_152);
+    block_on(async {
+        let mut tx = storage.begin_write().await?;
+        tx.create_account(new_account(owner.as_str(), 10)?).await?;
+        let mut contact = item("bob@example.com", None, &[])?;
+        let overhead = owner.as_str().len() + 1 + contact.jid.as_str().len() + 10;
+        let name_len = limit.max_bytes.get() - overhead;
+        contact.name = Some("x".repeat(name_len + 1).into_boxed_str());
+        assert!(matches!(
+            tx.put_roster_item(&owner, &contact, limit).await,
+            Err(super::RosterError::QuotaExceeded)
+        ));
+        assert_eq!(tx.roster_version(&owner).await?.get(), 0);
+        let mut name = contact.name.take().ok_or("missing name")?.into_string();
+        name.truncate(name_len);
+        contact.name = Some(name.into_boxed_str());
+        assert_eq!(tx.put_roster_item(&owner, &contact, limit).await?.get(), 1);
+        assert!(matches!(
+            tx.put_roster_item(&owner, &item("carol@example.com", None, &[])?, limit)
+                .await,
+            Err(super::RosterError::QuotaExceeded)
+        ));
+        assert_eq!(tx.roster_version(&owner).await?.get(), 1);
+        tx.commit().await?;
+        Ok::<_, Box<dyn Error>>(())
+    })
+}

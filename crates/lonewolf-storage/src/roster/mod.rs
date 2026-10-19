@@ -28,7 +28,7 @@ impl Default for RosterQuota {
     fn default() -> Self {
         Self {
             max_items: const { NonZeroUsize::new(1_000).unwrap() },
-            max_bytes: const { NonZeroUsize::new(1_048_576).unwrap() },
+            max_bytes: const { NonZeroUsize::new(2_097_152).unwrap() },
         }
     }
 }

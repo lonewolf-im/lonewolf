@@ -727,7 +727,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
                     "roster".into(),
                     toml::Table::from_iter([
                         ("max_items".into(), toml::Value::Integer(1000)),
-                        ("max_bytes".into(), toml::Value::Integer(1048576)),
+                        ("max_bytes".into(), toml::Value::Integer(2097152)),
                         (
                             "max_pending_subscription_requests".into(),
                             toml::Value::Integer(100),

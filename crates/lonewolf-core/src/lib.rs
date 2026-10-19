@@ -92,6 +92,13 @@ pub fn run_with_extensions(
 
     let (_logging_guard, dropped_logs) =
         logging::init(config.logging.level).map_err(RunError::Logging)?;
+    let effective_uid = nix::unistd::geteuid();
+    if effective_uid.is_root() {
+        tracing::warn!(
+            effective_uid = effective_uid.as_raw(),
+            "lonewolf is running as root; use an unprivileged user"
+        );
+    }
     tracing::info!(
         version = build.version,
         branch = build.branch,

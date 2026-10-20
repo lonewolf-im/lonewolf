@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod options;
+use std::error::Error;
 use std::sync::Arc;
 
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::{RedbStorage, RedbWrite};
-use lonewolf_util::arena::GlobalChunkAllocator;
-use lonewolf_xmpp::stanza::RoutedStanza;
+use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
+use lonewolf_xmpp::stanza::{Element, RoutedStanza};
 use parking_lot::Mutex as PlMutex;
 
 use super::account::AccountHandler;
 use super::delivery::{HandlerError, HostLookup};
-use super::discovery::{DiscoScope, Discovery, Identity};
+use super::discovery::{
+    DiscoScope, Discovery, INFO_NAMESPACE, ITEMS_NAMESPACE, Identity, Query, QueryKind, info_in,
+    item_in, items_in,
+};
 use super::iq::{IqHandler, IqRequestType, IqRoute, IqScope};
 use super::message::MessageHandler;
 use super::presence::{PresenceHandler, PresenceRequestType};
@@ -247,6 +251,123 @@ fn discovery_lists_registered_services() -> Result<(), RegistrationError> {
     }))?;
     let enabled = extensions.enable_host("example", ["services"])?;
     assert_eq!(enabled.discovery().services(), ["a.example", "b.example"]);
+    Ok(())
+}
+
+#[test]
+fn discovery_info_lists_identities_then_features() -> Result<(), Box<dyn Error>> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let element = info_in(
+        None,
+        &[
+            Identity {
+                category: "server",
+                kind: "im",
+                name: None,
+            },
+            Identity {
+                category: "store",
+                kind: "file",
+                name: Some("Files"),
+            },
+        ],
+        &[INFO_NAMESPACE, "urn:example"],
+        &mut arena,
+    )?;
+    let mut xml = String::new();
+    element.resolve(&arena)?.write_xml(&mut xml)?;
+    assert_eq!(
+        xml,
+        "<query xmlns=\"http://jabber.org/protocol/disco#info\"><identity category=\"server\" type=\"im\"/><identity category=\"store\" type=\"file\" name=\"Files\"/><feature var=\"http://jabber.org/protocol/disco#info\"/><feature var=\"urn:example\"/></query>"
+    );
+    Ok(())
+}
+
+#[test]
+fn discovery_info_repeats_the_requested_node() -> Result<(), Box<dyn Error>> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let element = info_in(Some("n"), &[], &[], &mut arena)?;
+    let mut xml = String::new();
+    element.resolve(&arena)?.write_xml(&mut xml)?;
+    assert_eq!(
+        xml,
+        "<query xmlns=\"http://jabber.org/protocol/disco#info\" node=\"n\"/>"
+    );
+    Ok(())
+}
+
+#[test]
+fn discovery_items_keep_item_order_and_optional_attributes() -> Result<(), Box<dyn Error>> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let first = item_in("a.example", None, None, &mut arena)?;
+    let second = item_in("b.example", Some("x"), Some("B"), &mut arena)?;
+    let element = items_in(None, &[first, second], &mut arena)?;
+    let mut xml = String::new();
+    element.resolve(&arena)?.write_xml(&mut xml)?;
+    assert_eq!(
+        xml,
+        "<query xmlns=\"http://jabber.org/protocol/disco#items\"><item jid=\"a.example\"/><item jid=\"b.example\" node=\"x\" name=\"B\"/></query>"
+    );
+    Ok(())
+}
+
+#[test]
+fn discovery_items_without_entries_are_empty() -> Result<(), Box<dyn Error>> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let element = items_in(Some("n"), &[], &mut arena)?;
+    let mut xml = String::new();
+    element.resolve(&arena)?.write_xml(&mut xml)?;
+    assert_eq!(
+        xml,
+        "<query xmlns=\"http://jabber.org/protocol/disco#items\" node=\"n\"/>"
+    );
+    Ok(())
+}
+
+#[test]
+fn discovery_queries_parse_kind_and_node() -> Result<(), Box<dyn Error>> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let info = Element::builder_in("query", INFO_NAMESPACE, &mut arena)?.build()?;
+    let items = Element::builder_in("query", ITEMS_NAMESPACE, &mut arena)?
+        .attribute("node", "", "n")?
+        .build()?;
+    let empty_node = Element::builder_in("query", ITEMS_NAMESPACE, &mut arena)?
+        .attribute("node", "", "")?
+        .build()?;
+    let child = Element::builder_in("child", INFO_NAMESPACE, &mut arena)?.build()?;
+    let nested = Element::builder_in("query", INFO_NAMESPACE, &mut arena)?
+        .child(child)?
+        .build()?;
+    let wrong_namespace = Element::builder_in("query", "jabber:iq:roster", &mut arena)?.build()?;
+    let wrong_name = Element::builder_in("other", INFO_NAMESPACE, &mut arena)?.build()?;
+
+    assert_eq!(
+        Query::parse(info.resolve(&arena)?)?,
+        Some(Query {
+            kind: QueryKind::Info,
+            node: None,
+        })
+    );
+    assert_eq!(
+        Query::parse(items.resolve(&arena)?)?,
+        Some(Query {
+            kind: QueryKind::Items,
+            node: Some("n"),
+        })
+    );
+    assert_eq!(
+        Query::parse(empty_node.resolve(&arena)?)?.map(|query| query.node),
+        Some(Some(""))
+    );
+    assert_eq!(
+        Query::parse(nested.resolve(&arena)?)?,
+        Some(Query {
+            kind: QueryKind::Info,
+            node: None,
+        })
+    );
+    assert_eq!(Query::parse(wrong_namespace.resolve(&arena)?)?, None);
+    assert_eq!(Query::parse(wrong_name.resolve(&arena)?)?, None);
     Ok(())
 }
 

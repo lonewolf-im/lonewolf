@@ -51,6 +51,7 @@ pub struct Peer {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<PeerResult>>,
     pub messages: Arc<std::sync::atomic::AtomicUsize>,
+    bindings: mpsc::Receiver<(String, bool)>,
 }
 impl Peer {
     pub fn start(directory: &Path, behavior: Behavior) -> TestResult<Self> {
@@ -71,6 +72,7 @@ impl Peer {
         let routes = Arc::new(PlMutex::new(BTreeMap::new()));
         let messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = messages.clone();
+        let (bindings, bound) = mpsc::channel();
         let thread = thread::spawn(move || {
             let mut workers = vec![];
             while !stopped.load(Ordering::Acquire) {
@@ -89,8 +91,11 @@ impl Peer {
                             stopped.clone(),
                             observed.clone(),
                         );
+                        let bindings = bindings.clone();
                         workers.push(thread::spawn(move || {
-                            serve(stream, config, behavior, routes, stopped, messages)
+                            serve(
+                                stream, config, behavior, routes, stopped, messages, bindings,
+                            )
                         }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -110,7 +115,14 @@ impl Peer {
             stop,
             thread: Some(thread),
             messages,
+            bindings: bound,
         })
+    }
+    pub fn assert_bound_route(&self, jid: &str) -> TestResult {
+        let (bound, registered) = self.bindings.recv_timeout(Duration::from_secs(10))?;
+        assert_eq!(bound, jid);
+        assert!(registered, "bind reply published before route registration");
+        Ok(())
     }
     pub fn finish(mut self) -> TestResult {
         self.stop.store(true, Ordering::Release);
@@ -223,6 +235,7 @@ fn serve(
     routes: Routes,
     stop: Arc<AtomicBool>,
     messages: Arc<std::sync::atomic::AtomicUsize>,
+    bindings: mpsc::Sender<(String, bool)>,
 ) -> PeerResult {
     let mut plain = Frames::new(stream);
     let fragment = behavior == Behavior::Fragmented;
@@ -318,10 +331,14 @@ fn serve(
             attr(&bind, "id")?
         )
     };
-    tls.send(&reply, fragment)?;
     let (send, receive) = mpsc::channel();
     routes.lock().insert(jid.clone(), send);
-    let result = traffic(&mut tls, behavior, &jid, &routes, receive, &stop, &messages);
+    let result = (|| {
+        let binding = (jid.clone(), routes.lock().contains_key(&jid));
+        tls.send(&reply, fragment)?;
+        bindings.send(binding)?;
+        traffic(&mut tls, behavior, &jid, &routes, receive, &stop, &messages)
+    })();
     routes.lock().remove(&jid);
     result
 }

@@ -406,6 +406,10 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         match event {
             ListenerEvent::Accepted(Ok((stream, peer))) => {
                 accept.as_mut().set(listener.accept());
+                if let Err(error) = stream.set_nodelay(true) {
+                    close_unhandled_connection(stream);
+                    break Err(error);
+                }
                 let reserved = admission.reserve(peer.ip()).await;
                 if let Err(rejection) = &reserved {
                     metrics.connection_rejected(rejection_reason(rejection));

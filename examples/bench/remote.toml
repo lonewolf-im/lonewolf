@@ -1,4 +1,4 @@
-# Replace the illustrative endpoint, domain and paths with your deployment.
+# Replace the endpoint, domain and paths with your deployment.
 
 [target]
 mode = "remote"
@@ -17,15 +17,3 @@ body_bytes = 256
 [measurement]
 warmup_ms = 10000
 duration_ms = 60000
-operation_timeout_ms = 10000
-setup_timeout_ms = 30000
-shutdown_timeout_ms = 10000
-ramp_rate_per_second = 20
-connect_concurrency = 2
-driver_workers = 2
-max_in_flight = 16
-max_schedule_lag_ms = 1000
-
-[metrics]
-interval_ms = 1000
-timeout_ms = 2000

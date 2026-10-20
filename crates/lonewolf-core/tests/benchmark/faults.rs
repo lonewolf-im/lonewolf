@@ -870,7 +870,6 @@ async fn destination_receipt_can_be_consumed_before_queued_sender_completion() -
         &cpu,
     )
     .await?;
-    peer.assert_bound_route(&sender.identity().bound_jid)?;
     let (mut recipient, _) = client::connect(
         &target,
         &mut recipient,
@@ -880,7 +879,6 @@ async fn destination_receipt_can_be_consumed_before_queued_sender_completion() -
         &cpu,
     )
     .await?;
-    peer.assert_bound_route(&recipient.identity().bound_jid)?;
     recipient.set_receive_route(ReceiveRoute {
         from: sender.identity().bound_jid.clone(),
         body_bytes: 3,

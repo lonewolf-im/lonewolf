@@ -1042,6 +1042,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                                 sender,
                                 target,
                                 discovery: &discovery,
+                                sessions: &delivery,
                                 requester: None,
                                 payload,
                             },
@@ -2756,6 +2757,7 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                             sender,
                             target,
                             discovery: &discovery,
+                            sessions: &delivery,
                             requester,
                             payload,
                         };

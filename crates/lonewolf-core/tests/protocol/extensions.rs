@@ -821,6 +821,25 @@ fn account_gets_learn_whether_the_requester_may_see_presence() -> TestResult {
 }
 
 #[test]
+fn account_gets_can_list_live_resources() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-account-access'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    desk.send("<presence id='avail'/>")?;
+    let presence = desk.receive()?;
+    presence.assert_name("jabber:client", "presence");
+    assert_eq!(presence.attribute("id"), Some("avail"));
+    desk.send("<iq type='get' id='resources'><query xmlns='urn:lonewolf:test:access' resources='true'/></iq>")?;
+    desk.expect_xml("<iq xmlns='jabber:client' type='result' id='resources' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='owner'><resource name='desk' available='true'/><resource name='phone' available='false'/></query></iq>")?;
+    phone.close()?;
+    suite.wait_for_log("stream disconnected")?;
+    desk.send("<iq type='get' id='remaining'><query xmlns='urn:lonewolf:test:access' resources='true'/></iq>")?;
+    desk.expect_xml("<iq xmlns='jabber:client' type='result' id='remaining' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='owner'><resource name='desk' available='true'/></query></iq>")?;
+    desk.close()
+}
+
+#[test]
 fn account_gets_answer_for_missing_accounts_through_the_handler() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster', 'test-account-access'")?;
     suite.create_account("alice", PASSWORD)?;

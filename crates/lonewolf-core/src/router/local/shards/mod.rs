@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crossbeam_utils::CachePadded;
 use futures_channel::oneshot;
-use lonewolf_extension::delivery::SessionTag;
+use lonewolf_extension::delivery::{BoundResource, SessionTag};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 #[cfg(test)]
@@ -187,6 +187,16 @@ impl<A: ChunkAllocator> Clone for LocalRouterHandle<A> {
 impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     pub(in crate::router) fn allocator(&self) -> A {
         self.inner.allocator.clone()
+    }
+
+    pub(crate) async fn account_resources(
+        &self,
+        account: &AccountKey,
+    ) -> Result<Vec<BoundResource>, RouterError> {
+        self.with_shard(self.shard_index(account.as_str()), |shard| {
+            shard.account_resources(account)
+        })
+        .await
     }
 
     pub(crate) async fn resource_match(

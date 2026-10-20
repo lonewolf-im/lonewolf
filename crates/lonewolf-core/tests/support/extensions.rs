@@ -1063,7 +1063,7 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestAccountAccess {
 }
 
 impl TestAccountAccess {
-    fn reply<A: ChunkAllocator>(
+    async fn reply<A: ChunkAllocator>(
         request: IqRequest<'_, A>,
         response: &mut Arena<A>,
     ) -> Result<IqReply<A>, HandlerError> {
@@ -1073,10 +1073,45 @@ impl TestAccountAccess {
             Some(Requester::Other) => "other",
             None => "none",
         };
-        let payload = Element::builder_in("query", ACCESS_ROUTE.namespace, response)
+        let condition = StanzaErrorCondition::InternalServerError;
+        let resources = if request
+            .payload
+            .attribute("resources", "")
+            .map_err(|_| condition)?
+            == Some("true")
+        {
+            let account = AccountKey::try_from(request.target.bare()).map_err(|_| condition)?;
+            request
+                .sessions
+                .resources(&account)
+                .await
+                .map_err(|_| condition)?
+        } else {
+            Vec::new()
+        };
+        let mut children = Vec::with_capacity(resources.len());
+        for resource in resources {
+            children.push(
+                Element::builder_in("resource", ACCESS_ROUTE.namespace, response)
+                    .and_then(|builder| builder.attribute("name", "", &resource.resource))
+                    .and_then(|builder| {
+                        builder.attribute(
+                            "available",
+                            "",
+                            if resource.available { "true" } else { "false" },
+                        )
+                    })
+                    .and_then(|builder| builder.build())
+                    .map_err(|_| condition)?,
+            );
+        }
+        let mut builder = Element::builder_in("query", ACCESS_ROUTE.namespace, response)
             .and_then(|builder| builder.attribute("requester", "", requester))
-            .and_then(|builder| builder.build())
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            .map_err(|_| condition)?;
+        for child in children {
+            builder = builder.child(child).map_err(|_| condition)?;
+        }
+        let payload = builder.build().map_err(|_| condition)?;
         Ok(IqReply::new(Some(payload), Effects::none()))
     }
 }
@@ -1088,7 +1123,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestAccountAccess {
         _: &'a RedbRead,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async move { Self::reply(request, response) })
+        Box::pin(async move { Self::reply(request, response).await })
     }
 
     fn get_missing_account(
@@ -1110,7 +1145,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestAccountAccess {
         _: &'a dyn HostLookup,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async move { Self::reply(request, response) })
+        Box::pin(async move { Self::reply(request, response).await })
     }
 }
 

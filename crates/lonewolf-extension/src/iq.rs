@@ -7,7 +7,7 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, Stanza, StanzaErrorCondition};
 
-use crate::delivery::{HandlerError, HostLookup};
+use crate::delivery::{HandlerError, HostLookup, SessionLookup};
 use crate::discovery::Discovery;
 use crate::{Effects, ExtensionFuture, RegistrationError};
 
@@ -46,6 +46,8 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     /// An omitted destination resolves to the authenticated account's bare JID.
     pub target: JidRef<'a>,
     pub discovery: &'a Discovery,
+    /// Live routing state, which can change after the transaction's snapshot was taken.
+    pub sessions: &'a dyn SessionLookup,
     /// Set for account `get` requests; server targets and `set` requests use `None`.
     pub requester: Option<Requester>,
     pub payload: ElementRef<'a, Arena<A>>,

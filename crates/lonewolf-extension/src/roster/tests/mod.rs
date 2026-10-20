@@ -27,7 +27,8 @@ use lonewolf_xmpp::stanza::{
 use super::{NAMESPACE, Roster};
 use crate::account::AccountHandler;
 use crate::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
+    BoundResource, Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup,
+    SessionLookup, SessionTag, StanzaFactory,
 };
 use crate::discovery::Discovery;
 use crate::iq::{IqHandler, IqReply, IqRequest, IqRequestType, Requester};
@@ -35,11 +36,22 @@ use crate::presence::{
     PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
     PresenceTransition, PresenceUpdate,
 };
-use crate::{Effects, Extensions};
+use crate::{Effects, ExtensionFuture, Extensions};
 
 type TestIqHandler = dyn IqHandler<GlobalChunkAllocator, RedbStorage>;
 type TestPresenceHandler = dyn PresenceHandler<GlobalChunkAllocator, RedbStorage>;
 type TestAccountHandler = dyn AccountHandler<GlobalChunkAllocator, RedbStorage>;
+
+struct NoSessions;
+
+impl SessionLookup for NoSessions {
+    fn resources<'a>(
+        &'a self,
+        _: &'a AccountKey,
+    ) -> ExtensionFuture<'a, Result<Vec<BoundResource>, DeliveryError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
 
 struct TestRoster {
     storage: RedbStorage,
@@ -270,6 +282,7 @@ impl IqCall {
             sender,
             target: sender.bare(),
             discovery: &discovery,
+            sessions: &NoSessions,
             requester: (kind == IqRequestType::Get).then_some(Requester::Owner),
             payload,
         };
@@ -1747,6 +1760,7 @@ fn current_version_get_skips_legacy_metadata_and_uses_its_consistent_snapshot()
             sender,
             target: sender.bare(),
             discovery: &discovery,
+            sessions: &NoSessions,
             requester: Some(Requester::Owner),
             payload,
         };

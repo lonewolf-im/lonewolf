@@ -124,6 +124,10 @@ pub(crate) struct RouterDelivery<A: ChunkAllocator> {
 }
 
 impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
+    pub(crate) fn router(&self) -> &RouterHandle<A> {
+        &self.router
+    }
+
     pub(crate) fn new(
         router: &RouterHandle<A>,
         allocator: &A,

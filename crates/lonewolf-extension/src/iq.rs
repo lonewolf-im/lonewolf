@@ -31,12 +31,23 @@ pub struct IqRoute {
     pub name: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Requester {
+    /// The sender's bare JID is the target account.
+    Owner,
+    /// The target's host lets the sender receive the account's presence.
+    PresenceAuthorized,
+    Other,
+}
+
 pub struct IqRequest<'a, A: ChunkAllocator> {
     /// The authenticated bound JID, independent of the client's `from` attribute.
     pub sender: JidRef<'a>,
     /// An omitted destination resolves to the authenticated account's bare JID.
     pub target: JidRef<'a>,
     pub discovery: &'a Discovery,
+    /// Set for account `get` requests; server targets and `set` requests use `None`.
+    pub requester: Option<Requester>,
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
@@ -77,6 +88,16 @@ pub trait IqHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         _response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async { Err(StanzaErrorCondition::ServiceUnavailable.into()) })
+    }
+
+    /// Answers a `get` to a missing account in place of `get`.
+    /// Overrides must answer as `get` does when the account hides the requested data.
+    fn get_missing_account(
+        &self,
+        _request: IqRequest<'_, A>,
+        _response: &mut Arena<A>,
+    ) -> Result<Option<Element>, HandlerError> {
+        Err(StanzaErrorCondition::ServiceUnavailable.into())
     }
 
     /// Applies a `set` inside the transaction; the reply and the effects follow its commit.

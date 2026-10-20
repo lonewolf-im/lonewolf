@@ -4,7 +4,7 @@ use crate::support::PASSWORD;
 
 use std::time::{Duration, Instant};
 
-use crate::support::{C2sSuite, Client, TestResult};
+use crate::support::{C2sSuite, Client, TestResult, mutually_subscribe};
 
 fn requester_outcome(client: &mut Client) -> TestResult<Option<String>> {
     client.send("<iq type='get' to='localhost' id='outcome'><outcome xmlns='urn:lonewolf:test:requester'/></iq>")?;
@@ -787,4 +787,62 @@ fn ordinary_connection_panic_leaves_router_and_other_connections_serving() -> Te
         "{logs}"
     );
     suite.stop()
+}
+
+#[test]
+fn account_gets_learn_whether_the_requester_may_see_presence() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-account-access'")?;
+    for user in ["alice", "bob", "carol"] {
+        suite.create_account(user, PASSWORD)?;
+    }
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+
+    alice.send("<iq type='get' id='own'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='own' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='owner'/></iq>")?;
+    alice.send("<iq type='get' id='explicit-own' to='alice@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='explicit-own' from='alice@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='owner'/></iq>")?;
+    alice.send("<iq type='get' id='other' to='bob@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='other' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='other'/></iq>")?;
+
+    mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
+    alice.send(
+        "<iq type='get' id='bob' to='bob@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='bob' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='presence-authorized'/></iq>")?;
+    bob.send("<iq type='get' id='alice' to='alice@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='result' id='alice' from='alice@localhost' to='bob@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='presence-authorized'/></iq>")?;
+    carol.send("<iq type='get' id='carol' to='bob@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    carol.expect_xml("<iq xmlns='jabber:client' type='result' id='carol' from='bob@localhost' to='carol@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='other'/></iq>")?;
+    alice.close()?;
+    bob.close()?;
+    carol.close()
+}
+
+#[test]
+fn account_gets_answer_for_missing_accounts_through_the_handler() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'test-account-access'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<iq type='get' id='missing' to='missing@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='missing' from='missing@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' missing='true'/></iq>")?;
+    alice.send("<iq type='set' id='missing-set' to='missing@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-set' from='missing@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.send("<iq type='set' id='set'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='set' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='none'/></iq>")?;
+    alice.close()
+}
+
+#[test]
+fn without_a_presence_handler_only_the_owner_is_authorized() -> TestResult {
+    let suite = C2sSuite::with_extensions("'test-account-access'")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<iq type='get' id='own'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='own' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='owner'/></iq>")?;
+    alice.send("<iq type='get' id='other' to='bob@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='other' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='other'/></iq>")?;
+    alice.close()
 }

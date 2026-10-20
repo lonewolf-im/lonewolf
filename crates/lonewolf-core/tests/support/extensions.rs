@@ -15,7 +15,7 @@ use lonewolf_extension::delivery::{
 };
 use lonewolf_extension::discovery::{DiscoScope, Identity};
 use lonewolf_extension::iq::{
-    IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope,
+    IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope, Requester,
 };
 use lonewolf_extension::message::{MessageHandler, StoreFuture, UndeliverableMessage};
 use lonewolf_extension::observer::{
@@ -161,6 +161,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
         gets: AtomicUsize::new(0),
         sets: AtomicUsize::new(0),
     }))?;
+    extensions.register(Arc::new(TestAccountAccess))?;
     extensions.register(Arc::new(TestIqResults))?;
     extensions.register(Arc::new(TestIqRequester {
         outcome: Arc::new(PlMutex::new(None)),
@@ -1028,6 +1029,88 @@ impl<A: ChunkAllocator + 'static> IqHandler<A, RedbStorage> for TestIqRequester 
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             Ok(IqReply::new(payload, Effects::none()))
         })
+    }
+}
+
+struct TestAccountAccess;
+
+const ACCESS_ROUTE: IqRoute = IqRoute {
+    scope: IqScope::Account,
+    kind: IqRequestType::Get,
+    namespace: "urn:lonewolf:test:access",
+    name: "query",
+};
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestAccountAccess {
+    fn name(&self) -> &'static str {
+        "test-account-access"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.iq(ACCESS_ROUTE, self.clone())?;
+        slots.iq(
+            IqRoute {
+                kind: IqRequestType::Set,
+                ..ACCESS_ROUTE
+            },
+            self,
+        )
+    }
+}
+
+impl TestAccountAccess {
+    fn reply<A: ChunkAllocator>(
+        request: IqRequest<'_, A>,
+        response: &mut Arena<A>,
+    ) -> Result<IqReply<A>, HandlerError> {
+        let requester = match request.requester {
+            Some(Requester::Owner) => "owner",
+            Some(Requester::PresenceAuthorized) => "presence-authorized",
+            Some(Requester::Other) => "other",
+            None => "none",
+        };
+        let payload = Element::builder_in("query", ACCESS_ROUTE.namespace, response)
+            .and_then(|builder| builder.attribute("requester", "", requester))
+            .and_then(|builder| builder.build())
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+        Ok(IqReply::new(Some(payload), Effects::none()))
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestAccountAccess {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move { Self::reply(request, response) })
+    }
+
+    fn get_missing_account(
+        &self,
+        _: IqRequest<'_, A>,
+        response: &mut Arena<A>,
+    ) -> Result<Option<Element>, HandlerError> {
+        Element::builder_in("query", ACCESS_ROUTE.namespace, response)
+            .and_then(|builder| builder.attribute("missing", "", "true"))
+            .and_then(|builder| builder.build())
+            .map(Some)
+            .map_err(|_| StanzaErrorCondition::InternalServerError.into())
+    }
+
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn HostLookup,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move { Self::reply(request, response) })
     }
 }
 

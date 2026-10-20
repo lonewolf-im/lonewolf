@@ -441,15 +441,7 @@ fn remote_cli_rejects_wrong_ca_and_password_without_secret_echo() -> TestResult 
 #[test]
 fn operator_examples_parse_without_accessing_remote_endpoints() -> TestResult {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bench");
-    for name in [
-        "idle",
-        "messages",
-        "churn",
-        "smoke-idle",
-        "smoke-messages",
-        "smoke-churn",
-        "remote",
-    ] {
+    for name in ["idle", "messages", "churn", "remote"] {
         RunConfig::load(&root.join(format!("{name}.toml")), None)?;
     }
     Ok(())

@@ -41,30 +41,19 @@ measurement window counts toward the reported results.
 
 ## Quick start
 
-Build the server and the tool, then run the two-second message workload:
+Build the server and the tool, then run the message workload. It takes a
+little over a minute: 10 s of warmup and 60 s of measurement.
 
 ```sh
 cargo build --release -p lonewolf -p lonewolf-bench --locked
 ./target/release/lonewolf-bench run \
-  --config examples/bench/smoke-messages.toml \
+  --config examples/bench/messages.toml \
   --output /tmp/bench-messages
 cat /tmp/bench-messages/summary.md
 ```
 
 The example configurations find the server at `target/release/lonewolf`. If
 you build into another target directory, pass `--server-binary <path>`.
-
-To check the whole pipeline, run the smoke script. It runs all three
-two-second workloads and compares the message result with itself. CI runs it
-on every change. It verifies that the tool works, not that the server is
-fast.
-
-```sh
-bash scripts/benchmark-smoke.sh \
-  --server-binary "$PWD/target/release/lonewolf" \
-  --bench-binary "$PWD/target/release/lonewolf-bench" \
-  --output /tmp/bench-smoke
-```
 
 ## Running a workload
 
@@ -93,11 +82,14 @@ The server and the tool share the same machine and compete for CPU and memory.
 
 | File | Workload |
 | --- | --- |
-| `examples/bench/idle.toml` | 100 idle connections, 10 s warmup, 60 s measurement. |
+| `examples/bench/idle.toml` | 100 idle connections. |
 | `examples/bench/messages.toml` | 50 pairs, 1,000 messages/s, 256-byte bodies. |
 | `examples/bench/churn.toml` | 64 accounts, 20 login cycles/s. |
-| `examples/bench/smoke-*.toml` | Two-second versions of the above, used by CI. |
 | `examples/bench/remote.toml` | Template for a remote server. |
+
+The local examples use 10 s of warmup, 60 s of measurement and a ramp of 100
+sessions per second. Every other setting uses its default. To make a shorter
+run, copy an example and lower `warmup_ms` and `duration_ms`.
 
 Press Ctrl-C to stop a run early. The tool stops sending, closes its sessions,
 stops the local server, writes what it has and exits with code 130.
@@ -151,7 +143,7 @@ The examples override several of these defaults.
 | `operation_timeout_ms` | `10000` | Time an operation has, counted from its scheduled slot, before it times out. |
 | `setup_timeout_ms` | `900000` | Time allowed for everything before warmup: starting the server, creating accounts and connecting. |
 | `shutdown_timeout_ms` | `10000` | Time allowed for closing sessions and stopping the server. |
-| `ramp_rate_per_second` | `10` | Highest rate of new sessions while connecting before warmup. |
+| `ramp_rate_per_second` | `10` | Highest rate of new sessions while connecting before warmup. The server's default policy allows 10 new connections per second from one address, so raise this for a remote server only when its policy allows more. |
 | `connect_concurrency` | `16` | Connection attempts in flight while connecting. |
 | `driver_workers` | `2` | Threads that drive the workload. |
 | `max_in_flight` | `4096` | Operations allowed to wait for completion at once. |

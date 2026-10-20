@@ -48,3 +48,14 @@ pub fn mutually_subscribe(
     ))?;
     barrier(left)
 }
+
+pub fn toggle(client: &mut Client, enabled: bool) -> TestResult {
+    client.send(&format!("<iq type='set' to='localhost' id='toggle'><toggle xmlns='urn:lonewolf:test:policy' enabled='{enabled}'/></iq>"))?;
+    let reply = client.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("type"), Some("result"), "{reply:?}");
+    assert_eq!(reply.attribute("id"), Some("toggle"), "{reply:?}");
+    assert_eq!(reply.attribute("from"), Some("localhost"), "{reply:?}");
+    assert!(reply.children.is_empty(), "{reply:?}");
+    Ok(())
+}

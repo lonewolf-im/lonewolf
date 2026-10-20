@@ -13,7 +13,9 @@ use lonewolf_extension::delivery::{
     Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError, HostLookup,
     SessionTag,
 };
-use lonewolf_extension::discovery::{DiscoScope, Identity};
+use lonewolf_extension::discovery::{
+    DiscoScope, INFO_NAMESPACE, Identity, Query, QueryKind, info_in,
+};
 use lonewolf_extension::iq::{
     IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope, Requester,
 };
@@ -229,20 +231,40 @@ impl<A: ChunkAllocator> ServiceHandler<A, RedbStorage> for TestService {
             let result = async {
                 match view.stanza_type() {
                     StanzaType::Iq(IqType::Get) => {
-                        let query = view.children()?.next().transpose()?;
-                        if query.is_none_or(|query| {
-                            query.name() != "query" || query.namespace() != SERVICE_NAMESPACE
-                        }) {
+                        let Some(query) = view.children()?.next().transpose()? else {
                             return Ok(());
-                        }
-                        let count = self.joined.lock().len().to_string();
+                        };
                         let mut arena = context.outbound.arena()?;
-                        let count = Element::builder_in("count", SERVICE_NAMESPACE, &mut arena)?
-                            .text(&count)?
-                            .build()?;
-                        let payload = Element::builder_in("query", SERVICE_NAMESPACE, &mut arena)?
-                            .child(count)?
-                            .build()?;
+                        let payload =
+                            if query.name() == "query" && query.namespace() == SERVICE_NAMESPACE {
+                                let count = self.joined.lock().len().to_string();
+                                let count =
+                                    Element::builder_in("count", SERVICE_NAMESPACE, &mut arena)?
+                                        .text(&count)?
+                                        .build()?;
+                                Element::builder_in("query", SERVICE_NAMESPACE, &mut arena)?
+                                    .child(count)?
+                                    .build()?
+                            } else if matches!(
+                                Query::parse(query)?,
+                                Some(Query {
+                                    kind: QueryKind::Info,
+                                    node: None,
+                                })
+                            ) {
+                                info_in(
+                                    None,
+                                    &[Identity {
+                                        category: "component",
+                                        kind: "generic",
+                                        name: Some("Echo"),
+                                    }],
+                                    &[INFO_NAMESPACE],
+                                    &mut arena,
+                                )?
+                            } else {
+                                return Ok(());
+                            };
                         let request = view.to_builder_in(&mut arena)?.build()?;
                         let reply = request.reply_in(&mut arena)?.child(payload)?.build()?;
                         context

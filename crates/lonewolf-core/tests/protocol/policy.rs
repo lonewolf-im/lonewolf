@@ -2,7 +2,7 @@
 
 use crate::support::PASSWORD;
 
-use super::support::{C2sSuite, Client, TestResult, barrier, mutually_subscribe};
+use super::support::{C2sSuite, TestResult, barrier, mutually_subscribe, toggle};
 
 #[test]
 fn outbound_rejection_carries_the_application_condition() -> TestResult {
@@ -141,17 +141,6 @@ fn stanzas_from_services_follow_inbound_policy() -> TestResult {
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
     alice.close()?;
     bob.close()
-}
-
-fn toggle(client: &mut Client, enabled: bool) -> TestResult {
-    client.send(&format!("<iq type='set' to='localhost' id='toggle'><toggle xmlns='urn:lonewolf:test:policy' enabled='{enabled}'/></iq>"))?;
-    let reply = client.receive()?;
-    reply.assert_name("jabber:client", "iq");
-    assert_eq!(reply.attribute("type"), Some("result"), "{reply:?}");
-    assert_eq!(reply.attribute("id"), Some("toggle"), "{reply:?}");
-    assert_eq!(reply.attribute("from"), Some("localhost"), "{reply:?}");
-    assert!(reply.children.is_empty(), "{reply:?}");
-    Ok(())
 }
 
 #[test]

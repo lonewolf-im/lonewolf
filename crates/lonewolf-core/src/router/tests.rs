@@ -1531,9 +1531,19 @@ fn retirement_transfers_grants_once_and_stale_handles_cannot_change_replacement(
             .await?;
         let old = desk.handle();
         directed_grant(&desk, "bob@localhost/desk", true).await?;
+        let mut cancelled = Box::pin(desk.wait_retired());
+        let mut first_wait = Box::pin(desk.wait_retired());
+        let mut second_wait = Box::pin(desk.wait_retired());
+        for waiter in [&mut cancelled, &mut first_wait, &mut second_wait] {
+            assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        }
+        drop(cancelled);
         handle.retire_account(&alice).await?;
-        let first = desk.wait_retired().await?;
-        let second = first.clone();
+        let (first, second) = futures_util::future::join(first_wait, second_wait).await;
+        let first = first?;
+        let second = second?;
+        let replay = desk.wait_retired().await?;
+        assert_eq!(first.cause, replay.cause);
         assert_eq!(first.cause, second.cause);
         let owned = old.end_presence().await?;
         assert_eq!(owned.directed.recipients.len(), 1);

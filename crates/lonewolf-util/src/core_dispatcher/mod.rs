@@ -24,6 +24,8 @@ use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, poll_fn, select};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
+use crate::wake_driven::WakeDriven;
+
 thread_local! {
     static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
 }
@@ -86,7 +88,7 @@ impl WorkerContext {
     ///
     /// Repeated calls return the same deadline, which may already have passed.
     pub async fn shutdown_requested(&self) -> Instant {
-        self.stop.clone().await
+        WakeDriven::new(self.stop.clone()).await
     }
 }
 
@@ -325,7 +327,7 @@ async fn run_worker(context: WorkerContext, jobs: Inbox) -> io::Result<()> {
     let mut tasks = FuturesUnordered::new();
     let mut panicked = false;
     let deadline = {
-        let mut stop = pin!(context.stop.clone());
+        let mut stop = pin!(WakeDriven::new(context.stop.clone()));
         loop {
             let event = {
                 let progress = async {

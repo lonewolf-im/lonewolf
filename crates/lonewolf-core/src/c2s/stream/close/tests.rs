@@ -382,7 +382,9 @@ fn shutdown_shortens_a_close_already_waiting_on_its_original_deadline() -> TestR
             phase_deadline: None,
         };
         let mut close = Box::pin(context.until(context.deadline(), std::future::pending::<()>()));
-        assert!(poll!(close.as_mut()).is_pending());
+        for _ in 0..100 {
+            assert!(poll!(close.as_mut()).is_pending());
+        }
         let deadline = Instant::now() + Duration::from_millis(100);
         stop.send(deadline).map_err(|_| "close stopped listening")?;
         assert!(
@@ -404,23 +406,25 @@ fn elapsed_close_budgets_preserve_the_phase_timeout_without_polling_network_work
     use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
 
     Runtime::new()?.block_on(async {
-        for expired_shutdown in [false, true] {
+        for shutdown_case in 0..3 {
             let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
             let mut peer = StdTcpStream::connect(listener.local_addr()?)?;
             peer.set_read_timeout(Some(Duration::from_secs(1)))?;
             let (socket, _) = listener.accept().await?;
             let expired = Instant::now();
-            let shutdown = if expired_shutdown {
-                std::future::ready(expired).boxed_local().shared()
-            } else {
-                std::future::pending::<Instant>().boxed_local().shared()
+            let shutdown = match shutdown_case {
+                0 => std::future::pending::<Instant>().boxed_local().shared(),
+                1 => std::future::ready(expired).boxed_local().shared(),
+                _ => std::future::ready(expired + Duration::from_secs(1))
+                    .boxed_local()
+                    .shared(),
             };
             let context = CloseContext {
                 socket,
                 shutdown,
                 phase_deadline: Some(expired - CLOSE_TIMEOUT),
             };
-            let deadline = if expired_shutdown {
+            let deadline = if shutdown_case == 1 {
                 expired + Duration::from_secs(1)
             } else {
                 context.deadline_for(CloseOutcome::AuthenticationTimeout)
@@ -937,6 +941,37 @@ fn failed_plaintext_footer_flush_never_polls_input() -> TestResult {
         );
         assert_eq!(reads.get(), 0);
         assert_eq!(parser_polls.get(), 0);
+        listener.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn shutdown_interrupts_after_repeated_pending_polls() -> TestResult {
+    use futures_util::FutureExt as _;
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
+
+    Runtime::new()?.block_on(async {
+        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let _peer = StdTcpStream::connect(listener.local_addr()?)?;
+        let (socket, _) = listener.accept().await?;
+        let (stop, stopped) = futures_channel::oneshot::channel();
+        let context = CloseContext {
+            socket,
+            shutdown: async move { stopped.await.unwrap_or_else(|_| Instant::now()) }
+                .boxed_local()
+                .shared(),
+            phase_deadline: None,
+        };
+        let mut interrupt =
+            Box::pin(context.interrupt(std::future::pending::<Result<(), CloseOutcome>>()));
+        for _ in 0..100 {
+            assert!(poll!(interrupt.as_mut()).is_pending());
+        }
+        stop.send(Instant::now())
+            .map_err(|_| "interrupt stopped listening")?;
+        assert_eq!(interrupt.await, Err(CloseOutcome::SystemShutdown));
+        context.abort();
         listener.close().await?;
         Ok(())
     })

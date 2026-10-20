@@ -34,6 +34,7 @@ use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
+use lonewolf_util::wake_driven::WakeDriven;
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
@@ -219,7 +220,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     } = bound;
     let (link, incoming, transport_link) = link::link();
     let watch = link.watch();
-    let shutdown = close.shutdown.clone();
+    let shutdown = WakeDriven::new(close.shutdown.clone());
     let mut transport = Transport {
         reader,
         writer,

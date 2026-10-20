@@ -16,6 +16,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_util::wake_driven::WakeDriven;
 use lonewolf_xmpp::jid::{JidError, JidRef};
 use parking_lot::Mutex as PlMutex;
 
@@ -134,7 +135,7 @@ impl<A: ChunkAllocator> Registration<A> {
     pub(crate) fn wait_retired(
         &self,
     ) -> impl Future<Output = Result<Retired<A>, RouterError>> + use<A> {
-        let retired = self.links.retired.clone();
+        let retired = WakeDriven::new(self.links.retired.clone());
         async move { retired.await.map_err(|_| RouterError::Stopped) }
     }
 

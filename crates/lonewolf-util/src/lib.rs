@@ -9,6 +9,7 @@ pub mod core_dispatcher;
 pub mod pool;
 pub mod rate_limited_reader;
 pub mod token_bucket;
+pub mod wake_driven;
 
 #[cfg(test)]
 mod test_allocator;

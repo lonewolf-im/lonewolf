@@ -409,3 +409,33 @@ fn absolute_shutdown_deadline_is_forwarded_without_a_new_grace_period() -> TestR
         Ok(())
     })
 }
+
+#[test]
+fn concurrent_shutdown_waiters_and_repeated_calls_share_the_exact_deadline() -> TestResult {
+    run_test(async {
+        let dispatcher = dispatcher()?;
+        let (started, running) = oneshot::channel();
+        let task = dispatcher
+            .handle()
+            .dispatch_at(0, move |context| async move {
+                let mut cancelled = Box::pin(context.shutdown_requested());
+                assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+                drop(cancelled);
+                let mut first = Box::pin(context.shutdown_requested());
+                let mut second = Box::pin(context.shutdown_requested());
+                for _ in 0..100 {
+                    assert!(futures_util::poll!(first.as_mut()).is_pending());
+                    assert!(futures_util::poll!(second.as_mut()).is_pending());
+                }
+                let _ = started.send(());
+                let (first, second) = futures_util::future::join(first, second).await;
+                (first, second, context.shutdown_requested().await)
+            })
+            .await?;
+        running.await?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        dispatcher.shutdown_at(deadline).await?;
+        assert_eq!(task.await?, (deadline, deadline, deadline));
+        Ok(())
+    })
+}

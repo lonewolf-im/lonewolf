@@ -12,6 +12,7 @@ use compio::net::TcpStream;
 use futures_util::future::{Either, LocalBoxFuture, Shared, select};
 use futures_util::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::wake_driven::WakeDriven;
 use lonewolf_xmpp::parser::StreamEvent;
 use socket2::SockRef;
 use tokio::io::AsyncBufRead;
@@ -90,7 +91,7 @@ impl CloseContext {
         &self,
         future: impl Future<Output = Result<T, CloseOutcome>>,
     ) -> Result<T, CloseOutcome> {
-        match select(pin!(self.shutdown.clone()), pin!(future)).await {
+        match select(pin!(WakeDriven::new(self.shutdown.clone())), pin!(future)).await {
             Either::Left(_) => Err(CloseOutcome::SystemShutdown),
             Either::Right((result, _)) => result,
         }
@@ -104,7 +105,7 @@ impl CloseContext {
         let mut future = pin!(future);
         let first = {
             let wait = pin!(before_deadline(deadline, future.as_mut()));
-            match select(pin!(self.shutdown.clone()), wait).await {
+            match select(pin!(WakeDriven::new(self.shutdown.clone())), wait).await {
                 Either::Right((result, _)) => Either::Right(result),
                 Either::Left((shutdown, _)) => Either::Left(shutdown),
             }

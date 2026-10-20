@@ -2763,3 +2763,32 @@ fn iq_account_guard_reads_deletion_and_rollback_from_its_write_transaction() -> 
         fixture.finish().await
     })
 }
+
+#[test]
+fn retirement_precedes_simultaneous_shutdown_and_session_completion() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for initially_pending in [false, true] {
+            let fixture = Fixture::new(&[MESSAGE]).await?;
+            let (stop, stopped) = oneshot::channel();
+            let shutdown = async move { stopped.await.unwrap() }.boxed_local().shared();
+            let (finish, finished) = oneshot::channel::<()>();
+            let session = async move { finished.await.unwrap() };
+            let retired = fixture.registration.wait_retired();
+            let mut selected = Box::pin(select(
+                Box::pin(retired),
+                Box::pin(select(WakeDriven::new(shutdown), Box::pin(session))),
+            ));
+            if initially_pending {
+                for _ in 0..100 {
+                    assert!(poll!(selected.as_mut()).is_pending());
+                }
+            }
+            fixture.router.handle().retire_account(fixture.registration.account()).await?;
+            stop.send(std::time::Instant::now()).map_err(|_| "shutdown waiter dropped")?;
+            finish.send(()).map_err(|_| "session waiter dropped")?;
+            assert!(matches!(selected.await, Either::Left((Ok(retired), _)) if retired.cause == RetireCause::AccountDeleted));
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
+}

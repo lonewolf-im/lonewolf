@@ -19,6 +19,7 @@ use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
+use lonewolf_util::wake_driven::WakeDriven;
 use nix::errno::Errno;
 use prometheus_client::registry::Registry;
 use socket2::SockRef;
@@ -379,13 +380,18 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         "c2s TCP worker listener started"
     );
     let shutdown = async move {
-        match select(pin!(context.shutdown_requested()), pin!(stop)).await {
+        match select(
+            pin!(context.shutdown_requested()),
+            pin!(WakeDriven::new(stop)),
+        )
+        .await
+        {
             Either::Left((deadline, _)) | Either::Right((deadline, _)) => deadline,
         }
     }
     .boxed_local()
     .shared();
-    let mut shutdown_wait = Box::pin(shutdown.clone());
+    let mut shutdown_wait = Box::pin(WakeDriven::new(shutdown.clone()));
     let mut active = FuturesUnordered::new();
     let mut accept = Box::pin(listener.accept());
     let result = loop {

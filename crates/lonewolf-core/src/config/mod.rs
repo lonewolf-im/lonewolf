@@ -225,6 +225,7 @@ impl Default for HostConfig {
             extensions: vec![
                 lonewolf_extension::roster::NAME.into(),
                 lonewolf_extension::offline::NAME.into(),
+                lonewolf_extension::disco::NAME.into(),
             ],
             options: BTreeMap::new(),
         }

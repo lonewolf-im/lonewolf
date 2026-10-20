@@ -5,6 +5,18 @@ use lonewolf_extension::discovery::{INFO_NAMESPACE, ITEMS_NAMESPACE};
 use crate::support::{C2sSuite, PASSWORD, TestResult, mutually_subscribe};
 
 #[test]
+fn default_hosts_answer_discovery() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<iq type='get' to='localhost' id='host-info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='host-info' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:roster'/><feature var='msgoffline'/></query></iq>")?;
+    alice.send("<iq type='get' to='alice@localhost' id='account-info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='account-info' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/></query></iq>")?;
+    alice.close()
+}
+
+#[test]
 fn host_info_lists_the_server_identity_and_disco_features() -> TestResult {
     let suite = C2sSuite::with_extensions("'disco'")?;
     suite.create_account("alice", PASSWORD)?;

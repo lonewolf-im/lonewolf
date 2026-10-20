@@ -30,17 +30,20 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
 }
 
 #[test]
-fn host_extensions_default_to_roster_and_offline() -> TestResult {
-    assert_eq!(HostConfig::default().extensions, ["roster", "offline"]);
+fn host_extensions_default_to_roster_offline_and_disco() -> TestResult {
+    assert_eq!(
+        HostConfig::default().extensions,
+        ["roster", "offline", "disco"]
+    );
     assert_eq!(
         Config::default().hosts["localhost"].extensions,
-        ["roster", "offline"]
+        ["roster", "offline", "disco"]
     );
     for contents in ["", "[hosts.localhost]"] {
         let file = config_file(contents)?;
         assert_eq!(
             Config::load(Some(file.path()))?.hosts["localhost"].extensions,
-            ["roster", "offline"]
+            ["roster", "offline", "disco"]
         );
     }
     Ok(())
@@ -64,19 +67,22 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
 }
 
 #[test]
-fn no_configuration_file_enables_roster_and_offline() -> TestResult {
+fn no_configuration_file_enables_default_extensions() -> TestResult {
     const CHILD: &str = "LONEWOLF_CONFIG_DEFAULTS_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
         assert!(!Path::new(super::DEFAULT_CONFIG_PATH).exists());
         let config = Config::load(None)?;
         assert_eq!(config, Config::default());
-        assert_eq!(config.hosts["localhost"].extensions, ["roster", "offline"]);
+        assert_eq!(
+            config.hosts["localhost"].extensions,
+            ["roster", "offline", "disco"]
+        );
     } else {
         let directory = tempfile::tempdir()?;
         let output = Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
-                "config::tests::no_configuration_file_enables_roster_and_offline",
+                "config::tests::no_configuration_file_enables_default_extensions",
             ])
             .env(CHILD, "1")
             .current_dir(directory.path())
@@ -721,7 +727,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     expected.hosts.insert(
         "example.com".into(),
         HostConfig {
-            extensions: vec!["roster".into(), "offline".into()],
+            extensions: vec!["roster".into(), "offline".into(), "disco".into()],
             options: BTreeMap::from([
                 (
                     "roster".into(),

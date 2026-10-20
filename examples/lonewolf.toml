@@ -25,13 +25,13 @@
 
 # Choose extensions included in the server build for this host.
 # This list replaces the default, including when it is empty.
-# extensions = ["roster", "offline"]
+# extensions = ["roster", "offline", "disco"]
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
 # [hosts."example.com"]
 
-# extensions = ["roster", "offline"]
+# extensions = ["roster", "offline", "disco"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.
 # Keep roster in this host's extension list when configuring these limits.

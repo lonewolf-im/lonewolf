@@ -15,8 +15,6 @@ fn report() -> TelemetryReport {
         samples_failed: 0,
         missed_ticks: 0,
         queue_overflows: 0,
-        bytes: 0,
-        total_scrape_duration_ms: 0,
         server: ResourceSummary::default(),
         generator: ResourceSummary::default(),
         policy_rejections: Default::default(),
@@ -189,7 +187,6 @@ async fn nonblocking_control_overflow_and_server_failure_keep_generator_samples(
             timing: MetricsConfig::default(),
         },
         Instant::now(),
-        allocate_buffer()?,
     )?;
     for _ in 0..CONTROL_CAPACITY {
         sampler
@@ -218,17 +215,8 @@ async fn nonblocking_control_overflow_and_server_failure_keep_generator_samples(
     assert_eq!(report.quality, TelemetryStatus::Partial);
     assert_eq!(report.queue_overflows, 1);
     assert!(report.samples_ok > 0 && report.samples_failed > 0);
-    assert_eq!(raw.capacity(), RAW_CAPACITY);
     assert!(std::str::from_utf8(&raw)?.contains("process_cpu_seconds_total"));
-    assert_eq!(
-        crate::measurement::MeasurementResult {
-            counters: CounterReport::default(),
-            latencies: Default::default(),
-            reasons: report.reasons
-        }
-        .status(),
-        RunStatus::Passed
-    );
+    assert_eq!(crate::report::status_of(&report.reasons), RunStatus::Passed);
     Ok(())
 }
 
@@ -361,42 +349,5 @@ fn connection_gauge_sums_distinct_listeners_and_rejects_whole_invalid_aggregates
         assert_eq!(snapshot.connections, None);
         assert!(snapshot.invalid_samples);
     }
-    Ok(())
-}
-
-#[test]
-fn compare_instrumentation_policy_v1_matches_all_collector_limits() {
-    for enabled in [false, true] {
-        let metadata = instrumentation_metadata(enabled);
-        assert_eq!(
-            metadata,
-            InstrumentationMetadata {
-                policy_version: 1,
-                server_metrics_enabled: enabled,
-                generator_metrics_enabled: true,
-                raw_capacity_bytes: 67_108_864,
-                control_capacity: 8,
-                response_body_limit_bytes: 1_048_576,
-                result_limit_bytes: 33_554_432
-            }
-        );
-        assert_eq!(metadata.raw_capacity_bytes, RAW_CAPACITY as u64);
-        assert_eq!(metadata.control_capacity, CONTROL_CAPACITY as u64);
-        assert_eq!(metadata.response_body_limit_bytes, BODY_CAPACITY as u64);
-        assert_eq!(
-            metadata.result_limit_bytes,
-            crate::report::artifacts::RESULT_LIMIT as u64
-        );
-    }
-}
-
-#[test]
-fn compare_instrumentation_body_limit_matches_parser_boundary() -> TestResult {
-    let limit = instrumentation_metadata(true).response_body_limit_bytes as usize;
-    let mut body = format!("#{}\n# EOF\n", "x".repeat(limit - 8));
-    assert_eq!(body.len(), limit);
-    parse_snapshot(&body)?;
-    body.push('\n');
-    assert!(parse_snapshot(&body).is_err());
     Ok(())
 }

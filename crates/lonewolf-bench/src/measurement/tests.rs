@@ -443,7 +443,7 @@ fn retained_expiry_and_send_failure_are_bounded_by_cap() {
     assert_eq!(result.counters.skipped_in_flight, 998);
     assert_eq!(result.counters.unreceived_send_failed, 2);
     assert_eq!(result.counters.peak_in_flight, 2);
-    assert_eq!(result.status(), RunStatus::Failed);
+    assert_eq!(result.status(), RunStatus::Degraded);
     assert!(std::mem::size_of::<super::LedgerEntry>() <= 4);
 }
 
@@ -588,11 +588,34 @@ fn finalization_requires_correct_barrier_and_complete_cohort() {
     receipt(&mut warmup, id, at + ms(1));
     let result = finish(warmup);
     assert_eq!(result.counters.received_on_time, 1);
+    assert_eq!(result.status(), RunStatus::Passed);
+}
+
+#[test]
+fn settled_phase_finalizes_expired_operations_as_degraded_timeouts() {
+    let mut ledger = ledger(2, 2);
+    let at = ledger_context_start(&ledger);
+    let delivered = admit(&mut ledger, 0);
+    started(&mut ledger, delivered, at);
+    completed(&mut ledger, delivered, at, true);
+    receipt(&mut ledger, delivered, at + ms(1));
+    let lost = admit(&mut ledger, 1);
+    started(&mut ledger, lost, at);
+    completed(&mut ledger, lost, at, true);
+    ledger.expire_through(at + ms(100)).unwrap();
+    let result = ledger.finish(FinishReason {
+        termination: Termination::Completed,
+        barrier: PhaseBarrier::Settled,
+    });
+    reconcile(&result.counters);
+    assert_eq!(result.counters.received_on_time, 1);
+    assert_eq!(result.counters.unreceived_timeout, 1);
+    assert_eq!(result.status(), RunStatus::Degraded);
     assert!(
         result
             .reasons
             .iter()
-            .any(|r| r.code == ReasonCode::WarmupObservationLag)
+            .any(|r| r.code == ReasonCode::OperationsFailed)
     );
 }
 
@@ -866,12 +889,6 @@ fn healthy_warmup_settles_without_retiring_sessions() {
         barrier: PhaseBarrier::Settled,
     });
     assert_eq!(result.status(), RunStatus::Passed);
-    assert!(
-        !result
-            .reasons
-            .iter()
-            .any(|r| r.code == ReasonCode::WarmupObservationLag)
-    );
 }
 
 #[test]
@@ -1275,7 +1292,7 @@ fn invalid_barrier_returns_known_evidence_without_finalizing_active_work() {
     started(&mut ledger, first, at);
     completed(&mut ledger, first, at + ms(2), true);
     receipt(&mut ledger, first, at + ms(1));
-    ledger.expire_through(at + ms(20)).unwrap();
+    ledger.expire_through(at + ms(5)).unwrap();
     let result = ledger.finish(FinishReason {
         termination: Termination::Cancelled,
         barrier: PhaseBarrier::Settled,

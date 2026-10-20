@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::{
-    client::ConnectTimings, config::ScenarioConfig, report::LatencyKind, run::tests::context,
+    client::ConnectTimings,
+    config::ScenarioConfig,
+    report::{LatencyKind, RunStatus},
+    run::tests::context,
 };
 use std::sync::Mutex;
 
@@ -37,7 +40,6 @@ fn phase(start: Instant, end: Instant, planned: u64) -> BenchResult<ChurnPhase> 
         phase: TrafficPhase::Measurement,
         reasons: Vec::new(),
         errors: BTreeMap::new(),
-        failed: false,
         end,
         connected_at_end: 0,
     })
@@ -140,7 +142,7 @@ fn bind_window_and_drain_use_source_time_even_when_close_fails() -> TestResult {
         ),
         (Some(100.0), Some(200.0), Some(100.0))
     );
-    assert_eq!(result.status(), RunStatus::Failed);
+    assert_eq!(result.status(), RunStatus::Degraded);
     Ok(())
 }
 
@@ -247,14 +249,14 @@ fn stage_failures_deadlines_and_unpolled_cancellation_reconcile_without_latency_
                 !result
                     .reasons
                     .iter()
-                    .any(|reason| reason.code == ReasonCode::SchedulerMiss)
+                    .any(|reason| reason.code == ReasonCode::DriverLimited)
             );
         } else if kind == ConnectFailureKind::Deadline {
             assert!(
                 result
                     .reasons
                     .iter()
-                    .any(|reason| reason.code == ReasonCode::SchedulerMiss)
+                    .any(|reason| reason.code == ReasonCode::DriverLimited)
             );
             assert!(
                 !result
@@ -265,10 +267,10 @@ fn stage_failures_deadlines_and_unpolled_cancellation_reconcile_without_latency_
         }
         assert_eq!(
             result.status(),
-            if kind == ConnectFailureKind::Cancelled {
-                RunStatus::Interrupted
-            } else {
+            if kind == ConnectFailureKind::Error {
                 RunStatus::Invalid
+            } else {
+                RunStatus::Interrupted
             }
         );
     }
@@ -379,8 +381,12 @@ async fn synthetic_phase(
         result.counters.planned,
         result.counters.dispatched
             + result.counters.skipped_account_busy
+            + result.counters.skipped_disconnected
             + result.counters.skipped_in_flight
     );
+    if fail_close {
+        assert!(result.counters.skipped_disconnected > 0);
+    }
     assert_eq!(
         result.counters.connection_attempts,
         result.counters.login_succeeded + result.counters.login_failed
@@ -398,7 +404,7 @@ async fn synthetic_phase(
         let sequence: usize = name.rsplit('-').next().ok_or("sequence")?.parse()?;
         assert_eq!(*index as usize, sequence % count);
     }
-    if count == 1 {
+    if count == 1 && !fail_close {
         assert!(result.counters.skipped_account_busy > 0);
     }
     if concurrency < count {
@@ -475,7 +481,6 @@ async fn prime_is_once_per_account_closed_and_untimed_and_failure_stops() -> Tes
         let mut launch = fake_launch(trace.clone(), Duration::from_millis(1), fail);
         let result = prime_with(&mut context, &mut pool, &mut launch).await;
         assert_eq!(result.is_err(), fail);
-        assert_eq!(context.report.target.cache_primed, !fail);
         assert!(context.measurement_window.is_none());
         assert!(context.report.latencies.is_empty());
         assert_eq!(pool.into_accounts().len(), 3);
@@ -643,7 +648,7 @@ fn changed_parameters_invalidate_and_uncertain_close_retires_account_with_owned_
         phase
             .finish(Termination::Completed, PhaseBarrier::Settled)
             .status(),
-        RunStatus::Failed
+        RunStatus::Degraded
     );
     let mut phase = self::phase(start, start + Duration::from_secs(1), 1)?;
     admit(&mut phase, start, 0)?;
@@ -723,14 +728,7 @@ async fn admitted_unpolled_cycle_cancellation_and_expiry_return_account_without_
             ),
             (1, 1, 1)
         );
-        assert_eq!(
-            result.status(),
-            if cancelled {
-                RunStatus::Interrupted
-            } else {
-                RunStatus::Invalid
-            }
-        );
+        assert_eq!(result.status(), RunStatus::Interrupted);
         drop(stop);
     }
     Ok(())
@@ -785,10 +783,13 @@ async fn cancelled_warmup_after_last_natural_close_remains_interrupted_with_sett
         (0, 0, 0)
     );
     assert_eq!(c.login_in_window + c.login_during_drain, c.login_succeeded);
-    assert!(!context.report.reasons.iter().any(|reason| matches!(
-        reason.code,
-        ReasonCode::WarmupObservationLag | ReasonCode::AccountingError
-    )));
+    assert!(
+        !context
+            .report
+            .reasons
+            .iter()
+            .any(|reason| reason.code == ReasonCode::AccountingError)
+    );
     assert!(
         context
             .report

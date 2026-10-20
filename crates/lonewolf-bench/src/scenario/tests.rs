@@ -10,25 +10,6 @@ use tokio::time::Instant;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-#[test]
-fn all_scenarios_are_supported() -> TestResult {
-    for scenario in [
-        ScenarioConfig::Idle { connections: 1 },
-        ScenarioConfig::Messages {
-            pairs: 1,
-            rate_per_second: 1,
-            body_bytes: 1,
-        },
-        ScenarioConfig::Churn {
-            accounts: 1,
-            rate_per_second: 1,
-        },
-    ] {
-        validate_supported(&scenario)?;
-    }
-    Ok(())
-}
-
 #[tokio::test(start_paused = true)]
 async fn all_connected_barrier_prevents_silent_empty_or_reduced_runs() -> TestResult {
     let (mut context, _signal) = context(2)?;
@@ -65,8 +46,8 @@ async fn idle_plateau_has_fixed_duration_no_writes_and_no_reconnections_after_di
     assert_eq!(result.counters.connection_attempts, 0);
     assert_eq!(result.counters.dispatched, 0);
     assert!(result.latencies.is_empty());
-    assert_eq!(context.report.status, RunStatus::Failed);
-    assert_eq!(result.status(), RunStatus::Failed);
+    assert_eq!(context.report.status, RunStatus::Degraded);
+    assert_eq!(result.status(), RunStatus::Degraded);
     let phase = context
         .report
         .phases

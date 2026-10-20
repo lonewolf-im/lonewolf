@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{MeasurementConfig, MetricsConfig, RunConfig, ScenarioConfig, TargetConfig};
+use crate::{
+    config::RunConfig,
+    error::{BenchError, BenchResult, ErrorCode},
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, io::Read, path::Path};
 
-mod reader;
+pub mod artifacts;
+pub mod metadata;
+pub mod summary;
+
+pub const RESULT_FILE: &str = "result.json";
+const RESULT_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Passed,
+    Degraded,
     Failed,
     Interrupted,
     Invalid,
@@ -20,11 +29,25 @@ impl RunStatus {
             Self::Passed => 0,
             Self::Failed => 1,
             Self::Invalid => 2,
+            Self::Degraded => 3,
             Self::Interrupted => 130,
         }
     }
     pub fn combine(self, other: Self) -> Self {
         self.max(other)
+    }
+    /// True when the measurement window completed and its numbers can be read.
+    pub fn measured(self) -> bool {
+        matches!(self, Self::Passed | Self::Degraded)
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Degraded => "degraded",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Invalid => "invalid",
+        }
     }
 }
 
@@ -42,24 +65,18 @@ pub enum PhaseName {
     Preflight,
     TargetSetup,
     AccountPrimingConnections,
+    Warmup,
     WarmupDrain,
+    Measurement,
     MeasurementDrain,
     ConnectionShutdown,
     LocalChildShutdown,
     ArtifactFinalization,
-    Setup,
-    Ramp,
-    Warmup,
-    Measurement,
-    DispatchTail,
-    Drain,
-    Shutdown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseStatus {
-    Pending,
     Running,
     Completed,
     Truncated,
@@ -72,21 +89,6 @@ pub enum PhaseStatus {
 pub enum TargetMode {
     Local,
     Remote,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkPath {
-    Loopback,
-    PrivateLan,
-    Internet,
-    Tunnel,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Microseconds {
-    Microseconds,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -122,27 +124,67 @@ pub enum LatencyKind {
     Close,
 }
 
+impl LatencyKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DispatchSchedulingLag => "Dispatch lag",
+            Self::SchedulingLag => "Start lag",
+            Self::MessageScheduleToReceive => "Schedule to receive",
+            Self::MessageWriteStartToReceive => "Write to receive",
+            Self::MessageWriteDuration => "Write duration",
+            Self::LoginScheduleToBound => "Schedule to bound",
+            Self::LoginConnectToBound => "Connect to bound",
+            Self::TcpConnect => "TCP connect",
+            Self::Starttls => "STARTTLS",
+            Self::Authenticate => "Authenticate",
+            Self::Bind => "Bind",
+            Self::Close => "Close",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
     InvalidConfig,
-    TargetFailure,
     SetupFailure,
+    TargetFailure,
     WorkloadFailure,
-    ConfiguredCapacity,
-    SchedulerMiss,
+    DriverLimited,
+    OperationsFailed,
+    Interrupted,
     EventOverflow,
     AccountingError,
+    HistogramError,
     ServerRestarted,
     ArtifactFailure,
-    Interrupted,
-    WarmupObservationLag,
-    HistogramError,
-    OutputLimit,
     TelemetryUnavailable,
     TelemetryPartial,
-    UnknownServerBuild,
-    ToolchainDifference,
+}
+
+impl ReasonCode {
+    pub const fn status(self) -> RunStatus {
+        match self {
+            Self::InvalidConfig
+            | Self::EventOverflow
+            | Self::AccountingError
+            | Self::HistogramError
+            | Self::ServerRestarted => RunStatus::Invalid,
+            Self::Interrupted => RunStatus::Interrupted,
+            Self::SetupFailure
+            | Self::TargetFailure
+            | Self::WorkloadFailure
+            | Self::ArtifactFailure => RunStatus::Failed,
+            Self::DriverLimited | Self::OperationsFailed => RunStatus::Degraded,
+            Self::TelemetryUnavailable | Self::TelemetryPartial => RunStatus::Passed,
+        }
+    }
+}
+
+pub fn status_of(reasons: &[RunReason]) -> RunStatus {
+    reasons.iter().fold(RunStatus::Passed, |status, reason| {
+        status.combine(reason.code.status())
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -155,82 +197,33 @@ pub struct RunReason {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunReport {
-    #[serde(with = "version_one")]
-    pub schema_version: u32,
-    #[serde(with = "version_one")]
-    pub measurement_version: u32,
     pub run_id: Option<String>,
     pub status: RunStatus,
     pub reasons: Vec<RunReason>,
-    pub telemetry_status: TelemetryStatus,
     pub started_at_utc: Option<String>,
+    pub config: RunConfig,
     pub phases: Vec<PhaseReport>,
-    pub config: SanitizedConfig,
     pub driver: DriverMetadata,
     pub target: TargetMetadata,
-    pub environment: Option<EnvironmentDescriptor>,
-    pub dataset: DatasetIdentity,
     pub counters: CounterReport,
     pub rates: RateReport,
     pub latencies: BTreeMap<LatencyKind, HistogramReport>,
     pub telemetry: TelemetryReport,
-    pub artifacts: BTreeMap<ArtifactKind, ArtifactMetadata>,
 }
 
 impl RunReport {
-    pub fn read(directory: &std::path::Path) -> crate::error::BenchResult<Self> {
-        reader::read(directory)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SanitizedConfig {
-    #[serde(with = "version_one")]
-    pub schema_version: u32,
-    pub environment_id: String,
-    pub target_mode: TargetMode,
-    #[serde(deserialize_with = "strict_config::scenario")]
-    pub scenario: ScenarioConfig,
-    #[serde(deserialize_with = "strict_config::measurement")]
-    pub measurement: MeasurementConfig,
-    #[serde(deserialize_with = "strict_config::metrics")]
-    pub metrics: MetricsConfig,
-    #[serde(default)]
-    pub instrumentation: Option<InstrumentationMetadata>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InstrumentationMetadata {
-    pub policy_version: u32,
-    pub server_metrics_enabled: bool,
-    pub generator_metrics_enabled: bool,
-    pub raw_capacity_bytes: u64,
-    pub control_capacity: u64,
-    pub response_body_limit_bytes: u64,
-    pub result_limit_bytes: u64,
-}
-
-impl From<&RunConfig> for SanitizedConfig {
-    fn from(config: &RunConfig) -> Self {
-        Self {
-            schema_version: config.schema_version,
-            environment_id: config.environment_id.clone(),
-            target_mode: match config.target {
-                TargetConfig::Local { .. } => TargetMode::Local,
-                TargetConfig::Remote { .. } => TargetMode::Remote,
-            },
-            scenario: config.scenario.clone(),
-            measurement: config.measurement.clone(),
-            metrics: config.metrics.clone(),
-            instrumentation: Some(crate::telemetry::instrumentation_metadata(
-                match &config.target {
-                    TargetConfig::Local { .. } => true,
-                    TargetConfig::Remote { metrics_url, .. } => metrics_url.is_some(),
-                },
-            )),
+    pub fn read(directory: &Path) -> BenchResult<Self> {
+        let invalid = |context| BenchError::new(ErrorCode::InvalidPath, context);
+        let file = std::fs::File::open(directory.join(RESULT_FILE))
+            .map_err(|_| invalid("result_unreadable"))?;
+        let mut data = Vec::new();
+        file.take(RESULT_LIMIT + 1)
+            .read_to_end(&mut data)
+            .map_err(|_| invalid("result_unreadable"))?;
+        if data.len() as u64 > RESULT_LIMIT {
+            return Err(invalid("result_too_large"));
         }
+        serde_json::from_slice(&data).map_err(|_| invalid("result_format"))
     }
 }
 
@@ -243,6 +236,7 @@ pub struct CounterReport {
     pub skipped_in_flight: u64,
     pub skipped_writer_busy: u64,
     pub skipped_account_busy: u64,
+    pub skipped_disconnected: u64,
     pub cancelled_before_dispatch: u64,
     pub write_succeeded: u64,
     pub message_body_bytes_write_succeeded: u64,
@@ -280,31 +274,30 @@ pub struct CounterReport {
     pub write_succeeded_during_drain: u64,
     pub login_in_window: u64,
     pub login_during_drain: u64,
-    pub max_dispatch_batch_observed: u64,
     pub errors: BTreeMap<ErrorCategory, u64>,
+}
+
+impl CounterReport {
+    pub fn driver_skips(&self) -> u64 {
+        self.skipped_scheduler
+            + self.skipped_in_flight
+            + self.skipped_writer_busy
+            + self.skipped_account_busy
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RateReport {
-    #[serde(with = "finite_option")]
     pub planned_per_second: Option<f64>,
-    #[serde(with = "finite_option")]
     pub dispatched_in_window_per_second: Option<f64>,
-    #[serde(with = "finite_option")]
     pub write_succeeded_in_window_per_second: Option<f64>,
-    #[serde(with = "finite_option")]
     pub received_in_window_per_second: Option<f64>,
-    #[serde(with = "finite_option")]
     pub cohort_receipts_per_second: Option<f64>,
-    #[serde(with = "finite_option")]
     pub login_in_window_per_second: Option<f64>,
-    #[serde(with = "finite_option")]
     pub cohort_logins_per_second: Option<f64>,
-    #[serde(with = "finite_option")]
     pub closed_cycles_per_second: Option<f64>,
     pub offered_rate_per_second: Option<u32>,
-    #[serde(with = "finite_option")]
     pub window_seconds: Option<f64>,
 }
 
@@ -330,12 +323,8 @@ pub struct HistogramBucket {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistogramReport {
-    pub unit: Microseconds,
-    #[serde(with = "three_figures")]
-    pub significant_figures: u8,
     pub count: u64,
     pub min_us: Option<u64>,
-    #[serde(with = "finite_option")]
     pub mean_us: Option<f64>,
     pub p50_us: Option<u64>,
     pub p95_us: Option<u64>,
@@ -347,53 +336,27 @@ pub struct HistogramReport {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DispatchPolicyMetadata {
-    pub dispatch_quantum_us: u64,
-    pub max_dispatch_batch: u64,
-    pub max_schedule_lag_ms: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DriverMetadata {
-    pub executable_sha256: Option<String>,
-    pub package_version: String,
+    pub version: String,
     pub revision: String,
     pub build_profile: String,
-    pub build_target: String,
-    pub rustc: String,
+    pub executable_sha256: Option<String>,
     pub worker_count: usize,
-    pub scheduler_policy: DispatchPolicyMetadata,
-    pub available_parallelism: Option<usize>,
+    pub cpu_pool_size: usize,
     pub rlimit_nofile_soft: Option<u64>,
     pub rlimit_nofile_hard: Option<u64>,
     pub system: SystemMetadata,
-    pub sources: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemMetadata {
-    pub os_release: Option<String>,
+    pub os: Option<String>,
     pub kernel: Option<String>,
     pub arch: Option<String>,
     pub cpu_model: Option<String>,
     pub logical_cpus: Option<u64>,
     pub memory_bytes: Option<u64>,
-    pub virtualization: Option<String>,
-    pub storage_description: Option<String>,
-    pub cpu_affinity: Option<Vec<u32>>,
-    #[serde(with = "finite_option")]
-    pub cpu_quota: Option<f64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerBuildDeclaration {
-    pub revision: String,
-    pub profile: String,
-    pub toolchain: Option<String>,
-    pub features: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -401,90 +364,17 @@ pub struct ServerBuildDeclaration {
 pub struct TargetMetadata {
     pub mode: TargetMode,
     pub xmpp_domain: String,
-    pub configured_endpoint: Option<String>,
+    pub endpoint: Option<String>,
+    pub server_binary_sha256: Option<String>,
+    pub server_build: Option<BTreeMap<String, String>>,
     pub negotiated_tls: Option<String>,
     pub cipher: Option<String>,
-    pub auth_mechanism: String,
-    pub resumption: bool,
-    pub cache_primed: bool,
-    pub observed_scram_iterations: Option<u32>,
-    pub observed_build: Option<BTreeMap<String, String>>,
-    #[serde(with = "finite_option")]
-    pub observed_process_start_time_seconds: Option<f64>,
-    pub local_binary_sha256: Option<String>,
-    pub declared_build: Option<ServerBuildDeclaration>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EnvironmentDescriptor {
-    #[serde(with = "version_one")]
-    pub schema_version: u32,
-    pub environment_id: String,
-    pub network_path: NetworkPath,
-    pub server: SystemMetadata,
-    pub server_build: ServerBuildDeclaration,
-    pub server_settings: ServerSettings,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerSettings {
-    pub workers: u16,
-    pub stanza_pool_size_mib: u64,
-    pub logging_level: String,
-    pub host_extensions: Vec<String>,
-    pub storage_backend: String,
-    pub max_unauthenticated_connections: u64,
-    pub max_resources_per_account: u64,
-    pub max_directed_presence_recipients_per_resource: u64,
-    pub max_connections_per_ip: u64,
-    pub max_stanza_bytes: u64,
-    pub connection_establishment_timeout_secs: u64,
-    pub authentication_timeout_secs: u64,
-    pub resource_binding_timeout_secs: u64,
-    pub authentication_retries: u64,
-    pub resource_binding_retries: u64,
-    pub connection_attempts_per_ip: RateLimitSettings,
-    pub incoming_stanzas_per_connection: RateLimitSettings,
-    pub new_recipients_per_connection: RateLimitSettings,
-    pub incoming_xml_per_connection: ByteRateLimitSettings,
-    pub offered_auth_mechanisms: Vec<String>,
-    pub tls_min: String,
-    pub tls_max: String,
-    pub empty_roster: bool,
-    pub offline_storage: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RateLimitSettings {
-    pub rate_per_second: u64,
-    pub burst: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ByteRateLimitSettings {
-    pub bytes_per_second: u64,
-    pub burst_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DatasetIdentity {
-    pub account_jids_sha256: Option<String>,
-    pub account_count: u64,
-    pub pair_count: Option<u64>,
-    pub resource_policy: String,
-    pub availability_policy: String,
-    pub body_bytes: Option<u64>,
+    pub scram_iterations: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct SampledValue {
-    #[serde(with = "finite_option")]
     pub value: Option<f64>,
     pub sample_count: u64,
     pub start_offset_ns: Option<u64>,
@@ -520,8 +410,6 @@ pub struct TelemetryReport {
     pub samples_failed: u64,
     pub missed_ticks: u64,
     pub queue_overflows: u64,
-    pub bytes: u64,
-    pub total_scrape_duration_ms: u64,
     pub server: ResourceSummary,
     pub generator: ResourceSummary,
     pub policy_rejections: BTreeMap<String, u64>,
@@ -529,91 +417,22 @@ pub struct TelemetryReport {
     pub reasons: Vec<RunReason>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactKind {
-    Summary,
-    Telemetry,
-    ServerLog,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArtifactMetadata {
-    pub bytes: u64,
-    pub sha256: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunMetadata {
-    pub driver: DriverMetadata,
-    pub target: TargetMetadata,
-    pub environment: Option<EnvironmentDescriptor>,
-    pub dataset: DatasetIdentity,
-}
-
-mod finite_option {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    pub fn serialize<S: Serializer>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error> {
-        if value.is_some_and(|v| !v.is_finite()) {
-            return Err(serde::ser::Error::custom("non-finite report value"));
+impl Default for TelemetryReport {
+    fn default() -> Self {
+        Self {
+            quality: TelemetryStatus::Unavailable,
+            samples_ok: 0,
+            samples_failed: 0,
+            missed_ticks: 0,
+            queue_overflows: 0,
+            server: ResourceSummary::default(),
+            generator: ResourceSummary::default(),
+            policy_rejections: BTreeMap::new(),
+            identity_changes: 0,
+            reasons: Vec::new(),
         }
-        value.serialize(serializer)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<f64>, D::Error> {
-        let value = Option::<f64>::deserialize(deserializer)?;
-        if value.is_some_and(|v| !v.is_finite()) {
-            return Err(serde::de::Error::custom("non-finite report value"));
-        }
-        Ok(value)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests;
-
-mod version_one {
-    use serde::{Deserialize, Deserializer, Serializer};
-    pub fn serialize<S: Serializer>(value: &u32, serializer: S) -> Result<S::Ok, S::Error> {
-        if *value != 1 {
-            return Err(serde::ser::Error::custom("unsupported schema version"));
-        }
-        serializer.serialize_u32(*value)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
-        let value = u32::deserialize(deserializer)?;
-        if value != 1 {
-            return Err(serde::de::Error::custom("unsupported schema version"));
-        }
-        Ok(value)
-    }
-}
-
-mod three_figures {
-    use serde::{Deserialize, Deserializer, Serializer};
-    pub fn serialize<S: Serializer>(value: &u8, serializer: S) -> Result<S::Ok, S::Error> {
-        if *value != 3 {
-            return Err(serde::ser::Error::custom(
-                "histograms require three significant figures",
-            ));
-        }
-        serializer.serialize_u8(*value)
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
-        let value = u8::deserialize(deserializer)?;
-        if value != 3 {
-            return Err(serde::de::Error::custom(
-                "histograms require three significant figures",
-            ));
-        }
-        Ok(value)
-    }
-}
-
-pub mod artifacts;
-pub mod metadata;
-mod strict_config;
-pub mod summary;

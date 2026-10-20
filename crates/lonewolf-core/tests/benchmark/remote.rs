@@ -13,7 +13,7 @@ mod support;
 use bench_support::{SECRET, TestResult, artifacts, cli, private_write};
 use lonewolf_bench::{
     config::{RunConfig, ScenarioConfig, TargetConfig},
-    report::{EnvironmentDescriptor, RunStatus},
+    report::RunStatus,
 };
 use std::{
     fs,
@@ -57,23 +57,11 @@ fn inputs(
         )?;
     }
     let mut config = bench_support::local_config(Path::new("unused"), scenario);
-    let environment = directory.join("environment.json");
-    if !environment.exists() {
-        let mut descriptor: serde_json::Value =
-            serde_json::from_slice(include_bytes!("support/environment.json"))?;
-        descriptor["server"] = serde_json::to_value(
-            lonewolf_bench::report::metadata::collect_metadata(&config)?
-                .driver
-                .system,
-        )?;
-        fs::write(&environment, serde_json::to_vec(&descriptor)?)?;
-    }
     config.target = TargetConfig::Remote {
         connect_host: address.ip().to_string(),
         port: address.port(),
         xmpp_domain: "localhost".into(),
         credentials_file: credentials,
-        environment_file: environment,
         ca_pem: Some(ca.into()),
         metrics_url: None,
     };
@@ -86,7 +74,6 @@ fn config_file(directory: &Path, name: &str, config: &RunConfig) -> TestResult<P
         port,
         xmpp_domain,
         credentials_file,
-        environment_file,
         ca_pem,
         metrics_url,
     } = &config.target
@@ -95,10 +82,8 @@ fn config_file(directory: &Path, name: &str, config: &RunConfig) -> TestResult<P
     };
     let q = |value: &str| serde_json::to_string(value);
     let mut text = format!(
-        "schema_version=1\nenvironment_id={environment:?}\n[target]\nmode='remote'\nconnect_host={connect_host:?}\nport={port}\nxmpp_domain={xmpp_domain:?}\ncredentials_file={}\nenvironment_file={}\n",
+        "[target]\nmode='remote'\nconnect_host={connect_host:?}\nport={port}\nxmpp_domain={xmpp_domain:?}\ncredentials_file={}\n",
         q(&credentials_file.to_string_lossy())?,
-        q(&environment_file.to_string_lossy())?,
-        environment = config.environment_id
     );
     if let Some(ca) = ca_pem {
         text += &format!("ca_pem={}\n", q(&ca.to_string_lossy())?);
@@ -171,10 +156,9 @@ fn compare_cli(
         serde_json::from_slice(&fs::read(out.join("comparison.json"))?)?;
     assert_eq!(
         output.status.code(),
-        Some(if report.eligible { 0 } else { 2 })
+        Some(if report.comparable { 0 } else { 2 })
     );
     assert!(fs::metadata(out.join("comparison.md"))?.len() > 0);
-    assert!(!out.join(".incomplete").exists());
     bench_support::assert_no_secret(
         out,
         Some(&output),
@@ -232,23 +216,8 @@ fn remote_cli_verifies_dns_over_loopback_and_runs_all_topologies_without_admin_e
         assert_eq!(report.target.xmpp_domain, "localhost");
         assert!(report.target.negotiated_tls.is_some());
         assert_eq!(report.phases.len(), 10);
-        assert_eq!(
-            report
-                .target
-                .declared_build
-                .as_ref()
-                .ok_or("build")?
-                .profile,
-            "test"
-        );
-        let build = &report
-            .environment
-            .as_ref()
-            .ok_or("environment")?
-            .server_build;
-        assert_eq!(build.profile, "test");
-        assert_eq!(build.features, Some(vec![]));
-        assert_eq!(build.toolchain, None);
+        assert!(report.target.server_build.is_some());
+        assert!(report.target.server_binary_sha256.is_none());
         assert!(!output_path.join("server.log").exists());
         bench_support::assert_no_secret(
             &output_path,
@@ -262,7 +231,7 @@ fn remote_cli_verifies_dns_over_loopback_and_runs_all_topologies_without_admin_e
                 &output_path,
                 &directory.path().join(format!("compare-{name}"))
             )?
-            .eligible
+            .comparable
         );
     }
     use std::os::unix::fs::MetadataExt;
@@ -272,7 +241,7 @@ fn remote_cli_verifies_dns_over_loopback_and_runs_all_topologies_without_admin_e
 }
 
 #[test]
-fn real_run_reports_compare_and_reject_incomplete_corrupt_and_incompatible_inputs() -> TestResult {
+fn real_run_reports_compare_and_refuse_unmeasured_corrupt_or_different_workloads() -> TestResult {
     let mut server = server()?;
     server.create_account("bench-000000", SECRET)?;
     server.create_account("bench-000001", SECRET)?;
@@ -298,84 +267,35 @@ fn real_run_reports_compare_and_reject_incomplete_corrupt_and_incompatible_input
     let a = directory.path().join("a");
     let b = directory.path().join("b");
     let before = fs::read(a.join("result.json"))?;
-    assert!(compare_cli(&a, &b, &directory.path().join("a-b"))?.eligible);
-    assert!(compare_cli(&a, &a, &directory.path().join("self"))?.eligible);
-    for (name, mutation) in [
-        ("changed-build", 0),
-        ("unknown-build", 1),
-        ("test-release", 2),
-        ("unknown-features", 3),
-        ("old-instrumentation", 4),
-        ("missing-measurement", 5),
-        ("different-rate", 6),
-        ("toolchain", 7),
-        ("incomplete", 8),
-        ("corrupt", 9),
-        ("artifact-corrupt", 10),
-        ("unknown-vs-known", 11),
-        ("equal-size-corruption", 12),
-        ("missing-telemetry", 13),
-        ("summary-corruption", 14),
-        ("missing-declaration", 15),
+    assert!(compare_cli(&a, &b, &directory.path().join("a-b"))?.comparable);
+    assert!(compare_cli(&a, &a, &directory.path().join("self"))?.comparable);
+    for (name, comparable) in [
+        ("degraded", true),
+        ("other-driver", true),
+        ("failed", false),
+        ("different-rate", false),
+        ("different-duration", false),
+        ("missing-field", false),
+        ("corrupt", false),
     ] {
         let candidate = directory.path().join(name);
         artifacts::copy_run(&b, &candidate)?;
-        match mutation {
-            8 => fs::write(candidate.join(".incomplete"), b"incomplete")?,
-            9 => fs::write(candidate.join("result.json"), b"{secret-auth-sentinel")?,
-            10 => fs::write(candidate.join("telemetry.ndjson"), b"corrupt")?,
-            12 => {
-                let file = candidate.join("telemetry.ndjson");
-                let mut bytes = fs::read(&file)?;
-                *bytes.first_mut().ok_or("telemetry")? ^= 1;
-                fs::write(file, bytes)?;
-            }
-            13 => fs::remove_file(candidate.join("telemetry.ndjson"))?,
-            14 => fs::write(candidate.join("summary.md"), b"secret-auth-sentinel")?,
-            _ => artifacts::edit_report(&candidate, |v| match mutation {
-                0 => {
-                    v["environment"]["server_build"]["revision"] = "other-source".into();
-                    v["target"]["declared_build"]["revision"] = "other-source".into();
+        match name {
+            "corrupt" => fs::write(candidate.join("result.json"), b"{secret-auth-sentinel")?,
+            _ => artifacts::edit_report(&candidate, |v| match name {
+                "degraded" => {
+                    v["status"] = "degraded".into();
+                    v["reasons"] = serde_json::json!([{"code":"driver_limited","context":"message_operations_skipped"}]);
                 }
-                1 => {
-                    v["environment"]["server_build"]["profile"] = "unknown".into();
-                    v["target"]["declared_build"]["profile"] = "unknown".into();
-                }
-                2 => {
-                    v["environment"]["server_build"]["profile"] = "release".into();
-                    v["target"]["declared_build"]["profile"] = "release".into();
-                }
-                3 => {
-                    v["environment"]["server_build"]["features"] = serde_json::Value::Null;
-                    v["target"]["declared_build"]["features"] = serde_json::Value::Null;
-                }
-                4 => {
-                    v["config"]
-                        .as_object_mut()
-                        .map(|m| m.remove("instrumentation"));
-                }
-                5 => {
+                "other-driver" => v["driver"]["executable_sha256"] = "f".repeat(64).into(),
+                "failed" => v["status"] = "failed".into(),
+                "different-rate" => v["config"]["scenario"]["rate_per_second"] = 3.into(),
+                "different-duration" => v["config"]["measurement"]["duration_ms"] = 999.into(),
+                _ => {
                     v["config"]["measurement"]
                         .as_object_mut()
                         .map(|m| m.remove("duration_ms"));
                 }
-                6 => v["config"]["scenario"]["rate_per_second"] = 3.into(),
-                7 => {
-                    v["environment"]["server_build"]["toolchain"] =
-                        "actual-other-test-toolchain".into();
-                    v["target"]["declared_build"]["toolchain"] =
-                        "actual-other-test-toolchain".into();
-                }
-                15 => {
-                    v["artifacts"]
-                        .as_object_mut()
-                        .map(|m| m.remove("telemetry"));
-                }
-                11 => {
-                    v["environment"]["server_build"]["profile"] = "unknown".into();
-                    v["target"]["declared_build"]["profile"] = "unknown".into();
-                }
-                _ => unreachable!(),
             })?,
         }
         let unchanged = artifacts::contents(&candidate)?;
@@ -385,41 +305,15 @@ fn real_run_reports_compare_and_reject_incomplete_corrupt_and_incompatible_input
             &directory.path().join(format!("comparison-{name}")),
         )?;
         assert_eq!(
-            comparison.eligible,
-            matches!(mutation, 0 | 7),
-            "{name}: {:?} {:?}",
-            comparison.refusals,
-            comparison.mismatches
+            comparison.comparable, comparable,
+            "{name}: {:?}",
+            comparison.refusals
         );
-        if mutation == 7 {
-            assert!(
-                comparison
-                    .caveats
-                    .iter()
-                    .any(|c| c.path == "target.declared_build.toolchain")
-            );
-        }
-        if mutation >= 10 && mutation != 11 {
-            assert!(comparison.metrics.is_empty());
-            let reversed = compare_cli(
-                &candidate,
-                &a,
-                &directory.path().join(format!("reverse-{name}")),
-            )?;
-            assert!(!reversed.eligible);
-            assert!(reversed.metrics.is_empty());
+        assert_eq!(comparison.metrics.is_empty(), !comparable);
+        if comparable {
+            assert!(!comparison.warnings.is_empty());
         }
         assert_eq!(artifacts::contents(&candidate)?, unchanged);
-        if mutation == 1 {
-            assert!(
-                !compare_cli(
-                    &candidate,
-                    &candidate,
-                    &directory.path().join("unknown-self")
-                )?
-                .eligible
-            );
-        }
     }
     assert_eq!(fs::read(a.join("result.json"))?, before);
     server.stop()?;
@@ -545,7 +439,7 @@ fn remote_cli_rejects_wrong_ca_and_password_without_secret_echo() -> TestResult 
 }
 
 #[test]
-fn strict_operator_examples_parse_without_accessing_remote_endpoints() -> TestResult {
+fn operator_examples_parse_without_accessing_remote_endpoints() -> TestResult {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bench");
     for name in [
         "idle",
@@ -556,61 +450,8 @@ fn strict_operator_examples_parse_without_accessing_remote_endpoints() -> TestRe
         "smoke-churn",
         "remote",
     ] {
-        let config = RunConfig::load(&root.join(format!("{name}.toml")), None)?;
-        if let TargetConfig::Local {
-            server_profile,
-            server_features,
-            server_toolchain,
-            ..
-        } = config.target
-        {
-            assert_eq!(server_profile, "release");
-            assert_eq!(server_features, Some(vec![]));
-            assert_eq!(server_toolchain, None);
-        }
+        RunConfig::load(&root.join(format!("{name}.toml")), None)?;
     }
-    let environment = EnvironmentDescriptor::read(&root.join("remote-environment.json"))?;
-    assert_eq!(environment.server_build.profile, "release");
-    assert_eq!(environment.server_build.features, Some(vec![]));
-    assert_eq!(environment.server_build.toolchain, None);
-    Ok(())
-}
-
-#[test]
-fn cli_runs_with_unknown_build_declarations_but_refuses_their_comparison() -> TestResult {
-    let mut server = server()?;
-    server.create_account("bench-000000", SECRET)?;
-    let directory = tempfile::tempdir()?;
-    let config = inputs(
-        directory.path(),
-        server.address,
-        &server.fixture_path().join("certificate.pem"),
-        ScenarioConfig::Idle { connections: 1 },
-    )?;
-    let path = config_file(directory.path(), "config", &config)?;
-    let environment = directory.path().join("environment.json");
-    let original: serde_json::Value = serde_json::from_slice(&fs::read(&environment)?)?;
-    for field in ["profile", "features"] {
-        let mut descriptor = original.clone();
-        descriptor["server_build"][field] = if field == "profile" {
-            "unknown".into()
-        } else {
-            serde_json::Value::Null
-        };
-        fs::write(&environment, serde_json::to_vec(&descriptor)?)?;
-        let out = directory.path().join(field);
-        let output = run_cli(&path, &out)?;
-        assert_eq!(output.status.code(), Some(0));
-        artifacts::complete(&out, RunStatus::Passed)?;
-        let comparison = compare_cli(
-            &out,
-            &out,
-            &directory.path().join(format!("comparison-{field}")),
-        )?;
-        assert!(!comparison.eligible);
-        assert!(comparison.metrics.is_empty());
-    }
-    server.stop()?;
     Ok(())
 }
 
@@ -666,10 +507,6 @@ fn remote_cli_rejects_certificate_name_after_trusting_the_same_peer_certificate(
     );
     assert!(report.target.negotiated_tls.is_none());
     bench_support::assert_no_secret(&output_path, Some(&output), &[SECRET, "PRIVATE KEY"])?;
-    let address = peer.address;
     peer.finish()?;
-    assert!(
-        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(1)).is_err()
-    );
     Ok(())
 }

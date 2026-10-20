@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     client::{BodyValidation, CorrelationId},
     measurement::{DispatchPolicy, ScheduledSlot},
-    report::{LatencyKind, ReasonCode},
+    report::{LatencyKind, ReasonCode, RunStatus},
     run::tests::context,
 };
 
@@ -45,7 +45,6 @@ fn phase(start: Instant, planned: u64, max: usize, end: Duration) -> BenchResult
         nonce: [7; 16],
         phase: TrafficPhase::Measurement,
         fatal: false,
-        workload_failed: false,
         body_bytes: 0,
         wire_bytes: 0,
         errors: Default::default(),
@@ -349,7 +348,7 @@ fn sender_stanza_errors_and_disconnects_preserve_the_cohort() -> TestResult {
         (1, 1, 1)
     );
     assert_eq!(result.counters.errors[&ErrorCategory::Policy], 1);
-    assert_eq!(result.status(), RunStatus::Failed);
+    assert_eq!(result.status(), RunStatus::Degraded);
     Ok(())
 }
 
@@ -396,7 +395,7 @@ fn admission_refusals_are_counted_once_without_retry() -> TestResult {
         ),
         (1, 1, 1, 1)
     );
-    assert_eq!(result.status(), RunStatus::Invalid);
+    assert_eq!(result.status(), RunStatus::Degraded);
     Ok(())
 }
 
@@ -531,7 +530,7 @@ async fn missing_reader_or_interrupted_warmup_never_starts_measurement() -> Test
 }
 
 #[test]
-fn retirement_preserves_success_and_marks_lagged_warmup_invalid() -> TestResult {
+fn retirement_preserves_on_time_warmup_receipts() -> TestResult {
     let start = Instant::now();
     let mut phase = phase(start, 1, 2, Duration::from_millis(10))?;
     phase.phase = TrafficPhase::Warmup;
@@ -560,19 +559,12 @@ fn retirement_preserves_success_and_marks_lagged_warmup_invalid() -> TestResult 
     let result = finished(phase);
     assert_message_equations(&result);
     assert_eq!(result.counters.received_on_time, 1);
-    assert!(
-        result
-            .reasons
-            .iter()
-            .any(|r| r.code == ReasonCode::WarmupObservationLag)
-    );
-    assert_eq!(result.status(), RunStatus::Invalid);
+    assert_eq!(result.status(), RunStatus::Passed);
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
-async fn warmup_receipts_recovered_only_at_retirement_preserve_success_and_abort_measurement()
--> TestResult {
+async fn degraded_warmup_still_runs_the_measurement_without_degrading_the_run() -> TestResult {
     let (mut context, _signal) = context(4)?;
     context.config.scenario = ScenarioConfig::Messages {
         pairs: 2,
@@ -584,38 +576,31 @@ async fn warmup_receipts_recovered_only_at_retirement_preserve_success_and_abort
     for _ in 0..4 {
         context.connections.simulated_lagged_messages();
     }
-    assert!(run(&mut context).await.is_err());
-    assert!(context.measurement_window.is_none());
-    assert!(
-        !context
-            .report
-            .phases
-            .iter()
-            .any(|p| p.name == PhaseName::Measurement)
-    );
-    assert_eq!(context.connections.active(), 0);
+    let result = run(&mut context).await?;
     let warmup = context
         .report
         .phases
         .iter()
         .find(|p| p.name == PhaseName::Warmup)
         .ok_or("warmup")?;
-    assert_eq!(
-        (
-            warmup.counters.write_succeeded,
-            warmup.counters.received_on_time
-        ),
-        (10, 10)
-    );
-    assert_eq!(warmup.counters.unreceived_timeout, 0);
+    assert_eq!(warmup.counters.write_succeeded, 10);
+    assert_eq!(warmup.counters.unreceived_timeout, 10);
     assert!(
         context
             .report
-            .reasons
+            .phases
             .iter()
-            .any(|r| r.code == ReasonCode::WarmupObservationLag)
+            .any(|p| p.name == PhaseName::Measurement)
     );
-    assert_eq!(context.report.status, RunStatus::Invalid);
+    assert!(context.measurement_window.is_some());
+    assert_eq!(result.counters.dispatched, result.counters.planned);
+    assert_eq!(result.counters.stale_phase_stanzas, 10);
+    assert_eq!(
+        context.report.status,
+        RunStatus::Passed,
+        "{:?}",
+        context.report.reasons
+    );
     Ok(())
 }
 
@@ -679,22 +664,18 @@ async fn cancellation_and_integrity_failure_cancel_unstarted_slots_without_sched
 }
 
 #[test]
-fn protocol_failure_truncates_and_still_consumes_committed_evidence() -> TestResult {
+fn stream_errors_wait_for_the_connection_loss_and_keep_committed_evidence() -> TestResult {
     let start = Instant::now();
     let mut phase = phase(start, 2, 2, Duration::from_millis(10))?;
     let operation = dispatch(&mut phase, 0, start)?;
-    assert!(
-        phase
-            .observe(RunEvent::Received {
-                index: 1,
-                event: ReceivedEvent {
-                    at: start,
-                    kind: ReceivedKind::StreamError
-                }
-            })
-            .is_err()
-    );
-    assert!(phase.fatal);
+    phase.observe(RunEvent::Received {
+        index: 1,
+        event: ReceivedEvent {
+            at: start,
+            kind: ReceivedKind::StreamError,
+        },
+    })?;
+    assert!(!phase.fatal);
     phase.observe(receipt(operation, start + Duration::from_millis(2)))?;
     phase.observe(started(operation, start))?;
     phase.observe(written(operation, start + Duration::from_millis(3), true))?;

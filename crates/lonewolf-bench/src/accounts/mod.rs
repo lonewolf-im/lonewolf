@@ -14,7 +14,6 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::OpenOptions,
@@ -239,21 +238,6 @@ impl CredentialSet {
     }
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
-    }
-    pub fn jids_sha256(&self) -> String {
-        let mut hash = Sha256::new();
-        for account in &self.accounts {
-            hash.update(account.jid.as_bytes());
-            hash.update(b"\n");
-        }
-        {
-            use std::fmt::Write;
-            let mut output = String::with_capacity(64);
-            for byte in hash.finalize() {
-                let _ = write!(output, "{byte:02x}");
-            }
-            output
-        }
     }
     pub fn into_prepared(self) -> BenchResult<Vec<PreparedAccount>> {
         self.accounts

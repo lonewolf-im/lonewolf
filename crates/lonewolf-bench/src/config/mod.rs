@@ -11,11 +11,9 @@ use std::{
 pub const MAX_ACCOUNTS: usize = 100_000;
 pub const MAX_PHASE_OPERATIONS: u64 = 10_000_000;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
-    pub schema_version: u32,
-    pub environment_id: String,
     pub target: TargetConfig,
     pub scenario: ScenarioConfig,
     #[serde(default)]
@@ -24,19 +22,11 @@ pub struct RunConfig {
     pub metrics: MetricsConfig,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TargetConfig {
     Local {
         server_binary: PathBuf,
-        #[serde(default = "unknown")]
-        server_revision: String,
-        #[serde(default = "unknown")]
-        server_profile: String,
-        #[serde(default)]
-        server_toolchain: Option<String>,
-        #[serde(default)]
-        server_features: Option<Vec<String>>,
         #[serde(default = "two")]
         server_workers: u16,
         #[serde(default = "pool_size")]
@@ -47,7 +37,6 @@ pub enum TargetConfig {
         port: u16,
         xmpp_domain: String,
         credentials_file: PathBuf,
-        environment_file: PathBuf,
         #[serde(default)]
         ca_pem: Option<PathBuf>,
         #[serde(default)]
@@ -78,6 +67,16 @@ pub enum ScenarioConfig {
     },
 }
 
+impl ScenarioConfig {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Idle { .. } => "idle",
+            Self::Messages { .. } => "messages",
+            Self::Churn { .. } => "churn",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeasurementConfig {
@@ -90,8 +89,6 @@ pub struct MeasurementConfig {
     pub connect_concurrency: usize,
     pub driver_workers: usize,
     pub max_in_flight: usize,
-    pub dispatch_quantum_us: u64,
-    pub max_dispatch_batch: u64,
     pub max_schedule_lag_ms: u64,
 }
 
@@ -107,8 +104,6 @@ impl Default for MeasurementConfig {
             connect_concurrency: 16,
             driver_workers: 2,
             max_in_flight: 4096,
-            dispatch_quantum_us: 1000,
-            max_dispatch_batch: 256,
             max_schedule_lag_ms: 100,
         }
     }
@@ -129,9 +124,6 @@ impl Default for MetricsConfig {
     }
 }
 
-fn unknown() -> String {
-    "unknown".into()
-}
 fn two() -> u16 {
     2
 }
@@ -198,34 +190,6 @@ pub fn normalize_dns(value: &str) -> BenchResult<String> {
         "DNS name cannot be an IP address",
     )?;
     Ok(value.to_ascii_lowercase())
-}
-
-pub fn validate_build(
-    profile: &str,
-    toolchain: Option<&str>,
-    features: Option<&[String]>,
-) -> BenchResult<()> {
-    require(printable(profile, 64), "invalid server profile declaration")?;
-    if let Some(value) = toolchain {
-        require(
-            printable(value, 1024),
-            "invalid server toolchain declaration",
-        )?;
-    }
-    if let Some(features) = features {
-        require(features.len() <= 256, "too many server features")?;
-        for (index, feature) in features.iter().enumerate() {
-            require(
-                printable(feature, 128),
-                "invalid server feature declaration",
-            )?;
-            require(
-                !features[..index].contains(feature),
-                "duplicate server feature declaration",
-            )?;
-        }
-    }
-    Ok(())
 }
 
 pub fn validate_metrics_url(value: &str) -> BenchResult<()> {
@@ -325,24 +289,16 @@ impl RunConfig {
             .parent()
             .ok_or_else(|| invalid("configuration directory is unavailable"))?;
         match &mut config.target {
-            TargetConfig::Local {
-                server_binary,
-                server_features,
-                ..
-            } => {
+            TargetConfig::Local { server_binary, .. } => {
                 *server_binary = match server_override {
                     Some(value) => absolute_path(&cwd, value)?,
                     None => absolute_path(base, server_binary)?,
                 };
-                if let Some(features) = server_features {
-                    features.sort_unstable();
-                }
             }
             TargetConfig::Remote {
                 connect_host,
                 xmpp_domain,
                 credentials_file,
-                environment_file,
                 ca_pem,
                 ..
             } => {
@@ -355,7 +311,6 @@ impl RunConfig {
                     *connect_host = normalize_dns(connect_host)?;
                 }
                 *credentials_file = absolute_path(base, credentials_file)?;
-                *environment_file = absolute_path(base, environment_file)?;
                 if let Some(ca) = ca_pem {
                     *ca = absolute_path(base, ca)?;
                 }
@@ -386,11 +341,6 @@ impl RunConfig {
     }
 
     pub fn validate(&self) -> BenchResult<()> {
-        require(self.schema_version == 1, "unsupported configuration schema")?;
-        require(
-            printable(&self.environment_id, 64),
-            "invalid environment identifier",
-        )?;
         require(
             (1..=MAX_ACCOUNTS).contains(&self.account_count()),
             "account count is out of bounds",
@@ -404,25 +354,12 @@ impl RunConfig {
         match &self.target {
             TargetConfig::Local {
                 server_binary,
-                server_profile,
-                server_revision,
-                server_toolchain,
-                server_features,
                 server_workers,
                 stanza_pool_size_mib,
             } => {
                 require(
                     !server_binary.as_os_str().is_empty(),
                     "server binary path is empty",
-                )?;
-                require(
-                    printable(server_revision, 1024),
-                    "invalid server revision declaration",
-                )?;
-                validate_build(
-                    server_profile,
-                    server_toolchain.as_deref(),
-                    server_features.as_deref(),
                 )?;
                 require(
                     (1..=256).contains(server_workers),
@@ -443,7 +380,6 @@ impl RunConfig {
                 port,
                 xmpp_domain,
                 credentials_file,
-                environment_file,
                 ca_pem,
                 metrics_url,
             } => {
@@ -454,7 +390,6 @@ impl RunConfig {
                 }
                 require(
                     !credentials_file.as_os_str().is_empty()
-                        && !environment_file.as_os_str().is_empty()
                         && ca_pem.as_ref().is_none_or(|p| !p.as_os_str().is_empty()),
                     "remote input path is empty",
                 )?;
@@ -484,20 +419,12 @@ impl RunConfig {
             "concurrency is out of bounds",
         )?;
         require(
-            (1000..=100_000).contains(&m.dispatch_quantum_us)
-                && (1..=4096).contains(&m.max_dispatch_batch)
-                && (1..=1000).contains(&m.max_schedule_lag_ms)
-                && m.max_schedule_lag_ms >= m.dispatch_quantum_us.div_ceil(1000)
+            (1..=1000).contains(&m.max_schedule_lag_ms)
                 && m.max_schedule_lag_ms < m.operation_timeout_ms,
-            "invalid dispatch policy",
+            "schedule lag must be between 1 and 1000 ms and below the operation timeout",
         )?;
         for rate in std::iter::once(m.ramp_rate_per_second).chain(self.offered_rate()) {
             require((1..=1_000_000).contains(&rate), "rate is out of bounds")?;
-            require(
-                (u128::from(rate) * u128::from(m.dispatch_quantum_us)).div_ceil(1_000_000)
-                    <= u128::from(m.max_dispatch_batch),
-                "rate exceeds dispatch batch capacity",
-            )?;
         }
         for duration in [m.warmup_ms, m.duration_ms] {
             require(
@@ -514,26 +441,8 @@ impl RunConfig {
                     count <= u128::from(MAX_PHASE_OPERATIONS),
                     "phase operation limit exceeded",
                 )?;
-                require(
-                    usize::try_from(count)
-                        .ok()
-                        .and_then(|v| v.checked_mul(4))
-                        .is_some(),
-                    "ledger memory requirement overflow",
-                )?;
             }
         }
-        let body_bytes = match self.scenario {
-            ScenarioConfig::Messages { body_bytes, .. } => body_bytes,
-            _ => 0,
-        };
-        require(
-            body_bytes
-                .checked_mul(m.max_in_flight)
-                .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
-                .is_some(),
-            "workload memory requirement overflow",
-        )?;
         require(
             (1000..=60_000).contains(&self.metrics.interval_ms)
                 && (1..=10_000).contains(&self.metrics.timeout_ms),

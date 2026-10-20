@@ -1,195 +1,589 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::config::{ScenarioConfig, TargetConfig};
 use std::fmt::Write;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unit {
+    PerSecond,
+    Count,
+    Ratio,
+    Microseconds,
+    Cores,
+    Bytes,
+}
+
+pub fn format_value(unit: Unit, value: Option<f64>) -> String {
+    let Some(value) = value.filter(|v| v.is_finite()) else {
+        return "-".into();
+    };
+    match unit {
+        Unit::PerSecond => format!("{}/s", decimal(value, 1)),
+        Unit::Count => decimal(value, 0),
+        Unit::Ratio => format!("{:.2}%", value * 100.0),
+        Unit::Microseconds => duration_us(value),
+        Unit::Cores => format!("{value:.2} cores"),
+        Unit::Bytes => bytes(value),
+    }
+}
+
+fn decimal(value: f64, places: usize) -> String {
+    let text = format!("{:.*}", places, value.abs());
+    let (whole, fraction) = text.split_once('.').unwrap_or((&text, ""));
+    let mut grouped = String::with_capacity(text.len() + whole.len() / 3 + 1);
+    if value < 0.0 && text.bytes().any(|b| b.is_ascii_digit() && b != b'0') {
+        grouped.push('-');
+    }
+    for (index, digit) in whole.chars().enumerate() {
+        if index > 0 && (whole.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    if !fraction.is_empty() {
+        grouped.push('.');
+        grouped.push_str(fraction);
+    }
+    grouped
+}
+
+fn duration_us(value: f64) -> String {
+    let magnitude = value.abs();
+    if magnitude >= 1_000_000.0 {
+        format!("{:.2} s", value / 1_000_000.0)
+    } else if magnitude >= 1000.0 {
+        format!("{:.2} ms", value / 1000.0)
+    } else {
+        format!("{value:.0} µs")
+    }
+}
+
+fn bytes(value: f64) -> String {
+    let magnitude = value.abs();
+    for (size, suffix) in [(1u64 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")] {
+        if magnitude >= size as f64 {
+            return format!("{:.1} {suffix}", value / size as f64);
+        }
+    }
+    format!("{value:.0} B")
+}
+
+fn count(value: u64) -> String {
+    format_value(Unit::Count, Some(value as f64))
+}
+
+fn counted(value: usize, singular: &str, plural: &str) -> String {
+    format!(
+        "{} {}",
+        count(value as u64),
+        if value == 1 { singular } else { plural }
+    )
+}
+
+fn per_second(value: Option<f64>) -> String {
+    format_value(Unit::PerSecond, value)
+}
+
+fn seconds(ms: u64) -> String {
+    if ms.is_multiple_of(1000) {
+        format!("{} s", ms / 1000)
+    } else {
+        format!("{} ms", decimal(ms as f64, 0))
+    }
+}
+
 pub fn render(report: &RunReport) -> String {
-    let c = &report.counters;
     let mut text = format!(
-        "# XMPP workload result\n\nOutcome: {:?}. Telemetry: {:?}.\n\n",
-        report.status, report.telemetry_status
+        "# {} workload: {}\n\n",
+        report.config.scenario.kind(),
+        report.status.as_str()
     );
+    overview(&mut text, report);
+    explain(&mut text, report);
+    let measured = report
+        .phases
+        .iter()
+        .any(|phase| phase.name == PhaseName::Measurement);
+    if !report.status.measured() {
+        text.push_str(if measured {
+            "\nThe measurement did not complete. The results below cover only the part that ran.\n"
+        } else {
+            "\nThe run has no complete measurement, so it reports no results.\n"
+        });
+    }
+    if measured {
+        outcome(&mut text, report);
+        latencies(&mut text, report);
+        resources(&mut text, report);
+    }
+    phases(&mut text, report);
+    environment(&mut text, report);
+    text
+}
+
+fn overview(text: &mut String, report: &RunReport) {
+    let target = match &report.config.target {
+        TargetConfig::Local { server_workers, .. } => {
+            format!("Local server with {server_workers} workers")
+        }
+        TargetConfig::Remote {
+            connect_host,
+            port,
+            xmpp_domain,
+            ..
+        } => format!("Remote server {connect_host}:{port} for {xmpp_domain}"),
+    };
+    let workload = match report.config.scenario {
+        ScenarioConfig::Idle { connections } => {
+            counted(connections, "idle connection", "idle connections")
+        }
+        ScenarioConfig::Messages {
+            pairs,
+            rate_per_second,
+            body_bytes,
+        } => format!(
+            "{}, {} messages/s in total, {body_bytes}-byte bodies",
+            counted(pairs, "pair", "pairs"),
+            count(rate_per_second.into())
+        ),
+        ScenarioConfig::Churn {
+            accounts,
+            rate_per_second,
+        } => format!(
+            "{}, {} login cycles/s in total",
+            counted(accounts, "account", "accounts"),
+            count(rate_per_second.into())
+        ),
+    };
+    let m = &report.config.measurement;
     let _ = writeln!(
         text,
-        "Offered operations: {}. Admitted: {}. On-time receipts: {}. Unreceived: {}. Late: {}. Duplicates: {}.\n",
-        c.planned,
-        c.dispatched,
-        c.received_on_time,
-        c.unreceived_timeout
-            + c.unreceived_connection_closed
-            + c.unreceived_send_failed
-            + c.unreceived_cancelled,
-        c.late_receipts,
-        c.duplicates
+        "| | |\n| --- | --- |\n| Target | {target} |\n| Workload | {workload} |\n| Timing | {} warmup, {} measurement, {} operation timeout |\n| Started | {} |",
+        seconds(m.warmup_ms),
+        seconds(m.duration_ms),
+        seconds(m.operation_timeout_ms),
+        report.started_at_utc.as_deref().unwrap_or("-"),
     );
-    let _ = writeln!(
-        text,
-        "Login successes/failures: {}/{}. Clean/failed closes: {}/{}. Active at window start/end: {}/{}. Peak active: {}.\n",
-        c.login_succeeded,
-        c.login_failed,
-        c.closed_cleanly,
-        c.close_failed,
-        c.connections_at_measurement_start,
-        c.connections_at_measurement_end,
-        c.peak_connections
-    );
-    let coverage = (c.dispatched > 0).then(|| c.received_on_time as f64 / c.dispatched as f64);
-    let _ = writeln!(
-        text,
-        "Receipt coverage (on-time/admitted): {coverage:?}. Error categories: {:?}.\n",
-        c.errors
-    );
+}
+
+fn explain(text: &mut String, report: &RunReport) {
+    let c = &report.counters;
+    let has = |code| report.reasons.iter().any(|reason| reason.code == code);
+    let mut lines = Vec::new();
+    if has(ReasonCode::DriverLimited) {
+        lines.push(format!(
+            "The driver skipped {} of {} scheduled operations ({}). The offered load was not fully applied, so the driver may be the bottleneck. Spread the rate over more pairs or accounts, or raise `max_in_flight`.",
+            count(c.driver_skips()),
+            count(c.planned),
+            skip_breakdown(c)
+        ));
+    }
+    if has(ReasonCode::OperationsFailed) {
+        lines.push(format!(
+            "Some operations did not succeed on time: {}.",
+            failure_breakdown(report)
+        ));
+    }
     for reason in &report.reasons {
-        let _ = writeln!(
-            text,
-            "- {:?}: {}",
-            reason.code,
-            reason.context.as_deref().unwrap_or("unavailable")
+        if reason.code.status().measured() {
+            continue;
+        }
+        let line = format!(
+            "`{}`: {}",
+            serde_json::to_value(reason.code)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            reason.context.as_deref().unwrap_or("no detail")
         );
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
     }
-    text.push_str("\n## Phases and rates\n\nOffsets use monotonic nanoseconds. The nominal window excludes setup, dispatch tail, drain and shutdown.\n\n");
-    for phase in &report.phases {
-        let _ = writeln!(
-            text,
-            "- {:?}: {:?}; start {}; nominal end {:?}; observed end {:?}.",
-            phase.name,
-            phase.status,
-            phase.start_offset_ns,
-            phase.planned_end_offset_ns,
-            phase.end_offset_ns
-        );
+    if lines.is_empty() {
+        return;
     }
+    let _ = writeln!(text, "\n## Why the run is {}\n", report.status.as_str());
+    for line in lines {
+        let _ = writeln!(text, "- {line}");
+    }
+}
+
+fn skip_breakdown(c: &CounterReport) -> String {
+    let parts: Vec<_> = [
+        ("scheduler lag", c.skipped_scheduler),
+        ("in-flight limit", c.skipped_in_flight),
+        ("sender busy", c.skipped_writer_busy),
+        ("account busy", c.skipped_account_busy),
+    ]
+    .into_iter()
+    .filter(|(_, value)| *value > 0)
+    .map(|(name, value)| format!("{name} {}", count(value)))
+    .collect();
+    if parts.is_empty() {
+        "some operations started too late".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn failure_breakdown(report: &RunReport) -> String {
+    let c = &report.counters;
+    let parts: Vec<_> = [
+        ("timed out", c.unreceived_timeout),
+        ("lost with their connection", c.unreceived_connection_closed),
+        ("failed to send", c.write_failed + c.unreceived_send_failed),
+        ("received late", c.late_receipts),
+        ("duplicated", c.duplicates),
+        ("misrouted", c.wrong_recipient + c.unknown_ids),
+        ("skipped on a closed connection", c.skipped_disconnected),
+        ("unexpected disconnects", c.unexpected_disconnects),
+        ("login failures", c.login_failed),
+        ("close failures", c.close_failed),
+    ]
+    .into_iter()
+    .filter(|(_, value)| *value > 0)
+    .map(|(name, value)| format!("{} {name}", count(value)))
+    .collect();
+    if parts.is_empty() {
+        "see the phase counters in result.json".into()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn outcome(text: &mut String, report: &RunReport) {
+    let c = &report.counters;
     let r = &report.rates;
-    let _ = writeln!(
-        text,
-        "\nNominal seconds: {:?}; configured offered rate: {:?}/s.\n\nPlanned: {:?}/s; admitted in window: {:?}/s; flushed in window: {:?}/s; received in window: {:?}/s; on-time cohort receipts: {:?}/s; bound in window: {:?}/s; cohort logins: {:?}/s; clean cohort cycles: {:?}/s.\n",
-        r.window_seconds,
-        r.offered_rate_per_second,
-        r.planned_per_second,
-        r.dispatched_in_window_per_second,
-        r.write_succeeded_in_window_per_second,
-        r.received_in_window_per_second,
-        r.cohort_receipts_per_second,
-        r.login_in_window_per_second,
-        r.cohort_logins_per_second,
-        r.closed_cycles_per_second
-    );
-    let _ = writeln!(
-        text,
-        "Dispatch tail: original cohort only, bounded by max_schedule_lag_ms={}; skipped scheduler/in-flight/writer/account: {}/{}/{}/{}. Operation deadline: {} ms. Shutdown budget: {} ms.\n",
-        report.config.measurement.max_schedule_lag_ms,
-        c.skipped_scheduler,
-        c.skipped_in_flight,
-        c.skipped_writer_busy,
-        c.skipped_account_busy,
-        report.config.measurement.operation_timeout_ms,
-        report.config.measurement.shutdown_timeout_ms
-    );
-    let drain_policy = match report.config.scenario {
+    text.push_str("\n## Outcome\n\n");
+    let mut line = |label: &str, value: String| {
+        let _ = writeln!(text, "- {label}: {value}");
+    };
+    let percent = |part: u64, total: u64| {
+        format_value(Unit::Ratio, (total > 0).then(|| part as f64 / total as f64))
+    };
+    match report.config.scenario {
         ScenarioConfig::Idle { .. } => {
-            "Idle uses a reader barrier without an offered-operation cohort."
+            line("Requested connections", count(c.requested_connections));
+            line(
+                "Open at the start of the measurement",
+                count(c.connections_at_measurement_start),
+            );
+            line(
+                "Open at the end of the measurement",
+                count(c.connections_at_measurement_end),
+            );
         }
         ScenarioConfig::Messages { .. } => {
-            "Message drain ends at nominal end plus operation timeout."
+            line(
+                "Scheduled",
+                format!(
+                    "{} ({})",
+                    count(c.planned),
+                    per_second(r.planned_per_second)
+                ),
+            );
+            line(
+                "Sent",
+                format!(
+                    "{} ({})",
+                    count(c.dispatched),
+                    per_second(r.dispatched_in_window_per_second)
+                ),
+            );
+            line(
+                "Delivered on time",
+                format!(
+                    "{}, {} of sent ({})",
+                    count(c.received_on_time),
+                    percent(c.received_on_time, c.dispatched),
+                    per_second(r.cohort_receipts_per_second)
+                ),
+            );
+            let bytes = c.serialized_stanza_bytes_write_succeeded;
+            if bytes > 0 {
+                line(
+                    "Bytes written",
+                    format_value(Unit::Bytes, Some(bytes as f64)),
+                );
+            }
         }
         ScenarioConfig::Churn { .. } => {
-            "Churn drain ends at nominal end plus operation timeout plus shutdown timeout."
+            line(
+                "Scheduled cycles",
+                format!(
+                    "{} ({})",
+                    count(c.planned),
+                    per_second(r.planned_per_second)
+                ),
+            );
+            line(
+                "Started",
+                format!(
+                    "{} ({})",
+                    count(c.dispatched),
+                    per_second(r.dispatched_in_window_per_second)
+                ),
+            );
+            line(
+                "Clean cycles",
+                format!(
+                    "{}, {} of started ({})",
+                    count(c.closed_cleanly),
+                    percent(c.closed_cleanly, c.dispatched),
+                    per_second(r.closed_cycles_per_second)
+                ),
+            );
+            line("Peak concurrent sessions", count(c.peak_connections));
         }
+    }
+    if c.driver_skips() > 0 {
+        line(
+            "Skipped by the driver",
+            format!("{} ({})", count(c.driver_skips()), skip_breakdown(c)),
+        );
+    }
+    let failures = failure_breakdown(report);
+    if !failures.starts_with("see ") {
+        line("Problems", failures);
+    }
+    if !c.errors.is_empty() {
+        let errors: Vec<_> = c
+            .errors
+            .iter()
+            .map(|(category, value)| {
+                format!(
+                    "{} {}",
+                    serde_json::to_value(category)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                    count(*value)
+                )
+            })
+            .collect();
+        line("Errors by stage", errors.join(", "));
+    }
+}
+
+fn latencies(text: &mut String, report: &RunReport) {
+    let rows: Vec<_> = report
+        .latencies
+        .iter()
+        .filter(|(_, histogram)| histogram.count > 0)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    text.push_str("\n## Latency\n\nOnly successful operations have a latency. Read these numbers together with the outcome above.\n\n| Measure | Samples | p50 | p95 | p99 | Max |\n| --- | ---: | ---: | ---: | ---: | ---: |\n");
+    for (kind, h) in rows {
+        let us = |value: Option<u64>| format_value(Unit::Microseconds, value.map(|v| v as f64));
+        let _ = writeln!(
+            text,
+            "| {} | {} | {} | {} | {} | {} |",
+            kind.label(),
+            count(h.count),
+            us(h.p50_us),
+            us(h.p95_us),
+            us(h.p99_us),
+            us(h.max_us)
+        );
+    }
+}
+
+fn resources(text: &mut String, report: &RunReport) {
+    let t = &report.telemetry;
+    let (server, driver) = (&t.server, &t.generator);
+    text.push_str("\n## Resources\n\nSampled during the measurement window.\n\n| | Server | Driver |\n| --- | ---: | ---: |\n");
+    let mut row = |label: &str, unit: Unit, a: Option<f64>, b: Option<f64>| {
+        if a.is_some() || b.is_some() {
+            let _ = writeln!(
+                text,
+                "| {label} | {} | {} |",
+                format_value(unit, a),
+                format_value(unit, b)
+            );
+        }
+    };
+    row(
+        "CPU",
+        Unit::Cores,
+        server.cpu_average_cores.value,
+        driver.cpu_average_cores.value,
+    );
+    row(
+        "Memory mean",
+        Unit::Bytes,
+        server.rss_mean_bytes.value,
+        driver.rss_mean_bytes.value,
+    );
+    row(
+        "Memory peak",
+        Unit::Bytes,
+        server.rss_peak_bytes.value.map(|v| v as f64),
+        driver.rss_peak_bytes.value.map(|v| v as f64),
+    );
+    row(
+        "Open files peak",
+        Unit::Count,
+        server.open_fds_peak.value.map(|v| v as f64),
+        driver.open_fds_peak.value.map(|v| v as f64),
+    );
+    row(
+        "Memory per connection",
+        Unit::Bytes,
+        server.incremental_rss_per_connection_bytes.value,
+        None,
+    );
+    row(
+        "Host CPU steal",
+        Unit::Microseconds,
+        None,
+        driver
+            .generator_host_steal_seconds
+            .value
+            .map(|seconds| seconds * 1_000_000.0),
+    );
+    let quality = match t.quality {
+        TelemetryStatus::Complete => "complete",
+        TelemetryStatus::Partial => "partial",
+        TelemetryStatus::Unavailable => "unavailable",
     };
     let _ = writeln!(
         text,
-        "{drain_policy} Admitted/flushed/bound after the window: {}/{}/{}. Receipts during drain: {}.\n",
-        c.dispatched_during_drain,
-        c.write_succeeded_during_drain,
-        c.login_during_drain,
-        c.received_during_drain
+        "\nSamples: {quality}, {} succeeded and {} failed. Memory is resident set size, not allocator usage.",
+        count(t.samples_ok),
+        count(t.samples_failed)
     );
-    text.push_str("## Successful-only latency distributions\n\nTimeouts have no invented latency. Receipt quantiles exclude unreceived operations.\n\n");
-    for (kind, h) in &report.latencies {
+    if !t.policy_rejections.is_empty() {
+        let rejections: Vec<_> = t
+            .policy_rejections
+            .iter()
+            .map(|(policy, value)| format!("{policy} {}", count(*value)))
+            .collect();
         let _ = writeln!(
             text,
-            "- {kind:?}: count {}; p50/p95/p99/max us {:?}/{:?}/{:?}/{:?}.",
-            h.count, h.p50_us, h.p95_us, h.p99_us, h.max_us
+            "\nThe server rejected connections by policy: {}.",
+            rejections.join(", ")
         );
     }
-    text.push_str("\n## Sampled resources\n\n");
-    let _ = writeln!(
-        text,
-        "Configured instrumentation: {:?}. Collection interval/timeout: {}/{} ms. These settings describe intent, not collection success.\n",
-        report.config.instrumentation,
-        report.config.metrics.interval_ms,
-        report.config.metrics.timeout_ms
-    );
-    for (scope, r) in [
-        ("server", &report.telemetry.server),
-        ("generator", &report.telemetry.generator),
-    ] {
-        for (name, v) in [
-            ("CPU average cores", &r.cpu_average_cores),
-            ("RSS mean bytes", &r.rss_mean_bytes),
-            ("open FDs mean", &r.open_fds_mean),
-            (
-                "sampled incremental RSS bytes per achieved connection",
-                &r.incremental_rss_per_connection_bytes,
-            ),
-            (
-                "generator host steal seconds",
-                &r.generator_host_steal_seconds,
-            ),
-        ] {
-            let _ = writeln!(
-                text,
-                "- {scope} {name}: {:?}; samples {}; offsets {:?}..{:?}.",
-                v.value, v.sample_count, v.start_offset_ns, v.end_offset_ns
-            );
-        }
+}
+
+fn phases(text: &mut String, report: &RunReport) {
+    text.push_str("\n## Phases\n\n| Phase | Status | Duration |\n| --- | --- | ---: |\n");
+    for phase in &report.phases {
+        let name = serde_json::to_value(phase.name)
+            .ok()
+            .and_then(|v| v.as_str().map(|v| v.replace('_', " ")))
+            .unwrap_or_default();
+        let status = serde_json::to_value(phase.status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let duration = phase.end_offset_ns.and_then(|end| {
+            end.checked_sub(phase.start_offset_ns)
+                .map(|ns| ns as f64 / 1000.0)
+        });
         let _ = writeln!(
             text,
-            "- {scope} RSS peak bytes: {:?}; samples {}. Open FDs peak: {:?}; samples {}.",
-            r.rss_peak_bytes.value,
-            r.rss_peak_bytes.sample_count,
-            r.open_fds_peak.value,
-            r.open_fds_peak.sample_count
+            "| {name} | {status} | {} |",
+            format_value(Unit::Microseconds, duration)
         );
     }
-    let t = &report.telemetry;
+}
+
+fn environment(text: &mut String, report: &RunReport) {
+    let d = &report.driver;
+    let s = &d.system;
+    let t = &report.target;
+    text.push_str("\n## Environment\n\n");
     let _ = writeln!(
         text,
-        "\nSamples ok/failed: {}/{}; missed ticks {}; queue overflows {}; encoded/received bytes {}; sampler scrape/encoding time {} ms. Fixed preallocated and touched telemetry buffer: 67108864 bytes. Policy rejections: {:?}.\n",
-        t.samples_ok,
-        t.samples_failed,
-        t.missed_ticks,
-        t.queue_overflows,
-        t.bytes,
-        t.total_scrape_duration_ms,
-        t.policy_rejections
+        "- Driver: lonewolf-bench {} ({}, {} build), {} workers, {} CPU jobs at once.",
+        d.version,
+        short(&d.revision),
+        d.build_profile,
+        d.worker_count,
+        d.cpu_pool_size
     );
-    text.push_str("## Provenance and limitations\n\n");
+    let host = [
+        s.os.clone(),
+        s.kernel.clone(),
+        s.arch.clone(),
+        s.cpu_model.clone(),
+        s.logical_cpus.map(|n| format!("{n} logical CPUs")),
+        s.memory_bytes
+            .map(|n| format!("{} memory", format_value(Unit::Bytes, Some(n as f64)))),
+        d.rlimit_nofile_soft.map(|n| format!("open file limit {n}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    let _ = writeln!(text, "- Driver host: {host}.");
+    let build = t.server_build.as_ref();
     let _ = writeln!(
         text,
-        "Driver executable SHA-256: {:?}; revision {}; profile {}; target {}; toolchain {}. Metadata sources: {:?}.\n",
-        report.driver.executable_sha256,
-        report.driver.revision,
-        report.driver.build_profile,
-        report.driver.build_target,
-        report.driver.rustc,
-        report.driver.sources
+        "- Server: binary {}, version {}, commit {}.",
+        t.server_binary_sha256.as_deref().map_or("-".into(), short),
+        build
+            .and_then(|b| b.get("version"))
+            .map_or("-", String::as_str),
+        build
+            .and_then(|b| b.get("commit"))
+            .map_or("-", String::as_str),
     );
-    let _ = writeln!(
-        text,
-        "Target executable SHA-256: {:?}; explicitly declared build: {:?}. Unknown profile/features prevent comparison. Unavailable observations remain null.\n",
-        report.target.local_binary_sha256, report.target.declared_build
-    );
-    let _ = writeln!(
-        text,
-        "Negotiated TLS/cipher: {:?}/{:?}. SCRAM-SHA-256 cache primed: {}; common observed iterations: {:?}; TLS resumption: false.\n",
-        report.target.negotiated_tls,
-        report.target.cipher,
-        report.target.cache_primed,
-        report.target.observed_scram_iterations
-    );
-    text.push_str("RSS is sampled process memory, not allocator bytes; negative incremental noise is preserved. CPU uses actual successful sample timestamps. RSS/FD samples require their full request interval inside the nominal window. Missing telemetry does not establish workload failure. Linux-only process values remain unavailable on macOS. Generator host steal does not describe a remote server.\n\n");
-    match report.target.mode { TargetMode::Local => text.push_str("The generator and server share local hardware and may contend for CPU, memory and file descriptors.\n"), TargetMode::Remote => text.push_str("Remote results include the declared network path, network variability and possible VPS contention. Remote server steal requires operator observations.\n") }
-    text.push_str("A single run does not establish server capacity or statistical significance.\n");
-    text
+    if let (Some(tls), Some(cipher)) = (&t.negotiated_tls, &t.cipher) {
+        let _ = writeln!(
+            text,
+            "- Session: {tls} with {cipher}, SCRAM-SHA-256 with {} iterations, no TLS resumption.",
+            t.scram_iterations.map_or("-".into(), |n| n.to_string())
+        );
+    }
+    if d.build_profile != "release" {
+        let _ = writeln!(
+            text,
+            "\nThe driver is a {} build. Its own overhead can distort the results, so use a release build.",
+            d.build_profile
+        );
+    }
+    match t.mode {
+        TargetMode::Local => text.push_str(
+            "\nThe driver and the server share this machine and compete for CPU and memory.\n",
+        ),
+        TargetMode::Remote => text.push_str(
+            "\nRemote results include network latency and any other load on the server host.\n",
+        ),
+    }
+}
+
+fn short(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn values_use_readable_units_and_separators() {
+        assert_eq!(format_value(Unit::Count, Some(1_234_567.0)), "1,234,567");
+        assert_eq!(format_value(Unit::Count, Some(-1234.0)), "-1,234");
+        assert_eq!(format_value(Unit::PerSecond, Some(19_996.66)), "19,996.7/s");
+        assert_eq!(format_value(Unit::Ratio, Some(0.9997)), "99.97%");
+        assert_eq!(format_value(Unit::Microseconds, Some(950.0)), "950 µs");
+        assert_eq!(format_value(Unit::Microseconds, Some(30_943.0)), "30.94 ms");
+        assert_eq!(
+            format_value(Unit::Microseconds, Some(2_500_000.0)),
+            "2.50 s"
+        );
+        assert_eq!(format_value(Unit::Bytes, Some(107_151.36)), "104.6 KiB");
+        assert_eq!(format_value(Unit::Bytes, Some(14_286_848.0)), "13.6 MiB");
+        assert_eq!(format_value(Unit::Cores, Some(0.0009)), "0.00 cores");
+        assert_eq!(format_value(Unit::Count, None), "-");
+        assert_eq!(format_value(Unit::Count, Some(f64::NAN)), "-");
+        assert_eq!(format_value(Unit::Count, Some(-0.2)), "0");
+    }
 }

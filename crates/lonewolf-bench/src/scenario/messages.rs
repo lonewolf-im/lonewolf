@@ -12,7 +12,7 @@ use crate::{
         PhaseBarrier, RateSchedule, RejectedObservation, ReserveError, RouteIdentity,
         ScheduledSlot, SkipReason, Termination,
     },
-    report::{ErrorCategory, PhaseName, PhaseStatus, RunStatus},
+    report::{ErrorCategory, PhaseName, PhaseStatus, ReasonCode},
     run::{RunContext, events::RunEvent, failure, policy},
 };
 use std::{
@@ -95,7 +95,6 @@ pub(crate) struct MessagePhase {
     nonce: [u8; 16],
     phase: TrafficPhase,
     fatal: bool,
-    workload_failed: bool,
     body_bytes: u64,
     wire_bytes: u64,
     errors: std::collections::BTreeMap<ErrorCategory, u64>,
@@ -176,10 +175,8 @@ impl MessagePhase {
                 let operation = match &event.kind {
                     ReceivedKind::Chat { correlation, .. }
                     | ReceivedKind::StanzaError { correlation, .. } => *correlation,
-                    ReceivedKind::StreamError | ReceivedKind::StreamEnd => {
-                        self.fatal = true;
-                        return Err(failure("message_stream_closed"));
-                    }
+                    // The connection actor reports the loss as a closed connection.
+                    ReceivedKind::StreamError | ReceivedKind::StreamEnd => return Ok(()),
                     ReceivedKind::Unexpected => {
                         return self.rejected(RejectedObservation::Unexpected);
                     }
@@ -195,7 +192,6 @@ impl MessagePhase {
                     if index != route.sender_index {
                         return self.rejected(RejectedObservation::WrongRecipient);
                     }
-                    self.workload_failed = true;
                     let category = match condition {
                         "resource-constraint" | "forbidden" | "not-allowed" => {
                             ErrorCategory::Policy
@@ -234,7 +230,6 @@ impl MessagePhase {
                 }
             }
             RunEvent::ConnectionClosed { index, at } => {
-                self.workload_failed = true;
                 self.ledger.observe(OperationEvent::ConnectionClosed {
                     session_index: index,
                     at,
@@ -248,11 +243,6 @@ impl MessagePhase {
     }
 
     fn finish(self, termination: Termination, barrier: PhaseBarrier) -> MeasurementResult {
-        let termination = if self.workload_failed && termination == Termination::Completed {
-            Termination::Failed
-        } else {
-            termination
-        };
         let mut result = self.ledger.finish(FinishReason {
             termination,
             barrier,
@@ -331,10 +321,7 @@ pub async fn run(context: &mut RunContext) -> BenchResult<MeasurementResult> {
         },
     )
     .await?;
-    if warmup.status() != RunStatus::Passed
-        || context.invalid.load(Ordering::Acquire)
-        || context.connections.active() != context.config.account_count() as u64
-    {
+    if !warmup.status().measured() || context.invalid.load(Ordering::Acquire) {
         return Err(failure("message_warmup_failed"));
     }
     run_phase(
@@ -378,7 +365,7 @@ async fn run_phase(
     let start = Instant::now();
     let timeout = Duration::from_millis(context.config.measurement.operation_timeout_ms);
     let shutdown = Duration::from_millis(context.config.measurement.shutdown_timeout_ms);
-    let dispatch_policy = policy(&context.config.measurement);
+    let dispatch_policy = policy(&context.config);
     let mut schedule = RateSchedule::new(
         start,
         settings.duration,
@@ -421,7 +408,6 @@ async fn run_phase(
         nonce: settings.nonce,
         phase: settings.phase,
         fatal: false,
-        workload_failed: false,
         body_bytes: 0,
         wire_bytes: 0,
         errors: Default::default(),
@@ -459,13 +445,6 @@ async fn run_phase(
             if phase
                 .ledger
                 .record_skipped(due.skipped, SkipReason::Scheduler)
-                .is_err()
-            {
-                break Termination::Failed;
-            }
-            if phase
-                .ledger
-                .record_dispatch_batch(due.dispatch.end - due.dispatch.start)
                 .is_err()
             {
                 break Termination::Failed;
@@ -512,7 +491,7 @@ async fn run_phase(
                         .rollback_reservation(operation, SkipReason::WriterBusy),
                     Err(TrySendError::Closed(_)) => phase
                         .ledger
-                        .rollback_reservation(operation, SkipReason::WriterBusy),
+                        .rollback_reservation(operation, SkipReason::Disconnected),
                 };
                 if result.is_err() {
                     invalid = true;
@@ -563,12 +542,6 @@ async fn run_phase(
     } else {
         Err(failure("message_phase_stopped"))
     };
-    let healthy = settled.is_ok()
-        && termination == Termination::Completed
-        && context.message_phase.as_ref().is_some_and(|phase| {
-            phase.ledger.is_settled() && !phase.fatal && !phase.workload_failed
-        })
-        && !*context.interruption.borrow();
     if let Some(index) = drain_index {
         context.finish_phase(
             index,
@@ -579,7 +552,7 @@ async fn run_phase(
             },
         );
     }
-    let barrier = if measuring || !healthy {
+    let barrier = if measuring || settled.is_err() {
         context.close_connections(Instant::now() + shutdown).await;
         PhaseBarrier::RetiredAndDrained
     } else {
@@ -607,7 +580,7 @@ async fn run_phase(
         .take()
         .ok_or_else(|| failure("message_phase_missing"))?
         .finish(termination, barrier);
-    let status = if result.status() == RunStatus::Passed {
+    let status = if result.status().measured() {
         PhaseStatus::Completed
     } else {
         PhaseStatus::Failed
@@ -619,7 +592,9 @@ async fn run_phase(
     let rates = result.rates(settings.duration, settings.rate, settings.topology);
     context.report.phases[phase_index].rates = rates.clone();
     for reason in &result.reasons {
-        context.reason(reason.code, "message_phase_outcome");
+        if measuring || !reason.code.status().measured() {
+            context.reason(reason.code, phase_context(reason.code));
+        }
     }
     if measuring {
         context.report.counters = result.counters.clone();
@@ -630,6 +605,18 @@ async fn run_phase(
         context.refresh_measurement();
     }
     Ok(result)
+}
+
+fn phase_context(code: ReasonCode) -> &'static str {
+    match code {
+        ReasonCode::DriverLimited => "message_operations_skipped",
+        ReasonCode::OperationsFailed => "message_operations_failed",
+        ReasonCode::Interrupted => "interrupted",
+        ReasonCode::EventOverflow => "event_queue_overflow",
+        ReasonCode::HistogramError => "latency_out_of_range",
+        ReasonCode::AccountingError => "message_accounting",
+        _ => "message_phase_failed",
+    }
 }
 
 #[cfg(test)]

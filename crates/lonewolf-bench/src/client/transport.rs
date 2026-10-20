@@ -11,8 +11,8 @@ use std::{
     time::Duration,
 };
 
+use crate::cpu::CpuPool;
 use futures_rustls::TlsConnector;
-use lonewolf_util::blocking::BlockingExecutor;
 use rustls::{
     ClientConfig, RootCertStore,
     client::Resumption,
@@ -139,7 +139,7 @@ pub async fn connect(
     resource: &str,
     key_mode: KeyMode,
     deadline: Instant,
-    cpu: &BlockingExecutor,
+    cpu: &CpuPool,
 ) -> BenchResult<(ClientSession, ConnectTimings)> {
     connect_observed(
         target,
@@ -160,7 +160,7 @@ pub(crate) async fn connect_observed(
     resource: &str,
     key_mode: KeyMode,
     deadline: Instant,
-    cpu: &BlockingExecutor,
+    cpu: &CpuPool,
     observation: &mut ConnectObservation,
 ) -> Result<(ClientSession, ConnectTimings), StageFailure> {
     let mut attempt = ConnectAttempt {
@@ -234,7 +234,7 @@ async fn connect_inner(
     account: &mut PreparedAccount,
     resource: &str,
     key_mode: KeyMode,
-    cpu: &BlockingExecutor,
+    cpu: &CpuPool,
     attempt: &mut ConnectAttempt<'_>,
 ) -> BenchResult<(ClientSession, ConnectTimings)> {
     let observation = &mut attempt.observation;
@@ -1233,7 +1233,7 @@ mod observation_tests {
             tls: remote_tls_config(None)?,
         };
         let mut account = PreparedAccount::new("user@example.test", "password".into())?;
-        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let cpu = CpuPool::new(NonZeroUsize::MIN);
         let mut observation = ConnectObservation::default();
         let unpolled = connect_observed(
             &target,
@@ -1276,7 +1276,7 @@ mod observation_tests {
             tls: remote_tls_config(None)?,
         };
         let mut account = PreparedAccount::new("user@example.test", "password".into())?;
-        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let cpu = CpuPool::new(NonZeroUsize::MIN);
         let mut observation = ConnectObservation::default();
         let before = Instant::now();
         let mut work = Box::pin(connect_observed(

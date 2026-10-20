@@ -35,18 +35,6 @@ pub const RAW_CAPACITY: usize = 64 * 1024 * 1024;
 pub const CONTROL_CAPACITY: usize = 8;
 const BODY_CAPACITY: usize = 1024 * 1024;
 
-pub(crate) fn instrumentation_metadata(server_metrics_enabled: bool) -> InstrumentationMetadata {
-    InstrumentationMetadata {
-        policy_version: 1,
-        server_metrics_enabled,
-        generator_metrics_enabled: true,
-        raw_capacity_bytes: RAW_CAPACITY as u64,
-        control_capacity: CONTROL_CAPACITY as u64,
-        response_body_limit_bytes: BODY_CAPACITY as u64,
-        result_limit_bytes: crate::report::artifacts::RESULT_LIMIT as u64,
-    }
-}
-
 #[derive(Clone)]
 pub struct MetricsEndpoint {
     address: SocketAddr,
@@ -103,24 +91,9 @@ fn failure(context: &'static str) -> BenchError {
     BenchError::new(ErrorCode::Runtime, context)
 }
 
-pub fn allocate_buffer() -> BenchResult<Vec<u8>> {
-    let mut buffer = Vec::new();
-    buffer
-        .try_reserve_exact(RAW_CAPACITY)
-        .map_err(|_| failure("telemetry_allocation"))?;
-    buffer.resize(RAW_CAPACITY, 0);
-    for page in buffer.chunks_mut(4096) {
-        page[0] = std::hint::black_box(1);
-    }
-    buffer.clear();
-    Ok(buffer)
-}
-
 impl TelemetrySampler {
-    pub fn start(config: SamplerConfig, epoch: Instant, buffer: Vec<u8>) -> BenchResult<Self> {
-        if buffer.capacity() != RAW_CAPACITY
-            || !buffer.is_empty()
-            || !(1000..=60_000).contains(&config.timing.interval_ms)
+    pub fn start(config: SamplerConfig, epoch: Instant) -> BenchResult<Self> {
+        if !(1000..=60_000).contains(&config.timing.interval_ms)
             || !(1..=10_000).contains(&config.timing.timeout_ms)
         {
             return Err(failure("telemetry_configuration"));
@@ -132,7 +105,6 @@ impl TelemetrySampler {
         let task = tokio::spawn(sample_loop(
             config,
             epoch,
-            buffer,
             receiver,
             stopped,
             overflows.clone(),
@@ -217,11 +189,11 @@ async fn scrape(
             if response.status() != http::StatusCode::OK {
                 return Err("http_status");
             }
-            if !response
+            if response
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.split(';').next() == Some("application/openmetrics-text"))
+                .is_none_or(|v| v.split(';').next() != Some("application/openmetrics-text"))
             {
                 return Err("content_type");
             }
@@ -534,7 +506,6 @@ impl ReadyBoundary {
 async fn sample_loop(
     config: SamplerConfig,
     epoch: Instant,
-    mut raw: Vec<u8>,
     mut control: mpsc::Receiver<PhaseSampleRequest>,
     mut stopped: watch::Receiver<Option<Instant>>,
     overflows: Arc<AtomicU64>,
@@ -544,18 +515,9 @@ async fn sample_loop(
     registry.register_collector(Box::new(lonewolf_metrics::ProcessCollector::new()));
     let mut report = TelemetryReport {
         quality: TelemetryStatus::Complete,
-        samples_ok: 0,
-        samples_failed: 0,
-        missed_ticks: 0,
-        queue_overflows: 0,
-        bytes: 0,
-        total_scrape_duration_ms: 0,
-        server: ResourceSummary::default(),
-        generator: ResourceSummary::default(),
-        policy_rejections: Default::default(),
-        identity_changes: 0,
-        reasons: Vec::new(),
+        ..TelemetryReport::default()
     };
+    let mut raw = Vec::new();
     let interval = Duration::from_millis(config.timing.interval_ms);
     let mut next_tick = Instant::now() + interval;
     let mut initial_sample = true;
@@ -573,7 +535,6 @@ async fn sample_loop(
     let mut ready = ReadyBoundary {
         completion: Some(ready_send),
     };
-    let mut total_duration_ns = 0u128;
     loop {
         let nominal_end = current.window.map(|(_, end)| end).filter(|_| !end_sampled);
         if !initial_sample {
@@ -667,7 +628,6 @@ async fn sample_loop(
                 );
             }
             let bytes = body.as_ref().map_or(0, String::len);
-            report.bytes += bytes as u64;
             if !output_limited
                 && !append_raw(
                     &mut raw,
@@ -693,15 +653,12 @@ async fn sample_loop(
                 output_limited = true;
                 reason(&mut report, ReasonCode::TelemetryPartial, "output_limit");
             }
-            total_duration_ns += Instant::now().duration_since(sample_start).as_nanos();
         }
         ready.complete();
         if Instant::now().duration_since(start) > interval {
             reason(&mut report, ReasonCode::TelemetryPartial, "slow_scrape");
         }
     }
-    report.total_scrape_duration_ms =
-        (total_duration_ns / 1_000_000).min(u128::from(u64::MAX)) as u64;
     report.queue_overflows = overflows.load(Ordering::Relaxed);
     if report.queue_overflows > 0 {
         reason(&mut report, ReasonCode::TelemetryPartial, "queue_overflow");

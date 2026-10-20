@@ -7,8 +7,9 @@ use crate::{
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Runs repeatable XMPP workloads against a Lonewolf server and compares results.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -16,21 +17,34 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Run one workload and write its results to a new directory.
+    ///
+    /// Exit codes: 0 passed, 3 degraded, 1 failed, 2 invalid, 130 interrupted.
     Run {
+        /// Workload configuration file in TOML format.
         #[arg(long)]
         config: PathBuf,
+        /// New directory for the results. It must not exist yet.
         #[arg(long)]
         output: PathBuf,
+        /// Server executable to start, overriding the configuration in local mode.
         #[arg(long)]
         server_binary: Option<PathBuf>,
     },
+    /// Generate or provision test accounts for a remote server.
     Accounts {
         #[command(subcommand)]
         command: AccountsCommand,
     },
+    /// Compare two result directories and write the differences to a new directory.
+    ///
+    /// Exit codes: 0 comparable, 2 refused.
     Compare {
+        /// Result directory of the reference run.
         baseline_dir: PathBuf,
+        /// Result directory of the run to compare against the baseline.
         candidate_dir: PathBuf,
+        /// New directory for the comparison. It must not exist yet.
         #[arg(long)]
         output: PathBuf,
     },
@@ -38,19 +52,27 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum AccountsCommand {
+    /// Write random credentials for new accounts to a private file.
     Generate {
+        /// XMPP domain of the accounts.
         #[arg(long)]
         domain: String,
+        /// Local part prefix. Accounts are named PREFIX-000000, PREFIX-000001 and so on.
         #[arg(long)]
         prefix: String,
+        /// Number of accounts to generate.
         #[arg(long)]
         count: usize,
+        /// New credentials file. It is created with owner-only permissions.
         #[arg(long)]
         output: PathBuf,
     },
+    /// Create the accounts from a credentials file through the server's admin socket.
     Provision {
+        /// Path of the server's Unix admin socket.
         #[arg(long)]
         socket: PathBuf,
+        /// Credentials file written by the generate command.
         #[arg(long)]
         credentials: PathBuf,
     },
@@ -78,7 +100,7 @@ impl Cli {
                         BenchError::new(ErrorCode::Runtime, "cannot construct driver runtime")
                     })?;
                 let report = runtime.block_on(crate::run(config, &output))?;
-                println!("{:?}", report.status);
+                println!("{}", report.status.as_str());
                 Ok(report.status.exit_code())
             }
             Command::Accounts {
@@ -99,7 +121,7 @@ impl Cli {
             } => {
                 let report =
                     crate::compare::compare_directories(&baseline_dir, &candidate_dir, &output)?;
-                Ok(if report.eligible { 0 } else { 2 })
+                Ok(if report.comparable { 0 } else { 2 })
             }
             Command::Accounts {
                 command:
@@ -231,7 +253,7 @@ mod run_exit_tests {
         let config_path = directory.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='/absent/lonewolf'\n[scenario]\nkind='idle'\nconnections=1",
+            "[target]\nmode='local'\nserver_binary='/absent/lonewolf'\n[scenario]\nkind='idle'\nconnections=1",
         )?;
         let output = directory.path().join("output");
         let status = Cli {

@@ -23,15 +23,10 @@ fn main() {
             println!("cargo::rerun-if-changed={path}");
         }
     }
-    for name in ["PROFILE", "TARGET", "RUSTC"] {
-        println!("cargo::rerun-if-env-changed={name}");
-    }
-    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    println!("cargo::rerun-if-env-changed=PROFILE");
     for (key, value) in [
         ("REVISION", output("git", &["rev-parse", "HEAD"])),
         ("PROFILE", env::var("PROFILE").ok()),
-        ("TARGET", env::var("TARGET").ok()),
-        ("RUSTC", output(&rustc, &["-Vv"])),
     ] {
         println!(
             "cargo::rustc-env=LONEWOLF_BENCH_{key}={}",

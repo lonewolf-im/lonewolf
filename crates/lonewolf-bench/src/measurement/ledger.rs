@@ -50,6 +50,7 @@ pub enum SkipReason {
     InFlight,
     WriterBusy,
     AccountBusy,
+    Disconnected,
     Cancelled,
 }
 
@@ -457,29 +458,21 @@ impl Ledger {
         self.record_samples(samples)
     }
 
-    pub fn record_dispatch_batch(&mut self, count: u64) -> BenchResult<()> {
-        if count > 4096 {
-            return Err(self.accounting("dispatch batch exceeds bound"));
-        }
-        self.counters.max_dispatch_batch_observed =
-            self.counters.max_dispatch_batch_observed.max(count);
-        Ok(())
-    }
-
     fn count_skip(&mut self, reason: SkipReason, count: u64) -> BenchResult<()> {
         let value = match reason {
             SkipReason::Scheduler => &mut self.counters.skipped_scheduler,
             SkipReason::InFlight => &mut self.counters.skipped_in_flight,
             SkipReason::WriterBusy => &mut self.counters.skipped_writer_busy,
             SkipReason::AccountBusy => &mut self.counters.skipped_account_busy,
+            SkipReason::Disconnected => &mut self.counters.skipped_disconnected,
             SkipReason::Cancelled => &mut self.counters.cancelled_before_dispatch,
         };
         increment(value, count, &mut self.reasons)?;
         if count > 0 {
             self.reason(match reason {
-                SkipReason::Scheduler => ReasonCode::SchedulerMiss,
                 SkipReason::Cancelled => ReasonCode::Interrupted,
-                _ => ReasonCode::ConfiguredCapacity,
+                SkipReason::Disconnected => ReasonCode::OperationsFailed,
+                _ => ReasonCode::DriverLimited,
             });
         }
         Ok(())
@@ -542,12 +535,16 @@ impl Ledger {
                 1,
                 &mut self.reasons,
             ),
-            OperationEvent::ConnectionClosed { session_index, at } => {
+            OperationEvent::ConnectionClosed {
+                session_index,
+                at: _,
+            } => {
                 let accounts = match self.context.topology {
                     LedgerTopology::Messages { pairs } => pairs.get() * 2,
                     LedgerTopology::Churn { accounts } => accounts.get(),
                 };
-                if session_index >= accounts || at < self.context.start {
+                // A closure detected just before the phase can be consumed after it starts.
+                if session_index >= accounts {
                     return Err(self.accounting("invalid connection closure"));
                 }
                 increment(
@@ -893,8 +890,8 @@ impl Ledger {
             Termination::Failed => self.reason(ReasonCode::WorkloadFailure),
             Termination::Completed => {}
         }
-        let may_finalize =
-            reason.barrier == PhaseBarrier::RetiredAndDrained || self.active.is_empty();
+        let may_finalize = reason.barrier == PhaseBarrier::RetiredAndDrained
+            || self.active.values().all(|active| active.expired);
         if !may_finalize {
             self.reason(ReasonCode::AccountingError);
         }
@@ -958,35 +955,22 @@ impl Ledger {
         let c = &self.counters;
         if [
             c.write_failed,
-            c.write_cancelled,
             c.unreceived_timeout,
             c.unreceived_connection_closed,
             c.unreceived_send_failed,
-            c.unreceived_cancelled,
+            c.late_receipts,
+            c.duplicates,
+            c.unknown_ids,
+            c.wrong_recipient,
+            c.unexpected_disconnects,
             c.login_failed,
             c.close_failed,
         ]
         .iter()
         .any(|&count| count > 0)
+            && reason.termination != Termination::Cancelled
         {
-            self.reason(ReasonCode::WorkloadFailure);
-        }
-        let all_succeeded = self.counters.planned > 0
-            && self.counters.dispatched == self.counters.planned
-            && match self.context.topology {
-                LedgerTopology::Messages { .. } => {
-                    self.counters.received_on_time == self.counters.dispatched
-                        && self.counters.write_succeeded == self.counters.dispatched
-                }
-                LedgerTopology::Churn { .. } => {
-                    self.counters.closed_cleanly == self.counters.dispatched
-                }
-            };
-        if self.context.phase == TrafficPhase::Warmup
-            && reason.barrier == PhaseBarrier::RetiredAndDrained
-            && all_succeeded
-        {
-            self.reason(ReasonCode::WarmupObservationLag);
+            self.reason(ReasonCode::OperationsFailed);
         }
         MeasurementResult {
             counters: self.counters,
@@ -1014,6 +998,7 @@ impl Ledger {
                 c.skipped_in_flight,
                 c.skipped_writer_busy,
                 c.skipped_account_busy,
+                c.skipped_disconnected,
                 c.cancelled_before_dispatch,
             ])?
             && c.dispatched == sum(&[c.dispatched_in_window, c.dispatched_during_drain])?

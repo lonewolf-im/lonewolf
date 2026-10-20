@@ -15,6 +15,23 @@ fn host_info_lists_the_server_identity_and_disco_features() -> TestResult {
 }
 
 #[test]
+fn host_info_lists_features_of_enabled_extensions() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'offline', 'disco'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<iq type='get' to='localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='info' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:roster'/><feature var='msgoffline'/></query></iq>")?;
+    alice.close()?;
+
+    let suite = C2sSuite::with_extensions("'offline', 'disco'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<iq type='get' to='localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='info' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='msgoffline'/></query></iq>")?;
+    alice.close()
+}
+
+#[test]
 fn host_items_list_hosted_service_domains() -> TestResult {
     let suite = C2sSuite::with_extensions("'disco', 'test-service'")?;
     suite.create_account("alice", PASSWORD)?;

@@ -23,6 +23,7 @@ use crate::{
 };
 
 pub const NAME: &str = "offline";
+pub const DISCO_FEATURE: &str = "msgoffline";
 const DEFAULT_MAX_MESSAGES_PER_ACCOUNT: NonZeroU32 = NonZeroU32::new(100).unwrap();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +104,7 @@ impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Offline {
         _host: &str,
         slots: &mut Slots<'_, A, S>,
     ) -> Result<(), RegistrationError> {
+        slots.disco_feature(crate::discovery::DiscoScope::Server, DISCO_FEATURE);
         slots.account(self.clone());
         slots.offline(self)
     }

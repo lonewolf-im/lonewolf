@@ -24,6 +24,7 @@ use crate::account::AccountHandler;
 use crate::delivery::{
     Delivery, DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
 };
+use crate::discovery::DiscoScope;
 use crate::iq::{IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope};
 use crate::presence::{
     PresenceAudience, PresenceFuture, PresenceHandler, PresenceRequest, PresenceRequestType,
@@ -227,6 +228,7 @@ where
         for kind in PresenceRequestType::ALL {
             slots.presence(kind, self.clone())?;
         }
+        slots.disco_feature(DiscoScope::Server, NAMESPACE);
         slots.stream_feature(VERSIONING_FEATURE);
         slots.stream_feature(PRE_APPROVAL_FEATURE);
         slots.account(self);

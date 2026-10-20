@@ -255,6 +255,28 @@ fn discovery_lists_registered_services() -> Result<(), RegistrationError> {
 }
 
 #[test]
+fn builtin_extensions_declare_their_discovery_features() -> Result<(), RegistrationError> {
+    let mut extensions = TestExtensions::default();
+    for factory in super::builtin() {
+        extensions.register_factory(factory)?;
+    }
+
+    let enabled = extensions.enable_host("example.com", ["roster", "offline"])?;
+    assert_eq!(
+        enabled.discovery().features(DiscoScope::Server),
+        ["jabber:iq:roster", "msgoffline"]
+    );
+    assert!(enabled.discovery().features(DiscoScope::Account).is_empty());
+
+    let roster_only = extensions.enable_host("example.com", ["roster"])?;
+    assert_eq!(
+        roster_only.discovery().features(DiscoScope::Server),
+        ["jabber:iq:roster"]
+    );
+    Ok(())
+}
+
+#[test]
 fn discovery_info_lists_identities_then_features() -> Result<(), Box<dyn Error>> {
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let element = info_in(

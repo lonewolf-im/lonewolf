@@ -318,10 +318,12 @@ fn serve(
             attr(&bind, "id")?
         )
     };
-    tls.send(&reply, fragment)?;
     let (send, receive) = mpsc::channel();
     routes.lock().insert(jid.clone(), send);
-    let result = traffic(&mut tls, behavior, &jid, &routes, receive, &stop, &messages);
+    let result = (|| {
+        tls.send(&reply, fragment)?;
+        traffic(&mut tls, behavior, &jid, &routes, receive, &stop, &messages)
+    })();
     routes.lock().remove(&jid);
     result
 }

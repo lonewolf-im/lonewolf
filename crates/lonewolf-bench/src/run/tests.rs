@@ -289,6 +289,7 @@ async fn remote_credential_and_target_failures_keep_partial_evidence() -> TestRe
     let directory = tempfile::tempdir()?;
     let credentials = directory.path().join("credentials.json");
     let mut config = config(2)?;
+    config.measurement.connect_concurrency = 1;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     config.target = TargetConfig::Remote {

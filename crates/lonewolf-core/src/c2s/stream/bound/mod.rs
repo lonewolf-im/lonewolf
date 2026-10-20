@@ -15,9 +15,10 @@ use std::time::SystemTime;
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{Either, Shared, join, select};
+use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::discovery::Discovery;
-use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope};
+use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester};
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
@@ -1041,6 +1042,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                                 sender,
                                 target,
                                 discovery: &discovery,
+                                requester: None,
                                 payload,
                             },
                             &mut transaction,
@@ -2626,22 +2628,61 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
     }
 }
 
-async fn require_iq_account(
+#[derive(Clone, Copy)]
+enum IqTarget {
+    Server,
+    Present,
+    Missing,
+}
+
+async fn iq_target(
     transaction: &impl AccountReads,
     target: Option<&AccountKey>,
-) -> Result<(), HandlerError> {
+) -> Result<IqTarget, HandlerError> {
     let Some(target) = target else {
-        return Ok(());
+        return Ok(IqTarget::Server);
     };
     match transaction.account(target).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(StanzaErrorCondition::ServiceUnavailable.into()),
+        Ok(Some(_)) => Ok(IqTarget::Present),
+        Ok(None) => Ok(IqTarget::Missing),
         Err(AccountError::Storage(error)) => Err(HandlerError::Internal {
             condition: StanzaErrorCondition::InternalServerError,
             failure: storage_failure(error, "iq_account_read"),
         }),
         Err(_) => Err(StanzaErrorCondition::InternalServerError.into()),
     }
+}
+
+async fn require_iq_account(
+    transaction: &impl AccountReads,
+    target: Option<&AccountKey>,
+) -> Result<(), HandlerError> {
+    match iq_target(transaction, target).await? {
+        IqTarget::Missing => Err(StanzaErrorCondition::ServiceUnavailable.into()),
+        IqTarget::Server | IqTarget::Present => Ok(()),
+    }
+}
+
+async fn iq_requester<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    account: &AccountKey,
+    sender: JidRef<'_>,
+    transaction: &RedbRead,
+) -> Result<Requester, HandlerError> {
+    if sender.bare().as_str() == account.as_str() {
+        return Ok(Requester::Owner);
+    }
+    let Some(handler) = router
+        .presence_handlers(account.domain())
+        .and_then(|handlers| handlers.find(PresenceRequestType::Available))
+    else {
+        return Ok(Requester::Other);
+    };
+    Ok(if handler.visibility(account, sender, transaction).await? {
+        Requester::PresenceAuthorized
+    } else {
+        Requester::Other
+    })
 }
 
 struct GetWork<A: ChunkAllocator> {
@@ -2680,9 +2721,9 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
             mut response,
             delivery,
         } = self;
-        let reply = match require_iq_account(&transaction, target_account.as_ref()).await {
+        let reply = match iq_target(&transaction, target_account.as_ref()).await {
             Err(error) => Err(error),
-            Ok(()) => {
+            Ok(iq_target) => {
                 let sender = sender.resolve(&arena)?;
                 let stanza = request.resolve(&arena)?;
                 let target = stanza.to()?.unwrap_or_else(|| sender.bare());
@@ -2691,13 +2732,43 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                     .next()
                     .transpose()?
                     .ok_or(CloseOutcome::InternalError)?;
-                let iq_request = IqRequest {
-                    sender,
-                    target,
-                    discovery: &discovery,
-                    payload,
+                let requester = match iq_target {
+                    IqTarget::Server => Ok(None),
+                    IqTarget::Present => {
+                        let account = target_account.as_ref().ok_or(CloseOutcome::InternalError)?;
+                        iq_requester(delivery.router(), account, sender, &transaction)
+                            .await
+                            .map(Some)
+                    }
+                    IqTarget::Missing => {
+                        let account = target_account.as_ref().ok_or(CloseOutcome::InternalError)?;
+                        Ok(Some(if sender.bare().as_str() == account.as_str() {
+                            Requester::Owner
+                        } else {
+                            Requester::Other
+                        }))
+                    }
                 };
-                handler.get(iq_request, &transaction, &mut response).await
+                match requester {
+                    Err(error) => Err(error),
+                    Ok(requester) => {
+                        let iq_request = IqRequest {
+                            sender,
+                            target,
+                            discovery: &discovery,
+                            requester,
+                            payload,
+                        };
+                        match iq_target {
+                            IqTarget::Missing => handler
+                                .get_missing_account(iq_request, &mut response)
+                                .map(|payload| IqReply::new(payload, Effects::none())),
+                            IqTarget::Server | IqTarget::Present => {
+                                handler.get(iq_request, &transaction, &mut response).await
+                            }
+                        }
+                    }
+                }
             }
         };
         drop(transaction);

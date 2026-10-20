@@ -25,3 +25,26 @@ pub const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
 pub const ROSTER_VERSIONING_NAMESPACE: &str = "urn:xmpp:features:rosterver";
 pub const PRE_APPROVAL_NAMESPACE: &str = "urn:xmpp:features:pre-approval";
 pub const STREAM_ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-streams";
+
+pub fn barrier(client: &mut Client) -> TestResult {
+    client.send("<iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")
+}
+
+pub fn mutually_subscribe(
+    left: &mut Client,
+    left_name: &str,
+    right: &mut Client,
+    right_name: &str,
+) -> TestResult {
+    left.send(&format!(
+        "<presence type='subscribed' to='{right_name}@localhost'/>"
+    ))?;
+    barrier(left)?;
+    right.send(&format!("<presence type='subscribe' to='{left_name}@localhost'/><presence type='subscribed' to='{left_name}@localhost'/>"))?;
+    barrier(right)?;
+    left.send(&format!(
+        "<presence type='subscribe' to='{right_name}@localhost'/>"
+    ))?;
+    barrier(left)
+}

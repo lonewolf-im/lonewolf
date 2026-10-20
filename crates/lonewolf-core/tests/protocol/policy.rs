@@ -2,7 +2,7 @@
 
 use crate::support::PASSWORD;
 
-use super::support::{C2sSuite, Client, TestResult};
+use super::support::{C2sSuite, Client, TestResult, barrier, mutually_subscribe};
 
 #[test]
 fn outbound_rejection_carries_the_application_condition() -> TestResult {
@@ -152,29 +152,6 @@ fn toggle(client: &mut Client, enabled: bool) -> TestResult {
     assert_eq!(reply.attribute("from"), Some("localhost"), "{reply:?}");
     assert!(reply.children.is_empty(), "{reply:?}");
     Ok(())
-}
-
-fn barrier(client: &mut Client) -> TestResult {
-    client.send("<iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
-    client.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")
-}
-
-fn mutually_subscribe(
-    left: &mut Client,
-    left_name: &str,
-    right: &mut Client,
-    right_name: &str,
-) -> TestResult {
-    left.send(&format!(
-        "<presence type='subscribed' to='{right_name}@localhost'/>"
-    ))?;
-    barrier(left)?;
-    right.send(&format!("<presence type='subscribe' to='{left_name}@localhost'/><presence type='subscribed' to='{left_name}@localhost'/>"))?;
-    barrier(right)?;
-    left.send(&format!(
-        "<presence type='subscribe' to='{right_name}@localhost'/>"
-    ))?;
-    barrier(left)
 }
 
 #[test]

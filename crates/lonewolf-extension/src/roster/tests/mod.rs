@@ -30,7 +30,7 @@ use crate::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup, SessionTag, StanzaFactory,
 };
 use crate::discovery::Discovery;
-use crate::iq::{IqHandler, IqReply, IqRequest, IqRequestType};
+use crate::iq::{IqHandler, IqReply, IqRequest, IqRequestType, Requester};
 use crate::presence::{
     PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
     PresenceTransition, PresenceUpdate,
@@ -270,6 +270,7 @@ impl IqCall {
             sender,
             target: sender.bare(),
             discovery: &discovery,
+            requester: (kind == IqRequestType::Get).then_some(Requester::Owner),
             payload,
         };
         match kind {
@@ -1746,6 +1747,7 @@ fn current_version_get_skips_legacy_metadata_and_uses_its_consistent_snapshot()
             sender,
             target: sender.bare(),
             discovery: &discovery,
+            requester: Some(Requester::Owner),
             payload,
         };
         let reply = <Roster as IqHandler<GlobalChunkAllocator, RedbStorage>>::get(

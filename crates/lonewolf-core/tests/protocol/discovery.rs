@@ -2,7 +2,7 @@
 
 use lonewolf_extension::discovery::{INFO_NAMESPACE, ITEMS_NAMESPACE};
 
-use crate::support::{C2sSuite, PASSWORD, TestResult};
+use crate::support::{C2sSuite, PASSWORD, TestResult, mutually_subscribe};
 
 #[test]
 fn host_info_lists_the_server_identity_and_disco_features() -> TestResult {
@@ -72,4 +72,127 @@ fn hosts_without_disco_do_not_answer_discovery() -> TestResult {
         alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='disabled' from='localhost'><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
     }
     alice.close()
+}
+
+#[test]
+fn owners_receive_account_info() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'disco'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send(
+        "<iq type='get' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='info' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/></query></iq>")?;
+    alice.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='info' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/></query></iq>")?;
+    alice.close()
+}
+
+#[test]
+fn account_info_requires_presence_authorization() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'disco'")?;
+    for user in ["alice", "bob"] {
+        suite.create_account(user, PASSWORD)?;
+    }
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    bob.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
+    bob.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='result' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/></query></iq>")?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn missing_and_hidden_accounts_answer_alike() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'disco'")?;
+    for user in ["alice", "bob"] {
+        suite.create_account(user, PASSWORD)?;
+    }
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    for namespace in [INFO_NAMESPACE, ITEMS_NAMESPACE] {
+        for node in ["", " node='x'"] {
+            let mut replies = Vec::with_capacity(2);
+            for target in ["missing", "alice"] {
+                bob.send(&format!("<iq type='get' to='{target}@localhost' id='query'><query xmlns='{namespace}'{node}/></iq>"))?;
+                let reply = bob.receive()?;
+                if namespace == INFO_NAMESPACE {
+                    reply.assert_xml(&format!("<iq xmlns='jabber:client' type='error' id='query' from='{target}@localhost' to='bob@localhost/desk'><query xmlns='{namespace}'{node}/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                } else {
+                    reply.assert_xml(&format!("<iq xmlns='jabber:client' type='result' id='query' from='{target}@localhost' to='bob@localhost/desk'><query xmlns='{namespace}'{node}/></iq>"))?;
+                }
+                replies.push(reply);
+            }
+            assert_eq!(replies[0].children, replies[1].children);
+        }
+    }
+    bob.close()
+}
+
+#[test]
+fn account_items_list_resources_by_relationship() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'disco'")?;
+    for user in ["alice", "bob", "carol"] {
+        suite.create_account(user, PASSWORD)?;
+    }
+    let mut alice_desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut alice_phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    mutually_subscribe(&mut alice_desk, "alice", &mut bob, "bob")?;
+    alice_desk.send("<presence id='avail'/>")?;
+    alice_desk.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost' id='avail'/>")?;
+    alice_desk.send("<iq type='get' to='alice@localhost' id='items'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    alice_desk.expect_xml("<iq xmlns='jabber:client' type='result' id='items' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'><item jid='alice@localhost/desk'/><item jid='alice@localhost/phone'/></query></iq>")?;
+    bob.send("<iq type='get' to='alice@localhost' id='items'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='result' id='items' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'><item jid='alice@localhost/desk'/></query></iq>")?;
+    carol.send("<iq type='get' to='alice@localhost' id='items'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    carol.expect_xml("<iq xmlns='jabber:client' type='result' id='items' from='alice@localhost' to='carol@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    alice_phone.close()?;
+    suite.wait_for_log("stream disconnected")?;
+    alice_desk.send("<iq type='get' to='alice@localhost' id='after-close'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    alice_desk.expect_xml("<iq xmlns='jabber:client' type='result' id='after-close' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'><item jid='alice@localhost/desk'/></query></iq>")?;
+    alice_desk.close()?;
+    bob.close()?;
+    carol.close()
+}
+
+#[test]
+fn account_queries_for_a_node() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'disco'")?;
+    for user in ["alice", "carol"] {
+        suite.create_account(user, PASSWORD)?;
+    }
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    for namespace in [INFO_NAMESPACE, ITEMS_NAMESPACE] {
+        alice.send(&format!("<iq type='get' to='alice@localhost' id='node'><query xmlns='{namespace}' node='x'/></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='alice@localhost/desk'><query xmlns='{namespace}' node='x'/><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+    }
+    carol.send("<iq type='get' to='alice@localhost' id='node'><query xmlns='http://jabber.org/protocol/disco#items' node='x'/></iq>")?;
+    carol.expect_xml("<iq xmlns='jabber:client' type='result' id='node' from='alice@localhost' to='carol@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items' node='x'/></iq>")?;
+    carol.send("<iq type='get' to='alice@localhost' id='node'><query xmlns='http://jabber.org/protocol/disco#info' node='x'/></iq>")?;
+    carol.expect_xml("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='carol@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info' node='x'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.close()?;
+    carol.close()
+}
+
+#[test]
+fn without_roster_only_owners_see_account_data() -> TestResult {
+    let suite = C2sSuite::with_extensions("'disco'")?;
+    for user in ["alice", "bob"] {
+        suite.create_account(user, PASSWORD)?;
+    }
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    bob.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    bob.send("<iq type='get' to='alice@localhost' id='items'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='result' id='items' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    alice.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='info' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/></query></iq>")?;
+    alice.close()?;
+    bob.close()
 }

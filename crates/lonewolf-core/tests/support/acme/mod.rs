@@ -39,17 +39,103 @@ fn prepare_blocking_stream(socket: &std::net::TcpStream) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+
+    fn accept_until(
+        deadline: Instant,
+        mut accept: impl FnMut() -> io::Result<(TcpStream, SocketAddr)>,
+    ) -> io::Result<(TcpStream, SocketAddr)> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ACME fixture accept timed out",
+                ));
+            }
+            match accept() {
+                Ok(accepted) => return Ok(accepted),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(
+                        Duration::from_millis(2)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[test]
+    fn accept_waits_for_connection_after_would_block() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let deadline = Instant::now() + TIMEOUT;
+        let mut client = None;
+        let (_, peer) = accept_until(deadline, || {
+            if client.is_none() {
+                let error = listener.accept().unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                client = Some(TcpStream::connect_timeout(
+                    &address,
+                    deadline.saturating_duration_since(Instant::now()),
+                )?);
+                return Err(error);
+            }
+            listener.accept()
+        })?;
+        assert_eq!(
+            peer,
+            client.ok_or("client was not connected")?.local_addr()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accept_deadline_bounds_waiting() {
+        let mut attempts = 0;
+        let error = accept_until(Instant::now() - Duration::from_millis(1), || {
+            attempts += 1;
+            Err(io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempts, 0);
+
+        let error = accept_until(Instant::now() + Duration::from_millis(10), || {
+            Err(io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn accept_propagates_other_errors() {
+        let mut attempts = 0;
+        let error = accept_until(Instant::now() + TIMEOUT, || {
+            attempts += 1;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "distinct accept failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "distinct accept failure");
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn accepted_nonblocking_stream_is_normalized_for_bounded_http_io() -> TestResult {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + TIMEOUT;
         let mut client = TcpStream::connect_timeout(&listener.local_addr()?, TIMEOUT)?;
         client.set_read_timeout(Some(TIMEOUT))?;
         client.set_write_timeout(Some(TIMEOUT))?;
-        let (mut accepted, _) = listener.accept()?;
+        let (mut accepted, _) = accept_until(deadline, || listener.accept())?;
         accepted.set_nonblocking(true)?;
         let mut byte = [0];
         assert_eq!(

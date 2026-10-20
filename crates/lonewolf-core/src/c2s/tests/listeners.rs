@@ -15,6 +15,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use parking_lot::Mutex as PlMutex;
+use socket2::{Domain, Protocol, Socket, Type};
 use tracing::instrument::WithSubscriber;
 
 use super::*;
@@ -539,13 +540,38 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
 #[test]
 fn ipv6_and_ipv4_wildcards_can_use_the_same_port() -> TestResult {
     run_test(async {
-        let ipv6 = bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))).await?;
+        let reservation = TcpSocket::new_v6().await?;
+        SockRef::from(&reservation).set_only_v6(false)?;
+        reservation.set_reuseaddr(true)?;
+        reservation.set_reuseport(true)?;
+        reservation
+            .bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)))
+            .await?;
+        let port = reservation.local_addr()?.port();
+        let ipv6_address = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+        let ipv4_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        for address in [ipv6_address, ipv4_address] {
+            let socket = Socket::new(
+                Domain::for_address(address),
+                Type::STREAM,
+                Some(Protocol::TCP),
+            )?;
+            if address.is_ipv6() {
+                socket.set_only_v6(true)?;
+            }
+            assert_eq!(
+                socket.bind(&address.into()).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse
+            );
+        }
+        let ipv6 = bind(ipv6_address).await?;
         assert!(SockRef::from(&ipv6).only_v6()?);
-        let port = ipv6.local_addr()?.port();
-        let ipv4 = bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))).await?;
+        let ipv4 = bind(ipv4_address).await?;
+        assert_eq!(ipv6.local_addr()?.port(), port);
         assert_eq!(ipv4.local_addr()?.port(), port);
         ipv4.close().await?;
         ipv6.close().await?;
+        drop(reservation);
         Ok(())
     })
 }

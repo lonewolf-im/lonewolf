@@ -2,14 +2,15 @@
 
 use std::cell::RefCell;
 use std::error::Error;
-use std::future::pending;
+use std::future::{Future, pending, ready};
 use std::io::{Read, Write};
-use std::net::{TcpListener as StdListener, TcpStream as StdStream};
+use std::net::{Ipv4Addr, TcpListener as StdListener, TcpStream as StdStream};
 
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
+use socket2::{Domain, Protocol, Socket, Type};
 
 use super::*;
 use crate::{ChallengeLease, ManagedHost};
@@ -18,6 +19,90 @@ type TestResult = Result<(), Box<dyn Error>>;
 const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz_012345";
 const AUTHORIZATION: &str =
     "abcdefghijklmnopqrstuvwxyz_012345.abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+
+fn bind_reusable_socket(address: SocketAddr) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    Ok(socket)
+}
+
+fn reserve_listener_address() -> io::Result<(Socket, SocketAddr)> {
+    // A wildcard reservation excludes automatic port allocation without taking the exact endpoint.
+    let reservation = bind_reusable_socket((Ipv4Addr::UNSPECIFIED, 0).into())?;
+    let address = reservation
+        .local_addr()?
+        .as_socket()
+        .ok_or_else(|| io::Error::other("missing reservation address"))?;
+    Ok((reservation, (Ipv4Addr::LOCALHOST, address.port()).into()))
+}
+
+fn bind_reusable_listener(address: SocketAddr) -> io::Result<Socket> {
+    let socket = bind_reusable_socket(address)?;
+    socket.listen(128)?;
+    Ok(socket)
+}
+
+async fn bind_after_release<T, F, B>(
+    addresses: &[SocketAddr],
+    deadline: Instant,
+    mut bind: F,
+) -> io::Result<T>
+where
+    F: FnMut() -> B,
+    B: Future<Output = io::Result<T>>,
+{
+    loop {
+        match bind().await {
+            Ok(socket) => return Ok(socket),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("listeners {addresses:?} remain in use after the cleanup deadline"),
+                    ));
+                }
+                compio::time::sleep_until((now + Duration::from_millis(5)).min(deadline)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn bind_released_listener(address: SocketAddr, deadline: Instant) -> io::Result<Socket> {
+    bind_after_release(std::slice::from_ref(&address), deadline, || {
+        ready(bind_reusable_listener(address))
+    })
+    .await
+}
+
+#[test]
+fn release_probe_rejects_a_live_listener_and_waits_for_delayed_release() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (_reservation, address) = reserve_listener_address()?;
+        let listener = bind_reusable_listener(address)?;
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert_eq!(
+            bind_released_listener(address, deadline)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(Instant::now() >= deadline);
+        let (replacement, ()) = futures_util::future::join(
+            bind_released_listener(address, Instant::now() + Duration::from_secs(2)),
+            async {
+                compio::time::sleep(Duration::from_millis(5)).await;
+                drop(listener);
+            },
+        )
+        .await;
+        let _replacement = replacement?;
+        Ok(())
+    })
+}
 
 fn challenges() -> (Challenges, ChallengeLease, ChallengeLease) {
     let challenges = Challenges::new(&["one.example", "two.example"].map(|name| ManagedHost {
@@ -304,12 +389,17 @@ async fn request(address: SocketAddr, request: String) -> io::Result<String> {
 fn bound_endpoints_share_challenges_and_release_sockets_on_shutdown() -> TestResult {
     Runtime::new()?.block_on(async {
         let (challenges, _one, _two) = challenges();
-        let server = Http01Server::bind(
-            &["127.0.0.1:0".parse()?, "127.0.0.1:0".parse()?],
-            challenges.clone(),
-        )
-        .await?;
-        let addresses = server.local_addrs()?;
+        let (_first_reservation, first) = reserve_listener_address()?;
+        let (_second_reservation, second) = reserve_listener_address()?;
+        let addresses = [first, second];
+        let server = Http01Server::bind(&addresses, challenges.clone()).await?;
+        assert_eq!(server.local_addrs()?, addresses);
+        for address in addresses {
+            assert_eq!(
+                bind_reusable_listener(address).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse
+            );
+        }
         let (stop, stopped) = oneshot::channel();
         let task = compio::runtime::spawn(server.run(async { stopped.await.unwrap() }));
         for address in &addresses {
@@ -329,7 +419,11 @@ fn bound_endpoints_share_challenges_and_release_sockets_on_shutdown() -> TestRes
         stop.send(Instant::now()).unwrap();
         timeout(Duration::from_secs(2), task).await???;
         assert!(challenges.lookup("one.example", TOKEN).is_none());
-        let restarted = Http01Server::bind(&addresses, challenges).await?;
+        let restarted =
+            bind_after_release(&addresses, Instant::now() + Duration::from_secs(2), || {
+                Http01Server::bind(&addresses, challenges.clone())
+            })
+            .await?;
         drop(restarted);
         Ok(())
     })
@@ -371,14 +465,13 @@ fn ipv6_listener_is_ipv6_only_when_available() -> TestResult {
 #[test]
 fn bind_failure_releases_earlier_listeners_and_challenges() -> TestResult {
     Runtime::new()?.block_on(async {
-        let reserved = StdListener::bind("127.0.0.1:0")?;
-        let first = reserved.local_addr()?;
+        let (_reservation, first) = reserve_listener_address()?;
         let occupied = StdListener::bind("127.0.0.1:0")?;
-        drop(reserved);
         let (challenges, _one, _two) = challenges();
         let result = Http01Server::bind(&[first, occupied.local_addr()?], challenges.clone()).await;
         assert_eq!(result.err().unwrap().kind(), io::ErrorKind::AddrInUse);
-        let _released = StdListener::bind(first)?;
+        let _released =
+            bind_released_listener(first, Instant::now() + Duration::from_secs(2)).await?;
         assert!(challenges.lookup("one.example", TOKEN).is_none());
         Ok(())
     })
@@ -388,8 +481,13 @@ fn bind_failure_releases_earlier_listeners_and_challenges() -> TestResult {
 fn cancellation_clears_challenges_and_pending_accepts() -> TestResult {
     Runtime::new()?.block_on(async {
         let (challenges, _one, _two) = challenges();
-        let server = Http01Server::bind(&["127.0.0.1:0".parse()?], challenges.clone()).await?;
-        let address = server.local_addrs()?[0];
+        let (_reservation, address) = reserve_listener_address()?;
+        let server = Http01Server::bind(&[address], challenges.clone()).await?;
+        assert_eq!(server.local_addrs()?, [address]);
+        assert_eq!(
+            bind_reusable_listener(address).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
         let mut run = Box::pin(server.run(pending()));
         assert!(matches!(
             select(
@@ -401,7 +499,12 @@ fn cancellation_clears_challenges_and_pending_accepts() -> TestResult {
         ));
         drop(run);
         assert!(challenges.lookup("one.example", TOKEN).is_none());
-        let server = Http01Server::bind(&[address], challenges).await?;
+        let addresses = [address];
+        let server =
+            bind_after_release(&addresses, Instant::now() + Duration::from_secs(2), || {
+                Http01Server::bind(&addresses, challenges.clone())
+            })
+            .await?;
         drop(server);
         Ok(())
     })

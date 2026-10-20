@@ -2,6 +2,7 @@
 
 use std::future::pending;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use compio::runtime::Runtime;
 use lonewolf_acme::{AcmeErrorKind, RetryState, StateStore, StoredCertificate, StoredHost};
 use parking_lot::Mutex as PlMutex;
 use rcgen::CertificateParams;
+use socket2::{Domain, Protocol, Socket, Type};
 use zeroize::Zeroizing;
 
 use super::*;
@@ -16,6 +18,75 @@ use crate::config::{HostConfig, HostTlsConfig};
 use crate::hosts::test_support::material;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn bind_reusable_socket(address: SocketAddr) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&address.into())?;
+    Ok(socket)
+}
+
+fn reserve_listener_address() -> io::Result<(Socket, SocketAddr)> {
+    // A wildcard reservation excludes automatic port allocation without taking the exact endpoint.
+    let reservation = bind_reusable_socket((Ipv4Addr::UNSPECIFIED, 0).into())?;
+    let address = reservation
+        .local_addr()?
+        .as_socket()
+        .ok_or_else(|| io::Error::other("missing reservation address"))?;
+    Ok((reservation, (Ipv4Addr::LOCALHOST, address.port()).into()))
+}
+
+fn bind_reusable_listener(address: SocketAddr) -> io::Result<Socket> {
+    let socket = bind_reusable_socket(address)?;
+    socket.listen(128)?;
+    Ok(socket)
+}
+
+async fn bind_released_listener(address: SocketAddr, deadline: Instant) -> io::Result<Socket> {
+    loop {
+        match bind_reusable_listener(address) {
+            Ok(socket) => return Ok(socket),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("listener {address} remains in use after the cleanup deadline"),
+                    ));
+                }
+                compio::time::sleep_until((now + Duration::from_millis(5)).min(deadline)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[test]
+fn release_probe_rejects_a_live_listener_and_waits_for_delayed_release() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (_reservation, address) = reserve_listener_address()?;
+        let listener = bind_reusable_listener(address)?;
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert_eq!(
+            bind_released_listener(address, deadline)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(Instant::now() >= deadline);
+        let (replacement, ()) = futures_util::future::join(
+            bind_released_listener(address, Instant::now() + Duration::from_secs(2)),
+            async {
+                compio::time::sleep(Duration::from_millis(5)).await;
+                drop(listener);
+            },
+        )
+        .await;
+        let _replacement = replacement?;
+        Ok(())
+    })
+}
 
 fn config(directory: &std::path::Path) -> Config {
     let mut config = Config::default();
@@ -189,14 +260,16 @@ fn startup_failure_releases_bound_listener_and_open_cache() -> TestResult {
     Runtime::new()?.block_on(async {
         let directory = tempfile::tempdir()?;
         let mut config = config(directory.path());
+        let (_reservation, address) = reserve_listener_address()?;
+        config.letsencrypt.listen = vec![address];
         config.letsencrypt.ca_certificates_path = Some(directory.path().join("missing-trust.pem"));
         let hosts = Hosts::new(&config.hosts, None)?;
         let managed = managed_hosts(&config)?;
         let challenges = Challenges::new(&managed)?;
         let http = Http01Server::bind(&config.letsencrypt.listen, challenges.clone()).await?;
-        let address = http.local_addrs()?[0];
+        assert_eq!(http.local_addrs()?, [address]);
         assert_eq!(
-            std::net::TcpListener::bind(address).unwrap_err().kind(),
+            bind_reusable_listener(address).unwrap_err().kind(),
             io::ErrorKind::AddrInUse
         );
         let error = AcmeServices::load_bound(&config, hosts, managed, challenges, http)
@@ -214,7 +287,8 @@ fn startup_failure_releases_bound_listener_and_open_cache() -> TestResult {
             return Err("unexpected manager failure".into());
         };
         assert_eq!(error.kind(), AcmeErrorKind::InvalidCaBundle);
-        let _listener = std::net::TcpListener::bind(address)?;
+        let _listener =
+            bind_released_listener(address, Instant::now() + Duration::from_secs(2)).await?;
         assert!(config.letsencrypt.state_path.exists());
         let _store = StateStore::open(
             config.letsencrypt.state_path,
@@ -229,18 +303,28 @@ fn startup_failure_releases_bound_listener_and_open_cache() -> TestResult {
 fn loaded_unstarted_service_releases_sockets_and_can_drain_with_expired_deadline() -> TestResult {
     Runtime::new()?.block_on(async {
         let directory = tempfile::tempdir()?;
-        let config = config(directory.path());
+        let mut config = config(directory.path());
+        let (_reservation, address) = reserve_listener_address()?;
+        config.letsencrypt.listen = vec![address];
         let hosts = Hosts::new(&config.hosts, None)?;
         let mut services = AcmeServices::load(&config, hosts)
             .await?
             .ok_or("missing service")?;
-        let address = services
-            .http
-            .as_ref()
-            .ok_or("missing HTTP")?
-            .local_addrs()?[0];
+        assert_eq!(
+            services
+                .http
+                .as_ref()
+                .ok_or("missing HTTP")?
+                .local_addrs()?,
+            [address]
+        );
+        assert_eq!(
+            bind_reusable_listener(address).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
         services.drain(Instant::now()).await?;
-        let _listener = std::net::TcpListener::bind(address)?;
+        let _listener =
+            bind_released_listener(address, Instant::now() + Duration::from_secs(2)).await?;
         assert!(matches!(
             services.run(pending()).await,
             Err(RunError::Acme { .. })
@@ -408,8 +492,12 @@ fn startup_signal_drops_partial_resources_and_late_cache_completion_cannot_activ
             .with_writer(capture.clone())
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let address = listener.local_addr()?;
+        let (_reservation, address) = reserve_listener_address()?;
+        let listener = bind_reusable_listener(address)?;
+        assert_eq!(
+            bind_reusable_listener(address).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
         let (complete, completed) = futures_channel::oneshot::channel::<()>();
         let started = Cell::new(false);
         let activated = Cell::new(false);
@@ -438,7 +526,8 @@ fn startup_signal_drops_partial_resources_and_late_cache_completion_cannot_activ
         assert!(started.get());
         assert!(complete.send(()).is_err());
         assert!(!activated.get());
-        let _listener = std::net::TcpListener::bind(address)?;
+        let _listener =
+            bind_released_listener(address, Instant::now() + Duration::from_secs(2)).await?;
         assert!(deadline.is_some());
         assert!(!std::str::from_utf8(&capture.0.lock())?.contains("waiting for stop signal"));
         Ok(())

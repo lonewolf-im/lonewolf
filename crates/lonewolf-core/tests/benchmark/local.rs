@@ -5,6 +5,7 @@
 mod bench_support;
 
 use bench_support::{TestResult, artifacts, local_config};
+use lonewolf_bench::cpu::CpuPool;
 use lonewolf_bench::{
     client::{self, KeyMode},
     compare::compare_runs,
@@ -16,7 +17,6 @@ use lonewolf_bench::{
         run_with_observer,
     },
 };
-use lonewolf_util::blocking::BlockingExecutor;
 use std::{fs, num::NonZeroUsize, path::Path, time::Duration};
 use tokio::time::{Instant, timeout};
 
@@ -64,31 +64,14 @@ async fn all_local_scenarios_persist_complete_accounting_and_release_sessions() 
         assert_eq!(persisted.phases.len(), 10);
         assert!(persisted.target.negotiated_tls.is_some());
         assert!(persisted.target.cipher.is_some());
-        assert!(persisted.target.observed_scram_iterations.is_some());
-        let settings = &persisted
-            .environment
-            .as_ref()
-            .ok_or("environment")?
-            .server_settings;
-        assert_eq!(settings.workers, 2);
-        assert_eq!(settings.stanza_pool_size_mib, 8);
-        assert_eq!(
+        assert!(persisted.target.scram_iterations.is_some());
+        assert!(persisted.target.server_binary_sha256.is_some());
+        assert!(
             persisted
                 .target
-                .declared_build
+                .server_build
                 .as_ref()
-                .ok_or("build")?
-                .profile,
-            "test"
-        );
-        assert_eq!(
-            persisted
-                .target
-                .declared_build
-                .as_ref()
-                .ok_or("build")?
-                .features,
-            Some(vec![])
+                .is_some_and(|build| build.contains_key("version"))
         );
         let mut peak_observed = None;
         while let Ok(event) = events.try_recv() {
@@ -108,8 +91,7 @@ async fn all_local_scenarios_persist_complete_accounting_and_release_sessions() 
                 assert!(persisted.latencies.is_empty());
             }
             "messages" => {
-                assert_eq!(persisted.dataset.account_count, 2);
-                assert_eq!(persisted.dataset.pair_count, Some(1));
+                assert_eq!(persisted.config.account_count(), 2);
                 assert_eq!(persisted.counters.planned, 2);
                 assert_eq!(persisted.counters.received_on_time, 2);
                 assert_eq!(persisted.counters.write_succeeded, 2);
@@ -122,15 +104,15 @@ async fn all_local_scenarios_persist_complete_accounting_and_release_sessions() 
             }
         }
         let comparison = compare_runs(&persisted, &persisted);
-        assert!(comparison.eligible, "{:?}", comparison.refusals);
+        assert!(comparison.comparable, "{:?}", comparison.refusals);
         bench_support::assert_no_secret(
             &output,
             None,
             &["PRIVATE KEY", "password", "<auth", "<message"],
         )?;
         let log = fs::read_to_string(output.join("server.log"))?;
-        assert!(log.contains("c2s_listener_stopped"));
-        assert!(log.contains("metrics_service_stopped"));
+        assert!(log.contains("c2s TCP listener stopped"));
+        assert!(log.contains("metrics service stopped"));
         assert!(persisted.phases.iter().any(|phase| phase.name
             == lonewolf_bench::report::PhaseName::LocalChildShutdown
             && phase.status == lonewolf_bench::report::PhaseStatus::Completed));
@@ -141,7 +123,7 @@ async fn all_local_scenarios_persist_complete_accounting_and_release_sessions() 
 #[tokio::test]
 async fn simultaneous_fresh_fixtures_get_distinct_assigned_ports_and_reap_children() -> TestResult {
     let config = local_config(server(), ScenarioConfig::Idle { connections: 1 });
-    let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+    let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut first = LocalFixture::prepare(&config, &cpu).await?;
     let mut second = LocalFixture::prepare(&config, &cpu).await?;
     let (a, b) = tokio::join!(
@@ -174,17 +156,12 @@ async fn simultaneous_fresh_fixtures_get_distinct_assigned_ports_and_reap_childr
             StopOutcome::Graceful
         );
         assert!(fixture.credentials().is_empty());
-        assert!(
-            tokio::net::TcpStream::connect(target.address)
-                .await
-                .is_err()
-        );
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn repeated_real_runs_have_fresh_fixtures_and_eligible_a_a_comparisons() -> TestResult {
+async fn repeated_real_runs_have_fresh_fixtures_and_comparable_a_a_results() -> TestResult {
     let directory = tempfile::tempdir()?;
     let config = local_config(
         server(),
@@ -199,13 +176,58 @@ async fn repeated_real_runs_have_fresh_fixtures_and_eligible_a_a_comparisons() -
     assert_eq!(a.status, RunStatus::Passed);
     assert_eq!(b.status, RunStatus::Passed);
     assert_ne!(a.run_id, b.run_id);
-    assert_eq!(a.dataset.account_jids_sha256, b.dataset.account_jids_sha256);
     let comparison = compare_runs(&a, &b);
-    assert!(
-        comparison.eligible,
-        "{:?} {:?}",
-        comparison.refusals, comparison.mismatches
-    );
+    assert!(comparison.comparable, "{:?}", comparison.refusals);
+    assert!(!comparison.metrics.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_exit_during_measurement_fails_the_run_instead_of_degrading_it() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir()?;
+    let script = directory.path().join("crashing-server");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n'{}' \"$@\" &\nchild=$!\nsleep 2\nkill -9 \"$child\"\nwait \"$child\"\nexit 1\n",
+            server().display()
+        ),
+    )?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
+    for (name, scenario) in [
+        ("idle", ScenarioConfig::Idle { connections: 2 }),
+        (
+            "messages",
+            ScenarioConfig::Messages {
+                pairs: 1,
+                rate_per_second: 20,
+                body_bytes: 64,
+            },
+        ),
+    ] {
+        let mut config = local_config(&script, scenario);
+        config.measurement.duration_ms = 5000;
+        let output = directory.path().join(name);
+        let report =
+            timeout(bench_support::TIMEOUT, lonewolf_bench::run(config, &output)).await??;
+        assert_eq!(
+            report.status,
+            RunStatus::Failed,
+            "{name}: {:?}",
+            report.reasons
+        );
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.context.as_deref() == Some("local_server_exited")),
+            "{name}: {:?}",
+            report.reasons
+        );
+        assert!(report.counters.unexpected_disconnects > 0, "{name}");
+        artifacts::complete(&output, RunStatus::Failed)?;
+    }
     Ok(())
 }
 
@@ -242,7 +264,7 @@ async fn startup_failure_and_forced_stop_remove_private_fixture_and_reap_child()
         )?;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
         let config = local_config(&script, ScenarioConfig::Idle { connections: 1 });
-        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let cpu = CpuPool::new(NonZeroUsize::MIN);
         let mut fixture = LocalFixture::prepare(&config, &cpu).await?;
         let started = fixture
             .start(Instant::now() + Duration::from_secs(10))
@@ -259,7 +281,7 @@ async fn startup_failure_and_forced_stop_remove_private_fixture_and_reap_child()
             if forced {
                 StopOutcome::Forced
             } else {
-                StopOutcome::Graceful
+                StopOutcome::Exited
             }
         );
         assert!(!Path::new(private_root).exists());

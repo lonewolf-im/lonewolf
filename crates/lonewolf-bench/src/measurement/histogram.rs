@@ -3,7 +3,7 @@
 use super::invalid;
 use crate::{
     error::BenchResult,
-    report::{HistogramBucket, HistogramReport, Microseconds},
+    report::{HistogramBucket, HistogramReport},
 };
 use hdrhistogram::Histogram;
 use std::time::Duration;
@@ -64,8 +64,6 @@ impl LatencyHistogram {
         let count = self.histogram.len();
         let quantile = |q| (count > 0).then(|| self.histogram.value_at_quantile(q));
         HistogramReport {
-            unit: Microseconds::Microseconds,
-            significant_figures: 3,
             count,
             min_us: self.minimum,
             mean_us: (count > 0).then(|| self.sum_us as f64 / count as f64),

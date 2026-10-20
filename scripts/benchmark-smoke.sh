@@ -49,10 +49,8 @@ for scenario in idle messages churn; do
   for artifact in result.json summary.md telemetry.ndjson server.log; do
     [[ -s "$output/$scenario/$artifact" ]] || exit 1
   done
-  [[ ! -e "$output/$scenario/.incomplete" ]] || exit 1
 done
 invoke "$bench_binary" compare "$output/messages" "$output/messages" --output "$output/comparison"
 for artifact in comparison.json comparison.md; do
   [[ -s "$output/comparison/$artifact" ]] || exit 1
 done
-[[ ! -e "$output/comparison/.incomplete" ]]

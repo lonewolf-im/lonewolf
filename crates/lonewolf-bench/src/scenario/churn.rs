@@ -6,18 +6,16 @@ use crate::{
         NegotiatedTls, OperationId, PreparedAccount, ReceivedKind, ResolvedTarget, StageFailure,
         TrafficPhase,
     },
+    cpu::CpuPool,
     error::BenchResult,
     measurement::{
         CloseOutcome, FinishReason, Ledger, LedgerContext, LedgerTopology, LoginOutcome,
         MeasurementResult, OperationEvent, PhaseBarrier, RateSchedule, ReserveError, RouteIdentity,
         ScheduledSlot, SkipReason, Termination,
     },
-    report::{
-        CounterReport, ErrorCategory, PhaseName, PhaseStatus, ReasonCode, RunReason, RunStatus,
-    },
+    report::{CounterReport, ErrorCategory, PhaseName, PhaseStatus, ReasonCode, RunReason},
     run::{RunContext, events::RunObserver, failure, policy},
 };
-use lonewolf_util::blocking::BlockingExecutor;
 use std::{
     collections::BTreeMap,
     future::{Future, poll_fn},
@@ -121,7 +119,7 @@ impl CycleControl {
 
 struct CycleSettings {
     target: ResolvedTarget,
-    cpu: BlockingExecutor,
+    cpu: CpuPool,
     shutdown: Duration,
     active: AtomicU64,
     peak: AtomicU64,
@@ -331,7 +329,7 @@ pub(crate) async fn prime(context: &mut RunContext) -> BenchResult<()> {
     if let Some(phase) = context.report.phases.last_mut() {
         phase.counters.peak_connections = settings.peak.load(Ordering::Acquire);
     }
-    context.cpu.run(|| ()).await;
+    context.cpu.barrier().await;
     result
 }
 
@@ -353,12 +351,7 @@ async fn prime_with(
         .ok_or_else(|| failure("ramp_rate"))?;
     let duration =
         Duration::from_nanos((count as u64 - 1) * 1_000_000_000 / u64::from(rate.get()) + 1);
-    let schedule = RateSchedule::new(
-        Instant::now(),
-        duration,
-        rate,
-        policy(&context.config.measurement),
-    )?;
+    let schedule = RateSchedule::new(Instant::now(), duration, rate, policy(&context.config))?;
     let (stop, stopped) = watch::channel(false);
     let control = CycleControl {
         interruption: context.interruption.clone(),
@@ -374,10 +367,7 @@ async fn prime_with(
         requested_connections: count as u64,
         ..Default::default()
     };
-    let dispatch = policy(&context.config.measurement);
-    let start = schedule.slot(0).scheduled_at;
-    let mut tick_end = start + dispatch.quantum;
-    let mut batch = 0;
+    let concurrency = context.config.measurement.connect_concurrency;
     while next < count || !pending.is_empty() {
         let now = Instant::now();
         if error.is_none() {
@@ -390,46 +380,30 @@ async fn prime_with(
         if error.is_some() {
             stop.send_replace(true);
         }
-        if now >= tick_end {
-            tick_end = start
-                + Duration::from_nanos(
-                    ((now.duration_since(start).as_nanos() / dispatch.quantum.as_nanos() + 1)
-                        * dispatch.quantum.as_nanos()) as u64,
-                );
-            batch = 0;
-        }
         let slot = (next < count).then(|| schedule.slot(next as u64));
         if error.is_none()
             && let Some(slot) = slot
+            && now >= slot.scheduled_at
+            && pending.len() < concurrency
         {
-            if now.saturating_duration_since(slot.scheduled_at) > dispatch.lag_allowance {
-                error = Some(failure("ramp_scheduler_miss"));
+            let Some(account) = pool.take(next) else {
+                error = Some(failure("churn_prime_account"));
                 continue;
-            }
-            if now >= slot.scheduled_at
-                && pending.len() < context.config.measurement.connect_concurrency
-                && batch < dispatch.max_batch
-            {
-                let Some(account) = pool.take(next) else {
-                    error = Some(failure("churn_prime_account"));
-                    continue;
-                };
-                pending.push(launch(
-                    account,
-                    CycleRequest {
-                        slot,
-                        index: next as u32,
-                        resource: resource(nonce, 'p', next as u64),
-                        mode: KeyMode::Prime,
-                        deadline: context.setup_deadline,
-                    },
-                    control.clone(),
-                ));
-                counters.connection_attempts += 1;
-                next += 1;
-                batch += 1;
-                continue;
-            }
+            };
+            pending.push(launch(
+                account,
+                CycleRequest {
+                    slot,
+                    index: next as u32,
+                    resource: resource(nonce, 'p', next as u64),
+                    mode: KeyMode::Prime,
+                    deadline: context.setup_deadline,
+                },
+                control.clone(),
+            ));
+            counters.connection_attempts += 1;
+            next += 1;
+            continue;
         }
         if error.is_some() && pending.is_empty() {
             break;
@@ -438,12 +412,8 @@ async fn prime_with(
             context.setup_deadline
         } else {
             match slot {
-                Some(slot) if pending.len() == context.config.measurement.connect_concurrency => {
-                    slot.scheduled_at + dispatch.lag_allowance + Duration::from_nanos(1)
-                }
-                Some(_) if batch == dispatch.max_batch => tick_end,
-                Some(slot) => slot.scheduled_at,
-                None => context.setup_deadline,
+                Some(slot) if pending.len() < concurrency => slot.scheduled_at,
+                _ => context.setup_deadline,
             }
             .min(context.setup_deadline)
         };
@@ -480,10 +450,8 @@ async fn prime_with(
     if let Some(phase) = context.report.phases.last_mut() {
         phase.counters = counters;
     }
-    context.report.target.cache_primed = error.is_none();
     if error.is_none() {
-        context.report.target.observed_scram_iterations =
-            if mixed_iterations { None } else { iterations };
+        context.report.target.scram_iterations = if mixed_iterations { None } else { iterations };
         if let Some(tls) = tls {
             context.report.target.negotiated_tls = Some(format!("{:?}", tls.version));
             context.report.target.cipher = Some(format!("{:?}", tls.cipher));
@@ -498,7 +466,6 @@ struct ChurnPhase {
     phase: TrafficPhase,
     reasons: Vec<RunReason>,
     errors: BTreeMap<ErrorCategory, u64>,
-    failed: bool,
     end: Instant,
     connected_at_end: u64,
 }
@@ -518,17 +485,12 @@ impl ChurnPhase {
     }
 
     fn observe(&mut self, outcome: CycleOutcome) -> BenchResult<()> {
-        if !matches!(outcome.login, LoginOutcome::Succeeded { .. })
-            || !matches!(outcome.close, Some(CloseOutcome::Clean { .. }))
-        {
-            self.failed = true;
-        }
         if matches!(
             outcome.close,
             Some(CloseOutcome::Failed { .. } | CloseOutcome::Cancelled { .. })
         ) {
             self.reason(
-                ReasonCode::WorkloadFailure,
+                ReasonCode::OperationsFailed,
                 "churn_account_retired_after_close",
             );
         }
@@ -545,7 +507,7 @@ impl ChurnPhase {
             {
                 self.reason(
                     if failure.kind == ConnectFailureKind::Deadline {
-                        ReasonCode::SchedulerMiss
+                        ReasonCode::DriverLimited
                     } else {
                         ReasonCode::AccountingError
                     },
@@ -600,11 +562,6 @@ impl ChurnPhase {
     }
 
     fn finish(self, termination: Termination, barrier: PhaseBarrier) -> MeasurementResult {
-        let termination = if self.failed && termination == Termination::Completed {
-            Termination::Failed
-        } else {
-            termination
-        };
         let mut result = self.ledger.finish(FinishReason {
             termination,
             barrier,
@@ -619,9 +576,6 @@ impl ChurnPhase {
 }
 
 pub async fn run(context: &mut RunContext) -> BenchResult<MeasurementResult> {
-    if !context.report.target.cache_primed {
-        return Err(failure("churn_not_primed"));
-    }
     let settings = CycleSettings::new(context)?;
     let mut pool = AccountPool::new(std::mem::take(&mut context.accounts));
     let mut launch = |account, request, control| -> CycleFuture {
@@ -689,7 +643,7 @@ async fn run_with(
             context.report.counters.peak_connections = peak;
             return Ok(result);
         }
-        if result.status() != RunStatus::Passed {
+        if !result.status().measured() {
             return Err(failure("churn_warmup_failed"));
         }
     }
@@ -712,7 +666,7 @@ async fn run_phase(
     let start = Instant::now();
     let timeout = Duration::from_millis(context.config.measurement.operation_timeout_ms);
     let shutdown = Duration::from_millis(context.config.measurement.shutdown_timeout_ms);
-    let dispatch = policy(&context.config.measurement);
+    let dispatch = policy(&context.config);
     let mut schedule = RateSchedule::new(
         start,
         settings.duration,
@@ -746,7 +700,6 @@ async fn run_phase(
         phase: settings.phase,
         reasons: Vec::new(),
         errors: BTreeMap::new(),
-        failed: false,
         end,
         connected_at_end: 0,
     };
@@ -816,10 +769,6 @@ async fn run_phase(
                 .ledger
                 .record_skipped(due.skipped, SkipReason::Scheduler)
                 .is_err()
-                || phase
-                    .ledger
-                    .record_dispatch_batch(due.dispatch.end - due.dispatch.start)
-                    .is_err()
             {
                 break Termination::Failed;
             }
@@ -832,6 +781,8 @@ async fn run_phase(
                     || at.saturating_duration_since(slot.scheduled_at) > dispatch.lag_allowance
                 {
                     Some(SkipReason::Scheduler)
+                } else if pool.states[index] == ChurnAccountState::Retired {
+                    Some(SkipReason::Disconnected)
                 } else if pool.states[index] != ChurnAccountState::Idle {
                     Some(SkipReason::AccountBusy)
                 } else {
@@ -840,7 +791,7 @@ async fn run_phase(
                 if let Some(reason) = skipped {
                     if pool.states[index] == ChurnAccountState::Retired {
                         phase.reason(
-                            ReasonCode::WorkloadFailure,
+                            ReasonCode::OperationsFailed,
                             "churn_retired_account_selected",
                         );
                     }
@@ -954,7 +905,7 @@ async fn run_phase(
     if let Some(index) = drain_index {
         context.finish_phase(
             index,
-            if result.status() == RunStatus::Passed {
+            if result.status().measured() {
                 PhaseStatus::Completed
             } else {
                 PhaseStatus::Failed
@@ -964,10 +915,12 @@ async fn run_phase(
     context.report.phases[phase_index].counters = result.counters.clone();
     let rates = result.rates(settings.duration, settings.rate, topology);
     context.report.phases[phase_index].rates = rates.clone();
-    context.report.status = context.report.status.combine(result.status());
     for reason in &result.reasons {
-        if !context.report.reasons.contains(reason) {
+        if (measuring || !reason.code.status().measured())
+            && !context.report.reasons.contains(reason)
+        {
             context.report.reasons.push(reason.clone());
+            context.report.status = context.report.status.combine(reason.code.status());
         }
     }
     if measuring {

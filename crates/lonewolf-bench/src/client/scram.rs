@@ -2,9 +2,9 @@
 
 use std::fmt;
 
+use crate::cpu::CpuPool;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
-use lonewolf_util::blocking::BlockingExecutor;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -68,7 +68,7 @@ impl PreparedAccount {
         &mut self,
         challenge: &Challenge,
         mode: KeyMode,
-        cpu: &BlockingExecutor,
+        cpu: &CpuPool,
     ) -> BenchResult<&CachedKeys> {
         if let Some(cache) = &self.cache {
             if cache.salt.as_slice() != challenge.salt.as_slice()
@@ -192,7 +192,7 @@ impl Exchange {
         account: &mut PreparedAccount,
         challenge: Challenge,
         mode: KeyMode,
-        cpu: &BlockingExecutor,
+        cpu: &CpuPool,
     ) -> BenchResult<Proof> {
         let keys = account.keys(&challenge, mode, cpu).await?;
         let final_without_proof = format!("c=biws,r={}", challenge.nonce);

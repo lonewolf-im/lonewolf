@@ -21,14 +21,8 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn local_config(server: &Path, scenario: ScenarioConfig) -> RunConfig {
     RunConfig {
-        schema_version: 1,
-        environment_id: "benchmark-test".into(),
         target: TargetConfig::Local {
             server_binary: server.into(),
-            server_revision: "test".into(),
-            server_profile: "test".into(),
-            server_toolchain: None,
-            server_features: Some(vec![]),
             server_workers: 2,
             stanza_pool_size_mib: 8,
         },
@@ -43,8 +37,6 @@ pub fn local_config(server: &Path, scenario: ScenarioConfig) -> RunConfig {
             connect_concurrency: 2,
             driver_workers: 2,
             max_in_flight: 16,
-            dispatch_quantum_us: 1000,
-            max_dispatch_batch: 16,
             max_schedule_lag_ms: 1000,
         },
         metrics: MetricsConfig {

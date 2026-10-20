@@ -7,12 +7,12 @@ use std::{num::NonZeroUsize, os::unix::fs::PermissionsExt};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn config() -> BenchResult<RunConfig> {
-    toml::from_str("schema_version=1\nenvironment_id='fixture-test'\n[target]\nmode='local'\nserver_binary='/usr/bin/true'\nserver_workers=1\nstanza_pool_size_mib=8\n[scenario]\nkind='idle'\nconnections=1\n[measurement]\nsetup_timeout_ms=10000").map_err(|_| failure("test_config"))
+    toml::from_str("[target]\nmode='local'\nserver_binary='/usr/bin/true'\nserver_workers=1\nstanza_pool_size_mib=8\n[scenario]\nkind='idle'\nconnections=1\n[measurement]\nsetup_timeout_ms=10000").map_err(|_| failure("test_config"))
 }
 
 #[tokio::test]
 async fn fixture_seeds_exactly_requested_accounts_and_releases_storage() -> TestResult {
-    let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+    let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut fixture = LocalFixture::prepare(&config()?, &cpu).await?;
     let directory = fixture
         .directory
@@ -48,7 +48,7 @@ async fn fixture_seeds_exactly_requested_accounts_and_releases_storage() -> Test
     drop(read);
     drop(storage);
     assert_eq!(fixture.credentials().len(), 1);
-    assert!(fixture.sanitized_server_log().is_none());
+    assert!(fixture.server_log().is_none());
     assert_eq!(
         fixture.stop(Duration::from_secs(1)).await?,
         StopOutcome::NotStarted
@@ -77,7 +77,7 @@ fn fixture_profile_rejects_workloads_above_declared_limits() -> TestResult {
 
 #[tokio::test]
 async fn failed_start_remains_owned_until_stop() -> TestResult {
-    let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+    let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut fixture = LocalFixture::prepare(&config()?, &cpu).await?;
     let directory = fixture
         .directory
@@ -92,7 +92,7 @@ async fn failed_start_remains_owned_until_stop() -> TestResult {
             .is_err()
     );
     fixture.stop(Duration::from_secs(1)).await?;
-    assert!(fixture.sanitized_server_log().is_some());
+    assert!(fixture.server_log().is_some());
     assert!(!directory.exists());
     Ok(())
 }
@@ -142,7 +142,7 @@ async fn attach_ignoring_child(fixture: &mut LocalFixture) -> TestResult {
 
 #[tokio::test]
 async fn cancelled_stop_keeps_owners_for_resumed_force_kill_and_reap() -> TestResult {
-    let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+    let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut fixture = LocalFixture::prepare(&config()?, &cpu).await?;
     attach_ignoring_child(&mut fixture).await?;
     let directory = fixture
@@ -169,15 +169,15 @@ async fn cancelled_stop_keeps_owners_for_resumed_force_kill_and_reap() -> TestRe
     assert!(!directory.exists());
     assert!(
         fixture
-            .sanitized_server_log()
-            .is_some_and(|log| log.ends_with(b"forced_termination\n"))
+            .server_log()
+            .is_some_and(|log| log.ends_with(b"[server killed after the shutdown timeout]\n"))
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn drop_kills_and_reaps_after_cancelled_stop() -> TestResult {
-    let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+    let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut fixture = LocalFixture::prepare(&config()?, &cpu).await?;
     attach_ignoring_child(&mut fixture).await?;
     let directory = fixture
@@ -317,7 +317,7 @@ async fn poll_to_admission<F: std::future::Future<Output = BenchResult<LocalFixt
 async fn preparation_stops_retain_resources_until_the_admitted_cpu_unit_finishes() -> TestResult {
     for mode in ["standalone_deadline", "run_deadline", "interruption"] {
         let config = config()?;
-        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let cpu = CpuPool::new(NonZeroUsize::MIN);
         let (admission, mut admitted) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         let probe = Arc::new(PreparationProbe {
@@ -382,15 +382,16 @@ async fn preparation_stops_retain_resources_until_the_admitted_cpu_unit_finishes
 #[tokio::test(start_paused = true)]
 async fn standalone_expiry_and_queued_cancellation_do_not_run_unadmitted_cpu_work() -> TestResult {
     for standalone in [true, false] {
-        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let cpu = CpuPool::new(NonZeroUsize::MIN);
         let occupied_cpu = cpu.clone();
         let (entered, mut started) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         let occupied = tokio::spawn(async move {
-            occupied_cpu
+            let _ = occupied_cpu
                 .run(move || {
                     let _ = entered.send(());
                     let _ = blocked.recv();
+                    Ok(())
                 })
                 .await;
         });
@@ -447,7 +448,7 @@ async fn stopped_preparation_finishes_the_whole_transaction_without_starting_the
         let mut config = config()?;
         config.scenario = ScenarioConfig::Idle { connections: 257 };
         config.measurement.setup_timeout_ms = 120_000;
-        let cpu = BlockingExecutor::new(NonZeroUsize::MIN);
+        let cpu = CpuPool::new(NonZeroUsize::MIN);
         let (admission, mut admitted) = tokio::sync::oneshot::channel();
         let (release, blocked) = tokio::sync::oneshot::channel();
         let probe = Arc::new(PreparationProbe {

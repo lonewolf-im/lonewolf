@@ -10,7 +10,9 @@ pub use schedule::{DispatchPolicy, DueSlots, RateSchedule, ScheduledSlot};
 
 use crate::{
     error::{BenchError, BenchResult, ErrorCode},
-    report::{CounterReport, HistogramReport, LatencyKind, RateReport, RunReason, RunStatus},
+    report::{
+        CounterReport, HistogramReport, LatencyKind, RateReport, RunReason, RunStatus, status_of,
+    },
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -24,31 +26,7 @@ pub struct MeasurementResult {
 
 impl MeasurementResult {
     pub fn status(&self) -> RunStatus {
-        use crate::report::ReasonCode;
-        self.reasons
-            .iter()
-            .fold(RunStatus::Passed, |status, reason| {
-                status.combine(match reason.code {
-                    ReasonCode::InvalidConfig
-                    | ReasonCode::SchedulerMiss
-                    | ReasonCode::EventOverflow
-                    | ReasonCode::AccountingError
-                    | ReasonCode::HistogramError
-                    | ReasonCode::WarmupObservationLag
-                    | ReasonCode::ServerRestarted
-                    | ReasonCode::ArtifactFailure
-                    | ReasonCode::OutputLimit => RunStatus::Invalid,
-                    ReasonCode::Interrupted => RunStatus::Interrupted,
-                    ReasonCode::TargetFailure
-                    | ReasonCode::SetupFailure
-                    | ReasonCode::WorkloadFailure
-                    | ReasonCode::ConfiguredCapacity => RunStatus::Failed,
-                    ReasonCode::TelemetryUnavailable
-                    | ReasonCode::TelemetryPartial
-                    | ReasonCode::UnknownServerBuild
-                    | ReasonCode::ToolchainDifference => RunStatus::Passed,
-                })
-            })
+        status_of(&self.reasons)
     }
 
     pub fn rates(

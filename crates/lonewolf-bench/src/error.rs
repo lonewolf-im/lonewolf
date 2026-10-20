@@ -11,10 +11,8 @@ pub enum ErrorCode {
     ConfigRead,
     InvalidPath,
     OutputExists,
-    NotImplemented,
     Runtime,
     UnsupportedPlatform,
-    IncompatibleComparison,
     ArtifactFailure,
 }
 
@@ -25,10 +23,8 @@ impl ErrorCode {
             Self::ConfigRead => "config_read",
             Self::InvalidPath => "invalid_path",
             Self::OutputExists => "output_exists",
-            Self::NotImplemented => "not_implemented",
             Self::Runtime => "runtime",
             Self::UnsupportedPlatform => "unsupported_platform",
-            Self::IncompatibleComparison => "incompatible_comparison",
             Self::ArtifactFailure => "artifact_failure",
         }
     }
@@ -67,9 +63,6 @@ impl BenchError {
     }
     pub const fn exit_code(&self) -> u8 {
         2
-    }
-    pub const fn staged() -> Self {
-        Self::new(ErrorCode::NotImplemented, "command is not implemented")
     }
 }
 impl fmt::Display for BenchError {

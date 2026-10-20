@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{fs, num::NonZeroUsize, os::unix::fs::PermissionsExt};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 pub(crate) fn config(count: usize) -> BenchResult<RunConfig> {
-    toml::from_str(&format!("schema_version=1\nenvironment_id='test'\n[target]\nmode='local'\nserver_binary='/absent/lonewolf'\n[scenario]\nkind='idle'\nconnections={count}\n[measurement]\nwarmup_ms=10\nduration_ms=40\nsetup_timeout_ms=1000\nshutdown_timeout_ms=20\nramp_rate_per_second=1000\n"))
+    toml::from_str(&format!("[target]\nmode='local'\nserver_binary='/absent/lonewolf'\n[scenario]\nkind='idle'\nconnections={count}\n[measurement]\nwarmup_ms=10\nduration_ms=40\nsetup_timeout_ms=1000\nshutdown_timeout_ms=20\nramp_rate_per_second=1000\n"))
         .map_err(|_| failure("test_configuration"))
 }
 
@@ -19,7 +19,7 @@ fn context_with_events(
     count: usize,
 ) -> BenchResult<(RunContext, watch::Sender<bool>, EventSender)> {
     let config = config(count)?;
-    let report = initial_report(&config);
+    let report = initial_report(&config, 1);
     let (signal, interruption) = watch::channel(false);
     let invalid = Arc::new(AtomicBool::new(false));
     let (sender, events) = EventSender::new(
@@ -36,7 +36,7 @@ fn context_with_events(
         observer: RunObserver::default(),
         report,
         fixture: None,
-        cpu: BlockingExecutor::new(NonZeroUsize::MIN),
+        cpu: CpuPool::new(NonZeroUsize::MIN),
         origin,
         setup_deadline: origin + Duration::from_secs(10),
         events,
@@ -47,7 +47,7 @@ fn context_with_events(
         setup_failures: 0,
         message_phase: None,
         telemetry: None,
-        telemetry_buffer: None,
+        telemetry_raw: Vec::new(),
     };
     Ok((context, signal, observed))
 }
@@ -59,10 +59,6 @@ async fn failed_setup_returns_private_partial_report_without_invented_metadata_o
     let output = directory.path().join("output");
     let report = run(config(1)?, &output).await?;
     assert_eq!(report.status, RunStatus::Failed);
-    assert_eq!(
-        report.config.instrumentation,
-        Some(crate::telemetry::instrumentation_metadata(true))
-    );
     assert_eq!(fs::metadata(&output)?.permissions().mode() & 0o777, 0o700);
     assert_eq!(
         fs::metadata(output.join("result.json"))?
@@ -72,8 +68,6 @@ async fn failed_setup_returns_private_partial_report_without_invented_metadata_o
         0o600
     );
     assert!(report.run_id.is_some() && report.started_at_utc.is_some());
-    assert!(report.environment.is_none());
-    assert!(report.dataset.account_jids_sha256.is_none());
     assert_eq!(report.counters, CounterReport::default());
     assert_eq!(report.rates, RateReport::default());
     assert!(
@@ -86,15 +80,14 @@ async fn failed_setup_returns_private_partial_report_without_invented_metadata_o
         report
             .phases
             .iter()
-            .all(|phase| phase.end_offset_ns.is_some()
-                && !matches!(phase.status, PhaseStatus::Pending | PhaseStatus::Running))
+            .all(|phase| phase.end_offset_ns.is_some() && phase.status != PhaseStatus::Running)
     );
     assert_eq!(report.phases[0].name, PhaseName::Preflight);
     assert_eq!(report.phases[1].name, PhaseName::TargetSetup);
     assert_eq!(report.phases[1].status, PhaseStatus::Failed);
     let saved: RunReport = serde_json::from_slice(&fs::read(output.join("result.json"))?)?;
     assert_eq!(saved, report);
-    assert!(!output.join(".incomplete").exists());
+    assert!(output.join("summary.md").is_file());
     assert!(run(config(1)?, &output).await.is_err());
     Ok(())
 }
@@ -108,13 +101,16 @@ async fn invalid_external_inputs_preserve_partial_evidence_and_status_precedence
         port: 1,
         xmpp_domain: "localhost".into(),
         credentials_file: directory.path().join("credentials"),
-        environment_file: directory.path().join("environment"),
         ca_pem: None,
         metrics_url: None,
     };
     fs::write(
-        directory.path().join("environment"),
+        directory.path().join("credentials"),
         "malformed PRIVATE_SENTINEL",
+    )?;
+    fs::set_permissions(
+        directory.path().join("credentials"),
+        fs::Permissions::from_mode(0o600),
     )?;
     let report = run(config, &directory.path().join("output")).await?;
     assert_eq!(report.status, RunStatus::Invalid);
@@ -124,8 +120,6 @@ async fn invalid_external_inputs_preserve_partial_evidence_and_status_precedence
             .iter()
             .any(|reason| reason.code == ReasonCode::InvalidConfig)
     );
-    assert!(report.target.declared_build.is_none());
-    assert!(report.environment.is_none());
     assert!(!serde_json::to_string(&report)?.contains("PRIVATE_SENTINEL"));
     let (mut context, _signal) = context(1)?;
     context.retain_error(failure("login_failed"));
@@ -153,18 +147,13 @@ async fn interrupted_preflight_has_no_setup_counts_or_measurement_window() -> Te
     .await?;
     assert_eq!(report.status, RunStatus::Interrupted);
     assert_eq!(report.phases[0].status, PhaseStatus::Cancelled);
-    assert_eq!(
-        report.config.instrumentation,
-        Some(crate::telemetry::instrumentation_metadata(true))
-    );
     assert_eq!(report.counters, CounterReport::default());
-    assert_eq!(report.dataset.account_count, 2);
-    assert!(report.environment.is_none());
+    assert_eq!(report.config.account_count(), 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn artifact_failure_retains_all_reasons_and_an_incomplete_marker() -> TestResult {
+async fn artifact_failure_is_reported_without_replacing_existing_files() -> TestResult {
     let directory = tempfile::tempdir()?;
     let output = directory.path().join("output");
     let writer = ArtifactWriter::create(&output)?;
@@ -178,26 +167,12 @@ async fn artifact_failure_retains_all_reasons_and_an_incomplete_marker() -> Test
         None,
     )
     .await?;
-    assert_eq!(report.status, RunStatus::Invalid);
-    assert!(
-        report
-            .reasons
-            .iter()
-            .any(|reason| reason.code == ReasonCode::Interrupted)
-    );
-    assert!(
-        report
-            .reasons
-            .iter()
-            .any(|reason| reason.code == ReasonCode::ArtifactFailure)
-    );
-    assert_eq!(
-        report.phases.last().map(|phase| phase.status),
-        Some(PhaseStatus::Failed)
-    );
+    assert_eq!(report.status, RunStatus::Interrupted);
+    for code in [ReasonCode::Interrupted, ReasonCode::ArtifactFailure] {
+        assert!(report.reasons.iter().any(|reason| reason.code == code));
+    }
     assert_eq!(fs::read(output.join("result.json"))?, b"existing");
-    assert!(output.join(".incomplete").exists());
-    assert!(output.join(".result.json.partial").exists());
+    assert!(output.join("summary.md").is_file());
     Ok(())
 }
 
@@ -292,60 +267,26 @@ async fn timestamped_events_belong_to_their_phase_and_not_the_drain_or_setup() -
         1
     );
     assert_eq!(context.report.counters.unexpected_disconnects, 2);
-    assert_eq!(context.report.status, RunStatus::Failed);
+    assert_eq!(context.report.status, RunStatus::Degraded);
     Ok(())
 }
 
 #[test]
-fn nullable_metadata_and_strict_remote_descriptor_validation() -> TestResult {
-    let report = initial_report(&config(1)?);
+fn nullable_metadata_round_trips() -> TestResult {
+    let report = initial_report(&config(1)?, 1);
     let encoded = serde_json::to_value(&report)?;
-    for key in ["run_id", "started_at_utc", "environment"] {
+    for key in ["run_id", "started_at_utc"] {
         assert!(encoded[key].is_null());
     }
-    assert!(encoded["dataset"]["account_jids_sha256"].is_null());
     assert!(encoded["driver"]["system"]["arch"].is_null());
+    assert!(encoded["target"]["server_build"].is_null());
     assert_eq!(serde_json::from_value::<RunReport>(encoded)?, report);
-    let mut descriptor = descriptor()?;
-    descriptor.validate("test")?;
-    descriptor.server.arch = None;
-    assert!(descriptor.validate("test").is_err());
-    descriptor.server.arch = Some("test".into());
-    descriptor.server_settings.max_connections_per_ip = 0;
-    assert!(descriptor.validate("test").is_err());
     Ok(())
 }
 
-fn descriptor() -> Result<EnvironmentDescriptor, Box<dyn std::error::Error>> {
-    let settings: ServerSettings = serde_json::from_value(serde_json::json!({
-        "workers":1,"stanza_pool_size_mib":8,"logging_level":"info","host_extensions":[],"storage_backend":"redb",
-        "max_unauthenticated_connections":1,"max_resources_per_account":1,"max_directed_presence_recipients_per_resource":1,
-        "max_connections_per_ip":1,"max_stanza_bytes":262144,"connection_establishment_timeout_secs":10,
-        "authentication_timeout_secs":10,"resource_binding_timeout_secs":10,"authentication_retries":1,"resource_binding_retries":1,
-        "connection_attempts_per_ip":{"rate_per_second":1,"burst":1},"incoming_stanzas_per_connection":{"rate_per_second":1,"burst":1},
-        "new_recipients_per_connection":{"rate_per_second":1,"burst":1},"incoming_xml_per_connection":{"bytes_per_second":1,"burst_bytes":1},
-        "offered_auth_mechanisms":["SCRAM-SHA-256"],"tls_min":"1.2","tls_max":"1.3","empty_roster":true,"offline_storage":false
-    }))?;
-    Ok(EnvironmentDescriptor {
-        schema_version: 1,
-        environment_id: "test".into(),
-        network_path: NetworkPath::Loopback,
-        server: system_metadata(),
-        server_build: initial_report(&config(1)?)
-            .target
-            .declared_build
-            .ok_or("local build")?,
-        server_settings: settings,
-    })
-}
-
 #[tokio::test]
-async fn later_credential_or_target_failure_preserves_validated_environment_and_selected_hash()
--> TestResult {
+async fn remote_credential_and_target_failures_keep_partial_evidence() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let environment = directory.path().join("environment.json");
-    let descriptor = descriptor()?;
-    fs::write(&environment, serde_json::to_vec(&descriptor)?)?;
     let credentials = directory.path().join("credentials.json");
     let mut config = config(2)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -355,27 +296,12 @@ async fn later_credential_or_target_failure_preserves_validated_environment_and_
         port,
         xmpp_domain: "localhost".into(),
         credentials_file: credentials.clone(),
-        environment_file: environment,
         ca_pem: None,
         metrics_url: None,
     };
     let report = run(config.clone(), &directory.path().join("before_accounts")).await?;
     assert_eq!(report.status, RunStatus::Invalid);
-    assert_eq!(report.environment.as_ref(), Some(&descriptor));
-    assert_eq!(
-        report.target.declared_build.as_ref(),
-        Some(&descriptor.server_build)
-    );
-    assert!(report.dataset.account_jids_sha256.is_none());
     crate::accounts::generate_credentials("localhost", "test", 3, &credentials)?;
-    let selected =
-        CredentialSet::read(&credentials, Some("localhost"), Some(2))?.into_prepared()?;
-    let hash = canonical_hash(
-        &selected
-            .iter()
-            .map(PreparedAccount::bare_jid)
-            .collect::<Vec<_>>(),
-    )?;
     let peer = tokio::spawn(async move {
         let (socket, _) = listener.accept().await?;
         drop(socket);
@@ -384,12 +310,6 @@ async fn later_credential_or_target_failure_preserves_validated_environment_and_
     let report = run(config, &directory.path().join("after_accounts")).await?;
     peer.await??;
     assert_eq!(report.status, RunStatus::Failed);
-    assert_eq!(report.environment.as_ref(), Some(&descriptor));
-    assert_eq!(
-        report.dataset.account_jids_sha256.as_deref(),
-        Some(hash.as_str())
-    );
-    assert!(!report.target.cache_primed);
     assert_eq!(report.counters, CounterReport::default());
     let setup = report
         .phases
@@ -445,12 +365,14 @@ async fn cleanup_awaits_cancelled_cpu_work_before_clearing_accounts() -> TestRes
     let (started, admitted) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
     let work = tokio::spawn(async move {
-        cpu.run(move || {
-            let _ = started.send(());
-            let _ = blocked.recv();
-            completed.store(true, Ordering::Release);
-        })
-        .await;
+        let _ = cpu
+            .run(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+                completed.store(true, Ordering::Release);
+                Ok(())
+            })
+            .await;
     });
     admitted.await?;
     work.abort();
@@ -469,10 +391,10 @@ async fn cleanup_awaits_cancelled_cpu_work_before_clearing_accounts() -> TestRes
 #[tokio::test]
 async fn warmup_settlement_drains_invalid_events_beyond_the_hot_loop_batch() -> TestResult {
     let (mut context, _signal, sender) = context_with_events(1)?;
-    context.config.measurement.max_dispatch_batch = 1;
+    let batch = policy(&context.config).max_batch as u64;
     let phase = context.start_phase(PhaseName::Warmup, None);
     let at = Instant::now();
-    for _ in 0..3 {
+    for _ in 0..batch + 3 {
         sender.emit(RunEvent::Received {
             index: 0,
             event: crate::client::ReceivedEvent {
@@ -486,7 +408,10 @@ async fn warmup_settlement_drains_invalid_events_beyond_the_hot_loop_batch() -> 
     context.finish_phase(phase, PhaseStatus::Completed);
     assert!(context.barrier_phase(PhaseName::WarmupDrain).await.is_err());
     assert_eq!(context.report.status, RunStatus::Invalid);
-    assert_eq!(context.report.phases[phase].counters.unexpected_stanzas, 3);
+    assert_eq!(
+        context.report.phases[phase].counters.unexpected_stanzas,
+        batch + 3
+    );
     assert!(context.events.try_recv().is_err());
     assert!(context.measurement_window.is_none());
     Ok(())
@@ -515,31 +440,17 @@ async fn stopped_fixture_retains_finalized_safe_logs_through_artifact_finalizati
         .as_mut()
         .ok_or("stopped fixture was dropped")?;
     assert!(fixture.credentials().is_empty());
-    assert!(fixture.sanitized_server_log().is_some());
-    assert_eq!(fixture.stop(Duration::ZERO).await?, StopOutcome::Graceful);
+    assert!(fixture.server_log().is_some());
+    assert_eq!(fixture.stop(Duration::ZERO).await?, StopOutcome::Exited);
     let artifact = context.start_phase(PhaseName::ArtifactFinalization, None);
     assert!(
         context
             .fixture
             .as_ref()
-            .and_then(LocalFixture::sanitized_server_log)
+            .and_then(LocalFixture::server_log)
             .is_some()
     );
     context.finish_phase(artifact, PhaseStatus::Completed);
-    Ok(())
-}
-
-#[test]
-fn churn_dataset_resource_policy_matches_unique_cycle_resources() -> TestResult {
-    let mut config = config(2)?;
-    config.scenario = ScenarioConfig::Churn {
-        accounts: 2,
-        rate_per_second: 1,
-    };
-    assert_eq!(
-        initial_report(&config).dataset.resource_policy,
-        "unique_resource_per_cycle:bench-RUN_NONCE-PHASE-SEQUENCE"
-    );
     Ok(())
 }
 
@@ -577,42 +488,21 @@ fn observed_restart_invalidates_even_when_telemetry_already_contains_the_reason(
 }
 
 #[tokio::test(start_paused = true)]
-async fn connection_observations_survive_failed_close_and_interruption() -> TestResult {
-    let (mut context, signal) = context(1)?;
-    let original = context.report.target.clone();
-    assert_eq!(original.negotiated_tls, None);
-    assert_eq!(original.cipher, None);
-    assert_eq!(original.observed_scram_iterations, None);
+async fn failed_close_degrades_the_run_and_interruption_takes_precedence() -> TestResult {
+    let (mut context, _signal) = context(1)?;
     context.connections.simulated(None, Duration::from_secs(10));
-    context.apply_connection_observations(connections::ConnectionObservations {
-        negotiated_tls: Some(rustls::ProtocolVersion::TLSv1_3),
-        cipher: Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
-        observed_scram_iterations: Some(600000),
-    });
-    assert_eq!(context.report.status, RunStatus::Passed);
-    assert_eq!(context.report.target.cache_primed, original.cache_primed);
-    signal.send_replace(true);
     context
         .close_connections(Instant::now() + Duration::from_millis(10))
         .await;
-    assert_eq!(context.report.status, RunStatus::Failed);
-    assert_eq!(
-        context.report.target.negotiated_tls.as_deref(),
-        Some("TLSv1_3")
-    );
-    assert_eq!(
-        context.report.target.cipher.as_deref(),
-        Some("TLS13_AES_256_GCM_SHA384")
-    );
-    assert_eq!(
-        context.report.target.observed_scram_iterations,
-        Some(600000)
+    assert_eq!(context.report.status, RunStatus::Degraded);
+    assert!(
+        context
+            .report
+            .reasons
+            .iter()
+            .any(|reason| reason.code == ReasonCode::OperationsFailed)
     );
     context.retain_error(failure("interrupted"));
     assert_eq!(context.report.status, RunStatus::Interrupted);
-    assert_eq!(
-        context.report.target.observed_scram_iterations,
-        Some(600000)
-    );
     Ok(())
 }

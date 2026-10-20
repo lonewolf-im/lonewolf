@@ -3,9 +3,7 @@
 use super::*;
 
 fn local(scenario: &str) -> String {
-    format!(
-        "schema_version = 1\nenvironment_id = 'test'\n[target]\nmode = 'local'\nserver_binary = 'server'\n[scenario]\nkind = '{scenario}'\n"
-    )
+    format!("[target]\nmode = 'local'\nserver_binary = 'server'\n[scenario]\nkind = '{scenario}'\n")
 }
 fn parse(text: &str) -> BenchResult<RunConfig> {
     let config: RunConfig =
@@ -19,20 +17,16 @@ fn all_scenarios_and_target_defaults() -> BenchResult<()> {
     for (kind, count) in [("idle", 100), ("messages", 100), ("churn", 64)] {
         let config = parse(&local(kind))?;
         assert_eq!(config.account_count(), count);
+        assert_eq!(config.scenario.kind(), kind);
         assert_eq!(config.measurement, MeasurementConfig::default());
-        if let TargetConfig::Local {
-            server_revision,
-            server_profile,
-            server_features,
-            server_toolchain,
-            ..
-        } = config.target
-        {
-            assert_eq!(server_revision, "unknown");
-            assert_eq!(server_profile, "unknown");
-            assert_eq!(server_features, None);
-            assert_eq!(server_toolchain, None);
-        }
+        assert!(matches!(
+            config.target,
+            TargetConfig::Local {
+                server_workers: 2,
+                stanza_pool_size_mib: 256,
+                ..
+            }
+        ));
     }
     Ok(())
 }
@@ -41,18 +35,21 @@ fn all_scenarios_and_target_defaults() -> BenchResult<()> {
 fn strict_missing_unknown_and_irrelevant_fields() {
     let text = local("idle");
     for changed in [
-        text.replace("schema_version = 1", "schema_version = 2"),
-        text.replace("schema_version = 1", "unexpected = 1\nschema_version = 1"),
+        format!("unexpected = 1\n{text}"),
         text.replace(
             "server_binary = 'server'",
             "credentials_file = 'secret'\nserver_binary = 'server'",
         ),
+        text.replace(
+            "server_binary = 'server'",
+            "server_binary = 'server'\nserver_profile = 'release'",
+        ),
         text.replace("server_binary = 'server'", ""),
         text.replace("kind = 'idle'", "kind = 'idle'\npairs = 1"),
-        text.replace("environment_id = 'test'", ""),
-        text + "[measurement]\nunexpected = 1\n",
+        text.clone() + "[measurement]\nunexpected = 1\n",
+        text.clone() + "[measurement]\ndispatch_quantum_us = 1000\n",
     ] {
-        assert!(parse(&changed).is_err());
+        assert!(parse(&changed).is_err(), "{changed}");
     }
 }
 
@@ -88,13 +85,9 @@ fn numeric_bounds_and_overflow() -> BenchResult<()> {
         "setup_timeout_ms = 86400001",
         "ramp_rate_per_second = 0",
         "ramp_rate_per_second = 1000001",
-        "dispatch_quantum_us = 999",
-        "max_dispatch_batch = 0",
         "max_schedule_lag_ms = 0",
         "max_schedule_lag_ms = 1001",
-        "dispatch_quantum_us = 100000\nmax_schedule_lag_ms = 99",
         "operation_timeout_ms = 100",
-        "dispatch_quantum_us = 100000\nmax_dispatch_batch = 99",
     ] {
         assert!(
             parse(&format!("{text}[measurement]\n{setting}\n")).is_err(),
@@ -112,15 +105,22 @@ fn numeric_bounds_and_overflow() -> BenchResult<()> {
         ))
         .is_err()
     );
+    for scenario in [
+        "kind = 'messages'\nbody_bytes = 65537",
+        "kind = 'messages'\nrate_per_second = 0",
+        "kind = 'messages'\nrate_per_second = 1000001",
+    ] {
+        assert!(parse(&text.replace("kind = 'messages'", scenario)).is_err());
+    }
     assert!(
-        parse(&text.replace("kind = 'messages'", "kind = 'messages'\nbody_bytes = 65537")).is_err()
-    );
-    assert!(
-        parse(&text.replace(
-            "kind = 'messages'",
-            "kind = 'messages'\nrate_per_second = 0"
+        parse(&format!(
+            "{}[measurement]\nduration_ms = 1000\n",
+            text.replace(
+                "kind = 'messages'",
+                "kind = 'messages'\nrate_per_second = 1000000"
+            )
         ))
-        .is_err()
+        .is_ok()
     );
     assert!(
         parse(&text.replace(
@@ -134,13 +134,17 @@ fn numeric_bounds_and_overflow() -> BenchResult<()> {
 
 #[test]
 fn remote_syntax_and_metrics_policy() -> BenchResult<()> {
-    let text = "schema_version=1\nenvironment_id='remote'\n[target]\nmode='remote'\nconnect_host='127.0.0.1'\nport=5222\nxmpp_domain='example.org'\ncredentials_file='credentials.json'\nenvironment_file='environment.json'\n[scenario]\nkind='idle'";
+    let text = "[target]\nmode='remote'\nconnect_host='127.0.0.1'\nport=5222\nxmpp_domain='example.org'\ncredentials_file='credentials.json'\n[scenario]\nkind='idle'";
     parse(text)?;
     for change in [
         text.replace("port=5222", "port=0"),
         text.replace("example.org", "127.0.0.1"),
         text.replace("example.org", "bad_name"),
         text.replace("mode='remote'", "mode='remote'\nserver_workers=2"),
+        text.replace(
+            "mode='remote'",
+            "mode='remote'\nenvironment_file='env.json'",
+        ),
     ] {
         assert!(parse(&change).is_err());
     }
@@ -165,30 +169,9 @@ fn remote_syntax_and_metrics_policy() -> BenchResult<()> {
 }
 
 #[test]
-fn declared_build_fields_and_secret_free_errors() -> BenchResult<()> {
-    let text = local("idle");
-    for profile in ["release", "production-custom"] {
-        let config = parse(&text.replace(
-            "server_binary = 'server'",
-            &format!(
-                "server_binary = 'server'\nserver_profile = '{profile}'\nserver_features = []"
-            ),
-        ))?;
-        assert!(
-            matches!(config.target, TargetConfig::Local { server_features: Some(features), .. } if features.is_empty())
-        );
-    }
-    for features in [
-        vec!["duplicate".into(), "duplicate".into()],
-        vec!["x".repeat(129)],
-        (0..257).map(|i| format!("f{i}")).collect(),
-    ] {
-        assert!(validate_build("release", None, Some(&features)).is_err());
-    }
-    assert!(validate_build(&"x".repeat(65), None, None).is_err());
-    assert!(validate_build("release", Some(&"x".repeat(1025)), None).is_err());
+fn errors_do_not_echo_configuration_values() -> BenchResult<()> {
     let secret = "TOP_SECRET_PASSWORD";
-    let failure = parse(&text.replace("kind = 'idle'", &format!("kind = '{secret}'")))
+    let failure = parse(&local("idle").replace("kind = 'idle'", &format!("kind = '{secret}'")))
         .err()
         .ok_or_else(|| invalid("expected error"))?;
     assert!(!format!("{failure:?} {failure}").contains(secret));
@@ -200,40 +183,31 @@ fn config_relative_paths_caller_override_and_new_output() -> Result<(), Box<dyn 
 {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("bench.toml");
-    fs::write(
-        &path,
-        local("idle").replace(
-            "server_binary = 'server'",
-            "server_binary = 'server'\nserver_features = ['z', 'a']",
-        ),
-    )?;
+    fs::write(&path, local("idle"))?;
     let config = RunConfig::load(&path, None)?;
     assert!(
-        matches!(config.target, TargetConfig::Local { server_binary, server_features: Some(features), .. }
-        if server_binary == directory.path().join("server") && features == ["a", "z"])
+        matches!(config.target, TargetConfig::Local { server_binary, .. }
+        if server_binary == directory.path().join("server"))
     );
     let config = RunConfig::load(&path, Some(Path::new("caller-server")))?;
     assert!(
         matches!(config.target, TargetConfig::Local { server_binary, .. } if server_binary == std::env::current_dir()?.join("caller-server"))
     );
-    let remote = local("idle").replace("mode = 'local'\nserver_binary = 'server'", "mode='remote'\nconnect_host='EXAMPLE.org'\nport=5222\nxmpp_domain='EXAMPLE.org.'\ncredentials_file='creds'\nenvironment_file='env'\nca_pem='ca'");
+    let remote = local("idle").replace("mode = 'local'\nserver_binary = 'server'", "mode='remote'\nconnect_host='EXAMPLE.org'\nport=5222\nxmpp_domain='EXAMPLE.org.'\ncredentials_file='creds'\nca_pem='ca'");
     fs::write(&path, remote)?;
     let config = RunConfig::load(&path, None)?;
     assert!(
-        matches!(config.target, TargetConfig::Remote { credentials_file, environment_file, ca_pem: Some(ca), xmpp_domain, .. }
-        if credentials_file == directory.path().join("creds") && environment_file == directory.path().join("env") && ca == directory.path().join("ca") && xmpp_domain == "example.org")
+        matches!(config.target, TargetConfig::Remote { credentials_file, ca_pem: Some(ca), xmpp_domain, .. }
+        if credentials_file == directory.path().join("creds") && ca == directory.path().join("ca") && xmpp_domain == "example.org")
     );
     assert!(RunConfig::load(&path, Some(Path::new("server"))).is_err());
     validate_new_output(&directory.path().join("new"))?;
     assert!(validate_new_output(&path).is_err());
     assert!(validate_new_output(&directory.path().join("absent/new")).is_err());
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(
-            directory.path().join("missing"),
-            directory.path().join("dangling"),
-        )?;
-        assert!(validate_new_output(&directory.path().join("dangling")).is_err());
-    }
+    std::os::unix::fs::symlink(
+        directory.path().join("missing"),
+        directory.path().join("dangling"),
+    )?;
+    assert!(validate_new_output(&directory.path().join("dangling")).is_err());
     Ok(())
 }

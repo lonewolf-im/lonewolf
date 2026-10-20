@@ -5,35 +5,27 @@ pub mod events;
 #[cfg(test)]
 pub(crate) mod tests;
 
-#[cfg(test)]
-use crate::report::metadata::system_metadata;
 use crate::{
     accounts::CredentialSet,
     client::{PreparedAccount, ResolvedTarget, remote_tls_config},
-    config::{MeasurementConfig, RunConfig, ScenarioConfig, TargetConfig},
+    config::{RunConfig, ScenarioConfig, TargetConfig},
+    cpu::CpuPool,
     error::{BenchError, BenchResult, ErrorCode},
     fixture::{LocalFixture, StopOutcome, preflight_descriptors},
     measurement::DispatchPolicy,
-    report::*,
-};
-use crate::{
     report::{
         artifacts::ArtifactWriter,
-        metadata::{canonical_hash, collect_metadata, initial_report},
+        metadata::{collect_host_facts, initial_report},
+        summary, *,
     },
-    telemetry::{
-        MetricsEndpoint, PhaseSampleRequest, SamplerConfig, TelemetrySampler, allocate_buffer,
-    },
+    telemetry::{MetricsEndpoint, PhaseSampleRequest, SamplerConfig, TelemetrySampler},
 };
 use connections::ConnectionSet;
 use events::{EventReceiver, EventSender, RunEvent, RunObserver};
-use lonewolf_util::blocking::BlockingExecutor;
 use std::{
-    collections::BTreeMap,
     fs::OpenOptions,
     future::Future,
     io::Read,
-    num::NonZeroUsize,
     os::unix::fs::OpenOptionsExt,
     path::Path,
     sync::{
@@ -62,7 +54,7 @@ pub struct RunContext {
     pub observer: RunObserver,
     pub report: RunReport,
     pub(crate) fixture: Option<LocalFixture>,
-    pub(crate) cpu: BlockingExecutor,
+    pub(crate) cpu: CpuPool,
     origin: Instant,
     pub(crate) setup_deadline: Instant,
     pub(crate) events: EventReceiver,
@@ -72,7 +64,7 @@ pub struct RunContext {
     pub(crate) setup_attempts: u64,
     pub(crate) setup_failures: u64,
     pub(crate) telemetry: Option<TelemetrySampler>,
-    pub(crate) telemetry_buffer: Option<Vec<u8>>,
+    pub(crate) telemetry_raw: Vec<u8>,
     pub(crate) message_phase: Option<crate::scenario::messages::MessagePhase>,
 }
 
@@ -86,7 +78,6 @@ pub async fn run_with_observer(
     observer: RunObserver,
 ) -> BenchResult<RunReport> {
     config.validate()?;
-    crate::scenario::validate_supported(&config.scenario)?;
     let writer = ArtifactWriter::create(output)?;
     let (sender, interruption) = watch::channel(false);
     let signal = signals(sender);
@@ -105,7 +96,8 @@ async fn execute(
     let capacity = event_capacity(config.measurement.max_in_flight, config.account_count())?;
     let invalid = Arc::new(AtomicBool::new(false));
     let (sender, events) = EventSender::new(capacity, invalid.clone());
-    let report = initial_report(&config);
+    let cpu = CpuPool::per_core();
+    let report = initial_report(&config, cpu.size());
     let mut context = RunContext {
         connections: ConnectionSet::new(sender, invalid.clone(), observer.clone()),
         config,
@@ -114,7 +106,7 @@ async fn execute(
         observer,
         report,
         fixture: None,
-        cpu: BlockingExecutor::new(NonZeroUsize::MIN),
+        cpu,
         origin,
         setup_deadline,
         events,
@@ -125,7 +117,7 @@ async fn execute(
         setup_failures: 0,
         message_phase: None,
         telemetry: None,
-        telemetry_buffer: None,
+        telemetry_raw: Vec::new(),
     };
     let mut signal_task = None;
     let phase = context.start_phase(PhaseName::Preflight, Some(setup_deadline));
@@ -155,22 +147,22 @@ async fn execute(
     context.consume_events();
     context.refresh_measurement();
     let phase = context.start_phase(PhaseName::ArtifactFinalization, None);
-    let raw = context.telemetry_buffer.take().unwrap_or_default();
-    let preparation = writer.prepare_data(
-        &mut context.report,
-        &raw,
-        context
-            .fixture
-            .as_ref()
-            .and_then(LocalFixture::sanitized_server_log),
-    );
-    context.finish_phase(phase, phase_status(&preparation));
-    let publication = preparation
-        .and_then(|()| writer.prepare_summary(&mut context.report))
-        .and_then(|()| writer.finish(&context.report));
-    if publication.is_err() {
-        context.reason(ReasonCode::ArtifactFailure, "result_publication_failed");
-        context.report.phases[phase].status = PhaseStatus::Failed;
+    let mut written = writer.write("telemetry.ndjson", &context.telemetry_raw);
+    if let Some(log) = context.fixture.as_ref().and_then(LocalFixture::server_log) {
+        written = written.and(writer.write("server.log", log));
+    }
+    context.finish_phase(phase, phase_status(&written));
+    if written.is_err() {
+        context.reason(ReasonCode::ArtifactFailure, "artifact_write_failed");
+    }
+    if writer
+        .write("summary.md", summary::render(&context.report).as_bytes())
+        .is_err()
+    {
+        context.reason(ReasonCode::ArtifactFailure, "summary_write_failed");
+    }
+    if writer.write_json(RESULT_FILE, &context.report).is_err() {
+        context.reason(ReasonCode::ArtifactFailure, "result_write_failed");
     }
     Ok(context.report)
 }
@@ -189,22 +181,7 @@ impl RunContext {
         if self.report.started_at_utc.is_none() {
             self.reason(ReasonCode::SetupFailure, "utc_time_unavailable");
         }
-        let metadata = collect_metadata(&self.config)?;
-        self.report.driver = metadata.driver;
-        self.report.target = metadata.target;
-        if self
-            .report
-            .target
-            .declared_build
-            .as_ref()
-            .is_some_and(|build| build.profile == "unknown" || build.features.is_none())
-        {
-            self.reason(
-                ReasonCode::UnknownServerBuild,
-                "server_profile_or_features_unknown",
-            );
-        }
-        self.telemetry_buffer = Some(allocate_buffer()?);
+        collect_host_facts(&mut self.report);
         self.connections.reserve(self.config.account_count())?;
         let workers = match self.config.target {
             TargetConfig::Local { server_workers, .. } => Some(server_workers),
@@ -215,19 +192,10 @@ impl RunContext {
         self.report.driver.rlimit_nofile_hard = Some(budget.hard);
         if let TargetConfig::Remote {
             credentials_file,
-            environment_file,
             xmpp_domain,
             ..
         } = &self.config.target
         {
-            let descriptor = EnvironmentDescriptor::read(environment_file)?;
-            descriptor.validate(&self.config.environment_id)?;
-            self.report.driver.sources.insert(
-                "server_build".into(),
-                "operator_environment_descriptor".into(),
-            );
-            self.report.target.declared_build = Some(descriptor.server_build.clone());
-            self.report.environment = Some(descriptor);
             let credentials = CredentialSet::read(
                 credentials_file,
                 Some(xmpp_domain),
@@ -237,25 +205,6 @@ impl RunContext {
             self.accounts = credentials
                 .into_prepared()
                 .map_err(|_| invalid_input("remote_credentials_invalid"))?;
-            self.report.dataset.account_jids_sha256 = Some(canonical_hash(
-                &self
-                    .accounts
-                    .iter()
-                    .map(PreparedAccount::bare_jid)
-                    .collect::<Vec<_>>(),
-            )?);
-        }
-        if self
-            .report
-            .target
-            .declared_build
-            .as_ref()
-            .is_some_and(|build| build.profile == "unknown" || build.features.is_none())
-        {
-            self.reason(
-                ReasonCode::UnknownServerBuild,
-                "server_profile_or_features_unknown",
-            );
         }
         identity?;
         if self.report.started_at_utc.is_none() {
@@ -313,7 +262,21 @@ impl RunContext {
                 crate::scenario::churn::run(self).await?;
             }
         }
+        self.require_progress();
         Ok(())
+    }
+
+    /// A measurement without a single success means the target stopped working, not that it slowed down.
+    fn require_progress(&mut self) {
+        let c = &self.report.counters;
+        let stalled = match self.config.scenario {
+            ScenarioConfig::Idle { .. } => c.connections_at_measurement_end == 0,
+            ScenarioConfig::Messages { .. } => c.planned > 0 && c.received_on_time == 0,
+            ScenarioConfig::Churn { .. } => c.planned > 0 && c.closed_cleanly == 0,
+        };
+        if stalled {
+            self.reason(ReasonCode::WorkloadFailure, "no_operation_succeeded");
+        }
     }
 
     async fn prepare_target(&mut self) -> BenchResult<()> {
@@ -332,29 +295,6 @@ impl RunContext {
                     .fixture
                     .as_mut()
                     .ok_or_else(|| failure("fixture_owner"))?;
-                let mut settings = fixture.sanitized_server_settings();
-                settings.tls_min = settings.tls_min.trim_start_matches("TLSv").to_owned();
-                settings.tls_max = settings.tls_max.trim_start_matches("TLSv").to_owned();
-                self.report.dataset.account_jids_sha256 = Some(canonical_hash(
-                    &fixture
-                        .credentials()
-                        .iter()
-                        .map(PreparedAccount::bare_jid)
-                        .collect::<Vec<_>>(),
-                )?);
-                self.report.environment = Some(EnvironmentDescriptor {
-                    schema_version: 1,
-                    environment_id: self.config.environment_id.clone(),
-                    network_path: NetworkPath::Loopback,
-                    server: self.report.driver.system.clone(),
-                    server_build: self
-                        .report
-                        .target
-                        .declared_build
-                        .clone()
-                        .ok_or_else(|| failure("local_build_declaration"))?,
-                    server_settings: settings,
-                });
                 self.target = Some(
                     bounded(
                         &mut self.interruption,
@@ -415,21 +355,18 @@ impl RunContext {
         } else {
             None
         };
-        if let Some(buffer) = self.telemetry_buffer.take() {
-            match TelemetrySampler::start(
-                SamplerConfig {
-                    endpoint,
-                    timing: self.config.metrics.clone(),
-                },
-                self.origin,
-                buffer,
-            ) {
-                Ok(mut sampler) => {
-                    sampler.ready().await;
-                    self.telemetry = Some(sampler);
-                }
-                Err(_) => self.reason(ReasonCode::TelemetryUnavailable, "sampler_start_failed"),
+        match TelemetrySampler::start(
+            SamplerConfig {
+                endpoint,
+                timing: self.config.metrics.clone(),
+            },
+            self.origin,
+        ) {
+            Ok(mut sampler) => {
+                sampler.ready().await;
+                self.telemetry = Some(sampler);
             }
+            Err(_) => self.reason(ReasonCode::TelemetryUnavailable, "sampler_start_failed"),
         }
     }
 
@@ -440,14 +377,6 @@ impl RunContext {
                 Err(_) => self.reason(ReasonCode::TelemetryUnavailable, "sampler_join_failed"),
             }
         }
-    }
-
-    fn apply_connection_observations(&mut self, observations: connections::ConnectionObservations) {
-        self.report.target.negotiated_tls = observations
-            .negotiated_tls
-            .map(|value| format!("{value:?}"));
-        self.report.target.cipher = observations.cipher.map(|value| format!("{value:?}"));
-        self.report.target.observed_scram_iterations = observations.observed_scram_iterations;
     }
 
     fn apply_telemetry(
@@ -464,17 +393,15 @@ impl RunContext {
                 self.report.reasons.push(reason.clone());
             }
         }
-        self.report.telemetry_status = report.quality;
+        self.report.status = status_of(&self.report.reasons);
         if report.identity_changes > 0 {
-            self.report.status = RunStatus::Invalid;
             self.reason(ReasonCode::ServerRestarted, "server_restarted");
         }
         if let Some(identity) = identity {
-            self.report.target.observed_build = identity.build;
-            self.report.target.observed_process_start_time_seconds = identity.process_start;
+            self.report.target.server_build = identity.build;
         }
         self.report.telemetry = report;
-        self.telemetry_buffer = Some(raw);
+        self.telemetry_raw = raw;
     }
 
     fn notify_telemetry(&self, phase: PhaseName, at: Instant) {
@@ -498,8 +425,7 @@ impl RunContext {
         let deadline = Instant::now() + timeout;
         self.close_connections(deadline).await;
         self.stop_telemetry(Instant::now() + timeout).await;
-        // One CPU permit makes this a barrier for all previously admitted jobs.
-        self.cpu.run(|| ()).await;
+        self.cpu.barrier().await;
         let phase = self.start_phase(
             PhaseName::LocalChildShutdown,
             Some(Instant::now() + timeout),
@@ -509,8 +435,12 @@ impl RunContext {
         } else {
             Ok(StopOutcome::NotStarted)
         };
-        if !matches!(stopped, Ok(StopOutcome::Graceful | StopOutcome::NotStarted)) {
-            self.reason(ReasonCode::TargetFailure, "local_child_cleanup_failed");
+        match stopped {
+            Ok(StopOutcome::Graceful | StopOutcome::NotStarted) => {}
+            Ok(StopOutcome::Exited) => {
+                self.reason(ReasonCode::TargetFailure, "local_server_exited");
+            }
+            _ => self.reason(ReasonCode::TargetFailure, "local_child_cleanup_failed"),
         }
         self.finish_phase(
             phase,
@@ -541,7 +471,7 @@ impl RunContext {
         self.report.phases[phase].counters.closed_cleanly = summary.clean;
         self.report.phases[phase].counters.close_failed = summary.failed;
         if summary.failed > 0 {
-            self.reason(ReasonCode::WorkloadFailure, "connection_close_failed");
+            self.reason(ReasonCode::OperationsFailed, "connection_close_failed");
         }
         self.finish_phase(
             phase,
@@ -554,7 +484,7 @@ impl RunContext {
     }
 
     pub(crate) fn consume_events(&mut self) {
-        self.consume_prefix(self.config.measurement.max_dispatch_batch as usize);
+        self.consume_prefix(policy(&self.config).max_batch as usize);
     }
 
     fn consume_prefix(&mut self, limit: usize) {
@@ -610,14 +540,9 @@ impl RunContext {
             self.report.counters.unexpected_disconnects += u64::from(disconnected);
             self.report.counters.unexpected_stanzas += u64::from(unexpected);
         }
-        self.reason(
-            ReasonCode::WorkloadFailure,
-            if disconnected {
-                "unexpected_disconnect"
-            } else {
-                "unexpected_idle_traffic"
-            },
-        );
+        if disconnected {
+            self.reason(ReasonCode::OperationsFailed, "unexpected_disconnect");
+        }
     }
 
     pub(crate) async fn connected_barrier(&mut self) -> BenchResult<()> {
@@ -633,12 +558,18 @@ impl RunContext {
     }
 
     pub(crate) async fn settle_until(&mut self, deadline: Instant) -> BenchResult<()> {
-        self.connections.begin_barrier();
-        while !self.connections.settled() {
-            tokio::select! {
-                event = self.events.recv() => if let Some(event) = event { self.consume(event); },
-                _ = sleep(Duration::from_millis(1)) => {},
-                _ = sleep_until(deadline) => return Err(failure("phase_barrier_deadline")),
+        loop {
+            self.connections.begin_barrier();
+            while !self.connections.settled() {
+                tokio::select! {
+                    event = self.events.recv() => if let Some(event) = event { self.consume(event); },
+                    _ = sleep(Duration::from_millis(1)) => {},
+                    _ = sleep_until(deadline) => return Err(failure("phase_barrier_deadline")),
+                }
+            }
+            // An actor acknowledges the barrier before it takes its queued command.
+            if !self.connections.commands_queued() {
+                break;
             }
         }
         self.consume_prefix(event_capacity(
@@ -792,7 +723,6 @@ impl RunContext {
     fn retain_error(&mut self, error: BenchError) {
         let code = match (error.code, error.context()) {
             (_, "interrupted") => ReasonCode::Interrupted,
-            (_, "ramp_scheduler_miss") => ReasonCode::SchedulerMiss,
             (_, "run_integrity_failure") => ReasonCode::AccountingError,
             (_, "event_queue_overflow" | "phase_barrier_deadline") => ReasonCode::EventOverflow,
             (ErrorCode::InvalidConfig, _) => ReasonCode::InvalidConfig,
@@ -814,12 +744,7 @@ impl RunContext {
             code,
             context: Some(context.into()),
         });
-        self.report.status = crate::measurement::MeasurementResult {
-            counters: CounterReport::default(),
-            latencies: BTreeMap::new(),
-            reasons: self.report.reasons.clone(),
-        }
-        .status();
+        self.report.status = status_of(&self.report.reasons);
     }
 }
 
@@ -831,11 +756,14 @@ fn phase_status(result: &BenchResult<()>) -> PhaseStatus {
     }
 }
 
-pub(crate) fn policy(config: &MeasurementConfig) -> DispatchPolicy {
+pub(crate) fn policy(config: &RunConfig) -> DispatchPolicy {
+    let rate = config
+        .offered_rate()
+        .unwrap_or_default()
+        .max(config.measurement.ramp_rate_per_second);
     DispatchPolicy {
-        quantum: Duration::from_micros(config.dispatch_quantum_us),
-        max_batch: config.max_dispatch_batch as u32,
-        lag_allowance: Duration::from_millis(config.max_schedule_lag_ms),
+        lag_allowance: Duration::from_millis(config.measurement.max_schedule_lag_ms),
+        ..DispatchPolicy::for_rate(rate)
     }
 }
 

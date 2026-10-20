@@ -1,6 +1,4 @@
-# Replace the illustrative endpoint and descriptor with verified deployment facts.
-schema_version = 1
-environment_id = "illustrative-vps"
+# Replace the illustrative endpoint, domain and paths with your deployment.
 
 [target]
 mode = "remote"
@@ -8,7 +6,6 @@ connect_host = "xmpp.example.test"
 port = 5222
 xmpp_domain = "example.test"
 credentials_file = "private/credentials.json"
-environment_file = "remote-environment.json"
 metrics_url = "http://metrics.example.test:9090/metrics"
 
 [scenario]
@@ -27,8 +24,6 @@ ramp_rate_per_second = 20
 connect_concurrency = 2
 driver_workers = 2
 max_in_flight = 16
-dispatch_quantum_us = 1000
-max_dispatch_batch = 16
 max_schedule_lag_ms = 1000
 
 [metrics]

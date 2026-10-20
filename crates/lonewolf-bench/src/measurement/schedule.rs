@@ -4,7 +4,7 @@ use std::{num::NonZeroU32, ops::Range, time::Duration};
 use tokio::time::Instant;
 
 use super::invalid;
-use crate::{config::MAX_PHASE_OPERATIONS, error::BenchResult, report::DispatchPolicyMetadata};
+use crate::{config::MAX_PHASE_OPERATIONS, error::BenchResult};
 
 #[derive(Clone, Copy, Debug)]
 pub struct DispatchPolicy {
@@ -13,22 +13,23 @@ pub struct DispatchPolicy {
     pub lag_allowance: Duration,
 }
 
+impl DispatchPolicy {
+    /// Allows a burst of four ticks at `rate` so a stalled driver catches up in bounded steps.
+    pub fn for_rate(rate: u32) -> Self {
+        let per_tick = u64::from(rate).div_ceil(1000);
+        Self {
+            max_batch: (per_tick * 4).clamp(256, 4096) as u32,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for DispatchPolicy {
     fn default() -> Self {
         Self {
             quantum: Duration::from_micros(1000),
             max_batch: 256,
             lag_allowance: Duration::from_millis(100),
-        }
-    }
-}
-
-impl DispatchPolicy {
-    pub fn metadata(self) -> DispatchPolicyMetadata {
-        DispatchPolicyMetadata {
-            dispatch_quantum_us: self.quantum.as_micros() as u64,
-            max_dispatch_batch: self.max_batch.into(),
-            max_schedule_lag_ms: self.lag_allowance.as_millis() as u64,
         }
     }
 }

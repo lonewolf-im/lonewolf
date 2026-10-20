@@ -9,18 +9,15 @@ use crate::{
     accounts,
     client::{PreparedAccount, ResolvedTarget, local_tls_config},
     config::{RunConfig, ScenarioConfig, TargetConfig},
+    cpu::CpuPool,
     error::{BenchError, BenchResult, ErrorCode},
-    report::{ByteRateLimitSettings, RateLimitSettings, ServerSettings},
 };
 use lonewolf_auth::scram::{SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramIterations};
 use lonewolf_storage::{
     RedbStorage, Storage, WriteTransaction,
     account::{AccountKey, AccountWrites, NewAccount},
 };
-use lonewolf_util::{
-    arena::{Arena, ArenaConfig},
-    blocking::BlockingExecutor,
-};
+use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use nix::{
     sys::signal::{Signal, kill},
@@ -54,6 +51,8 @@ fn failure(context: &'static str) -> BenchError {
 pub enum StopOutcome {
     NotStarted,
     Graceful,
+    /// The server exited before the driver asked it to stop.
+    Exited,
     Forced,
 }
 
@@ -110,13 +109,14 @@ pub struct LocalFixture {
     config_path: PathBuf,
     setup_deadline: Instant,
     accounts: Vec<PreparedAccount>,
-    settings: ServerSettings,
+    workers: u16,
     certificate: rustls::pki_types::CertificateDer<'static>,
     child: Option<Child>,
     collector: Option<Collector>,
     log: Option<Vec<u8>>,
     metrics: String,
     stop_requested: bool,
+    exited: bool,
     forced: bool,
     reaped: bool,
     started: bool,
@@ -172,32 +172,80 @@ impl PreparationControl<'_> {
         Err(stop)
     }
 
-    async fn run_cpu<T: Send + 'static>(
-        &mut self,
-        cpu: &BlockingExecutor,
+    fn cpu_job<T: Send + 'static>(
+        &self,
+        cpu: &CpuPool,
         operation: impl FnOnce(&AtomicBool) -> BenchResult<T> + Send + 'static,
-    ) -> BenchResult<T> {
+    ) -> impl Future<Output = BenchResult<T>> + Send + 'static {
         let cancelled = self.cancelled.clone();
         let deadline = self.deadline;
         let context = self.deadline_context;
         #[cfg(test)]
         let probe = self.probe.clone();
-        self.wait(cpu.run(move || {
-            if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-                return Err(failure(context));
+        let cpu = cpu.clone();
+        async move {
+            cpu.run(move || {
+                if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return Err(failure(context));
+                }
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe.cpu_started()?;
+                }
+                operation(&cancelled)
+            })
+            .await
+        }
+    }
+
+    async fn run_cpu<T: Send + 'static>(
+        &mut self,
+        cpu: &CpuPool,
+        operation: impl FnOnce(&AtomicBool) -> BenchResult<T> + Send + 'static,
+    ) -> BenchResult<T> {
+        let job = self.cpu_job(cpu, operation);
+        self.wait(job).await
+    }
+
+    /// Runs every job concurrently on the pool and returns their results in order.
+    async fn run_cpu_all<T: Send + 'static, F>(
+        &mut self,
+        cpu: &CpuPool,
+        operations: impl IntoIterator<Item = F>,
+    ) -> BenchResult<Vec<T>>
+    where
+        F: FnOnce(&AtomicBool) -> BenchResult<T> + Send + 'static,
+    {
+        self.check()?;
+        let jobs: Vec<_> = operations
+            .into_iter()
+            .map(|operation| tokio::spawn(self.cpu_job(cpu, operation)))
+            .collect();
+        let cancelled = self.cancelled.clone();
+        self.wait(async move {
+            let mut results = Vec::with_capacity(jobs.len());
+            let mut first_error = None;
+            for job in jobs {
+                match job
+                    .await
+                    .map_err(|_| failure("fixture_cpu_job"))
+                    .and_then(|r| r)
+                {
+                    Ok(value) => results.push(value),
+                    Err(error) => {
+                        cancelled.store(true, Ordering::Release);
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
-            #[cfg(test)]
-            if let Some(probe) = probe {
-                probe.cpu_started()?;
-            }
-            operation(&cancelled)
-        }))
+            first_error.map_or(Ok(results), Err)
+        })
         .await
     }
 }
 
 impl LocalFixture {
-    pub async fn prepare(config: &RunConfig, cpu: &BlockingExecutor) -> BenchResult<Self> {
+    pub async fn prepare(config: &RunConfig, cpu: &CpuPool) -> BenchResult<Self> {
         config.validate()?;
         let deadline = Instant::now() + Duration::from_millis(config.measurement.setup_timeout_ms);
         let mut control = PreparationControl {
@@ -213,7 +261,7 @@ impl LocalFixture {
 
     pub(crate) async fn prepare_for_run(
         config: &RunConfig,
-        cpu: &BlockingExecutor,
+        cpu: &CpuPool,
         deadline: Instant,
         interruption: &mut watch::Receiver<bool>,
     ) -> BenchResult<Self> {
@@ -230,7 +278,7 @@ impl LocalFixture {
 
     async fn prepare_inner(
         config: &RunConfig,
-        cpu: &BlockingExecutor,
+        cpu: &CpuPool,
         control: &mut PreparationControl<'_>,
     ) -> BenchResult<Self> {
         control.check()?;
@@ -281,39 +329,26 @@ impl LocalFixture {
             .await?;
         for chunk in credentials.accounts.chunks(256) {
             control.check()?;
-            let secrets: Vec<_> = chunk
-                .iter()
-                .map(|account| {
-                    (
-                        account.jid.clone(),
-                        Zeroizing::new(account.password.to_string()),
-                    )
-                })
-                .collect();
-            let batch = control
-                .run_cpu(cpu, move |cancelled| {
-                    let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())
-                        .map_err(|_| failure("fixture_scram_policy"))?;
-                    let mut batch = Vec::with_capacity(secrets.len());
-                    for (jid, password) in secrets {
-                        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-                            return Err(failure(deadline_context));
-                        }
-                        let mut arena = Arena::try_new(ArenaConfig::default())
-                            .map_err(|_| failure("fixture_arena"))?;
-                        let jid =
-                            Jid::parse_in(&jid, &mut arena).map_err(|_| failure("fixture_jid"))?;
-                        let key = AccountKey::try_from(
-                            jid.resolve(&arena).map_err(|_| failure("fixture_jid"))?,
+            let jobs = chunk.chunks(chunk.len().div_ceil(cpu.size())).map(|part| {
+                let secrets: Vec<_> = part
+                    .iter()
+                    .map(|account| {
+                        (
+                            account.jid.clone(),
+                            Zeroizing::new(account.password.to_string()),
                         )
-                        .map_err(|_| failure("fixture_jid"))?;
-                        let credentials = ScramCredentials::provision(&password, iterations)
-                            .map_err(|_| failure("fixture_password"))?;
-                        batch.push(NewAccount { key, credentials });
-                    }
-                    Ok::<_, BenchError>(batch)
-                })
-                .await?;
+                    })
+                    .collect();
+                move |cancelled: &AtomicBool| {
+                    provision_accounts(secrets, cancelled, deadline, deadline_context)
+                }
+            });
+            let batch: Vec<_> = control
+                .run_cpu_all(cpu, jobs)
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
             #[cfg(test)]
             let probe = control.probe.clone();
             control
@@ -348,10 +383,12 @@ impl LocalFixture {
         drop(storage);
         let accounts = credentials.into_prepared()?;
         control.check()?;
-        let settings = settings(*server_workers, *stanza_pool_size_mib);
         let config_path = directory.path().join("lonewolf.toml");
         control.check()?;
-        tls::write_private(&config_path, server_config(&settings).as_bytes())?;
+        tls::write_private(
+            &config_path,
+            server_config(*stanza_pool_size_mib).as_bytes(),
+        )?;
         control.check()?;
         Ok(Self {
             directory: Some(directory),
@@ -359,13 +396,14 @@ impl LocalFixture {
             config_path,
             setup_deadline: deadline,
             accounts,
-            settings,
+            workers: *server_workers,
             certificate,
             child: None,
             collector: None,
             log: None,
             metrics: String::new(),
             stop_requested: false,
+            exited: false,
             forced: false,
             reaped: false,
             started: false,
@@ -386,7 +424,7 @@ impl LocalFixture {
                 .arg("--config")
                 .arg(&self.config_path)
                 .current_dir(directory.path())
-                .env("LONEWOLF_WORKER_COUNT", self.settings.workers.to_string())
+                .env("LONEWOLF_WORKER_COUNT", self.workers.to_string())
                 .env("NO_COLOR", "1")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -458,6 +496,7 @@ impl LocalFixture {
             {
                 self.reaped = true;
             }
+            self.exited |= self.reaped && !self.stop_requested;
             if !self.reaped && !self.stop_requested {
                 let pid = i32::try_from(child.id()).map_err(|_| failure("fixture_pid"))?;
                 match kill(Pid::from_raw(pid), Signal::SIGTERM) {
@@ -498,9 +537,8 @@ impl LocalFixture {
         }
         if self.forced
             && let Some(log) = &mut self.log
-            && !log.ends_with(b"forced_termination\n")
         {
-            log.extend_from_slice(b"forced_termination\n");
+            log.extend_from_slice(b"[server killed after the shutdown timeout]\n");
         }
         self.accounts.clear();
         let cleanup = if let Some(directory) = self.directory.take() {
@@ -514,6 +552,8 @@ impl LocalFixture {
         cleanup?;
         Ok(if self.forced {
             StopOutcome::Forced
+        } else if self.exited {
+            StopOutcome::Exited
         } else if self.child.is_some() {
             StopOutcome::Graceful
         } else {
@@ -530,10 +570,7 @@ impl LocalFixture {
     pub fn credentials(&mut self) -> &mut [PreparedAccount] {
         &mut self.accounts
     }
-    pub fn sanitized_server_settings(&self) -> ServerSettings {
-        self.settings.clone()
-    }
-    pub fn sanitized_server_log(&self) -> Option<&[u8]> {
+    pub fn server_log(&self) -> Option<&[u8]> {
         self.log.as_deref()
     }
 }
@@ -574,48 +611,38 @@ fn validate_limits(config: &RunConfig) -> BenchResult<()> {
     }
     Ok(())
 }
-fn settings(workers: u16, pool: u64) -> ServerSettings {
-    let rate = RateLimitSettings {
-        rate_per_second: 1_000_000,
-        burst: 1_000_000,
-    };
-    ServerSettings {
-        workers,
-        stanza_pool_size_mib: pool,
-        logging_level: "info".into(),
-        host_extensions: vec!["roster".into(), "offline".into()],
-        storage_backend: "redb".into(),
-        max_unauthenticated_connections: 100_000,
-        max_resources_per_account: 1,
-        max_directed_presence_recipients_per_resource: 256,
-        max_connections_per_ip: 100_000,
-        max_stanza_bytes: 262_144,
-        connection_establishment_timeout_secs: 10,
-        authentication_timeout_secs: 15,
-        resource_binding_timeout_secs: 5,
-        authentication_retries: 2,
-        resource_binding_retries: 5,
-        connection_attempts_per_ip: rate.clone(),
-        incoming_stanzas_per_connection: rate.clone(),
-        new_recipients_per_connection: rate,
-        incoming_xml_per_connection: ByteRateLimitSettings {
-            bytes_per_second: 1_073_741_824,
-            burst_bytes: 1_073_741_824,
-        },
-        offered_auth_mechanisms: vec!["SCRAM-SHA-256".into()],
-        tls_min: "TLSv1.2".into(),
-        tls_max: "TLSv1.3".into(),
-        empty_roster: true,
-        offline_storage: true,
+fn provision_accounts(
+    secrets: Vec<(String, Zeroizing<String>)>,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+    deadline_context: &'static str,
+) -> BenchResult<Vec<NewAccount>> {
+    let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())
+        .map_err(|_| failure("fixture_scram_policy"))?;
+    let mut batch = Vec::with_capacity(secrets.len());
+    for (jid, password) in secrets {
+        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(failure(deadline_context));
+        }
+        let mut arena =
+            Arena::try_new(ArenaConfig::default()).map_err(|_| failure("fixture_arena"))?;
+        let jid = Jid::parse_in(&jid, &mut arena).map_err(|_| failure("fixture_jid"))?;
+        let key = AccountKey::try_from(jid.resolve(&arena).map_err(|_| failure("fixture_jid"))?)
+            .map_err(|_| failure("fixture_jid"))?;
+        let credentials = ScramCredentials::provision(&password, iterations)
+            .map_err(|_| failure("fixture_password"))?;
+        batch.push(NewAccount { key, credentials });
     }
+    Ok(batch)
 }
-fn server_config(settings: &ServerSettings) -> String {
+
+fn server_config(stanza_pool_size_mib: u64) -> String {
     format!(
         r#"[logging]
 level = "info"
 [xmpp]
 default_host = "localhost"
-stanza_pool_size_mib = {}
+stanza_pool_size_mib = {stanza_pool_size_mib}
 [hosts.localhost]
 extensions = ["roster", "offline"]
 [hosts.localhost.tls]
@@ -653,7 +680,6 @@ enabled = false
 [metrics]
 enabled = true
 address = "127.0.0.1:0"
-"#,
-        settings.stanza_pool_size_mib
+"#
     )
 }

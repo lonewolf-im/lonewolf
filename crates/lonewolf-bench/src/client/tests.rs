@@ -14,8 +14,8 @@ use std::{
     time::Duration,
 };
 
+use crate::cpu::CpuPool;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use lonewolf_util::blocking::BlockingExecutor;
 use lonewolf_xmpp::parser::StreamEvent;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::{Instant, timeout};
@@ -36,8 +36,8 @@ const SERVER_PROOF: &str = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=";
 fn account() -> BenchResult<PreparedAccount> {
     PreparedAccount::new("user@example.test", "pencil".to_owned())
 }
-fn cpu() -> BlockingExecutor {
-    BlockingExecutor::new(NonZeroUsize::MIN)
+fn cpu() -> CpuPool {
+    CpuPool::new(NonZeroUsize::MIN)
 }
 fn id() -> CorrelationId {
     CorrelationId {
@@ -578,6 +578,7 @@ async fn cpu_admission_remains_bounded_after_caller_cancellation() -> TestResult
                 let _ = entered.send(());
                 let _ = gate.recv_timeout(Duration::from_secs(5));
                 first_active.fetch_sub(1, Ordering::AcqRel);
+                Ok(())
             })
             .await
     });
@@ -590,6 +591,7 @@ async fn cpu_admission_remains_bounded_after_caller_cancellation() -> TestResult
         let running = next_active.fetch_add(1, Ordering::AcqRel) + 1;
         next_max.fetch_max(running, Ordering::AcqRel);
         next_active.fetch_sub(1, Ordering::AcqRel);
+        Ok(())
     }));
     assert!(
         second
@@ -599,7 +601,7 @@ async fn cpu_admission_remains_bounded_after_caller_cancellation() -> TestResult
     );
     assert_eq!(maximum.load(Ordering::Acquire), 1);
     release.send(())?;
-    second.await;
+    second.await?;
     assert_eq!(maximum.load(Ordering::Acquire), 1);
     Ok(())
 }
@@ -880,7 +882,8 @@ async fn reused_scram_keys_do_not_admit_cpu_work_and_new_exchanges_have_fresh_no
         blocked_executor
             .run(move || {
                 let _ = entered.send(());
-                gate.recv_timeout(Duration::from_secs(5))
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+                Ok(())
             })
             .await
     });

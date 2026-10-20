@@ -13,11 +13,10 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use zeroize::{Zeroize, Zeroizing};
 
 const LINE_LIMIT: usize = 8192;
-const LOG_LIMIT: usize = 64 * 1024;
-const MARKER_RESERVE: usize = 256;
+const LOG_LIMIT: usize = 1024 * 1024;
+const TRUNCATED: &[u8] = b"[server log truncated]\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Startup {
@@ -27,6 +26,7 @@ pub(super) enum Startup {
     Failed,
 }
 
+/// Copies the server's stderr into a bounded log and reports startup events.
 pub(super) struct Collector {
     pub(super) receiver: Receiver<Startup>,
     stop: Arc<AtomicBool>,
@@ -77,14 +77,15 @@ impl Drop for Collector {
 }
 
 fn collect(reader: &mut impl Read, stop: &AtomicBool, sender: SyncSender<Startup>) -> Vec<u8> {
-    let mut parser = Projection::new(sender);
-    let mut chunk = Zeroizing::new([0; 8192]);
+    let mut capture = Capture::new(sender);
+    let mut chunk = [0; 8192];
     let mut draining = None;
     let mut drained = 0;
     loop {
         if stop.load(Ordering::Acquire) && draining.is_none() {
             draining = Some(Instant::now());
         }
+        // Another process may keep the pipe open, so the final drain is bounded.
         if draining.is_some_and(|start: Instant| start.elapsed() >= Duration::from_millis(100))
             || drained >= LOG_LIMIT
         {
@@ -93,7 +94,7 @@ fn collect(reader: &mut impl Read, stop: &AtomicBool, sender: SyncSender<Startup
         match reader.read(&mut chunk[..]) {
             Ok(0) => break,
             Ok(count) => {
-                parser.push(&chunk[..count]);
+                capture.push(&chunk[..count]);
                 if draining.is_some() {
                     drained += count;
                 }
@@ -106,36 +107,36 @@ fn collect(reader: &mut impl Read, stop: &AtomicBool, sender: SyncSender<Startup
                 thread::sleep(Duration::from_millis(5));
             }
             Err(_) => {
-                parser.status(8, b"capture_read_failure\n");
-                parser.notify(Startup::Failed);
+                capture.record(b"[server log read failed]\n");
+                capture.notify(Startup::Failed);
                 break;
             }
         }
     }
-    if !parser.line.is_empty() || parser.oversized {
-        parser.status(2, b"input_omitted\n");
+    if !capture.line.is_empty() {
+        capture.finish_line();
     }
-    parser.output
+    capture.output
 }
 
-struct Projection {
-    line: Zeroizing<Vec<u8>>,
+struct Capture {
+    line: Vec<u8>,
     oversized: bool,
     output: Vec<u8>,
-    status_flags: u8,
+    truncated: bool,
     sender: SyncSender<Startup>,
     c2s: Option<u16>,
     metrics: Option<u16>,
     ready: bool,
     failed: bool,
 }
-impl Projection {
+impl Capture {
     fn new(sender: SyncSender<Startup>) -> Self {
         Self {
-            line: Zeroizing::new(Vec::with_capacity(LINE_LIMIT)),
+            line: Vec::with_capacity(LINE_LIMIT),
             oversized: false,
-            output: Vec::with_capacity(LOG_LIMIT),
-            status_flags: 0,
+            output: Vec::new(),
+            truncated: false,
             sender,
             c2s: None,
             metrics: None,
@@ -143,37 +144,29 @@ impl Projection {
             failed: false,
         }
     }
-    fn marker(&mut self, token: &[u8]) {
-        if self.output.len() + token.len() <= LOG_LIMIT - MARKER_RESERVE {
-            self.output.extend_from_slice(token);
-        } else {
-            self.status(1, b"capture_truncated\n");
+    fn record(&mut self, bytes: &[u8]) {
+        if self.truncated {
+            return;
         }
-    }
-    fn status(&mut self, bit: u8, token: &[u8]) {
-        if self.status_flags & bit == 0 {
-            self.status_flags |= bit;
-            self.output.extend_from_slice(token);
+        if self.output.len() + bytes.len() + TRUNCATED.len() > LOG_LIMIT {
+            self.output.extend_from_slice(TRUNCATED);
+            self.truncated = true;
+        } else {
+            self.output.extend_from_slice(bytes);
         }
     }
     fn notify(&mut self, event: Startup) {
         let fresh = match event {
-            Startup::C2s(port) => match self.c2s {
-                None => {
-                    self.c2s = Some(port);
-                    true
-                }
+            Startup::C2s(port) => match self.c2s.replace(port) {
+                None => true,
                 Some(old) if old == port => false,
                 Some(_) => {
                     self.notify(Startup::Failed);
                     false
                 }
             },
-            Startup::Metrics(port) => match self.metrics {
-                None => {
-                    self.metrics = Some(port);
-                    true
-                }
+            Startup::Metrics(port) => match self.metrics.replace(port) {
+                None => true,
                 Some(old) if old == port => false,
                 Some(_) => {
                     self.notify(Startup::Failed);
@@ -187,28 +180,28 @@ impl Projection {
             let _ = self.sender.try_send(event);
         }
     }
+    fn finish_line(&mut self) {
+        if self.oversized {
+            self.record(b"[oversized line omitted]\n");
+        } else {
+            let line = std::mem::take(&mut self.line);
+            if let Some(event) = std::str::from_utf8(&line).ok().and_then(parse) {
+                self.notify(event);
+            }
+            self.record(&line);
+            self.record(b"\n");
+            self.line = line;
+        }
+        self.line.clear();
+        self.oversized = false;
+    }
     fn push(&mut self, data: &[u8]) {
         for &byte in data {
             if byte == b'\n' {
-                if self.oversized {
-                    self.status(4, b"oversized_line_omitted\n");
-                } else {
-                    let parsed = std::str::from_utf8(&self.line).ok().and_then(parse);
-                    match parsed {
-                        Some((event, token)) => {
-                            self.marker(token);
-                            if let Some(event) = event {
-                                self.notify(event);
-                            }
-                        }
-                        None => self.status(2, b"input_omitted\n"),
-                    }
-                }
-                self.line.zeroize();
-                self.oversized = false;
+                self.finish_line();
             } else if !self.oversized {
                 if self.line.len() == LINE_LIMIT {
-                    self.line.zeroize();
+                    self.line.clear();
                     self.oversized = true;
                 } else {
                     self.line.push(byte);
@@ -218,8 +211,7 @@ impl Projection {
     }
 }
 
-type Parsed = (Option<Startup>, &'static [u8]);
-fn parse(line: &str) -> Option<Parsed> {
+fn parse(line: &str) -> Option<Startup> {
     if line.bytes().any(|byte| byte.is_ascii_control()) {
         return None;
     }
@@ -229,19 +221,16 @@ fn parse(line: &str) -> Option<Parsed> {
     if date.len() != 10 || time.len() != 8 || words.next()? != "INFO" {
         return None;
     }
-    if !date.bytes().enumerate().all(|(index, byte)| {
-        if index == 4 || index == 7 {
-            byte == b':'
-        } else {
-            byte.is_ascii_digit()
-        }
-    }) || !time.bytes().enumerate().all(|(index, byte)| {
-        if index == 2 || index == 5 {
-            byte == b':'
-        } else {
-            byte.is_ascii_digit()
-        }
-    }) {
+    let digits_with = |value: &str, separators: [usize; 2]| {
+        value.bytes().enumerate().all(|(index, byte)| {
+            if separators.contains(&index) {
+                byte == b':'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+    };
+    if !digits_with(date, [4, 7]) || !digits_with(time, [2, 5]) {
         return None;
     }
     let target = words.next()?;
@@ -249,47 +238,32 @@ fn parse(line: &str) -> Option<Parsed> {
     let message = message.strip_prefix(' ')?;
     match target {
         "lonewolf_core::c2s:" => {
-            if let Some(fields) = message.strip_prefix("c2s TCP listener stopped ") {
-                let [listener, workers] = numeric_fields(fields, ["listener_id", "worker_count"])?;
-                if listener == 0 && workers > 0 {
-                    return Some((None, b"c2s_listener_stopped\n"));
-                }
-                return None;
-            }
             let fields = message.strip_prefix("c2s TCP listener started ")?;
             let [listener, workers, port] =
                 numeric_fields(fields, ["listener_id", "worker_count", "port"])?;
             if listener != 0 || workers == 0 {
                 return None;
             }
-            let port = u16::try_from(port).ok()?;
-            if port == 0 {
-                return None;
-            }
-            Some((Some(Startup::C2s(port)), b"c2s_listener_started\n"))
+            u16::try_from(port)
+                .ok()
+                .filter(|port| *port != 0)
+                .map(Startup::C2s)
         }
         "lonewolf_metrics::server:" => {
-            if message == "metrics service stopped" {
-                return Some((None, b"metrics_service_stopped\n"));
-            }
             let [port] =
                 numeric_fields(message.strip_prefix("metrics service started ")?, ["port"])?;
-            let port = u16::try_from(port).ok()?;
-            if port == 0 {
-                return None;
-            }
-            Some((Some(Startup::Metrics(port)), b"metrics_service_started\n"))
+            u16::try_from(port)
+                .ok()
+                .filter(|port| *port != 0)
+                .map(Startup::Metrics)
         }
-        "lonewolf_core:" => match message {
-            "waiting for stop signal... (press Ctrl+C to stop the server)" => {
-                Some((Some(Startup::Ready), b"server_ready\n"))
-            }
-            "core dispatcher stopped" => Some((None, b"core_dispatcher_stopped\n")),
-            _ => None,
-        },
+        "lonewolf_core:" => (message
+            == "waiting for stop signal... (press Ctrl+C to stop the server)")
+            .then_some(Startup::Ready),
         _ => None,
     }
 }
+
 fn numeric_fields<const N: usize>(fields: &str, keys: [&str; N]) -> Option<[u64; N]> {
     let mut values = [None; N];
     for field in fields.split_whitespace() {
@@ -313,6 +287,7 @@ fn numeric_fields<const N: usize>(fields: &str, keys: [&str; N]) -> Option<[u64;
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn final_drain_is_finite_when_another_owner_keeps_pipe_open()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -327,105 +302,58 @@ mod tests {
         drop(writer);
         Ok(())
     }
+
     #[test]
-    fn fragmented_logs_project_only_known_tokens_and_unique_ports() {
+    fn fragmented_logs_report_startup_once_and_keep_every_line() {
         let (sender, receiver) = mpsc::sync_channel(4);
-        let mut projection = Projection::new(sender);
-        let input = b"2026:10:19 12:00:00  INFO lonewolf_core::c2s: c2s TCP listener started listener_id=0 worker_count=2 port=1234\n2026:10:19 12:00:00  INFO lonewolf_metrics::server: metrics service started port=2345\n2026:10:19 12:00:00  INFO lonewolf_core: waiting for stop signal... (press Ctrl+C to stop the server)\nsecret-password\n";
+        let mut capture = Capture::new(sender);
+        let input = b"2026:10:19 12:00:00  INFO lonewolf_core::c2s: c2s TCP listener started listener_id=0 worker_count=2 port=1234\n2026:10:19 12:00:00  INFO lonewolf_metrics::server: metrics service started port=2345\n2026:10:19 12:00:00  INFO lonewolf_core: waiting for stop signal... (press Ctrl+C to stop the server)\nother line\n";
         for chunk in input.chunks(3) {
-            projection.push(chunk);
+            capture.push(chunk);
         }
         assert_eq!(
             receiver.try_iter().collect::<Vec<_>>(),
             [Startup::C2s(1234), Startup::Metrics(2345), Startup::Ready]
         );
-        assert_eq!(
-            projection.output,
-            b"c2s_listener_started\nmetrics_service_started\nserver_ready\ninput_omitted\n"
-        );
-        assert!(parse("2026:10:19 12:00:00 INFO lonewolf_metrics::server: metrics service started port=4 port=5").is_none());
-        assert!(
-            parse(
-                "2026:10:19 12:00:00 INFO lonewolf_metrics::server: metrics service started port=0"
-            )
-            .is_none()
-        );
-        assert!(
-            parse("2026:10:19 12:00:00 INFO lonewolf_metrics::server: metrics service started")
-                .is_none()
-        );
-        assert!(parse("2026:10:19 12:00:00 INFO lonewolf_core::c2s: c2s TCP listener started worker_count=2 port=1234").is_none());
-        assert!(parse("2026:10:19 12:00:00 INFO other: waiting for stop signal... (press Ctrl+C to stop the server)").is_none());
+        assert_eq!(capture.output, input);
     }
+
     #[test]
-    fn startup_fields_reject_quoted_embedded_unknown_malformed_and_duplicate_tokens() {
+    fn startup_fields_reject_malformed_and_duplicate_tokens() {
         for message in [
-            r#"metrics service started detail=" port=2345 ""#,
-            r#"metrics service started port=2345 detail="secret""#,
-            "metrics service started port=2345 port=2345",
-            "metrics service started port=2345 extra",
-            "metrics service started port=2345=1234",
-            "metrics service started port=65536",
+            "lonewolf_metrics::server: metrics service started port=4 port=5",
+            "lonewolf_metrics::server: metrics service started port=0",
+            "lonewolf_metrics::server: metrics service started",
+            r#"lonewolf_metrics::server: metrics service started detail=" port=2345 ""#,
+            "lonewolf_metrics::server: metrics service started port=2345 extra",
+            "lonewolf_metrics::server: metrics service started port=65536",
+            "lonewolf_core::c2s: c2s TCP listener started worker_count=2 port=1234",
+            "lonewolf_core::c2s: c2s TCP listener started listener_id=0 worker_count=2 port=1234 other=1",
+            "other: waiting for stop signal... (press Ctrl+C to stop the server)",
         ] {
-            assert!(
-                parse(&format!(
-                    "2026:10:19 12:00:00 INFO lonewolf_metrics::server: {message}"
-                ))
-                .is_none()
-            );
-        }
-        for message in [
-            r#"c2s TCP listener started listener_id=0 worker_count=2 detail=" port=1234 ""#,
-            r#"c2s TCP listener started detail=" listener_id=0 worker_count=2 port=1234 ""#,
-            "c2s TCP listener started listener_id=0 worker_count=2 port=1234 other=1",
-            "c2s TCP listener started listener_id=0 listener_id=0 worker_count=2 port=1234",
-        ] {
-            assert!(
-                parse(&format!(
-                    "2026:10:19 12:00:00 INFO lonewolf_core::c2s: {message}"
-                ))
-                .is_none()
-            );
+            assert_eq!(parse(&format!("2026:10:19 12:00:00 INFO {message}")), None);
         }
         assert_eq!(
             parse(
                 "2026:10:19 12:00:00 INFO lonewolf_metrics::server: metrics service started port=2345"
             ),
-            Some((
-                Some(Startup::Metrics(2345)),
-                b"metrics_service_started\n".as_slice()
-            ))
-        );
-        assert_eq!(
-            parse(
-                "2026:10:19 12:00:00 INFO lonewolf_core::c2s: c2s TCP listener started listener_id=0 worker_count=2 port=1234"
-            ),
-            Some((
-                Some(Startup::C2s(1234)),
-                b"c2s_listener_started\n".as_slice()
-            ))
+            Some(Startup::Metrics(2345))
         );
     }
+
     #[test]
-    fn oversized_and_saturated_logs_remain_bounded_and_keep_draining() {
+    fn oversized_and_saturated_logs_remain_bounded_and_keep_detecting_startup() {
         let (sender, receiver) = mpsc::sync_channel(4);
-        let mut projection = Projection::new(sender);
-        projection.push(&vec![b'x'; LINE_LIMIT + 1]);
-        projection.push(b"\n");
-        for _ in 0..10000 {
-            projection.push(b"2026:10:19 12:00:00 INFO lonewolf_core: core dispatcher stopped\n");
+        let mut capture = Capture::new(sender);
+        capture.push(&vec![b'x'; LINE_LIMIT + 1]);
+        capture.push(b"\n");
+        for _ in 0..20_000 {
+            capture.push(b"2026:10:19 12:00:00 INFO lonewolf_core: core dispatcher stopped\n");
         }
-        projection.push(b"secret\n");
-        projection.push(b"2026:10:19 12:00:00 INFO lonewolf_core: waiting for stop signal... (press Ctrl+C to stop the server)\n");
-        assert!(projection.output.len() <= LOG_LIMIT);
-        assert!(projection.output.starts_with(b"oversized_line_omitted\n"));
-        assert!(
-            projection
-                .output
-                .windows(b"capture_truncated\n".len())
-                .any(|chunk| chunk == b"capture_truncated\n")
-        );
+        capture.push(b"2026:10:19 12:00:00 INFO lonewolf_core: waiting for stop signal... (press Ctrl+C to stop the server)\n");
+        assert!(capture.output.len() <= LOG_LIMIT);
+        assert!(capture.output.starts_with(b"[oversized line omitted]\n"));
+        assert!(capture.output.ends_with(TRUNCATED));
         assert_eq!(receiver.try_recv(), Ok(Startup::Ready));
-        assert!(!projection.output.windows(6).any(|chunk| chunk == b"secret"));
     }
 }

@@ -12,11 +12,11 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
 use lonewolf_extension::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError, HostLookup,
-    IqResponseFuture, SessionTag, StanzaFactory,
+    BoundResource, Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError,
+    HostLookup, IqResponseFuture, SessionLookup, SessionTag, StanzaFactory,
 };
 use lonewolf_extension::message::MessageHandler;
-use lonewolf_extension::{Deliver, Effects};
+use lonewolf_extension::{Deliver, Effects, ExtensionFuture};
 #[cfg(test)]
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
@@ -388,6 +388,20 @@ mod tests;
 impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<A> {
     fn is_local_host(&self, domain: &str) -> bool {
         self.router.is_local_host(domain)
+    }
+}
+
+impl<A: ChunkAllocator + Clone> SessionLookup for RouterDelivery<A> {
+    fn resources<'a>(
+        &'a self,
+        account: &'a AccountKey,
+    ) -> ExtensionFuture<'a, Result<Vec<BoundResource>, DeliveryError>> {
+        Box::pin(async move {
+            self.router
+                .account_resources(account)
+                .await
+                .map_err(|_| DeliveryError)
+        })
     }
 }
 

@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::account::AccountHandler;
 use lonewolf_extension::archive::ArchiveHandler;
-use lonewolf_extension::delivery::SessionTag;
+use lonewolf_extension::delivery::{BoundResource, SessionTag};
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
@@ -398,6 +398,16 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
 
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
         self.local.retire_account(account).await
+    }
+
+    pub(crate) async fn account_resources(
+        &self,
+        account: &AccountKey,
+    ) -> Result<Vec<BoundResource>, RouterError> {
+        if !self.is_local_host(account.domain()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        self.local.account_resources(account).await
     }
 
     pub(crate) async fn resource_match(

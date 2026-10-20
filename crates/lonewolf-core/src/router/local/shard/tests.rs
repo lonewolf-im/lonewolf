@@ -306,6 +306,62 @@ fn full_normal_delivery_linearizes_at_exact_resource_binding_and_disconnect()
 }
 
 #[test]
+fn account_resources_lists_live_sessions_sorted_with_availability() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let account = account()?;
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let limit = NonZeroUsize::MIN.saturating_add(2);
+        let mut registrations = Vec::with_capacity(3);
+        for resource in ["phone", "desk", "tablet"] {
+            let (outbound, inbound) = async_channel::bounded(64);
+            registrations.push(shard.register(
+                account.clone(),
+                Some(resource.into()),
+                limit,
+                outbound,
+                inbound,
+                test_router(),
+            )?);
+        }
+        shard.presence(
+            &account,
+            "desk",
+            registrations[1].token,
+            Some(0),
+            routed("<presence from='alice@localhost/desk'/>").await?,
+            None,
+        )?;
+        registrations[2].alive.store(false, Ordering::Release);
+        assert_eq!(
+            shard.account_resources(&account),
+            [
+                BoundResource {
+                    resource: "desk".into(),
+                    available: true
+                },
+                BoundResource {
+                    resource: "phone".into(),
+                    available: false
+                },
+            ]
+        );
+        let mut arena = Arena::try_new(Default::default())?;
+        let unknown = Jid::parse_in("unknown@localhost", &mut arena)?;
+        let unknown = AccountKey::try_from(unknown.resolve(&arena)?)?;
+        assert!(shard.account_resources(&unknown).is_empty());
+        registrations[0].links.inbound.close();
+        assert_eq!(
+            shard.account_resources(&account),
+            [BoundResource {
+                resource: "desk".into(),
+                available: true
+            }]
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn resource_match_ignores_dead_and_closed_sessions() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
         for closed in [false, true] {

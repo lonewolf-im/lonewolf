@@ -146,6 +146,21 @@ pub trait HostLookup {
     fn is_local_host(&self, domain: &str) -> bool;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundResource {
+    pub resource: Box<str>,
+    /// The resource has sent available presence and has not withdrawn it.
+    pub available: bool,
+}
+
+pub trait SessionLookup {
+    /// Lists the live resources bound to a local account, sorted by resource.
+    fn resources<'a>(
+        &'a self,
+        account: &'a AccountKey,
+    ) -> ExtensionFuture<'a, Result<Vec<BoundResource>, DeliveryError>>;
+}
+
 /// Every method runs on the connection worker of the request being handled.
 pub trait Delivery<A: ChunkAllocator>: HostLookup {
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;

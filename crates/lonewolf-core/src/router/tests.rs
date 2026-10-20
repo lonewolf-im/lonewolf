@@ -18,8 +18,8 @@ use crate::router::{
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_extension::ExtensionFuture;
-use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::delivery::SessionTag;
+use lonewolf_extension::delivery::{BoundResource, HandlerError};
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_storage::RedbStorage;
@@ -1853,6 +1853,53 @@ fn resource_match_observes_connected_tokens_without_availability_or_capacity_fil
         router.shutdown().await?;
         assert_eq!(
             handle.resource_match(&alice, "desk").await,
+            Err(RouterError::Stopped)
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn account_resources_reports_live_resources_and_rejects_remote_accounts() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        assert!(handle.account_resources(&alice).await?.is_empty());
+        let limit = NonZeroUsize::MIN.saturating_add(1);
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        assert_eq!(
+            handle.account_resources(&alice).await?,
+            [
+                BoundResource {
+                    resource: "desk".into(),
+                    available: false
+                },
+                BoundResource {
+                    resource: "phone".into(),
+                    available: false
+                },
+            ]
+        );
+        assert_eq!(
+            handle
+                .account_resources(&account("alice@example.com")?)
+                .await,
+            Err(RouterError::RemoteUnsupported)
+        );
+        drop(desk);
+        assert_eq!(
+            handle.account_resources(&alice).await?,
+            [BoundResource {
+                resource: "phone".into(),
+                available: false
+            }]
+        );
+        drop(phone);
+        router.shutdown().await?;
+        assert_eq!(
+            handle.account_resources(&alice).await,
             Err(RouterError::Stopped)
         );
         Ok(())

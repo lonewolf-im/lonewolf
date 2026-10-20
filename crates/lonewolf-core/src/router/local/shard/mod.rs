@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use lonewolf_extension::delivery::{SessionTag, SessionTags};
+use lonewolf_extension::delivery::{BoundResource, SessionTag, SessionTags};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::jid::JidRef;
@@ -562,6 +562,23 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             next_token: 0,
             terminated: false,
         }
+    }
+
+    pub(super) fn account_resources(&self, account: &AccountKey) -> Vec<BoundResource> {
+        let Some(sessions) = self.accounts.get(account.as_str()) else {
+            return Vec::new();
+        };
+        let mut resources = Vec::with_capacity(sessions.len());
+        for (resource, session) in sessions {
+            if session.alive.load(Ordering::Acquire) && !session.outbound.is_closed() {
+                resources.push(BoundResource {
+                    resource: resource.clone(),
+                    available: session.priority.is_some(),
+                });
+            }
+        }
+        resources.sort_unstable_by(|left, right| left.resource.cmp(&right.resource));
+        resources
     }
 
     pub(super) fn resource_match(

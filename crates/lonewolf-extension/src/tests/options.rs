@@ -407,3 +407,27 @@ fn option_errors_preserve_display_and_source() {
         );
     }
 }
+
+#[test]
+fn disco_rejects_host_options() -> TestResult {
+    let mut catalog = TestExtensions::default();
+    for factory in crate::builtin() {
+        catalog.register_factory(factory)?;
+    }
+    let options = BTreeMap::from([("disco".into(), toml::from_str("x = 1")?)]);
+    assert!(matches!(
+        catalog.enable(&[HostSelection {
+            domain: "example.com",
+            extensions: &["disco".into()],
+            options: &options,
+        }]),
+        Err(EnableError {
+            source: RegistrationError::InvalidOptions {
+                extension: "disco",
+                ..
+            },
+            ..
+        })
+    ));
+    Ok(())
+}

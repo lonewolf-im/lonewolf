@@ -9,6 +9,8 @@ mod archive;
 
 mod policy;
 
+mod discovery;
+
 mod extensions;
 
 mod services;

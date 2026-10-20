@@ -57,7 +57,7 @@ pub enum AccountsCommand {
         /// XMPP domain of the accounts.
         #[arg(long)]
         domain: String,
-        /// Local part prefix. Accounts are named <prefix>-000000, <prefix>-000001 and so on.
+        /// Local part prefix. Accounts are named PREFIX-000000, PREFIX-000001 and so on.
         #[arg(long)]
         prefix: String,
         /// Number of accounts to generate.

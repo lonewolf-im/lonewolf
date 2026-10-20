@@ -16,6 +16,7 @@ use lonewolf_util::arena::ChunkAllocator;
 pub mod account;
 pub mod archive;
 pub mod delivery;
+pub mod disco;
 pub mod discovery;
 pub mod iq;
 pub mod message;
@@ -334,10 +335,11 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for Shared<A, S> {
     }
 }
 
-pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 2] {
+pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 3] {
     [
         Box::new(roster::RosterFactory),
         Box::new(offline::OfflineFactory),
+        Box::new(Shared(Arc::new(disco::Disco))),
     ]
 }
 

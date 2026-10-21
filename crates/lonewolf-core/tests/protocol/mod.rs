@@ -44,3 +44,5 @@ mod stream_errors;
 mod sessions;
 
 mod metrics;
+
+mod vcard;

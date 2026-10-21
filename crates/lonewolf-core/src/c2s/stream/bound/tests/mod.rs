@@ -33,6 +33,7 @@ use crate::router::{Router, StoredRelease};
 
 mod iq_destinations;
 mod iq_errors;
+mod vcard;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const MESSAGE: &[u8] =

@@ -13,6 +13,7 @@ use lonewolf_extension::iq::IqFuture;
 use lonewolf_extension::message::StoreFuture;
 use lonewolf_extension::presence::{PresenceFuture, PresenceHandler};
 use lonewolf_extension::{Effects, Extension, Extensions, RegistrationError, Slots};
+use lonewolf_storage::account::AccountWrites;
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use parking_lot::Mutex as PlMutex;
@@ -542,6 +543,136 @@ fn iq_snapshot_handoff_and_global_fixing_progress_while_output_is_blocked() -> T
         session.outbox.flush().await.map_err(|e| format!("{e:?}"))?;
         assert_eq!(session.outbox.writer.written.len(), 2);
         assert!(session.outbox.writer.written[1].contains("id=\"snapshot\""));
+        drop(session);
+        fixture.finish().await
+    })
+}
+
+struct VCardPreparation {
+    gate: Arc<Gate>,
+    handler: lonewolf_extension::vcard::VCard,
+}
+
+impl IqHandler<GlobalChunkAllocator, RedbStorage> for VCardPreparation {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, GlobalChunkAllocator>,
+        transaction: &'a RedbRead,
+        response: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> IqFuture<'a, GlobalChunkAllocator> {
+        <lonewolf_extension::vcard::VCard as IqHandler<GlobalChunkAllocator, RedbStorage>>::get(
+            &self.handler,
+            request,
+            transaction,
+            response,
+        )
+    }
+
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, GlobalChunkAllocator>,
+        transaction: &'a mut RedbWrite,
+        hosts: &'a dyn HostLookup,
+        response: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> IqFuture<'a, GlobalChunkAllocator> {
+        Box::pin(async move {
+            let reply = <lonewolf_extension::vcard::VCard as IqHandler<
+                GlobalChunkAllocator,
+                RedbStorage,
+            >>::set(&self.handler, request, transaction, hosts, response)
+            .await?;
+            self.gate.wait().await;
+            Ok(reply)
+        })
+    }
+}
+
+#[test]
+fn vcard_staged_cancellation_rolls_back_but_submitted_commit_outlives_requester() -> TestResult {
+    use lonewolf_storage::vcard::{VCardQuota, VCardReads, VCardWrites};
+
+    Runtime::new()?.block_on(async {
+        for handoff in [false, true] {
+            let fixture = Fixture::new(&[]).await?;
+            let (gate, entered, release) = Gate::new(Outcome::Commit);
+            let fixture = enable(fixture, &gate)?;
+            let owner = fixture.registration.account();
+            let old = "<vCard xmlns='vcard-temp' xml:lang='' xml:space='default'><FN>old</FN></vCard>";
+            let mut transaction = fixture.storage.begin_write().await?;
+            transaction.replace_vcard(owner, old, VCardQuota::default()).await?;
+            transaction.commit().await?;
+            let fixed = fixture.storage.begin_read().await?;
+            let handler = Arc::new(VCardPreparation {
+                gate: Arc::clone(&gate),
+                handler: lonewolf_extension::vcard::VCard::new(Default::default()),
+            });
+            let (mut session, output_entered, output_release) = session(&fixture, false).await?;
+            let (request, mut arena) = parsed("<iq type='set' id='vcard-cancel'><vCard xmlns='vcard-temp'><FN>new</FN></vCard></iq>").await?.into_parts();
+            let sender = Jid::parse_in("bob@localhost/preparing", &mut arena)?;
+            let mut operation = Box::pin(session.handle_iq_set(request, sender, arena, Arena::try_new(Default::default())?, handler, Some(owner.clone())));
+            drive(operation.as_mut(), entered).await??;
+            assert_eq!(fixed.vcard(owner).await?.ok_or("missing old card")?.xml.as_ref(), old);
+            queue_delivery(&fixture).await?;
+            drive(operation.as_mut(), output_entered).await??;
+            if handoff {
+                release.send(()).map_err(|_| "vCard preparation cancelled")?;
+                drop(drive(operation.as_mut(), fixture.storage.begin_write()).await??);
+                drop(operation);
+            } else {
+                drop(operation);
+                assert!(release.send(()).is_err());
+            }
+            assert!(output_release.send(()).is_err());
+            drop(fixture.storage.begin_write().await?);
+            let stored = fixture.storage.begin_read().await?.vcard(owner).await?.ok_or("missing card")?;
+            if handoff {
+                assert!(stored.xml.contains("<FN>new</FN>"));
+                assert!(!stored.xml.contains("<FN>old</FN>"));
+            } else {
+                assert_eq!(stored.xml.as_ref(), old);
+            }
+            assert_eq!(fixed.vcard(owner).await?.ok_or("missing snapshot")?.xml.as_ref(), old);
+            assert!(session.outbox.queue.is_empty());
+            drop(fixed);
+            drop(session);
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn vcard_waiting_writer_is_cancelled_by_retirement_before_deleted_account_recreation() -> TestResult
+{
+    use lonewolf_storage::vcard::{VCardReads, VCardWrites};
+
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[]).await?;
+        let (gate, _, _) = Gate::new(Outcome::Commit);
+        let fixture = enable(fixture, &gate)?;
+        let (mut session, _, _) = session(&fixture, false).await?;
+        let owner = fixture.registration.account();
+        let handler = Arc::new(VCardPreparation { gate: Arc::clone(&gate), handler: lonewolf_extension::vcard::VCard::new(Default::default()) });
+        let mut deletion = fixture.storage.begin_write().await?;
+        let (request, mut arena) = parsed("<iq type='set' id='retiring'><vCard xmlns='vcard-temp'><FN>must not resurrect</FN></vCard></iq>").await?.into_parts();
+        let sender = Jid::parse_in("bob@localhost/preparing", &mut arena)?;
+        let mut operation = Box::pin(session.handle_iq_set(request,sender,arena,Arena::try_new(Default::default())?,handler,Some(owner.clone())));
+        assert!(poll!(operation.as_mut()).is_pending());
+        fixture.router.handle().retire_account(owner).await?;
+        assert!(matches!(operation.await, Err(CloseOutcome::InternalError)));
+        assert!(!gate.completed.load(Ordering::Acquire));
+        let credentials = lonewolf_auth::scram::ScramCredentials::new(deletion.scram(owner, lonewolf_auth::scram::ScramHash::Sha1).await?.ok_or("missing credentials")?);
+        deletion.delete_vcard(owner).await?;
+        deletion.delete_account(owner).await?;
+        let mut recreation = Box::pin(fixture.storage.begin_write());
+        assert!(poll!(recreation.as_mut()).is_pending());
+        deletion.commit().await?;
+        let mut recreation = recreation.await?;
+        assert!(recreation.account(owner).await?.is_none());
+        recreation.create_account(lonewolf_storage::account::NewAccount {key:owner.clone(),credentials}).await?;
+        recreation.commit().await?;
+        assert!(fixture.storage.begin_read().await?.vcard(owner).await?.is_none());
+        assert!(session.outbox.queue.is_empty());
         drop(session);
         fixture.finish().await
     })

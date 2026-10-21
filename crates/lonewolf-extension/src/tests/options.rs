@@ -148,6 +148,7 @@ fn invalid_builtin_options_identify_the_host_and_extension() -> TestResult {
     for (name, key) in [
         ("roster", "max_pending_subscription_requests"),
         ("offline", "max_messages_per_account"),
+        ("vcard", "max_bytes"),
     ] {
         let names = [name.into()];
         for setting in [
@@ -237,6 +238,16 @@ fn options_require_an_enabled_known_extension() -> TestResult {
             "ping",
             vec!["disco".into()],
             RegistrationError::OptionsWithoutExtension("ping".into()),
+        ),
+        (
+            "vcard",
+            vec![],
+            RegistrationError::OptionsWithoutExtension("vcard".into()),
+        ),
+        (
+            "vcard",
+            vec!["disco".into()],
+            RegistrationError::OptionsWithoutExtension("vcard".into()),
         ),
         (
             "unknown",

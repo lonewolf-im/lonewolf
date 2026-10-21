@@ -26,6 +26,7 @@ fn builtin_catalog() -> Result<TestExtensions, RegistrationError> {
         factories.each_ref().map(|factory| factory.name()),
         [
             crate::roster::NAME,
+            crate::vcard::NAME,
             crate::offline::NAME,
             crate::disco::NAME,
             NAME

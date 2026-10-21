@@ -32,7 +32,9 @@
 # The domain below is an example.
 # [hosts."example.com"]
 
-# extensions = ["roster", "offline", "disco", "ping"]
+# Enable vcard with disco to publish profiles readable by authenticated local clients.
+# This extension selection is an example.
+# extensions = ["roster", "offline", "disco", "ping", "vcard"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.
 # Keep roster in this host's extension list when configuring these limits.
@@ -49,6 +51,13 @@
 # Keep offline in this host's extension list when configuring its limit.
 # [hosts."example.com".offline]
 # max_messages_per_account = 100
+
+# Increase the vCard write budget for larger profiles, within 1 to 1048576 bytes.
+# Keep vcard and disco in this host's extension list when configuring this limit.
+# The budget counts serialized XML, including detached language, space, and namespaces.
+# A lower budget limits later writes; stored profiles remain readable.
+# [hosts."example.com".vcard]
+# max_bytes = 262144
 
 # Choose certificate files or automatic certificates for each host except localhost.
 # Localhost uses a new self-signed certificate on each start if you omit its TLS section.

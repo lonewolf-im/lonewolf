@@ -28,6 +28,7 @@ pub mod presence;
 pub mod roster;
 pub mod service;
 mod slots;
+pub mod vcard;
 
 pub use slots::Slots;
 
@@ -340,9 +341,10 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for Shared<A, S> {
     }
 }
 
-pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 4] {
+pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 5] {
     [
         Box::new(roster::RosterFactory),
+        Box::new(vcard::VCardFactory),
         Box::new(offline::OfflineFactory),
         Box::new(Shared(Arc::new(disco::Disco))),
         Box::new(Shared(Arc::new(ping::Ping))),

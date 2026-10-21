@@ -749,8 +749,13 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
                 "offline".into(),
                 "disco".into(),
                 "ping".into(),
+                "vcard".into(),
             ],
             options: BTreeMap::from([
+                (
+                    "vcard".into(),
+                    toml::Table::from_iter([("max_bytes".into(), toml::Value::Integer(262144))]),
+                ),
                 (
                     "roster".into(),
                     toml::Table::from_iter([

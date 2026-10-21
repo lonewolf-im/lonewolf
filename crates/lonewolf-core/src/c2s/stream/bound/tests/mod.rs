@@ -2763,3 +2763,206 @@ fn iq_account_guard_reads_deletion_and_rollback_from_its_write_transaction() -> 
         fixture.finish().await
     })
 }
+
+struct IqContextObservation {
+    path: &'static str,
+    lang: Option<&'static str>,
+    space: Option<XmlSpace>,
+    payload_lang: Option<&'static str>,
+    payload_space: Option<&'static str>,
+    calls: AtomicUsize,
+}
+
+impl IqContextObservation {
+    fn observe(&self, request: IqRequest<'_, GlobalChunkAllocator>) -> Result<(), HandlerError> {
+        assert_eq!(request.lang, self.lang);
+        assert_eq!(request.space, self.space);
+        assert_eq!(
+            request
+                .payload
+                .attribute("lang", XML_NAMESPACE)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?,
+            self.payload_lang
+        );
+        assert_eq!(
+            request
+                .payload
+                .attribute("space", XML_NAMESPACE)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?,
+            self.payload_space
+        );
+        let child = request
+            .payload
+            .child("child", "urn:test:context")
+            .map_err(|_| StanzaErrorCondition::InternalServerError)?
+            .ok_or(StanzaErrorCondition::InternalServerError)?;
+        assert_eq!(
+            child
+                .attribute("lang", XML_NAMESPACE)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?,
+            None
+        );
+        assert_eq!(
+            child
+                .attribute("space", XML_NAMESPACE)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?,
+            None
+        );
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl IqHandler<GlobalChunkAllocator, RedbStorage> for IqContextObservation {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, GlobalChunkAllocator>,
+        _: &'a RedbRead,
+        _: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> lonewolf_extension::iq::IqFuture<'a, GlobalChunkAllocator> {
+        Box::pin(async move {
+            assert_eq!(self.path, "get");
+            self.observe(request)?;
+            Ok(IqReply::new(None, Effects::none()))
+        })
+    }
+
+    fn get_missing_account(
+        &self,
+        request: IqRequest<'_, GlobalChunkAllocator>,
+        _: &mut Arena<GlobalChunkAllocator>,
+    ) -> Result<Option<Element>, HandlerError> {
+        assert_eq!(self.path, "missing");
+        self.observe(request)?;
+        Ok(None)
+    }
+
+    fn set<'a>(
+        &'a self,
+        request: IqRequest<'a, GlobalChunkAllocator>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn lonewolf_extension::delivery::HostLookup,
+        _: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> lonewolf_extension::iq::IqFuture<'a, GlobalChunkAllocator> {
+        Box::pin(async move {
+            assert_eq!(self.path, "set");
+            self.observe(request)?;
+            Ok(IqReply::new(None, Effects::none()))
+        })
+    }
+}
+
+fn context_attributes(lang: Option<&str>, space: Option<&str>) -> String {
+    let mut attributes = String::new();
+    if let Some(lang) = lang {
+        attributes.push_str(&format!(" xml:lang='{lang}'"));
+    }
+    if let Some(space) = space {
+        attributes.push_str(&format!(" xml:space='{space}'"));
+    }
+    attributes
+}
+
+#[test]
+fn iq_context_reaches_get_set_and_missing_account_handlers() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut fixture = Fixture::new(&[]).await?;
+        fixture.router = fixture.router.with_extensions(std::collections::BTreeMap::from([(
+            "localhost".into(), Default::default(),
+        )]));
+        let router = fixture.router.handle();
+        let registration = router.register(
+            fixture.registration.account(), Some("desk"),
+            NonZeroUsize::new(2).ok_or("resource limit")?
+        ).await?;
+        let (_sender, incoming) = async_channel::bounded(1);
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        outbox.liveness = registration.liveness();
+        let mut session = BoundSession {
+            outbox,
+            registration,
+            router,
+            storage: fixture.storage.clone(),
+            allocator: GlobalChunkAllocator,
+            work: fixture.work.handle(),
+            service_presence: None,
+            service_pending: None,
+            recipients: RecipientLimiter::new(NonZeroUsize::MIN, NonZeroUsize::new(100).ok_or("burst")?, Instant::now(), crate::c2s::metrics::C2sWorkerMetrics::detached()),
+            available: false,
+            priority: None,
+            incoming,
+        };
+        let mut contexts = vec![
+            (None, None, None, None, None, None),
+            (Some("en"), None, None, Some("preserve"), None, None),
+            (Some("en"), None, Some("de"), Some("default"), None, Some("preserve")),
+            (Some("en"), Some("fr"), Some("de"), Some("preserve"), Some("default"), Some("preserve")),
+            (Some("en"), Some(""), Some("de"), Some("default"), Some("preserve"), Some("default")),
+            (None, Some(""), Some(""), None, Some("default"), None),
+            (Some(""), None, None, None, None, None),
+            (Some("x-Unchecked"), None, None, None, None, None),
+            (None, None, Some("de"), None, None, Some("preserve")),
+        ];
+        for invalid in ["", "unknown", "Preserve", "DEFAULT", " preserve "] {
+            contexts.push((Some("en"), None, Some("de"), Some(invalid), None, Some("default")));
+            contexts.push((Some("en"), Some(""), Some("de"), Some("preserve"), Some(invalid), Some("preserve")));
+        }
+        for (stream_lang, iq_lang, payload_lang, stream_space, iq_space, payload_space) in contexts {
+            for path in ["get", "set", "missing"] {
+                let target = if path == "missing" { "missing@localhost" } else { "bob@localhost" };
+                let kind = if path == "set" { "set" } else { "get" };
+                let input = format!(
+                    "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'{}><iq type='{kind}' id='context' to='{target}'{}><query xmlns='urn:test:context'{}><child/></query></iq>",
+                    context_attributes(stream_lang, stream_space),
+                    context_attributes(iq_lang, iq_space),
+                    context_attributes(payload_lang, payload_space),
+                );
+                let mut parser = XmppParser::new(input.as_bytes(), ParserConfig {
+                    max_stanza_bytes: NonZeroUsize::new(4096).ok_or("stanza limit")?,
+                    arena: ArenaConfig::default(),
+                }, GlobalChunkAllocator);
+                assert!(matches!(parser.next_event().await?, Some(StreamEvent::StreamStart { .. })));
+                let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+                    return Err("expected context IQ".into());
+                };
+                let (request, mut arena) = parsed.into_parts();
+                let sender = Jid::parse_in("bob@localhost/desk", &mut arena)?;
+                let target = AccountKey::try_from(Jid::parse_in(target, &mut arena)?.resolve(&arena)?)?;
+                let handler = Arc::new(IqContextObservation {
+                    path,
+                    lang: iq_lang.or(stream_lang.filter(|lang| !lang.is_empty())),
+                    space: iq_space.or(stream_space).map(XmlSpace::from_attribute),
+                    payload_lang,
+                    payload_space,
+                    calls: AtomicUsize::new(0),
+                });
+                let response = Arena::try_new(Default::default())?;
+                if path == "set" {
+                    session.handle_iq_set(request, sender, arena, response, handler.clone(), Some(target))
+                        .await.map_err(|error| format!("{path}: {error:?}"))?;
+                    session.outbox.flush().await.map_err(|error| format!("{path}: {error:?}"))?;
+                    let reply = session.outbox.writer.written.pop().ok_or("missing set reply")?;
+                    assert!(reply.contains("type=\"result\""), "{reply}");
+                } else {
+                    let work = GetWork {
+                        account: fixture.registration.account().clone(),
+                        target_account: Some(target),
+                        transaction: fixture.storage.begin_read().await?,
+                        handler: handler.clone(),
+                        discovery: Arc::new(Discovery::default()),
+                        arena,
+                        request,
+                        sender,
+                        response,
+                        delivery: RouterDelivery::new(&fixture.router.handle(), &GlobalChunkAllocator, Some(&fixture.registration)),
+                    };
+                    let outcome = work.run(Vec::new()).await.map_err(|error| format!("{path}: {error:?}"))?;
+                    assert!(matches!(outcome.reply, Ok(None)));
+                }
+                assert_eq!(handler.calls.load(Ordering::SeqCst), 1, "{path}");
+            }
+        }
+        drop(session);
+        fixture.finish().await
+    })
+}

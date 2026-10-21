@@ -18,7 +18,9 @@ use futures_util::future::{Either, Shared, join, select};
 use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::discovery::Discovery;
-use lonewolf_extension::iq::{IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester};
+use lonewolf_extension::iq::{
+    IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester, XmlSpace,
+};
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
@@ -40,6 +42,7 @@ use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppP
 use lonewolf_xmpp::stanza::{
     ApplicationCondition, BuildError, CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType,
     RejectedStanza, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
+    XML_NAMESPACE,
 };
 
 use super::bind::Bound;
@@ -121,7 +124,7 @@ enum Output<A: ChunkAllocator> {
         stanza: Stanza,
         arena: Arena<A>,
     },
-    /// Parse each request at write time to keep large backlogs out of memory.
+    /// Requests stay unparsed to bound backlog memory.
     Requests(Vec<PendingSubscription>),
     Offline {
         backlog: Backlog,
@@ -1044,6 +1047,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                                 discovery: &discovery,
                                 sessions: &delivery,
                                 requester: None,
+                                lang: stanza.lang()?,
+                                space: stanza
+                                    .attribute("space", XML_NAMESPACE)?
+                                    .map(XmlSpace::from_attribute),
                                 payload,
                             },
                             &mut transaction,
@@ -2759,6 +2766,10 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                             discovery: &discovery,
                             sessions: &delivery,
                             requester,
+                            lang: stanza.lang()?,
+                            space: stanza
+                                .attribute("space", XML_NAMESPACE)?
+                                .map(XmlSpace::from_attribute),
                             payload,
                         };
                         match iq_target {

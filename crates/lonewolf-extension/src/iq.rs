@@ -40,6 +40,23 @@ pub enum Requester {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XmlSpace {
+    Default,
+    Preserve,
+    Invalid,
+}
+
+impl XmlSpace {
+    pub fn from_attribute(value: &str) -> Self {
+        match value {
+            "default" => Self::Default,
+            "preserve" => Self::Preserve,
+            _ => Self::Invalid,
+        }
+    }
+}
+
 pub struct IqRequest<'a, A: ChunkAllocator> {
     /// The authenticated bound JID, independent of the client's `from` attribute.
     pub sender: JidRef<'a>,
@@ -50,6 +67,10 @@ pub struct IqRequest<'a, A: ChunkAllocator> {
     pub sessions: &'a dyn SessionLookup,
     /// Set for account `get` requests; server targets and `set` requests use `None`.
     pub requester: Option<Requester>,
+    /// The enclosing IQ language can be empty to reset inherited language.
+    pub lang: Option<&'a str>,
+    /// The enclosing IQ space directive is independent of payload attributes.
+    pub space: Option<XmlSpace>,
     pub payload: ElementRef<'a, Arena<A>>,
 }
 
@@ -164,5 +185,26 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.handlers.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::XmlSpace;
+
+    #[test]
+    fn xml_space_matches_only_exact_directives() {
+        for (value, expected) in [
+            ("default", XmlSpace::Default),
+            ("preserve", XmlSpace::Preserve),
+            ("", XmlSpace::Invalid),
+            ("unknown", XmlSpace::Invalid),
+            ("Default", XmlSpace::Invalid),
+            ("PRESERVE", XmlSpace::Invalid),
+            (" preserve ", XmlSpace::Invalid),
+            ("default\npreserve", XmlSpace::Invalid),
+        ] {
+            assert_eq!(XmlSpace::from_attribute(value), expected, "{value:?}");
+        }
     }
 }

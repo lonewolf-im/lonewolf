@@ -284,6 +284,8 @@ impl IqCall {
             discovery: &discovery,
             sessions: &NoSessions,
             requester: (kind == IqRequestType::Get).then_some(Requester::Owner),
+            lang: None,
+            space: None,
             payload,
         };
         match kind {
@@ -1762,6 +1764,8 @@ fn current_version_get_skips_legacy_metadata_and_uses_its_consistent_snapshot()
             discovery: &discovery,
             sessions: &NoSessions,
             requester: Some(Requester::Owner),
+            lang: None,
+            space: None,
             payload,
         };
         let reply = <Roster as IqHandler<GlobalChunkAllocator, RedbStorage>>::get(

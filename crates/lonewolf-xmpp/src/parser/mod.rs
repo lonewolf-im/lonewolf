@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parses UTF-8 XML 1.0 streams with XMPP restrictions and bounded event sizes.
+//! Parses UTF-8 XML 1.0 with XMPP restrictions and bounded event sizes.
 //!
 //! Each parsed value owns a separate arena and can outlive the parser.
 
@@ -38,7 +38,7 @@ const RETAINED_BUFFER_RESERVE_BYTES: usize = 4_096;
 #[derive(Clone, Copy, Debug)]
 pub struct ParserConfig {
     /// Counts wire bytes per top-level element, including markup.
-    /// Excludes stream whitespace.
+    /// Excludes stream whitespace; standalone documents include surrounding whitespace.
     pub max_stanza_bytes: NonZeroUsize,
     /// Applies per parsed value, excluding parser scratch buffers.
     pub arena: ArenaConfig,
@@ -126,6 +126,41 @@ enum Phase {
     Closed,
 }
 
+/// Parses one standalone element without inherited stream context.
+///
+/// The returned value owns its arena and can outlive `xml`.
+/// The byte limit includes surrounding XML whitespace.
+///
+/// # Errors
+///
+/// Returns [`ParseError::UnexpectedEvent`] for extra content or a stanza or stream root.
+/// Empty input returns [`ParseError::UnexpectedEof`]; XML and allocation failures
+/// use the existing typed parse and build errors.
+pub async fn parse_element<A: ChunkAllocator + Clone>(
+    xml: &[u8],
+    config: ParserConfig,
+    allocator: A,
+) -> Result<Parsed<Element, A>, ParseError> {
+    if xml.len() > config.max_stanza_bytes.get() {
+        return Err(ParseError::SizeLimitExceeded {
+            limit: config.max_stanza_bytes.get(),
+        });
+    }
+    let mut parser = XmppParser::single_element(xml, config, allocator);
+    let Some(StreamEvent::Element(element)) = parser.next_event().await? else {
+        return Err(ParseError::UnexpectedEvent);
+    };
+    if !parser
+        .into_inner()
+        .iter()
+        .copied()
+        .all(input::is_whitespace)
+    {
+        return Err(ParseError::UnexpectedEvent);
+    }
+    Ok(element)
+}
+
 /// Retains receive buffers and runs on the caller's executor.
 pub fn compio_reader<R: compio_io::AsyncRead + Unpin + 'static>(
     reader: Pin<&mut AsyncReadStream<R>>,
@@ -148,6 +183,13 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
             phase: Phase::Initial,
             failed: false,
         }
+    }
+
+    fn single_element(reader: R, config: ParserConfig, allocator: A) -> Self {
+        let mut parser = Self::new(reader, config, allocator);
+        parser.phase = Phase::Open;
+        parser.reader.get_mut().reset(config.max_stanza_bytes.get());
+        parser
     }
 
     /// Resets stream context while preserving unread transport bytes.

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::alloc::Layout;
 use std::future::Future;
 use std::io::{self, Cursor};
 use std::num::NonZeroUsize;
@@ -10,17 +11,18 @@ use std::task::{Context, Poll, Waker};
 
 use crate::parser::{
     MAX_ATTRIBUTES_PER_ELEMENT, MAX_STREAM_HEADER_BYTES, ParseError, Parsed, ParserConfig,
-    StreamEvent, XmppParser, compio_reader,
+    StreamEvent, XmppParser, compio_reader, parse_element,
 };
 use crate::stanza::{
-    BuildError, CLIENT_NAMESPACE, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, MessageType, NodeRef,
-    Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRejection, StanzaType,
+    BuildError, CLIENT_NAMESPACE, Element, ElementRef, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES,
+    MessageType, NodeRef, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRejection,
+    StanzaType, XML_NAMESPACE,
 };
 use compio_io::compat::AsyncReadStream;
 use futures_executor::block_on;
 use lonewolf_util::arena::{
-    Arena, ArenaConfig, ArenaError, ChunkAllocator, ChunkAllocatorHandle, GlobalChunkAllocator,
-    HandleError,
+    AllocationError, Arena, ArenaConfig, ArenaError, ArenaRead, Chunk, ChunkAllocator,
+    ChunkAllocatorHandle, GlobalChunkAllocator, HandleError,
 };
 use lonewolf_util::pool::{MIN_POOL_SIZE, PoolConfig, PooledChunkAllocator};
 use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
@@ -35,6 +37,361 @@ fn config(limit: usize) -> TestResult<ParserConfig> {
     Ok(ParserConfig {
         max_stanza_bytes: NonZeroUsize::new(limit).ok_or("zero limit")?,
         arena: ArenaConfig::default(),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+enum ElementSnapshot {
+    Element {
+        name: String,
+        namespace: String,
+        attributes: Vec<(String, String, String)>,
+        children: Vec<ElementSnapshot>,
+    },
+    Text(String),
+}
+
+fn element_snapshot(element: &ElementRef<'_, impl ArenaRead>) -> TestResult<ElementSnapshot> {
+    let attributes = element
+        .attributes()?
+        .map(|attribute| {
+            let attribute = attribute?;
+            Ok((
+                attribute.name.to_owned(),
+                attribute.namespace.to_owned(),
+                attribute.value.to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, HandleError>>()?;
+    let children = element
+        .children()?
+        .map(|node| match node? {
+            NodeRef::Element(child) => element_snapshot(&child),
+            NodeRef::Text(text) => Ok(ElementSnapshot::Text(text.to_owned())),
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    Ok(ElementSnapshot::Element {
+        name: element.name().to_owned(),
+        namespace: element.namespace().to_owned(),
+        attributes,
+        children,
+    })
+}
+
+async fn standalone_round_trip(
+    xml: &[u8],
+) -> TestResult<(Parsed<Element, GlobalChunkAllocator>, String)> {
+    let parsed = parse_element(xml, config(16384)?, GlobalChunkAllocator).await?;
+    let original = parsed.value().resolve(parsed.arena())?;
+    let expected = element_snapshot(&original)?;
+    let mut serialized = String::new();
+    original.write_xml(&mut serialized)?;
+    let replay = parse_element(serialized.as_bytes(), config(16384)?, GlobalChunkAllocator).await?;
+    let replay = replay.value().resolve(replay.arena())?;
+    assert_eq!(element_snapshot(&replay)?, expected);
+    let mut second = String::new();
+    replay.write_xml(&mut second)?;
+    let second = parse_element(second.as_bytes(), config(16384)?, GlobalChunkAllocator).await?;
+    assert_eq!(
+        element_snapshot(&second.value().resolve(second.arena())?)?,
+        expected
+    );
+    let mut asynchronous = futures_util::io::Cursor::new(Vec::new());
+    original.write_xml_async(&mut asynchronous).await?;
+    assert_eq!(asynchronous.into_inner(), serialized.as_bytes());
+    let mut copied_arena = Arena::try_new(ArenaConfig::default())?;
+    let copied = original.clone_in(&mut copied_arena)?;
+    assert_eq!(element_snapshot(&copied.resolve(&copied_arena)?)?, expected);
+    Ok((parsed, serialized))
+}
+
+#[test]
+fn standalone_elements_preserve_expanded_names_and_mixed_child_order() -> TestResult {
+    block_on(async {
+        for input in [
+            "<x/>",
+            " \t\r\n<vCard xmlns='vcard-temp'><FN>Zoë &amp; 李</FN><N><GIVEN>Zoë</GIVEN></N></vCard>\r\n\t ",
+            "<x attr='&quot;&amp;&lt;&gt;'>a&amp;&lt;&gt;<![CDATA[b<c>]]><y/>tail</x>",
+            "<x xmlns='urn:root' xmlns:p='urn:outer' p:attr='value'><y xmlns=''/><p:z xmlns:p='urn:inner' p:attr='inner'/><p:z/></x>",
+        ] {
+            standalone_round_trip(input.as_bytes()).await?;
+        }
+        let (parsed, _) = standalone_round_trip(b"<x>first<y/>second<z/>third</x>").await?;
+        let root = parsed.value().resolve(parsed.arena())?;
+        assert_eq!(root.name(), "x");
+        assert_eq!(root.namespace(), "");
+        let nodes = root.children()?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(nodes.len(), 5);
+        assert!(matches!(nodes[0], NodeRef::Text("first")));
+        assert!(matches!(&nodes[1], NodeRef::Element(child) if child.name() == "y"));
+        assert!(matches!(nodes[2], NodeRef::Text("second")));
+        assert!(matches!(&nodes[3], NodeRef::Element(child) if child.name() == "z"));
+        assert!(matches!(nodes[4], NodeRef::Text("third")));
+
+        let (text, _) = standalone_round_trip(b"<x>a&lt;b&gt;c</x>").await?;
+        let (cdata, _) = standalone_round_trip(b"<x><![CDATA[a<b>c]]></x>").await?;
+        assert_eq!(
+            element_snapshot(&text.value().resolve(text.arena())?)?,
+            element_snapshot(&cdata.value().resolve(cdata.arena())?)?
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_namespaces_preserve_qname_values_and_scoped_bindings() -> TestResult {
+    block_on(async {
+        let input = b"<vCard xmlns='vcard-temp' xmlns:p='urn:types' xmlns:a='urn:attributes' a:type='p:Root'>p:Text<reset xmlns=''/><p:child xmlns:p='urn:inner' a:type='p:Inner'/><p:child/></vCard>";
+        let (parsed, serialized) = standalone_round_trip(input).await?;
+        assert_root_namespace_binding(&serialized, "p", Some("urn:types"))?;
+        assert_root_namespace_binding(&serialized, "a", Some("urn:attributes"))?;
+        assert_root_namespace_binding(&serialized, "stream", None)?;
+        let root = parsed.value().resolve(parsed.arena())?;
+        assert_eq!(root.attribute("type", "urn:attributes")?, Some("p:Root"));
+        assert_eq!(root.child("reset", "")?.ok_or("reset")?.namespace(), "");
+        assert_eq!(
+            root.child("child", "urn:inner")?
+                .ok_or("rebound child")?
+                .attribute("type", "urn:attributes")?,
+            Some("p:Inner")
+        );
+        assert!(root.child("child", "urn:types")?.is_some());
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_normalization_survives_serialization_without_value_changes() -> TestResult {
+    block_on(async {
+        let input = "<vCard xmlns='vcard-temp' xmlns:f='urn:foreign' literal='a\tb\nc\rd\r\ne' references='a&#9;b&#10;c&#13;d' xml:lang='' xml:space='preserve'>a\rb\r\nc&#13;d<f:MiXeD f:CaSe='e\u{301}'>e\u{301}<nested xml:lang='es' xml:space='default'><reset xml:lang='' xml:space='preserve'/></nested></f:MiXeD></vCard>";
+        let (parsed, serialized) = standalone_round_trip(input.as_bytes()).await?;
+        let root = parsed.value().resolve(parsed.arena())?;
+        assert_eq!(root.attribute("literal", "")?, Some("a b c d e"));
+        assert_eq!(root.attribute("references", "")?, Some("a\tb\nc\rd"));
+        assert_eq!(root.attribute("lang", XML_NAMESPACE)?, Some(""));
+        assert_eq!(root.attribute("space", XML_NAMESPACE)?, Some("preserve"));
+        let first = root.children()?.next().ok_or("text")??;
+        assert!(matches!(first, NodeRef::Text("a\nb\nc\rd")));
+        let foreign = root.child("MiXeD", "urn:foreign")?.ok_or("foreign")?;
+        assert_eq!(foreign.attribute("CaSe", "urn:foreign")?, Some("e\u{301}"));
+        assert!(foreign.attribute("case", "urn:foreign")?.is_none());
+        let nested = foreign.child("nested", "vcard-temp")?.ok_or("nested")?;
+        assert_eq!(nested.attribute("lang", XML_NAMESPACE)?, Some("es"));
+        assert_eq!(nested.attribute("space", XML_NAMESPACE)?, Some("default"));
+        let reset = nested.child("reset", "vcard-temp")?.ok_or("reset")?;
+        assert_eq!(reset.attribute("lang", XML_NAMESPACE)?, Some(""));
+        assert_eq!(reset.attribute("space", XML_NAMESPACE)?, Some("preserve"));
+        assert!(serialized.contains("&#x9;"));
+        assert!(serialized.contains("&#xA;"));
+        assert!(serialized.contains("&#xD;"));
+        for value in ["", "invalid", "default", "preserve"] {
+            let input = format!("<x xml:space='{value}'><y/></x>");
+            let (parsed, _) = standalone_round_trip(input.as_bytes()).await?;
+            let root = parsed.value().resolve(parsed.arena())?;
+            assert_eq!(root.attribute("space", XML_NAMESPACE)?, Some(value));
+            assert_eq!(root.attribute("lang", XML_NAMESPACE)?, None);
+            let child = root.child("y", "")?.ok_or("child")?;
+            assert_eq!(child.attribute("lang", XML_NAMESPACE)?, None);
+            assert_eq!(child.attribute("space", XML_NAMESPACE)?, None);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_rejects_empty_documents_and_non_whitespace_remainders() -> TestResult {
+    block_on(async {
+        for input in [b"".as_slice(), b" \t\r\n"] {
+            assert!(matches!(
+                parse_element(input, config(4096)?, GlobalChunkAllocator).await,
+                Err(ParseError::UnexpectedEof)
+            ));
+        }
+        for suffix in [
+            "<y/>",
+            "text",
+            "</stream:stream>",
+            "</stream:stream>junk",
+            "<?xml version='1.0'?>",
+            "<!--comment-->",
+            "<?pi value?>",
+            "<!DOCTYPE x>",
+            "&#32;",
+            "\u{a0}",
+        ] {
+            let input = format!("<x/> \t\r\n{suffix}");
+            assert!(
+                matches!(
+                    parse_element(input.as_bytes(), config(4096)?, GlobalChunkAllocator).await,
+                    Err(ParseError::UnexpectedEvent)
+                ),
+                "suffix={suffix:?}"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_enforces_restricted_xml_namespaces_and_root_kind() -> TestResult {
+    block_on(async {
+        for input in [
+            "<?xml version='1.0'?><x/>",
+            "<?xml version='1.1'?><x/>",
+            "<!--comment--><x/>",
+            "<?pi value?><x/>",
+            "<!DOCTYPE x><x/>",
+            "<!DOCTYPE x [<!ENTITY e 'expanded'>]><x>&e;</x>",
+            "<x>&unknown;</x>",
+            "<x><!--comment--></x>",
+            "<x><?pi value?></x>",
+            "<p:x/>",
+            "<stream:x/>",
+            "<x stream:attr='value'/>",
+            "<x xmlns:a='urn:a' xmlns:b='urn:a' a:id='1' b:id='2'/>",
+            "<x></y>",
+            "<x>",
+            "text<x/>",
+            "<message xmlns='jabber:client'/>",
+            "<presence xmlns='jabber:client'/>",
+            "<iq xmlns='jabber:client' type='get' id='1'><query/></iq>",
+            "<iq xmlns='jabber:client'/>",
+            "<message xmlns='jabber:server'/>",
+            "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'>",
+            "<stream xmlns='http://etherx.jabber.org/streams'/>",
+            "</stream:stream>",
+        ] {
+            assert!(
+                parse_element(input.as_bytes(), config(4096)?, GlobalChunkAllocator)
+                    .await
+                    .is_err(),
+                "input={input:?}"
+            );
+        }
+        for input in [b"<x>\xff</x>".as_slice(), b"<x attr='\xff'/>", b"<\xff/>"] {
+            assert!(matches!(
+                parse_element(input, config(4096)?, GlobalChunkAllocator).await,
+                Err(ParseError::UnsupportedEncoding)
+            ));
+        }
+        assert!(matches!(
+            parse_element(b"<stream:x/>", config(4096)?, GlobalChunkAllocator).await,
+            Err(ParseError::UnboundNamespacePrefix)
+        ));
+        Ok(())
+    })
+}
+
+#[derive(Clone)]
+struct ExhaustedElementAllocator(Arc<AtomicUsize>);
+
+// This allocator never returns storage, so no memory can outlive an allocation.
+unsafe impl ChunkAllocator for ExhaustedElementAllocator {
+    fn allocate(&self, _: Layout) -> Result<Chunk, AllocationError> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Err(AllocationError::Exhausted)
+    }
+
+    unsafe fn deallocate(&self, _: Chunk) {
+        panic!("exhausted allocator cannot own chunks");
+    }
+}
+
+#[test]
+fn standalone_byte_limit_precedes_allocator_use_and_includes_surrounding_whitespace() -> TestResult
+{
+    block_on(async {
+        let input = b" \t<x/>\r\n ";
+        parse_element(input, config(input.len())?, GlobalChunkAllocator).await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let allocator = ExhaustedElementAllocator(calls.clone());
+        assert!(matches!(
+            parse_element(input, config(input.len() - 1)?, allocator.clone()).await,
+            Err(ParseError::SizeLimitExceeded { limit }) if limit == input.len() - 1
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            parse_element(b"<x/>", config(4)?, allocator).await,
+            Err(ParseError::Build(BuildError::Allocation(
+                ArenaError::Allocation(AllocationError::Exhausted)
+            )))
+        ));
+        assert!(calls.load(Ordering::Relaxed) > 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_tree_attribute_and_arena_limits_are_enforced() -> TestResult {
+    block_on(async {
+        for depth in [MAX_ELEMENT_DEPTH, MAX_ELEMENT_DEPTH + 1] {
+            let input = format!("{}{}", "<x>".repeat(depth), "</x>".repeat(depth));
+            let result =
+                parse_element(input.as_bytes(), config(input.len())?, GlobalChunkAllocator).await;
+            if depth == MAX_ELEMENT_DEPTH {
+                result?;
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ParseError::Build(BuildError::TreeLimitExceeded))
+                ));
+            }
+        }
+        for count in [MAX_ATTRIBUTES_PER_ELEMENT, MAX_ATTRIBUTES_PER_ELEMENT + 1] {
+            let attributes = (0..count)
+                .map(|index| format!(" a{index}='v'"))
+                .collect::<String>();
+            let input = format!("<x{attributes}/>");
+            let result =
+                parse_element(input.as_bytes(), config(input.len())?, GlobalChunkAllocator).await;
+            if count == MAX_ATTRIBUTES_PER_ELEMENT {
+                result?;
+            } else {
+                assert!(matches!(result, Err(ParseError::TooManyAttributes)));
+            }
+        }
+        for children in [MAX_ELEMENT_NODES - 1, MAX_ELEMENT_NODES] {
+            let input = format!("<x>{}</x>", "<y/>".repeat(children));
+            let mut limits = config(input.len())?;
+            limits.arena.max_reserved_bytes =
+                NonZeroUsize::new(32 * 1024 * 1024).ok_or("arena limit")?;
+            let result = parse_element(input.as_bytes(), limits, GlobalChunkAllocator).await;
+            if children == MAX_ELEMENT_NODES - 1 {
+                result?;
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ParseError::Build(BuildError::TreeLimitExceeded))
+                ));
+            }
+        }
+        let input = format!("<x>{}</x>", "a".repeat(8192));
+        let mut limits = config(input.len())?;
+        limits.arena.max_reserved_bytes = NonZeroUsize::new(4096).ok_or("arena limit")?;
+        assert!(matches!(
+            parse_element(input.as_bytes(), limits, GlobalChunkAllocator).await,
+            Err(ParseError::Build(BuildError::Allocation(
+                ArenaError::ArenaLimitExceeded
+            )))
+        ));
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_element_owns_values_after_source_buffer_is_dropped() -> TestResult {
+    block_on(async {
+        let parsed = {
+            let source = String::from("<vCard xmlns='vcard-temp'><FN>retained</FN></vCard>");
+            parse_element(source.as_bytes(), config(4096)?, GlobalChunkAllocator).await?
+        };
+        let root = parsed.value().resolve(parsed.arena())?;
+        assert_eq!(root.namespace(), "vcard-temp");
+        assert_eq!(
+            root.child("FN", "vcard-temp")?.ok_or("FN")?.text()?,
+            Some("retained")
+        );
+        Ok(())
     })
 }
 

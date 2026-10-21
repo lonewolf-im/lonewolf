@@ -22,6 +22,7 @@ pub mod iq;
 pub mod message;
 pub mod observer;
 pub mod offline;
+pub mod ping;
 pub mod policy;
 pub mod presence;
 pub mod roster;

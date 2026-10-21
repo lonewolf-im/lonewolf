@@ -25,7 +25,7 @@
 
 # Choose extensions included in the server build for this host.
 # This list replaces the default, including when it is empty.
-# Include disco when you select ping so clients can discover Ping support.
+# Enable disco to let clients discover the features selected for this host.
 # extensions = ["roster", "offline", "disco", "ping"]
 
 # Quote domain names that contain dots in TOML table headers.

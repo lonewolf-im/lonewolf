@@ -443,7 +443,7 @@ fn disco_rejects_host_options() -> TestResult {
 }
 
 #[test]
-fn ping_rejects_empty_and_nonempty_host_options_with_disco_enabled() -> TestResult {
+fn ping_rejects_empty_and_nonempty_host_options() -> TestResult {
     let mut catalog = TestExtensions::default();
     for factory in crate::builtin() {
         catalog.register_factory(factory)?;
@@ -451,8 +451,9 @@ fn ping_rejects_empty_and_nonempty_host_options_with_disco_enabled() -> TestResu
     for table in [toml::Table::new(), toml::from_str("x = 1")?] {
         let options = BTreeMap::from([("ping".into(), table)]);
         for names in [
-            ["ping".into(), "disco".into()],
-            ["disco".into(), "ping".into()],
+            vec!["ping".into()],
+            vec!["ping".into(), "disco".into()],
+            vec!["disco".into(), "ping".into()],
         ] {
             let error = catalog
                 .enable(&[

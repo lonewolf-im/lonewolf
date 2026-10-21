@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::error::Error;
 
 use futures_executor::block_on;
@@ -12,10 +13,189 @@ use lonewolf_xmpp::stanza::Element;
 use super::*;
 use crate::delivery::{BoundResource, DeliveryError, SessionLookup};
 use crate::discovery::Discovery;
-use crate::{ExtensionFuture, Extensions};
+use crate::{EnableError, ExtensionFuture, Extensions, HostSelection};
 
 type TestResult = Result<(), Box<dyn Error>>;
 type TestArena = Arena<GlobalChunkAllocator>;
+type TestExtensions = Extensions<GlobalChunkAllocator, RedbStorage>;
+
+fn builtin_catalog() -> Result<TestExtensions, RegistrationError> {
+    let mut catalog = TestExtensions::default();
+    let factories = crate::builtin();
+    assert_eq!(
+        factories.each_ref().map(|factory| factory.name()),
+        [
+            crate::roster::NAME,
+            crate::offline::NAME,
+            crate::disco::NAME,
+            NAME
+        ]
+    );
+    for factory in factories {
+        catalog.register_factory(factory)?;
+    }
+    Ok(catalog)
+}
+
+#[test]
+fn builtin_ping_routes_and_features_follow_each_hosts_selection() -> TestResult {
+    let catalog = builtin_catalog()?;
+    let disco = catalog.enable_host("baseline.example", [crate::disco::NAME])?;
+    let options = BTreeMap::new();
+    for enabled in [[NAME, crate::disco::NAME], [crate::disco::NAME, NAME]] {
+        let names = enabled.map(String::from);
+        for disabled in [&[][..], &[String::from(crate::disco::NAME)][..]] {
+            for reverse in [false, true] {
+                let mut selections = [
+                    HostSelection {
+                        domain: "enabled.example",
+                        extensions: &names,
+                        options: &options,
+                    },
+                    HostSelection {
+                        domain: "disabled.example",
+                        extensions: disabled,
+                        options: &options,
+                    },
+                ];
+                if reverse {
+                    selections.reverse();
+                }
+                let registries = catalog.enable(&selections)?;
+                for selection in &selections {
+                    let registry = &registries[selection.domain];
+                    let has_ping = selection.domain == "enabled.example";
+                    assert_eq!(registry.enabled(), selection.extensions);
+                    for (scope, discovery_scope) in [
+                        (IqScope::Server, DiscoScope::Server),
+                        (IqScope::Account, DiscoScope::Account),
+                    ] {
+                        assert_eq!(
+                            registry
+                                .iq()
+                                .find(scope, IqRequestType::Get, NAMESPACE, "ping")
+                                .is_some(),
+                            has_ping
+                        );
+                        assert!(
+                            registry
+                                .iq()
+                                .find(scope, IqRequestType::Set, NAMESPACE, "ping")
+                                .is_none()
+                        );
+                        let features = registry.discovery().features(discovery_scope);
+                        let mut expected = if selection.extensions.is_empty() {
+                            Vec::new()
+                        } else {
+                            disco.discovery().features(discovery_scope).to_vec()
+                        };
+                        if has_ping {
+                            expected.push(NAMESPACE);
+                            expected.sort_unstable();
+                        }
+                        assert_eq!(features, expected);
+                        assert_eq!(
+                            features
+                                .iter()
+                                .filter(|&&feature| feature == NAMESPACE)
+                                .count(),
+                            usize::from(has_ping)
+                        );
+                        if !selection.extensions.is_empty() {
+                            assert_eq!(
+                                registry.discovery().identities(discovery_scope),
+                                disco.discovery().identities(discovery_scope)
+                            );
+                        } else {
+                            assert!(registry.discovery().identities(discovery_scope).is_empty());
+                        }
+                    }
+                    assert_eq!(registry.stream_features(), disco.stream_features());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn builtin_ping_dependencies_cannot_be_satisfied_by_another_host() -> TestResult {
+    let catalog = builtin_catalog()?;
+    let options = BTreeMap::new();
+    let names = [NAME.into()];
+    let disco = [crate::disco::NAME.into()];
+    for reverse in [false, true] {
+        let mut selections = [
+            HostSelection {
+                domain: "ping-only.example",
+                extensions: &names,
+                options: &options,
+            },
+            HostSelection {
+                domain: "disco-only.example",
+                extensions: &disco,
+                options: &options,
+            },
+        ];
+        if reverse {
+            selections.reverse();
+        }
+        let ping_only = HostSelection {
+            domain: "ping-only.example",
+            extensions: &names,
+            options: &options,
+        };
+        for hosts in [&selections[..], std::slice::from_ref(&ping_only)] {
+            let error = catalog
+                .enable(hosts)
+                .err()
+                .ok_or("Ping-only host accepted")?;
+            assert_eq!(
+                error,
+                EnableError {
+                    host: "ping-only.example".into(),
+                    source: RegistrationError::MissingDependency {
+                        extension: NAME,
+                        dependency: crate::disco::NAME,
+                    },
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn builtin_ping_rejects_duplicate_and_misspelled_selections() -> TestResult {
+    let catalog = builtin_catalog()?;
+    for (names, expected) in [
+        (
+            vec![NAME.into(), crate::disco::NAME.into(), NAME.into()],
+            RegistrationError::DuplicateExtension(NAME),
+        ),
+        (
+            vec!["pign".into(), crate::disco::NAME.into()],
+            RegistrationError::UnknownExtension("pign".into()),
+        ),
+    ] {
+        let error = catalog
+            .enable(&[HostSelection {
+                domain: "invalid.example",
+                extensions: &names,
+                options: &BTreeMap::new(),
+            }])
+            .err()
+            .ok_or("invalid selection accepted")?;
+        assert_eq!(
+            error,
+            EnableError {
+                host: "invalid.example".into(),
+                source: expected
+            }
+        );
+    }
+    Ok(())
+}
 
 struct UnexpectedSessions;
 

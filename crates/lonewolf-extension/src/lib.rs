@@ -336,11 +336,12 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for Shared<A, S> {
     }
 }
 
-pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 3] {
+pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 4] {
     [
         Box::new(roster::RosterFactory),
         Box::new(offline::OfflineFactory),
         Box::new(Shared(Arc::new(disco::Disco))),
+        Box::new(Shared(Arc::new(ping::Ping))),
     ]
 }
 

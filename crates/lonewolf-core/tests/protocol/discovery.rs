@@ -10,9 +10,9 @@ fn default_hosts_answer_discovery() -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' to='localhost' id='host-info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='host-info' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:roster'/><feature var='msgoffline'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='host-info' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:roster'/><feature var='msgoffline'/><feature var='urn:xmpp:ping'/></query></iq>")?;
     alice.send("<iq type='get' to='alice@localhost' id='account-info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='account-info' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='account-info' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='urn:xmpp:ping'/></query></iq>")?;
     alice.close()
 }
 

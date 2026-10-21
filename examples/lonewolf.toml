@@ -25,13 +25,14 @@
 
 # Choose extensions included in the server build for this host.
 # This list replaces the default, including when it is empty.
-# extensions = ["roster", "offline", "disco"]
+# Include disco when you select ping so clients can discover Ping support.
+# extensions = ["roster", "offline", "disco", "ping"]
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
 # [hosts."example.com"]
 
-# extensions = ["roster", "offline", "disco"]
+# extensions = ["roster", "offline", "disco", "ping"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.
 # Keep roster in this host's extension list when configuring these limits.

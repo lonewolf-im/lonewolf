@@ -2,6 +2,11 @@
 
 use std::path::Path;
 
+use lonewolf_extension::discovery::DiscoScope;
+use lonewolf_extension::{Extensions, HostSelection, RegistrationError};
+use lonewolf_storage::RedbStorage;
+use lonewolf_util::arena::GlobalChunkAllocator;
+
 use crate::config::{
     Config, ConfigError, HostConfig, HostTlsConfig, HostTlsSource, managed_dns_name,
 };
@@ -187,6 +192,179 @@ fn extension_option_tables_are_kept_per_host() -> TestResult {
         config.hosts["localhost"].options["roster"]["max_pending_subscription_requests"],
         toml::Value::Integer(7),
     );
+    Ok(())
+}
+
+fn builtin_catalog() -> Result<Extensions<GlobalChunkAllocator, RedbStorage>, RegistrationError> {
+    let mut catalog = Extensions::default();
+    for factory in lonewolf_extension::builtin() {
+        catalog.register_factory(factory)?;
+    }
+    Ok(catalog)
+}
+
+fn selections(config: &Config) -> Vec<HostSelection<'_>> {
+    config
+        .hosts
+        .iter()
+        .map(|(domain, host)| HostSelection {
+            domain,
+            extensions: &host.extensions,
+            options: &host.options,
+        })
+        .collect()
+}
+
+fn two_vcard_hosts(local: &str, other: &str) -> String {
+    format!(
+        "[xmpp]\ndefault_host='localhost'\n[hosts.localhost]\n{local}\n[hosts.'example.com']\n{other}\n[hosts.'example.com'.tls]\ncertificate_chain_path='cert.pem'\nprivate_key_path='key.pem'\n"
+    )
+}
+
+#[test]
+fn vcard_options_and_selection_are_prepared_independently_per_host() -> TestResult {
+    let catalog = builtin_catalog()?;
+    for (first, second) in [
+        ("['disco', 'vcard']", "['vcard', 'disco']"),
+        ("['vcard', 'disco']", "['disco', 'vcard']"),
+    ] {
+        for (local_quota, other_quota) in [(1, 1_048_576), (262_144, 100)] {
+            let contents = two_vcard_hosts(
+                &format!("extensions={first}\n[hosts.localhost.vcard]\nmax_bytes={local_quota}"),
+                &format!(
+                    "extensions={second}\n[hosts.'example.com'.vcard]\nmax_bytes={other_quota}"
+                ),
+            );
+            let file = config_file(&contents)?;
+            let config = Config::load(Some(file.path()))?;
+            let prepared = catalog.enable(&selections(&config))?;
+            for (domain, quota) in [("localhost", local_quota), ("example.com", other_quota)] {
+                let host = &config.hosts[domain];
+                assert_eq!(
+                    host.options["vcard"]["max_bytes"],
+                    toml::Value::Integer(quota)
+                );
+                assert_eq!(prepared[domain].enabled(), host.extensions);
+                for scope in [DiscoScope::Server, DiscoScope::Account] {
+                    assert_eq!(
+                        prepared[domain].discovery().features(scope),
+                        [
+                            "http://jabber.org/protocol/disco#info",
+                            "http://jabber.org/protocol/disco#items",
+                            "vcard-temp",
+                        ]
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vcard_dependency_cannot_use_another_hosts_discovery() -> TestResult {
+    let catalog = builtin_catalog()?;
+    for missing in ["localhost", "example.com"] {
+        for other in ["['disco']", "['disco', 'vcard']", "['vcard', 'disco']"] {
+            let (local, other) = if missing == "localhost" {
+                ("extensions=['vcard']".into(), format!("extensions={other}"))
+            } else {
+                (format!("extensions={other}"), "extensions=['vcard']".into())
+            };
+            let file = config_file(&two_vcard_hosts(&local, &other))?;
+            let config = Config::load(Some(file.path()))?;
+            let error = catalog
+                .enable(&selections(&config))
+                .err()
+                .ok_or("missing dependency accepted")?;
+            assert_eq!(error.host, missing);
+            assert_eq!(
+                error.source,
+                RegistrationError::MissingDependency {
+                    extension: "vcard",
+                    dependency: "disco",
+                }
+            );
+            assert_eq!(config.hosts[missing].extensions, ["vcard"]);
+            assert!(error.to_string().contains("disco"));
+            assert!(error.to_string().contains("vcard"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_vcard_options_fail_during_extension_preparation() -> TestResult {
+    let catalog = builtin_catalog()?;
+    for invalid in [
+        "max_bytes=0",
+        "max_bytes=-1",
+        "max_bytes=1048577",
+        "max_bytes=1.5",
+        "max_bytes='4'",
+        "max_bytes=true",
+        "max_bytes=[]",
+        "max_bytes={value=4}",
+        "unknown=1",
+    ] {
+        for domain in ["localhost", "example.com"] {
+            let valid = "extensions=['disco', 'vcard']";
+            let invalid = format!("{valid}\n[hosts.'{domain}'.vcard]\n{invalid}");
+            let contents = if domain == "localhost" {
+                two_vcard_hosts(&invalid, valid)
+            } else {
+                two_vcard_hosts(valid, &invalid)
+            };
+            let file = config_file(&contents)?;
+            let config = Config::load(Some(file.path()))?;
+            assert!(config.hosts[domain].options.contains_key("vcard"));
+            let error = catalog
+                .enable(&selections(&config))
+                .err()
+                .ok_or("invalid quota accepted")?;
+            assert_eq!(error.host, domain);
+            assert!(matches!(error.source, RegistrationError::InvalidOptions {
+                extension: "vcard", ref reason,
+            } if !reason.is_empty()));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_and_disabled_extension_options_fail_during_preparation() -> TestResult {
+    let catalog = builtin_catalog()?;
+    for domain in ["localhost", "example.com"] {
+        for (name, expected) in [
+            (
+                "vcard",
+                RegistrationError::OptionsWithoutExtension("vcard".into()),
+            ),
+            (
+                "unknown",
+                RegistrationError::UnknownOptions("unknown".into()),
+            ),
+        ] {
+            for options in ["", "max_bytes=100"] {
+                let disabled =
+                    format!("extensions=['disco']\n[hosts.'{domain}'.{name}]\n{options}");
+                let enabled = "extensions=['disco', 'vcard']";
+                let contents = if domain == "localhost" {
+                    two_vcard_hosts(&disabled, enabled)
+                } else {
+                    two_vcard_hosts(enabled, &disabled)
+                };
+                let file = config_file(&contents)?;
+                let config = Config::load(Some(file.path()))?;
+                let error = catalog
+                    .enable(&selections(&config))
+                    .err()
+                    .ok_or("unsupported options accepted")?;
+                assert_eq!(error.host, domain);
+                assert_eq!(error.source, expected);
+            }
+        }
+    }
     Ok(())
 }
 

@@ -26,14 +26,14 @@
 # Choose extensions included in the server build for this host.
 # This list replaces the default, including when it is empty.
 # Enable disco to let clients discover the features selected for this host.
-# extensions = ["roster", "offline", "disco", "ping"]
+# extensions = ["roster", "offline", "disco", "ping", "vcard"]
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
 # [hosts."example.com"]
 
-# Enable vcard with disco to publish profiles readable by authenticated local clients.
-# This extension selection is an example.
+# vcard requires disco in the same host's extension list.
+# Stored profiles are public to authenticated local C2S users.
 # extensions = ["roster", "offline", "disco", "ping", "vcard"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.
@@ -53,11 +53,12 @@
 # max_messages_per_account = 100
 
 # Increase the vCard write budget for larger profiles, within 1 to 1048576 bytes.
-# Keep vcard and disco in this host's extension list when configuring this limit.
-# The budget counts serialized XML, including detached language, space, and namespaces.
-# A lower budget limits later writes; stored profiles remain readable.
+# The budget counts serialized UTF-8 XML, including materialized
+# namespace, language, and whitespace-context markup.
+# The listener's complete-stanza limit can be smaller.
+# Reducing this budget does not delete or hide stored profiles; new documents must fit.
 # [hosts."example.com".vcard]
-# max_bytes = 262144
+# max_bytes = 262_144
 
 # Choose certificate files or automatic certificates for each host except localhost.
 # Localhost uses a new self-signed certificate on each start if you omit its TLS section.

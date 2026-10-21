@@ -305,7 +305,7 @@ fn missing_accounts_answer_like_hidden_ones() -> TestResult {
                 (Err(hidden), Err(missing)) => {
                     assert_eq!(
                         hidden,
-                        HandlerError::Stanza(StanzaErrorCondition::ServiceUnavailable)
+                        HandlerError::Stanza(StanzaErrorCondition::ServiceUnavailable).into()
                     );
                     assert_eq!(hidden, missing);
                 }

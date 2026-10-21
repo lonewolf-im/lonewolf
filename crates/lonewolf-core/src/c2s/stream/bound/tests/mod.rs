@@ -31,6 +31,8 @@ use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Router, StoredRelease};
 
+mod iq_errors;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const MESSAGE: &[u8] =
     b"<message xmlns='jabber:client' to='bob@localhost/old' type='chat' id='stored'/>";
@@ -2460,7 +2462,8 @@ impl IqHandler<GlobalChunkAllocator, RedbStorage> for FailedGet {
                 Some(kind) => Err(HandlerError::Internal {
                     condition: StanzaErrorCondition::InternalServerError,
                     failure: storage_failure(seeded_error(kind), "roster_read"),
-                }),
+                }
+                .into()),
                 None => Ok(IqReply::new(
                     None,
                     lonewolf_extension::Effects::new(Vec::new(), |_| {
@@ -2717,9 +2720,7 @@ fn iq_account_guard_and_get_handler_share_the_fixed_snapshot_across_deletion() -
             .map_err(|error| format!("{error:?}"))?;
         assert!(matches!(
             outcome.reply,
-            Err(HandlerError::Stanza(
-                StanzaErrorCondition::ServiceUnavailable
-            ))
+            Err(error) if error == HandlerError::Stanza(StanzaErrorCondition::ServiceUnavailable).into()
         ));
         assert!(outcome.results.is_empty());
         assert_eq!(handler.0.load(Ordering::SeqCst), 1);
@@ -2831,7 +2832,7 @@ impl IqHandler<GlobalChunkAllocator, RedbStorage> for IqContextObservation {
         &self,
         request: IqRequest<'_, GlobalChunkAllocator>,
         _: &mut Arena<GlobalChunkAllocator>,
-    ) -> Result<Option<Element>, HandlerError> {
+    ) -> Result<Option<Element>, IqError> {
         assert_eq!(self.path, "missing");
         self.observe(request)?;
         Ok(None)

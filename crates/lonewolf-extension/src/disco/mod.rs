@@ -13,7 +13,7 @@ use crate::discovery::{
     item_in, items_in,
 };
 use crate::iq::{
-    IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope, Requester,
+    IqError, IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope, Requester,
 };
 use crate::{Effects, Extension, RegistrationError, Slots};
 
@@ -122,7 +122,7 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Disco {
                 let account = request.target;
                 let answer = account_answer(query.kind, requester, query.node);
                 let mut item_count = 0;
-                let result = match answer {
+                let result: Result<_, HandlerError> = match answer {
                     AccountAnswer::ServiceUnavailable => {
                         Err(StanzaErrorCondition::ServiceUnavailable.into())
                     }
@@ -199,19 +199,20 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Disco {
         &self,
         request: IqRequest<'_, A>,
         response: &mut Arena<A>,
-    ) -> Result<Option<Element>, HandlerError> {
+    ) -> Result<Option<Element>, IqError> {
         let query = Query::parse(request.payload)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?
             .ok_or(StanzaErrorCondition::BadRequest)?;
-        let result = match account_answer(query.kind, Requester::Other, query.node) {
-            AccountAnswer::ServiceUnavailable => {
-                Err(StanzaErrorCondition::ServiceUnavailable.into())
-            }
-            AccountAnswer::EmptyItems => items_in(query.node, &[], response)
-                .map(Some)
-                .map_err(|_| StanzaErrorCondition::ResourceConstraint.into()),
-            _ => Err(StanzaErrorCondition::InternalServerError.into()),
-        };
+        let result: Result<_, HandlerError> =
+            match account_answer(query.kind, Requester::Other, query.node) {
+                AccountAnswer::ServiceUnavailable => {
+                    Err(StanzaErrorCondition::ServiceUnavailable.into())
+                }
+                AccountAnswer::EmptyItems => items_in(query.node, &[], response)
+                    .map(Some)
+                    .map_err(|_| StanzaErrorCondition::ResourceConstraint.into()),
+                _ => Err(StanzaErrorCondition::InternalServerError.into()),
+            };
         if result.is_ok()
             || matches!(
                 result,
@@ -236,7 +237,7 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Disco {
                 ),
             }
         }
-        result
+        result.map_err(Into::into)
     }
 }
 

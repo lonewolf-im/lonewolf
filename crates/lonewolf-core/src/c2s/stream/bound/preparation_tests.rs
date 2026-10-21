@@ -149,7 +149,7 @@ impl IqHandler<GlobalChunkAllocator, RedbStorage> for Gate {
                     None,
                     Effects::new(vec![account], |_| Box::pin(async { Ok(()) })),
                 )),
-                _ => Err(Self::error("roster_write")),
+                _ => Err(Self::error("roster_write").into()),
             }
         })
     }

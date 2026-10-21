@@ -683,7 +683,11 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for OfflineInspect {
         transaction: &'a RedbRead,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(inspect_offline(request, transaction, response))
+        Box::pin(async move {
+            inspect_offline(request, transaction, response)
+                .await
+                .map_err(Into::into)
+        })
     }
     fn set<'a>(
         &'a self,
@@ -760,7 +764,9 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for SlowOffline {
                     .map_err(|_| StanzaErrorCondition::InternalServerError)?;
                 return Ok(IqReply::new(Some(released), Effects::none()));
             }
-            inspect_offline(request, transaction, response).await
+            inspect_offline(request, transaction, response)
+                .await
+                .map_err(Into::into)
         })
     }
 }
@@ -1145,14 +1151,14 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestAccountAccess {
         _: &'a RedbRead,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async move { Self::reply(request, response).await })
+        Box::pin(async move { Self::reply(request, response).await.map_err(Into::into) })
     }
 
     fn get_missing_account(
         &self,
         _: IqRequest<'_, A>,
         response: &mut Arena<A>,
-    ) -> Result<Option<Element>, HandlerError> {
+    ) -> Result<Option<Element>, lonewolf_extension::iq::IqError> {
         Element::builder_in("query", ACCESS_ROUTE.namespace, response)
             .and_then(|builder| builder.attribute("missing", "", "true"))
             .and_then(|builder| builder.build())
@@ -1167,7 +1173,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestAccountAccess {
         _: &'a dyn HostLookup,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async move { Self::reply(request, response).await })
+        Box::pin(async move { Self::reply(request, response).await.map_err(Into::into) })
     }
 }
 
@@ -1296,7 +1302,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
                 return Ok(IqReply::new(Some(payload), Effects::none()));
             }
             self.gets.fetch_add(1, Ordering::SeqCst);
-            identity(&request, response).await
+            identity(&request, response).await.map_err(Into::into)
         })
     }
 
@@ -1389,7 +1395,7 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ServerIq {
         _: &'a RedbRead,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async move { identity(&request, response).await })
+        Box::pin(async move { identity(&request, response).await.map_err(Into::into) })
     }
 }
 
@@ -1576,7 +1582,8 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for FailureIq {
             Err(injected_handler_error(
                 lonewolf_storage::StorageErrorKind::CorruptData,
                 "roster_read",
-            ))
+            )
+            .into())
         })
     }
     fn set<'a>(
@@ -1590,7 +1597,8 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for FailureIq {
             Err(injected_handler_error(
                 lonewolf_storage::StorageErrorKind::Unavailable,
                 "roster_write",
-            ))
+            )
+            .into())
         })
     }
 }

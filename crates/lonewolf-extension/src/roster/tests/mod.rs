@@ -268,7 +268,7 @@ impl IqCall {
         roster: &TestRoster,
         kind: IqRequestType,
         delivery: &RecordingDelivery,
-    ) -> Result<IqReply<GlobalChunkAllocator>, HandlerError> {
+    ) -> Result<IqReply<GlobalChunkAllocator>, crate::iq::IqError> {
         let sender = self
             .sender
             .resolve(&self.request)
@@ -332,7 +332,7 @@ fn handle_iq(
     kind: IqRequestType,
     item_jid: &str,
     delivery: &RecordingDelivery,
-) -> Result<Vec<AccountKey>, HandlerError> {
+) -> Result<Vec<AccountKey>, crate::iq::IqError> {
     let mut call = IqCall::new(item_jid);
     let reply = block_on(call.handle(roster, kind, delivery))?;
     let Effects { accounts, deliver } = reply.effects;
@@ -594,7 +594,7 @@ fn roster_set_from_a_deleted_account_is_forbidden() {
     assert!(
         matches!(
             result,
-            Err(HandlerError::Stanza(StanzaErrorCondition::Forbidden))
+            Err(error) if error == HandlerError::Stanza(StanzaErrorCondition::Forbidden).into()
         ),
         "{result:?}"
     );

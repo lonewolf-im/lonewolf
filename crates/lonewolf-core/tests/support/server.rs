@@ -31,6 +31,22 @@ impl C2sSuitePermit {
     }
 }
 
+fn spawn_process(directory: &Path) -> std::io::Result<Child> {
+    Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "support::server::server_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("LONEWOLF_PROTOCOL_TEST_SERVER", "1")
+        .current_dir(directory)
+        .env("LONEWOLF_WORKER_COUNT", "2")
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(directory.join("server.log"))?)
+        .spawn()
+}
+
 impl Drop for C2sSuitePermit {
     fn drop(&mut self) {
         let mut active = ACTIVE_SERVERS.lock();
@@ -232,19 +248,7 @@ max_resources_per_account = {resources}
             ),
         )?;
         setup(directory.path())?;
-        let child = Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "support::server::server_process",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("LONEWOLF_PROTOCOL_TEST_SERVER", "1")
-            .current_dir(directory.path())
-            .env("LONEWOLF_WORKER_COUNT", "2")
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(directory.path().join("server.log"))?)
-            .spawn()?;
+        let child = spawn_process(directory.path())?;
         let mut server = Self {
             _permit: permit,
             child,
@@ -255,6 +259,13 @@ max_resources_per_account = {resources}
         };
         server.wait_until_ready()?;
         Ok(server)
+    }
+
+    pub fn restart(&mut self) -> TestResult {
+        self.stop()?;
+        self.child = spawn_process(self.directory.path())?;
+        self.address.set_port(0);
+        self.wait_until_ready()
     }
 
     pub fn tls_with_versions(

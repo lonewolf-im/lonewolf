@@ -18,6 +18,8 @@ pub(super) struct RecipientLimiter {
     len: usize,
     next: usize,
     metrics: C2sWorkerMetrics,
+    #[cfg(test)]
+    admission_calls: usize,
 }
 
 impl RecipientLimiter {
@@ -36,10 +38,21 @@ impl RecipientLimiter {
             len: 0,
             next: 0,
             metrics,
+            #[cfg(test)]
+            admission_calls: 0,
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn admission_calls(&self) -> usize {
+        self.admission_calls
+    }
+
     pub(super) fn admit(&mut self, recipient: &str, now: Instant) -> bool {
+        #[cfg(test)]
+        {
+            self.admission_calls += 1;
+        }
         let hash = self.hasher.hash_one(recipient);
         if self.recent[..self.len].contains(&hash) {
             return true;

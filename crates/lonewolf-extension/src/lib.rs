@@ -37,7 +37,7 @@ use account::AccountHandler;
 use archive::ArchiveHandler;
 use delivery::{Delivery, DeliveryFuture};
 use discovery::Discovery;
-use iq::{IqRegistry, IqRoute};
+use iq::{IqRegistry, IqRequestKey, IqRoute};
 use message::MessageHandler;
 use observer::{MessageObserver, SessionObserver};
 use policy::PolicyHandler;
@@ -133,6 +133,7 @@ pub enum RegistrationError {
     DuplicateExtension(&'static str),
     UnknownExtension(String),
     DuplicateRoute(IqRoute),
+    DuplicateIqDestinationRule(IqRequestKey),
     DuplicatePresenceRoute(PresenceRequestType),
     DuplicatePresenceDecoration {
         name: &'static str,
@@ -165,6 +166,9 @@ impl fmt::Display for RegistrationError {
             }
             Self::UnknownExtension(name) => write!(formatter, "unknown extension {name:?}"),
             Self::DuplicateRoute(route) => write!(formatter, "conflicting IQ route {route:?}"),
+            Self::DuplicateIqDestinationRule(key) => {
+                write!(formatter, "conflicting IQ destination rule {key:?}")
+            }
             Self::DuplicatePresenceRoute(route) => {
                 write!(formatter, "conflicting presence route {route:?}")
             }

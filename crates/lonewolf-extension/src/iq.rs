@@ -24,6 +24,19 @@ pub enum IqRequestType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct IqRequestKey {
+    pub kind: IqRequestType,
+    pub namespace: &'static str,
+    pub name: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IqDestinationRule {
+    /// Allows an omitted target or an exact match for the authenticated sender's bare JID.
+    SenderBare,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct IqRoute {
     pub scope: IqScope,
     pub kind: IqRequestType,
@@ -188,12 +201,14 @@ pub trait IqHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
 
 pub struct IqRegistry<A: ChunkAllocator, S: Storage> {
     handlers: Vec<(IqRoute, Arc<dyn IqHandler<A, S>>)>,
+    destinations: Vec<(IqRequestKey, IqDestinationRule)>,
 }
 
 impl<A: ChunkAllocator, S: Storage> Default for IqRegistry<A, S> {
     fn default() -> Self {
         Self {
             handlers: Vec::new(),
+            destinations: Vec::new(),
         }
     }
 }
@@ -233,9 +248,41 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
         Some(&self.handlers[index].1)
     }
 
+    pub(crate) fn register_destination(
+        &mut self,
+        key: IqRequestKey,
+        rule: IqDestinationRule,
+    ) -> Result<(), RegistrationError> {
+        match self
+            .destinations
+            .binary_search_by_key(&key, |(entry, _)| *entry)
+        {
+            Ok(_) => Err(RegistrationError::DuplicateIqDestinationRule(key)),
+            Err(index) => {
+                self.destinations.insert(index, (key, rule));
+                Ok(())
+            }
+        }
+    }
+
+    pub fn destination_rule(
+        &self,
+        kind: IqRequestType,
+        namespace: &str,
+        name: &str,
+    ) -> Option<IqDestinationRule> {
+        let index = self
+            .destinations
+            .binary_search_by(|(key, _)| {
+                (key.kind, key.namespace, key.name).cmp(&(kind, namespace, name))
+            })
+            .ok()?;
+        Some(self.destinations[index].1)
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.handlers.is_empty()
+        self.handlers.is_empty() && self.destinations.is_empty()
     }
 }
 

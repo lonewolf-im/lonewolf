@@ -31,6 +31,7 @@ use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Router, StoredRelease};
 
+mod iq_destinations;
 mod iq_errors;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;

@@ -16,7 +16,7 @@ use super::discovery::{
     DiscoScope, Discovery, INFO_NAMESPACE, ITEMS_NAMESPACE, Identity, Query, QueryKind, info_in,
     item_in, items_in,
 };
-use super::iq::{IqHandler, IqRequestType, IqRoute, IqScope};
+use super::iq::{IqDestinationRule, IqHandler, IqRequestKey, IqRequestType, IqRoute, IqScope};
 use super::message::MessageHandler;
 use super::presence::{PresenceHandler, PresenceRequestType};
 use super::service::{ServiceContext, ServiceHandler};
@@ -35,6 +35,7 @@ const ROUTE: IqRoute = IqRoute {
 struct Fake {
     name: &'static str,
     iq: &'static [IqRoute],
+    destinations: &'static [IqRequestKey],
     presence: &'static [PresenceRequestType],
     features: &'static [&'static str],
     disco_features: &'static [(DiscoScope, &'static str)],
@@ -103,6 +104,9 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for Fake {
         self.hosts.lock().push(host.into());
         for route in self.iq {
             slots.iq(*route, self.clone())?;
+        }
+        for key in self.destinations {
+            slots.iq_destination(*key, IqDestinationRule::SenderBare)?;
         }
         for kind in self.presence {
             slots.presence(*kind, self.clone())?;
@@ -700,6 +704,119 @@ fn account_handlers_follow_enable_order() -> Result<(), RegistrationError> {
             .enable_host("example.com", ["plain"])?
             .account_handlers()
             .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn iq_destination_rules_match_exact_keys_independently_of_handler_routes()
+-> Result<(), RegistrationError> {
+    const KEYS: [IqRequestKey; 4] = [
+        IqRequestKey {
+            kind: IqRequestType::Set,
+            namespace: "urn:test:guard",
+            name: "query",
+        },
+        IqRequestKey {
+            kind: IqRequestType::Get,
+            namespace: "urn:test:guard",
+            name: "query",
+        },
+        IqRequestKey {
+            kind: IqRequestType::Set,
+            namespace: "urn:test:guard",
+            name: "other",
+        },
+        IqRequestKey {
+            kind: IqRequestType::Set,
+            namespace: "urn:test:other",
+            name: "query",
+        },
+    ];
+    let mut extensions = TestExtensions::default();
+    extensions.register(Arc::new(Fake {
+        name: "guard",
+        destinations: &KEYS,
+        ..Fake::default()
+    }))?;
+    let enabled = extensions.enable_host("a.example", ["guard"])?;
+    let disabled = extensions.enable_host("b.example", [])?;
+    assert!(!enabled.iq().is_empty());
+    assert!(disabled.iq().is_empty());
+    for key in KEYS {
+        assert_eq!(
+            enabled
+                .iq()
+                .destination_rule(key.kind, key.namespace, key.name),
+            Some(IqDestinationRule::SenderBare)
+        );
+        assert_eq!(
+            disabled
+                .iq()
+                .destination_rule(key.kind, key.namespace, key.name),
+            None
+        );
+        assert!(
+            enabled
+                .iq()
+                .find(IqScope::Account, key.kind, key.namespace, key.name)
+                .is_none()
+        );
+    }
+    for (kind, namespace, name) in [
+        (IqRequestType::Get, "urn:test:other", "query"),
+        (IqRequestType::Set, "urn:test:guard", "Query"),
+        (IqRequestType::Set, "URN:test:guard", "query"),
+        (IqRequestType::Set, "urn:test:guard", ""),
+    ] {
+        assert_eq!(enabled.iq().destination_rule(kind, namespace, name), None);
+    }
+    Ok(())
+}
+
+#[test]
+fn duplicate_iq_destination_rules_fail_in_every_registration_order() -> Result<(), RegistrationError>
+{
+    const KEY: IqRequestKey = IqRequestKey {
+        kind: IqRequestType::Set,
+        namespace: "urn:test:guard",
+        name: "query",
+    };
+    let mut extensions = TestExtensions::default();
+    for name in ["first", "second"] {
+        extensions.register(Arc::new(Fake {
+            name,
+            destinations: &[KEY],
+            ..Fake::default()
+        }))?;
+    }
+    extensions.register(Arc::new(Fake {
+        name: "repeated",
+        destinations: &[KEY, KEY],
+        ..Fake::default()
+    }))?;
+    for names in [["first", "second"], ["second", "first"]] {
+        assert!(matches!(
+            extensions.enable_host("a.example", names),
+            Err(RegistrationError::DuplicateIqDestinationRule(KEY))
+        ));
+    }
+    assert!(matches!(
+        extensions.enable_host("a.example", ["repeated"]),
+        Err(RegistrationError::DuplicateIqDestinationRule(KEY))
+    ));
+    for name in ["first", "second"] {
+        let enabled = extensions.enable_host("a.example", [name])?;
+        assert_eq!(
+            enabled
+                .iq()
+                .destination_rule(KEY.kind, KEY.namespace, KEY.name),
+            Some(IqDestinationRule::SenderBare)
+        );
+    }
+    assert_eq!(
+        RegistrationError::DuplicateIqDestinationRule(KEY).to_string(),
+        format!("conflicting IQ destination rule {KEY:?}")
     );
     Ok(())
 }

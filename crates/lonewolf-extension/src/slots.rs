@@ -9,7 +9,7 @@ use lonewolf_xmpp::jid::Jid;
 use crate::account::AccountHandler;
 use crate::archive::ArchiveHandler;
 use crate::discovery::{DiscoScope, Identity};
-use crate::iq::{IqHandler, IqRoute};
+use crate::iq::{IqDestinationRule, IqHandler, IqRequestKey, IqRoute};
 use crate::message::MessageHandler;
 use crate::observer::{MessageObserver, SessionObserver};
 use crate::policy::PolicyHandler;
@@ -36,6 +36,14 @@ impl<'r, A: ChunkAllocator, S: Storage> Slots<'r, A, S> {
         handler: Arc<dyn IqHandler<A, S>>,
     ) -> Result<(), RegistrationError> {
         self.registry.iq.register(route, handler)
+    }
+
+    pub fn iq_destination(
+        &mut self,
+        key: IqRequestKey,
+        rule: IqDestinationRule,
+    ) -> Result<(), RegistrationError> {
+        self.registry.iq.register_destination(key, rule)
     }
 
     pub fn presence(

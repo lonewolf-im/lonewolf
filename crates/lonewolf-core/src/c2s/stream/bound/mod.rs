@@ -19,8 +19,8 @@ use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::{
-    IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester,
-    XmlSpace,
+    IqDestinationRule, IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType,
+    IqScope, Requester, XmlSpace,
 };
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
@@ -498,6 +498,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         if stanza.namespace() != StanzaNamespace::Client {
             return Err(CloseOutcome::InvalidNamespace);
         }
+        let parsed = if matches!(stanza.stanza_type(), StanzaType::Iq(_)) {
+            let Some(parsed) = self.admit_iq(parsed)? else {
+                return Ok(());
+            };
+            parsed
+        } else {
+            parsed
+        };
+        let stanza = parsed.value().resolve(parsed.arena())?;
         let service = stanza
             .to()?
             .and_then(|to| self.router.service(to.domainpart()).cloned());
@@ -696,23 +705,73 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         }
     }
 
+    fn admit_iq(
+        &mut self,
+        parsed: Parsed<Stanza, A>,
+    ) -> Result<Option<Parsed<Stanza, A>>, CloseOutcome> {
+        let stanza = parsed.value().resolve(parsed.arena())?;
+        let error = if self.admit_recipient(&stanza)? {
+            self.iq_destination_error(&stanza)?
+        } else {
+            Some(StanzaErrorCondition::PolicyViolation.into())
+        };
+        let Some(error) = error else {
+            return Ok(Some(parsed));
+        };
+        let (request, mut arena) = parsed.into_parts();
+        let account = self.registration.account();
+        let sender = Jid::from_trusted_parts_in(
+            Some(account.username()),
+            account.domain(),
+            Some(self.registration.resource()),
+            &mut arena,
+        )?;
+        self.queue_iq_error(request, sender, arena, error)?;
+        Ok(None)
+    }
+
+    fn iq_destination_error(
+        &self,
+        stanza: &StanzaRef<'_, Arena<A>>,
+    ) -> Result<Option<IqError>, CloseOutcome> {
+        let kind = match stanza.stanza_type() {
+            StanzaType::Iq(IqType::Get) => IqRequestType::Get,
+            StanzaType::Iq(IqType::Set) => IqRequestType::Set,
+            _ => return Ok(None),
+        };
+        let payload = stanza
+            .children()?
+            .next()
+            .transpose()?
+            .ok_or(CloseOutcome::InternalError)?;
+        let source_domain = self.registration.account().domain();
+        let target = stanza.to()?;
+        let target_domain = target.map_or(source_domain, |to| to.domainpart());
+        let mut rejected = false;
+        for domain in [
+            Some(source_domain),
+            (target_domain != source_domain).then_some(target_domain),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let rule = self.router.iq_handlers(domain).and_then(|registry| {
+                registry.destination_rule(kind, payload.namespace(), payload.name())
+            });
+            rejected |= match rule {
+                Some(IqDestinationRule::SenderBare) => {
+                    target.is_some_and(|to| to.as_str() != self.registration.account().as_str())
+                }
+                None => false,
+            };
+        }
+        Ok(rejected.then(|| IqError::without_payload(StanzaErrorCondition::Forbidden.into())))
+    }
+
     /// Committed handler effects outlive this session.
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration, &self.router)?;
-        if !self.admit_recipient(&request.resolve(&arena)?)? {
-            let reply = iq::error_reply(
-                &request,
-                &mut arena,
-                StanzaErrorCondition::PolicyViolation,
-                Some(route.sender),
-            )?;
-            self.outbox.push(Output::Owned {
-                stanza: reply,
-                arena,
-            });
-            return Ok(());
-        }
         let verdict = {
             let view = request.resolve(&arena)?;
             match view.to()? {

@@ -12,8 +12,8 @@ use lonewolf_xmpp::stanza::Element;
 
 use super::*;
 use crate::delivery::{BoundResource, DeliveryError, SessionLookup};
-use crate::discovery::Discovery;
-use crate::{EnableError, ExtensionFuture, Extensions, HostSelection};
+use crate::discovery::{Discovery, INFO_NAMESPACE, ITEMS_NAMESPACE, Identity};
+use crate::{EnableError, ExtensionFuture, ExtensionRegistry, Extensions, HostSelection};
 
 type TestResult = Result<(), Box<dyn Error>>;
 type TestArena = Arena<GlobalChunkAllocator>;
@@ -37,13 +37,109 @@ fn builtin_catalog() -> Result<TestExtensions, RegistrationError> {
     Ok(catalog)
 }
 
+fn assert_selection(
+    registry: &ExtensionRegistry<GlobalChunkAllocator, RedbStorage>,
+    names: &[&str],
+) {
+    let has_ping = names.contains(&NAME);
+    let has_disco = names.contains(&crate::disco::NAME);
+    assert_eq!(registry.enabled(), names);
+    for (scope, discovery_scope, category, kind) in [
+        (IqScope::Server, DiscoScope::Server, "server", "im"),
+        (
+            IqScope::Account,
+            DiscoScope::Account,
+            "account",
+            "registered",
+        ),
+    ] {
+        for (namespace, name, enabled) in [
+            (NAMESPACE, "ping", has_ping),
+            (INFO_NAMESPACE, "query", has_disco),
+            (ITEMS_NAMESPACE, "query", has_disco),
+        ] {
+            assert_eq!(
+                registry
+                    .iq()
+                    .find(scope, IqRequestType::Get, namespace, name)
+                    .is_some(),
+                enabled,
+                "{scope:?}: {namespace} {name} for {names:?}"
+            );
+            assert!(
+                registry
+                    .iq()
+                    .find(scope, IqRequestType::Set, namespace, name)
+                    .is_none()
+            );
+        }
+        for (namespace, name) in [(NAMESPACE, "pong"), ("urn:wrong", "ping")] {
+            for request_type in [IqRequestType::Get, IqRequestType::Set] {
+                assert!(
+                    registry
+                        .iq()
+                        .find(scope, request_type, namespace, name)
+                        .is_none()
+                );
+            }
+        }
+        let mut expected_features = Vec::new();
+        if has_disco {
+            expected_features.extend([INFO_NAMESPACE, ITEMS_NAMESPACE]);
+        }
+        if has_ping {
+            expected_features.push(NAMESPACE);
+        }
+        expected_features.sort_unstable();
+        let features = registry.discovery().features(discovery_scope);
+        assert_eq!(features, expected_features);
+        assert_eq!(
+            features
+                .iter()
+                .filter(|&&feature| feature == NAMESPACE)
+                .count(),
+            usize::from(has_ping)
+        );
+        let identity = Identity {
+            category,
+            kind,
+            name: None,
+        };
+        let expected_identities = if has_disco {
+            std::slice::from_ref(&identity)
+        } else {
+            &[]
+        };
+        assert_eq!(
+            registry.discovery().identities(discovery_scope),
+            expected_identities
+        );
+    }
+    for kind in crate::presence::PresenceRequestType::ALL {
+        assert!(registry.presence().find(kind).is_none());
+    }
+    assert!(registry.discovery().services().is_empty());
+    assert!(registry.services().is_empty());
+    assert!(registry.stream_features().is_empty());
+    assert!(registry.account_handlers().is_empty());
+    assert!(registry.message_observers().is_empty());
+    assert!(registry.session_observers().is_empty());
+    assert!(registry.presence_decorations().is_empty());
+    assert!(registry.policies().is_empty());
+    assert!(registry.archive().is_none());
+    assert!(registry.messages().is_none());
+}
+
 #[test]
 fn builtin_ping_routes_and_features_follow_each_hosts_selection() -> TestResult {
     let catalog = builtin_catalog()?;
-    let disco = catalog.enable_host("baseline.example", [crate::disco::NAME])?;
     let options = BTreeMap::new();
-    for enabled in [[NAME, crate::disco::NAME], [crate::disco::NAME, NAME]] {
-        let names = enabled.map(String::from);
+    for enabled in [
+        &[NAME][..],
+        &[NAME, crate::disco::NAME][..],
+        &[crate::disco::NAME, NAME][..],
+    ] {
+        let names: Vec<_> = enabled.iter().copied().map(String::from).collect();
         for disabled in [&[][..], &[String::from(crate::disco::NAME)][..]] {
             for reverse in [false, true] {
                 let mut selections = [
@@ -63,54 +159,9 @@ fn builtin_ping_routes_and_features_follow_each_hosts_selection() -> TestResult 
                 }
                 let registries = catalog.enable(&selections)?;
                 for selection in &selections {
-                    let registry = &registries[selection.domain];
-                    let has_ping = selection.domain == "enabled.example";
-                    assert_eq!(registry.enabled(), selection.extensions);
-                    for (scope, discovery_scope) in [
-                        (IqScope::Server, DiscoScope::Server),
-                        (IqScope::Account, DiscoScope::Account),
-                    ] {
-                        assert_eq!(
-                            registry
-                                .iq()
-                                .find(scope, IqRequestType::Get, NAMESPACE, "ping")
-                                .is_some(),
-                            has_ping
-                        );
-                        assert!(
-                            registry
-                                .iq()
-                                .find(scope, IqRequestType::Set, NAMESPACE, "ping")
-                                .is_none()
-                        );
-                        let features = registry.discovery().features(discovery_scope);
-                        let mut expected = if selection.extensions.is_empty() {
-                            Vec::new()
-                        } else {
-                            disco.discovery().features(discovery_scope).to_vec()
-                        };
-                        if has_ping {
-                            expected.push(NAMESPACE);
-                            expected.sort_unstable();
-                        }
-                        assert_eq!(features, expected);
-                        assert_eq!(
-                            features
-                                .iter()
-                                .filter(|&&feature| feature == NAMESPACE)
-                                .count(),
-                            usize::from(has_ping)
-                        );
-                        if !selection.extensions.is_empty() {
-                            assert_eq!(
-                                registry.discovery().identities(discovery_scope),
-                                disco.discovery().identities(discovery_scope)
-                            );
-                        } else {
-                            assert!(registry.discovery().identities(discovery_scope).is_empty());
-                        }
-                    }
-                    assert_eq!(registry.stream_features(), disco.stream_features());
+                    let expected: Vec<_> =
+                        selection.extensions.iter().map(String::as_str).collect();
+                    assert_selection(&registries[selection.domain], &expected);
                 }
             }
         }
@@ -119,7 +170,7 @@ fn builtin_ping_routes_and_features_follow_each_hosts_selection() -> TestResult 
 }
 
 #[test]
-fn builtin_ping_dependencies_cannot_be_satisfied_by_another_host() -> TestResult {
+fn builtin_ping_and_disco_selections_are_isolated_between_hosts() -> TestResult {
     let catalog = builtin_catalog()?;
     let options = BTreeMap::new();
     let names = [NAME.into()];
@@ -140,28 +191,18 @@ fn builtin_ping_dependencies_cannot_be_satisfied_by_another_host() -> TestResult
         if reverse {
             selections.reverse();
         }
-        let ping_only = HostSelection {
-            domain: "ping-only.example",
-            extensions: &names,
-            options: &options,
-        };
-        for hosts in [&selections[..], std::slice::from_ref(&ping_only)] {
-            let error = catalog
-                .enable(hosts)
-                .err()
-                .ok_or("Ping-only host accepted")?;
-            assert_eq!(
-                error,
-                EnableError {
-                    host: "ping-only.example".into(),
-                    source: RegistrationError::MissingDependency {
-                        extension: NAME,
-                        dependency: crate::disco::NAME,
-                    },
-                }
-            );
-        }
+        let registries = catalog.enable(&selections)?;
+        assert_eq!(registries.len(), 2);
+        assert_selection(&registries["ping-only.example"], &[NAME]);
+        assert_selection(&registries["disco-only.example"], &[crate::disco::NAME]);
     }
+    let registries = catalog.enable(&[HostSelection {
+        domain: "ping-only.example",
+        extensions: &names,
+        options: &options,
+    }])?;
+    assert_eq!(registries.len(), 1);
+    assert_selection(&registries["ping-only.example"], &[NAME]);
     Ok(())
 }
 
@@ -209,90 +250,21 @@ impl SessionLookup for UnexpectedSessions {
 }
 
 #[test]
-fn ping_requires_disco_and_registers_only_get_routes_and_features() -> TestResult {
-    let mut extensions = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
+fn ping_registers_only_get_routes_and_features_without_disco() -> TestResult {
+    let mut extensions = TestExtensions::default();
     extensions.register(Arc::new(Ping))?;
+    let ping = extensions.enable_host("example.com", [NAME])?;
+    assert_selection(&ping, &[NAME]);
     extensions.register(Arc::new(crate::disco::Disco))?;
-    assert!(matches!(
-        extensions.enable_host("example.com", [NAME]),
-        Err(RegistrationError::MissingDependency {
-            extension: NAME,
-            dependency: crate::disco::NAME,
-        })
-    ));
-    let disco = extensions.enable_host("example.com", [crate::disco::NAME])?;
-    for names in [&[][..], &[crate::disco::NAME][..]] {
+    for names in [
+        &[][..],
+        &[NAME][..],
+        &[crate::disco::NAME][..],
+        &[NAME, crate::disco::NAME][..],
+        &[crate::disco::NAME, NAME][..],
+    ] {
         let registry = extensions.enable_host("example.com", names.iter().copied())?;
-        assert_eq!(registry.enabled(), names);
-        for (scope, discovery_scope) in [
-            (IqScope::Server, DiscoScope::Server),
-            (IqScope::Account, DiscoScope::Account),
-        ] {
-            for kind in [IqRequestType::Get, IqRequestType::Set] {
-                assert!(registry.iq().find(scope, kind, NAMESPACE, "ping").is_none());
-            }
-            assert!(
-                !registry
-                    .discovery()
-                    .features(discovery_scope)
-                    .contains(&NAMESPACE)
-            );
-        }
-    }
-    for names in [[NAME, crate::disco::NAME], [crate::disco::NAME, NAME]] {
-        let registry = extensions.enable_host("example.com", names)?;
-        assert_eq!(registry.enabled(), names);
-        for (scope, discovery_scope) in [
-            (IqScope::Server, DiscoScope::Server),
-            (IqScope::Account, DiscoScope::Account),
-        ] {
-            assert!(
-                registry
-                    .iq()
-                    .find(scope, IqRequestType::Get, NAMESPACE, "ping")
-                    .is_some()
-            );
-            assert!(
-                registry
-                    .iq()
-                    .find(scope, IqRequestType::Set, NAMESPACE, "ping")
-                    .is_none()
-            );
-            for (namespace, name) in [(NAMESPACE, "pong"), ("urn:wrong", "ping")] {
-                for kind in [IqRequestType::Get, IqRequestType::Set] {
-                    assert!(registry.iq().find(scope, kind, namespace, name).is_none());
-                }
-            }
-            let features = registry.discovery().features(discovery_scope);
-            assert_eq!(
-                features
-                    .iter()
-                    .filter(|&&feature| feature == NAMESPACE)
-                    .count(),
-                1
-            );
-            let mut expected = disco.discovery().features(discovery_scope).to_vec();
-            expected.push(NAMESPACE);
-            expected.sort_unstable();
-            assert_eq!(features, expected);
-            assert_eq!(
-                registry.discovery().identities(discovery_scope),
-                disco.discovery().identities(discovery_scope)
-            );
-        }
-        assert_eq!(
-            registry.discovery().services(),
-            disco.discovery().services()
-        );
-        assert_eq!(registry.services().len(), disco.services().len());
-        assert_eq!(registry.stream_features(), disco.stream_features());
-        assert!(registry.account_handlers().is_empty());
-        assert!(registry.message_observers().is_empty());
-        assert!(registry.session_observers().is_empty());
-        assert!(registry.presence_decorations().is_empty());
-        assert!(registry.policies().is_empty());
-        assert!(registry.archive().is_none());
-        assert!(registry.messages().is_none());
+        assert_selection(&registry, names);
     }
     Ok(())
 }

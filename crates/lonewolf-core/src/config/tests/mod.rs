@@ -14,7 +14,7 @@ use crate::config::{
     HostTlsSource, MetricsConfig, StoreConfig, TcpListenerConfig, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
-use lonewolf_extension::{EnableError, Extensions, HostSelection, RegistrationError};
+use lonewolf_extension::{Extensions, HostSelection};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 
@@ -61,6 +61,8 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
         ("['offline']", ["offline"].as_slice()),
         ("['ping']", ["ping"].as_slice()),
         ("['disco']", ["disco"].as_slice()),
+        ("['ping', 'disco']", ["ping", "disco"].as_slice()),
+        ("['disco', 'ping']", ["disco", "ping"].as_slice()),
         (
             "['roster', 'offline', 'disco']",
             ["roster", "offline", "disco"].as_slice(),
@@ -76,20 +78,7 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
             extensions: &host.extensions,
             options: &host.options,
         }]);
-        if expected == ["ping"] {
-            assert_eq!(
-                prepared.err().ok_or("Ping-only host accepted")?,
-                EnableError {
-                    host: "localhost".into(),
-                    source: RegistrationError::MissingDependency {
-                        extension: "ping",
-                        dependency: "disco",
-                    },
-                }
-            );
-        } else {
-            assert_eq!(prepared?["localhost"].enabled(), expected);
-        }
+        assert_eq!(prepared?["localhost"].enabled(), expected);
     }
     Ok(())
 }

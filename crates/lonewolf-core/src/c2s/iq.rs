@@ -4,8 +4,8 @@ use lonewolf_extension::iq::IqRequestType;
 use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, BuildError, Element, IqType, Stanza, StanzaErrorCondition, StanzaRef,
-    StanzaType,
+    ApplicationCondition, BuildError, Element, IqType, STANZA_ERROR_NAMESPACE, Stanza,
+    StanzaErrorCondition, StanzaRef, StanzaType,
 };
 
 use super::stream::CloseOutcome;
@@ -138,4 +138,38 @@ pub(super) fn result_reply<A: ChunkAllocator>(
         builder = builder.child(payload)?;
     }
     Ok(builder.build()?)
+}
+
+pub(super) fn error_reply_omitting_payload<A: ChunkAllocator>(
+    request: &StanzaRef<'_, Arena<A>>,
+    sender: JidRef<'_>,
+    condition: StanzaErrorCondition,
+    response: &mut Arena<A>,
+) -> Result<Stanza, ReplyError> {
+    if !matches!(
+        request.stanza_type(),
+        StanzaType::Iq(IqType::Get | IqType::Set)
+    ) {
+        return Err(BuildError::NotIqRequest.into());
+    }
+    let recipient = sender.clone_in(response)?;
+    let from = request
+        .to()?
+        .map(|from| from.clone_in(response))
+        .transpose()?;
+    let condition_element =
+        Element::builder_in(condition.as_str(), STANZA_ERROR_NAMESPACE, response)?.build()?;
+    let error = Element::builder_in("error", request.namespace().as_str(), response)?
+        .attribute("type", "", condition.error_type())?
+        .child(condition_element)?
+        .build()?;
+    Ok(
+        Stanza::builder_in(StanzaType::Iq(IqType::Error), request.namespace(), response)
+            .id(request.id()?)?
+            .lang(request.lang()?)?
+            .from(from)?
+            .to(Some(recipient))?
+            .child(error)?
+            .build()?,
+    )
 }

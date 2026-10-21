@@ -474,7 +474,7 @@ fn allowed_ping_requests_validate_payloads_and_return_empty_replies() -> TestRes
                     assert!(
                         matches!(
                             result,
-                            Err(HandlerError::Stanza(StanzaErrorCondition::BadRequest))
+                            Err(error) if error == HandlerError::Stanza(StanzaErrorCondition::BadRequest).into()
                         ),
                         "{target} {}",
                         case.name
@@ -512,7 +512,7 @@ fn account_authorization_precedes_payload_validation() -> TestResult {
                 &mut response,
             ));
             assert!(
-                matches!(result, Err(error) if error == HandlerError::Stanza(condition)),
+                matches!(result, Err(error) if error == HandlerError::Stanza(condition).into()),
                 "{requester:?} {}",
                 case.name
             );
@@ -552,9 +552,7 @@ fn missing_accounts_always_use_the_default_service_unavailable_reply() -> TestRe
             assert!(
                 matches!(
                     result,
-                    Err(HandlerError::Stanza(
-                        StanzaErrorCondition::ServiceUnavailable
-                    ))
+                    Err(error) if error == HandlerError::Stanza(StanzaErrorCondition::ServiceUnavailable).into()
                 ),
                 "{requester:?} {}",
                 case.name

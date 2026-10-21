@@ -56,7 +56,7 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Ping {
         _transaction: &'a S::Read,
         _response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
-        Box::pin(async move { answer(request) })
+        Box::pin(async move { answer(request).map_err(Into::into) })
     }
 }
 

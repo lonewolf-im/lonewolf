@@ -7,7 +7,7 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, Stanza, StanzaErrorCondition};
 
-use crate::delivery::{HandlerError, HostLookup, SessionLookup};
+use crate::delivery::{Failure, HandlerError, HostLookup, SessionLookup};
 use crate::discovery::Discovery;
 use crate::{Effects, ExtensionFuture, RegistrationError};
 
@@ -97,7 +97,59 @@ impl<A: ChunkAllocator> IqReply<A> {
     }
 }
 
-pub type IqFuture<'a, A> = ExtensionFuture<'a, Result<IqReply<A>, HandlerError>>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IqErrorPayload {
+    Include,
+    Omit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IqError {
+    error: HandlerError,
+    payload: IqErrorPayload,
+}
+
+impl IqError {
+    pub const fn without_payload(error: HandlerError) -> Self {
+        Self {
+            error,
+            payload: IqErrorPayload::Omit,
+        }
+    }
+
+    pub const fn handler_error(&self) -> &HandlerError {
+        &self.error
+    }
+
+    pub const fn payload(&self) -> IqErrorPayload {
+        self.payload
+    }
+
+    pub const fn condition(&self) -> StanzaErrorCondition {
+        self.error.condition()
+    }
+
+    pub const fn failure(&self) -> Option<Failure> {
+        self.error.failure()
+    }
+}
+
+impl From<HandlerError> for IqError {
+    fn from(error: HandlerError) -> Self {
+        Self {
+            error,
+            payload: IqErrorPayload::Include,
+        }
+    }
+}
+
+impl From<StanzaErrorCondition> for IqError {
+    fn from(condition: StanzaErrorCondition) -> Self {
+        HandlerError::from(condition).into()
+    }
+}
+
+pub type IqFuture<'a, A> = ExtensionFuture<'a, Result<IqReply<A>, IqError>>;
 
 /// Every future runs on the connection worker and can be cancelled on shutdown.
 /// Handlers authorize `request.target` against `request.sender` themselves.
@@ -113,13 +165,12 @@ pub trait IqHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         Box::pin(async { Err(StanzaErrorCondition::ServiceUnavailable.into()) })
     }
 
-    /// Answers a `get` to a missing account in place of `get`.
     /// Overrides must answer as `get` does when the account hides the requested data.
     fn get_missing_account(
         &self,
         _request: IqRequest<'_, A>,
         _response: &mut Arena<A>,
-    ) -> Result<Option<Element>, HandlerError> {
+    ) -> Result<Option<Element>, IqError> {
         Err(StanzaErrorCondition::ServiceUnavailable.into())
     }
 
@@ -190,7 +241,36 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::XmlSpace;
+    use super::{IqError, IqErrorPayload, XmlSpace};
+    use crate::delivery::{Failure, FailureKind, HandlerError};
+    use lonewolf_xmpp::stanza::StanzaErrorCondition;
+
+    #[test]
+    fn iq_error_payload_policy_preserves_condition_and_failure() {
+        let condition = StanzaErrorCondition::ResourceConstraint;
+        let failure = Failure {
+            kind: FailureKind::Delivery,
+            operation: "iq_test",
+        };
+        for error in [
+            HandlerError::Stanza(condition),
+            HandlerError::Internal { condition, failure },
+        ] {
+            for (iq_error, payload) in [
+                (IqError::from(error), IqErrorPayload::Include),
+                (IqError::without_payload(error), IqErrorPayload::Omit),
+            ] {
+                assert_eq!(iq_error.handler_error(), &error);
+                assert_eq!(iq_error.condition(), error.condition());
+                assert_eq!(iq_error.failure(), error.failure());
+                assert_eq!(iq_error.payload(), payload);
+            }
+        }
+        let converted = IqError::from(condition);
+        assert_eq!(converted.payload(), IqErrorPayload::Include);
+        assert_eq!(converted.condition(), condition);
+        assert_eq!(converted.failure(), None);
+    }
 
     #[test]
     fn xml_space_matches_only_exact_directives() {

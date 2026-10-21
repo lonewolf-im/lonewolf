@@ -19,7 +19,8 @@ use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::{
-    IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester, XmlSpace,
+    IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester,
+    XmlSpace,
 };
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
@@ -1029,7 +1030,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 close_storage_failure(error, "iq_set_begin_write", registration.account())
             })?;
             let reply = match require_iq_account(&transaction, target_account.as_ref()).await {
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
                 Ok(()) => {
                     let sender = sender.resolve(&arena)?;
                     let stanza = request.resolve(&arena)?;
@@ -1084,7 +1085,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 )),
                 Err(error) => {
                     drop(transaction);
-                    report_handler_failure(&error, registration.account());
+                    report_handler_failure(error.handler_error(), registration.account());
                     Err(error)
                 }
             })
@@ -1108,23 +1109,45 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         self.queue_iq_reply(request, sender, arena, response, reply, results)
     }
 
+    fn queue_iq_error(
+        &mut self,
+        request: Stanza,
+        sender: Jid,
+        mut arena: Arena<A>,
+        error: IqError,
+    ) -> Result<(), CloseOutcome> {
+        let (stanza, arena) = match error.payload() {
+            IqErrorPayload::Include => {
+                let stanza =
+                    iq::error_reply(&request, &mut arena, error.condition(), Some(sender))?;
+                (stanza, arena)
+            }
+            IqErrorPayload::Omit => {
+                let mut response = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+                let stanza = iq::error_reply_omitting_payload(
+                    &request.resolve(&arena)?,
+                    sender.resolve(&arena)?,
+                    error.condition(),
+                    &mut response,
+                )?;
+                (stanza, response)
+            }
+        };
+        self.outbox.push(Output::Owned { stanza, arena });
+        Ok(())
+    }
+
     fn queue_iq_reply(
         &mut self,
         request: Stanza,
         sender: Jid,
         mut arena: Arena<A>,
         mut response: Arena<A>,
-        reply: Result<Option<Element>, HandlerError>,
+        reply: Result<Option<Element>, IqError>,
         mut results: Vec<Stanza>,
     ) -> Result<(), CloseOutcome> {
         match reply {
-            Err(error) => {
-                let reply = iq::error_reply(&request, &mut arena, error.condition(), Some(sender))?;
-                self.outbox.push(Output::Owned {
-                    stanza: reply,
-                    arena,
-                });
-            }
+            Err(error) => self.queue_iq_error(request, sender, arena, error)?,
             Ok(payload) => {
                 let sender_ref = sender.resolve(&arena)?;
                 for result in &results {
@@ -2709,7 +2732,7 @@ struct GetWork<A: ChunkAllocator> {
 struct GetOutcome<A: ChunkAllocator> {
     arena: Arena<A>,
     response: Arena<A>,
-    reply: Result<Option<Element>, HandlerError>,
+    reply: Result<Option<Element>, IqError>,
     results: Vec<Stanza>,
     /// Write these deliveries before the reply to preserve mailbox order.
     queued: Vec<MailboxEntry<A>>,
@@ -2730,7 +2753,7 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
             delivery,
         } = self;
         let reply = match iq_target(&transaction, target_account.as_ref()).await {
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
             Ok(iq_target) => {
                 let sender = sender.resolve(&arena)?;
                 let stanza = request.resolve(&arena)?;
@@ -2758,7 +2781,7 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                     }
                 };
                 match requester {
-                    Err(error) => Err(error),
+                    Err(error) => Err(error.into()),
                     Ok(requester) => {
                         let iq_request = IqRequest {
                             sender,
@@ -2804,7 +2827,7 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                 (Ok(payload), results)
             }
             Err(error) => {
-                report_handler_failure(&error, &account);
+                report_handler_failure(error.handler_error(), &account);
                 (Err(error), Vec::new())
             }
         };

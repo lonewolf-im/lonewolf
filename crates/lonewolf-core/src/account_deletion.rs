@@ -9,6 +9,7 @@ use futures_channel::oneshot;
 use lonewolf_admin::{AccountDeleter, DeleterError};
 use lonewolf_storage::account::{AccountError, AccountKey, AccountWrites};
 use lonewolf_storage::offline::{OfflineError, OfflineWrites};
+use lonewolf_storage::vcard::{VCardError, VCardWrites};
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
 
@@ -108,6 +109,13 @@ async fn delete<A: ChunkAllocator + Clone>(
             OfflineError::Storage(error) => DeleterError::from(error),
             error => DeleterError::Other(Box::new(error)),
         })?;
+    transaction
+        .delete_vcard(account)
+        .await
+        .map_err(|error| match error {
+            VCardError::Storage(error) => DeleterError::from(error),
+            error => DeleterError::Other(Box::new(error)),
+        })?;
     let ((), mut ticket) = router.order().fix_all(transaction.commit()).await?;
     tracing::info!(
         operation = "cleanup",
@@ -138,3 +146,6 @@ async fn delete<A: ChunkAllocator + Clone>(
 fn deleter_error(message: &'static str) -> DeleterError {
     DeleterError::Other(Box::from(message))
 }
+
+#[cfg(test)]
+mod tests;

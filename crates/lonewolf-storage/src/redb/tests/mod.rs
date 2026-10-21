@@ -22,8 +22,8 @@ use self::backend::{FailingSyncBackend, ObservedBackend};
 use super::initialize;
 use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY};
 use crate::account::{AccountReads, AccountWrites};
-use crate::offline::OfflineReads;
 use crate::offline::redb::{MESSAGES, SEQUENCES};
+use crate::offline::{OfflineReads, OfflineWrites};
 use crate::roster::redb::{ITEMS, PENDING, VERSIONS};
 use crate::roster::{RosterReads, RosterSubscription, RosterWrites, SubscriptionState};
 use crate::tests::{
@@ -31,6 +31,8 @@ use crate::tests::{
     decoy_salt, item, item_with_subscription, jid, key, new_account, pending, poll, read, verifier,
     write,
 };
+use crate::vcard::redb::VCARDS;
+use crate::vcard::{VCardQuota, VCardReads, VCardWrites};
 use crate::{RedbStorage, Storage, StorageErrorKind, WriteTransaction};
 
 const METADATA: TableDefinition<&str, u32> = TableDefinition::new("lonewolf_metadata");
@@ -68,7 +70,7 @@ fn fresh_database_initializes_all_tables() -> TestResult {
     let storage = RedbStorage::new(database)?;
     let transaction = storage.as_ref().begin_read()?;
     let tables: Vec<_> = transaction.list_tables()?.collect();
-    assert_eq!(tables.len(), 7);
+    assert_eq!(tables.len(), 8);
     for expected in [
         ACCOUNTS.name(),
         DECOY_SECRET.name(),
@@ -77,6 +79,7 @@ fn fresh_database_initializes_all_tables() -> TestResult {
         VERSIONS.name(),
         MESSAGES.name(),
         SEQUENCES.name(),
+        VCARDS.name(),
     ] {
         assert!(
             tables.iter().any(|table| table.name() == expected),
@@ -108,7 +111,7 @@ fn unknown_tables_are_left_untouched() -> TestResult {
     let reinitialized = initialize(storage.as_ref())?;
     assert_eq!(decoy_salt(&reinitialized)?, before);
     let transaction = storage.as_ref().begin_read()?;
-    assert_eq!(transaction.list_tables()?.count(), 8);
+    assert_eq!(transaction.list_tables()?.count(), 9);
     assert_eq!(
         transaction
             .open_table(METADATA)?
@@ -147,7 +150,7 @@ fn existing_database_gains_offline_tables_without_changing_accounts() -> TestRes
         Ok::<_, Box<dyn Error>>(())
     })?;
     let reader = storage.as_ref().begin_read()?;
-    assert_eq!(reader.list_tables()?.count(), 7);
+    assert_eq!(reader.list_tables()?.count(), 8);
     reader.open_table(MESSAGES)?;
     reader.open_table(SEQUENCES)?;
     Ok(())
@@ -301,6 +304,9 @@ fn committed_state_survives_reopening() -> TestResult {
                 .await?;
             writer.delete_account(&deleted).await?;
             writer
+                .replace_vcard(&alice, "persisted vCard", VCardQuota::default())
+                .await?;
+            writer
                 .put_roster_item(&alice, &bob, RosterQuota::default())
                 .await?;
             writer
@@ -321,6 +327,15 @@ fn committed_state_survives_reopening() -> TestResult {
         assert!(reader.scram(&alice, ScramHash::Sha1).await?.is_none());
         assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 20)?;
         assert!(reader.account(&deleted).await?.is_none());
+        assert_eq!(
+            reader
+                .vcard(&alice)
+                .await?
+                .ok_or("missing vCard")?
+                .xml
+                .as_ref(),
+            "persisted vCard"
+        );
         for hash in [ScramHash::Sha1, ScramHash::Sha256] {
             assert!(reader.scram(&deleted, hash).await?.is_none());
             assert!(reader.scram(&other, hash).await?.is_some());
@@ -433,6 +448,12 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         assert_worker_threads(&backend)?;
         writer.replace_credentials(&alice, credentials(20)).await?;
         assert_worker_threads(&backend)?;
+        writer
+            .replace_vcard(&alice, "worker vCard", VCardQuota::default())
+            .await?;
+        assert_worker_threads(&backend)?;
+        assert!(writer.vcard(&alice).await?.is_some());
+        assert_worker_threads(&backend)?;
         assert_eq!(
             writer.accounts_after(None, NonZeroUsize::MAX).await?.len(),
             1
@@ -480,6 +501,8 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_some());
         assert_worker_threads(&backend)?;
+        assert!(reader.vcard(&alice).await?.is_some());
+        assert_worker_threads(&backend)?;
         assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 23)?;
         assert_worker_threads(&backend)?;
         assert_eq!(
@@ -517,6 +540,8 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         writer.clear_roster(&alice).await?;
         assert_worker_threads(&backend)?;
         writer.delete_account(&alice).await?;
+        assert_worker_threads(&backend)?;
+        writer.delete_vcard(&alice).await?;
         assert_worker_threads(&backend)?;
         writer.commit().await?;
         assert_worker_threads(&backend)?;
@@ -816,5 +841,147 @@ fn reopened_pending_queue_preserves_rows_above_a_lower_limit() -> TestResult {
             ]
         );
         TestResult::Ok(())
+    })
+}
+
+#[test]
+fn existing_database_gains_only_an_empty_vcard_table_without_rewriting_other_rows() -> TestResult {
+    use ::redb::ReadableTable;
+
+    let storage = storage()?;
+    let alice = key("alice@example.com")?;
+    block_on(async {
+        let mut writer = storage.begin_write().await?;
+        writer
+            .create_account(new_account("alice@example.com", 10)?)
+            .await?;
+        writer
+            .put_roster_item(
+                &alice,
+                &item("bob@example.com", Some("Bob"), &["Friends"])?,
+                RosterQuota::default(),
+            )
+            .await?;
+        writer
+            .put_pending_request(
+                &alice,
+                pending("bob@example.com", b"pending")?,
+                NonZeroUsize::MAX,
+            )
+            .await?;
+        writer.push_offline_message(&alice, 100, b"offline").await?;
+        writer.commit().await?;
+        TestResult::Ok(())
+    })?;
+    let transaction = storage.as_ref().begin_write()?;
+    transaction.delete_table(VCARDS)?;
+    transaction.open_table(METADATA)?.insert("unknown", 42)?;
+    transaction.commit()?;
+    let before = storage.as_ref().begin_read()?;
+    assert_eq!(before.list_tables()?.count(), 8);
+    let snapshot = |transaction: &::redb::ReadTransaction| -> TestResult<_> {
+        let account = transaction
+            .open_table(ACCOUNTS)?
+            .get(alice.as_str())?
+            .ok_or("missing account")?
+            .value()
+            .to_vec();
+        let decoy = transaction
+            .open_table(DECOY_SECRET)?
+            .get(DECOY_SECRET_KEY)?
+            .ok_or("missing decoy")?
+            .value()
+            .to_vec();
+        let item = transaction
+            .open_table(ITEMS)?
+            .iter()?
+            .next()
+            .ok_or("missing item")??
+            .1
+            .value()
+            .to_vec();
+        let pending = transaction
+            .open_table(PENDING)?
+            .iter()?
+            .next()
+            .ok_or("missing pending")??
+            .1
+            .value()
+            .to_vec();
+        let version = transaction
+            .open_table(VERSIONS)?
+            .get(alice.as_str())?
+            .ok_or("missing version")?
+            .value();
+        let message = transaction
+            .open_table(MESSAGES)?
+            .get((alice.as_str(), 1))?
+            .ok_or("missing message")?
+            .value()
+            .to_vec();
+        let sequence = transaction
+            .open_table(SEQUENCES)?
+            .get(alice.as_str())?
+            .ok_or("missing sequence")?
+            .value();
+        let unknown = transaction
+            .open_table(METADATA)?
+            .get("unknown")?
+            .ok_or("missing unknown row")?
+            .value();
+        Ok((
+            account, decoy, item, pending, version, message, sequence, unknown,
+        ))
+    };
+    let expected = snapshot(&before)?;
+    initialize(storage.as_ref())?;
+    let after = storage.as_ref().begin_read()?;
+    assert_eq!(after.list_tables()?.count(), 9);
+    assert!(after.open_table(VCARDS)?.is_empty()?);
+    assert_eq!(snapshot(&after)?, expected);
+    assert_eq!(snapshot(&before)?, expected);
+    Ok(())
+}
+
+#[test]
+fn failed_vcard_commit_recovers_a_complete_document_with_its_account_changes() -> TestResult {
+    let backend = FailingSyncBackend::default();
+    let alice = key("alice@example.com")?;
+    let old = "old document".repeat(4096);
+    let new = "new document".repeat(4096);
+    {
+        let storage = RedbStorage::new(database(backend.clone(), 1024 * 1024)?)?;
+        block_on(async {
+            let mut writer = storage.begin_write().await?;
+            writer
+                .create_account(new_account("alice@example.com", 10)?)
+                .await?;
+            writer
+                .replace_vcard(&alice, &old, VCardQuota::default())
+                .await?;
+            writer.commit().await?;
+            let mut writer = storage.begin_write().await?;
+            writer.replace_credentials(&alice, credentials(20)).await?;
+            writer
+                .replace_vcard(&alice, &new, VCardQuota::default())
+                .await?;
+            backend.fail_next_sync();
+            assert_storage_error(writer.commit().await, StorageErrorKind::CommitUnknown);
+            TestResult::Ok(())
+        })?;
+    }
+    let storage = RedbStorage::new(database(backend, 1024 * 1024)?)?;
+    block_on(async {
+        let reader = storage.begin_read().await?;
+        let xml = reader.vcard(&alice).await?.ok_or("lost vCard")?.xml;
+        let marker = if xml.as_ref() == old {
+            10
+        } else {
+            assert_eq!(xml.as_ref(), new);
+            20
+        };
+        assert_scram(reader.scram(&alice, ScramHash::Sha1).await?, marker)?;
+        assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, marker + 3)?;
+        Ok(())
     })
 }

@@ -4,6 +4,7 @@ pub(crate) mod account;
 pub(crate) mod offline;
 pub(crate) mod roster;
 pub(crate) mod transaction;
+pub(crate) mod vcard;
 
 use std::error::Error;
 use std::future::Future;
@@ -204,6 +205,12 @@ macro_rules! storage_contract_tests {
             offline::offline_removals_and_clear_succeed_without_messages,
             offline::dropping_offline_writes_preserves_messages_and_the_counter,
             offline::offline_reads_keep_their_snapshot_across_commits,
+            vcard::vcard_round_trip_replaces_the_whole_document_and_isolates_owners,
+            vcard::vcard_snapshots_uncommitted_changes_and_drops_are_atomic,
+            vcard::vcard_quotas_count_bytes_and_rejections_preserve_committable_state,
+            vcard::vcard_hard_ceiling_applies_even_with_an_oversized_quota,
+            vcard::vcard_missing_accounts_reject_replacement_and_allow_repeated_removal,
+            vcard::vcard_concurrent_writers_observe_only_complete_documents,
             transaction::uncommitted_writes_are_visible_only_inside_their_transaction,
             transaction::dropping_a_write_transaction_aborts_every_write,
             transaction::commit_persists_account_and_roster_writes_together,

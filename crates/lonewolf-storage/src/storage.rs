@@ -8,6 +8,7 @@ use crate::StorageError;
 use crate::account::{AccountReads, AccountWrites};
 use crate::offline::{OfflineReads, OfflineWrites};
 use crate::roster::{RosterReads, RosterWrites};
+use crate::vcard::{VCardReads, VCardWrites};
 
 /// One store, which is one transaction domain.
 ///
@@ -29,14 +30,18 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn scram_decoy(&self) -> &ScramDecoy;
 }
 
-/// The operations available on one consistent snapshot.
-pub trait ReadTransaction: AccountReads + OfflineReads + RosterReads + Send + Sync {}
+pub trait ReadTransaction:
+    AccountReads + OfflineReads + RosterReads + VCardReads + Send + Sync
+{
+}
 
 /// Writes commit atomically, and values read stay stable until commit or abort.
 /// The store must serialize writers or lock all values read; read-committed isolation is insufficient.
 ///
 /// Dropping the transaction without committing aborts every write in it.
-pub trait WriteTransaction: ReadTransaction + AccountWrites + OfflineWrites + RosterWrites {
+pub trait WriteTransaction:
+    ReadTransaction + AccountWrites + OfflineWrites + RosterWrites + VCardWrites
+{
     /// Persists every write made through this transaction.
     ///
     /// # Errors

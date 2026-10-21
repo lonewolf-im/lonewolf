@@ -10,6 +10,7 @@ pub mod account;
 pub mod metrics;
 pub mod offline;
 pub mod roster;
+pub mod vcard;
 
 mod error;
 mod redb;

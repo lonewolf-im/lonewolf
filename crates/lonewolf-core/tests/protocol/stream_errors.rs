@@ -806,6 +806,7 @@ fn application_stanzas_during_empty_sasl_challenge_close_before_reauthentication
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
 
     for stanza in [
+        "<iq to='localhost' type='get' id='ping'><ping xmlns='urn:xmpp:ping'/></iq>",
         "<message to='bob@localhost'><body>hello</body></message>",
         "<presence to='bob@localhost'/>",
         "<iq to='bob@localhost' type='get' id='one'><query xmlns='urn:test'/></iq>",
@@ -831,6 +832,7 @@ fn application_stanzas_during_scram_proof_challenge_close_before_reauthenticatio
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
 
     for stanza in [
+        "<iq to='localhost' type='get' id='ping'><ping xmlns='urn:xmpp:ping'/></iq>",
         "<message to='bob@localhost'><body>hello</body></message>",
         "<presence to='bob@localhost'/>",
         "<iq to='bob@localhost' type='get' id='one'><query xmlns='urn:test'/></iq>",

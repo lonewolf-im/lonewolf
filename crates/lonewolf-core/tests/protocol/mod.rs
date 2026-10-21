@@ -11,6 +11,8 @@ mod policy;
 
 mod discovery;
 
+mod ping;
+
 mod extensions;
 
 mod services;

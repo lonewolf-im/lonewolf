@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
+use rustls::pki_types::ServerName;
+
 use lonewolf_extension::discovery::{INFO_NAMESPACE, ITEMS_NAMESPACE};
 
-use crate::support::{C2sSuite, PASSWORD, TestResult, mutually_subscribe, toggle};
+use crate::support::{C2sSuite, OPEN, PASSWORD, TestResult, mutually_subscribe, toggle};
 
 #[test]
 fn default_hosts_answer_discovery() -> TestResult {
@@ -10,10 +14,87 @@ fn default_hosts_answer_discovery() -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' to='localhost' id='host-info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='host-info' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:roster'/><feature var='msgoffline'/><feature var='urn:xmpp:ping'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='host-info' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:roster'/><feature var='msgoffline'/><feature var='urn:xmpp:ping'/><feature var='vcard-temp'/></query></iq>")?;
     alice.send("<iq type='get' to='alice@localhost' id='account-info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='account-info' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='urn:xmpp:ping'/></query></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='result' id='account-info' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='urn:xmpp:ping'/><feature var='vcard-temp'/></query></iq>")?;
     alice.close()
+}
+
+#[test]
+fn discovery_and_vcard_quotas_follow_each_hosts_selection() -> TestResult {
+    for (local, remote) in [
+        ("'disco', 'vcard'", "'vcard', 'disco'"),
+        ("'vcard', 'disco'", "'disco', 'vcard'"),
+    ] {
+        let suite = C2sSuite::with_hosts(&format!(
+            "[hosts.localhost]\nextensions=[{local}]\n[hosts.localhost.vcard]\nmax_bytes=512\n[hosts.'other.localhost']\nextensions=[{remote}]\n[hosts.'other.localhost'.vcard]\nmax_bytes=1\n[hosts.'other.localhost'.tls]\ncertificate_chain_path='certificate.pem'\nprivate_key_path='private-key.pem'\n"
+        ))?;
+        suite.create_account("alice", PASSWORD)?;
+        suite.create_account_jid("alice@other.localhost", PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        let opening = OPEN.replace("to='localhost'", "to='other.localhost'");
+        let mut plain = suite.tcp_client()?;
+        plain.open_with(&opening)?;
+        plain.features()?;
+        let mut other = plain.start_tls_with_identity(
+            Arc::clone(&suite.tls),
+            ServerName::try_from("other.localhost")?,
+        )?;
+        other.open_with(&opening)?;
+        other.features()?;
+        other.authenticate("alice", PASSWORD)?;
+        let mut other = other.restart();
+        other.open_with(&opening)?;
+        other.features()?;
+        assert_eq!(other.bind(Some("desk"))?, "alice@other.localhost/desk");
+        for (client, domain, fits) in [
+            (&mut alice, "localhost", true),
+            (&mut other, "other.localhost", false),
+        ] {
+            for (target, category, kind) in [
+                (domain.to_owned(), "server", "im"),
+                (format!("alice@{domain}"), "account", "registered"),
+            ] {
+                client.send(&format!("<iq type='get' to='{target}' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>"))?;
+                client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@{domain}/desk' id='info'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='{category}' type='{kind}'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='vcard-temp'/></query></iq>"))?;
+            }
+            client.send("<iq type='set' id='write'><vCard xmlns='vcard-temp'/></iq>")?;
+            if fits {
+                client.expect_xml(&format!(
+                    "<iq xmlns='jabber:client' type='result' id='write' to='alice@{domain}/desk'/>"
+                ))?;
+            } else {
+                client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='write' to='alice@{domain}/desk'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            }
+        }
+        other.send(
+            "<iq type='get' to='alice@localhost' id='public'><vCard xmlns='vcard-temp'/></iq>",
+        )?;
+        other.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost' to='alice@other.localhost/desk' id='public'><vCard xmlns='vcard-temp' xmlns:stream='http://etherx.jabber.org/streams' xml:lang='' xml:space='default'/></iq>")?;
+        alice.close()?;
+        other.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn public_vcards_do_not_make_default_account_discovery_public() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for user in ["alice", "bob"] {
+        suite.create_account(user, PASSWORD)?;
+    }
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    alice.send("<iq type='set' id='write'><vCard xmlns='vcard-temp'/></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='write' to='alice@localhost/desk'/>",
+    )?;
+    bob.send("<iq type='get' to='alice@localhost' id='public'><vCard xmlns='vcard-temp'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost' to='bob@localhost/desk' id='public'><vCard xmlns='vcard-temp' xmlns:stream='http://etherx.jabber.org/streams' xml:lang='' xml:space='default'/></iq>")?;
+    bob.send("<iq type='get' to='alice@localhost' id='private'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' to='bob@localhost/desk' id='private'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.close()?;
+    bob.close()
 }
 
 #[test]

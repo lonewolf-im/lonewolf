@@ -30,20 +30,20 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
 }
 
 #[test]
-fn host_extensions_default_to_roster_offline_disco_and_ping() -> TestResult {
+fn host_extensions_default_to_roster_offline_disco_ping_and_vcard() -> TestResult {
     assert_eq!(
         HostConfig::default().extensions,
-        ["roster", "offline", "disco", "ping"]
+        ["roster", "offline", "disco", "ping", "vcard"]
     );
     assert_eq!(
         Config::default().hosts["localhost"].extensions,
-        ["roster", "offline", "disco", "ping"]
+        ["roster", "offline", "disco", "ping", "vcard"]
     );
     for contents in ["", "[hosts.localhost]"] {
         let file = config_file(contents)?;
         assert_eq!(
             Config::load(Some(file.path()))?.hosts["localhost"].extensions,
-            ["roster", "offline", "disco", "ping"]
+            ["roster", "offline", "disco", "ping", "vcard"]
         );
     }
     Ok(())
@@ -63,6 +63,8 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
         ("['disco']", ["disco"].as_slice()),
         ("['ping', 'disco']", ["ping", "disco"].as_slice()),
         ("['disco', 'ping']", ["disco", "ping"].as_slice()),
+        ("['disco', 'vcard']", ["disco", "vcard"].as_slice()),
+        ("['vcard', 'disco']", ["vcard", "disco"].as_slice()),
         (
             "['roster', 'offline', 'disco']",
             ["roster", "offline", "disco"].as_slice(),
@@ -78,7 +80,20 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
             extensions: &host.extensions,
             options: &host.options,
         }]);
-        assert_eq!(prepared?["localhost"].enabled(), expected);
+        let prepared = prepared?;
+        let registry = &prepared["localhost"];
+        assert_eq!(registry.enabled(), expected);
+        for scope in [
+            lonewolf_extension::discovery::DiscoScope::Server,
+            lonewolf_extension::discovery::DiscoScope::Account,
+        ] {
+            for (extension, feature) in [("ping", "urn:xmpp:ping"), ("vcard", "vcard-temp")] {
+                assert_eq!(
+                    registry.discovery().features(scope).contains(&feature),
+                    expected.contains(&extension),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -92,7 +107,7 @@ fn no_configuration_file_enables_default_extensions() -> TestResult {
         assert_eq!(config, Config::default());
         assert_eq!(
             config.hosts["localhost"].extensions,
-            ["roster", "offline", "disco", "ping"]
+            ["roster", "offline", "disco", "ping", "vcard"]
         );
     } else {
         let directory = tempfile::tempdir()?;
@@ -684,6 +699,21 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
             .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
     );
     assert_eq!(Config::load(Some(&path))?, Config::default());
+    for constraint in [
+        "vcard requires disco in the same host's extension list",
+        "public to authenticated local C2S users",
+        "serialized UTF-8 XML",
+        "namespace, language, and whitespace-context markup",
+        "1 to 1048576 bytes",
+        "complete-stanza limit can be smaller",
+        "Reducing this budget does not delete or hide stored profiles",
+        "new documents must fit",
+    ] {
+        assert!(
+            reference.contains(constraint),
+            "missing operator constraint: {constraint}"
+        );
+    }
 
     let mut uncommented = String::with_capacity(reference.len());
     let mut example = None;

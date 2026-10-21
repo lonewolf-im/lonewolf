@@ -229,6 +229,16 @@ fn options_require_an_enabled_known_extension() -> TestResult {
             RegistrationError::OptionsWithoutExtension("offline".into()),
         ),
         (
+            "ping",
+            vec![],
+            RegistrationError::OptionsWithoutExtension("ping".into()),
+        ),
+        (
+            "ping",
+            vec!["disco".into()],
+            RegistrationError::OptionsWithoutExtension("ping".into()),
+        ),
+        (
             "unknown",
             vec![],
             RegistrationError::UnknownOptions("unknown".into()),
@@ -429,5 +439,47 @@ fn disco_rejects_host_options() -> TestResult {
             ..
         })
     ));
+    Ok(())
+}
+
+#[test]
+fn ping_rejects_empty_and_nonempty_host_options_with_disco_enabled() -> TestResult {
+    let mut catalog = TestExtensions::default();
+    for factory in crate::builtin() {
+        catalog.register_factory(factory)?;
+    }
+    for table in [toml::Table::new(), toml::from_str("x = 1")?] {
+        let options = BTreeMap::from([("ping".into(), table)]);
+        for names in [
+            ["ping".into(), "disco".into()],
+            ["disco".into(), "ping".into()],
+        ] {
+            let error = catalog
+                .enable(&[
+                    HostSelection {
+                        domain: "valid.example",
+                        extensions: &names,
+                        options: &BTreeMap::new(),
+                    },
+                    HostSelection {
+                        domain: "invalid.example",
+                        extensions: &names,
+                        options: &options,
+                    },
+                ])
+                .err()
+                .ok_or("Ping options accepted")?;
+            assert_eq!(
+                error,
+                EnableError {
+                    host: "invalid.example".into(),
+                    source: RegistrationError::InvalidOptions {
+                        extension: "ping",
+                        reason: "this extension has no options".into(),
+                    },
+                }
+            );
+        }
+    }
     Ok(())
 }

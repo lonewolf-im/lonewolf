@@ -14,7 +14,7 @@ use crate::config::{
     HostTlsSource, MetricsConfig, StoreConfig, TcpListenerConfig, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
-use lonewolf_extension::{Extensions, HostSelection};
+use lonewolf_extension::{EnableError, Extensions, HostSelection, RegistrationError};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 
@@ -30,20 +30,20 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
 }
 
 #[test]
-fn host_extensions_default_to_roster_offline_and_disco() -> TestResult {
+fn host_extensions_default_to_roster_offline_disco_and_ping() -> TestResult {
     assert_eq!(
         HostConfig::default().extensions,
-        ["roster", "offline", "disco"]
+        ["roster", "offline", "disco", "ping"]
     );
     assert_eq!(
         Config::default().hosts["localhost"].extensions,
-        ["roster", "offline", "disco"]
+        ["roster", "offline", "disco", "ping"]
     );
     for contents in ["", "[hosts.localhost]"] {
         let file = config_file(contents)?;
         assert_eq!(
             Config::load(Some(file.path()))?.hosts["localhost"].extensions,
-            ["roster", "offline", "disco"]
+            ["roster", "offline", "disco", "ping"]
         );
     }
     Ok(())
@@ -51,17 +51,45 @@ fn host_extensions_default_to_roster_offline_and_disco() -> TestResult {
 
 #[test]
 fn configured_host_extensions_replace_the_default_list() -> TestResult {
+    let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
+    for factory in lonewolf_extension::builtin() {
+        catalog.register_factory(factory)?;
+    }
     for (setting, expected) in [
         ("[]", [].as_slice()),
         ("['roster']", ["roster"].as_slice()),
         ("['offline']", ["offline"].as_slice()),
+        ("['ping']", ["ping"].as_slice()),
+        ("['disco']", ["disco"].as_slice()),
+        (
+            "['roster', 'offline', 'disco']",
+            ["roster", "offline", "disco"].as_slice(),
+        ),
         ("['offline', 'roster']", ["offline", "roster"].as_slice()),
     ] {
         let file = config_file(&format!("[hosts.localhost]\nextensions = {setting}"))?;
-        assert_eq!(
-            Config::load(Some(file.path()))?.hosts["localhost"].extensions,
-            expected
-        );
+        let config = Config::load(Some(file.path()))?;
+        let host = &config.hosts["localhost"];
+        assert_eq!(host.extensions, expected);
+        let prepared = catalog.enable(&[HostSelection {
+            domain: "localhost",
+            extensions: &host.extensions,
+            options: &host.options,
+        }]);
+        if expected == ["ping"] {
+            assert_eq!(
+                prepared.err().ok_or("Ping-only host accepted")?,
+                EnableError {
+                    host: "localhost".into(),
+                    source: RegistrationError::MissingDependency {
+                        extension: "ping",
+                        dependency: "disco",
+                    },
+                }
+            );
+        } else {
+            assert_eq!(prepared?["localhost"].enabled(), expected);
+        }
     }
     Ok(())
 }
@@ -75,7 +103,7 @@ fn no_configuration_file_enables_default_extensions() -> TestResult {
         assert_eq!(config, Config::default());
         assert_eq!(
             config.hosts["localhost"].extensions,
-            ["roster", "offline", "disco"]
+            ["roster", "offline", "disco", "ping"]
         );
     } else {
         let directory = tempfile::tempdir()?;
@@ -727,7 +755,12 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     expected.hosts.insert(
         "example.com".into(),
         HostConfig {
-            extensions: vec!["roster".into(), "offline".into(), "disco".into()],
+            extensions: vec![
+                "roster".into(),
+                "offline".into(),
+                "disco".into(),
+                "ping".into(),
+            ],
             options: BTreeMap::from([
                 (
                     "roster".into(),

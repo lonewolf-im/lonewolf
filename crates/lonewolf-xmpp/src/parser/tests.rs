@@ -184,7 +184,11 @@ fn standalone_normalization_survives_serialization_without_value_changes() -> Te
         assert!(serialized.contains("&#x9;"));
         assert!(serialized.contains("&#xA;"));
         assert!(serialized.contains("&#xD;"));
-        for value in ["", "invalid", "default", "preserve"] {
+        let absent = parse_element(b"<x><y/></x>", config(4096)?, GlobalChunkAllocator).await?;
+        let absent = absent.value().resolve(absent.arena())?;
+        assert_eq!(absent.attribute("lang", XML_NAMESPACE)?, None);
+        assert_eq!(absent.attribute("space", XML_NAMESPACE)?, None);
+        for value in ["", "invalid", "default", "preserve", "Preserve"] {
             let input = format!("<x xml:space='{value}'><y/></x>");
             let (parsed, _) = standalone_round_trip(input.as_bytes()).await?;
             let root = parsed.value().resolve(parsed.arena())?;
@@ -577,11 +581,11 @@ fn stanza_writers_preserve_header_aliases_and_stanza_namespace_bindings() -> Tes
 }
 
 #[test]
-fn explicit_attributes_exclude_inherited_stream_language() -> TestResult {
+fn explicit_attributes_exclude_inherited_stream_language_and_space() -> TestResult {
     block_on(async {
         let input = format!(
-            "{}<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' flag='1'/>",
-            OPEN.replace('>', " xml:lang='es'>")
+            "{}<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' xml:space='default'/>",
+            OPEN.replace('>', " xml:lang='es' xml:space='preserve'>")
         );
         let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
         open(&mut parser).await?;
@@ -593,6 +597,13 @@ fn explicit_attributes_exclude_inherited_stream_language() -> TestResult {
             first
                 .value()
                 .resolve(first.arena())?
+                .attribute("space", XML_NAMESPACE)?,
+            Some("preserve")
+        );
+        assert_eq!(
+            first
+                .value()
+                .resolve(first.arena())?
                 .attribute("lang", "http://www.w3.org/XML/1998/namespace")?,
             Some("es")
         );
@@ -600,6 +611,13 @@ fn explicit_attributes_exclude_inherited_stream_language() -> TestResult {
             return Err("expected second element".into());
         };
         assert!(second.has_explicit_attributes());
+        assert_eq!(
+            second
+                .value()
+                .resolve(second.arena())?
+                .attribute("space", XML_NAMESPACE)?,
+            Some("default")
+        );
         Ok(())
     })
 }
@@ -975,7 +993,7 @@ fn namespace_scopes_normalize_values_and_preserve_mixed_content() -> TestResult 
 #[test]
 fn restart_preserves_buffered_bytes_and_resets_stream_context() -> TestResult {
     block_on(async {
-        let input = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:x='urn:old' xml:lang='en'><success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server'><message from='a.example' to='b.example'/><message from='a.example' to='b.example'><x:test/></message>";
+        let input = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' xmlns:x='urn:old' xml:lang='en' xml:space='preserve'><success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server'><message from='a.example' to='b.example'/><message from='a.example' to='b.example'><x:test/></message>";
         let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
         open(&mut parser).await?;
         let Some(StreamEvent::Element(success)) = parser.next_event().await? else {
@@ -985,10 +1003,18 @@ fn restart_preserves_buffered_bytes_and_resets_stream_context() -> TestResult {
             success.value().resolve(success.arena())?.namespace(),
             "urn:ietf:params:xml:ns:xmpp-sasl"
         );
+        assert_eq!(
+            success
+                .value()
+                .resolve(success.arena())?
+                .attribute("space", XML_NAMESPACE)?,
+            Some("preserve")
+        );
         let mut parser = parser.restart()?;
         open(&mut parser).await?;
         let parsed = stanza(&mut parser).await?;
         let view = parsed.value().resolve(parsed.arena())?;
+        assert_eq!(view.attribute("space", XML_NAMESPACE)?, None);
         assert_eq!(view.namespace(), StanzaNamespace::Server);
         assert_eq!(view.lang()?, None);
         assert!(matches!(
@@ -3214,4 +3240,197 @@ fn stream_character_data_checks_grammar_before_xmpp_structure() -> TestResult {
         })?;
     }
     Ok(())
+}
+
+fn xml_context_attributes(lang: Option<&str>, space: Option<&str>) -> String {
+    let mut attributes = String::new();
+    if let Some(lang) = lang {
+        attributes.push_str(&format!(" xml:lang='{lang}'"));
+    }
+    if let Some(space) = space {
+        attributes.push_str(&format!(" xml:space='{space}'"));
+    }
+    attributes
+}
+
+#[test]
+fn stream_language_and_iq_language_keep_payload_overrides_separate() -> TestResult {
+    block_on(async {
+        for (stream, iq, payload, expected) in [
+            (None, None, None, None),
+            (Some("es"), None, None, Some("es")),
+            (Some("es"), Some("fr"), Some("de"), Some("fr")),
+            (Some("es"), Some(""), Some("de"), Some("")),
+            (None, Some(""), None, Some("")),
+            (Some(""), None, Some("de"), None),
+            (Some("x-Unchecked"), None, Some(""), Some("x-Unchecked")),
+        ] {
+            let input = format!(
+                "{}<iq type='get' id='context'{}><query xmlns='urn:test'{}><child/></query></iq>",
+                OPEN.replace('>', &format!("{}>", xml_context_attributes(stream, None))),
+                xml_context_attributes(iq, None),
+                xml_context_attributes(payload, None),
+            );
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            let parsed = stanza(&mut parser).await?;
+            let view = parsed.value().resolve(parsed.arena())?;
+            assert_eq!(view.lang()?, expected);
+            let query = view.child("query", "urn:test")?.ok_or("query")?;
+            assert_eq!(query.attribute("lang", XML_NAMESPACE)?, payload);
+            assert_eq!(
+                query
+                    .child("child", "urn:test")?
+                    .ok_or("child")?
+                    .attribute("lang", XML_NAMESPACE)?,
+                None
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn stream_space_is_raw_root_context_and_survives_forwarding() -> TestResult {
+    block_on(async {
+        let values = [
+            None,
+            Some("preserve"),
+            Some("default"),
+            Some(""),
+            Some("unknown"),
+            Some("Preserve"),
+            Some(" preserve "),
+        ];
+        for stream in values {
+            for iq in values {
+                for payload in [None, Some("default"), Some("preserve")] {
+                    let input = format!(
+                        "{}<iq type='set' id='context'{}><query xmlns='urn:test'{}><child/></query></iq><message/>",
+                        OPEN.replace('>', &format!("{}>", xml_context_attributes(None, stream))),
+                        xml_context_attributes(None, iq),
+                        xml_context_attributes(None, payload),
+                    );
+                    let mut parser = XmppParser::new(
+                        Fragmented::new(input.as_bytes(), 1),
+                        config(4096)?,
+                        GlobalChunkAllocator,
+                    );
+                    open(&mut parser).await?;
+                    let parsed = stanza(&mut parser).await?;
+                    let view = parsed.value().resolve(parsed.arena())?;
+                    let expected = iq.or(stream);
+                    assert_eq!(view.attribute("space", XML_NAMESPACE)?, expected);
+                    let query = view.child("query", "urn:test")?.ok_or("query")?;
+                    assert_eq!(query.attribute("space", XML_NAMESPACE)?, payload);
+                    assert_eq!(
+                        query
+                            .child("child", "urn:test")?
+                            .ok_or("child")?
+                            .attribute("space", XML_NAMESPACE)?,
+                        None
+                    );
+                    let mut forwarded = String::new();
+                    view.write_xml(&mut forwarded)?;
+                    let replay = format!("{OPEN}{forwarded}");
+                    let mut replay =
+                        XmppParser::new(replay.as_bytes(), config(4096)?, GlobalChunkAllocator);
+                    open(&mut replay).await?;
+                    let replayed = stanza(&mut replay).await?;
+                    assert_eq!(
+                        replayed
+                            .value()
+                            .resolve(replayed.arena())?
+                            .attribute("space", XML_NAMESPACE)?,
+                        expected
+                    );
+                    let next = stanza(&mut parser).await?;
+                    assert!(!next.has_explicit_attributes());
+                    assert_eq!(
+                        next.value()
+                            .resolve(next.arena())?
+                            .attribute("space", XML_NAMESPACE)?,
+                        stream
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn inherited_space_obeys_wire_attribute_and_arena_limits() -> TestResult {
+    block_on(async {
+        for count in [MAX_ATTRIBUTES_PER_ELEMENT, MAX_ATTRIBUTES_PER_ELEMENT + 1] {
+            let attributes = (0..count).map(|i| format!(" a{i}='v'")).collect::<String>();
+            let input = format!(
+                "{}<message{attributes}/>",
+                OPEN.replace('>', " xml:space='preserve'>")
+            );
+            let mut parser =
+                XmppParser::new(input.as_bytes(), config(16384)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            if count == MAX_ATTRIBUTES_PER_ELEMENT {
+                let parsed = stanza(&mut parser).await?;
+                assert!(parsed.has_explicit_attributes());
+                assert_eq!(
+                    parsed
+                        .value()
+                        .resolve(parsed.arena())?
+                        .attribute("space", XML_NAMESPACE)?,
+                    Some("preserve")
+                );
+            } else {
+                assert!(matches!(
+                    parser.next_event().await,
+                    Err(ParseError::TooManyAttributes)
+                ));
+            }
+        }
+        let large = "a".repeat(2048);
+        for (stream, explicit, succeeds) in [
+            (None, "", true),
+            (Some(large.as_str()), "", false),
+            (Some(large.as_str()), " xml:space='default'", true),
+        ] {
+            let input = format!(
+                "{}<message extra='{large}'{explicit}/>",
+                OPEN.replace('>', &format!("{}>", xml_context_attributes(None, stream)))
+            );
+            let mut limits = config(16384)?;
+            limits.arena.max_reserved_bytes = NonZeroUsize::new(4096).ok_or("arena limit")?;
+            let mut parser = XmppParser::new(input.as_bytes(), limits, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            if succeeds {
+                stanza(&mut parser).await?;
+            } else {
+                assert!(matches!(
+                    parser.next_event().await,
+                    Err(ParseError::Build(BuildError::Allocation(
+                        ArenaError::ArenaLimitExceeded
+                    )))
+                ));
+            }
+        }
+        let input = format!(
+            "{}<message/>",
+            OPEN.replace(
+                '>',
+                &format!(
+                    " xml:space='{large}{}'>",
+                    "a".repeat(MAX_STREAM_HEADER_BYTES)
+                )
+            )
+        );
+        let mut parser =
+            XmppParser::new(input.as_bytes(), config(usize::MAX)?, GlobalChunkAllocator);
+        assert!(matches!(
+            parser.next_event().await,
+            Err(ParseError::SizeLimitExceeded {
+                limit: MAX_STREAM_HEADER_BYTES
+            })
+        ));
+        Ok(())
+    })
 }

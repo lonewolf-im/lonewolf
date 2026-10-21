@@ -270,6 +270,8 @@ fn missing_accounts_answer_like_hidden_ones() -> TestResult {
                     discovery: &discovery,
                     sessions: &UnexpectedSessions,
                     requester: Some(Requester::Other),
+                    lang: None,
+                    space: None,
                     payload: query.resolve(&request_arena)?,
                 })
             };

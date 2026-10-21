@@ -114,6 +114,7 @@ pub struct XmppParser<R, A: ChunkAllocator> {
     text: String,
     frames: Vec<Frame>,
     stream_lang: String,
+    stream_space: Option<String>,
     root_explicit_attributes: bool,
     phase: Phase,
     failed: bool,
@@ -134,8 +135,7 @@ enum Phase {
 /// # Errors
 ///
 /// Returns [`ParseError::UnexpectedEvent`] for extra content or a stanza or stream root.
-/// Empty input returns [`ParseError::UnexpectedEof`]; XML and allocation failures
-/// use the existing typed parse and build errors.
+/// Empty input returns [`ParseError::UnexpectedEof`].
 pub async fn parse_element<A: ChunkAllocator + Clone>(
     xml: &[u8],
     config: ParserConfig,
@@ -179,6 +179,7 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
             text: String::new(),
             frames: Vec::new(),
             stream_lang: String::new(),
+            stream_space: None,
             root_explicit_attributes: false,
             phase: Phase::Initial,
             failed: false,
@@ -221,6 +222,7 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
         self.reader = Reader::from_reader(input);
         self.namespaces = NamespaceResolver::default();
         self.stream_lang.clear();
+        self.stream_space = None;
         self.root_explicit_attributes = false;
         self.phase = Phase::Initial;
         Ok(self)
@@ -321,6 +323,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                             false,
                             "",
                             None,
+                            None,
                         )?
                         .finish(&mut header_arena, &mut self.text)?;
                         let Completed::Element(value) = header else {
@@ -336,6 +339,12 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                         {
                             self.stream_lang.push_str(lang);
                         }
+                        self.stream_space = value
+                            .resolve(&header_arena)
+                            .map_err(BuildError::from)?
+                            .attribute("space", XML_NAMESPACE)
+                            .map_err(BuildError::from)?
+                            .map(str::to_owned);
                         self.phase = Phase::Open;
                         self.reader
                             .get_mut()
@@ -378,6 +387,7 @@ impl<R: AsyncBufRead + Unpin, A: ChunkAllocator + Clone> XmppParser<R, A> {
                         current,
                         self.frames.is_empty(),
                         &self.stream_lang,
+                        self.stream_space.as_deref(),
                         self.frames.last().map(Frame::namespaces),
                     )?;
                     if empty {

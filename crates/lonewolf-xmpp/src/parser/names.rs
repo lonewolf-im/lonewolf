@@ -136,6 +136,7 @@ pub(super) fn frame<A: ChunkAllocator>(
     arena: &mut Arena<A>,
     root: bool,
     stream_lang: &str,
+    stream_space: Option<&str>,
     parent_namespaces: Option<NamespaceContext>,
 ) -> Result<Frame, ParseError> {
     let (name, namespace) = element(resolver, start)?;
@@ -184,6 +185,7 @@ pub(super) fn frame<A: ChunkAllocator>(
     }
     frame.set_namespaces(namespaces);
     let mut has_lang = false;
+    let mut has_space = false;
     for attribute in start.attributes() {
         let attribute = attribute.map_err(quick_xml::Error::from)?;
         if attribute.key.as_namespace_binding().is_some() {
@@ -194,6 +196,7 @@ pub(super) fn frame<A: ChunkAllocator>(
         let name = name.into_inner();
         let value = normalized(&attribute)?;
         has_lang |= name == "lang" && namespace == XML_NAMESPACE;
+        has_space |= name == "space" && namespace == XML_NAMESPACE;
         frame
             .attribute(name, namespace, &value, arena)
             .map_err(|error| {
@@ -206,6 +209,12 @@ pub(super) fn frame<A: ChunkAllocator>(
     }
     if root && !has_lang && !stream_lang.is_empty() {
         frame.attribute("lang", XML_NAMESPACE, stream_lang, arena)?;
+    }
+    if root
+        && !has_space
+        && let Some(space) = stream_space
+    {
+        frame.attribute("space", XML_NAMESPACE, space, arena)?;
     }
     Ok(frame)
 }

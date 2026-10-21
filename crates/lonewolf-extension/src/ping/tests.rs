@@ -419,6 +419,8 @@ fn request<'a>(
         discovery,
         sessions: &UnexpectedSessions,
         requester,
+        lang: None,
+        space: None,
     })
 }
 

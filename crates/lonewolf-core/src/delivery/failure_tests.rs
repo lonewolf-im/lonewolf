@@ -11,6 +11,7 @@ use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 use lonewolf_storage::account::*;
 use lonewolf_storage::offline::*;
 use lonewolf_storage::roster::*;
+use lonewolf_storage::vcard::{StoredVCard, VCardError, VCardQuota, VCardReads, VCardWrites};
 use lonewolf_storage::{ReadTransaction, StorageError, StorageErrorKind, WriteTransaction};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use parking_lot::Mutex as PlMutex;
@@ -145,6 +146,27 @@ impl AccountWrites for FailedCommit {
         _key: &AccountKey,
         _credentials: ScramCredentials,
     ) -> Result<(), AccountError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+}
+
+impl VCardReads for FailedCommit {
+    async fn vcard(&self, _: &AccountKey) -> Result<Option<StoredVCard>, VCardError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+}
+
+impl VCardWrites for FailedCommit {
+    async fn replace_vcard(
+        &mut self,
+        _: &AccountKey,
+        _: &str,
+        _: VCardQuota,
+    ) -> Result<(), VCardError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+
+    async fn delete_vcard(&mut self, _: &AccountKey) -> Result<(), VCardError> {
         unreachable!("commit test cannot use storage operations")
     }
 }

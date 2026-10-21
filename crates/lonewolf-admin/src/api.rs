@@ -547,6 +547,7 @@ mod tests {
         OfflineError, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage,
     };
     use lonewolf_storage::roster::{self, RosterReads, RosterWrites};
+    use lonewolf_storage::vcard::{StoredVCard, VCardError, VCardQuota, VCardReads, VCardWrites};
     use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
     use serde_json::{Value, json};
 
@@ -868,6 +869,27 @@ mod tests {
             >,
             lonewolf_storage::roster::RosterError,
         > {
+            unreachable!()
+        }
+    }
+
+    impl VCardReads for MemoryTransaction {
+        async fn vcard(&self, _: &AccountKey) -> Result<Option<StoredVCard>, VCardError> {
+            unreachable!()
+        }
+    }
+
+    impl VCardWrites for MemoryTransaction {
+        async fn replace_vcard(
+            &mut self,
+            _: &AccountKey,
+            _: &str,
+            _: VCardQuota,
+        ) -> Result<(), VCardError> {
+            unreachable!()
+        }
+
+        async fn delete_vcard(&mut self, _: &AccountKey) -> Result<(), VCardError> {
             unreachable!()
         }
     }

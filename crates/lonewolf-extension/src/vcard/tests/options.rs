@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use super::*;
 use crate::discovery::DiscoScope;
 use crate::iq::{IqDestinationRule, IqRequestType, IqScope};
@@ -145,71 +147,115 @@ fn builtin_dependency_and_exact_route_constraint_and_discovery_inventory() -> Te
     Ok(())
 }
 
+fn configured_handler(domain: &str, kind: IqRequestType) -> TestResult<Arc<TestHandler>> {
+    let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
+    for factory in crate::builtin() {
+        catalog.register_factory(factory)?;
+    }
+    let names = ["disco".into(), "vcard".into()];
+    let omitted = BTreeMap::new();
+    let small = BTreeMap::from([("vcard".into(), toml::from_str("max_bytes=1")?)]);
+    let enabled = catalog.enable(&[
+        HostSelection {
+            domain: "example.com",
+            extensions: &names,
+            options: &omitted,
+        },
+        HostSelection {
+            domain: "other.example",
+            extensions: &names,
+            options: &small,
+        },
+    ])?;
+    Ok(Arc::clone(
+        enabled[domain]
+            .iq()
+            .find(IqScope::Account, kind, NAMESPACE, "vCard")
+            .ok_or("missing configured handler")?,
+    ))
+}
+
 #[test]
-fn configured_factory_limits_apply_to_authenticated_owner_hosts_and_default_omissions() -> TestResult
-{
+fn omitted_host_quota_publishes_the_complete_card() -> TestResult {
     block_on(async {
         let test = TestVCard::new().await?;
-        let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
-        for factory in crate::builtin() {
-            catalog.register_factory(factory)?;
-        }
-        let names = ["disco".into(), "vcard".into()];
-        let omitted = BTreeMap::new();
-        let small = BTreeMap::from([("vcard".into(), toml::from_str("max_bytes=1")?)]);
-        let enabled = catalog.enable(&[
-            HostSelection {
-                domain: "example.com",
-                extensions: &names,
-                options: &omitted,
-            },
-            HostSelection {
-                domain: "other.example",
-                extensions: &names,
-                options: &small,
-            },
-        ])?;
-        for (owner, succeeds) in [("alice@example.com", true), ("alice@other.example", false)] {
-            let domain = key(owner)?.domain().to_owned();
-            let handler = enabled[domain.as_str()]
-                .iq()
-                .find(IqScope::Account, IqRequestType::Set, NAMESPACE, "vCard")
-                .ok_or("missing SET handler")?;
-            let call = Call::new(&format!("{owner}/desk"), owner, FIRST).await?;
-            let mut response = arena()?;
-            let mut transaction = test.storage.begin_write().await?;
-            let result = handler
+        let handler = configured_handler("example.com", IqRequestType::Set)?;
+        let call = Call::new("alice@example.com/desk", "alice@example.com", FIRST).await?;
+        let mut response = arena()?;
+        let mut transaction = test.storage.begin_write().await?;
+        let reply = handler
+            .set(
+                call.request(None, None, None)?,
+                &mut transaction,
+                &NoLookups,
+                &mut response,
+            )
+            .await
+            .map_err(|error| format!("unexpected SET error: {error:?}"))?;
+        assert!(reply.payload.is_none());
+        assert!(reply.effects.accounts.is_empty());
+        assert!(reply.results.is_empty());
+        transaction.commit().await?;
+        assert_eq!(
+            test.stored("alice@example.com").await?,
+            Some(
+                r#"<vCard xmlns="vcard-temp" xml:lang="" xml:space="default"><FN>First</FN><NICKNAME>old</NICKNAME></vCard>"#.into()
+            )
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn owner_host_quota_rejects_oversized_card_without_storing_it() -> TestResult {
+    block_on(async {
+        let test = TestVCard::new().await?;
+        let handler = configured_handler("other.example", IqRequestType::Set)?;
+        let call = Call::new("alice@other.example/desk", "alice@other.example", FIRST).await?;
+        let mut response = arena()?;
+        let mut transaction = test.storage.begin_write().await?;
+        condition(
+            handler
                 .set(
                     call.request(None, None, None)?,
                     &mut transaction,
                     &NoLookups,
                     &mut response,
                 )
-                .await;
-            if succeeds {
-                assert!(result.is_ok());
-            } else {
-                condition(result, StanzaErrorCondition::ResourceConstraint)?;
-            }
-            transaction.commit().await?;
-            assert_eq!(test.stored(owner).await?.is_some(), succeeds);
-        }
+                .await,
+            StanzaErrorCondition::ResourceConstraint,
+        )?;
+        transaction.commit().await?;
+        assert_eq!(test.stored("alice@other.example").await?, None);
+        Ok(())
+    })
+}
+
+#[test]
+fn reader_host_quota_does_not_hide_another_hosts_complete_card() -> TestResult {
+    block_on(async {
+        let test = TestVCard::new().await?;
+        accepted(
+            test.set("alice@example.com/desk", "alice@example.com", FIRST, true)
+                .await?,
+        )?;
+        let handler = configured_handler("example.com", IqRequestType::Get)?;
         let call = Call::new("alice@other.example/desk", "alice@example.com", EMPTY).await?;
-        let handler = enabled["example.com"]
-            .iq()
-            .find(IqScope::Account, IqRequestType::Get, NAMESPACE, "vCard")
-            .ok_or("missing GET handler")?;
         let mut response = arena()?;
         let snapshot = test.storage.begin_read().await?;
-        assert!(
-            handler
-                .get(
-                    call.request(Some(Requester::Other), None, None)?,
-                    &snapshot,
-                    &mut response
-                )
-                .await
-                .is_ok()
+        let reply = handler
+            .get(
+                call.request(Some(Requester::Other), None, None)?,
+                &snapshot,
+                &mut response,
+            )
+            .await
+            .map_err(|error| format!("unexpected GET error: {error:?}"))?;
+        assert!(reply.effects.accounts.is_empty());
+        assert!(reply.results.is_empty());
+        assert_eq!(
+            serialize(reply.payload.ok_or("missing card")?, &response)?,
+            r#"<vCard xmlns="vcard-temp" xml:lang="" xml:space="default"><FN>First</FN><NICKNAME>old</NICKNAME></vCard>"#
         );
         Ok(())
     })

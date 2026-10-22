@@ -24,7 +24,7 @@ fn service_errors_become_error_replies() -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='set' to='echo.localhost' id='service'><query xmlns='urn:lonewolf:test:service'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='echo.localhost' to='alice@localhost/desk' id='service'><query xmlns='urn:lonewolf:test:service'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='echo.localhost' to='alice@localhost/desk' id='service'><query xmlns='urn:lonewolf:test:service'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
     alice.close()
 }
 

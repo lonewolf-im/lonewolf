@@ -30,7 +30,7 @@ fn subscribe(client: &mut Client, target: &str, id: &str) -> TestResult {
 }
 
 fn expect_overflow(client: &mut Client, from: &str, to: &str, id: &str) -> TestResult {
-    client.expect_xml(&format!("<presence xmlns='jabber:client' from='{from}' to='{to}' type='error' id='{id}'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))
+    client.expect_xml(&format!("<presence xmlns='jabber:client' from='{from}' to='{to}' type='error' id='{id}'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The recipient's pending subscription request limit of 1 has been reached. Retry after the recipient handles pending requests.</text></error></presence>"))
 }
 
 fn available(client: &mut Client, full: &str, bare: &str) -> TestResult {
@@ -116,7 +116,7 @@ fn listeners_and_workers_share_one_recipient_pending_limit() -> TestResult {
                     let first = client.receive()?;
                     let accepted = first.name == "message";
                     if !accepted {
-                        first.assert_xml(&format!("<presence xmlns='jabber:client' from='bob@localhost' to='{full}' type='error' id='{id}'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+                        first.assert_xml(&format!("<presence xmlns='jabber:client' from='bob@localhost' to='{full}' type='error' id='{id}'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The recipient's pending subscription request limit of 1 has been reached. Retry after the recipient handles pending requests.</text></error></presence>"))?;
                         client.expect_xml(&format!("<message xmlns='jabber:client' from='{full}' to='{full}' id='barrier'/>"))?;
                     } else {
                         first.assert_xml(&format!("<message xmlns='jabber:client' from='{full}' to='{full}' id='barrier'/>"))?;

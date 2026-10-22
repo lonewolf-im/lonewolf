@@ -1705,11 +1705,13 @@ impl PolicyHandler<RedbStorage> for TestPolicy {
                         name: "blocked",
                         namespace: "urn:lonewolf:test:policy",
                     }),
+                    text: None,
                 },
                 (Some("spammer"), Direction::Inbound) => Verdict::Drop,
                 (Some("rejecter"), Direction::Inbound) => Verdict::Reject {
                     condition: StanzaErrorCondition::ServiceUnavailable,
                     application: None,
+                    text: None,
                 },
                 (Some("broken"), _) => {
                     return Err(HandlerError::Internal {

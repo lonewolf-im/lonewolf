@@ -201,7 +201,10 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for VCard {
                 transaction
                     .replace_vcard(&owner, &document, quota)
                     .await
-                    .map_err(|error| storage_error(error, "vcard_write"))?;
+                    .map_err(|error| match error {
+                        VCardError::QuotaExceeded => xml::byte_quota(quota.max_bytes.get()),
+                        error => storage_error(error, "vcard_write"),
+                    })?;
                 Ok(IqReply::new(None, Effects::none()))
             }
             .await;

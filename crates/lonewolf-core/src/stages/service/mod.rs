@@ -22,6 +22,7 @@ pub(crate) enum ServiceOutcome<A: ChunkAllocator> {
     Rejected {
         stanza: RoutedStanza<A>,
         condition: StanzaErrorCondition,
+        text: lonewolf_xmpp::stanza::StanzaErrorText,
     },
 }
 
@@ -66,6 +67,7 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
             return Ok(ServiceOutcome::Rejected {
                 stanza,
                 condition: error.condition(),
+                text: error.text(),
             });
         }
     }

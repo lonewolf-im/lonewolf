@@ -36,7 +36,10 @@ fn omitted_error(
     assert_eq!(reply.children.len(), 1);
     let error = reply.child("jabber:client", "error")?;
     assert_eq!(error.attribute("type"), Some(kind));
-    assert_eq!(error.children.len(), 1);
+    assert_eq!(error.children.len(), 2);
+    let text = error.child("urn:ietf:params:xml:ns:xmpp-stanzas", "text")?;
+    assert_eq!(text.attribute_in("lang", XML)?, Some("en"));
+    assert!(!text.text.is_empty());
     error.child("urn:ietf:params:xml:ns:xmpp-stanzas", condition)?;
     assert!(!format!("{reply:?}").contains(MARKER));
     Ok(reply)
@@ -649,10 +652,17 @@ fn vcard_exact_encoded_quota_counts_context_namespaces_unicode_escaping_and_attr
     publish(&mut alice, "desk", &exact)?;
     let before = own_card(&mut alice, "desk")?;
     alice.send(&format!(
-        "<iq type='set' id='over'>{}</iq>",
+        "<iq type='set' id='over' xml:lang='es'>{}</iq>",
         exact.replace("</FN>", "x</FN>")
     ))?;
-    omitted_error(&mut alice, "over", "resource-constraint", "wait")?;
+    let error = omitted_error(&mut alice, "over", "resource-constraint", "wait")?;
+    assert_eq!(
+        error
+            .child("jabber:client", "error")?
+            .child("urn:ietf:params:xml:ns:xmpp-stanzas", "text")?
+            .text,
+        "vCard exceeds the 256-byte limit, including XML and Base64 data. Use a smaller avatar or reduce profile data."
+    );
     assert_eq!(own_card(&mut alice, "desk")?, before);
     alice.close()
 }
@@ -1331,5 +1341,37 @@ fn vcard_detached_root_attribute_growth_rejects_before_replacement() -> TestResu
     );
     let logs = fs::read_to_string(suite.fixture_path().join("server.log"))?;
     assert!(!logs.contains(MARKER));
+    alice.close()
+}
+
+#[test]
+fn vcard_structural_rejection_has_english_text_without_profile_or_quota_claim() -> TestResult {
+    let suite = C2sSuite::with_hosts("[hosts.localhost]\nextensions=['disco','vcard']")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    publish(
+        &mut alice,
+        "desk",
+        "<vCard xmlns='vcard-temp'><FN>old</FN></vCard>",
+    )?;
+    let before = own_card(&mut alice, "desk")?;
+    let declarations = (0..120)
+        .map(|index| format!(" xmlns:p{index}='urn:{index}'"))
+        .collect::<String>();
+    let attributes = (0..134)
+        .map(|index| format!(" a{index}='{MARKER}'"))
+        .collect::<String>();
+    alice.send(&format!("<iq type='set' id='structure' xml:lang='es'{declarations}><vCard xmlns='vcard-temp'{attributes}/></iq>"))?;
+    let reply = omitted_error(&mut alice, "structure", "resource-constraint", "wait")?;
+    assert_eq!(reply.attribute_in("lang", XML)?, Some("es"));
+    let text = &reply
+        .child("jabber:client", "error")?
+        .child("urn:ietf:params:xml:ns:xmpp-stanzas", "text")?
+        .text;
+    assert_eq!(
+        text,
+        "vCard has too many XML attributes. Reduce the profile's XML attributes."
+    );
+    assert_eq!(own_card(&mut alice, "desk")?, before);
     alice.close()
 }

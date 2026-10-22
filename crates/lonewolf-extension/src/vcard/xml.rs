@@ -5,10 +5,12 @@ use std::num::NonZeroUsize;
 
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::vcard::{MAX_VCARD_BYTES, VCardQuota};
-use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, GlobalChunkAllocator};
+use lonewolf_util::arena::{
+    Arena, ArenaConfig, ArenaError, ArenaRead, ChunkAllocator, GlobalChunkAllocator,
+};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, parse_element};
 use lonewolf_xmpp::stanza::{
-    BuildError, Element, ElementRef, NodeRef, StanzaErrorCondition, WriteError,
+    BuildError, Element, ElementRef, NodeRef, StanzaErrorCondition, StanzaErrorText, WriteError,
 };
 
 use super::{NAMESPACE, failure};
@@ -45,9 +47,7 @@ impl fmt::Write for BoundedOutput {
 impl BoundedOutput {
     fn write<R: ArenaRead>(&mut self, element: &ElementRef<'_, R>) -> Result<(), HandlerError> {
         element.write_xml(self).map_err(|error| match error {
-            WriteError::Output(_) if self.exceeded => {
-                StanzaErrorCondition::ResourceConstraint.into()
-            }
+            WriteError::Output(_) if self.exceeded => byte_quota(self.limit),
             _ => StanzaErrorCondition::InternalServerError.into(),
         })
     }
@@ -111,14 +111,17 @@ pub(super) async fn encode<A: ChunkAllocator>(
         return Err(StanzaErrorCondition::InternalServerError.into());
     }
     validate(payload, false).map_err(|error| match error {
-        ProfileError::Invalid => StanzaErrorCondition::BadRequest.into(),
+        ProfileError::Invalid => HandlerError::described(StanzaErrorCondition::BadRequest, StanzaErrorText::Static("vCard must contain profile elements without direct text and use valid xml:space values.")),
         ProfileError::Access => HandlerError::from(StanzaErrorCondition::InternalServerError),
     })?;
     let root_space = payload
         .attribute("space", XML)
         .map_err(|_| HandlerError::from(StanzaErrorCondition::InternalServerError))?;
     if root_space.is_none() && inherited_space == Some(XmlSpace::Invalid) {
-        return Err(StanzaErrorCondition::BadRequest.into());
+        return Err(HandlerError::described(
+            StanzaErrorCondition::BadRequest,
+            StanzaErrorText::Static("vCard must use an xml:space value of default or preserve."),
+        ));
     }
     let limit = quota.max_bytes.get().min(MAX_VCARD_BYTES);
     let mut output = BoundedOutput {
@@ -162,12 +165,16 @@ pub(super) async fn encode<A: ChunkAllocator>(
     let document = output.output.ok_or(HandlerError::from(
         StanzaErrorCondition::InternalServerError,
     ))?;
-    let parsed = parse_stored(&document).await.map_err(|error| {
-        if capacity(&error) {
-            StanzaErrorCondition::ResourceConstraint.into()
-        } else {
-            HandlerError::from(StanzaErrorCondition::InternalServerError)
+    let parsed = parse_stored(&document).await.map_err(|error| match error {
+        ParseError::SizeLimitExceeded { .. } => byte_quota(MAX_VCARD_BYTES),
+        ParseError::TooManyAttributes => {
+            structural("vCard has too many XML attributes. Reduce the profile's XML attributes.")
         }
+        ParseError::Build(BuildError::TreeLimitExceeded) => structural(
+            "vCard exceeds the XML tree depth or node limit. Simplify the profile's XML structure.",
+        ),
+        ParseError::Build(error @ BuildError::Allocation(_)) => build_error(error),
+        _ => HandlerError::from(StanzaErrorCondition::InternalServerError),
     })?;
     let root = parsed
         .value()
@@ -204,27 +211,70 @@ async fn parse_stored(xml: &str) -> Result<Parsed<Element, GlobalChunkAllocator>
     .await
 }
 
-fn capacity(error: &ParseError) -> bool {
-    matches!(
-        error,
-        ParseError::SizeLimitExceeded { .. }
-            | ParseError::TooManyAttributes
-            | ParseError::Build(BuildError::Allocation(_) | BuildError::TreeLimitExceeded)
+pub(super) fn byte_quota(max: usize) -> HandlerError {
+    HandlerError::described(
+        StanzaErrorCondition::ResourceConstraint,
+        StanzaErrorText::Limit {
+            prefix: "vCard exceeds the ",
+            max,
+            suffix: "-byte limit, including XML and Base64 data. Use a smaller avatar or reduce profile data.",
+        },
+    )
+}
+
+fn structural(text: &'static str) -> HandlerError {
+    HandlerError::described(
+        StanzaErrorCondition::ResourceConstraint,
+        StanzaErrorText::Static(text),
     )
 }
 
 fn build_error(error: BuildError) -> HandlerError {
     match error {
-        BuildError::Allocation(_) | BuildError::TreeLimitExceeded => {
-            StanzaErrorCondition::ResourceConstraint.into()
+        BuildError::Allocation(ArenaError::ArenaLimitExceeded | ArenaError::CapacityOverflow) => {
+            structural(
+                "vCard exceeds the XML processing memory limit. Simplify the profile's XML structure.",
+            )
         }
+        BuildError::Allocation(_) => StanzaErrorCondition::ResourceConstraint.into(),
+        BuildError::TreeLimitExceeded => structural(
+            "vCard exceeds the XML tree depth or node limit. Simplify the profile's XML structure.",
+        ),
         _ => StanzaErrorCondition::InternalServerError.into(),
     }
 }
 
 #[cfg(test)]
 mod output_tests {
-    use super::BoundedOutput;
+    use super::{BoundedOutput, build_error};
+    use lonewolf_util::arena::{AllocationError, ArenaError};
+    use lonewolf_xmpp::stanza::{BuildError, StanzaErrorCondition, StanzaErrorText};
+
+    #[test]
+    fn memory_budget_and_allocator_failures_have_distinct_descriptions() {
+        for error in [ArenaError::ArenaLimitExceeded, ArenaError::CapacityOverflow] {
+            let error = build_error(BuildError::Allocation(error));
+            assert_eq!(error.condition(), StanzaErrorCondition::ResourceConstraint);
+            assert_eq!(
+                error.text(),
+                StanzaErrorText::Static(
+                    "vCard exceeds the XML processing memory limit. Simplify the profile's XML structure."
+                )
+            );
+        }
+        for error in [
+            AllocationError::Exhausted,
+            AllocationError::UnsupportedLayout,
+        ] {
+            let error = build_error(BuildError::Allocation(ArenaError::Allocation(error)));
+            assert_eq!(error.condition(), StanzaErrorCondition::ResourceConstraint);
+            assert_eq!(
+                error.text(),
+                StanzaErrorCondition::ResourceConstraint.default_text()
+            );
+            assert!(error.failure().is_none());
+        }
+    }
     use std::fmt::Write;
 
     #[test]

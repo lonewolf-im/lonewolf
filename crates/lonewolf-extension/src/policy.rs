@@ -34,6 +34,7 @@ pub enum Verdict {
     Reject {
         condition: StanzaErrorCondition,
         application: Option<ApplicationCondition>,
+        text: Option<lonewolf_xmpp::stanza::StanzaErrorText>,
     },
     /// Dropped IQ requests receive a service-unavailable error after stanza filtering.
     Drop,
@@ -56,6 +57,7 @@ impl Verdict {
                 Self::Reject {
                     condition: StanzaErrorCondition::ServiceUnavailable,
                     application: None,
+                    text: None,
                 }
             }
             Self::Reject { .. }
@@ -97,6 +99,7 @@ mod tests {
             Verdict::Reject {
                 condition: StanzaErrorCondition::Forbidden,
                 application: None,
+                text: None,
             },
         ] {
             assert_eq!(verdict.strictest(Verdict::Drop), Verdict::Drop);
@@ -109,6 +112,7 @@ mod tests {
         let first = Verdict::Reject {
             condition: StanzaErrorCondition::Forbidden,
             application: None,
+            text: None,
         };
         let second = Verdict::Reject {
             condition: StanzaErrorCondition::NotAcceptable,
@@ -116,6 +120,7 @@ mod tests {
                 name: "blocked",
                 namespace: "urn:test",
             }),
+            text: None,
         };
         assert_eq!(first.strictest(second), first);
         assert_eq!(second.strictest(first), second);
@@ -128,6 +133,7 @@ mod tests {
         let rejection = Verdict::Reject {
             condition: StanzaErrorCondition::Forbidden,
             application: None,
+            text: None,
         };
         for kind in [
             StanzaType::Presence(PresenceType::Available),
@@ -156,10 +162,12 @@ mod tests {
         let service_unavailable = Verdict::Reject {
             condition: StanzaErrorCondition::ServiceUnavailable,
             application: None,
+            text: None,
         };
         let competing_rejection = Verdict::Reject {
             condition: StanzaErrorCondition::Forbidden,
             application: None,
+            text: None,
         };
         for kind in [StanzaType::Iq(IqType::Get), StanzaType::Iq(IqType::Set)] {
             assert_eq!(Verdict::Drop.for_stanza(kind), service_unavailable);

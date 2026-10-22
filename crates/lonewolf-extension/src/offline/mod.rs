@@ -182,7 +182,14 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
                     recipient_jid = ?message.recipient.as_str(),
                     "offline message policy decided"
                 );
-                return Err(StanzaErrorCondition::ResourceConstraint.into());
+                return Err(HandlerError::described(
+                    StanzaErrorCondition::ResourceConstraint,
+                    lonewolf_xmpp::stanza::StanzaErrorText::Limit {
+                        prefix: "The offline message queue has reached its limit of ",
+                        max: limits.max_messages_per_account.get() as usize,
+                        suffix: " messages. Retry after the recipient retrieves queued messages.",
+                    },
+                ));
             }
             let (stored_at, stanza) = xml::stamped(&message, scratch)?;
             let sequence = match transaction
@@ -288,7 +295,12 @@ fn store_error(
 fn offline_error(error: OfflineError, operation: &'static str) -> HandlerError {
     match error {
         OfflineError::NoAccount => StanzaErrorCondition::ServiceUnavailable.into(),
-        OfflineError::ValueTooLarge => StanzaErrorCondition::ResourceConstraint.into(),
+        OfflineError::ValueTooLarge => HandlerError::described(
+            StanzaErrorCondition::ResourceConstraint,
+            lonewolf_xmpp::stanza::StanzaErrorText::Static(
+                "The message exceeds the offline storage size limit. Send a smaller message.",
+            ),
+        ),
         OfflineError::Storage(error) => HandlerError::Internal {
             condition: StanzaErrorCondition::InternalServerError,
             failure: Failure {

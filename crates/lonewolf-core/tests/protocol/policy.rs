@@ -20,7 +20,7 @@ fn outbound_rejection_carries_the_application_condition() -> TestResult {
     alice.send(
         "<message type='chat' to='blocked@localhost' id='blocked'><body>Blocked</body></message>",
     )?;
-    alice.expect_xml("<message xmlns='jabber:client' from='blocked@localhost' to='alice@localhost/res' type='error' id='blocked'><body>Blocked</body><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='blocked@localhost' to='alice@localhost/res' type='error' id='blocked'><body>Blocked</body><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
     second.send("<message type='chat' to='blocked@localhost/res' id='first'/>")?;
     blocked.expect_xml("<message xmlns='jabber:client' from='blocked@localhost/second' to='blocked@localhost/res' type='chat' id='first'/>")?;
     alice.close()?;
@@ -39,8 +39,8 @@ fn inbound_drop_replies_to_iq_and_discards_messages() -> TestResult {
     let mut bob = suite.connect("bob", PASSWORD, "res")?;
 
     spammer.send("<message type='chat' to='alice@localhost/res' id='drop'/><iq type='get' to='alice@localhost/res' id='drop-iq'><query xmlns='urn:test:iq'/></iq><iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
-    spammer.expect_xml("<iq xmlns='jabber:client' from='alice@localhost/res' type='error' id='drop-iq'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
-    spammer.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    spammer.expect_xml("<iq xmlns='jabber:client' from='alice@localhost/res' type='error' id='drop-iq'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
+    spammer.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.expect_no_tls_input()?;
     bob.send("<message type='chat' to='alice@localhost/res' id='first'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
@@ -58,7 +58,7 @@ fn inbound_rejection_answers_the_sender() -> TestResult {
     let mut rejecter = suite.connect("rejecter", PASSWORD, "res")?;
 
     rejecter.send("<message type='chat' to='alice@localhost/res' id='reject'/>")?;
-    rejecter.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='rejecter@localhost/res' type='error' id='reject'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    rejecter.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='rejecter@localhost/res' type='error' id='reject'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></message>")?;
     alice.send("<message type='chat' to='alice@localhost/res' id='first'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='alice@localhost/res' type='chat' id='first'/>")?;
     alice.close()?;
@@ -85,7 +85,7 @@ fn failing_policy_rejects_with_its_condition() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "res")?;
 
     alice.send("<message type='chat' to='broken@localhost' id='failure'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='broken@localhost' to='alice@localhost/res' type='error' id='failure'><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='broken@localhost' to='alice@localhost/res' type='error' id='failure'><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server could not complete the request. Try again later.</text></error></message>")?;
     alice.close()
 }
 
@@ -100,10 +100,14 @@ fn iq_requests_follow_policy_and_rejected_responses_are_dropped() -> TestResult 
     let mut bob = suite.connect("bob", PASSWORD, "res")?;
     let mut second = suite.connect("blocked", PASSWORD, "second")?;
 
-    alice.send(
-        "<iq type='get' to='blocked@localhost/res' id='reject'><query xmlns='urn:test:iq'/></iq>",
-    )?;
-    alice.expect_xml("<iq xmlns='jabber:client' from='blocked@localhost/res' type='error' id='reject'><query xmlns='urn:test:iq'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
+    for from in [
+        "",
+        " from='alice@localhost/res'",
+        " from='mallory@localhost/forged'",
+    ] {
+        alice.send(&format!("<iq type='get' to='blocked@localhost/res' id='reject'{from}><query xmlns='urn:test:iq'/></iq>"))?;
+        alice.expect_xml("<iq xmlns='jabber:client' from='blocked@localhost/res' type='error' id='reject'><query xmlns='urn:test:iq'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
+    }
     toggle(&mut alice, false)?;
     alice.send("<presence to='blocked@localhost/res'/>")?;
     blocked.expect_xml(

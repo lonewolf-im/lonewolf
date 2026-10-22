@@ -49,7 +49,7 @@ fn rejected_binding_and_bound_stanzas_preserve_the_connection_allowance() -> Tes
     let mut alice = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     alice.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     alice.expect_no_tls_input()?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/desk</jid></bind></iq>")?;
@@ -182,7 +182,7 @@ fn stanza_shaping_does_not_extend_the_resource_binding_deadline() -> TestResult 
     let mut alice = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let started = Instant::now();
     alice.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     alice.send("<iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     alice
         .receive()?
@@ -227,7 +227,7 @@ fn new_recipient_budget_rejects_fourth_without_poisoning_recent_recipients() -> 
         alice.send(&format!(
             "<message to='erin@localhost/phone' type='chat' id='{id}'/>"
         ))?;
-        alice.expect_xml(&format!("<message xmlns='jabber:client' from='erin@localhost/phone' to='alice@localhost/desk' type='error' id='{id}'><error type='wait'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))?;
+        alice.expect_xml(&format!("<message xmlns='jabber:client' from='erin@localhost/phone' to='alice@localhost/desk' type='error' id='{id}'><error type='wait'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Too many distinct recipients were contacted. Wait before contacting additional recipients.</text></error></message>"))?;
     }
     for (index, name) in ["bob", "carol", "dave"].into_iter().enumerate() {
         alice.send(&format!(

@@ -199,8 +199,17 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
         max_pending_subscription_requests,
     )
     .await
-    .map_err(|error| roster_error(error, "roster_write"))?
-    {
+    .map_err(|error| match error {
+        lonewolf_storage::roster::RosterError::PendingLimitExceeded => HandlerError::described(
+            StanzaErrorCondition::ResourceConstraint,
+            lonewolf_xmpp::stanza::StanzaErrorText::Limit {
+                prefix: "The recipient's pending subscription request limit of ",
+                max: max_pending_subscription_requests.get(),
+                suffix: " has been reached. Retry after the recipient handles pending requests.",
+            },
+        ),
+        error => roster_error(error, "roster_write"),
+    })? {
         RequestOutcome::ContactMissing => {
             return Err(StanzaErrorCondition::ServiceUnavailable.into());
         }

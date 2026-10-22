@@ -475,7 +475,7 @@ fn allowed_ping_requests_validate_payloads_and_return_empty_replies() -> TestRes
                     assert!(
                         matches!(
                             result,
-                            Err(error) if error == HandlerError::Stanza(StanzaErrorCondition::BadRequest).into()
+                            Err(error) if error == super::malformed_ping().into()
                         ),
                         "{target} {}",
                         case.name
@@ -570,7 +570,7 @@ fn ping_validator_rejects_wrong_resolved_qnames() -> TestResult {
         let payload = Element::builder_in(name, namespace, &mut arena)?.build()?;
         assert_eq!(
             validate_payload(payload.resolve(&arena)?),
-            Err(HandlerError::Stanza(StanzaErrorCondition::BadRequest))
+            Err(super::malformed_ping())
         );
     }
     Ok(())

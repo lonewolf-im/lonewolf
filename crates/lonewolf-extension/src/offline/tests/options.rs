@@ -95,8 +95,13 @@ fn factory_applies_defaults_and_host_specific_message_limits() -> TestResult {
                         &mut scratch
                     )
                     .await,
-                Err(HandlerError::Stanza(
-                    StanzaErrorCondition::ResourceConstraint
+                Err(HandlerError::described(
+                    StanzaErrorCondition::ResourceConstraint,
+                    lonewolf_xmpp::stanza::StanzaErrorText::Limit {
+                        prefix: "The offline message queue has reached its limit of ",
+                        max: limit,
+                        suffix: " messages. Retry after the recipient retrieves queued messages.",
+                    }
                 )),
                 "{domain}"
             );

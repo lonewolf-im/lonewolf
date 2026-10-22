@@ -26,6 +26,7 @@ pub(crate) enum ArchiveStep<A: ChunkAllocator> {
     Rejected {
         stanza: RoutedStanza<A>,
         condition: StanzaErrorCondition,
+        text: lonewolf_xmpp::stanza::StanzaErrorText,
     },
 }
 
@@ -120,6 +121,7 @@ pub(crate) async fn archive<A: ChunkAllocator + Clone>(
             return Ok(ArchiveStep::Rejected {
                 stanza: routed,
                 condition: error.condition(),
+                text: error.text(),
             });
         }
         if sent.is_some() || received.is_some() {

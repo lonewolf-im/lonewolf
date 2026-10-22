@@ -484,7 +484,7 @@ async fn send_bind_error(
     error_type: &str,
     condition: &str,
 ) -> Result<(), CloseOutcome> {
-    let mut xml = String::with_capacity(129 + CLIENT_NAMESPACE.len() + id.len());
+    let mut xml = String::with_capacity(512 + CLIENT_NAMESPACE.len() + id.len());
     xml.push_str("<iq xmlns='");
     xml.push_str(CLIENT_NAMESPACE);
     xml.push_str("' type='error' id='");
@@ -495,7 +495,20 @@ async fn send_bind_error(
     xml.push_str(condition);
     xml.push_str(" xmlns='");
     xml.push_str(STANZA_ERROR_NAMESPACE);
-    xml.push_str("'/></error></iq>");
+    xml.push_str("'/><text xmlns='");
+    xml.push_str(STANZA_ERROR_NAMESPACE);
+    xml.push_str("' xml:lang='en'>");
+    let text = match condition {
+        "bad-request" => {
+            "Resource binding requires one bind element and a valid optional resource name."
+        }
+        "resource-constraint" => {
+            "The server cannot allocate another resource for this account. Close an existing session or try again later."
+        }
+        _ => "The requested operation is not available before resource binding completes.",
+    };
+    escape_text(&mut xml, text);
+    xml.push_str("</text></error></iq>");
     writer.send_stanza_xml(&xml, StanzaKind::Iq).await
 }
 

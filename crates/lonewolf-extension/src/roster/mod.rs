@@ -283,7 +283,7 @@ where
             let snapshot = transaction
                 .roster(&owner, self.quota(&owner))
                 .await
-                .map_err(|error| roster_error(error, "roster_read"))?;
+                .map_err(|error| roster_quota_error(error, "roster_read", self.quota(&owner)))?;
             let item_count = snapshot.items.len();
             let outcome;
             let payload = match versioning::answer(known, &snapshot) {
@@ -334,10 +334,22 @@ where
                         groups: update.groups,
                         subscription,
                     };
+                    let quota = self.quota(&owner);
+                    if item.groups.len() > lonewolf_storage::roster::MAX_GROUPS_PER_ITEM {
+                        return Err(HandlerError::described(
+                            StanzaErrorCondition::ResourceConstraint,
+                            lonewolf_xmpp::stanza::StanzaErrorText::Limit {
+                                prefix: "A roster contact can have at most ",
+                                max: lonewolf_storage::roster::MAX_GROUPS_PER_ITEM,
+                                suffix: " groups. Remove groups from this contact.",
+                            },
+                        )
+                        .into());
+                    }
                     let version = transaction
-                        .put_roster_item(&owner, &item, self.quota(&owner))
+                        .put_roster_item(&owner, &item, quota)
                         .await
-                        .map_err(|error| roster_error(error, "roster_write"))?;
+                        .map_err(|error| roster_quota_error(error, "roster_write", quota))?;
                     let mutation = RosterMutation {
                         version,
                         value: item,
@@ -404,7 +416,7 @@ where
             let snapshot = transaction
                 .roster(&owner, self.quota(&owner))
                 .await
-                .map_err(|error| roster_error(error, "roster_read"))?;
+                .map_err(|error| roster_quota_error(error, "roster_read", self.quota(&owner)))?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
             let (pending, contacts) = if update.transition == PresenceTransition::Initial {
                 let pending = transaction
@@ -563,12 +575,47 @@ fn storage_error(error: lonewolf_storage::StorageError, operation: &'static str)
     }
 }
 
+fn roster_quota_error(
+    error: RosterError,
+    operation: &'static str,
+    quota: RosterQuota,
+) -> HandlerError {
+    match error {
+        RosterError::QuotaExceeded => HandlerError::described(
+            StanzaErrorCondition::ResourceConstraint,
+            lonewolf_xmpp::stanza::StanzaErrorText::TwoLimits {
+                parts: &[
+                    "The roster exceeds its quota of ",
+                    " contacts or ",
+                    " stored bytes. Remove contacts or reduce contact and group data.",
+                ],
+                values: [quota.max_items.get(), quota.max_bytes.get()],
+            },
+        ),
+        error => roster_error(error, operation),
+    }
+}
+
 fn roster_error(error: RosterError, operation: &'static str) -> HandlerError {
     match error {
-        RosterError::ValueTooLarge => StanzaErrorCondition::NotAcceptable.into(),
-        RosterError::PendingLimitExceeded | RosterError::QuotaExceeded => {
-            StanzaErrorCondition::ResourceConstraint.into()
-        }
+        RosterError::ValueTooLarge => HandlerError::described(
+            StanzaErrorCondition::NotAcceptable,
+            lonewolf_xmpp::stanza::StanzaErrorText::Static(
+                "A roster value is too large. Shorten the contact name or group names.",
+            ),
+        ),
+        RosterError::PendingLimitExceeded => HandlerError::described(
+            StanzaErrorCondition::ResourceConstraint,
+            lonewolf_xmpp::stanza::StanzaErrorText::Static(
+                "The recipient's pending subscription request limit has been reached. Retry after the recipient handles pending requests.",
+            ),
+        ),
+        RosterError::QuotaExceeded => HandlerError::described(
+            StanzaErrorCondition::ResourceConstraint,
+            lonewolf_xmpp::stanza::StanzaErrorText::Static(
+                "The roster exceeds its contact count, stored byte, or group limit. Remove contacts or reduce contact and group data.",
+            ),
+        ),
         RosterError::NoAccount => StanzaErrorCondition::Forbidden.into(),
         RosterError::Storage(error) => storage_error(error, operation),
     }

@@ -84,7 +84,7 @@ fn rejected_iq_envelopes_return_bad_request_and_allow_binding_on_the_same_connec
         let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
         client.send(&format!("<iq {envelope}><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>"))?;
         client.expect_xml(&format!(
-            "<iq xmlns='jabber:client' type='error' id='{id}'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"
+            "<iq xmlns='jabber:client' type='error' id='{id}'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>"
         ))?;
 
         assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -104,7 +104,7 @@ fn rejected_iq_child_counts_return_bad_request_and_allow_binding_retry() -> Test
         let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         client.send(&format!("<iq type='set' id='bad'>{children}</iq>"))?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
 
         assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
         client.close()?;
@@ -154,7 +154,7 @@ const PRE_BIND_RESPONSES: &[&str] = &[
 fn iq_responses_are_ignored_before_binding_for_permitted_addresses() -> TestResult {
     for response in [
         "<iq type='result' id='reply'{address}/>",
-        "<iq type='error' id='reply'{address}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+        "<iq type='error' id='reply'{address}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>",
         "<iq type='result'{address}/>",
         "<iq type='result' id='bad'{address}><first/><second/></iq>",
         "<iq type='error' id='bad'{address}/>",
@@ -185,7 +185,7 @@ fn fifth_rejected_iq_envelope_still_allows_success() -> TestResult {
 
     for _ in 0..5 {
         client.send("<iq type='bogus' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     }
 
     assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -205,7 +205,7 @@ fn rejected_iq_envelopes_share_the_binding_failure_limit() -> TestResult {
             "<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>"
         };
         client.send(input)?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     }
     client.expect_stream_error("policy-violation")?;
 
@@ -297,7 +297,7 @@ fn resource_attributes_returns_bad_request_and_allows_retry() -> TestResult {
     client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'>desk</resource></bind></iq>")?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
     </iq>",
     )?;
 
@@ -314,7 +314,7 @@ fn duplicate_resources_returns_bad_request_and_allows_retry() -> TestResult {
     client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource><resource>phone</resource></bind></iq>")?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
     </iq>",
     )?;
 
@@ -331,7 +331,7 @@ fn unknown_child_returns_bad_request_and_allows_retry() -> TestResult {
     client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><other/></bind></iq>")?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
     </iq>",
     )?;
 
@@ -350,7 +350,7 @@ fn text_content_returns_bad_request_and_allows_retry() -> TestResult {
     )?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
     </iq>",
     )?;
 
@@ -368,7 +368,7 @@ fn fifth_binding_failure_still_allows_success() -> TestResult {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
         client.expect_xml(
             "<iq xmlns='jabber:client' type='error' id='bad'>
-            <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+            <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
         </iq>",
         )?;
     }
@@ -387,7 +387,7 @@ fn sixth_binding_failure_closes_the_stream() -> TestResult {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
         client.expect_xml(
             "<iq xmlns='jabber:client' type='error' id='bad'>
-            <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+            <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
         </iq>",
         )?;
     }
@@ -395,7 +395,7 @@ fn sixth_binding_failure_closes_the_stream() -> TestResult {
     client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
     </iq>",
     )?;
     client.expect_stream_error("policy-violation")
@@ -412,7 +412,7 @@ fn configured_resource_binding_retries_close_after_eight_failed_attempts() -> Te
 
     for _ in 0..8 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     }
     client.expect_stream_error("policy-violation")
 }
@@ -478,7 +478,7 @@ fn resource_limit_allows_retry_after_another_client_disconnects() -> TestResult 
 
     phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
     phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'>
-        <error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error>
     </iq>")?;
 
     desktop.close()?;
@@ -496,7 +496,7 @@ fn resource_limit_bind_failures_close_the_stream_at_the_retry_limit() -> TestRes
 
     for _ in 0..6 {
         phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
-        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error></iq>")?;
     }
     phone.expect_stream_error("policy-violation")
 }
@@ -511,10 +511,10 @@ fn malformed_and_resource_limit_bind_failures_share_the_retry_limit() -> TestRes
     for attempt in 0..6 {
         if attempt % 2 == 0 {
             phone.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
-            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
         } else {
             phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
-            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error></iq>")?;
         }
     }
     phone.expect_stream_error("policy-violation")
@@ -534,10 +534,10 @@ fn unusable_resource_fallback_and_resource_limit_share_the_retry_limit() -> Test
     for attempt in 0..6 {
         if attempt % 2 == 0 {
             phone.send(&format!("<iq type='set' id='invalid'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{overlong_resource}</resource></bind></iq>"))?;
-            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error></iq>")?;
         } else {
             phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
-            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error></iq>")?;
         }
     }
     phone.expect_stream_error("policy-violation")
@@ -556,7 +556,7 @@ fn prefix_free_stream_returns_client_namespace_binding_and_iq_replies() -> TestR
     client.send("<iq xmlns='jabber:client' type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
     client.expect_xml(
         "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
     </iq>",
     )?;
 
@@ -570,7 +570,7 @@ fn prefix_free_stream_returns_client_namespace_binding_and_iq_replies() -> TestR
     client.send("<iq xmlns='jabber:client' type='get' id='unsupported'><query xmlns='urn:test:unknown'/></iq>")?;
     client.expect_xml("<iq xmlns='jabber:client' type='error' id='unsupported'>
         <query xmlns='urn:test:unknown'/>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
     </iq>")?;
     client.close()
 }
@@ -593,7 +593,7 @@ fn fifth_structural_failure_still_allows_unusable_resource_fallback() -> TestRes
             client.send(&format!(
                 "<iq type='set' id='bad'><bind xmlns='{BIND_NAMESPACE}'>{payload}</bind></iq>"
             ))?;
-            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
         }
 
         assert_generated_identifier(&client.bind(Some(resource))?)?;
@@ -613,7 +613,7 @@ fn saturated_unusable_resource_fallback_counts_one_failure_per_request() -> Test
 
         for _ in 0..6 {
             phone.send(&format!("<iq type='set' id='full'><bind xmlns='{BIND_NAMESPACE}'><resource>{resource}</resource></bind></iq>"))?;
-            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error></iq>")?;
         }
         phone.expect_stream_error("policy-violation")?;
         desktop.close()?;
@@ -637,7 +637,7 @@ fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
 
         for _ in 0..6 {
             client.send(&format!("<iq type='set' id='bad'>{bind}</iq>"))?;
-            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
         }
         client.expect_stream_error("policy-violation")?;
     }
@@ -652,7 +652,7 @@ fn nested_resource_children_close_at_the_retry_limit() -> TestResult {
 
     for _ in 0..6 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource><other/></resource></bind></iq>")?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     }
     client.expect_stream_error("policy-violation")
 }
@@ -665,7 +665,7 @@ fn mixed_resource_children_close_at_the_retry_limit() -> TestResult {
 
     for _ in 0..6 {
         client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk<other/></resource></bind></iq>")?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     }
     client.expect_stream_error("policy-violation")
 }
@@ -679,7 +679,7 @@ fn pre_bind_disco_without_destination_returns_service_unavailable_then_binds() -
     client.send(
         "<iq type='get' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>",
     )?;
-    client.expect_xml("<iq xmlns='jabber:client' type='error' id='disco'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id='disco'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
     assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
     client.close()
 }
@@ -704,7 +704,7 @@ fn pre_bind_requests_to_permitted_destinations_return_service_unavailable() -> T
             client.send(&format!(
                 "<iq type='{kind}' id='a&amp;b'{attributes}>{payload}</iq>"
             ))?;
-            client.expect_xml("<iq xmlns='jabber:client' type='error' id='a&amp;b'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='a&amp;b'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
             assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
             client.close()?;
         }
@@ -719,7 +719,7 @@ fn own_bare_destination_accepts_binding_and_rejected_request_recovery() -> TestR
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send("<iq type='get' id='bad' to='alice@localhost'><first/><second/></iq>")?;
-    client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     client.send("<iq type='set' id='bind' to='alice@localhost'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     client.expect_xml("<iq xmlns='jabber:client' type='result' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>alice@localhost/desk</jid></bind></iq>")?;
     client.close()
@@ -738,7 +738,7 @@ fn pre_bind_iqs_to_other_entities_close_before_request_or_response_handling() ->
             "type='get' id='query'><ping xmlns='urn:xmpp:ping'/></iq>",
             "type='set' id='query'><query xmlns='urn:test:unsupported'/></iq>",
             "type='result' id='reply'/>",
-            "type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+            "type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>",
             "type='result'/>",
             "type='error'/>",
         ] {
@@ -774,7 +774,7 @@ fn pre_bind_responses_preserve_namespace_and_address_gate_precedence() -> TestRe
             let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
             let payload = if envelope.starts_with("type='error' id=") {
-                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
+                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error>"
             } else {
                 ""
             };
@@ -794,11 +794,11 @@ fn ignored_pre_bind_responses_do_not_increment_or_reset_the_failure_count() -> T
 
         for _ in 0..5 {
             client.send("<iq type='set' id='bad'><query xmlns='urn:test:unsupported'/></iq>")?;
-            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
         }
         for _ in 0..7 {
             client.send("<iq type='result' id='reply'/>")?;
-            client.send("<iq type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.send("<iq type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
             client.send("<iq type='result'/>")?;
             client.send("<iq type='error'/>")?;
         }
@@ -807,7 +807,7 @@ fn ignored_pre_bind_responses_do_not_increment_or_reset_the_failure_count() -> T
             client.close()?;
         } else {
             client.send("<iq type='get' id='sixth'><ping xmlns='urn:xmpp:ping'/></iq>")?;
-            client.expect_xml("<iq xmlns='jabber:client' type='error' id='sixth'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='sixth'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
             client.expect_stream_error("policy-violation")?;
         }
     }
@@ -829,7 +829,7 @@ fn unsupported_pre_bind_requests_close_at_default_and_configured_retry_limits() 
             client.send(&format!(
                 "<iq type='{kind}' id='bad'><query xmlns='urn:test:unsupported'/></iq>"
             ))?;
-            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
         }
         client.expect_stream_error("policy-violation")?;
     }
@@ -845,11 +845,11 @@ fn unsupported_malformed_and_resource_limit_failures_share_the_pre_bind_budget()
 
     for _ in 0..2 {
         phone.send("<iq type='set' id='unsupported'><query xmlns='urn:test:unsupported'/></iq>")?;
-        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='unsupported'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='unsupported'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
         phone.send("<iq type='set' id='malformed'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
-        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='malformed'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='malformed'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
         phone.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
-        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        phone.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error></iq>")?;
     }
     phone.expect_stream_error("policy-violation")?;
     desktop.close()

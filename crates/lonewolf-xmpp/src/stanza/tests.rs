@@ -1555,7 +1555,7 @@ fn error_reply_writes_the_application_condition_after_the_defined_condition() ->
     assert_eq!(
         xml,
         format!(
-            r#"<message xmlns="jabber:client" type="error"><error type="{}"><not-acceptable xmlns="urn:ietf:params:xml:ns:xmpp-stanzas"/><blocked xmlns="urn:xmpp:blocking:errors"/></error></message>"#,
+            r#"<message xmlns="jabber:client" type="error"><error type="{}"><not-acceptable xmlns="urn:ietf:params:xml:ns:xmpp-stanzas"/><text xmlns="urn:ietf:params:xml:ns:xmpp-stanzas" xml:lang="en">A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns="urn:xmpp:blocking:errors"/></error></message>"#,
             condition.error_type()
         )
     );

@@ -58,7 +58,7 @@ fn rejected_messages_produce_only_a_sent_event() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     alice.send("<message type='normal' to='bob@localhost/absent' id='reject'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/absent' to='alice@localhost/desk' type='error' id='reject'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/absent' to='alice@localhost/desk' type='error' id='reject'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></message>")?;
     events(
         &mut alice,
         "desk",
@@ -74,7 +74,7 @@ fn messages_stopped_by_policy_produce_no_events() -> TestResult {
     accounts(&suite)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message type='chat' to='blocked@localhost' id='blocked'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='blocked@localhost' to='alice@localhost/desk' type='error' id='blocked'><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='blocked@localhost' to='alice@localhost/desk' type='error' id='blocked'><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
     events(&mut alice, "desk", "")?;
     alice.close()
 }

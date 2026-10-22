@@ -481,6 +481,7 @@ fn evaluate_keeps_registration_and_check_order_on_one_snapshot() -> TestResult {
                 name: "blocked",
                 namespace: "urn:test:policy",
             }),
+            text: None,
         };
         let mut extensions = Extensions::default();
         for (name, verdict) in [
@@ -490,6 +491,7 @@ fn evaluate_keeps_registration_and_check_order_on_one_snapshot() -> TestResult {
                 Verdict::Reject {
                     condition: StanzaErrorCondition::ServiceUnavailable,
                     application: None,
+                    text: None,
                 },
             ),
         ] {
@@ -651,7 +653,8 @@ fn evaluate_fails_closed_and_stops_handlers_and_checks_after_drop() -> TestResul
                 .map_err(|_| "policy failed")?,
             Verdict::Reject {
                 condition: StanzaErrorCondition::InternalServerError,
-                application: None
+                application: None,
+                text: Some(StanzaErrorCondition::InternalServerError.default_text()),
             }
         );
         assert_eq!(

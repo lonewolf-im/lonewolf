@@ -145,7 +145,7 @@ fn authentication_and_binding_outcomes_are_reported() -> TestResult {
     suite.wait_for_metric("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 1")?;
     let mut second = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     second.send("<iq type='set' id='full'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>phone</resource></bind></iq>")?;
-    second.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    second.expect_xml("<iq xmlns='jabber:client' type='error' id='full'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot allocate another resource for this account. Close an existing session or try again later.</text></error></iq>")?;
     suite.wait_for_metric("lonewolf_c2s_stanzas_received_total{listener=\"0\",kind=\"iq\"} 2")?;
     suite.wait_for_metric("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 2")?;
     for sample in [
@@ -178,7 +178,7 @@ fn stanza_byte_and_rate_limit_counters_are_reported() -> TestResult {
     loop {
         let reply = alice.receive()?;
         if reply.attribute("id") == Some("metrics-barrier") {
-            reply.assert_xml("<iq xmlns='jabber:client' type='error' id='metrics-barrier'><query xmlns='urn:test:metrics-barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            reply.assert_xml("<iq xmlns='jabber:client' type='error' id='metrics-barrier'><query xmlns='urn:test:metrics-barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
             break;
         }
         reply.assert_name("jabber:client", "message");

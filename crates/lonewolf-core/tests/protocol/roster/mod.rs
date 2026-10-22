@@ -1754,7 +1754,7 @@ fn subscription_request_to_a_missing_account_returns_an_error_without_mutating_t
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<presence type='subscribe' id='missing' to='bob@localhost'/>")?;
-    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='missing' from='bob@localhost' to='alice@localhost/desk'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='missing' from='bob@localhost' to='alice@localhost/desk'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></presence>")?;
     request_roster(
         &mut alice,
         "unchanged-roster",
@@ -1782,7 +1782,7 @@ private_key_path = "private-key.pem"
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<presence type='subscribe' id='disabled' to='bob@other.localhost'/>")?;
-    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='disabled' from='bob@other.localhost' to='alice@localhost/desk'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='disabled' from='bob@other.localhost' to='alice@localhost/desk'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></presence>")?;
     request_roster(
         &mut alice,
         "unchanged-roster",
@@ -1826,7 +1826,7 @@ fn remote_subscriptions_preserve_the_roster_and_version() -> TestResult {
                 )?;
                 alice.send(&format!("<iq type='result' id='{push}'/>"))?;
             } else {
-                alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='remote' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+                alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='remote' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error></presence>"))?;
             }
             alice.send(
                 "<iq type='get' id='unchanged'><query xmlns='jabber:iq:roster' ver=''/></iq>",
@@ -1852,7 +1852,7 @@ fn remote_subscriptions_return_errors_with_the_sender_roster_disabled() -> TestR
             "remote.example/phone",
         ] {
             alice.send(&format!("<presence type='{kind}' from='mallory@localhost/spy' to='{target}' id='remote'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick></presence>"))?;
-            alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='remote' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+            alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='remote' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error></presence>"))?;
         }
         alice.send(&format!(
             "<presence type='{kind}' to='bob@localhost/phone' id='local'/>"
@@ -1883,7 +1883,7 @@ fn remote_subscription_policy_denials_precede_routing_with_and_without_roster() 
             alice.send(&format!(
                 "<presence type='{kind}' to='blocked@remote.example/phone' id='allowed'/>"
             ))?;
-            alice.expect_xml("<presence xmlns='jabber:client' type='error' id='allowed' from='blocked@remote.example/phone' to='alice@localhost/desk'><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+            alice.expect_xml("<presence xmlns='jabber:client' type='error' id='allowed' from='blocked@remote.example/phone' to='alice@localhost/desk'><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error></presence>")?;
         }
         alice.close()?;
     }
@@ -1909,7 +1909,7 @@ fn roster_get_with_an_item_returns_bad_request() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<iq type='get' id='invalid-roster'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
 
     alice.close()
 }
@@ -2112,7 +2112,7 @@ fn a_rejected_roster_get_still_delivers_the_pushes_queued_before_it() -> TestRes
     let mut contacts = [first.as_str(), second.as_str()];
     contacts.sort_unstable();
     assert_eq!(contacts, ["bob@localhost", "carol@localhost"]);
-    desk.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='0'><item jid='bob@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    desk.expect_xml("<iq xmlns='jabber:client' type='error' id='invalid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster' ver='0'><item jid='bob@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
     desk.send("<iq type='get' id='since-2'><query xmlns='jabber:iq:roster' ver='2'/></iq>")?;
     desk.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='since-2' to='alice@localhost/desk'/>",
@@ -2177,7 +2177,7 @@ fn roster_get_for_a_missing_account_returns_service_unavailable() -> TestResult 
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='missing-roster' to='missing@localhost'><query xmlns='jabber:iq:roster'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-roster' from='missing@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-roster' from='missing@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.send("<message to='alice@localhost/desk' id='processed'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='processed'/>")?;
     alice.close()
@@ -2189,7 +2189,7 @@ fn roster_set_for_a_missing_account_returns_service_unavailable() -> TestResult 
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='missing-roster' to='missing@localhost'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-roster' from='missing@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-roster' from='missing@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.send("<message to='alice@localhost/desk' id='processed'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='processed'/>")?;
     alice.close()
@@ -2205,7 +2205,7 @@ fn roster_get_for_another_account_returns_forbidden() -> TestResult {
     alice.send(
         "<iq type='get' id='other-roster' to='bob@localhost'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-roster' from='bob@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-roster' from='bob@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>You do not have permission to perform this operation.</text></error></iq>")?;
 
     alice.close()
 }
@@ -2406,7 +2406,7 @@ fn roster_set_with_multiple_items_returns_bad_request_without_mutating() -> Test
         "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
     alice.send("<iq type='set' id='multiple-items'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/><item jid='carol@localhost'/></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='multiple-items' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/><item jid='carol@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='multiple-items' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/><item jid='carol@localhost'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
     request_roster(
         &mut alice,
         "unchanged-roster",
@@ -2428,7 +2428,7 @@ fn roster_set_with_duplicate_groups_returns_bad_request_without_mutating() -> Te
         "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
     alice.send("<iq type='set' id='duplicate-groups'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group>Friends</group><group>Friends</group></item></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='duplicate-groups' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group>Friends</group><group>Friends</group></item></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='duplicate-groups' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group>Friends</group><group>Friends</group></item></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
     request_roster(
         &mut alice,
         "unchanged-roster",
@@ -2450,7 +2450,7 @@ fn roster_set_with_an_empty_group_returns_not_acceptable_without_mutating() -> T
         "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
     alice.send("<iq type='set' id='empty-group'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group/></item></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='empty-group' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group/></item></query><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='empty-group' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'><group/></item></query><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text></error></iq>")?;
     request_roster(
         &mut alice,
         "unchanged-roster",
@@ -2474,7 +2474,7 @@ fn roster_set_for_another_account_returns_forbidden_without_mutating() -> TestRe
         "<iq xmlns='jabber:client' type='result' id='initial-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
     alice.send("<iq type='set' id='other-roster' to='bob@localhost'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-roster' from='bob@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-roster' from='bob@localhost' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query><error type='auth'><forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>You do not have permission to perform this operation.</text></error></iq>")?;
     request_roster(
         &mut bob,
         "unchanged-roster",
@@ -2492,7 +2492,7 @@ fn roster_set_without_an_item_returns_bad_request() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<iq type='set' id='missing-item'><query xmlns='jabber:iq:roster'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-item' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-item' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
 
     alice.close()
 }
@@ -2504,7 +2504,7 @@ fn roster_set_without_an_item_jid_returns_bad_request() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<iq type='set' id='missing-jid'><query xmlns='jabber:iq:roster'><item name='Bob'/></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-jid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item name='Bob'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-jid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item name='Bob'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
 
     alice.close()
 }
@@ -2516,7 +2516,7 @@ fn roster_set_with_a_full_jid_returns_bad_request() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<iq type='set' id='full-jid'><query xmlns='jabber:iq:roster'><item jid='bob@localhost/phone'/></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='full-jid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost/phone'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='full-jid' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost/phone'/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
 
     alice.close()
 }
@@ -2540,7 +2540,7 @@ fn roster_set_with_an_ipv6_zone_returns_bad_request_without_mutating() -> TestRe
     for domain in ["[fe80::1%eth0]", "[fe80::1%25eth0]", "[fe80::1%25eth%32]"] {
         for fields in ["name='Scoped'", "subscription='remove'"] {
             alice.send(&format!("<iq type='set' id='scoped'><query xmlns='jabber:iq:roster'><item jid='bob@{domain}' {fields}/></query></iq>"))?;
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='scoped' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@{domain}' {fields}/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='scoped' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@{domain}' {fields}/></query><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>"))?;
             request_roster(
                 &mut alice,
                 "unchanged-roster",
@@ -3032,7 +3032,7 @@ fn roster_removal_of_a_missing_item_returns_item_not_found() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<iq type='set' id='missing'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='remove'/></query></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='remove'/></query><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' subscription='remove'/></query><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested item is not available.</text></error></iq>")?;
     request_roster(
         &mut alice,
         "unchanged-roster",
@@ -3654,7 +3654,13 @@ fn roster_set_enforces_shared_item_and_byte_quota() -> TestResult {
                         match response.attribute("type") {
                             Some("result")=>Ok(true),
                             Some("error")=> {
-                                response.child("jabber:client","error")?.child("urn:ietf:params:xml:ns:xmpp-stanzas","resource-constraint")?;
+                                let error = response.child("jabber:client", "error")?;
+                                assert_eq!(error.attribute("type"), Some("wait"));
+                                assert_eq!(error.children.len(), 2);
+                                error.child("urn:ietf:params:xml:ns:xmpp-stanzas", "resource-constraint")?;
+                                let text = error.child("urn:ietf:params:xml:ns:xmpp-stanzas", "text")?;
+                                assert_eq!(text.attribute("xml:lang"), Some("en"));
+                                assert_eq!(text.text, format!("The roster exceeds its quota of {max_items} contacts or {max_bytes} stored bytes. Remove contacts or reduce contact and group data."));
                                 Ok(false)
                             }
                             _=>Err("unexpected quota reply".into()),

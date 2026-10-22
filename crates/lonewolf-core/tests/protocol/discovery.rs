@@ -64,7 +64,7 @@ fn discovery_and_vcard_quotas_follow_each_hosts_selection() -> TestResult {
                     "<iq xmlns='jabber:client' type='result' id='write' to='alice@{domain}/desk'/>"
                 ))?;
             } else {
-                client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='write' to='alice@{domain}/desk'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='write' to='alice@{domain}/desk'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>vCard exceeds the 1-byte limit, including XML and Base64 data. Use a smaller avatar or reduce profile data.</text></error></iq>"))?;
             }
         }
         other.send(
@@ -92,7 +92,7 @@ fn public_vcards_do_not_make_default_account_discovery_public() -> TestResult {
     bob.send("<iq type='get' to='alice@localhost' id='public'><vCard xmlns='vcard-temp'/></iq>")?;
     bob.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost' to='bob@localhost/desk' id='public'><vCard xmlns='vcard-temp' xmlns:stream='http://etherx.jabber.org/streams' xml:lang='' xml:space='default'/></iq>")?;
     bob.send("<iq type='get' to='alice@localhost' id='private'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' to='bob@localhost/desk' id='private'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' to='bob@localhost/desk' id='private'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()?;
     bob.close()
 }
@@ -151,7 +151,7 @@ fn host_queries_for_a_node_return_item_not_found() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     for namespace in [INFO_NAMESPACE, ITEMS_NAMESPACE] {
         alice.send(&format!("<iq type='get' to='localhost' id='node'><query xmlns='{namespace}' node='urn:lonewolf:test:node'/></iq>"))?;
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='node' from='localhost' to='alice@localhost/desk'><query xmlns='{namespace}' node='urn:lonewolf:test:node'/><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='node' from='localhost' to='alice@localhost/desk'><query xmlns='{namespace}' node='urn:lonewolf:test:node'/><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested item is not available.</text></error></iq>"))?;
     }
     alice.close()
 }
@@ -166,7 +166,7 @@ fn discovery_sets_are_not_routed() -> TestResult {
             alice.send(&format!(
                 "<iq type='set' to='{target}' id='set'><query xmlns='{namespace}'/></iq>"
             ))?;
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='set' from='{target}'><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='set' from='{target}'><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
         }
     }
     alice.close()
@@ -182,7 +182,7 @@ fn hosts_without_disco_do_not_answer_discovery() -> TestResult {
             alice.send(&format!(
                 "<iq type='get' to='{target}' id='disabled'><query xmlns='{namespace}'/></iq>"
             ))?;
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='disabled' from='{target}'><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='disabled' from='{target}'><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
         }
     }
     alice.close()
@@ -211,7 +211,7 @@ fn account_info_requires_presence_authorization() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     bob.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    bob.expect_xml("<iq xmlns='jabber:client' type='error' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
     bob.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
     bob.expect_xml("<iq xmlns='jabber:client' type='result' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='account' type='registered'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/></query></iq>")?;
@@ -233,7 +233,7 @@ fn missing_and_hidden_accounts_answer_alike() -> TestResult {
                 bob.send(&format!("<iq type='get' to='{target}@localhost' id='query'><query xmlns='{namespace}'{node}/></iq>"))?;
                 let reply = bob.receive()?;
                 if namespace == INFO_NAMESPACE {
-                    reply.assert_xml(&format!("<iq xmlns='jabber:client' type='error' id='query' from='{target}@localhost' to='bob@localhost/desk'><query xmlns='{namespace}'{node}/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                    reply.assert_xml(&format!("<iq xmlns='jabber:client' type='error' id='query' from='{target}@localhost' to='bob@localhost/desk'><query xmlns='{namespace}'{node}/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
                 } else {
                     reply.assert_xml(&format!("<iq xmlns='jabber:client' type='result' id='query' from='{target}@localhost' to='bob@localhost/desk'><query xmlns='{namespace}'{node}/></iq>"))?;
                 }
@@ -287,16 +287,16 @@ fn account_queries_for_a_node() -> TestResult {
     mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
     for namespace in [INFO_NAMESPACE, ITEMS_NAMESPACE] {
         alice.send(&format!("<iq type='get' to='alice@localhost' id='node'><query xmlns='{namespace}' node='x'/></iq>"))?;
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='alice@localhost/desk'><query xmlns='{namespace}' node='x'/><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='alice@localhost/desk'><query xmlns='{namespace}' node='x'/><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested item is not available.</text></error></iq>"))?;
     }
     for namespace in [INFO_NAMESPACE, ITEMS_NAMESPACE] {
         bob.send(&format!("<iq type='get' to='alice@localhost' id='node'><query xmlns='{namespace}' node='x'/></iq>"))?;
-        bob.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='bob@localhost/desk'><query xmlns='{namespace}' node='x'/><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        bob.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='bob@localhost/desk'><query xmlns='{namespace}' node='x'/><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested item is not available.</text></error></iq>"))?;
     }
     carol.send("<iq type='get' to='alice@localhost' id='node'><query xmlns='http://jabber.org/protocol/disco#items' node='x'/></iq>")?;
     carol.expect_xml("<iq xmlns='jabber:client' type='result' id='node' from='alice@localhost' to='carol@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items' node='x'/></iq>")?;
     carol.send("<iq type='get' to='alice@localhost' id='node'><query xmlns='http://jabber.org/protocol/disco#info' node='x'/></iq>")?;
-    carol.expect_xml("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='carol@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info' node='x'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    carol.expect_xml("<iq xmlns='jabber:client' type='error' id='node' from='alice@localhost' to='carol@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info' node='x'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()?;
     bob.close()?;
     carol.close()
@@ -311,7 +311,7 @@ fn without_roster_only_owners_see_account_data() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     bob.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    bob.expect_xml("<iq xmlns='jabber:client' type='error' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' id='info' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     bob.send("<iq type='get' to='alice@localhost' id='items'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
     bob.expect_xml("<iq xmlns='jabber:client' type='result' id='items' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
     alice.send("<iq type='get' to='alice@localhost' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
@@ -353,7 +353,7 @@ private_key_path = "private-key.pem"
     alice.send("<iq type='get' to='localhost' id='local'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='local' from='localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:roster'/><feature var='msgoffline'/></query></iq>")?;
     alice.send("<iq type='get' to='bob@other.localhost' id='account'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='account' from='bob@other.localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='account' from='bob@other.localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()
 }
 
@@ -366,10 +366,10 @@ fn policy_runs_before_account_discovery() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     toggle(&mut alice, true)?;
     alice.send("<iq type='get' to='blocked@localhost' id='policy'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='policy' from='blocked@localhost'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='policy' from='blocked@localhost'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
     toggle(&mut alice, false)?;
     alice.send("<iq type='get' to='blocked@localhost' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='disco' from='blocked@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='disco' from='blocked@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()
 }
 
@@ -400,7 +400,7 @@ fn remote_discovery_targets_are_not_answered() -> TestResult {
             alice.send(&format!(
                 "<iq type='get' to='{target}' id='remote'><query xmlns='{namespace}'/></iq>"
             ))?;
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='remote' from='{target}'><query xmlns='{namespace}'/><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='remote' from='{target}'><query xmlns='{namespace}'/><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error></iq>"))?;
         }
     }
     alice.close()

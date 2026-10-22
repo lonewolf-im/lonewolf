@@ -67,6 +67,7 @@ pub(crate) async fn evaluate_in<A: ChunkAllocator + Clone>(
                     Verdict::Reject {
                         condition: error.condition(),
                         application: None,
+                        text: Some(error.text()),
                     }
                 }
             };

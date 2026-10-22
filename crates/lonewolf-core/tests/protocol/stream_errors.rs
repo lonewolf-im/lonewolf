@@ -493,7 +493,7 @@ fn rejected_iq_allows_correction_before_binding() -> TestResult {
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<iq type='subscribe'/>"#)?;
-    client.expect_xml("<iq xmlns='jabber:client' type='error' id=''><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id=''><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
     assert_eq!(client.bind(Some("desktop"))?, "alice@localhost/desktop");
     client.close()
 }
@@ -1015,7 +1015,11 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
     ] {
         client.send(request)?;
         client.send("<iq type='get' id='sentinel'><query xmlns='jabber:iq:roster'/></iq>")?;
-        client.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' id='{id}' to='alice@localhost/desktop'{from}><error type='modify'><{condition} xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></{kind}>"))?;
+        let text = match condition {
+            "jid-malformed" => "An address is invalid. Use a valid XMPP address.",
+            _ => "The request has an invalid structure or value. Check the request format.",
+        };
+        client.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' id='{id}' to='alice@localhost/desktop'{from}><error type='modify'><{condition} xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>{text}</text></error></{kind}>"))?;
         client.expect_xml("<iq xmlns='jabber:client' type='result' id='sentinel' to='alice@localhost/desktop'><query xmlns='jabber:iq:roster'/></iq>")?;
     }
     client.close()?;
@@ -1056,7 +1060,7 @@ fn explicit_empty_ids_survive_valid_stanzas_and_error_replies() -> TestResult {
     client.send("<message to='alice@localhost/desktop' id=''/>")?;
     client.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost/desktop' id=''/>")?;
     client.send("<presence type='probe' to='bad@' id=''/>")?;
-    client.expect_xml("<presence xmlns='jabber:client' from='localhost' to='alice@localhost/desktop' id='' type='error'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    client.expect_xml("<presence xmlns='jabber:client' from='localhost' to='alice@localhost/desktop' id='' type='error'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>An address is invalid. Use a valid XMPP address.</text></error></presence>")?;
     client.close()
 }
 

@@ -128,7 +128,7 @@ fn assert_omitted_reply<A: ChunkAllocator>(
     assert_eq!(error.attribute("type", "")?, Some(condition.error_type()));
     assert_eq!(error.attributes()?.count(), 1);
     let conditions = error.children()?.collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(conditions.len(), 1);
+    assert_eq!(conditions.len(), 2);
     let NodeRef::Element(condition_element) = &conditions[0] else {
         return Err("expected standard condition element".into());
     };
@@ -136,6 +136,19 @@ fn assert_omitted_reply<A: ChunkAllocator>(
     assert_eq!(condition_element.namespace(), STANZA_ERROR_NAMESPACE);
     assert_eq!(condition_element.children()?.count(), 0);
     assert_eq!(condition_element.attributes()?.count(), 0);
+    let NodeRef::Element(text) = &conditions[1] else {
+        return Err("expected explanatory text".into());
+    };
+    assert_eq!(text.name(), "text");
+    assert_eq!(text.namespace(), STANZA_ERROR_NAMESPACE);
+    assert_eq!(
+        text.attribute("lang", lonewolf_xmpp::stanza::XML_NAMESPACE)?,
+        Some("en")
+    );
+    let lonewolf_xmpp::stanza::StanzaErrorText::Static(expected) = condition.default_text() else {
+        return Err("expected static default".into());
+    };
+    assert_eq!(text.text()?, Some(expected));
     let mut xml = String::new();
     reply.write_xml(&mut xml)?;
     assert!(!xml.contains(PROFILE), "{xml}");
@@ -157,6 +170,7 @@ fn omitted_iq_error_preserves_parsed_envelope_and_authenticated_recipient() -> T
                         for (stream_lang, iq_lang, effective) in [
                             ("", "", None),
                             (" xml:lang='en'", "", Some("en")),
+                            (" xml:lang='es'", "", Some("es")),
                             (" xml:lang='en'", " xml:lang='fr'", Some("fr")),
                             (" xml:lang='en'", " xml:lang=''", Some("")),
                             ("", " xml:lang='x-Unchecked'", Some("x-Unchecked")),
@@ -198,7 +212,7 @@ fn omitted_iq_error_preserves_parsed_envelope_and_authenticated_recipient() -> T
                 }
             }
         }
-        assert_eq!(session.outbox.writer.written.len(), 120);
+        assert_eq!(session.outbox.writer.written.len(), 144);
         drop(session);
         router.shutdown().await?;
         fixture.finish().await
@@ -519,6 +533,7 @@ fn omitted_iq_error_rejects_response_misuse_and_dispatcher_sends_no_reply() -> T
                     &request.resolve(&arena)?,
                     sender.resolve(&arena)?,
                     StanzaErrorCondition::BadRequest,
+                    StanzaErrorCondition::BadRequest.default_text(),
                     &mut response,
                 )
                 .is_err()

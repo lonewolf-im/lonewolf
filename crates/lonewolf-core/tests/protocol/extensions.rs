@@ -176,7 +176,7 @@ fn misaddressed_iq_results_become_an_internal_error() -> TestResult {
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<iq type='get' id='misaddressed'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='misaddressed' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='misaddressed' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:results' misaddressed='true'/><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server could not complete the request. Try again later.</text></error></iq>")?;
     alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
     alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
     alice.close()
@@ -423,7 +423,7 @@ fn missing_account_requests_skip_registered_get_and_set_handlers() -> TestResult
             } else {
                 ""
             };
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='missing-{kind}' from='missing@localhost'{recipient}><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='missing-{kind}' from='missing@localhost'{recipient}><query xmlns='{namespace}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
         }
     }
     alice.send("<iq type='result' id='missing-result' to='missing@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
@@ -475,7 +475,7 @@ fn subscription_presence_handlers_receive_authenticated_directed_requests() -> T
             "remote.example/phone",
         ] {
             alice.send(&format!("<presence type='{kind}' id='{kind}' from='mallory@localhost/spy' to='{target}'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick></presence>"))?;
-            alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='{kind}' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"))?;
+            alice.expect_xml(&format!("<presence xmlns='jabber:client' type='error' id='{kind}' from='{target}' to='alice@localhost/desk'><nick xmlns='http://jabber.org/protocol/nick'>Robert</nick><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>This operation is not allowed for the requested target.</text></error></presence>"))?;
         }
     }
 
@@ -497,7 +497,7 @@ private_key_path = "private-key.pem"
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
 
     alice.send("<presence type='subscribe' id='other-host' to='bob@other.localhost'/>")?;
-    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='other-host' from='bob@other.localhost' to='alice@localhost/desk'><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='error' id='other-host' from='bob@other.localhost' to='alice@localhost/desk'><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>This operation is not allowed for the requested target.</text></error></presence>")?;
 
     alice.close()
 }
@@ -551,7 +551,7 @@ fn disabled_extension_returns_service_unavailable() -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='disabled'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='disabled'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='disabled'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()
 }
 
@@ -561,7 +561,7 @@ fn unknown_payload_namespace_does_not_match_a_handler() -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='unknown'><query xmlns='urn:lonewolf:test:unknown'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='unknown'><query xmlns='urn:lonewolf:test:unknown'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='unknown'><query xmlns='urn:lonewolf:test:unknown'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()
 }
 
@@ -573,7 +573,7 @@ fn only_the_direct_payload_element_selects_the_handler() -> TestResult {
     alice.send(
         "<iq type='get' id='nested'><other xmlns='urn:lonewolf:test:iq'><query/></other></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='nested'><other xmlns='urn:lonewolf:test:iq'><query/></other><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='nested'><other xmlns='urn:lonewolf:test:iq'><query/></other><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()
 }
 
@@ -594,7 +594,7 @@ fn handler_errors_preserve_the_request_payload_and_address_the_bound_resource() 
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='set' id='denied' from='mallory@localhost/spy' to='alice@localhost'><deny xmlns='urn:lonewolf:test:iq'><detail>Keep &amp; escape</detail></deny></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='denied' from='alice@localhost' to='alice@localhost/desk'><deny xmlns='urn:lonewolf:test:iq'><detail>Keep &amp; escape</detail></deny><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='denied' from='alice@localhost' to='alice@localhost/desk'><deny xmlns='urn:lonewolf:test:iq'><detail>Keep &amp; escape</detail></deny><error type='cancel'><not-allowed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>This operation is not allowed for the requested target.</text></error></iq>")?;
     alice.close()
 }
 
@@ -604,7 +604,7 @@ fn server_scope_does_not_handle_account_requests() -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='account'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='account'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='account'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.send(
         "<iq type='get' id='server' to='localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>",
     )?;
@@ -620,7 +620,7 @@ fn account_scope_does_not_handle_server_requests() -> TestResult {
     alice.send(
         "<iq type='get' id='server' to='localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='server' from='localhost'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='server' from='localhost'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()
 }
 
@@ -647,7 +647,7 @@ fn remote_requests_are_not_consumed_by_local_handlers() -> TestResult {
             "remote.example/phone",
         ] {
             alice.send(&format!("<iq type='{kind}' from='mallory@localhost/spy' id='remote' to='{target}'><query xmlns='urn:lonewolf:test:iq'/></iq>"))?;
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='remote' from='{target}'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='remote' from='{target}'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error></iq>"))?;
         }
     }
     alice.close()
@@ -679,7 +679,7 @@ private_key_path = "private-key.pem"
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<iq type='get' id='other-host' to='other.localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-host' from='other.localhost'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='other-host' from='other.localhost'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.send("<iq type='get' id='enabled-host' to='localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='enabled-host' from='localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq' sender='alice@localhost/desk' target='localhost'/></iq>")?;
     alice.close()
@@ -695,7 +695,7 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
         suite.create_account("alice", PASSWORD)?;
         let mut alice = suite.connect("alice", PASSWORD, "desk")?;
         alice.send(&format!("<iq type='{kind}' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail></iq>"))?;
-        alice.expect_xml("<iq xmlns='jabber:client' type='error' to='alice@localhost/desk' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        alice.expect_xml("<iq xmlns='jabber:client' type='error' to='alice@localhost/desk' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server could not complete the request. Try again later.</text></error></iq>")?;
         alice.send("<message to='alice@localhost/desk' id='still-open'/>")?;
         alice.expect_xml("<message xmlns='jabber:client' to='alice@localhost/desk' from='alice@localhost/desk' id='still-open'/>")?;
         let logs = suite.wait_for_log("internal operation failed")?;
@@ -847,7 +847,7 @@ fn account_gets_answer_for_missing_accounts_through_the_handler() -> TestResult 
     alice.send("<iq type='get' id='missing' to='missing@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='missing' from='missing@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' missing='true'/></iq>")?;
     alice.send("<iq type='set' id='missing-set' to='missing@localhost'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-set' from='missing@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' id='missing-set' from='missing@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.send("<iq type='set' id='set'><query xmlns='urn:lonewolf:test:access'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='set' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='none'/></iq>")?;
     alice.close()

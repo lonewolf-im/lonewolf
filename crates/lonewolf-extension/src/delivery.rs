@@ -108,6 +108,10 @@ pub struct Failure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandlerError {
     Stanza(StanzaErrorCondition),
+    Described {
+        condition: StanzaErrorCondition,
+        text: lonewolf_xmpp::stanza::StanzaErrorText,
+    },
     Internal {
         condition: StanzaErrorCondition,
         failure: Failure,
@@ -115,15 +119,31 @@ pub enum HandlerError {
 }
 
 impl HandlerError {
+    pub const fn described(
+        condition: StanzaErrorCondition,
+        text: lonewolf_xmpp::stanza::StanzaErrorText,
+    ) -> Self {
+        Self::Described { condition, text }
+    }
+
+    pub const fn text(&self) -> lonewolf_xmpp::stanza::StanzaErrorText {
+        match self {
+            Self::Described { text, .. } => *text,
+            _ => self.condition().default_text(),
+        }
+    }
+
     pub const fn condition(&self) -> StanzaErrorCondition {
         match self {
-            Self::Stanza(condition) | Self::Internal { condition, .. } => *condition,
+            Self::Stanza(condition)
+            | Self::Described { condition, .. }
+            | Self::Internal { condition, .. } => *condition,
         }
     }
 
     pub const fn failure(&self) -> Option<Failure> {
         match self {
-            Self::Stanza(_) => None,
+            Self::Stanza(_) | Self::Described { .. } => None,
             Self::Internal { failure, .. } => Some(*failure),
         }
     }

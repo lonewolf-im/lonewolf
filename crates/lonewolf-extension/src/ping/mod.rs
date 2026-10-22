@@ -72,9 +72,18 @@ fn answer<A: ChunkAllocator>(request: IqRequest<'_, A>) -> Result<IqReply<A>, Ha
     Ok(IqReply::new(None, Effects::none()))
 }
 
+fn malformed_ping() -> HandlerError {
+    HandlerError::described(
+        StanzaErrorCondition::BadRequest,
+        lonewolf_xmpp::stanza::StanzaErrorText::Static(
+            "A ping must be empty and may only include the xml:lang attribute. Remove other attributes, text, and child elements.",
+        ),
+    )
+}
+
 fn validate_payload<R: ArenaRead>(payload: ElementRef<'_, R>) -> Result<(), HandlerError> {
     if payload.name() != "ping" || payload.namespace() != NAMESPACE {
-        return Err(StanzaErrorCondition::BadRequest.into());
+        return Err(malformed_ping());
     }
     for attribute in payload
         .attributes()
@@ -82,7 +91,7 @@ fn validate_payload<R: ArenaRead>(payload: ElementRef<'_, R>) -> Result<(), Hand
     {
         let attribute = attribute.map_err(|_| StanzaErrorCondition::InternalServerError)?;
         if attribute.name != "lang" || attribute.namespace != XML_NAMESPACE {
-            return Err(StanzaErrorCondition::BadRequest.into());
+            return Err(malformed_ping());
         }
     }
     if let Some(child) = payload
@@ -91,7 +100,7 @@ fn validate_payload<R: ArenaRead>(payload: ElementRef<'_, R>) -> Result<(), Hand
         .next()
     {
         child.map_err(|_| StanzaErrorCondition::InternalServerError)?;
-        return Err(StanzaErrorCondition::BadRequest.into());
+        return Err(malformed_ping());
     }
     Ok(())
 }

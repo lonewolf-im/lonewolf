@@ -555,7 +555,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             Verdict::Reject {
                 condition,
                 application,
-            } => return self.reply_rejection(&routed, condition, application),
+                text,
+            } => {
+                return self.reply_rejection_with_text(
+                    &routed,
+                    condition,
+                    application,
+                    text.unwrap_or_else(|| condition.default_text()),
+                );
+            }
             Verdict::Drop => return Ok(()),
         }
         let mut sent = None;
@@ -584,8 +592,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     sent = archived.sent;
                     archived.stanza
                 }
-                archive::ArchiveStep::Rejected { stanza, condition } => {
-                    return self.reply_error(&stanza, condition);
+                archive::ArchiveStep::Rejected {
+                    stanza,
+                    condition,
+                    text,
+                } => {
+                    return self.reply_rejection_with_text(&stanza, condition, None, text);
                 }
             }
         } else {
@@ -700,7 +712,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .await?;
         }
         match outcome {
-            ServiceOutcome::Rejected { stanza, condition } => self.reply_error(&stanza, condition),
+            ServiceOutcome::Rejected {
+                stanza,
+                condition,
+                text,
+            } => self.reply_rejection_with_text(&stanza, condition, None, text),
             ServiceOutcome::Handled => Ok(()),
         }
     }
@@ -713,7 +729,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let error = if self.admit_recipient(&stanza)? {
             self.iq_destination_error(&stanza)?
         } else {
-            Some(StanzaErrorCondition::PolicyViolation.into())
+            Some(HandlerError::described(StanzaErrorCondition::PolicyViolation,
+                lonewolf_xmpp::stanza::StanzaErrorText::Static("Too many distinct recipients were contacted. Wait before contacting additional recipients.")).into())
         };
         let Some(error) = error else {
             return Ok(Some(parsed));
@@ -765,7 +782,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 None => false,
             };
         }
-        Ok(rejected.then(|| IqError::without_payload(StanzaErrorCondition::Forbidden.into())))
+        Ok(rejected.then(|| IqError::without_payload(HandlerError::described(StanzaErrorCondition::Forbidden,
+            lonewolf_xmpp::stanza::StanzaErrorText::Static("This operation requires an omitted destination or your authenticated bare JID without a resource.")))))
     }
 
     /// Committed handler effects outlive this session.
@@ -820,9 +838,16 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             Verdict::Reject {
                 condition,
                 application,
+                text,
             } => {
-                let reply =
-                    iq::error_reply_with(&request, &mut arena, condition, application, None)?;
+                let reply = request
+                    .error_reply_described_in(
+                        &mut arena,
+                        condition,
+                        application,
+                        text.unwrap_or_else(|| condition.default_text()),
+                    )?
+                    .build()?;
                 self.outbox.push(Output::Owned {
                     stanza: reply,
                     arena,
@@ -1177,8 +1202,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     ) -> Result<(), CloseOutcome> {
         let (stanza, arena) = match error.payload() {
             IqErrorPayload::Include => {
-                let stanza =
-                    iq::error_reply(&request, &mut arena, error.condition(), Some(sender))?;
+                let stanza = request
+                    .error_reply_described_in(
+                        &mut arena,
+                        error.condition(),
+                        None,
+                        error.handler_error().text(),
+                    )?
+                    .to(Some(sender))?
+                    .build()?;
                 (stanza, arena)
             }
             IqErrorPayload::Omit => {
@@ -1187,6 +1219,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     &request.resolve(&arena)?,
                     sender.resolve(&arena)?,
                     error.condition(),
+                    error.handler_error().text(),
                     &mut response,
                 )?;
                 (stanza, response)
@@ -1541,7 +1574,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             Verdict::Reject {
                 condition,
                 application,
-            } => return self.reply_rejection(&routed, condition, application),
+                text,
+            } => {
+                return self.reply_rejection_with_text(
+                    &routed,
+                    condition,
+                    application,
+                    text.unwrap_or_else(|| condition.default_text()),
+                );
+            }
             Verdict::Drop => return Ok(()),
         }
         let archived = {
@@ -1587,8 +1628,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             received,
         } = match archived {
             archive::ArchiveStep::Accepted(archived) => archived,
-            archive::ArchiveStep::Rejected { stanza, condition } => {
-                return self.reply_error(&stanza, condition);
+            archive::ArchiveStep::Rejected {
+                stanza,
+                condition,
+                text,
+            } => {
+                return self.reply_rejection_with_text(&stanza, condition, None, text);
             }
         };
         let observed = {
@@ -1655,7 +1700,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .await?;
         }
         match outcome {
-            DeliveryOutcome::Rejected { stanza, condition } => self.reply_error(&stanza, condition),
+            DeliveryOutcome::Rejected {
+                stanza,
+                condition,
+                text,
+            } => self.reply_rejection_with_text(&stanza, condition, None, text),
             DeliveryOutcome::Routed | DeliveryOutcome::Stored | DeliveryOutcome::Discarded => {
                 Ok(())
             }
@@ -1857,7 +1906,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         };
         let mut pending = match self.outbox.drain_until(registration, prepare).await?? {
             Ok(pending) => pending,
-            Err((routed, error)) => return self.reply_error(&routed, error.condition()),
+            Err((routed, error)) => {
+                return self.reply_rejection_with_text(
+                    &routed,
+                    error.condition(),
+                    None,
+                    error.text(),
+                );
+            }
         };
         self.outbox
             .drain_until(&self.registration, pending.turned())
@@ -2014,7 +2070,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     .await?
             };
             if let Err(error) = authorized {
-                return self.reply_error(&source, error.condition());
+                return self.reply_rejection_with_text(
+                    &source,
+                    error.condition(),
+                    None,
+                    error.text(),
+                );
             }
         }
         if sender_host.is_none() {
@@ -2157,7 +2218,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 self.outbox.delivered(queued);
                 Ok(())
             }
-            Some(Err(error)) => self.reply_error(&source, error.condition()),
+            Some(Err(error)) => {
+                self.reply_rejection_with_text(&source, error.condition(), None, error.text())
+            }
         }
     }
 
@@ -2175,10 +2238,20 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         condition: StanzaErrorCondition,
         application: Option<ApplicationCondition>,
     ) -> Result<(), CloseOutcome> {
+        self.reply_rejection_with_text(source, condition, application, condition.default_text())
+    }
+
+    fn reply_rejection_with_text(
+        &mut self,
+        source: &RoutedStanza<A>,
+        condition: StanzaErrorCondition,
+        application: Option<ApplicationCondition>,
+        text: lonewolf_xmpp::stanza::StanzaErrorText,
+    ) -> Result<(), CloseOutcome> {
         let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
         let source = source.resolve()?.clone_in(&mut arena)?;
         let reply = source
-            .error_reply_with_in(&mut arena, condition, application)?
+            .error_reply_described_in(&mut arena, condition, application, text)?
             .build()?;
         self.outbox.push(Output::Owned {
             stanza: reply,
@@ -2234,7 +2307,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 PresenceType::Available | PresenceType::Unavailable | PresenceType::Probe
             )
         ) {
-            self.reply_error(routed, StanzaErrorCondition::PolicyViolation)?;
+            self.reply_rejection_with_text(routed, StanzaErrorCondition::PolicyViolation, None,
+                lonewolf_xmpp::stanza::StanzaErrorText::Static("Too many distinct recipients were contacted. Wait before contacting additional recipients."))?;
         }
         Ok(false)
     }

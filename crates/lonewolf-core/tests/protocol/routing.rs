@@ -19,7 +19,7 @@ fn ipv6_zone_destinations_return_recoverable_jid_malformed_errors() -> TestResul
             alice.send(&format!(
                 "<{kind} {attributes} to='{destination}' id='scoped'>{payload}</{kind}>"
             ))?;
-            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' from='localhost' type='error' id='scoped' to='alice@localhost/desktop'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></{kind}>"))?;
+            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' from='localhost' type='error' id='scoped' to='alice@localhost/desktop'><error type='modify'><jid-malformed xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>An address is invalid. Use a valid XMPP address.</text></error></{kind}>"))?;
             alice.send("<message to='alice@localhost/desktop' type='chat' id='sentinel'/>")?;
             alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost/desktop' type='chat' id='sentinel'/>")?;
         }
@@ -202,7 +202,7 @@ fn negative_priority_excludes_a_resource_from_bare_delivery() -> TestResult {
 
     alice.send(r#"<message to='alice@localhost' type='chat' id='hello'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='hello' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -372,7 +372,7 @@ fn missing_full_jid_normal_returns_service_unavailable() -> TestResult {
 
     alice.send(r#"<message to='alice@localhost/missing' type='normal' id='hello'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='hello' from='alice@localhost/missing' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -390,7 +390,7 @@ fn missing_full_jid_headline_returns_service_unavailable() -> TestResult {
 
     alice.send(r#"<message to='alice@localhost/missing' type='headline' id='hello'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='hello' from='alice@localhost/missing' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -408,7 +408,7 @@ fn missing_full_jid_groupchat_returns_service_unavailable() -> TestResult {
 
     alice.send(r#"<message to='alice@localhost/missing' type='groupchat' id='hello'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='hello' from='alice@localhost/missing' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -425,7 +425,7 @@ fn unavailable_account_returns_service_unavailable_with_the_original_payload() -
      </message>"#,
     )?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='failed' from='alice@localhost' to='alice@localhost/desk'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -443,7 +443,7 @@ fn offline_account_returns_service_unavailable_with_the_original_payload() -> Te
      </message>"#,
     )?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='failed' from='offline@localhost' to='alice@localhost/desk'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -460,7 +460,7 @@ fn unknown_account_returns_service_unavailable_with_the_original_payload() -> Te
      </message>"#,
     )?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='failed' from='missing@localhost' to='alice@localhost/desk'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -478,7 +478,7 @@ fn missing_full_jid_without_fallback_returns_service_unavailable_with_the_origin
      </message>"#,
     )?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='failed' from='alice@localhost/missing' to='alice@localhost/desk'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -497,7 +497,7 @@ fn remote_messages_return_remote_server_not_found_with_the_original_payload() ->
     ] {
         for kind in ["normal", "chat", "headline", "groupchat"] {
             alice.send(&format!("<message to='{target}' from='mallory@localhost/spy' type='{kind}' id='failed'><body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra></message>"))?;
-            alice.expect_xml(&format!("<message xmlns='jabber:client' type='error' id='failed' from='{target}' to='alice@localhost/desk'><body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))?;
+            alice.expect_xml(&format!("<message xmlns='jabber:client' type='error' id='failed' from='{target}' to='alice@localhost/desk'><body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error></message>"))?;
         }
     }
     alice.close()
@@ -520,7 +520,7 @@ fn remote_error_stanzas_and_iq_results_are_silent_in_a_mixed_sequence() -> TestR
             ("iq", "iq", "<query xmlns='urn:test'/>", ""),
             ("presence", "presence", "", " to='alice@localhost/desk'"),
         ] {
-            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' from='{target}' id='{id}'{to}>{payload}<error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></{kind}>"))?;
+            alice.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' from='{target}' id='{id}'{to}>{payload}<error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error></{kind}>"))?;
         }
     }
     alice.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
@@ -534,7 +534,7 @@ fn remote_bare_groupchat_keeps_policy_rejections() -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message type='groupchat' to='blocked@remote.example' id='blocked'><body>Keep</body></message>")?;
-    alice.expect_xml("<message xmlns='jabber:client' type='error' id='blocked' from='blocked@remote.example' to='alice@localhost/desk'><body>Keep</body><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' type='error' id='blocked' from='blocked@remote.example' to='alice@localhost/desk'><body>Keep</body><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></message>")?;
     alice.close()
 }
 
@@ -550,7 +550,7 @@ fn server_domain_returns_service_unavailable_with_the_original_payload() -> Test
      </message>"#,
     )?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='failed' from='localhost' to='alice@localhost/desk'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -567,7 +567,7 @@ fn bare_groupchat_returns_service_unavailable_with_the_original_payload() -> Tes
      </message>"#,
     )?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='failed' from='alice@localhost' to='alice@localhost/desk'>
-        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <body>Keep &amp; escape</body><extra xmlns='urn:test:payload'>value</extra><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -721,11 +721,11 @@ fn presence_priority_above_maximum_does_not_make_the_resource_available() -> Tes
      </presence>"#,
     )?;
     alice.expect_xml(r#"<presence xmlns='jabber:client' type='error' id='priority' from='alice@localhost' to='alice@localhost/desk'>
-        <priority>128</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <priority>128</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error>
      </presence>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -742,11 +742,11 @@ fn presence_priority_below_minimum_does_not_make_the_resource_available() -> Tes
      </presence>"#,
     )?;
     alice.expect_xml(r#"<presence xmlns='jabber:client' type='error' id='priority' from='alice@localhost' to='alice@localhost/desk'>
-        <priority>-129</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <priority>-129</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error>
      </presence>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -763,11 +763,11 @@ fn presence_priority_nonnumeric_does_not_make_the_resource_available() -> TestRe
      </presence>"#,
     )?;
     alice.expect_xml(r#"<presence xmlns='jabber:client' type='error' id='priority' from='alice@localhost' to='alice@localhost/desk'>
-        <priority>many</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <priority>many</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error>
      </presence>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -784,11 +784,11 @@ fn presence_priority_empty_does_not_make_the_resource_available() -> TestResult 
      </presence>"#,
     )?;
     alice.expect_xml(r#"<presence xmlns='jabber:client' type='error' id='priority' from='alice@localhost' to='alice@localhost/desk'>
-        <priority/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <priority/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error>
      </presence>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -805,11 +805,11 @@ fn presence_priority_with_attributes_does_not_make_the_resource_available() -> T
      </presence>"#,
     )?;
     alice.expect_xml(r#"<presence xmlns='jabber:client' type='error' id='priority' from='alice@localhost' to='alice@localhost/desk'>
-        <priority extra='1'>1</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <priority extra='1'>1</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error>
      </presence>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -826,11 +826,11 @@ fn presence_priority_duplicate_does_not_make_the_resource_available() -> TestRes
      </presence>"#,
     )?;
     alice.expect_xml(r#"<presence xmlns='jabber:client' type='error' id='priority' from='alice@localhost' to='alice@localhost/desk'>
-        <priority>1</priority><priority>2</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <priority>1</priority><priority>2</priority><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error>
      </presence>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -844,7 +844,7 @@ fn directed_presence_does_not_change_local_availability() -> TestResult {
     alice.send(r#"<presence to='alice@localhost'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -858,7 +858,7 @@ fn subscribe_presence_does_not_change_local_availability() -> TestResult {
     alice.send(r#"<presence type='subscribe'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -872,7 +872,7 @@ fn subscribed_presence_does_not_change_local_availability() -> TestResult {
     alice.send(r#"<presence type='subscribed'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -886,7 +886,7 @@ fn unsubscribe_presence_does_not_change_local_availability() -> TestResult {
     alice.send(r#"<presence type='unsubscribe'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -900,7 +900,7 @@ fn unsubscribed_presence_does_not_change_local_availability() -> TestResult {
     alice.send(r#"<presence type='unsubscribed'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -914,7 +914,7 @@ fn probe_presence_does_not_change_local_availability() -> TestResult {
     alice.send(r#"<presence type='probe'/>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -930,7 +930,7 @@ fn error_presence_does_not_change_local_availability() -> TestResult {
      </presence>"#)?;
     alice.send(r#"<message to='alice@localhost' type='chat' id='unavailable'/>"#)?;
     alice.expect_xml(r#"<message xmlns='jabber:client' type='error' id='unavailable' from='alice@localhost' to='alice@localhost/desk'>
-        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </message>"#)?;
     alice.close()
 }
@@ -1028,7 +1028,7 @@ fn unsupported_unaddressed_iq_get_returns_service_unavailable() -> TestResult {
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1045,7 +1045,7 @@ fn unsupported_server_iq_get_returns_service_unavailable() -> TestResult {
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='localhost'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1062,7 +1062,7 @@ fn unsupported_remote_server_iq_get_returns_remote_server_not_found() -> TestRes
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='remote.example'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1079,7 +1079,7 @@ fn unsupported_bare_jid_iq_get_returns_service_unavailable() -> TestResult {
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='alice@localhost'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1113,7 +1113,7 @@ fn unsupported_unaddressed_iq_set_returns_service_unavailable() -> TestResult {
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1130,7 +1130,7 @@ fn unsupported_server_iq_set_returns_service_unavailable() -> TestResult {
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='localhost'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1147,7 +1147,7 @@ fn unsupported_remote_server_iq_set_returns_remote_server_not_found() -> TestRes
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='remote.example'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot deliver this request to a remote domain.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1164,7 +1164,7 @@ fn unsupported_bare_jid_iq_set_returns_service_unavailable() -> TestResult {
      </iq>"#,
     )?;
     alice.expect_xml(r#"<iq xmlns='jabber:client' type='error' id='unsupported' from='alice@localhost'>
-        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>
+        <query xmlns='urn:test:outer'><child xmlns='urn:test:inner'/></query><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>
      </iq>"#)?;
     alice.close()
 }
@@ -1302,7 +1302,7 @@ fn directed_full_jid_iq_exchanges_preserve_envelopes_and_sender_order() -> TestR
     alice.send(
         "<iq type='get' to='bob@localhost/phone' id='revoked'><query xmlns='urn:test:iq'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()?;
     bob.close()
 }
@@ -1322,7 +1322,7 @@ fn missing_and_unauthorized_full_jid_iq_requests_have_the_same_error() -> TestRe
         alice.send(&format!(
             "<iq type='get' to='{target}' id='denied'><query xmlns='urn:test:iq'/></iq>"
         ))?;
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='denied'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='denied'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
     }
     alice.close()?;
     bob.close()
@@ -1389,7 +1389,7 @@ fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
     alice.send(
         "<iq type='set' to='bob@localhost/phone' id='revoked'><query xmlns='urn:test:iq'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()?;
     bob.close()
 }
@@ -1532,4 +1532,30 @@ fn opaque_extension_qnames_retain_namespace_context_after_authenticated_routing(
         ("urn:example:types", "Example")
     );
     alice.close()
+}
+
+#[test]
+fn forwarded_error_conditions_and_peer_text_are_not_replaced_or_supplemented() -> TestResult {
+    let suite = C2sSuite::with_extensions("")?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    suite.create_account("bob", ALTERNATE_PASSWORD)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", ALTERNATE_PASSWORD, "phone")?;
+    for (kind, payload) in [
+        ("message", "<body>original</body>"),
+        ("iq", "<query xmlns='urn:test'/>"),
+    ] {
+        for detail in [
+            "",
+            "<text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='fr'>Texte du correspondant &amp; détail.</text><extra xmlns='urn:test:peer-error'/>",
+        ] {
+            let error = format!(
+                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>{detail}</error>"
+            );
+            alice.send(&format!("<{kind} type='error' id='peer-error' to='bob@localhost/phone' xml:lang='es'>{payload}{error}</{kind}>"))?;
+            bob.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' id='peer-error' from='alice@localhost/desk' to='bob@localhost/phone' xml:lang='es'>{payload}{error}</{kind}>"))?;
+        }
+    }
+    alice.close()?;
+    bob.close()
 }

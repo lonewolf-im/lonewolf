@@ -6,8 +6,8 @@ use super::element::ElementFrame;
 use super::namespace::NamespaceContext;
 use super::{
     AttributesBuilder, BuildError, Element, Header, IqType, MessageType, PresenceType,
-    STANZA_ERROR_NAMESPACE, SliceBuilder, Stanza, StanzaBuilder, StanzaErrorCondition, StanzaKind,
-    StanzaNamespace, StanzaType, XML_NAMESPACE, store_text, xml,
+    SliceBuilder, Stanza, StanzaBuilder, StanzaErrorCondition, StanzaKind, StanzaNamespace,
+    StanzaType, XML_NAMESPACE, error_element_in, store_text, xml,
 };
 use crate::jid::{Jid, JidError, JidRef};
 
@@ -114,12 +114,13 @@ impl RejectedStanza {
             StanzaRejection::BadRequest => StanzaErrorCondition::BadRequest,
             StanzaRejection::JidMalformed => StanzaErrorCondition::JidMalformed,
         };
-        let condition_element =
-            Element::builder_in(condition.as_str(), STANZA_ERROR_NAMESPACE, arena)?.build()?;
-        let error = Element::builder_in("error", self.namespace.as_str(), arena)?
-            .attribute("type", "", condition.error_type())?
-            .child(condition_element)?
-            .build()?;
+        let error = error_element_in(
+            self.namespace,
+            condition,
+            None,
+            condition.default_text(),
+            arena,
+        )?;
         let stanza_type = match self.kind {
             StanzaKind::Message => StanzaType::Message(MessageType::Error),
             StanzaKind::Presence => StanzaType::Presence(PresenceType::Error),

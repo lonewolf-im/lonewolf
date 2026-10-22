@@ -58,7 +58,7 @@ fn archive_rejection_stops_the_message() -> TestResult {
     alice.send(
         "<message type='chat' to='bob@localhost/res' id='reject'><body>reject</body></message>",
     )?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='error' id='reject'><body>reject</body><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='alice@localhost/res' type='error' id='reject'><body>reject</body><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server cannot complete this request within its resource limits.</text></error></message>")?;
     entries(&mut alice, "alice@localhost/res", "")?;
     alice.send("<message type='chat' to='bob@localhost/res' id='first'/>")?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/res' to='bob@localhost/res' type='chat' id='first'><stanza-id xmlns='urn:xmpp:sid:0' id='2' by='bob@localhost'/></message>")?;

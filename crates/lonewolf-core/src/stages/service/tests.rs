@@ -32,7 +32,14 @@ impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for RejectingService {
         _stanza: RoutedStanza<GlobalChunkAllocator>,
         _context: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
     ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
-        Box::pin(async { Err(StanzaErrorCondition::BadRequest.into()) })
+        Box::pin(async {
+            Err(HandlerError::described(
+                StanzaErrorCondition::BadRequest,
+                lonewolf_xmpp::stanza::StanzaErrorText::Static(
+                    "The service requires a supported request format.",
+                ),
+            ))
+        })
     }
 }
 
@@ -125,9 +132,10 @@ fn dispatch_replies_only_to_iq_requests_and_non_error_messages() -> TestResult {
         ] {
             let outcome = dispatch(&fixture.stage(), route, parsed(xml).await?).await.map_err(|_| "dispatch failed")?;
             match outcome {
-                ServiceOutcome::Rejected { condition, .. } => {
+                ServiceOutcome::Rejected { condition, text, .. } => {
                     assert!(rejected, "unexpected error reply: {xml}");
                     assert_eq!(condition, StanzaErrorCondition::BadRequest);
+                    assert_eq!(text, lonewolf_xmpp::stanza::StanzaErrorText::Static("The service requires a supported request format."));
                 }
                 ServiceOutcome::Handled => assert!(!rejected, "missing error reply: {xml}"),
             }

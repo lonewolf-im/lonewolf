@@ -25,6 +25,7 @@ pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
     Rejected {
         stanza: RoutedStanza<A>,
         condition: StanzaErrorCondition,
+        text: lonewolf_xmpp::stanza::StanzaErrorText,
     },
 }
 
@@ -72,6 +73,7 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
         return Ok(DeliveryOutcome::Rejected {
             stanza: routed,
             condition: StanzaErrorCondition::ServiceUnavailable,
+            text: StanzaErrorCondition::ServiceUnavailable.default_text(),
         });
     }
     if let Err(error) = stage.router.route_message(routed.clone()).await {
@@ -105,6 +107,7 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
         return Ok(DeliveryOutcome::Rejected {
             stanza: routed,
             condition,
+            text: condition.default_text(),
         });
     }
     Ok(DeliveryOutcome::Routed)
@@ -127,6 +130,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
         return Ok(DeliveryOutcome::Rejected {
             stanza: routed,
             condition: StanzaErrorCondition::ServiceUnavailable,
+            text: StanzaErrorCondition::ServiceUnavailable.default_text(),
         });
     };
     let bytes = if tracing::enabled!(tracing::Level::INFO) {
@@ -186,6 +190,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
         StorePreparation::Rejected { stanza, error } => Ok(DeliveryOutcome::Rejected {
             stanza,
             condition: error.condition(),
+            text: error.text(),
         }),
         StorePreparation::Discarded => Ok(DeliveryOutcome::Discarded),
         StorePreparation::Committed(pending) => {

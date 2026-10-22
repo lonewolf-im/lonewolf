@@ -583,7 +583,7 @@ fn account_iq_dispatch_observes_completed_deletion_and_recreation() -> TestResul
     suite.delete_account("bob")?;
     for kind in ["get", "set"] {
         alice.send(&format!("<iq type='{kind}' id='deleted-{kind}' to='bob@localhost'><query xmlns='urn:lonewolf:test:iq'/></iq>"))?;
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='deleted-{kind}' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='deleted-{kind}' from='bob@localhost' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
     }
     suite.create_account("bob", PASSWORD)?;
     alice.send(

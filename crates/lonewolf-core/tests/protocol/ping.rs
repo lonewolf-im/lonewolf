@@ -26,7 +26,7 @@ fn server_and_owner_ping_replies_preserve_addresses() -> TestResult {
                 client.expect_xml(&format!("<iq xmlns='jabber:client' type='result'{source} to='alice@localhost/{resource}' id='{id}'/>"))?;
             }
             client.send(&format!("<iq type='get'{destination} from='victim@localhost/spy' id='reused'><ping xmlns='urn:xmpp:ping' invalid='true'/></iq>"))?;
-            client.expect_xml(&format!("<iq xmlns='jabber:client' type='error'{source} to='alice@localhost/{resource}' id='reused'><ping xmlns='urn:xmpp:ping' invalid='true'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            client.expect_xml(&format!("<iq xmlns='jabber:client' type='error'{source} to='alice@localhost/{resource}' id='reused'><ping xmlns='urn:xmpp:ping' invalid='true'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A ping must be empty and may only include the xml:lang attribute. Remove other attributes, text, and child elements.</text></error></iq>"))?;
             client.send(&format!(
                 "<iq type='get'{destination} id='reused'><ping xmlns='urn:xmpp:ping'/></iq>"
             ))?;
@@ -77,7 +77,7 @@ fn ping_payload_validation_is_namespace_aware() -> TestResult {
         alice.send(&format!(
             "<iq type='get' to='localhost' id='invalid'>{payload}</iq>"
         ))?;
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='localhost' to='alice@localhost/desk' id='invalid'>{payload}<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='localhost' to='alice@localhost/desk' id='invalid'>{payload}<error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A ping must be empty and may only include the xml:lang attribute. Remove other attributes, text, and child elements.</text></error></iq>"))?;
         alice.send(
             "<iq type='get' to='localhost' id='recovery'><ping xmlns='urn:xmpp:ping'/></iq>",
         )?;
@@ -115,13 +115,13 @@ fn ping_unsupported_requests_keep_generic_iq_errors() -> TestResult {
                 alice.send(&format!(
                     "<iq type='{kind}' to='{target}' id='unsupported'>{payload}</iq>"
                 ))?;
-                alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='unsupported'>{payload}<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='unsupported'>{payload}<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
             }
             if !enabled {
                 alice.send(&format!(
                     "<iq type='get' to='{target}' id='disabled'><ping xmlns='urn:xmpp:ping'/></iq>"
                 ))?;
-                alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='disabled'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='disabled'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
             }
         }
         alice.close()?;
@@ -159,7 +159,7 @@ fn ping_invalid_iq_shapes_use_existing_rejections() -> TestResult {
         ),
     ] {
         alice.send(&format!("<iq {attributes} to='localhost'>{payload}</iq>"))?;
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='localhost' to='alice@localhost/desk' id='{id}'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='localhost' to='alice@localhost/desk' id='{id}'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>"))?;
         alice.send("<iq type='get' to='localhost' id=''><ping xmlns='urn:xmpp:ping'/></iq>")?;
         alice.expect_xml("<iq xmlns='jabber:client' type='result' from='localhost' to='alice@localhost/desk' id=''/>")?;
     }
@@ -208,7 +208,7 @@ fn ping_and_disco_are_independently_selectable() -> TestResult {
                         alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@localhost/desk' id='disco'><query xmlns='http://jabber.org/protocol/disco#items'>{items}</query></iq>"))?;
                     }
                 } else {
-                    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='disco'><query xmlns='http://jabber.org/protocol/disco#{query}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='disco'><query xmlns='http://jabber.org/protocol/disco#{query}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
                     if ping {
                         alice.send(&format!("<iq type='get' to='{target}' id='after-disco'><ping xmlns='urn:xmpp:ping'/></iq>"))?;
                         alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@localhost/desk' id='after-disco'/>"))?;
@@ -221,7 +221,7 @@ fn ping_and_disco_are_independently_selectable() -> TestResult {
             if ping {
                 alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@localhost/desk' id='ping'/>"))?;
             } else {
-                alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='ping'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='ping'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
             }
         }
         if ping {
@@ -257,7 +257,7 @@ fn pipelined_ping_recovery_preserves_sender_order() -> TestResult {
     let mut phone = suite.connect("alice", PASSWORD, "phone")?;
     alice.send("<iq type='get' to='localhost' id='first'><ping xmlns='urn:xmpp:ping'/></iq><iq type='get' to='alice@localhost' id='bad'><ping xmlns='urn:xmpp:ping'>bad</ping></iq><iq type='get' id='last'><ping xmlns='urn:xmpp:ping'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' from='localhost' to='alice@localhost/desk' id='first'/>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' to='alice@localhost/desk' id='bad'><ping xmlns='urn:xmpp:ping'>bad</ping><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' to='alice@localhost/desk' id='bad'><ping xmlns='urn:xmpp:ping'>bad</ping><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A ping must be empty and may only include the xml:lang attribute. Remove other attributes, text, and child elements.</text></error></iq>")?;
     alice.expect_xml(
         "<iq xmlns='jabber:client' type='result' to='alice@localhost/desk' id='last'/>",
     )?;
@@ -283,7 +283,7 @@ fn bare_ping_uses_existing_account_authorization() -> TestResult {
             alice.send(&format!(
                 "<iq type='get' to='{target}' id='hidden'>{payload}</iq>"
             ))?;
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='hidden'>{payload}<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='hidden'>{payload}<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
         }
     }
     bob.send("<presence to='alice@localhost/desk'/>")?;
@@ -293,7 +293,7 @@ fn bare_ping_uses_existing_account_authorization() -> TestResult {
     alice.send(
         "<iq type='get' to='bob@localhost' id='directed'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost' to='alice@localhost/desk' id='directed'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost' to='alice@localhost/desk' id='directed'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     bob.send("<presence to='alice@localhost/desk' type='unavailable'/>")?;
     alice.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost/desk' type='unavailable'/>")?;
     bob.send("<presence type='subscribed' to='alice@localhost'/>")?;
@@ -307,7 +307,7 @@ fn bare_ping_uses_existing_account_authorization() -> TestResult {
     bob.send(
         "<iq type='get' to='alice@localhost' id='reverse'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' to='bob@localhost/phone' id='reverse'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' to='bob@localhost/phone' id='reverse'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     bob.send("<presence type='unsubscribed' to='alice@localhost'/>")?;
     barrier(&mut bob)?;
     alice.send("<presence type='subscribed' to='bob@localhost'/>")?;
@@ -319,7 +319,7 @@ fn bare_ping_uses_existing_account_authorization() -> TestResult {
     alice.send(
         "<iq type='get' to='bob@localhost' id='opposite-denied'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost' to='alice@localhost/desk' id='opposite-denied'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost' to='alice@localhost/desk' id='opposite-denied'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
     bob.send("<iq type='get' to='alice@localhost' id='mutual'><ping xmlns='urn:xmpp:ping'/></iq>")?;
     bob.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost' to='bob@localhost/phone' id='mutual'/>")?;
@@ -353,7 +353,7 @@ fn bare_ping_uses_existing_account_authorization() -> TestResult {
     alice.send(
         "<iq type='get' to='bob@localhost' id='no-roster'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost' to='alice@localhost/desk' id='no-roster'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost' to='alice@localhost/desk' id='no-roster'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     alice.close()
 }
 
@@ -404,7 +404,7 @@ private_key_path = "private-key.pem"
             } else {
                 ""
             };
-            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='alice@other.localhost'{to} id='not-owner'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='alice@other.localhost'{to} id='not-owner'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
             other.send("<presence type='subscribed' to='alice@localhost'/>")?;
             barrier(&mut other)?;
             alice.send("<presence type='subscribe' to='alice@other.localhost'/>")?;
@@ -439,7 +439,7 @@ private_key_path = "private-key.pem"
                     if ping_enabled {
                         client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='{source}' id='target'/>"))?;
                     } else {
-                        client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='target'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                        client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='target'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
                     }
                     for query in ["info", "items"] {
                         client.send(&format!("<iq type='get' to='{target}' id='disco'><query xmlns='http://jabber.org/protocol/disco#{query}'/></iq>"))?;
@@ -460,7 +460,7 @@ private_key_path = "private-key.pem"
                                 client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='{source}' id='disco'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>"))?;
                             }
                         } else {
-                            client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='disco'><query xmlns='http://jabber.org/protocol/disco#{query}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+                            client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='disco'><query xmlns='http://jabber.org/protocol/disco#{query}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
                         }
                     }
                 }
@@ -473,7 +473,7 @@ private_key_path = "private-key.pem"
             client.send(&format!(
                 "<iq type='get' to='{target}' id='own-disabled'><ping xmlns='urn:xmpp:ping'/></iq>"
             ))?;
-            client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='own-disabled'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+            client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='own-disabled'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
             other.close()?;
             alice.close()?;
         }
@@ -500,7 +500,7 @@ fn full_jid_ping_is_answered_by_the_client_even_when_extension_disabled() -> Tes
         alice.send(
             "<iq type='get' id='barrier' xml:lang=''><query xmlns='urn:test:barrier'/></iq>",
         )?;
-        alice.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier' xml:lang=''><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+        alice.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier' xml:lang=''><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
         phone.send("<iq type='result' to='alice@localhost/desk' id='sibling'/>")?;
         alice.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost/phone' to='alice@localhost/desk' id='sibling'/>")?;
         let mut bob = suite.unauthenticated_client()?;
@@ -531,7 +531,7 @@ fn full_jid_ping_is_answered_by_the_client_even_when_extension_disabled() -> Tes
             alice.send(
                 "<iq type='get' id='barrier' xml:lang=''><query xmlns='urn:test:barrier'/></iq>",
             )?;
-            alice.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier' xml:lang=''><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+            alice.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier' xml:lang=''><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
             if kind == "set" {
                 bob.send("<iq type='error' to='alice@localhost/desk' id='endpoint'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
                 alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='endpoint' xml:lang='fr'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
@@ -574,7 +574,7 @@ fn full_jid_ping_preserves_visibility_and_disconnect_errors() -> TestResult {
         alice.send(&format!(
             "<iq type='get' to='{target}' id='denied'><ping xmlns='urn:xmpp:ping'/></iq>"
         ))?;
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='denied'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' to='alice@localhost/desk' id='denied'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
     }
     bob.send("<presence to='alice@localhost/desk'/>")?;
     alice.expect_xml(
@@ -591,7 +591,7 @@ fn full_jid_ping_preserves_visibility_and_disconnect_errors() -> TestResult {
     alice.send(
         "<iq type='get' to='bob@localhost/phone' id='revoked'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     bob.send("<presence type='subscribed' to='alice@localhost'/>")?;
     barrier(&mut bob)?;
     alice.send("<presence type='subscribe' to='bob@localhost'/>")?;
@@ -603,7 +603,7 @@ fn full_jid_ping_preserves_visibility_and_disconnect_errors() -> TestResult {
     bob.send(
         "<iq type='get' to='alice@localhost/desk' id='reverse'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost/desk' to='bob@localhost/phone' id='reverse'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost/desk' to='bob@localhost/phone' id='reverse'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     bob.send("<presence><priority>-1</priority></presence>")?;
     bob.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>-1</priority></presence>")?;
     alice.send(
@@ -621,7 +621,7 @@ fn full_jid_ping_preserves_visibility_and_disconnect_errors() -> TestResult {
     alice.send(
         "<iq type='get' to='bob@localhost/phone' id='closed'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='closed'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='closed'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     barrier(&mut sibling)?;
     sibling.close()?;
     alice.close()
@@ -651,7 +651,7 @@ fn ping_uses_normalized_jids_without_folding_resource_case() -> TestResult {
     alice.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost/Desk' to='alice@localhost/desk' id='upper'/>")?;
     alice.close()?;
     upper.send("<iq type='get' to='alice@localhost/desk' id='missing-case'><ping xmlns='urn:xmpp:ping'/></iq>")?;
-    upper.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost/desk' to='alice@localhost/Desk' id='missing-case'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    upper.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost/desk' to='alice@localhost/Desk' id='missing-case'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
     let mut lower = suite.connect("alice", PASSWORD, "desk")?;
     upper.send(
         "<iq type='get' to='alice@localhost/desk' id='separate'><ping xmlns='urn:xmpp:ping'/></iq>",
@@ -682,7 +682,7 @@ fn ping_policy_and_nonlocal_targets_keep_existing_routing() -> TestResult {
     alice.send(
         "<iq type='get' to='blocked@localhost' id='policy'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='blocked@localhost' id='policy'><ping xmlns='urn:xmpp:ping'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='blocked@localhost' id='policy'><ping xmlns='urn:xmpp:ping'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
     toggle(&mut alice, false)?;
     alice.send(
         "<iq type='get' to='blocked@localhost' id='recovered'><ping xmlns='urn:xmpp:ping'/></iq>",
@@ -702,14 +702,22 @@ fn ping_policy_and_nonlocal_targets_keep_existing_routing() -> TestResult {
         } else {
             ""
         };
-        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}'{to} id='nonlocal'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><{condition} xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"))?;
+        let text = match condition {
+            "remote-server-not-found" => {
+                "The server cannot deliver this request to a remote domain."
+            }
+            _ => {
+                "The requested service or operation is unavailable for this target. Check the address and requested feature."
+            }
+        };
+        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}'{to} id='nonlocal'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><{condition} xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>{text}</text></error></iq>"))?;
     }
     alice.send("<iq type='get' to='echo.localhost' id='service-ping'><ping xmlns='urn:xmpp:ping'/></iq><iq type='get' to='echo.localhost' id='service-control'><query xmlns='urn:lonewolf:test:service'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' from='echo.localhost' to='alice@localhost/desk' id='service-control'><query xmlns='urn:lonewolf:test:service'><count>0</count></query></iq>")?;
     alice.send(
         "<iq type='set' to='echo.localhost' id='service-set'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='echo.localhost' to='alice@localhost/desk' id='service-set'><ping xmlns='urn:xmpp:ping'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='echo.localhost' to='alice@localhost/desk' id='service-set'><ping xmlns='urn:xmpp:ping'/><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The request has an invalid structure or value. Check the request format.</text></error></iq>")?;
     blocked.close()?;
     alice.close()
 }
@@ -737,7 +745,7 @@ fn ping_results_and_errors_do_not_trigger_response_loops() -> TestResult {
     alice.send(
         "<iq type='get' to='carol@localhost/phone' id='budget'><ping xmlns='urn:xmpp:ping'/></iq>",
     )?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='carol@localhost/phone' to='alice@localhost/desk' id='budget'><ping xmlns='urn:xmpp:ping'/><error type='wait'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='carol@localhost/phone' to='alice@localhost/desk' id='budget'><ping xmlns='urn:xmpp:ping'/><error type='wait'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Too many distinct recipients were contacted. Wait before contacting additional recipients.</text></error></iq>")?;
     toggle(&mut alice, true)?;
     carol.send("<presence to='alice@localhost/desk' type='unavailable'/>")?;
     alice.expect_xml("<presence xmlns='jabber:client' from='carol@localhost/phone' to='alice@localhost/desk' type='unavailable'/>")?;
@@ -745,7 +753,7 @@ fn ping_results_and_errors_do_not_trigger_response_loops() -> TestResult {
     carol.expect_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost/desk' to='carol@localhost/phone' id='peer-result'><ping xmlns='urn:xmpp:ping'/></iq>")?;
     carol.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost/desk' to='carol@localhost/phone' id='peer-error'><ping xmlns='urn:xmpp:ping'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
     alice.send("<iq type='get' to='carol@localhost/phone' id='still-limited'><ping xmlns='urn:xmpp:ping'/></iq>")?;
-    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='carol@localhost/phone' to='alice@localhost/desk' id='still-limited'><ping xmlns='urn:xmpp:ping'/><error type='wait'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='carol@localhost/phone' to='alice@localhost/desk' id='still-limited'><ping xmlns='urn:xmpp:ping'/><error type='wait'><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Too many distinct recipients were contacted. Wait before contacting additional recipients.</text></error></iq>")?;
     for destination in [
         "",
         " to='localhost'",

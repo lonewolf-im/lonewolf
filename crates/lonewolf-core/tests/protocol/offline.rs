@@ -426,7 +426,7 @@ fn bare_normal_and_missing_full_chat_store_while_missing_full_normal_is_rejected
         Some("bob@localhost/missing"),
     )?;
     alice.send("<message to='bob@localhost/missing' type='normal' id='rejected'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='rejected' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='rejected' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></message>")?;
     inspect(
         &mut bob,
         "bob@localhost/phone",
@@ -476,7 +476,7 @@ fn missing_full_normal_is_rejected_without_storage_or_replay_for_every_sibling_s
                 None
             };
             alice.send("<message to='bob@localhost/missing' from='mallory@localhost' type='normal' id='missing'/>")?;
-            alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='missing' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+            alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='missing' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></message>")?;
             if let Some(bob) = &mut sibling {
                 inspect(bob, "bob@localhost/phone", 0, 0, None)?;
                 bob.close()?;
@@ -507,7 +507,7 @@ fn standalone_chat_states_do_not_consume_the_two_message_quota() -> TestResult {
     alice.send("<message to='bob@localhost' type='chat' id='first'/>")?;
     alice.send("<message to='bob@localhost' type='chat' id='second'/>")?;
     alice.send("<message to='bob@localhost' type='chat' id='third'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost' to='alice@localhost/desk' id='third' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost' to='alice@localhost/desk' id='third' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The offline message queue has reached its limit of 2 messages. Retry after the recipient retrieves queued messages.</text></error></message>")?;
     let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     inspect(&mut bob, "bob@localhost/phone", 2, 2, Some("bob@localhost"))?;
     bob.close()?;
@@ -522,7 +522,7 @@ fn headline_groupchat_and_error_keep_their_existing_offline_behaviour() -> TestR
     alice.send("<message to='bob@localhost' type='headline' id='headline'/>")?;
     alice.send("<message to='bob@localhost' type='error' id='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
     alice.send("<message to='bob@localhost' type='groupchat' id='groupchat'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost' to='alice@localhost/desk' id='groupchat' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost' to='alice@localhost/desk' id='groupchat' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></message>")?;
     let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
     bob.close()?;
@@ -619,7 +619,7 @@ fn recipient_host_selects_the_handler_and_quota() -> TestResult {
     alice.send("<message to='bob@other.localhost' type='chat' id='first'/>")?;
     alice.send("<message to='bob@other.localhost' type='chat' id='second'/>")?;
     alice.send("<message to='bob@other.localhost' type='chat' id='third'/>")?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@other.localhost' to='alice@localhost/desk' id='third' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@other.localhost' to='alice@localhost/desk' id='third' type='error'><error type='wait'><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The offline message queue has reached its limit of 2 messages. Retry after the recipient retrieves queued messages.</text></error></message>")?;
     alice.close()
 }
 
@@ -661,7 +661,7 @@ fn rejected_full_normal_stays_absent_when_a_sibling_becomes_eligible() -> TestRe
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
     )?;
-    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='raced' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@localhost/missing' to='alice@localhost/desk' id='raced' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></message>")?;
     inspect(&mut bob, "bob@localhost/phone", 0, 0, None)?;
     bob.close()?;
     let mut bob = suite.connect("bob", OTHER_PASSWORD, "missing")?;

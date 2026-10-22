@@ -325,12 +325,17 @@ fn per_host_quota_accepts_the_limit_then_rejects_the_next_message() -> TestResul
         for _ in 0..2 {
             test.store(&owner, MESSAGE).await?;
         }
-        assert!(matches!(
+        assert_eq!(
             test.store_at(&owner, MESSAGE, received_at()).await?,
-            Err(HandlerError::Stanza(
-                StanzaErrorCondition::ResourceConstraint
+            Err(HandlerError::described(
+                StanzaErrorCondition::ResourceConstraint,
+                lonewolf_xmpp::stanza::StanzaErrorText::Limit {
+                    prefix: "The offline message queue has reached its limit of ",
+                    max: 2,
+                    suffix: " messages. Retry after the recipient retrieves queued messages.",
+                }
             ))
-        ));
+        );
         assert_eq!(
             test.backlog(&owner)
                 .await?
@@ -537,12 +542,17 @@ fn hosts_without_configured_limits_enforce_the_default_quota() -> TestResult {
         for _ in 0..100 {
             test.store(&owner, MESSAGE).await?;
         }
-        assert!(matches!(
+        assert_eq!(
             test.store_at(&owner, MESSAGE, received_at()).await?,
-            Err(HandlerError::Stanza(
-                StanzaErrorCondition::ResourceConstraint
+            Err(HandlerError::described(
+                StanzaErrorCondition::ResourceConstraint,
+                lonewolf_xmpp::stanza::StanzaErrorText::Limit {
+                    prefix: "The offline message queue has reached its limit of ",
+                    max: 100,
+                    suffix: " messages. Retry after the recipient retrieves queued messages.",
+                }
             ))
-        ));
+        );
         assert_eq!(
             test.backlog(&owner)
                 .await?

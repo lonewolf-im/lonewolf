@@ -85,7 +85,8 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Disco {
         Box::pin(async move {
             let query = Query::parse(request.payload)
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                .ok_or(StanzaErrorCondition::BadRequest)?;
+                .ok_or(HandlerError::described(StanzaErrorCondition::BadRequest,
+                    lonewolf_xmpp::stanza::StanzaErrorText::Static("Discovery requires a query element in the disco#info or disco#items namespace.")))?;
             let payload = if request.target.localpart().is_none() {
                 let result = answer_server(query, request.discovery, response);
                 let outcome = if query.node.is_some() {
@@ -202,7 +203,8 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Disco {
     ) -> Result<Option<Element>, IqError> {
         let query = Query::parse(request.payload)
             .map_err(|_| StanzaErrorCondition::InternalServerError)?
-            .ok_or(StanzaErrorCondition::BadRequest)?;
+            .ok_or(HandlerError::described(StanzaErrorCondition::BadRequest,
+                    lonewolf_xmpp::stanza::StanzaErrorText::Static("Discovery requires a query element in the disco#info or disco#items namespace.")))?;
         let result: Result<_, HandlerError> =
             match account_answer(query.kind, Requester::Other, query.node) {
                 AccountAnswer::ServiceUnavailable => {

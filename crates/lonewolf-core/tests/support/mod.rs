@@ -28,7 +28,7 @@ pub const STREAM_ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-streams";
 
 pub fn barrier(client: &mut Client) -> TestResult {
     client.send("<iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;
-    client.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")
+    client.expect_xml("<iq xmlns='jabber:client' type='error' id='barrier'><query xmlns='urn:test:barrier'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")
 }
 
 pub fn mutually_subscribe(

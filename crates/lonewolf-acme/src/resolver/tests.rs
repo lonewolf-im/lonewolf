@@ -140,7 +140,7 @@ fn process_pool_survives_transport_recreation() {
     let uri = "https://localhost/".parse().unwrap();
     BoundedResolver
         .resolve(&uri, &config, timeout(Duration::from_secs(5)))
-        .unwrap();
+        .expect("system resolver must resolve localhost for the pool ownership test");
     let first = std::ptr::from_ref(POOL.get().unwrap().as_ref().unwrap());
     for _ in 0..8 {
         let client = futures_executor::block_on(crate::AcmeHttpClient::new(
@@ -151,7 +151,7 @@ fn process_pool_survives_transport_recreation() {
         drop(client);
         BoundedResolver
             .resolve(&uri, &config, timeout(Duration::from_secs(5)))
-            .unwrap();
+            .expect("system resolver must resolve localhost after transport recreation");
         assert_eq!(
             first,
             std::ptr::from_ref(POOL.get().unwrap().as_ref().unwrap())

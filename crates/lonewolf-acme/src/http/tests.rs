@@ -439,11 +439,11 @@ fn ipv6_listener_is_ipv6_only_when_available() -> TestResult {
                 if matches!(
                     error.kind(),
                     io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
-                ) =>
+                ) || error.raw_os_error() == Some(nix::libc::EAFNOSUPPORT) =>
             {
+                eprintln!("IPv6 listener check unavailable on this host: {error}");
                 return Ok(());
             }
-            Err(error) if error.raw_os_error() == Some(nix::libc::EAFNOSUPPORT) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         let port = server.local_addrs()?[0].port();
@@ -458,6 +458,7 @@ fn ipv6_listener_is_ipv6_only_when_available() -> TestResult {
         assert!(response.starts_with("HTTP/1.1 200"));
         stop.send(Instant::now()).unwrap();
         timeout(Duration::from_secs(2), task).await???;
+        eprintln!("IPv6-only HTTP listener exercised");
         Ok(())
     })
 }

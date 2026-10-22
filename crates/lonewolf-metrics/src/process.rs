@@ -161,13 +161,23 @@ mod tests {
                 line.strip_prefix(name)
                     .and_then(|line| line.strip_prefix(' '))
             })
-            .expect("missing process metric")
+            .unwrap_or_else(|| panic!("missing process metric: {name}"))
             .parse()
-            .expect("invalid process metric")
+            .unwrap_or_else(|error| panic!("invalid process metric {name}: {error}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_procfs() {
+        std::fs::File::open("/proc/self/statm")
+            .expect("process metrics tests require readable /proc/self/statm");
+        std::fs::read_dir("/proc/self/fd")
+            .expect("process metrics tests require readable /proc/self/fd");
     }
 
     #[test]
     fn process_metrics_are_encoded() -> Result<(), fmt::Error> {
+        #[cfg(target_os = "linux")]
+        require_procfs();
         let mut registry = Registry::default();
         registry.register_collector(Box::new(ProcessCollector::new()));
         let mut output = String::new();
@@ -201,6 +211,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_process_reads_do_not_allocate_in_rust() {
+        require_procfs();
         assert_eq!(
             crate::test_allocator::allocations_during(|| {
                 assert!(resident_memory_bytes().is_some());

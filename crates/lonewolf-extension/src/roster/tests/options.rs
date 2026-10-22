@@ -83,9 +83,9 @@ fn factory_applies_defaults_and_host_specific_pending_limits() -> Result<(), Box
                     Err(HandlerError::described(
                         StanzaErrorCondition::ResourceConstraint,
                         lonewolf_xmpp::stanza::StanzaErrorText::Limit {
-                            prefix: "The pending subscription request limit of ",
+                            prefix: "The recipient's pending subscription request limit of ",
                             max: limit,
-                            suffix: " has been reached. Resolve existing requests before adding more.",
+                            suffix: " has been reached. Retry after the recipient handles pending requests.",
                         },
                     )),
                 ),

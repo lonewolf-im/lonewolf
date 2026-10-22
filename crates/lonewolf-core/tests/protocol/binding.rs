@@ -154,7 +154,7 @@ const PRE_BIND_RESPONSES: &[&str] = &[
 fn iq_responses_are_ignored_before_binding_for_permitted_addresses() -> TestResult {
     for response in [
         "<iq type='result' id='reply'{address}/>",
-        "<iq type='error' id='reply'{address}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>",
+        "<iq type='error' id='reply'{address}><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
         "<iq type='result'{address}/>",
         "<iq type='result' id='bad'{address}><first/><second/></iq>",
         "<iq type='error' id='bad'{address}/>",
@@ -738,7 +738,7 @@ fn pre_bind_iqs_to_other_entities_close_before_request_or_response_handling() ->
             "type='get' id='query'><ping xmlns='urn:xmpp:ping'/></iq>",
             "type='set' id='query'><query xmlns='urn:test:unsupported'/></iq>",
             "type='result' id='reply'/>",
-            "type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>",
+            "type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
             "type='result'/>",
             "type='error'/>",
         ] {
@@ -774,7 +774,7 @@ fn pre_bind_responses_preserve_namespace_and_address_gate_precedence() -> TestRe
             let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
             let payload = if envelope.starts_with("type='error' id=") {
-                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error>"
+                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
             } else {
                 ""
             };
@@ -798,7 +798,7 @@ fn ignored_pre_bind_responses_do_not_increment_or_reset_the_failure_count() -> T
         }
         for _ in 0..7 {
             client.send("<iq type='result' id='reply'/>")?;
-            client.send("<iq type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested operation is not available before resource binding completes.</text></error></iq>")?;
+            client.send("<iq type='error' id='reply'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>")?;
             client.send("<iq type='result'/>")?;
             client.send("<iq type='error'/>")?;
         }

@@ -100,10 +100,14 @@ fn iq_requests_follow_policy_and_rejected_responses_are_dropped() -> TestResult 
     let mut bob = suite.connect("bob", PASSWORD, "res")?;
     let mut second = suite.connect("blocked", PASSWORD, "second")?;
 
-    alice.send(
-        "<iq type='get' to='blocked@localhost/res' id='reject'><query xmlns='urn:test:iq'/></iq>",
-    )?;
-    alice.expect_xml("<iq xmlns='jabber:client' from='blocked@localhost/res' type='error' id='reject'><query xmlns='urn:test:iq'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
+    for from in [
+        "",
+        " from='alice@localhost/res'",
+        " from='mallory@localhost/forged'",
+    ] {
+        alice.send(&format!("<iq type='get' to='blocked@localhost/res' id='reject'{from}><query xmlns='urn:test:iq'/></iq>"))?;
+        alice.expect_xml("<iq xmlns='jabber:client' from='blocked@localhost/res' type='error' id='reject'><query xmlns='urn:test:iq'/><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A request value exceeds an allowed limit or has an unsupported format.</text><blocked xmlns='urn:lonewolf:test:policy'/></error></iq>")?;
+    }
     toggle(&mut alice, false)?;
     alice.send("<presence to='blocked@localhost/res'/>")?;
     blocked.expect_xml(

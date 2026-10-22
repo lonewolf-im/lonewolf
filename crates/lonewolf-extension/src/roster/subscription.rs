@@ -203,9 +203,9 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
         lonewolf_storage::roster::RosterError::PendingLimitExceeded => HandlerError::described(
             StanzaErrorCondition::ResourceConstraint,
             lonewolf_xmpp::stanza::StanzaErrorText::Limit {
-                prefix: "The pending subscription request limit of ",
+                prefix: "The recipient's pending subscription request limit of ",
                 max: max_pending_subscription_requests.get(),
-                suffix: " has been reached. Resolve existing requests before adding more.",
+                suffix: " has been reached. Retry after the recipient handles pending requests.",
             },
         ),
         error => roster_error(error, "roster_write"),

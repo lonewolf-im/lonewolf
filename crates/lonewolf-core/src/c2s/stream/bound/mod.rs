@@ -847,6 +847,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         application,
                         text.unwrap_or_else(|| condition.default_text()),
                     )?
+                    .to(None)?
                     .build()?;
                 self.outbox.push(Output::Owned {
                     stanza: reply,

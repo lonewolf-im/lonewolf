@@ -5,7 +5,9 @@ use std::num::NonZeroUsize;
 
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_storage::vcard::{MAX_VCARD_BYTES, VCardQuota};
-use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, GlobalChunkAllocator};
+use lonewolf_util::arena::{
+    Arena, ArenaConfig, ArenaError, ArenaRead, ChunkAllocator, GlobalChunkAllocator,
+};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, parse_element};
 use lonewolf_xmpp::stanza::{
     BuildError, Element, ElementRef, NodeRef, StanzaErrorCondition, StanzaErrorText, WriteError,
@@ -171,9 +173,7 @@ pub(super) async fn encode<A: ChunkAllocator>(
         ParseError::Build(BuildError::TreeLimitExceeded) => structural(
             "vCard exceeds the XML tree depth or node limit. Simplify the profile's XML structure.",
         ),
-        ParseError::Build(BuildError::Allocation(_)) => structural(
-            "vCard exceeds the XML processing memory limit. Simplify the profile's XML structure.",
-        ),
+        ParseError::Build(error @ BuildError::Allocation(_)) => build_error(error),
         _ => HandlerError::from(StanzaErrorCondition::InternalServerError),
     })?;
     let root = parsed
@@ -231,9 +231,12 @@ fn structural(text: &'static str) -> HandlerError {
 
 fn build_error(error: BuildError) -> HandlerError {
     match error {
-        BuildError::Allocation(_) => structural(
-            "vCard exceeds the XML processing memory limit. Simplify the profile's XML structure.",
-        ),
+        BuildError::Allocation(ArenaError::ArenaLimitExceeded | ArenaError::CapacityOverflow) => {
+            structural(
+                "vCard exceeds the XML processing memory limit. Simplify the profile's XML structure.",
+            )
+        }
+        BuildError::Allocation(_) => StanzaErrorCondition::ResourceConstraint.into(),
         BuildError::TreeLimitExceeded => structural(
             "vCard exceeds the XML tree depth or node limit. Simplify the profile's XML structure.",
         ),
@@ -243,7 +246,35 @@ fn build_error(error: BuildError) -> HandlerError {
 
 #[cfg(test)]
 mod output_tests {
-    use super::BoundedOutput;
+    use super::{BoundedOutput, build_error};
+    use lonewolf_util::arena::{AllocationError, ArenaError};
+    use lonewolf_xmpp::stanza::{BuildError, StanzaErrorCondition, StanzaErrorText};
+
+    #[test]
+    fn memory_budget_and_allocator_failures_have_distinct_descriptions() {
+        for error in [ArenaError::ArenaLimitExceeded, ArenaError::CapacityOverflow] {
+            let error = build_error(BuildError::Allocation(error));
+            assert_eq!(error.condition(), StanzaErrorCondition::ResourceConstraint);
+            assert_eq!(
+                error.text(),
+                StanzaErrorText::Static(
+                    "vCard exceeds the XML processing memory limit. Simplify the profile's XML structure."
+                )
+            );
+        }
+        for error in [
+            AllocationError::Exhausted,
+            AllocationError::UnsupportedLayout,
+        ] {
+            let error = build_error(BuildError::Allocation(ArenaError::Allocation(error)));
+            assert_eq!(error.condition(), StanzaErrorCondition::ResourceConstraint);
+            assert_eq!(
+                error.text(),
+                StanzaErrorCondition::ResourceConstraint.default_text()
+            );
+            assert!(error.failure().is_none());
+        }
+    }
     use std::fmt::Write;
 
     #[test]

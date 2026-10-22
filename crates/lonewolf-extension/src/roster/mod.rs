@@ -607,7 +607,7 @@ fn roster_error(error: RosterError, operation: &'static str) -> HandlerError {
         RosterError::PendingLimitExceeded => HandlerError::described(
             StanzaErrorCondition::ResourceConstraint,
             lonewolf_xmpp::stanza::StanzaErrorText::Static(
-                "The pending subscription request limit has been reached. Resolve existing requests before adding more.",
+                "The recipient's pending subscription request limit has been reached. Retry after the recipient handles pending requests.",
             ),
         ),
         RosterError::QuotaExceeded => HandlerError::described(

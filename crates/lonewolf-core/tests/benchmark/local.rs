@@ -11,13 +11,21 @@ use lonewolf_bench::{
     compare::compare_runs,
     config::ScenarioConfig,
     fixture::{LocalFixture, StopOutcome},
-    report::RunStatus,
+    report::{PhaseName, RunStatus},
     run::{
         events::{ObserverEvent, RunObserver},
         run_with_observer,
     },
 };
-use std::{fs, num::NonZeroUsize, path::Path, time::Duration};
+use std::{
+    fs,
+    future::{Future, poll_fn},
+    num::{NonZeroU32, NonZeroUsize},
+    path::Path,
+    pin::pin,
+    task::Poll,
+    time::Duration,
+};
 use tokio::time::{Instant, timeout};
 
 fn server() -> &'static Path {
@@ -187,11 +195,21 @@ async fn server_exit_during_measurement_fails_the_run_instead_of_degrading_it() 
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir()?;
     let script = directory.path().join("crashing-server");
+    let record = directory.path().join("server.pid");
+    let quote = |path: &Path| -> TestResult<String> {
+        Ok(format!(
+            "'{}'",
+            path.to_str()
+                .ok_or("non-UTF-8 executable path")?
+                .replace('\'', "'\\''")
+        ))
+    };
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\n'{}' \"$@\" &\nchild=$!\nsleep 2\nkill -9 \"$child\"\nwait \"$child\"\nexit 1\n",
-            server().display()
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nexec {} \"$@\"\n",
+            quote(&record)?,
+            quote(server())?
         ),
     )?;
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700))?;
@@ -206,11 +224,41 @@ async fn server_exit_during_measurement_fails_the_run_instead_of_degrading_it() 
             },
         ),
     ] {
-        let mut config = local_config(&script, scenario);
-        config.measurement.duration_ms = 5000;
+        let config = local_config(&script, scenario);
         let output = directory.path().join(name);
-        let report =
-            timeout(bench_support::TIMEOUT, lonewolf_bench::run(config, &output)).await??;
+        let (observer, mut events) =
+            RunObserver::bounded(NonZeroUsize::new(128).ok_or("capacity")?);
+        let mut run = pin!(run_with_observer(config, &output, observer));
+        let report = timeout(bench_support::TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = events.recv() => match event {
+                        Some(ObserverEvent::PhaseStarted(PhaseName::Measurement)) => break,
+                        Some(_) => {},
+                        None => return Err("observer closed before measurement".into()),
+                    },
+                    completed = run.as_mut() => {
+                        let report = completed?;
+                        return Err(format!("run finished before measurement: {:?}", report.reasons).into());
+                    },
+                }
+            }
+            assert!(poll_fn(|context| Poll::Ready(run.as_mut().poll(context))).await.is_pending());
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    !matches!(event, ObserverEvent::PhaseFinished(PhaseName::Measurement)),
+                    "measurement completed before the server was stopped"
+                );
+            }
+            let pid: NonZeroU32 = fs::read_to_string(&record)?.trim().parse()?;
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(pid.get())?),
+                nix::sys::signal::Signal::SIGKILL,
+            )?;
+            Ok::<_, Box<dyn std::error::Error>>(run.await?)
+        })
+        .await??;
         assert_eq!(
             report.status,
             RunStatus::Failed,

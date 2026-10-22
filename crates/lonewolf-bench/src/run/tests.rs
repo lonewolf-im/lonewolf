@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use std::{fs, num::NonZeroUsize, os::unix::fs::PermissionsExt};
+use std::{
+    fs,
+    future::{Future, poll_fn},
+    num::NonZeroUsize,
+    os::unix::fs::PermissionsExt,
+    pin::pin,
+    task::Poll,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -333,11 +340,14 @@ async fn remote_credential_and_target_failures_keep_partial_evidence() -> TestRe
 async fn global_event_receiver_closes_and_cancelled_waits_keep_the_queue() -> TestResult {
     let invalid = Arc::new(AtomicBool::new(false));
     let (sender, mut receiver) = EventSender::new(2, invalid);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1), receiver.recv())
-            .await
-            .is_err()
-    );
+    {
+        let mut waiting = pin!(receiver.recv());
+        assert!(
+            poll_fn(|context| Poll::Ready(waiting.as_mut().poll(context)))
+                .await
+                .is_pending()
+        );
+    }
     sender.emit(RunEvent::Received {
         index: 42,
         event: crate::client::ReceivedEvent {
@@ -378,14 +388,19 @@ async fn cleanup_awaits_cancelled_cpu_work_before_clearing_accounts() -> TestRes
     admitted.await?;
     work.abort();
     let _ = work.await;
-    let release = tokio::spawn(async move {
-        sleep(Duration::from_millis(5)).await;
-        let _ = release.send(());
-    });
-    context.cleanup().await;
+    {
+        let mut cleanup = pin!(context.cleanup());
+        assert!(
+            poll_fn(|context| Poll::Ready(cleanup.as_mut().poll(context)))
+                .await
+                .is_pending()
+        );
+        assert!(!finished.load(Ordering::Acquire));
+        release.send(())?;
+        cleanup.await;
+    }
     assert!(finished.load(Ordering::Acquire));
     assert!(context.accounts.is_empty());
-    release.await?;
     Ok(())
 }
 
@@ -423,18 +438,18 @@ async fn stopped_fixture_retains_finalized_safe_logs_through_artifact_finalizati
     let (mut context, _signal) = context(1)?;
     let mut config = config(1)?;
     if let TargetConfig::Local { server_binary, .. } = &mut config.target {
-        *server_binary = "/usr/bin/true".into();
+        *server_binary = std::env::current_exe()?;
     }
     context.fixture = Some(LocalFixture::prepare(&config, &context.cpu).await?);
-    assert!(
-        context
-            .fixture
-            .as_mut()
-            .ok_or("fixture")?
-            .start(Instant::now() + Duration::from_secs(1))
-            .await
-            .is_err()
-    );
+    let error = context
+        .fixture
+        .as_mut()
+        .ok_or("fixture")?
+        .start(Instant::now() + Duration::from_secs(1))
+        .await
+        .err()
+        .ok_or("test executable unexpectedly started as a server")?;
+    assert_eq!(error.context(), "fixture_startup_exit");
     context.cleanup().await;
     let fixture = context
         .fixture

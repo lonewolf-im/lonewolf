@@ -690,7 +690,7 @@ fn unreadable_configuration_is_an_error() -> TestResult {
 }
 
 #[test]
-fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult {
+fn reference_configuration_is_commented_and_loads_builtin_defaults() -> TestResult {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
     let reference = fs::read_to_string(&path)?;
     assert!(
@@ -699,6 +699,13 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
             .all(|line| line.trim().is_empty() || line.trim_start().starts_with('#'))
     );
     assert_eq!(Config::load(Some(&path))?, Config::default());
+    Ok(())
+}
+
+#[test]
+fn reference_configuration_explains_vcard_constraints() -> TestResult {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
+    let reference = fs::read_to_string(path)?;
     for constraint in [
         "vcard requires disco in the same host's extension list",
         "public to authenticated local C2S users",
@@ -715,6 +722,12 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         );
     }
 
+    Ok(())
+}
+
+fn documented_settings_and_examples() -> Result<(String, Vec<String>), Box<dyn Error>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
+    let reference = fs::read_to_string(path)?;
     let mut uncommented = String::with_capacity(reference.len());
     let mut example = None;
     let mut examples = Vec::new();
@@ -737,6 +750,12 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         }
     }
     assert!(example.is_none());
+    Ok((uncommented, examples))
+}
+
+#[test]
+fn reference_configuration_fenced_examples_load() -> TestResult {
+    let (_, examples) = documented_settings_and_examples()?;
     assert_eq!(examples.len(), 5);
     for example in examples {
         let contents = if example.starts_with("[letsencrypt]") {
@@ -747,6 +766,12 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         let file = config_file(&contents)?;
         Config::load(Some(file.path()))?;
     }
+    Ok(())
+}
+
+#[test]
+fn reference_configuration_settings_match_documented_defaults() -> TestResult {
+    let (uncommented, _) = documented_settings_and_examples()?;
     assert!(!uncommented.is_empty());
     let mut documented: toml::Value = toml::from_str(&uncommented)?;
     let example_profile = documented
@@ -833,6 +858,14 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     );
     let loaded = Config::load(Some(file.path()))?;
     assert_eq!(loaded, expected);
+    Ok(())
+}
+
+#[test]
+fn reference_configuration_extensions_enable_for_each_host() -> TestResult {
+    let (uncommented, _) = documented_settings_and_examples()?;
+    let file = config_file(&uncommented)?;
+    let loaded = Config::load(Some(file.path()))?;
     let mut extensions = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
     for factory in lonewolf_extension::builtin() {
         extensions.register_factory(factory)?;
@@ -846,7 +879,11 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
             options: &host.options,
         })
         .collect::<Vec<_>>();
-    extensions.enable(&selections)?;
+    let enabled = extensions.enable(&selections)?;
+    assert_eq!(
+        enabled.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["example.com", "localhost"]
+    );
     Ok(())
 }
 

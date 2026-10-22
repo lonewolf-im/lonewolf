@@ -228,6 +228,36 @@ impl Fixture {
         }
     }
 
+    pub(super) fn bound_session<A: ChunkAllocator + Clone>(
+        &self,
+        allocator: A,
+        registration: Registration<A>,
+        router: RouterHandle<A>,
+        incoming: async_channel::Receiver<Incoming<A>>,
+    ) -> TestResult<BoundSession<'_, A, ControlledWriter>> {
+        let mut outbox = self.outbox(allocator.clone(), ControlledWriter::default());
+        outbox.liveness = registration.liveness();
+        Ok(BoundSession {
+            outbox,
+            registration,
+            router,
+            storage: self.storage.clone(),
+            allocator,
+            work: self.work.handle(),
+            service_presence: None,
+            service_pending: None,
+            recipients: RecipientLimiter::new(
+                NonZeroUsize::MIN,
+                NonZeroUsize::new(100).ok_or("burst")?,
+                Instant::now(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
+            ),
+            available: false,
+            priority: None,
+            incoming,
+        })
+    }
+
     async fn backlog(&self) -> TestResult<Backlog> {
         let snapshot = self.storage.begin_read().await?;
         let messages = snapshot
@@ -277,23 +307,8 @@ fn remote_presence_without_roster_rejects_before_writer_admission_and_keeps_stat
         transaction.commit().await?;
         let before = fixture.storage.begin_read().await?.roster(owner, RosterQuota::default()).await?;
         let held = fixture.storage.begin_write().await?;
-        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
-        outbox.liveness = registration.liveness();
         let (_sender, incoming) = async_channel::bounded(1);
-        let mut session = BoundSession {
-            registration,
-            router,
-            storage: fixture.storage.clone(),
-            allocator: GlobalChunkAllocator,
-            work: fixture.work.handle(),
-            service_presence: None,
-            service_pending: None,
-            recipients: RecipientLimiter::new(NonZeroUsize::MIN, NonZeroUsize::new(100).ok_or("zero burst")?, Instant::now(), crate::c2s::metrics::C2sWorkerMetrics::detached()),
-            available: false,
-            priority: None,
-            incoming,
-            outbox,
-        };
+        let mut session = fixture.bound_session(GlobalChunkAllocator, registration, router, incoming)?;
         for target in ["alice@remote.example", "alice@remote.example/phone", "remote.example", "remote.example/phone"] {
             for kind in [" type='subscribe'", " type='subscribed'", " type='unsubscribe'", " type='unsubscribed'", "", " type='unavailable'", " type='probe'"] {
                 let input = format!("<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'><presence{kind} to='{target}' from='mallory@localhost/spy' id='remote'/>");
@@ -1187,8 +1202,10 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
 }
 
 fn certificate_monitor() -> super::super::certificate::ValidityMonitor {
-    let now = SystemTime::now();
+    let clock = super::super::certificate::Clock::manual();
+    let now = clock.now();
     super::super::certificate::ValidityMonitor {
+        clock,
         validity: Cell::new(crate::hosts::client_identity::ClientValidity {
             recheck_at: now,
             valid_until: now + Duration::from_secs(1),
@@ -1249,15 +1266,15 @@ fn certificate_expiry_interrupts_a_blocked_outbox_write() -> TestResult {
         });
         let monitor = certificate_monitor();
         let mut validity = monitor.validity.get();
-        validity.valid_until = SystemTime::now() + Duration::from_millis(30);
+        validity.valid_until = monitor.clock.now() + Duration::from_millis(30);
         monitor.validity.set(validity);
-        assert_eq!(
-            monitor
-                .interrupt(outbox.flush(), |_| std::future::pending())
-                .await,
-            Err(CloseOutcome::CertificateInvalid)
-        );
-        writing.await?;
+        let mut operation = Box::pin(monitor.interrupt(outbox.flush(), |_| std::future::pending()));
+        match select(writing, operation.as_mut()).await {
+            Either::Left((entered, _)) => entered?,
+            Either::Right(_) => return Err("outbox write completed before expiry".into()),
+        }
+        monitor.clock.advance(Duration::from_millis(30));
+        assert_eq!(operation.await, Err(CloseOutcome::CertificateInvalid));
         assert_eq!(fixture.count().await?, 1);
         drop(outbox);
         fixture.finish().await
@@ -2879,22 +2896,7 @@ fn iq_context_reaches_get_set_and_missing_account_handlers() -> TestResult {
             NonZeroUsize::new(2).ok_or("resource limit")?
         ).await?;
         let (_sender, incoming) = async_channel::bounded(1);
-        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
-        outbox.liveness = registration.liveness();
-        let mut session = BoundSession {
-            outbox,
-            registration,
-            router,
-            storage: fixture.storage.clone(),
-            allocator: GlobalChunkAllocator,
-            work: fixture.work.handle(),
-            service_presence: None,
-            service_pending: None,
-            recipients: RecipientLimiter::new(NonZeroUsize::MIN, NonZeroUsize::new(100).ok_or("burst")?, Instant::now(), crate::c2s::metrics::C2sWorkerMetrics::detached()),
-            available: false,
-            priority: None,
-            incoming,
-        };
+        let mut session = fixture.bound_session(GlobalChunkAllocator, registration, router, incoming)?;
         let mut contexts = vec![
             (None, None, None, None, None, None),
             (Some("en"), None, None, Some("preserve"), None, None),

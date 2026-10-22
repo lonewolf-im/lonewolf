@@ -142,3 +142,150 @@ impl Reply {
         Err(CtlError::api(code.as_deref()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    use super::*;
+
+    #[test]
+    fn expected_status_preserves_the_response_body() {
+        for status in [StatusCode::OK, StatusCode::CREATED, StatusCode::NO_CONTENT] {
+            let body = b"opaque response bytes\0\xff";
+            let reply = Reply {
+                status,
+                body: body.to_vec(),
+            };
+            let actual = reply
+                .expect_status(status)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(actual, body);
+        }
+    }
+
+    #[test]
+    fn unexpected_success_status_is_an_invalid_response() {
+        for status in [
+            StatusCode::CREATED,
+            StatusCode::ACCEPTED,
+            StatusCode::NO_CONTENT,
+        ] {
+            let reply = Reply {
+                status,
+                body: br#"{"error":{"code":"not_found"}}"#.to_vec(),
+            };
+            let Err(error) = reply.expect_status(StatusCode::OK) else {
+                panic!("accepted unexpected success status {status}");
+            };
+            assert_eq!(error.code, "invalid_response");
+            assert_eq!(
+                error.to_string(),
+                "admin service returned an invalid response"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_statuses_preserve_valid_api_codes() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let reply = Reply {
+                status,
+                body: br#"{"error":{"code":"not_found"}}"#.to_vec(),
+            };
+            let Err(error) = reply.expect_status(StatusCode::OK) else {
+                panic!("accepted failed status {status}");
+            };
+            assert_eq!(error.code, "not_found");
+            assert_eq!(error.to_string(), "account not found");
+        }
+    }
+
+    #[test]
+    fn failed_statuses_without_valid_error_json_use_server_error() {
+        for body in [
+            "",
+            "not JSON",
+            r#"{"error":{"code":"not_found"}"#,
+            "null",
+            "[]",
+            "{}",
+            r#"{"error":null}"#,
+            r#"{"error":{"code":42}}"#,
+        ] {
+            let reply = Reply {
+                status: StatusCode::BAD_REQUEST,
+                body: body.as_bytes().to_vec(),
+            };
+            let Err(error) = reply.expect_status(StatusCode::OK) else {
+                panic!("accepted failed reply {body:?}");
+            };
+            assert_eq!(error.code, "server_error", "{body:?}");
+            assert_eq!(error.to_string(), "admin service returned an error");
+        }
+    }
+
+    #[test]
+    fn admitted_request_times_out_without_a_server_response()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let directory = tempfile::tempdir()?;
+            let socket = directory.path().join("timeout.sock");
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            let (admitted, admission) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    stream.readable().await?;
+                    let mut buffer = [0; 1024];
+                    match stream.try_read(&mut buffer) {
+                        Ok(0) => return Err(std::io::Error::other("request ended before headers")),
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                assert!(request.starts_with(b"GET /v1/accounts HTTP/1.1\r\n"));
+                admitted
+                    .send(())
+                    .map_err(|_| std::io::Error::other("admission cancelled"))?;
+                std::future::pending::<()>().await;
+                drop(stream);
+                Ok(())
+            });
+            let mut request = tokio::spawn(async move {
+                Client::new(socket)
+                    .request(Method::GET, "/v1/accounts", Vec::new())
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), admission).await??;
+            assert!(
+                poll_fn(|context| Poll::Ready(Pin::new(&mut request).poll(context)))
+                    .await
+                    .is_pending()
+            );
+            tokio::time::pause();
+            tokio::time::advance(REQUEST_TIMEOUT).await;
+            let Err(error) = tokio::time::timeout(Duration::from_secs(1), request).await?? else {
+                return Err("accepted unanswered request".into());
+            };
+            assert_eq!(error.code, "request_timeout");
+            assert_eq!(error.to_string(), "admin request timed out");
+            server.abort();
+            let cancelled = server.await.err().ok_or("server was not cancelled")?;
+            assert!(cancelled.is_cancelled());
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+    }
+}

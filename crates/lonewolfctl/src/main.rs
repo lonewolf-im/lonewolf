@@ -380,4 +380,37 @@ mod tests {
             "password must contain at least 15 characters and 3 distinct characters after SASLprep"
         );
     }
+
+    #[test]
+    fn api_codes_accept_lowercase_ascii_digits_and_underscores_up_to_64_bytes() {
+        let longest = "a".repeat(64);
+        for code in ["a", "0", "_", "future_error_123", longest.as_str()] {
+            let error = CtlError::api(Some(code));
+            assert_eq!(error.code, code);
+            assert_eq!(error.to_string(), "admin service returned an error");
+        }
+    }
+
+    #[test]
+    fn hostile_api_codes_use_the_bounded_server_error_fallback() {
+        let oversized = "a".repeat(65);
+        for code in [
+            None,
+            Some(""),
+            Some(oversized.as_str()),
+            Some("UPPERCASE"),
+            Some("with-dash"),
+            Some("with space"),
+            Some("é"),
+            Some("line\nbreak"),
+            Some("carriage\rreturn"),
+            Some("escape\u{1b}[31m"),
+            Some("nul\0byte"),
+            Some("quote\"value"),
+        ] {
+            let error = CtlError::api(code);
+            assert_eq!(error.code, "server_error", "{code:?}");
+            assert_eq!(error.to_string(), "admin service returned an error");
+        }
+    }
 }

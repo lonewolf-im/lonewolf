@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use lonewolf_core::test_support::{StreamProbe, StreamProbeEvent, install_stream_probe};
 use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
@@ -36,7 +37,7 @@ use lonewolf_extension::{
 };
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
-use lonewolf_storage::roster::{RosterJid, RosterWrites};
+use lonewolf_storage::roster::{RosterJid, RosterReads, RosterWrites};
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_util::pool::PooledChunkAllocator;
@@ -162,6 +163,11 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(TestIq {
         gets: AtomicUsize::new(0),
         sets: AtomicUsize::new(0),
+        entered: Arc::new(async_lock::Semaphore::new(0)),
+        release: Arc::new(async_lock::Semaphore::new(0)),
+    }))?;
+    extensions.register(Arc::new(TestStreamProbe {
+        probe: PlMutex::new(None),
     }))?;
     extensions.register(Arc::new(TestAccountAccess))?;
     extensions.register(Arc::new(TestIqResults))?;
@@ -559,6 +565,124 @@ struct ConflictingIq;
 struct TestIq {
     gets: AtomicUsize,
     sets: AtomicUsize,
+    entered: Arc<async_lock::Semaphore>,
+    release: Arc<async_lock::Semaphore>,
+}
+
+struct TestStreamProbe {
+    probe: PlMutex<Option<StreamProbe>>,
+}
+
+const PROBE_NAMESPACE: &str = "urn:lonewolf:test:stream-probe";
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestStreamProbe {
+    fn name(&self) -> &'static str {
+        "test-stream-probe"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for name in ["install", "hold-write", "event", "release-write", "remove"] {
+            slots.iq(
+                IqRoute {
+                    scope: IqScope::Server,
+                    kind: IqRequestType::Get,
+                    namespace: PROBE_NAMESPACE,
+                    name,
+                },
+                self.clone(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestStreamProbe {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _transaction: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let attribute = |name| {
+                request
+                    .payload
+                    .attribute(name, "")
+                    .map_err(|_| StanzaErrorCondition::BadRequest)
+            };
+            match request.payload.name() {
+                "install" => {
+                    let target = attribute("jid")?.ok_or(StanzaErrorCondition::BadRequest)?;
+                    let mut current = self.probe.lock();
+                    if current.is_some() {
+                        return Err(StanzaErrorCondition::Conflict.into());
+                    }
+                    *current = Some(
+                        install_stream_probe(target)
+                            .map_err(|_| StanzaErrorCondition::BadRequest)?,
+                    );
+                }
+                "hold-write" => self
+                    .probe
+                    .lock()
+                    .as_ref()
+                    .ok_or(StanzaErrorCondition::BadRequest)?
+                    .hold_next_pending_write()
+                    .map_err(|_| StanzaErrorCondition::BadRequest)?,
+                "release-write" => self
+                    .probe
+                    .lock()
+                    .as_ref()
+                    .ok_or(StanzaErrorCondition::BadRequest)?
+                    .release_write()
+                    .map_err(|_| StanzaErrorCondition::BadRequest)?,
+                "remove" => {
+                    self.probe.lock().take();
+                }
+                "event" => {
+                    let expected = attribute("name")?.ok_or(StanzaErrorCondition::BadRequest)?;
+                    let waiting = async {
+                        loop {
+                            let event = self
+                                .probe
+                                .lock()
+                                .as_ref()
+                                .ok_or(StanzaErrorCondition::BadRequest)?
+                                .next_event();
+                            let event = event
+                                .await
+                                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                            let name = match event {
+                                StreamProbeEvent::IqGetAdmitted => "iq-get-admitted",
+                                StreamProbeEvent::UnavailablePresenceAdmitted => {
+                                    "unavailable-admitted"
+                                }
+                                StreamProbeEvent::WriteHeld => "write-held",
+                                StreamProbeEvent::WriteCancelled => "write-cancelled",
+                            };
+                            if name == expected {
+                                let payload =
+                                    Element::builder_in("event", PROBE_NAMESPACE, response)
+                                        .and_then(|builder| builder.attribute("name", "", name))
+                                        .and_then(|builder| builder.build())
+                                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                                return Ok(IqReply::new(Some(payload), Effects::none()));
+                            }
+                        }
+                    };
+                    return compio::time::timeout(Duration::from_secs(5), waiting)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                }
+                _ => return Err(StanzaErrorCondition::BadRequest.into()),
+            }
+            Ok(IqReply::new(None, Effects::none()))
+        })
+    }
 }
 
 struct ServerIq;
@@ -1319,6 +1443,9 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestIq {
         for route in [ACCOUNT_GET, ACCOUNT_SET, ACCOUNT_SLOW] {
             slots.iq(route, self.clone())?;
         }
+        for name in ["effects-entered", "release-effects", "roster-version"] {
+            slots.iq(IqRoute { name, ..SERVER_GET }, self.clone())?;
+        }
         Ok(())
     }
 }
@@ -1327,10 +1454,50 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
     fn get<'a>(
         &'a self,
         request: IqRequest<'a, A>,
-        _: &'a RedbRead,
+        transaction: &'a RedbRead,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
+            match request.payload.name() {
+                "effects-entered" => {
+                    compio::time::timeout(Duration::from_secs(5), self.entered.acquire())
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .forget();
+                    return Ok(IqReply::new(None, Effects::none()));
+                }
+                "release-effects" => {
+                    self.release.add_permits(1);
+                    return Ok(IqReply::new(None, Effects::none()));
+                }
+                "roster-version" => {
+                    let target = request
+                        .payload
+                        .attribute("account", "")
+                        .map_err(|_| StanzaErrorCondition::BadRequest)?
+                        .ok_or(StanzaErrorCondition::BadRequest)?;
+                    let jid = Jid::parse_in(target, response)
+                        .map_err(|_| StanzaErrorCondition::BadRequest)?;
+                    let account = AccountKey::try_from(
+                        jid.resolve(response)
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                            .bare(),
+                    )
+                    .map_err(|_| StanzaErrorCondition::BadRequest)?;
+                    let version = transaction
+                        .roster_version(&account)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let payload = Element::builder_in("version", NAMESPACE, response)
+                        .and_then(|builder| {
+                            builder.attribute("value", "", &version.get().to_string())
+                        })
+                        .and_then(|builder| builder.build())
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    return Ok(IqReply::new(Some(payload), Effects::none()));
+                }
+                _ => {}
+            }
             if request
                 .payload
                 .attribute("calls", "")
@@ -1369,8 +1536,9 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
                 .payload
                 .attribute("millis", "")
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                .and_then(|value| value.parse().ok())
-                .ok_or(StanzaErrorCondition::BadRequest)?;
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| StanzaErrorCondition::BadRequest)?;
             let account = AccountKey::try_from(request.target.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             if let Some(observer) = request
@@ -1391,6 +1559,8 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
                     .await
                     .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             }
+            let entered = self.entered.clone();
+            let release = self.release.clone();
             let effects = Effects::new(vec![account.clone()], move |delivery| {
                 Box::pin(async move {
                     delivery
@@ -1412,7 +1582,12 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestIq {
                             }),
                         )
                         .await?;
-                    compio::time::sleep(Duration::from_millis(millis)).await;
+                    if let Some(millis) = millis {
+                        compio::time::sleep(Duration::from_millis(millis)).await;
+                    } else {
+                        entered.add_permits(1);
+                        release.acquire().await.forget();
+                    }
                     Ok(())
                 })
             });

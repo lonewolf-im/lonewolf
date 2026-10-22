@@ -47,8 +47,7 @@ fn adjacent_opening_attributes_return_not_well_formed_after_authentication() -> 
     Ok(())
 }
 
-fn rejected_version_headers() -> impl Iterator<Item = (String, Option<&'static str>, &'static str)>
-{
+fn rejected_headers() -> impl Iterator<Item = (String, Option<&'static str>, &'static str)> {
     [
         ("", "http://etherx.jabber.org/streams", "to='localhost'", None, "unsupported-version"),
         ("", "http://etherx.jabber.org/streams", "to='localhost' version='0.9'", Some("0.9"), "unsupported-version"),
@@ -69,6 +68,14 @@ fn rejected_version_headers() -> impl Iterator<Item = (String, Option<&'static s
         ("<?xml version='1.1'?>", "http://etherx.jabber.org/streams", "to='localhost' version='00.009'", Some("0.9"), "unsupported-version"),
         ("<?xml version='2.0'?>", "http://etherx.jabber.org/streams", "to='localhost' version='0.9'", Some("1.0"), "not-well-formed"),
         ("<?xml version='1.1'?>", "http://etherx.jabber.org/streams", "to='localhost' version='0.9' flag='&#x1;'", Some("1.0"), "not-well-formed"),
+        ("", "http://etherx.jabber.org/streams", "to='unknown.example' version='1.0'", Some("1.0"), "host-unknown"),
+        ("", "http://etherx.jabber.org/streams", "to='alice@localhost' version='1.0'", Some("1.0"), "bad-format"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost/phone' version='1.0'", Some("1.0"), "bad-format"),
+        ("", "http://etherx.jabber.org/streams", "to='bad domain' version='1.0'", Some("1.0"), "bad-format"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' ", None, "unsupported-version"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='1.0' xml:lang='en_US'", Some("1.0"), "bad-format"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='1.0' xml:lang=''", Some("1.0"), "bad-format"),
+        ("", "http://etherx.jabber.org/streams", "to='localhost' version='1.0' from='bad domain'", Some("1.0"), "invalid-from"),
     ].into_iter().map(|(declaration, namespace, attributes, version, condition)| {
         (format!("{declaration}<stream:stream xmlns:stream='{namespace}' xmlns='jabber:client' {attributes}>"), version, condition)
     })
@@ -77,7 +84,7 @@ fn rejected_version_headers() -> impl Iterator<Item = (String, Option<&'static s
 #[test]
 fn rejected_headers_negotiate_response_version_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
-    for (opening, version, condition) in rejected_version_headers() {
+    for (opening, version, condition) in rejected_headers() {
         let mut client = suite.tcp_client()?;
         let header = client.open_with(&opening)?;
         assert_eq!(header.attribute("version"), version, "{opening}");
@@ -89,7 +96,7 @@ fn rejected_headers_negotiate_response_version_before_tls() -> TestResult {
 #[test]
 fn rejected_headers_negotiate_response_version_after_tls() -> TestResult {
     let suite = C2sSuite::start()?;
-    for (opening, version, condition) in rejected_version_headers() {
+    for (opening, version, condition) in rejected_headers() {
         let mut client = suite.tls_client()?;
         let header = client.open_with(&opening)?;
         assert_eq!(header.attribute("version"), version, "{opening}");
@@ -102,7 +109,7 @@ fn rejected_headers_negotiate_response_version_after_tls() -> TestResult {
 fn rejected_headers_negotiate_response_version_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    for (opening, version, condition) in rejected_version_headers() {
+    for (opening, version, condition) in rejected_headers() {
         let mut client = suite.unauthenticated_client()?;
         client.authenticate("alice", ALTERNATE_PASSWORD)?;
         let mut client = client.restart();
@@ -497,109 +504,6 @@ fn leading_feff_is_rejected_after_authentication() -> TestResult {
 }
 
 #[test]
-fn unknown_host_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='unknown.example' version='1.0'>"#)?;
-    client.expect_stream_error("host-unknown")
-}
-
-#[test]
-fn account_destination_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='alice@localhost' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn resource_destination_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost/phone' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn malformed_destination_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='bad domain' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn old_version_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='0.9'>"#)?;
-    assert_eq!(header.attribute("version"), Some("0.9"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn missing_version_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' >"#)?;
-    assert_eq!(header.attribute("version"), None);
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn signed_version_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='+1.0'>"#)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn nonnumeric_version_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.x'>"#)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn malformed_language_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang='en_US'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn empty_language_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang=''>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn malformed_sender_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' from='bad domain'>"#)?;
-    client.expect_stream_error("invalid-from")
-}
-
-#[test]
 fn ipv6_zone_stream_identities_are_terminal_before_and_after_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     for domain in ["[fe80::1%eth0]", "[fe80::1%25eth0]"] {
@@ -683,109 +587,6 @@ fn non_xml_opening_is_rejected_before_tls() -> TestResult {
 }
 
 #[test]
-fn unknown_host_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='unknown.example' version='1.0'>"#)?;
-    client.expect_stream_error("host-unknown")
-}
-
-#[test]
-fn account_destination_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='alice@localhost' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn resource_destination_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost/phone' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn malformed_destination_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='bad domain' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn old_version_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='0.9'>"#)?;
-    assert_eq!(header.attribute("version"), Some("0.9"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn missing_version_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' >"#)?;
-    assert_eq!(header.attribute("version"), None);
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn signed_version_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='+1.0'>"#)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn nonnumeric_version_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.x'>"#)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn malformed_language_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang='en_US'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn empty_language_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang=''>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn malformed_sender_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' from='bad domain'>"#)?;
-    client.expect_stream_error("invalid-from")
-}
-
-#[test]
 fn duplicate_attribute_is_rejected_after_tls() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.tls_client()?;
@@ -840,142 +641,6 @@ fn non_xml_opening_is_rejected_after_tls() -> TestResult {
 
     client.open_with("!")?;
     client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn unknown_host_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='unknown.example' version='1.0'>"#)?;
-    client.expect_stream_error("host-unknown")
-}
-
-#[test]
-fn account_destination_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='alice@localhost' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn resource_destination_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost/phone' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn malformed_destination_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='bad domain' version='1.0'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn old_version_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='0.9'>"#)?;
-    assert_eq!(header.attribute("version"), Some("0.9"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn missing_version_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' >"#)?;
-    assert_eq!(header.attribute("version"), None);
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn signed_version_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='+1.0'>"#)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn nonnumeric_version_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    let header = client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.x'>"#)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.expect_stream_error("unsupported-version")
-}
-
-#[test]
-fn malformed_language_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang='en_US'>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn empty_language_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' xml:lang=''>"#)?;
-    client.expect_stream_error("bad-format")
-}
-
-#[test]
-fn malformed_sender_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' from='bad domain'>"#)?;
-    client.expect_stream_error("invalid-from")
 }
 
 #[test]

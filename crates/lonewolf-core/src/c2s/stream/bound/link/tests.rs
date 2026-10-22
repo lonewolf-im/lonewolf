@@ -505,6 +505,13 @@ fn stopping_cancels_a_pending_write_and_drops_queued_output() -> TestResult {
 fn stopping_cancels_a_pending_flush_without_advancing_the_watermark() -> TestResult {
     Runtime::new()?.block_on(async {
         let (mut link, _incoming, transport) = link();
+        #[cfg(feature = "test-support")]
+        let probe = crate::test_support::install_stream_probe("flush-probe@localhost/desk")?;
+        #[cfg(feature = "test-support")]
+        let transport = {
+            probe.hold_next_pending_write()?;
+            transport.for_stream("flush-probe@localhost/desk".into())
+        };
         let commands = transport.commands.clone();
         let state = Arc::clone(&link.state);
         let (notice, entered) = oneshot::channel();
@@ -530,8 +537,18 @@ fn stopping_cancels_a_pending_flush_without_advancing_the_watermark() -> TestRes
             let mut running = pin!(transport.write(&mut controlled, None));
             assert!(poll!(running.as_mut()).is_pending());
             entered.await?;
+            #[cfg(feature = "test-support")]
+            assert_eq!(
+                probe.next_event().now_or_never(),
+                Some(Ok(crate::test_support::StreamProbeEvent::WriteHeld))
+            );
             link.stop();
             assert!(poll!(running.as_mut()).is_pending());
+            #[cfg(feature = "test-support")]
+            assert_eq!(
+                probe.next_event().now_or_never(),
+                Some(Ok(crate::test_support::StreamProbeEvent::WriteCancelled))
+            );
             assert!(release.send(()).is_err());
             assert!(commands.is_empty());
             link.close(CloseOutcome::StreamEnd).await;

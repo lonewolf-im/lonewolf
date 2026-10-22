@@ -28,3 +28,7 @@ futures-channel.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true, features = ["feature"] }
+
+[[test]]
+name = "http"
+path = "../lonewolf-core/tests/metrics/http.rs"

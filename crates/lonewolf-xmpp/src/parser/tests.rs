@@ -32,6 +32,16 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const OPEN: &str =
     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
 const CLOSE: &str = "</stream:stream>";
+const TRUNCATED_TOKENS: &[(&str, &str)] = &[
+    ("<message><body id='attribute", "syntax"),
+    ("<message><body id=\"attribute", "syntax"),
+    ("<message><body id='attribute&amp", "syntax"),
+    ("<message><body>text&amp", "syntax"),
+    ("<message><body>text&#128", "syntax"),
+    ("<message><body>text&#x1F4", "syntax"),
+    ("<message><body>text", "eof"),
+    ("<message><body>text</bo", "syntax"),
+];
 
 fn config(limit: usize) -> TestResult<ParserConfig> {
     Ok(ParserConfig {
@@ -3078,6 +3088,139 @@ fn extension_payload_prefixes_and_unprefixed_stanzas_keep_their_namespace_contex
                 parser.next_event().await?,
                 Some(StreamEvent::StreamEnd)
             ));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn truncated_tokens_report_precise_errors_release_the_pool_and_poison_the_parser() -> TestResult {
+    block_on(async {
+        let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
+            total_bytes: NonZeroUsize::new(MIN_POOL_SIZE).ok_or("pool size")?,
+            ..PoolConfig::default()
+        })?);
+        for &(partial, expected) in TRUNCATED_TOKENS {
+            let input = format!("{OPEN}{partial}");
+            for chunk in [1, usize::MAX] {
+                for split in [OPEN.len(), input.len() - 1] {
+                    let before = pool.stats();
+                    let mut source = Fragmented::new(input.as_bytes(), chunk);
+                    source.split = split;
+                    let consumed = source.consumed.clone();
+                    let mut parser = XmppParser::new(source, config(4096)?, pool.clone());
+                    open(&mut parser).await?;
+                    let error = parser
+                        .next_event()
+                        .await
+                        .err()
+                        .ok_or("accepted truncated token")?;
+                    assert!(
+                        matches!(
+                            (&error, expected),
+                            (ParseError::NotWellFormed, "syntax")
+                                | (ParseError::UnexpectedEof, "eof")
+                        ),
+                        "{partial:?}, chunk={chunk}, split={split}: {error:?}"
+                    );
+                    assert!(!error.is_transport_error());
+                    assert_eq!(consumed.load(Ordering::Relaxed), input.len());
+                    assert_eq!(
+                        pool.stats().buckets.map(|bucket| bucket.available_chunks),
+                        before.buckets.map(|bucket| bucket.available_chunks)
+                    );
+                    assert_eq!(
+                        pool.stats().heap_allocation_count,
+                        before.heap_allocation_count
+                    );
+                    assert!(matches!(
+                        parser.next_event().await,
+                        Err(ParseError::ParserFailed)
+                    ));
+                    assert!(matches!(parser.restart(), Err(ParseError::ParserFailed)));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn transport_failures_inside_tokens_keep_the_io_error_release_the_pool_and_poison_the_parser()
+-> TestResult {
+    block_on(async {
+        let pool = Arc::new(PooledChunkAllocator::try_new(PoolConfig {
+            total_bytes: NonZeroUsize::new(MIN_POOL_SIZE).ok_or("pool size")?,
+            ..PoolConfig::default()
+        })?);
+        for &(partial, _) in TRUNCATED_TOKENS {
+            let input = format!("{OPEN}{partial}");
+            for chunk in [1, usize::MAX] {
+                for split in [OPEN.len(), input.len() - 1] {
+                    let before = pool.stats();
+                    let mut source = Fragmented::new(input.as_bytes(), chunk);
+                    source.split = split;
+                    source.error_at_end = true;
+                    let consumed = source.consumed.clone();
+                    let mut parser = XmppParser::new(source, config(4096)?, pool.clone());
+                    open(&mut parser).await?;
+                    let error = parser
+                        .next_event()
+                        .await
+                        .err()
+                        .ok_or("accepted transport failure")?;
+                    assert!(
+                        error.is_transport_error(),
+                        "{partial:?}, chunk={chunk}, split={split}: {error:?}"
+                    );
+                    let ParseError::Xml(quick_xml::Error::Io(cause)) = error else {
+                        return Err("expected XML transport error".into());
+                    };
+                    assert_eq!(cause.kind(), io::ErrorKind::Other);
+                    assert_eq!(cause.to_string(), "transport failure");
+                    assert_eq!(consumed.load(Ordering::Relaxed), input.len());
+                    assert_eq!(
+                        pool.stats().buckets.map(|bucket| bucket.available_chunks),
+                        before.buckets.map(|bucket| bucket.available_chunks)
+                    );
+                    assert_eq!(
+                        pool.stats().heap_allocation_count,
+                        before.heap_allocation_count
+                    );
+                    assert!(matches!(
+                        parser.next_event().await,
+                        Err(ParseError::ParserFailed)
+                    ));
+                    assert!(matches!(parser.restart(), Err(ParseError::ParserFailed)));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn complete_tokens_preserve_attribute_references_and_text_across_all_splits() -> TestResult {
+    block_on(async {
+        let message = "<message><body id='attribute&amp;value'>text&amp;&#128058;&#x1F43A;end</body></message>";
+        let input = format!("{OPEN}{message}{CLOSE}");
+        for chunk in [1, usize::MAX] {
+            for split in OPEN.len()..=OPEN.len() + message.len() {
+                let mut source = Fragmented::new(input.as_bytes(), chunk);
+                source.split = split;
+                let mut parser = XmppParser::new(source, config(4096)?, GlobalChunkAllocator);
+                open(&mut parser).await?;
+                let parsed = stanza(&mut parser).await?;
+                let message = parsed.value().resolve(parsed.arena())?;
+                let body = message.child("body", CLIENT_NAMESPACE)?.ok_or("body")?;
+                assert_eq!(body.attribute("id", "")?, Some("attribute&value"));
+                assert_eq!(body.text()?, Some("text&🐺🐺end"));
+                assert!(matches!(
+                    parser.next_event().await?,
+                    Some(StreamEvent::StreamEnd)
+                ));
+                assert!(parser.next_event().await?.is_none());
+            }
         }
         Ok(())
     })

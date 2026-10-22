@@ -223,6 +223,8 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         resource_requested: _,
     } = bound;
     let (link, incoming, transport_link) = link::link();
+    #[cfg(feature = "test-support")]
+    let transport_link = transport_link.for_stream(registration.full_jid());
     let watch = link.watch();
     let shutdown = close.shutdown.clone();
     let mut transport = Transport {
@@ -1068,6 +1070,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             ))
         };
         let mut pending = self.outbox.drain_until(registration, prepare).await??;
+        #[cfg(feature = "test-support")]
+        crate::test_support::stream_event(
+            &registration.full_jid(),
+            crate::test_support::StreamProbeEvent::IqGetAdmitted,
+        );
         self.outbox
             .drain_until(&self.registration, pending.turned())
             .await?;
@@ -1916,6 +1923,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 );
             }
         };
+        #[cfg(feature = "test-support")]
+        if !available {
+            crate::test_support::stream_event(
+                &registration.full_jid(),
+                crate::test_support::StreamProbeEvent::UnavailablePresenceAdmitted,
+            );
+        }
         self.outbox
             .drain_until(&self.registration, pending.turned())
             .await?;

@@ -58,6 +58,8 @@ pub(super) struct LinkWriter<A: ChunkAllocator> {
 }
 
 pub(super) struct LinkTransport<A: ChunkAllocator> {
+    #[cfg(feature = "test-support")]
+    probe_target: Option<String>,
     commands: async_channel::Receiver<Command<A>>,
     incoming: async_channel::Sender<Incoming<A>>,
     state: Arc<LinkState>,
@@ -88,6 +90,8 @@ pub(super) fn link<A: ChunkAllocator>() -> (
         transport: AtomicWaker::new(),
     });
     let transport = LinkTransport {
+        #[cfg(feature = "test-support")]
+        probe_target: None,
         commands: receiver,
         incoming: incoming_sender,
         state: Arc::clone(&state),
@@ -194,6 +198,12 @@ impl LinkWatch {
 }
 
 impl<A: ChunkAllocator> LinkTransport<A> {
+    #[cfg(feature = "test-support")]
+    pub(super) fn for_stream(mut self, full_jid: String) -> Self {
+        self.probe_target = Some(full_jid);
+        self
+    }
+
     pub(super) async fn write<W: OutboxWriter<A>>(
         &self,
         writer: &mut W,
@@ -215,12 +225,20 @@ impl<A: ChunkAllocator> LinkTransport<A> {
             }
             match command {
                 Command::Write(output) => {
-                    if let Some(Err(outcome)) = self.until_stopped(writer.write(output)).await {
+                    let write = writer.write(output);
+                    #[cfg(feature = "test-support")]
+                    let write =
+                        crate::test_support::observe_write(self.probe_target.as_deref(), write);
+                    if let Some(Err(outcome)) = self.until_stopped(write).await {
                         self.fail(outcome);
                     }
                 }
                 Command::Flush { through, request } => {
-                    match self.until_stopped(writer.flush(through)).await {
+                    let flush = writer.flush(through);
+                    #[cfg(feature = "test-support")]
+                    let flush =
+                        crate::test_support::observe_write(self.probe_target.as_deref(), flush);
+                    match self.until_stopped(flush).await {
                         Some(Ok(())) => {
                             {
                                 let mut progress = self.state.progress.lock();

@@ -1452,6 +1452,7 @@ dependencies = [
  "lonewolf-acme",
  "lonewolf-admin",
  "lonewolf-auth",
+ "lonewolf-core",
  "lonewolf-extension",
  "lonewolf-metrics",
  "lonewolf-storage",

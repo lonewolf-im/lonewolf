@@ -50,6 +50,7 @@ zeroize.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
+lonewolf-core = { path = ".", features = ["test-support"] }
 hmac.workspace = true
 pbkdf2.workspace = true
 quick-xml.workspace = true

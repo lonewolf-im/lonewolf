@@ -9,7 +9,7 @@ mod pending_limits;
 use std::fs;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::support::{C2sSuite, Client, TestResult};
 use compio::runtime::Runtime;
@@ -25,6 +25,62 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 
 const ROSTER_NAMESPACE: &str = "jabber:iq:roster";
+const PROBE_NAMESPACE: &str = "urn:lonewolf:test:stream-probe";
+
+fn server_query(observer: &mut Client, payload: &str) -> TestResult<crate::support::xml::Element> {
+    observer.send(&format!(
+        "<iq type='get' to='localhost' id='control'>{payload}</iq>"
+    ))?;
+    let reply = observer.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("type"), Some("result"), "{reply:?}");
+    assert_eq!(reply.attribute("id"), Some("control"));
+    assert_eq!(reply.attribute("from"), Some("localhost"));
+    assert_eq!(reply.attribute("to"), Some("observer@localhost/watch"));
+    Ok(reply)
+}
+
+fn control(observer: &mut Client, payload: &str) -> TestResult {
+    let reply = server_query(observer, payload)?;
+    assert!(reply.children.is_empty(), "{reply:?}");
+    Ok(())
+}
+
+fn wait_for_probe(observer: &mut Client, expected: &str) -> TestResult {
+    let reply = server_query(
+        observer,
+        &format!("<event xmlns='{PROBE_NAMESPACE}' name='{expected}'/>"),
+    )?;
+    assert_eq!(reply.children.len(), 1);
+    assert_eq!(
+        reply.child(PROBE_NAMESPACE, "event")?.attribute("name"),
+        Some(expected)
+    );
+    Ok(())
+}
+
+fn wait_for_roster_version(observer: &mut Client, expected: u64) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = server_query(
+            observer,
+            "<roster-version xmlns='urn:lonewolf:test:iq' account='alice@localhost'/>",
+        )?;
+        assert_eq!(reply.children.len(), 1);
+        let current: u64 = reply
+            .child("urn:lonewolf:test:iq", "version")?
+            .attribute("value")
+            .ok_or("roster version")?
+            .parse()?;
+        if current >= expected {
+            assert_eq!(current, expected);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("roster version stayed at {current}, expected {expected}").into());
+        }
+    }
+}
 
 fn request_roster(client: &mut Client, id: &str, expected: &str) -> TestResult {
     client.send(&format!(
@@ -593,9 +649,13 @@ fn a_subscriber_addressed_by_directed_presence_alone_is_told_when_it_ends() -> T
 #[test]
 fn a_reset_while_unavailable_presence_waits_for_its_turn_still_tells_directed_recipients()
 -> TestResult {
-    let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
+    let suite = C2sSuite::with_extensions(
+        "'roster', 'test-iq', 'test-stream-probe', 'test-session-observer'",
+    )?;
     suite.create_account("alice", PASSWORD)?;
     suite.create_account("bob", PASSWORD)?;
+    suite.create_account("observer", PASSWORD)?;
+    let mut observer = suite.connect("observer", PASSWORD, "watch")?;
     let mut desk = suite.connect("alice", PASSWORD, "desk")?;
     let mut slow = suite.connect("alice", PASSWORD, "slow")?;
     let mut bob = suite.connect("bob", PASSWORD, "desk")?;
@@ -604,23 +664,88 @@ fn a_reset_while_unavailable_presence_waits_for_its_turn_still_tells_directed_re
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk'/>",
     )?;
 
-    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='2000'/></iq>")?;
-    thread::sleep(Duration::from_millis(300));
+    control(
+        &mut observer,
+        "<install xmlns='urn:lonewolf:test:stream-probe' jid='alice@localhost/desk'/>",
+    )?;
+    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq'/></iq>")?;
+    control(
+        &mut observer,
+        "<effects-entered xmlns='urn:lonewolf:test:iq'/>",
+    )?;
     desk.send("<presence type='unavailable'/>")?;
-    thread::sleep(Duration::from_millis(300));
+    wait_for_probe(&mut observer, "unavailable-admitted")?;
     desk.reset()?;
     for index in 0..8 {
         bob.send(&format!(
             "<message to='alice@localhost/desk' id='m{index}'/>"
         ))?;
-        thread::sleep(Duration::from_millis(50));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = server_query(
+            &mut observer,
+            "<events xmlns='urn:lonewolf:test:sessions'/>",
+        )?;
+        assert_eq!(reply.children.len(), 1);
+        let events = reply.child("urn:lonewolf:test:sessions", "events")?;
+        let kinds = events
+            .children
+            .iter()
+            .filter(|event| event.attribute("session") == Some("alice@localhost/desk"))
+            .map(|event| event.attribute("kind").ok_or("session event has no kind"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if kinds == ["bound", "ended"] {
+            break;
+        }
+        assert!(["bound", "ended"].starts_with(&kinds), "{kinds:?}");
+        assert!(Instant::now() < deadline, "reset not observed: {kinds:?}");
     }
 
-    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost/desk'/>")?;
+    control(
+        &mut observer,
+        "<release-effects xmlns='urn:lonewolf:test:iq'/>",
+    )?;
     slow.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/slow'/>",
     )?;
+    bob.send("<iq type='get' to='localhost' id='reset-cutoff'><events xmlns='urn:lonewolf:test:sessions'/></iq>")?;
+    let mut withdrawals = 0;
+    let mut errors = [false; 8];
+    let mut cutoff_received = false;
+    for _ in 0..=9 {
+        let reply = bob.receive()?;
+        if reply.attribute("id") == Some("reset-cutoff") {
+            reply.assert_xml("<iq xmlns='jabber:client' type='result' id='reset-cutoff' from='localhost' to='bob@localhost/desk'><events xmlns='urn:lonewolf:test:sessions'><event session='observer@localhost/watch' kind='bound'/><event session='alice@localhost/desk' kind='bound'/><event session='alice@localhost/slow' kind='bound'/><event session='bob@localhost/desk' kind='bound'/><event session='alice@localhost/desk' kind='ended'/></events></iq>")?;
+            cutoff_received = true;
+            break;
+        }
+        if reply.name == "presence" {
+            reply.assert_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost/desk'/>")?;
+            withdrawals += 1;
+            assert_eq!(withdrawals, 1, "duplicate withdrawal: {reply:?}");
+        } else {
+            let id = reply.attribute("id").ok_or("message error has no ID")?;
+            let index = ["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"]
+                .iter()
+                .position(|expected| *expected == id)
+                .ok_or("unexpected message error ID")?;
+            assert!(!errors[index], "duplicate message error: {reply:?}");
+            errors[index] = true;
+            reply.assert_xml(&format!("<message xmlns='jabber:client' type='error' id='{id}' from='alice@localhost/desk' to='bob@localhost/desk'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></message>"))?;
+        }
+    }
+    assert!(
+        cutoff_received,
+        "cutoff did not follow at most 9 preceding stanzas"
+    );
+    assert_eq!(withdrawals, 1, "missing withdrawal before cutoff");
     slow.close()?;
+    control(
+        &mut observer,
+        "<remove xmlns='urn:lonewolf:test:stream-probe'/>",
+    )?;
+    observer.close()?;
     bob.send("</stream:stream>")?;
     bob.drain()
 }
@@ -2038,8 +2163,10 @@ fn versioned_roster_get_returns_a_roster_larger_than_a_mailbox_whole() -> TestRe
 
 #[test]
 fn versioned_roster_get_preceded_by_queued_pushes_returns_the_full_roster() -> TestResult {
-    let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
+    let suite = C2sSuite::with_extensions("'roster', 'test-iq', 'test-stream-probe'")?;
     suite.create_account("alice", PASSWORD)?;
+    suite.create_account("observer", PASSWORD)?;
+    let mut observer = suite.connect("observer", PASSWORD, "watch")?;
     let mut desk = suite.connect("alice", PASSWORD, "desk")?;
     let mut slow = suite.connect("alice", PASSWORD, "slow")?;
     let mut one = suite.connect("alice", PASSWORD, "one")?;
@@ -2050,14 +2177,27 @@ fn versioned_roster_get_preceded_by_queued_pushes_returns_the_full_roster() -> T
         "<iq xmlns='jabber:client' type='result' id='desk-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
 
-    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
+    control(
+        &mut observer,
+        "<install xmlns='urn:lonewolf:test:stream-probe' jid='alice@localhost/desk'/>",
+    )?;
+    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq'/></iq>")?;
     let marker = desk.receive()?;
     assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
+    control(
+        &mut observer,
+        "<effects-entered xmlns='urn:lonewolf:test:iq'/>",
+    )?;
     one.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
     two.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
-    // The blocked ticket prevents replies from confirming these commits.
-    thread::sleep(Duration::from_millis(500));
+    wait_for_roster_version(&mut observer, 2)?;
     desk.send("<iq type='get' id='since-0'><query xmlns='jabber:iq:roster' ver='0'/></iq>")?;
+
+    wait_for_probe(&mut observer, "iq-get-admitted")?;
+    control(
+        &mut observer,
+        "<release-effects xmlns='urn:lonewolf:test:iq'/>",
+    )?;
 
     let first = receive_versioned_push(&mut desk, 1)?;
     let second = receive_versioned_push(&mut desk, 2)?;
@@ -2078,6 +2218,11 @@ fn versioned_roster_get_preceded_by_queued_pushes_returns_the_full_roster() -> T
     slow.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/slow'/>",
     )?;
+    control(
+        &mut observer,
+        "<remove xmlns='urn:lonewolf:test:stream-probe'/>",
+    )?;
+    observer.close()?;
     desk.close()?;
     one.close()?;
     two.close()?;
@@ -2086,8 +2231,10 @@ fn versioned_roster_get_preceded_by_queued_pushes_returns_the_full_roster() -> T
 
 #[test]
 fn a_rejected_roster_get_still_delivers_the_pushes_queued_before_it() -> TestResult {
-    let suite = C2sSuite::with_extensions("'roster', 'test-iq'")?;
+    let suite = C2sSuite::with_extensions("'roster', 'test-iq', 'test-stream-probe'")?;
     suite.create_account("alice", PASSWORD)?;
+    suite.create_account("observer", PASSWORD)?;
+    let mut observer = suite.connect("observer", PASSWORD, "watch")?;
     let mut desk = suite.connect("alice", PASSWORD, "desk")?;
     let mut slow = suite.connect("alice", PASSWORD, "slow")?;
     let mut one = suite.connect("alice", PASSWORD, "one")?;
@@ -2098,14 +2245,27 @@ fn a_rejected_roster_get_still_delivers_the_pushes_queued_before_it() -> TestRes
         "<iq xmlns='jabber:client' type='result' id='desk-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
     )?;
 
-    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='3000'/></iq>")?;
+    control(
+        &mut observer,
+        "<install xmlns='urn:lonewolf:test:stream-probe' jid='alice@localhost/desk'/>",
+    )?;
+    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq'/></iq>")?;
     let marker = desk.receive()?;
     assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
+    control(
+        &mut observer,
+        "<effects-entered xmlns='urn:lonewolf:test:iq'/>",
+    )?;
     one.send("<iq type='set' id='add-bob'><query xmlns='jabber:iq:roster'><item jid='bob@localhost'/></query></iq>")?;
     two.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
-    // The blocked ticket prevents replies from confirming these commits.
-    thread::sleep(Duration::from_millis(500));
+    wait_for_roster_version(&mut observer, 2)?;
     desk.send("<iq type='get' id='invalid'><query xmlns='jabber:iq:roster' ver='0'><item jid='bob@localhost'/></query></iq>")?;
+
+    wait_for_probe(&mut observer, "iq-get-admitted")?;
+    control(
+        &mut observer,
+        "<release-effects xmlns='urn:lonewolf:test:iq'/>",
+    )?;
 
     let first = receive_versioned_push(&mut desk, 1)?;
     let second = receive_versioned_push(&mut desk, 2)?;
@@ -2126,6 +2286,11 @@ fn a_rejected_roster_get_still_delivers_the_pushes_queued_before_it() -> TestRes
     slow.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/slow'/>",
     )?;
+    control(
+        &mut observer,
+        "<remove xmlns='urn:lonewolf:test:stream-probe'/>",
+    )?;
+    observer.close()?;
     desk.close()?;
     one.close()?;
     two.close()?;
@@ -2283,6 +2448,8 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
         "incoming_stanzas_per_connection = { per_second = 100_000, burst = 100_000 }",
         seed_mutual_subscription,
     )?;
+    suite.create_account("observer", PASSWORD)?;
+    let mut observer = suite.connect("observer", PASSWORD, "watch")?;
     let mut desk = suite.connect("alice", PASSWORD, "desk")?;
     let mut phone = suite.connect("alice", PASSWORD, "phone")?;
     let mut tablet = suite.connect("alice", PASSWORD, "tablet")?;
@@ -2312,15 +2479,18 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
     )?;
 
-    desk.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='6000'/></iq>")?;
+    desk.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq'/></iq>")?;
     for interested in [&mut phone, &mut tablet] {
         let marker = interested.receive()?;
         assert_eq!(marker.attribute("id"), Some("slow"), "{marker:?}");
     }
 
+    control(
+        &mut observer,
+        "<effects-entered xmlns='urn:lonewolf:test:iq'/>",
+    )?;
     tablet.send("<iq type='set' id='add-carol'><query xmlns='jabber:iq:roster'><item jid='carol@localhost'/></query></iq>")?;
-    // The blocked ticket prevents the reply from confirming this commit.
-    thread::sleep(Duration::from_millis(300));
+    wait_for_roster_version(&mut observer, 2)?;
     for index in 0..1200 {
         bob.send(&format!(
             "<presence><priority>{}</priority></presence>",
@@ -2334,6 +2504,10 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
         ))?;
     }
 
+    control(
+        &mut observer,
+        "<release-effects xmlns='urn:lonewolf:test:iq'/>",
+    )?;
     tablet.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='add-carol' to='alice@localhost/tablet'/>",
     )?;
@@ -2345,6 +2519,7 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
     desk.expect_xml(
         "<iq xmlns='jabber:client' type='result' id='slow' to='alice@localhost/desk'/>",
     )?;
+    observer.close()?;
     desk.close()?;
     phone.close()?;
     tablet.close()
@@ -2352,18 +2527,34 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
 
 #[test]
 fn a_client_that_stops_reading_does_not_hold_up_account_deletion() -> TestResult {
-    let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_large_roster)?;
+    let suite =
+        C2sSuite::with_extensions_and_setup("'roster', 'test-stream-probe'", seed_large_roster)?;
+    suite.create_account("observer", PASSWORD)?;
+    let mut observer = suite.connect("observer", PASSWORD, "watch")?;
     let mut desk = suite.connect("alice", PASSWORD, "desk")?;
     let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    control(
+        &mut observer,
+        "<install xmlns='urn:lonewolf:test:stream-probe' jid='alice@localhost/desk'/>",
+    )?;
+    control(
+        &mut observer,
+        "<hold-write xmlns='urn:lonewolf:test:stream-probe'/>",
+    )?;
     for index in 0..256 {
         desk.send(&format!(
             "<iq type='get' id='get-{index}'><query xmlns='{ROSTER_NAMESPACE}'/></iq>"
         ))?;
     }
-    // Socket backpressure has no client-visible acknowledgement.
-    thread::sleep(Duration::from_secs(1));
+    wait_for_probe(&mut observer, "write-held")?;
 
     suite.delete_account("alice")?;
+    wait_for_probe(&mut observer, "write-cancelled")?;
+    control(
+        &mut observer,
+        "<remove xmlns='urn:lonewolf:test:stream-probe'/>",
+    )?;
+    observer.close()?;
     phone.expect_stream_error("not-authorized")?;
     desk.drain()
 }

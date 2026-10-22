@@ -39,6 +39,9 @@ pub(crate) mod router;
 mod shutdown;
 mod stages;
 mod storage;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 
 use config::Config;
 pub use error::RunError;

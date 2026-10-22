@@ -11,6 +11,7 @@ clap.workspace = true
 lonewolf-core.workspace = true
 
 [dev-dependencies]
+lonewolf-core = { workspace = true, features = ["test-support"] }
 lonewolf-bench.workspace = true
 lonewolf-util.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "net"] }
@@ -19,7 +20,7 @@ futures-executor.workspace = true
 graviola.workspace = true
 hmac.workspace = true
 idna.workspace = true
-lonewolf-acme.workspace = true
+lonewolf-acme = { workspace = true, features = ["test-support"] }
 parking_lot.workspace = true
 pbkdf2.workspace = true
 quick-xml.workspace = true

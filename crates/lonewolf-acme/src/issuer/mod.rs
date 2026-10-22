@@ -22,6 +22,7 @@ use x509_cert::der::Decode;
 use zeroize::Zeroizing;
 
 use crate::crypto::CertificateSigner;
+use crate::time::Time;
 use crate::types::{validate_url, *};
 use crate::{
     AcmeHttpClient, ChallengeLease, Challenges, StateStore, crypto_provider,
@@ -35,6 +36,7 @@ pub struct Issuer {
     challenges: Challenges,
     transport: AcmeHttpClient,
     directory_url: String,
+    time: Time,
 }
 
 impl Issuer {
@@ -43,6 +45,16 @@ impl Issuer {
         challenges: Challenges,
         transport: AcmeHttpClient,
         directory_url: String,
+    ) -> Result<Self, AttemptFailure> {
+        Self::with_time(store, challenges, transport, directory_url, Time::default())
+    }
+
+    pub(crate) fn with_time(
+        store: StateStore,
+        challenges: Challenges,
+        transport: AcmeHttpClient,
+        directory_url: String,
+        time: Time,
     ) -> Result<Self, AttemptFailure> {
         validate_url(&directory_url)?;
         if store.directory_url() != directory_url {
@@ -53,6 +65,7 @@ impl Issuer {
             challenges,
             transport,
             directory_url,
+            time,
         })
     }
 
@@ -81,7 +94,7 @@ impl Issuer {
     ) -> Result<Option<RenewalWindow>, AttemptFailure> {
         let transport = self.transport.for_attempt();
         let mut engine = Upstream::new(AriTransport(transport), &self.directory_url);
-        renewal_request(&self.store, &SystemClock, &mut engine, host).await
+        renewal_request(&self.store, &self.time, &mut engine, host).await
     }
 
     /// The manager must serialize account initialization and recovery.
@@ -90,11 +103,11 @@ impl Issuer {
         let outcome = {
             let work = pin!(ensure_account(
                 &self.store,
-                &SystemClock,
+                &self.time,
                 &mut engine,
                 &self.directory_url
             ));
-            let timeout = pin!(compio::time::sleep(ATTEMPT_BUDGET));
+            let timeout = pin!(self.time.sleep(ATTEMPT_BUDGET));
             match select(timeout, work).await {
                 Either::Left(_) => None,
                 Either::Right((result, _)) => Some(result),
@@ -115,13 +128,13 @@ impl Issuer {
             let work = pin!(attempt(
                 &self.store,
                 &self.challenges,
-                &SystemClock,
+                &self.time,
                 &mut engine,
                 host,
                 installer,
                 replaces
             ));
-            let timeout = pin!(compio::time::sleep(ATTEMPT_BUDGET));
+            let timeout = pin!(self.time.sleep(ATTEMPT_BUDGET));
             match select(timeout, work).await {
                 Either::Left(_) => None,
                 Either::Right((result, _)) => Some(result),
@@ -160,13 +173,12 @@ trait Clock {
     async fn sleep(&self, duration: Duration);
 }
 
-struct SystemClock;
-impl Clock for SystemClock {
+impl Clock for Time {
     fn now(&self) -> SystemTime {
-        SystemTime::now()
+        Time::now(self)
     }
     fn monotonic(&self) -> Instant {
-        Instant::now()
+        Time::monotonic(self)
     }
     fn uniform(&self, maximum: u64) -> Result<u64, AttemptFailure> {
         let range = maximum.checked_add(1).ok_or(StateError::InvalidData)?;
@@ -181,7 +193,7 @@ impl Clock for SystemClock {
         }
     }
     async fn sleep(&self, duration: Duration) {
-        compio::time::sleep(duration).await
+        Time::sleep(self, duration).await
     }
 }
 

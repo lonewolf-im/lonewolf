@@ -233,7 +233,7 @@ fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> Test
             },
         );
         drop(committed);
-        compio::time::sleep(Duration::from_millis(20)).await;
+        drop(compio::time::timeout(Duration::from_secs(1), storage.begin_write()).await??);
         assert!(!ran.get(), "effects ran before their turn");
         assert!(work.drain().now_or_never().is_none());
 

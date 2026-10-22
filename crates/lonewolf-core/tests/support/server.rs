@@ -111,16 +111,23 @@ impl C2sSuite {
     }
 
     pub fn wait_for_metric(&self, sample: &str) -> TestResult<String> {
+        self.wait_for_metrics(sample, |body| body.lines().any(|line| line == sample))
+    }
+
+    pub fn wait_for_metrics(
+        &self,
+        expected: &str,
+        ready: impl Fn(&str) -> bool,
+    ) -> TestResult<String> {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let body = self.scrape_metrics()?;
-            if body.lines().any(|line| line == sample) {
+            if ready(&body) {
                 return Ok(body);
             }
             if Instant::now() >= deadline {
-                return Err(format!("missing metric sample {sample}: {body}").into());
+                return Err(format!("missing metrics {expected}: {body}").into());
             }
-            thread::sleep(Duration::from_millis(10));
         }
     }
 

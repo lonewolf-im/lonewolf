@@ -510,11 +510,25 @@ fn authentication_deadline_caps_a_local_close_wait() -> TestResult {
 
 #[test]
 fn account_retirement_preserves_a_partial_read_while_recreation_proceeds() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_metrics()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut retiring = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
-    retiring.send("<message to='alice@localhost/desk' id='discarded'")?;
-    std::thread::sleep(Duration::from_millis(50));
+    let idle = suite.wait_for_metrics("all stanza chunks available", |body| {
+        matches!(
+            (
+                pool_chunks(body, "lonewolf_stanza_pool_available_chunks"),
+                pool_chunks(body, "lonewolf_stanza_pool_chunks")
+            ),
+            (Ok(available), Ok(total)) if available == total
+        )
+    })?;
+    let available = pool_chunks(&idle, "lonewolf_stanza_pool_available_chunks")?;
+    retiring.send("<message to='alice@localhost/desk' id='discarded'><body>partial")?;
+    let reading = suite.wait_for_metrics("partial stanza owns an arena", |body| {
+        pool_chunks(body, "lonewolf_stanza_pool_available_chunks")
+            .is_ok_and(|current| current < available)
+    })?;
+    assert!(pool_chunks(&reading, "lonewolf_stanza_pool_available_chunks")? < available);
     suite.delete_account("alice")?;
     retiring
         .receive()?
@@ -523,13 +537,28 @@ fn account_retirement_preserves_a_partial_read_while_recreation_proceeds() -> Te
     retiring.expect_no_tls_input()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut recreated = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
-    retiring.send("/></stream:stream>")?;
+    retiring.send("</body></message></stream:stream>")?;
     retiring.expect_tls_close()?;
     retiring.send_tls_close()?;
     retiring.expect_tcp_eof()?;
     recreated.send("<message to='alice@localhost/desk' id='sentinel'/>")?;
     recreated.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' id='sentinel'/>")?;
     recreated.close()
+}
+
+fn pool_chunks(body: &str, series: &str) -> TestResult<u64> {
+    let mut samples = body
+        .lines()
+        .filter_map(|line| line.strip_prefix(series)?.strip_prefix('{'));
+    let first = samples.next().ok_or("missing stanza pool samples")?;
+    let count = |sample: &str| -> TestResult<u64> {
+        Ok(sample
+            .rsplit_once(' ')
+            .ok_or("missing pool chunk count")?
+            .1
+            .parse()?)
+    };
+    samples.try_fold(count(first)?, |total, sample| Ok(total + count(sample)?))
 }
 
 #[test]

@@ -811,3 +811,142 @@ fn renegotiation_aborts_and_wakes_failure_watch_while_output_is_blocked() -> Tes
         Ok(())
     })
 }
+
+#[test]
+fn pending_input_does_not_bypass_acceptance_after_a_successful_write() -> TestResult {
+    use std::cell::Cell;
+    use std::io;
+    use std::pin::Pin;
+    use std::rc::Rc;
+
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    #[derive(Clone, Copy)]
+    enum PendingInput {
+        Pending,
+        Reset,
+        Eof,
+        Stanza,
+    }
+
+    struct ControlledInput {
+        bytes: &'static [u8],
+        next: Rc<Cell<PendingInput>>,
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl AsyncRead for ControlledInput {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let bytes = std::task::ready!(self.as_mut().poll_fill_buf(context))?;
+            let length = bytes.len().min(output.remaining());
+            output.put_slice(&bytes[..length]);
+            self.consume(length);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncBufRead for ControlledInput {
+        fn poll_fill_buf(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            let this = self.get_mut();
+            this.polls.set(this.polls.get() + 1);
+            if !this.bytes.is_empty() {
+                return Poll::Ready(Ok(this.bytes));
+            }
+            match this.next.get() {
+                PendingInput::Reset => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+                PendingInput::Eof => Poll::Ready(Ok(&[])),
+                PendingInput::Stanza => {
+                    this.bytes = b"<message/>";
+                    this.next.set(PendingInput::Pending);
+                    Poll::Ready(Ok(this.bytes))
+                }
+                PendingInput::Pending => Poll::Pending,
+            }
+        }
+
+        fn consume(self: Pin<&mut Self>, length: usize) {
+            let this = self.get_mut();
+            this.bytes = &this.bytes[length..];
+        }
+    }
+
+    Runtime::new()?.block_on(async {
+        for pending in [PendingInput::Reset, PendingInput::Eof, PendingInput::Stanza] {
+            let state = Rc::new(Cell::new(PendingInput::Pending));
+            let reads = Rc::new(Cell::new(0));
+            let input = ControlledInput {
+                bytes: b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'><presence/>",
+                next: Rc::clone(&state),
+                polls: Rc::clone(&reads),
+            };
+            let mut reader = Reader::new(
+                XmppParser::new(
+                    input,
+                    ParserConfig {
+                        max_stanza_bytes: NonZeroUsize::new(10_000).ok_or("stanza size")?,
+                        arena: ArenaConfig::default(),
+                    },
+                    GlobalChunkAllocator,
+                ),
+                StanzaLimiter::new(
+                    NonZeroUsize::MIN,
+                    NonZeroUsize::new(8).ok_or("stanza burst")?,
+                ),
+            );
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::StreamStart { .. }))
+            ));
+            let (mut link, incoming, transport) = link();
+            let watch = link.watch();
+            let mut reading = pin!(transport.read(&mut reader, None));
+            assert_eq!(poll!(reading.as_mut()), Poll::Pending);
+            assert!(matches!(incoming.recv().await?, Incoming::Stanza(_)));
+            let before = reads.get();
+            state.set(pending);
+            let mut controlled = ControlledWriter::default();
+            {
+                let mut writing = pin!(transport.write(&mut controlled, None));
+                link.write(presence()?).await.map_err(|_| "write")?;
+                let mut flushing = pin!(link.flush(OutputSequence::new(1)));
+                assert_eq!(poll!(flushing.as_mut()), Poll::Pending);
+                assert!(poll!(writing.as_mut()).is_pending());
+                assert_eq!(poll!(flushing.as_mut()), Poll::Ready(Ok(())));
+            }
+            assert_eq!(controlled.flushed, [OutputSequence::new(1)]);
+            assert!(poll!(pin!(watch.failed())).is_pending());
+            assert_eq!(poll!(reading.as_mut()), Poll::Pending);
+            assert!(incoming.is_empty());
+            assert_eq!(reads.get(), before);
+            link.accept();
+            let done = poll!(reading.as_mut());
+            match pending {
+                PendingInput::Reset => {
+                    assert_eq!(done, Poll::Ready(()));
+                    assert!(matches!(
+                        incoming.recv().await?,
+                        Incoming::Ended(CloseOutcome::TransportError)
+                    ));
+                }
+                PendingInput::Eof => {
+                    assert_eq!(done, Poll::Ready(()));
+                    assert!(matches!(
+                        incoming.recv().await?,
+                        Incoming::Ended(CloseOutcome::Eof)
+                    ));
+                }
+                PendingInput::Stanza => {
+                    assert_eq!(done, Poll::Pending);
+                    assert!(matches!(incoming.recv().await?, Incoming::Stanza(_)));
+                }
+                PendingInput::Pending => unreachable!("a ready input was selected"),
+            }
+            assert!(reads.get() > before);
+        }
+        Ok(())
+    })
+}

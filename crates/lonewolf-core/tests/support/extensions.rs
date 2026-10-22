@@ -394,7 +394,54 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for ServiceLifecycle {
         host: &str,
         slots: &mut Slots<'_, A, RedbStorage>,
     ) -> Result<(), RegistrationError> {
+        if matches!(
+            self.kind,
+            ServiceLifecycleKind::DelayedAvailable | ServiceLifecycleKind::DelayedUnavailable
+        ) {
+            for name in ["tag-session", "retire-session"] {
+                slots.iq(
+                    IqRoute {
+                        scope: IqScope::Account,
+                        kind: IqRequestType::Get,
+                        namespace: SERVICE_NAMESPACE,
+                        name,
+                    },
+                    self.clone(),
+                )?;
+            }
+        }
         slots.service(&format!("echo.{host}"), self)
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for ServiceLifecycle {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _: &'a RedbRead,
+        _: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let account = AccountKey::try_from(request.target.bare())
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            let effects = match request.payload.name() {
+                "tag-session" if request.target.bare() == request.sender.bare() => {
+                    Effects::new(vec![account], |delivery| {
+                        delivery.tag_session(SessionTag::Interested)
+                    })
+                }
+                "tag-session" => return Err(StanzaErrorCondition::Forbidden.into()),
+                "retire-session" => Effects::new(vec![account.clone()], move |delivery| {
+                    Box::pin(async move {
+                        delivery
+                            .retire_tagged(&account, SessionTag::Interested)
+                            .await
+                    })
+                }),
+                _ => return Err(StanzaErrorCondition::BadRequest.into()),
+            };
+            Ok(IqReply::new(None, effects))
+        })
     }
 }
 

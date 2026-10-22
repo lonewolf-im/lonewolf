@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "../support/ports.rs"]
+mod ports;
+
 use std::error::Error;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use futures_channel::oneshot;
+use futures_util::future::{Either, select};
 use lonewolf_metrics::MetricsServer;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::registry::Registry;
@@ -130,12 +134,21 @@ fn unknown_paths_and_methods_are_rejected() -> TestResult {
 #[test]
 fn shutdown_drains_connections_and_releases_the_port() -> TestResult {
     Runtime::new()?.block_on(async {
-        let server = MetricsServer::bind("127.0.0.1:0".parse()?).await?;
-        let address = server.local_addr()?;
+        let (_reservation, address) = ports::reserve_listener_address()?;
+        let server = MetricsServer::bind(address).await?;
+        assert_eq!(server.local_addr()?, address);
+        assert_eq!(
+            ports::bind_released_listener(address, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse
+        );
         let (stop, stopped) = oneshot::channel();
+        let (observed, observing) = oneshot::channel();
         let mut task =
             compio::runtime::spawn(server.run(Arc::new(Registry::default()), async move {
                 let _ = stopped.await;
+                let _ = observed.send(());
             }));
         let stream = blocking::unblock(move || -> io::Result<TcpStream> {
             let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
@@ -149,7 +162,13 @@ fn shutdown_drains_connections_and_releases_the_port() -> TestResult {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         stop.send(())
             .map_err(|_| "server stopped before shutdown")?;
-        assert!(timeout(Duration::from_millis(20), &mut task).await.is_err());
+        match select(observing, &mut task).await {
+            Either::Left((observed, _)) => observed?,
+            Either::Right(_) => {
+                return Err("server stopped before draining the partial request".into());
+            }
+        }
+        assert!(futures_util::poll!(&mut task).is_pending());
         let response = blocking::unblock(move || -> io::Result<String> {
             let mut stream = stream;
             stream.write_all(b"\r\n")?;
@@ -160,7 +179,11 @@ fn shutdown_drains_connections_and_releases_the_port() -> TestResult {
         .await?;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(timeout(Duration::from_secs(5), task).await?.is_ok());
-        let _listener = TcpListener::bind(address)?;
+        let replacement = blocking::unblock(move || {
+            ports::bind_released_listener(address, Instant::now() + Duration::from_secs(2))
+        })
+        .await?;
+        assert_eq!(replacement.local_addr()?.as_socket(), Some(address));
         Ok(())
     })
 }

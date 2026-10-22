@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "../support/ports.rs"]
+mod ports;
+
 #[path = "../support/acme/mod.rs"]
 mod support;
 
@@ -287,7 +290,7 @@ fn ipv6_listener_works_when_available_and_bind_collision_rolls_back_all_endpoint
     }
     let collision = std::net::TcpListener::bind("127.0.0.1:0")?;
     let occupied = collision.local_addr()?;
-    let free = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let (_reservation, free) = ports::reserve_listener_address()?;
     let config = server.config()?;
     let old = config
         .lines()
@@ -298,7 +301,10 @@ fn ipv6_listener_works_when_available_and_bind_collision_rolls_back_all_endpoint
     server.spawn()?;
     assert!(!server.wait_exit()?.success());
     assert!(server.logs()?.contains("HTTP bind"));
-    let _released = std::net::TcpListener::bind(free)?;
+    let _released = ports::bind_released_listener(
+        free,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    )?;
     assert_eq!(
         ca.counts().at(AcmeStage::NewOrder),
         usize::from(ca.counts().at(AcmeStage::Challenge) > 0)
@@ -737,7 +743,10 @@ fn sigterm(stage: AcmeStage) -> TestResult {
     let old = server.records()?;
     let addresses = [server.address, server.challenge];
     for address in addresses {
-        let _listener = std::net::TcpListener::bind(address)?;
+        let _listener = ports::bind_released_listener(
+            address,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )?;
     }
     ca.release(stage);
     server.start(&ca)?;

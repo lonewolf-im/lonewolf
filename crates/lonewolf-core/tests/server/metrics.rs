@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "../support/ports.rs"]
+mod ports;
+
 use std::error::Error;
 use std::fs;
 use std::io::{Read, Write};
@@ -109,8 +112,11 @@ fn request(port: u16, path: &str) -> Result<String, Box<dyn Error>> {
 
 #[test]
 fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
+    let (_reservation, address) = ports::reserve_listener_address()?;
     let mut server = Server::start(
-        "[logging]\nlevel = 'debug'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[metrics]\nenabled = true\naddress = '127.0.0.1:0'\n[admin]\nenabled = false\n",
+        &format!(
+            "[logging]\nlevel = 'debug'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[metrics]\nenabled = true\naddress = '{address}'\n[admin]\nenabled = false\n"
+        ),
         2,
     )?;
     let logs = server.ready(true)?;
@@ -119,6 +125,7 @@ fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
         .find(|line| line.contains("metrics service started"))
         .ok_or("missing metrics start log")?;
     let port = field(line, "port=")?.try_into()?;
+    assert_eq!(port, address.port());
     let response = request(port, "/metrics")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
@@ -151,7 +158,7 @@ fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
     assert!(request(port, "/missing")?.starts_with("HTTP/1.1 404"));
     server.stop(Signal::SIGTERM)?;
     assert!(server.logs()?.contains("metrics service stopped"));
-    let _listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    let _listener = ports::bind_released_listener(address, Instant::now() + TIMEOUT)?;
     Ok(())
 }
 

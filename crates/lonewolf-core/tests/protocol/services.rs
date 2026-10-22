@@ -141,6 +141,7 @@ fn pending_service_unavailable_survives_session_replacement() -> TestResult {
     suite.create_account("bob", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+    tag_session(&mut alice)?;
     alice.send("<presence to='bob@localhost/phone'/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone'/>",
@@ -149,12 +150,14 @@ fn pending_service_unavailable_survives_session_replacement() -> TestResult {
     assert_eq!(joined(&mut alice)?, 1);
     alice.send("<presence type='unavailable' to='room@echo.localhost/a'/>")?;
     suite.wait_for_log("test service presence waiting")?;
-    alice.reset()?;
     bob.send(
         "<message type='chat' to='alice@localhost/desk'><body>check transport</body></message>",
     )?;
-    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost/phone'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' type='chat' from='bob@localhost/phone' to='alice@localhost/desk'><body>check transport</body></message>")?;
+    alice.reset()?;
+    retire_session(&mut bob)?;
     let mut replacement = suite.connect("alice", PASSWORD, "desk")?;
+    assert_eq!(joined(&mut bob)?, 1);
     release(&mut bob)?;
     suite.wait_for_log("test service withdrawal handled")?;
     wait_for_count(&mut bob, 0)?;
@@ -169,19 +172,22 @@ fn delayed_service_available_is_withdrawn_before_replacement_joins() -> TestResu
     suite.create_account("bob", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+    tag_session(&mut alice)?;
     alice.send("<presence to='bob@localhost/phone'/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone'/>",
     )?;
     alice.send("<presence to='room@echo.localhost/a'/>")?;
     suite.wait_for_log("test service presence waiting")?;
-    alice.reset()?;
     bob.send(
         "<message type='chat' to='alice@localhost/desk'><body>check transport</body></message>",
     )?;
-    bob.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost/phone'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' type='chat' from='bob@localhost/phone' to='alice@localhost/desk'><body>check transport</body></message>")?;
+    alice.reset()?;
+    retire_session(&mut bob)?;
     let mut replacement = suite.connect("alice", PASSWORD, "desk")?;
     replacement.send("<presence to='room@echo.localhost/a'/>")?;
+    assert_eq!(joined(&mut bob)?, 0);
     release(&mut bob)?;
     suite.wait_for_log("test service withdrawal handled")?;
     assert_eq!(joined(&mut replacement)?, 1);
@@ -189,6 +195,41 @@ fn delayed_service_available_is_withdrawn_before_replacement_joins() -> TestResu
     replacement.close()?;
     wait_for_count(&mut bob, 0)?;
     bob.close()
+}
+
+fn tag_session(client: &mut Client) -> TestResult {
+    client.send(
+        "<iq type='get' id='tag-session'><tag-session xmlns='urn:lonewolf:test:service'/></iq>",
+    )?;
+    client.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='tag-session' to='alice@localhost/desk'/>",
+    )
+}
+
+fn retire_session(client: &mut Client) -> TestResult {
+    client.send("<iq type='get' to='alice@localhost' id='retire-session'><retire-session xmlns='urn:lonewolf:test:service'/></iq>")?;
+    let mut acknowledged = false;
+    let mut withdrawn = false;
+    for _ in 0..2 {
+        let reply = client.receive().map_err(|error| {
+            format!("retirement reply pending (acknowledged={acknowledged}, withdrawn={withdrawn}): {error}")
+        })?;
+        match (reply.namespace.as_str(), reply.name.as_str()) {
+            ("jabber:client", "iq") => {
+                assert!(!acknowledged, "duplicate retirement acknowledgement");
+                reply.assert_xml("<iq xmlns='jabber:client' type='result' from='alice@localhost' to='bob@localhost/phone' id='retire-session'/>")?;
+                acknowledged = true;
+            }
+            ("jabber:client", "presence") => {
+                assert!(!withdrawn, "duplicate unavailable presence");
+                reply.assert_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/desk' to='bob@localhost/phone'/>")?;
+                withdrawn = true;
+            }
+            _ => return Err("unexpected reply during session retirement".into()),
+        }
+    }
+    assert!(acknowledged && withdrawn);
+    Ok(())
 }
 
 fn release(client: &mut Client) -> TestResult {

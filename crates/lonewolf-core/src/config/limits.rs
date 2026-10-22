@@ -192,7 +192,7 @@ impl Default for C2sLimitProfile {
     fn default() -> Self {
         Self {
             max_connections_per_ip: const { nonzero(256) },
-            max_stanza_bytes: const { nonzero(262_144) },
+            max_stanza_bytes: const { nonzero(524_288) },
             connection_establishment_timeout_secs: nonzero_secs(10),
             authentication_timeout_secs: nonzero_secs(15),
             resource_binding_timeout_secs: nonzero_secs(5),

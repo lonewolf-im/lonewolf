@@ -162,7 +162,7 @@
 
 # Set the largest incoming stanza to suit client payloads, including XML markup.
 # Choose at least 10,000 bytes and no more than the platform allocation range.
-# max_stanza_bytes = 262_144
+# max_stanza_bytes = 524_288
 
 # Limit the time from TCP accept through the TLS-protected stream opening.
 # connection_establishment_timeout_secs = 10
@@ -203,7 +203,7 @@
 # incoming_xml_per_connection = { bytes_per_second = 262_144, burst_bytes = 1_048_576 }
 
 # [limits.c2s.profiles.internal]
-# max_stanza_bytes = 524_288
+# max_stanza_bytes = 1_048_576
 
 # Add one section per TCP endpoint. These sections replace the default endpoint.
 # Lonewolf requires at least one client endpoint.

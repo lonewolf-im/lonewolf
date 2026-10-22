@@ -9,8 +9,6 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
-#[cfg(test)]
-use std::time::SystemTime;
 
 use futures_channel::oneshot;
 use futures_util::FutureExt;

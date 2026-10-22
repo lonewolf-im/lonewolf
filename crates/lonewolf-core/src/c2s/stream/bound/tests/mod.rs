@@ -1187,8 +1187,10 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
 }
 
 fn certificate_monitor() -> super::super::certificate::ValidityMonitor {
-    let now = SystemTime::now();
+    let clock = super::super::certificate::Clock::manual();
+    let now = clock.now();
     super::super::certificate::ValidityMonitor {
+        clock,
         validity: Cell::new(crate::hosts::client_identity::ClientValidity {
             recheck_at: now,
             valid_until: now + Duration::from_secs(1),
@@ -1249,15 +1251,15 @@ fn certificate_expiry_interrupts_a_blocked_outbox_write() -> TestResult {
         });
         let monitor = certificate_monitor();
         let mut validity = monitor.validity.get();
-        validity.valid_until = SystemTime::now() + Duration::from_millis(30);
+        validity.valid_until = monitor.clock.now() + Duration::from_millis(30);
         monitor.validity.set(validity);
-        assert_eq!(
-            monitor
-                .interrupt(outbox.flush(), |_| std::future::pending())
-                .await,
-            Err(CloseOutcome::CertificateInvalid)
-        );
-        writing.await?;
+        let mut operation = Box::pin(monitor.interrupt(outbox.flush(), |_| std::future::pending()));
+        match select(writing, operation.as_mut()).await {
+            Either::Left((entered, _)) => entered?,
+            Either::Right(_) => return Err("outbox write completed before expiry".into()),
+        }
+        monitor.clock.advance(Duration::from_millis(30));
+        assert_eq!(operation.await, Err(CloseOutcome::CertificateInvalid));
         assert_eq!(fixture.count().await?, 1);
         drop(outbox);
         fixture.finish().await

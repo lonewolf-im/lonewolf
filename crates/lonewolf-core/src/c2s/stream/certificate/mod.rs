@@ -22,6 +22,7 @@ impl CertificateMonitor {
             client,
             state: ValidityMonitor {
                 validity: Cell::new(validity),
+                clock: Clock::default(),
             },
         }
     }
@@ -42,11 +43,12 @@ impl CertificateMonitor {
 
 pub(super) struct ValidityMonitor {
     pub(super) validity: Cell<ClientValidity>,
+    pub(super) clock: Clock,
 }
 
 impl ValidityMonitor {
     fn check(&self) -> Result<(), CloseOutcome> {
-        if SystemTime::now() >= self.validity.get().valid_until {
+        if self.clock.now() >= self.validity.get().valid_until {
             Err(CloseOutcome::CertificateInvalid)
         } else {
             Ok(())
@@ -78,8 +80,14 @@ impl ValidityMonitor {
     {
         loop {
             let validity = self.validity.get();
-            wait_until(validity.recheck_at.min(validity.valid_until)).await;
-            match before_expiry(validity.valid_until, revalidate(validity)).await {
+            self.clock
+                .wait_until(validity.recheck_at.min(validity.valid_until))
+                .await;
+            match self
+                .clock
+                .before_expiry(validity.valid_until, revalidate(validity))
+                .await
+            {
                 Ok(validity) => self.validity.set(validity),
                 Err(_) => return,
             }
@@ -105,29 +113,70 @@ pub(super) async fn before_expiry<T>(
     deadline: SystemTime,
     operation: impl Future<Output = Result<T, CloseOutcome>>,
 ) -> Result<T, CloseOutcome> {
-    let mut operation = pin!(operation);
-    let guarded = poll_fn(|context| {
-        if SystemTime::now() >= deadline {
-            Poll::Ready(Err(CloseOutcome::CertificateInvalid))
-        } else {
-            operation.as_mut().poll(context)
-        }
-    });
-    match select(pin!(wait_until(deadline)), pin!(guarded)).await {
-        Either::Left(_) => Err(CloseOutcome::CertificateInvalid),
-        Either::Right((result, _)) => result,
-    }
+    Clock::default().before_expiry(deadline, operation).await
 }
 
-async fn wait_until(deadline: SystemTime) {
-    loop {
-        let remaining = deadline
-            .duration_since(SystemTime::now())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            return;
+#[derive(Default)]
+pub(super) struct Clock {
+    #[cfg(test)]
+    manual: Option<tests::ManualClock>,
+}
+
+impl Clock {
+    pub(super) fn now(&self) -> SystemTime {
+        #[cfg(test)]
+        if let Some(clock) = &self.manual {
+            return clock.now();
         }
-        compio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+        SystemTime::now()
+    }
+
+    #[cfg(test)]
+    pub(super) fn manual() -> Self {
+        Self {
+            manual: Some(tests::ManualClock::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn advance(&self, elapsed: Duration) {
+        self.manual
+            .as_ref()
+            .expect("manual clock required")
+            .advance(elapsed);
+    }
+
+    async fn before_expiry<T>(
+        &self,
+        deadline: SystemTime,
+        operation: impl Future<Output = Result<T, CloseOutcome>>,
+    ) -> Result<T, CloseOutcome> {
+        let mut operation = pin!(operation);
+        let guarded = poll_fn(|context| {
+            if self.now() >= deadline {
+                Poll::Ready(Err(CloseOutcome::CertificateInvalid))
+            } else {
+                operation.as_mut().poll(context)
+            }
+        });
+        match select(pin!(self.wait_until(deadline)), pin!(guarded)).await {
+            Either::Left(_) => Err(CloseOutcome::CertificateInvalid),
+            Either::Right((result, _)) => result,
+        }
+    }
+
+    async fn wait_until(&self, deadline: SystemTime) {
+        #[cfg(test)]
+        if let Some(clock) = &self.manual {
+            return clock.wait_until(deadline).await;
+        }
+        loop {
+            let remaining = deadline.duration_since(self.now()).unwrap_or_default();
+            if remaining.is_zero() {
+                return;
+            }
+            compio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+        }
     }
 }
 

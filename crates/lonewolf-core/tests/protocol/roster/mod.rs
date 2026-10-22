@@ -2475,6 +2475,11 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
         "<presence xmlns='jabber:client' from='alice@localhost/tablet' to='alice@localhost'/>",
     )?;
     bob.send("<presence/>")?;
+    expect_presence_pair(
+        &mut bob,
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+        "<presence xmlns='jabber:client' from='alice@localhost/tablet' to='bob@localhost'/>",
+    )?;
     tablet.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
     )?;
@@ -2495,13 +2500,18 @@ fn a_request_waiting_for_its_turn_keeps_receiving_deliveries() -> TestResult {
         bob.send(&format!(
             "<presence><priority>{}</priority></presence>",
             index % 128
-        ))?;
-    }
-    for index in 0..1200 {
+        ))
+        .map_err(|error| format!("presence update {index}: {error}"))?;
         tablet.expect_xml(&format!(
             "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'><priority>{}</priority></presence>",
             index % 128
-        ))?;
+        ))
+        .map_err(|error| format!("tablet delivery {index}: {error}"))?;
+        bob.expect_xml(&format!(
+            "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>{}</priority></presence>",
+            index % 128
+        ))
+        .map_err(|error| format!("sender echo {index}: {error}"))?;
     }
 
     control(

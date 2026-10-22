@@ -78,6 +78,7 @@ jobs:
       - name: Test documentation with all features
         run: cargo test --workspace --doc --all-features --locked
       - name: Build release binaries
+        if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
         run: cargo build --workspace --all-features --release --locked
 
   dependencies:

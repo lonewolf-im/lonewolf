@@ -758,7 +758,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
         .ok_or("missing example profile")?;
     assert_eq!(
         example_profile,
-        toml::from_str::<toml::Value>("max_stanza_bytes = 524_288")?
+        toml::from_str::<toml::Value>("max_stanza_bytes = 1_048_576")?
     );
     assert_eq!(
         documented.get("limits"),
@@ -827,7 +827,7 @@ fn reference_configuration_documents_defaults_and_valid_examples() -> TestResult
     expected.limits.c2s.profiles.insert(
         "internal".into(),
         C2sLimitProfile {
-            max_stanza_bytes: NonZeroUsize::new(524_288).ok_or("invalid example stanza size")?,
+            max_stanza_bytes: NonZeroUsize::new(1_048_576).ok_or("invalid example stanza size")?,
             ..C2sLimitProfile::default()
         },
     );

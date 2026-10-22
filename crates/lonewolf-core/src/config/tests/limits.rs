@@ -89,7 +89,7 @@ fn negotiation_retry_limits_reject_values_outside_the_rfc_bounds() -> TestResult
 fn limits_defaults_match_the_policy() -> TestResult {
     let expected = [
         ("max_connections_per_ip", 256),
-        ("max_stanza_bytes", 262_144),
+        ("max_stanza_bytes", 524_288),
         ("connection_establishment_timeout_secs", 10),
         ("authentication_timeout_secs", 15),
         ("resource_binding_timeout_secs", 5),
@@ -225,7 +225,7 @@ fn unrelated_limits_and_profile_inheritance_are_not_configurable() -> TestResult
 
 #[test]
 fn one_named_profile_replaces_the_builtin_and_is_selected_automatically() -> TestResult {
-    let file = config_file("[limits.c2s.profiles.public]\nmax_stanza_bytes = 524288")?;
+    let file = config_file("[limits.c2s.profiles.public]\nmax_stanza_bytes = 1048576")?;
     let config = Config::load(Some(file.path()))?;
     assert_eq!(config.limits.c2s.default, "public");
     assert_eq!(config.limits.c2s.profiles.len(), 1);
@@ -237,7 +237,7 @@ fn one_named_profile_replaces_the_builtin_and_is_selected_automatically() -> Tes
         .into_values()
         .next()
         .ok_or("missing profile")?;
-    assert_eq!(profile.max_stanza_bytes.get(), 524_288);
+    assert_eq!(profile.max_stanza_bytes.get(), 1_048_576);
     profile.max_stanza_bytes = C2sLimitProfile::default().max_stanza_bytes;
     assert_eq!(profile, C2sLimitProfile::default());
     assert_eq!(config.c2s.listeners[0].limits, None);
@@ -253,7 +253,7 @@ default = "public"
 max_resources_per_account = 12
 [limits.c2s.profiles.public]
 [limits.c2s.profiles.internal]
-max_stanza_bytes = 524288
+max_stanza_bytes = 1048576
 [[c2s.listeners]]
 address = "0.0.0.0:5222"
 limits = "public"
@@ -268,6 +268,16 @@ address = "[::]:5222"
     assert_eq!(config.limits.c2s.default, "public");
     assert_eq!(config.limits.c2s.max_resources_per_account.get(), 12);
     assert_eq!(config.limits.c2s.profiles.len(), 2);
+    assert_eq!(
+        config.limits.c2s.profiles["public"].max_stanza_bytes.get(),
+        524_288
+    );
+    assert_eq!(
+        config.limits.c2s.profiles["internal"]
+            .max_stanza_bytes
+            .get(),
+        1_048_576
+    );
     assert_eq!(config.c2s.listeners[0].limits.as_deref(), Some("public"));
     assert_eq!(config.c2s.listeners[1].limits.as_deref(), Some("internal"));
     assert_eq!(config.c2s.listeners[2].limits, None);

@@ -81,7 +81,30 @@ pub fn run(config_path: Option<&Path>, build: BuildInfo) -> Result<(), RunError>
 pub fn run_with_extensions(
     config_path: Option<&Path>,
     build: BuildInfo,
+    extensions: Extensions<Arc<PooledChunkAllocator>, RedbStorage>,
+) -> Result<(), RunError> {
+    run_internal(config_path, build, extensions, acme::LoadOptions::default())
+}
+
+#[cfg(feature = "test-support")]
+pub fn run_with_acme_clock(
+    config_path: Option<&Path>,
+    build: BuildInfo,
+    clock: lonewolf_acme::test_support::TestClock,
+) -> Result<(), RunError> {
+    run_internal(
+        config_path,
+        build,
+        Extensions::default(),
+        acme::LoadOptions { clock: Some(clock) },
+    )
+}
+
+fn run_internal(
+    config_path: Option<&Path>,
+    build: BuildInfo,
     mut extensions: Extensions<Arc<PooledChunkAllocator>, RedbStorage>,
+    acme_options: acme::LoadOptions,
 ) -> Result<(), RunError> {
     panic::init(&build);
 
@@ -138,7 +161,7 @@ pub fn run_with_extensions(
             let mut shutdown_deadline = None;
             let result = async {
                 match startup_until_signal(
-                    acme::supervise("load", acme::AcmeServices::load(&config, hosts.clone())),
+                    acme::supervise("load", acme_options.load(&config, hosts.clone())),
                     stop_signal.as_mut(),
                     &mut shutdown_deadline,
                 )

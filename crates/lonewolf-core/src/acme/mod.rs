@@ -58,6 +58,26 @@ impl Installer for HostInstaller {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct LoadOptions {
+    #[cfg(feature = "test-support")]
+    pub(crate) clock: Option<lonewolf_acme::test_support::TestClock>,
+}
+
+impl LoadOptions {
+    pub(crate) async fn load(
+        self,
+        config: &Config,
+        hosts: Hosts,
+    ) -> Result<Option<AcmeServices>, RunError> {
+        #[cfg(feature = "test-support")]
+        if self.clock.is_some() {
+            return AcmeServices::load_options(config, hosts, self).await;
+        }
+        AcmeServices::load(config, hosts).await
+    }
+}
+
 pub(crate) struct AcmeServices {
     http: Option<Http01Server>,
     manager: Manager<HostInstaller>,
@@ -66,6 +86,14 @@ pub(crate) struct AcmeServices {
 
 impl AcmeServices {
     pub(crate) async fn load(config: &Config, hosts: Hosts) -> Result<Option<Self>, RunError> {
+        Self::load_options(config, hosts, LoadOptions::default()).await
+    }
+
+    async fn load_options(
+        config: &Config,
+        hosts: Hosts,
+        options: LoadOptions,
+    ) -> Result<Option<Self>, RunError> {
         let managed = managed_hosts(config)?;
         if managed.is_empty() {
             return Ok(None);
@@ -74,6 +102,13 @@ impl AcmeServices {
         let http = Http01Server::bind(&config.letsencrypt.listen, challenges.clone())
             .await
             .map_err(|error| io_failure("HTTP bind", error))?;
+        #[cfg(feature = "test-support")]
+        if options.clock.is_some() {
+            return Self::load_bound_options(config, hosts, managed, challenges, http, options)
+                .await
+                .map(Some);
+        }
+        let _ = options;
         Self::load_bound(config, hosts, managed, challenges, http)
             .await
             .map(Some)
@@ -86,18 +121,44 @@ impl AcmeServices {
         challenges: Challenges,
         http: Http01Server,
     ) -> Result<Self, RunError> {
-        let manager = Manager::load(
-            ManagerOptions {
-                directory_url: config.letsencrypt.directory_url.clone(),
-                state_path: config.letsencrypt.state_path.clone(),
-                ca_certificates_path: config.letsencrypt.ca_certificates_path.clone(),
-                hosts: managed,
-            },
+        Self::load_bound_options(
+            config,
+            hosts,
+            managed,
             challenges,
-            HostInstaller { hosts },
+            http,
+            LoadOptions::default(),
         )
         .await
-        .map_err(|error| failure("load", error))?;
+    }
+
+    async fn load_bound_options(
+        config: &Config,
+        hosts: Hosts,
+        managed: Vec<ManagedHost>,
+        challenges: Challenges,
+        http: Http01Server,
+        options: LoadOptions,
+    ) -> Result<Self, RunError> {
+        let manager_options = ManagerOptions {
+            directory_url: config.letsencrypt.directory_url.clone(),
+            state_path: config.letsencrypt.state_path.clone(),
+            ca_certificates_path: config.letsencrypt.ca_certificates_path.clone(),
+            hosts: managed,
+        };
+        let installer = HostInstaller { hosts };
+        #[cfg(feature = "test-support")]
+        let manager = if let Some(clock) = options.clock {
+            Manager::load_with_clock(manager_options, challenges, installer, clock).await
+        } else {
+            Manager::load(manager_options, challenges, installer).await
+        };
+        #[cfg(not(feature = "test-support"))]
+        let manager = {
+            let _ = options;
+            Manager::load(manager_options, challenges, installer).await
+        };
+        let manager = manager.map_err(|error| failure("load", error))?;
         for (index, address) in http
             .local_addrs()
             .map_err(|error| io_failure("HTTP address", error))?

@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures_executor::block_on;
+use lonewolf_acme::test_support::{ClockMode, ClockSnapshot, Parked};
 use lonewolf_acme::{StateStore, StoredAccount, StoredHost};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -21,6 +22,8 @@ use super::{Client, FakeAcmeCa, PASSWORD, PlainClient, TIMEOUT, TLS_NAMESPACE, T
 pub struct AcmeServer {
     pub directory: tempfile::TempDir,
     child: Option<Child>,
+    clock: Option<super::clock::ClockControl>,
+    clock_start: Option<(std::time::SystemTime, ClockMode)>,
     pub address: SocketAddr,
     pub challenge: SocketAddr,
     pub tls: Arc<ClientConfig>,
@@ -104,6 +107,8 @@ ca_certificates_path = {:?}
         Ok(Self {
             directory,
             child: None,
+            clock: None,
+            clock_start: None,
             address: "127.0.0.1:0".parse()?,
             challenge,
             tls,
@@ -135,6 +140,13 @@ ca_certificates_path = {:?}
     pub fn spawn(&mut self) -> TestResult {
         assert!(self.child.is_none());
         self.reservation.take();
+        if let Some((now, mode)) = self.clock_start {
+            let (child, clock) = super::clock::spawn(self.path(), now, mode)?;
+            self.child = Some(child);
+            self.clock = Some(clock);
+            self.launch_count += 1;
+            return Ok(());
+        }
         self.child = Some(
             Command::new(env!("CARGO_BIN_EXE_lonewolf"))
                 .current_dir(self.path())
@@ -145,6 +157,41 @@ ca_certificates_path = {:?}
         );
         self.launch_count += 1;
         Ok(())
+    }
+    pub fn enable_clock(&mut self) {
+        self.clock_start = Some((std::time::SystemTime::now(), ClockMode::Running));
+    }
+    pub fn freeze_clock(&mut self) -> TestResult<ClockSnapshot> {
+        let snapshot = self
+            .clock
+            .as_mut()
+            .ok_or("missing clock controller")?
+            .freeze()?;
+        self.clock_start = Some((snapshot.now, ClockMode::Frozen));
+        Ok(snapshot)
+    }
+    pub fn advance_clock(&mut self, now: std::time::SystemTime) -> TestResult<u64> {
+        Ok(self
+            .clock
+            .as_mut()
+            .ok_or("missing clock controller")?
+            .advance_to(now)?)
+    }
+    pub fn resume_clock(&mut self) -> TestResult<u64> {
+        Ok(self
+            .clock
+            .as_mut()
+            .ok_or("missing clock controller")?
+            .resume()?)
+    }
+    pub fn parked_clock(&mut self, generation: u64) -> TestResult<Parked> {
+        self.clock
+            .as_mut()
+            .ok_or("missing clock controller")?
+            .wait_parked(generation)
+            .map_err(|error| {
+                format!("ACME manager did not park at generation {generation}: {error}").into()
+            })
     }
     pub fn reserve_listener(&mut self, listener: TcpListener) -> TestResult {
         let address = listener.local_addr()?;
@@ -243,6 +290,7 @@ ca_certificates_path = {:?}
             let logs = self.logs()?;
             if let Some(status) = self.child.as_mut().ok_or("missing child")?.try_wait()? {
                 self.child.take();
+                self.clock.take();
                 return Ok(Some(status));
             }
             if logs.contains("waiting for stop signal") {
@@ -285,6 +333,7 @@ ca_certificates_path = {:?}
         loop {
             if let Some(status) = self.child.as_mut().ok_or("missing child")?.try_wait()? {
                 self.child.take();
+                self.clock.take();
                 return Ok(status);
             }
             if Instant::now() >= deadline {
@@ -456,6 +505,7 @@ ca_certificates_path = {:?}
 }
 impl Drop for AcmeServer {
     fn drop(&mut self) {
+        self.clock.take();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();

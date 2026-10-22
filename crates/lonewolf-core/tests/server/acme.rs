@@ -587,8 +587,10 @@ fn interrupted(stage: AcmeStage) -> TestResult {
     let ca = FakeAcmeCa::start()?;
     ca.set_fault(stage, AcmeFault::Hold);
     let mut server = C2sSuite::managed(&ca)?;
+    server.enable_clock();
     server.start(&ca)?;
     ca.wait_for(stage)?;
+    let frozen = server.freeze_clock()?;
     server.kill()?;
     let (account, host) = server.records()?;
     let before = ca.counts();
@@ -614,27 +616,22 @@ fn interrupted(stage: AcmeStage) -> TestResult {
             .not_before_unix
             .max(account.retry.not_before_unix)
     });
-    assert!(
-        floor
-            > std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs()
-    );
+    let until = std::time::UNIX_EPOCH + std::time::Duration::from_secs(floor);
+    assert!(until > frozen.now);
     ca.release(stage);
     server.start(&ca)?;
+    let parked = server.parked_clock(0)?;
+    assert_eq!(parked.now, frozen.now);
     assert_pending(&server, "xmpp.example.test")?;
-    assert_eq!(
-        ca.counts().at(AcmeStage::NewOrder),
-        before.at(AcmeStage::NewOrder)
-    );
-    assert_eq!(
-        ca.counts().at(AcmeStage::Account),
-        before.at(AcmeStage::Account)
-    );
-    let until = std::time::UNIX_EPOCH + std::time::Duration::from_secs(floor);
-    if let Ok(remaining) = until.duration_since(std::time::SystemTime::now()) {
-        std::thread::sleep(remaining);
-    }
+    assert_eq!(ca.counts().stages, before.stages);
+    let just_before = until - std::time::Duration::from_secs(1);
+    let generation = server.advance_clock(just_before)?;
+    let parked = server.parked_clock(generation)?;
+    assert_eq!(parked.now, just_before);
+    assert_pending(&server, "xmpp.example.test")?;
+    assert_eq!(ca.counts().stages, before.stages);
+    server.advance_clock(until)?;
+    server.resume_clock()?;
     let certificate = server.wait_certificate(None)?;
     server.account("xmpp.example.test")?;
     let mut client = authenticate(

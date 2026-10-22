@@ -4,6 +4,7 @@ mod ca;
 #[allow(dead_code)]
 #[path = "../client.rs"]
 mod client;
+pub mod clock;
 pub mod process;
 mod proxy;
 #[allow(dead_code)]

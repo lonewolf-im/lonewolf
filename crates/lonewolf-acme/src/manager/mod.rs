@@ -14,6 +14,7 @@ use parking_lot::Mutex as PlMutex;
 
 use crate::issuer::RenewalWindow;
 use crate::schedule;
+use crate::time::Time;
 use crate::types::*;
 use crate::{AcmeHttpClient, Challenges, Issuer, StateStore, TransportOptions};
 
@@ -96,6 +97,7 @@ pub struct Manager<I: Installer> {
     hosts: Vec<StoredHost>,
     status: StatusHandle,
     started: bool,
+    time: Time,
 }
 
 impl<I: Installer> Manager<I> {
@@ -104,6 +106,25 @@ impl<I: Installer> Manager<I> {
         challenges: Challenges,
         installer: I,
     ) -> Result<Self, ManagerError> {
+        Self::with_time(options, challenges, installer, Time::default()).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn load_with_clock(
+        options: ManagerOptions,
+        challenges: Challenges,
+        installer: I,
+        clock: crate::test_support::TestClock,
+    ) -> Result<Self, ManagerError> {
+        Self::with_time(options, challenges, installer, Time::controlled(clock)).await
+    }
+
+    async fn with_time(
+        options: ManagerOptions,
+        challenges: Challenges,
+        installer: I,
+        time: Time,
+    ) -> Result<Self, ManagerError> {
         let store = StateStore::open(options.state_path, options.directory_url.clone()).await?;
         let transport = AcmeHttpClient::new(TransportOptions {
             ca_certificates_path: options.ca_certificates_path,
@@ -111,11 +132,12 @@ impl<I: Installer> Manager<I> {
         .await
         .map_err(ManagerError::Transport)?;
         let issuer = Arc::new(
-            Issuer::new(
+            Issuer::with_time(
                 store.clone(),
                 challenges.clone(),
                 transport.clone(),
                 options.directory_url,
+                time.clone(),
             )
             .map_err(fatal)?,
         );
@@ -146,8 +168,8 @@ impl<I: Installer> Manager<I> {
             {
                 return Err(StateError::CorruptData.into());
             }
-            let installed = prepare_cache(&record, &installer, schedule::now)?;
-            let now = schedule::now()?;
+            let installed = prepare_cache(&record, &installer, || Clock::now(&time))?;
+            let now = Clock::now(&time)?;
             let mut initial_state = state(&record, now);
             if initial_state == HostState::Ready && !installed {
                 initial_state = HostState::Pending;
@@ -183,6 +205,7 @@ impl<I: Installer> Manager<I> {
             hosts,
             status,
             started: false,
+            time,
         })
     }
 
@@ -203,12 +226,13 @@ impl<I: Installer> Manager<I> {
         let production = Production {
             issuer: self.issuer.clone(),
             installer: self.installer.clone(),
+            time: self.time.clone(),
         };
         let result = until_shutdown(
             drive(
                 &self.store,
                 &production,
-                &SystemClock,
+                &self.time,
                 std::mem::take(&mut self.hosts),
                 &self.status,
             ),
@@ -345,17 +369,22 @@ trait Clock {
     fn now(&self) -> Result<u64, StateError>;
     fn uniform(&self, maximum: u64) -> Result<u64, StateError>;
     async fn sleep(&self, delay: Duration);
+    async fn idle_sleep(&self, delay: Duration) {
+        self.sleep(delay).await
+    }
 }
-struct SystemClock;
-impl Clock for SystemClock {
+impl Clock for Time {
     fn now(&self) -> Result<u64, StateError> {
-        schedule::now()
+        self.unix()
     }
     fn uniform(&self, maximum: u64) -> Result<u64, StateError> {
         schedule::uniform(maximum)
     }
     async fn sleep(&self, delay: Duration) {
-        compio::time::sleep(delay).await
+        Time::sleep(self, delay).await
+    }
+    async fn idle_sleep(&self, delay: Duration) {
+        Time::idle_sleep(self, delay).await
     }
 }
 trait Engine {
@@ -367,10 +396,11 @@ trait Engine {
 struct Production<I> {
     issuer: Arc<Issuer>,
     installer: Arc<I>,
+    time: Time,
 }
 impl<I: Installer> Engine for Production<I> {
     fn publish_cache(&self, host: &StoredHost, _: u64) -> Result<bool, ManagerError> {
-        prepare_cache(host, self.installer.as_ref(), schedule::now)
+        prepare_cache(host, self.installer.as_ref(), || self.time.unix())
     }
 
     async fn ensure_account(&self) -> Result<(), AttemptFailure> {
@@ -640,7 +670,7 @@ async fn drive(
         }
         let wait = Duration::from_secs(next.saturating_sub(clock.now()?).clamp(1, 60));
         let completed = if jobs.is_empty() {
-            clock.sleep(wait).await;
+            clock.idle_sleep(wait).await;
             continue;
         } else {
             let sleep = pin!(clock.sleep(wait));

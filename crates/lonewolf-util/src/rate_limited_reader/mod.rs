@@ -23,6 +23,8 @@ pub struct RateLimitState {
     burst_bytes: NonZeroUsize,
     bucket: TokenBucket,
     refill_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
+    #[cfg(test)]
+    clock: Option<tests::Clock>,
 }
 
 impl<R> RateLimitedReader<R> {
@@ -34,6 +36,8 @@ impl<R> RateLimitedReader<R> {
                 burst_bytes,
                 bucket: TokenBucket::new(burst_bytes, Instant::now()),
                 refill_wait: None,
+                #[cfg(test)]
+                clock: None,
             },
         }
     }
@@ -55,27 +59,38 @@ impl<R> RateLimitedReader<R> {
     }
 }
 
+impl RateLimitState {
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock.now();
+        }
+        Instant::now()
+    }
+}
+
 impl<R: AsyncBufRead + Unpin> AsyncBufRead for RateLimitedReader<R> {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
         let this = self.get_mut();
-        this.state.bucket.replenish(
-            this.state.bytes_per_second,
-            this.state.burst_bytes,
-            Instant::now(),
-        );
+        let now = this.state.now();
+        this.state
+            .bucket
+            .replenish(this.state.bytes_per_second, this.state.burst_bytes, now);
         while this.state.bucket.available() == 0 {
             let wait = this.state.bucket.refill_delay(this.state.bytes_per_second);
-            let timer = this
-                .state
-                .refill_wait
-                .get_or_insert_with(|| Box::pin(compio::time::sleep(wait)));
+            let timer = this.state.refill_wait.get_or_insert_with(|| {
+                #[cfg(test)]
+                if let Some(clock) = &this.state.clock {
+                    return clock.sleep(wait);
+                }
+                Box::pin(compio::time::sleep(wait))
+            });
             ready!(timer.as_mut().poll(cx));
             this.state.refill_wait = None;
-            this.state.bucket.replenish(
-                this.state.bytes_per_second,
-                this.state.burst_bytes,
-                Instant::now(),
-            );
+            let now = this.state.now();
+            this.state
+                .bucket
+                .replenish(this.state.bytes_per_second, this.state.burst_bytes, now);
         }
         this.state.refill_wait = None;
         let available = ready!(Pin::new(&mut this.inner).poll_fill_buf(cx))?;

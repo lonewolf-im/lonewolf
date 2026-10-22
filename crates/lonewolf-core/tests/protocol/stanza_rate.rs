@@ -236,7 +236,8 @@ fn new_recipient_budget_rejects_fourth_without_poisoning_recent_recipients() -> 
         recipients[index].expect_xml(&format!("<message xmlns='jabber:client' from='alice@localhost/desk' to='{name}@localhost/phone' type='chat' id='repeat'/>"))?;
     }
     recipients[3].expect_no_tls_input()?;
-    let logs = suite.wait_for_log("recipient_rate")?;
+    alice.close()?;
+    let logs = suite.wait_for_log("stream disconnected")?;
     let rejections: Vec<_> = logs
         .lines()
         .filter(|line| line.contains("recipient_rate"))
@@ -251,7 +252,6 @@ fn new_recipient_budget_rejects_fourth_without_poisoning_recent_recipients() -> 
             "{event}"
         );
     }
-    alice.close()?;
     for recipient in &mut recipients {
         recipient.close()?;
     }

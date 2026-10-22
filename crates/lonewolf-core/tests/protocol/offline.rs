@@ -237,7 +237,7 @@ fn corrupt_stored_records_are_logged_once_skipped_and_removed_without_ending_the
         "<message xmlns='jabber:client' to='bob@localhost/old' type='chat' id='valid'/>",
     )?;
     await_empty(&mut bob, "bob@localhost/phone")?;
-    let logs = suite.wait_for_log("stored offline message rejected")?;
+    let logs = suite.wait_for_log("offline replay flushed operation=\"replay\" outcome=\"flushed\" messages_written=1 messages_skipped=3")?;
     assert_eq!(logs.matches("stored offline message rejected").count(), 3);
     for sequence in 1..=3 {
         assert!(logs.contains(&format!("sequence={sequence}")));

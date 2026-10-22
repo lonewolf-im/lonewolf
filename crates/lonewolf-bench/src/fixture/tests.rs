@@ -7,7 +7,12 @@ use std::{num::NonZeroUsize, os::unix::fs::PermissionsExt};
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn config() -> BenchResult<RunConfig> {
-    toml::from_str("[target]\nmode='local'\nserver_binary='/usr/bin/true'\nserver_workers=1\nstanza_pool_size_mib=8\n[scenario]\nkind='idle'\nconnections=1\n[measurement]\nsetup_timeout_ms=10000").map_err(|_| failure("test_config"))
+    let mut config: RunConfig = toml::from_str("[target]\nmode='local'\nserver_binary='test-executable'\nserver_workers=1\nstanza_pool_size_mib=8\n[scenario]\nkind='idle'\nconnections=1\n[measurement]\nsetup_timeout_ms=10000").map_err(|_| failure("test_config"))?;
+    let TargetConfig::Local { server_binary, .. } = &mut config.target else {
+        return Err(failure("test_config"));
+    };
+    *server_binary = std::env::current_exe().map_err(|_| failure("test_executable"))?;
+    Ok(config)
 }
 
 #[tokio::test]
@@ -85,12 +90,12 @@ async fn failed_start_remains_owned_until_stop() -> TestResult {
         .ok_or("directory")?
         .path()
         .to_owned();
-    assert!(
-        fixture
-            .start(Instant::now() + Duration::from_secs(2))
-            .await
-            .is_err()
-    );
+    let error = fixture
+        .start(Instant::now() + Duration::from_secs(2))
+        .await
+        .err()
+        .ok_or("test executable unexpectedly started as a server")?;
+    assert_eq!(error.context(), "fixture_startup_exit");
     fixture.stop(Duration::from_secs(1)).await?;
     assert!(fixture.server_log().is_some());
     assert!(!directory.exists());
@@ -98,7 +103,7 @@ async fn failed_start_remains_owned_until_stop() -> TestResult {
 }
 
 #[test]
-#[ignore]
+#[ignore = "subprocess entry point for the owned-child force-kill fixture"]
 fn owned_child_helper() -> TestResult {
     let Some(ready) = std::env::var_os("LONEWOLF_BENCH_TEST_READY") else {
         return Ok(());

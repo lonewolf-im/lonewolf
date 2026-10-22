@@ -329,7 +329,11 @@ impl LocalFixture {
             .await?;
         for chunk in credentials.accounts.chunks(256) {
             control.check()?;
+            #[cfg(test)]
+            let probe = control.probe.clone();
             let jobs = chunk.chunks(chunk.len().div_ceil(cpu.size())).map(|part| {
+                #[cfg(test)]
+                let probe = probe.clone();
                 let secrets: Vec<_> = part
                     .iter()
                     .map(|account| {
@@ -340,7 +344,16 @@ impl LocalFixture {
                     })
                     .collect();
                 move |cancelled: &AtomicBool| {
-                    provision_accounts(secrets, cancelled, deadline, deadline_context)
+                    provision_accounts(
+                        secrets,
+                        cancelled,
+                        deadline,
+                        deadline_context,
+                        #[cfg(test)]
+                        probe
+                            .as_ref()
+                            .and_then(|probe| probe.prepared_credentials.as_ref()),
+                    )
                 }
             });
             let batch: Vec<_> = control
@@ -616,6 +629,7 @@ fn provision_accounts(
     cancelled: &AtomicBool,
     deadline: Instant,
     deadline_context: &'static str,
+    #[cfg(test)] prepared_credentials: Option<&ScramCredentials>,
 ) -> BenchResult<Vec<NewAccount>> {
     let iterations = ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())
         .map_err(|_| failure("fixture_scram_policy"))?;
@@ -629,7 +643,12 @@ fn provision_accounts(
         let jid = Jid::parse_in(&jid, &mut arena).map_err(|_| failure("fixture_jid"))?;
         let key = AccountKey::try_from(jid.resolve(&arena).map_err(|_| failure("fixture_jid"))?)
             .map_err(|_| failure("fixture_jid"))?;
-        let credentials = ScramCredentials::provision(&password, iterations)
+        #[cfg(test)]
+        let credentials = prepared_credentials.cloned();
+        #[cfg(not(test))]
+        let credentials: Option<ScramCredentials> = None;
+        let credentials = credentials
+            .map_or_else(|| ScramCredentials::provision(&password, iterations), Ok)
             .map_err(|_| failure("fixture_password"))?;
         batch.push(NewAccount { key, credentials });
     }

@@ -216,6 +216,7 @@ async fn drop_kills_and_reaps_after_cancelled_stop() -> TestResult {
 
 #[derive(Default)]
 pub(super) struct PreparationProbe {
+    pub(super) prepared_credentials: Option<ScramCredentials>,
     directory: std::sync::Mutex<Option<PathBuf>>,
     dropped: AtomicBool,
     cpu_steps: std::sync::atomic::AtomicUsize,
@@ -449,6 +450,10 @@ async fn standalone_expiry_and_queued_cancellation_do_not_run_unadmitted_cpu_wor
 #[tokio::test(start_paused = true)]
 async fn stopped_preparation_finishes_the_whole_transaction_without_starting_the_next_batch()
 -> TestResult {
+    let credentials = ScramCredentials::provision(
+        "transaction-fixture-password",
+        ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
+    )?;
     for (interrupt, storage_error) in [(true, false), (true, true), (false, true)] {
         let mut config = config()?;
         config.scenario = ScenarioConfig::Idle { connections: 257 };
@@ -457,6 +462,7 @@ async fn stopped_preparation_finishes_the_whole_transaction_without_starting_the
         let (admission, mut admitted) = tokio::sync::oneshot::channel();
         let (release, blocked) = tokio::sync::oneshot::channel();
         let probe = Arc::new(PreparationProbe {
+            prepared_credentials: Some(credentials.clone()),
             admission: std::sync::Mutex::new(Some(admission)),
             transaction_release: std::sync::Mutex::new(Some(blocked)),
             ..Default::default()

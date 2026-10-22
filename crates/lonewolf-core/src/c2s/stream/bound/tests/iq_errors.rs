@@ -30,27 +30,7 @@ async fn session<A: ChunkAllocator + Clone>(
         )
         .await?;
     let (_sender, incoming) = async_channel::bounded(1);
-    let mut outbox = fixture.outbox(allocator.clone(), ControlledWriter::default());
-    outbox.liveness = registration.liveness();
-    let session = BoundSession {
-        outbox,
-        registration,
-        router: router.handle(),
-        storage: fixture.storage.clone(),
-        allocator,
-        work: fixture.work.handle(),
-        service_presence: None,
-        service_pending: None,
-        recipients: RecipientLimiter::new(
-            NonZeroUsize::MIN,
-            NonZeroUsize::new(100).ok_or("burst")?,
-            Instant::now(),
-            crate::c2s::metrics::C2sWorkerMetrics::detached(),
-        ),
-        available: false,
-        priority: None,
-        incoming,
-    };
+    let session = fixture.bound_session(allocator, registration, router.handle(), incoming)?;
     Ok((router, session))
 }
 

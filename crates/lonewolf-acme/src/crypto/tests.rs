@@ -111,7 +111,7 @@ fn csr_has_one_dns_san_and_independent_signature_and_key() {
     let secret = p256::SecretKey::from_pkcs8_der(&key).unwrap();
     let verifier = VerifyingKey::from(secret.public_key());
     assert_eq!(
-        verifier.to_encoded_point(false).as_bytes(),
+        verifier.to_sec1_point(false).as_bytes(),
         csr.info.public_key.subject_public_key.as_bytes().unwrap()
     );
     verifier

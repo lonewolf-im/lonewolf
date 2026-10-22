@@ -49,5 +49,5 @@ zeroize.workspace = true
 [dev-dependencies]
 blocking.workspace = true
 futures-executor.workspace = true
-p256 = { version = "0.13.2", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
+p256 = { version = "0.14.0", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
 tempfile.workspace = true

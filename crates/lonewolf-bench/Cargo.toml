@@ -47,7 +47,7 @@ compio = { workspace = true, features = ["time"] }
 futures-executor.workspace = true
 idna.workspace = true
 lonewolf-acme.workspace = true
-lonewolf-core.workspace = true
+lonewolf-core = { workspace = true, features = ["test-support"] }
 lonewolf-extension.workspace = true
 parking_lot.workspace = true
 quick-xml.workspace = true

@@ -211,3 +211,12 @@ fn config_relative_paths_caller_override_and_new_output() -> Result<(), Box<dyn 
     assert!(validate_new_output(&directory.path().join("dangling")).is_err());
     Ok(())
 }
+
+#[test]
+fn operator_examples_parse_without_accessing_remote_endpoints() -> BenchResult<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bench");
+    for name in ["idle", "messages", "churn", "remote"] {
+        RunConfig::load(&root.join(format!("{name}.toml")), None)?;
+    }
+    Ok(())
+}

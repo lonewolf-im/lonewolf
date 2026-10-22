@@ -132,14 +132,20 @@ fn public_anchors_keep_all_mozilla_constraints_with_extra_roots() {
     }
     let mut invalid_suffix = pem.into_bytes();
     invalid_suffix.extend_from_slice(b"junk");
-    assert!(add_roots(&mut roots, &invalid_suffix).is_err());
+    assert_eq!(
+        add_roots(&mut roots, &invalid_suffix).unwrap_err().kind(),
+        AcmeErrorKind::InvalidCaBundle
+    );
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(&invalid_suffix).unwrap();
-    assert!(
+    assert_eq!(
         block_on(AcmeHttpClient::new(TransportOptions {
             ca_certificates_path: Some(file.path().into())
         }))
-        .is_err()
+        .err()
+        .unwrap()
+        .kind(),
+        AcmeErrorKind::InvalidCaBundle
     );
 }
 
@@ -196,7 +202,8 @@ fn untrusted_wrong_name_and_expired_certificates_fail() {
         let (url, worker) = serve(server_config(certificate, key), |_| {
             panic!("unverified TLS reached HTTP")
         });
-        assert!(block_on(client.request(request(&url))).is_err());
+        let error = block_on(client.request(request(&url))).err().unwrap();
+        assert_eq!(error_kind(&error), AcmeErrorKind::Other);
         worker.join().unwrap();
     }
 }
@@ -210,15 +217,17 @@ fn plain_http_invalid_urls_and_oversized_requests_fail_before_network() {
         "https://example.com:0/",
     ] {
         let error = block_on(client.request(request(url))).err().unwrap();
-        assert!(format!("{error:?}").contains("InvalidInput"));
+        assert_eq!(error_kind(&error), AcmeErrorKind::InvalidInput);
     }
     let long_url = format!("https://example.com/{}", "a".repeat(8192));
-    assert!(block_on(client.request(request(&long_url))).is_err());
+    let error = block_on(client.request(request(&long_url))).err().unwrap();
+    assert_eq!(error_kind(&error), AcmeErrorKind::InvalidInput);
     let oversized = http::Request::builder()
         .uri("https://127.0.0.1:1/")
         .body(instant_acme::BodyWrapper::from(vec![0; MAX_REQUEST + 1]))
         .unwrap();
-    assert!(block_on(client.request(oversized)).is_err());
+    let error = block_on(client.request(oversized)).err().unwrap();
+    assert_eq!(error_kind(&error), AcmeErrorKind::InvalidInput);
 }
 
 #[test]
@@ -226,29 +235,98 @@ fn redirects_compression_and_oversized_headers_and_bodies_fail() {
     let (certificate, key) = certificate("127.0.0.1", false);
     let client = client_with_root(&certificate, GLOBAL_TIMEOUT);
     let cases = [
-        "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n"
-            .to_owned(),
-        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n".to_owned(),
-        format!(
-            "HTTP/1.1 200 OK\r\nX-Large: {}\r\nContent-Length: 0\r\n\r\n",
-            "a".repeat(33 * 1024)
+        (
+            "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n"
+                .to_owned(),
+            AcmeErrorKind::InvalidInput,
+            Some(302),
         ),
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-            MAX_BODY + 1,
-            "a".repeat(MAX_BODY + 1)
+        (
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n".to_owned(),
+            AcmeErrorKind::InvalidInput,
+            Some(200),
+        ),
+        (
+            format!(
+                "HTTP/1.1 200 OK\r\nX-Large: {}\r\nContent-Length: 0\r\n\r\n",
+                "a".repeat(33 * 1024)
+            ),
+            AcmeErrorKind::Other,
+            None,
+        ),
+        (
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                MAX_BODY + 1,
+                "a".repeat(MAX_BODY + 1)
+            ),
+            AcmeErrorKind::Other,
+            Some(200),
+        ),
+        (
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {MAX_BODY}\r\n\r\n{}",
+                "a".repeat(MAX_BODY)
+            ),
+            AcmeErrorKind::Other,
+            Some(200),
         ),
     ];
-    for response in cases {
+    for (response, expected, status) in cases {
         let (url, worker) = serve(
             server_config(certificate.clone(), key.clone()),
             move |stream| {
                 let _ = stream.write_all(response.as_bytes());
             },
         );
-        assert!(block_on(client.request(request(&url))).is_err());
+        let error = block_on(client.request(request(&url))).err().unwrap();
+        assert_eq!(error_kind(&error), expected);
+        let instant_acme::Error::Other(error) = error else {
+            panic!("unexpected protocol error")
+        };
+        assert_eq!(error.downcast_ref::<AcmeError>().unwrap().status(), status);
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn permitted_headers_are_preserved() {
+    let (certificate, key) = certificate("127.0.0.1", false);
+    let client = client_with_root(&certificate, GLOBAL_TIMEOUT);
+    let (url, worker) = serve(server_config(certificate, key), |stream| {
+        let header = "a".repeat(31 * 1024);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nX-Large: {header}\r\nContent-Length: 2\r\n\r\nok"
+        )
+        .unwrap();
+    });
+    let mut response = block_on(client.request(request(&url))).unwrap();
+    assert_eq!(response.parts.status, http::StatusCode::OK);
+    assert_eq!(response.parts.headers["X-Large"], "a".repeat(31 * 1024));
+    assert_eq!(block_on(response.body.into_bytes()).unwrap(), "ok");
+    worker.join().unwrap();
+}
+
+#[test]
+fn a_body_one_byte_below_the_exclusive_read_limit_is_preserved() {
+    let (certificate, key) = certificate("127.0.0.1", false);
+    let client = client_with_root(&certificate, GLOBAL_TIMEOUT);
+    let length = MAX_BODY - 1;
+    let (url, worker) = serve(server_config(certificate, key), move |stream| {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(&vec![b'a'; length]).unwrap();
+    });
+    let mut response = block_on(client.request(request(&url))).unwrap();
+    assert_eq!(response.parts.status, http::StatusCode::OK);
+    let body = block_on(response.body.into_bytes()).unwrap();
+    assert_eq!(body.len(), MAX_BODY - 1);
+    assert!(body.iter().all(|byte| *byte == b'a'));
+    worker.join().unwrap();
 }
 
 #[test]
@@ -298,7 +376,8 @@ fn response_retry_hint_survives_rejected_compression() {
     let (url, worker) = serve(server_config(certificate, key), |stream| {
         let _ = stream.write_all(b"HTTP/1.1 503 Unavailable\r\nRetry-After: 60\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n");
     });
-    assert!(block_on(client.request(request(&url))).is_err());
+    let error = block_on(client.request(request(&url))).err().unwrap();
+    assert_eq!(error_kind(&error), AcmeErrorKind::InvalidInput);
     assert!(client.retry_not_before().is_some());
     worker.join().unwrap();
 }
@@ -389,7 +468,8 @@ fn global_deadline_bounds_handshake_and_response_body_stalls() {
     let (certificate, key) = certificate("127.0.0.1", false);
     let client = client_with_root(&certificate, Duration::from_millis(100));
     let started = Instant::now();
-    assert!(block_on(client.request(request(&url))).is_err());
+    let error = block_on(client.request(request(&url))).err().unwrap();
+    assert_eq!(error_kind(&error), AcmeErrorKind::Timeout);
     assert!(started.elapsed() < WAIT);
     release.send(()).unwrap();
     worker.join().unwrap();
@@ -401,7 +481,8 @@ fn global_deadline_bounds_handshake_and_response_body_stalls() {
         gate.recv_timeout(WAIT).unwrap();
     });
     let started = Instant::now();
-    assert!(block_on(client.request(request(&url))).is_err());
+    let error = block_on(client.request(request(&url))).err().unwrap();
+    assert_eq!(error_kind(&error), AcmeErrorKind::Timeout);
     assert!(started.elapsed() < WAIT);
     release.send(()).unwrap();
     worker.join().unwrap();

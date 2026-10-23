@@ -7,7 +7,7 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, ElementRef, Stanza, StanzaErrorCondition};
 
-use crate::delivery::{Failure, HandlerError, HostLookup, SessionLookup};
+use crate::delivery::{Failure, HandlerError, HostLookup, SessionLookup, TagChange};
 use crate::discovery::Discovery;
 use crate::{Effects, ExtensionFuture, RegistrationError};
 
@@ -199,9 +199,28 @@ pub trait IqHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
     }
 }
 
+pub struct SessionIqReply {
+    pub payload: Option<Element>,
+    /// Applied to the requesting session before the reply.
+    pub change: Option<TagChange>,
+}
+
+/// Answers an account `set` that changes only the requesting session's routing state.
+pub trait SessionIqHandler<A: ChunkAllocator>: Send + Sync {
+    /// Runs without storage and must not block; handlers authorize `request.target` themselves.
+    fn set(
+        &self,
+        request: IqRequest<'_, A>,
+        response: &mut Arena<A>,
+    ) -> Result<SessionIqReply, IqError>;
+}
+
+type SessionHandler<A> = ((&'static str, &'static str), Arc<dyn SessionIqHandler<A>>);
+
 pub struct IqRegistry<A: ChunkAllocator, S: Storage> {
     handlers: Vec<(IqRoute, Arc<dyn IqHandler<A, S>>)>,
     destinations: Vec<(IqRequestKey, IqDestinationRule)>,
+    sessions: Vec<SessionHandler<A>>,
 }
 
 impl<A: ChunkAllocator, S: Storage> Default for IqRegistry<A, S> {
@@ -209,6 +228,7 @@ impl<A: ChunkAllocator, S: Storage> Default for IqRegistry<A, S> {
         Self {
             handlers: Vec::new(),
             destinations: Vec::new(),
+            sessions: Vec::new(),
         }
     }
 }
@@ -219,6 +239,12 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
         route: IqRoute,
         handler: Arc<dyn IqHandler<A, S>>,
     ) -> Result<(), RegistrationError> {
+        if route.scope == IqScope::Account
+            && route.kind == IqRequestType::Set
+            && self.find_session(route.namespace, route.name).is_some()
+        {
+            return Err(RegistrationError::DuplicateRoute(route));
+        }
         match self
             .handlers
             .binary_search_by_key(&route, |(entry, _)| *entry)
@@ -229,6 +255,48 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
                 Ok(())
             }
         }
+    }
+
+    pub(crate) fn register_session(
+        &mut self,
+        namespace: &'static str,
+        name: &'static str,
+        handler: Arc<dyn SessionIqHandler<A>>,
+    ) -> Result<(), RegistrationError> {
+        let route = IqRoute {
+            scope: IqScope::Account,
+            kind: IqRequestType::Set,
+            namespace,
+            name,
+        };
+        if self
+            .find(route.scope, route.kind, namespace, name)
+            .is_some()
+        {
+            return Err(RegistrationError::DuplicateRoute(route));
+        }
+        match self
+            .sessions
+            .binary_search_by_key(&(namespace, name), |(key, _)| *key)
+        {
+            Ok(_) => Err(RegistrationError::DuplicateRoute(route)),
+            Err(index) => {
+                self.sessions.insert(index, ((namespace, name), handler));
+                Ok(())
+            }
+        }
+    }
+
+    pub fn find_session(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Option<&Arc<dyn SessionIqHandler<A>>> {
+        let index = self
+            .sessions
+            .binary_search_by(|(key, _)| key.cmp(&(namespace, name)))
+            .ok()?;
+        Some(&self.sessions[index].1)
     }
 
     pub fn find(
@@ -282,7 +350,7 @@ impl<A: ChunkAllocator, S: Storage> IqRegistry<A, S> {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.handlers.is_empty() && self.destinations.is_empty()
+        self.handlers.is_empty() && self.destinations.is_empty() && self.sessions.is_empty()
     }
 }
 

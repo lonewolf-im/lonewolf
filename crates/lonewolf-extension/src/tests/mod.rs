@@ -820,3 +820,99 @@ fn duplicate_iq_destination_rules_fail_in_every_registration_order() -> Result<(
     );
     Ok(())
 }
+
+impl super::iq::SessionIqHandler<GlobalChunkAllocator> for Fake {
+    fn set(
+        &self,
+        _: super::iq::IqRequest<'_, GlobalChunkAllocator>,
+        _: &mut Arena<GlobalChunkAllocator>,
+    ) -> Result<super::iq::SessionIqReply, super::iq::IqError> {
+        Ok(super::iq::SessionIqReply {
+            payload: None,
+            change: None,
+        })
+    }
+}
+
+#[test]
+fn session_iq_routes_conflict_with_account_set_routes_in_both_orders()
+-> Result<(), RegistrationError> {
+    let route = IqRoute {
+        kind: IqRequestType::Set,
+        ..ROUTE
+    };
+    for session_first in [true, false] {
+        let mut registry = super::ExtensionRegistry::default();
+        let mut slots = Slots::new(&mut registry, "session");
+        let handler = Arc::new(Fake::default());
+        let result = if session_first {
+            slots.session_iq(route.namespace, route.name, handler.clone())?;
+            slots.iq(route, handler)
+        } else {
+            slots.iq(route, handler.clone())?;
+            slots.session_iq(route.namespace, route.name, handler)
+        };
+        assert_eq!(result, Err(RegistrationError::DuplicateRoute(route)));
+    }
+    Ok(())
+}
+
+#[test]
+fn session_iq_routes_conflict_with_each_other() -> Result<(), RegistrationError> {
+    let mut registry = super::ExtensionRegistry::<GlobalChunkAllocator, RedbStorage>::default();
+    let mut slots = Slots::new(&mut registry, "session");
+    let handler = Arc::new(Fake::default());
+    slots.session_iq(ROUTE.namespace, ROUTE.name, handler.clone())?;
+    assert_eq!(
+        slots.session_iq(ROUTE.namespace, ROUTE.name, handler),
+        Err(RegistrationError::DuplicateRoute(IqRoute {
+            kind: IqRequestType::Set,
+            ..ROUTE
+        }))
+    );
+    assert!(!registry.iq.is_empty());
+    Ok(())
+}
+
+#[test]
+fn session_iq_lookup_matches_only_exact_expanded_names() -> Result<(), RegistrationError> {
+    let mut registry = super::ExtensionRegistry::default();
+    let handler: Arc<dyn super::iq::SessionIqHandler<GlobalChunkAllocator>> =
+        Arc::new(Fake::default());
+    for (namespace, name) in [("urn:z", "a"), ("urn:a", "z"), ("urn:a", "a")] {
+        let mut slots = Slots::new(&mut registry, "session");
+        slots.session_iq(namespace, name, handler.clone())?;
+        for (scope, kind) in [
+            (IqScope::Server, IqRequestType::Set),
+            (IqScope::Account, IqRequestType::Get),
+        ] {
+            slots.iq(
+                IqRoute {
+                    scope,
+                    kind,
+                    namespace,
+                    name,
+                },
+                Arc::new(Fake::default()),
+            )?;
+        }
+    }
+    for (namespace, name) in [("urn:z", "a"), ("urn:a", "z"), ("urn:a", "a")] {
+        assert!(
+            registry
+                .iq
+                .find_session(namespace, name)
+                .is_some_and(|found| Arc::ptr_eq(found, &handler))
+        );
+    }
+    for (namespace, name) in [
+        ("urn:z", "z"),
+        ("urn:A", "a"),
+        ("urn:a", "A"),
+        ("", "a"),
+        ("urn:a", ""),
+    ] {
+        assert!(registry.iq.find_session(namespace, name).is_none());
+    }
+    Ok(())
+}

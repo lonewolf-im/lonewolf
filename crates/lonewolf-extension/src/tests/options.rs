@@ -250,6 +250,16 @@ fn options_require_an_enabled_known_extension() -> TestResult {
             RegistrationError::OptionsWithoutExtension("vcard".into()),
         ),
         (
+            "carbons",
+            vec![],
+            RegistrationError::OptionsWithoutExtension("carbons".into()),
+        ),
+        (
+            "carbons",
+            vec!["disco".into()],
+            RegistrationError::OptionsWithoutExtension("carbons".into()),
+        ),
+        (
             "unknown",
             vec![],
             RegistrationError::UnknownOptions("unknown".into()),
@@ -455,16 +465,25 @@ fn disco_rejects_host_options() -> TestResult {
 
 #[test]
 fn ping_rejects_empty_and_nonempty_host_options() -> TestResult {
+    rejects_shared_options("ping")
+}
+
+#[test]
+fn carbons_rejects_host_options() -> TestResult {
+    rejects_shared_options("carbons")
+}
+
+fn rejects_shared_options(name: &'static str) -> TestResult {
     let mut catalog = TestExtensions::default();
     for factory in crate::builtin() {
         catalog.register_factory(factory)?;
     }
     for table in [toml::Table::new(), toml::from_str("x = 1")?] {
-        let options = BTreeMap::from([("ping".into(), table)]);
+        let options = BTreeMap::from([(name.into(), table)]);
         for names in [
-            vec!["ping".into()],
-            vec!["ping".into(), "disco".into()],
-            vec!["disco".into(), "ping".into()],
+            vec![name.into()],
+            vec![name.into(), "disco".into()],
+            vec!["disco".into(), name.into()],
         ] {
             let error = catalog
                 .enable(&[
@@ -480,13 +499,13 @@ fn ping_rejects_empty_and_nonempty_host_options() -> TestResult {
                     },
                 ])
                 .err()
-                .ok_or("Ping options accepted")?;
+                .ok_or("shared extension options accepted")?;
             assert_eq!(
                 error,
                 EnableError {
                     host: "invalid.example".into(),
                     source: RegistrationError::InvalidOptions {
-                        extension: "ping",
+                        extension: name,
                         reason: "this extension has no options".into(),
                     },
                 }

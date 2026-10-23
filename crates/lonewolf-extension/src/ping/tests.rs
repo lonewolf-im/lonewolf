@@ -29,7 +29,8 @@ fn builtin_catalog() -> Result<TestExtensions, RegistrationError> {
             crate::vcard::NAME,
             crate::offline::NAME,
             crate::disco::NAME,
-            NAME
+            NAME,
+            crate::carbons::NAME
         ]
     );
     for factory in factories {

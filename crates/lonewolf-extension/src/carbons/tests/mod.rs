@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod copy;
+mod extension;
+mod observer;
 mod rules;
 
 use std::error::Error;

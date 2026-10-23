@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use lonewolf_extension::discovery::DiscoScope;
+use lonewolf_extension::discovery::{DiscoScope, INFO_NAMESPACE, ITEMS_NAMESPACE};
+use lonewolf_extension::iq::{IqRequestType, IqScope};
 use lonewolf_extension::{Extensions, HostSelection, RegistrationError};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
@@ -262,32 +263,59 @@ fn vcard_options_and_selection_are_prepared_independently_per_host() -> TestResu
 }
 
 #[test]
-fn vcard_dependency_cannot_use_another_hosts_discovery() -> TestResult {
+fn vcard_and_discovery_are_selected_independently_per_host() -> TestResult {
     let catalog = builtin_catalog()?;
-    for missing in ["localhost", "example.com"] {
+    for standalone in ["localhost", "example.com"] {
         for other in ["['disco']", "['disco', 'vcard']", "['vcard', 'disco']"] {
-            let (local, other) = if missing == "localhost" {
+            let (local, other) = if standalone == "localhost" {
                 ("extensions=['vcard']".into(), format!("extensions={other}"))
             } else {
                 (format!("extensions={other}"), "extensions=['vcard']".into())
             };
             let file = config_file(&two_vcard_hosts(&local, &other))?;
             let config = Config::load(Some(file.path()))?;
-            let error = catalog
-                .enable(&selections(&config))
-                .err()
-                .ok_or("missing dependency accepted")?;
-            assert_eq!(error.host, missing);
-            assert_eq!(
-                error.source,
-                RegistrationError::MissingDependency {
-                    extension: "vcard",
-                    dependency: "disco",
+            let prepared = catalog.enable(&selections(&config))?;
+            assert_eq!(config.hosts[standalone].extensions, ["vcard"]);
+            for domain in ["localhost", "example.com"] {
+                let registry = &prepared[domain];
+                let host = &config.hosts[domain];
+                assert_eq!(registry.enabled(), host.extensions);
+                let disco = domain != standalone;
+                let vcard = host.extensions.iter().any(|name| name == "vcard");
+                for (scope, iq_scope) in [
+                    (DiscoScope::Server, IqScope::Server),
+                    (DiscoScope::Account, IqScope::Account),
+                ] {
+                    assert_eq!(
+                        registry.discovery().features(scope),
+                        match (disco, vcard) {
+                            (false, true) => ["vcard-temp"].as_slice(),
+                            (true, false) => [INFO_NAMESPACE, ITEMS_NAMESPACE].as_slice(),
+                            (true, true) =>
+                                [INFO_NAMESPACE, ITEMS_NAMESPACE, "vcard-temp"].as_slice(),
+                            (false, false) => [].as_slice(),
+                        }
+                    );
+                    for namespace in [INFO_NAMESPACE, ITEMS_NAMESPACE] {
+                        assert_eq!(
+                            registry
+                                .iq()
+                                .find(iq_scope, IqRequestType::Get, namespace, "query")
+                                .is_some(),
+                            disco
+                        );
+                    }
+                    for kind in [IqRequestType::Get, IqRequestType::Set] {
+                        assert_eq!(
+                            registry
+                                .iq()
+                                .find(iq_scope, kind, "vcard-temp", "vCard")
+                                .is_some(),
+                            vcard && iq_scope == IqScope::Account
+                        );
+                    }
                 }
-            );
-            assert_eq!(config.hosts[missing].extensions, ["vcard"]);
-            assert!(error.to_string().contains("disco"));
-            assert!(error.to_string().contains("vcard"));
+            }
         }
     }
     Ok(())

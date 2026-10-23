@@ -32,7 +32,6 @@
 # The domain below is an example.
 # [hosts."example.com"]
 
-# vcard requires disco in the same host's extension list.
 # Stored profiles are public to authenticated local C2S users.
 # extensions = ["roster", "offline", "disco", "ping", "vcard"]
 

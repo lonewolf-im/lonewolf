@@ -83,9 +83,90 @@ fn drain_presence(client: &mut Client) -> TestResult {
 }
 
 #[test]
+fn vcard_and_disco_are_independently_selectable() -> TestResult {
+    for (extensions, disco, vcard) in [
+        ("", false, false),
+        ("'vcard'", false, true),
+        ("'disco'", true, false),
+        ("'vcard', 'disco'", true, true),
+        ("'disco', 'vcard'", true, true),
+    ] {
+        let suite = C2sSuite::with_extensions(extensions)?;
+        suite.create_account("alice", PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        if vcard {
+            publish(
+                &mut alice,
+                "desk",
+                "<vCard xmlns='vcard-temp'><FN>Alice</FN></vCard>",
+            )?;
+            assert_eq!(
+                own_card(&mut alice, "desk")?.child(VCARD, "FN")?.text,
+                "Alice"
+            );
+        }
+        for (target, category, identity) in [
+            ("localhost", "server", "im"),
+            ("alice@localhost", "account", "registered"),
+        ] {
+            for query in ["info", "items"] {
+                alice.send(&format!("<iq type='get' to='{target}' id='disco'><query xmlns='http://jabber.org/protocol/disco#{query}'/></iq>"))?;
+                if disco {
+                    if query == "info" {
+                        let feature = if vcard {
+                            "<feature var='vcard-temp'/>"
+                        } else {
+                            ""
+                        };
+                        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@localhost/desk' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='{category}' type='{identity}'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/>{feature}</query></iq>"))?;
+                    } else {
+                        let items = if category == "account" {
+                            "<item jid='alice@localhost/desk'/>"
+                        } else {
+                            ""
+                        };
+                        alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@localhost/desk' id='disco'><query xmlns='http://jabber.org/protocol/disco#items'>{items}</query></iq>"))?;
+                    }
+                } else {
+                    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='disco'><query xmlns='http://jabber.org/protocol/disco#{query}'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
+                    if vcard {
+                        publish(
+                            &mut alice,
+                            "desk",
+                            "<vCard xmlns='vcard-temp'><FN>After discovery</FN></vCard>",
+                        )?;
+                        assert_eq!(
+                            own_card(&mut alice, "desk")?.child(VCARD, "FN")?.text,
+                            "After discovery"
+                        );
+                    }
+                }
+            }
+        }
+        for kind in ["set", "get"] {
+            alice.send(&format!(
+                "<iq type='{kind}' to='alice@localhost' id='card'><vCard xmlns='vcard-temp'/></iq>"
+            ))?;
+            if vcard {
+                let payload = if kind == "get" {
+                    "<vCard xmlns='vcard-temp' xml:lang='' xml:space='default'/>"
+                } else {
+                    ""
+                };
+                alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='alice@localhost' to='alice@localhost/desk' id='card'>{payload}</iq>"))?;
+            } else {
+                alice.expect_xml("<iq xmlns='jabber:client' type='error' from='alice@localhost' id='card'><vCard xmlns='vcard-temp'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
+            }
+        }
+        alice.close()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn vcard_owner_two_resources_public_offline_whole_replacement_and_empty_publication() -> TestResult
 {
-    let suite = C2sSuite::start()?;
+    let suite = C2sSuite::with_extensions("'vcard'")?;
     for name in ["alice", "bob"] {
         suite.create_account(name, PASSWORD)?;
     }

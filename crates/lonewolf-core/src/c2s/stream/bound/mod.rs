@@ -686,7 +686,19 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 )
                 .await??
         };
+        let rejection = match (&observed, &outcome) {
+            (
+                Some(_),
+                ServiceOutcome::Rejected {
+                    stanza,
+                    condition,
+                    text,
+                },
+            ) => Some(self.rejection_reply(stanza, *condition, None, *text)?),
+            _ => None,
+        };
         if let Some(observed) = observed {
+            let sender = self.registration.session_id();
             let stage = Stage {
                 router: &self.router,
                 storage: &self.storage,
@@ -706,6 +718,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                             stanza: &observed,
                             outcome: MessageOutcome::from(&outcome),
                             archived: sent,
+                            holders: std::slice::from_ref(&sender),
+                            rejection: rejection.as_ref(),
                         },
                     ),
                 )
@@ -716,7 +730,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 stanza,
                 condition,
                 text,
-            } => self.reply_rejection_with_text(&stanza, condition, None, text),
+            } => {
+                if let Some(reply) = rejection {
+                    self.outbox.push(Output::Routed(reply));
+                    Ok(())
+                } else {
+                    self.reply_rejection_with_text(&stanza, condition, None, text)
+                }
+            }
             ServiceOutcome::Handled => Ok(()),
         }
     }
@@ -1669,7 +1690,34 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .outbox
             .drain_until(&self.registration, message::deliver(&stage, routed, kind))
             .await??;
+        let rejection = match (&observed, &outcome) {
+            (
+                Some(_),
+                DeliveryOutcome::Rejected {
+                    stanza,
+                    condition,
+                    text,
+                },
+            ) => Some(self.rejection_reply(stanza, *condition, None, *text)?),
+            _ => None,
+        };
         if let Some((observed, recipient)) = observed {
+            let sender = self.registration.session_id();
+            let admitted = match &outcome {
+                DeliveryOutcome::Routed { admitted } | DeliveryOutcome::Stored { admitted } => {
+                    admitted.as_slice()
+                }
+                DeliveryOutcome::Discarded | DeliveryOutcome::Rejected { .. } => &[],
+            };
+            let same_account = recipient.as_ref() == Some(self.registration.account());
+            let combined = if same_account {
+                let mut holders = Vec::with_capacity(1 + admitted.len());
+                holders.push(sender);
+                holders.extend_from_slice(admitted);
+                holders
+            } else {
+                Vec::new()
+            };
             let delivery = self.delivery();
             self.outbox
                 .drain_until(&self.registration, async {
@@ -1683,6 +1731,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                             stanza: &observed,
                             outcome,
                             archived: sent,
+                            holders: if same_account {
+                                &combined
+                            } else {
+                                std::slice::from_ref(&sender)
+                            },
+                            rejection: rejection.as_ref(),
                         },
                     )
                     .await;
@@ -1698,6 +1752,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                                 stanza: &observed,
                                 outcome,
                                 archived: received,
+                                holders: if same_account { &combined } else { admitted },
+                                rejection: None,
                             },
                         )
                         .await;
@@ -1710,7 +1766,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 stanza,
                 condition,
                 text,
-            } => self.reply_rejection_with_text(&stanza, condition, None, text),
+            } => {
+                if let Some(reply) = rejection {
+                    self.outbox.push(Output::Routed(reply));
+                    Ok(())
+                } else {
+                    self.reply_rejection_with_text(&stanza, condition, None, text)
+                }
+            }
             DeliveryOutcome::Routed { .. }
             | DeliveryOutcome::Stored { .. }
             | DeliveryOutcome::Discarded => Ok(()),
@@ -2261,16 +2324,28 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         application: Option<ApplicationCondition>,
         text: lonewolf_xmpp::stanza::StanzaErrorText,
     ) -> Result<(), CloseOutcome> {
+        self.outbox.push(Output::Routed(self.rejection_reply(
+            source,
+            condition,
+            application,
+            text,
+        )?));
+        Ok(())
+    }
+
+    fn rejection_reply(
+        &self,
+        source: &RoutedStanza<A>,
+        condition: StanzaErrorCondition,
+        application: Option<ApplicationCondition>,
+        text: lonewolf_xmpp::stanza::StanzaErrorText,
+    ) -> Result<RoutedStanza<A>, CloseOutcome> {
         let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
         let source = source.resolve()?.clone_in(&mut arena)?;
         let reply = source
             .error_reply_described_in(&mut arena, condition, application, text)?
             .build()?;
-        self.outbox.push(Output::Owned {
-            stanza: reply,
-            arena,
-        });
-        Ok(())
+        Ok(RoutedStanza::from_parts(reply, arena))
     }
 
     fn delivery(&self) -> RouterDelivery<A> {

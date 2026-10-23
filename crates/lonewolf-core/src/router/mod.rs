@@ -50,7 +50,6 @@ pub(crate) enum Admitted {
 }
 
 impl Admitted {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn as_slice(&self) -> &[SessionId] {
         match self {
             Self::None => &[],

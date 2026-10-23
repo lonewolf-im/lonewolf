@@ -214,6 +214,8 @@ mod tests {
                 stanza: &stanza,
                 outcome: MessageOutcome::Routed,
                 archived: Some(ArchiveId::new(7)),
+                holders: &[],
+                rejection: None,
             };
             let capture = Capture::default();
             let subscriber = tracing::subscriber::set_default(capture.clone());

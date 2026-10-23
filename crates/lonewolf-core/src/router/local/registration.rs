@@ -103,7 +103,6 @@ impl<A: ChunkAllocator> Clone for Retired<A> {
 }
 
 impl<A: ChunkAllocator> Registration<A> {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn session_id(&self) -> SessionId {
         SessionId::new(self.token)
     }

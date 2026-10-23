@@ -19,11 +19,9 @@ use crate::router::{Admitted, Destination, RoutedStanza, RouterError};
 
 pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
     Routed {
-        #[expect(dead_code)]
         admitted: Admitted,
     },
     Stored {
-        #[expect(dead_code)]
         admitted: Admitted,
     },
     /// RFC 6121 or the offline fallback discards the message without a reply.

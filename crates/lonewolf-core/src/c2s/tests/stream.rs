@@ -5,7 +5,8 @@ use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, OnceLock};
+use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -44,7 +45,6 @@ const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/stream
 const PSI_OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0' xmlns='jabber:client' xml:lang='es' xmlns:xml='http://www.w3.org/XML/1998/namespace'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-static LOG_SUBSCRIBER: OnceLock<Result<(), String>> = OnceLock::new();
 
 thread_local! {
     static LOG_CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
@@ -68,29 +68,47 @@ impl Write for LogWriter {
 }
 
 fn capture_logs<R>(run: impl FnOnce() -> R) -> io::Result<(R, String)> {
-    LOG_SUBSCRIBER
-        .get_or_init(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .without_time()
-                .with_max_level(tracing::Level::INFO)
-                .with_writer(|| LogWriter)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber).map_err(|error| error.to_string())
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(|| LogWriter)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        LOG_CAPTURE.with(|capture| {
+            if capture.borrow().is_some() {
+                return Err(io::Error::other("nested log capture"));
+            }
+            capture.replace(Some(Vec::new()));
+            let result = run();
+            let bytes = capture
+                .replace(None)
+                .ok_or_else(|| io::Error::other("log capture missing"))?;
+            Ok((result, String::from_utf8(bytes).map_err(io::Error::other)?))
         })
-        .as_ref()
-        .map_err(|error| io::Error::other(error.clone()))?;
-    LOG_CAPTURE.with(|capture| {
-        if capture.borrow().is_some() {
-            return Err(io::Error::other("nested log capture"));
-        }
-        capture.replace(Some(Vec::new()));
-        let result = run();
-        let bytes = capture
-            .replace(None)
-            .ok_or_else(|| io::Error::other("log capture missing"))?;
-        Ok((result, String::from_utf8(bytes).map_err(io::Error::other)?))
     })
+}
+
+// Sibling tests share the tracing callsite registry.
+fn run_log_test_in_child(test: &str) -> io::Result<bool> {
+    const CHILD: &str = "LONEWOLF_C2S_LOG_TEST_CHILD";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
+        return Ok(false);
+    }
+    let output = Command::new(std::env::current_exe()?)
+        .args([test, "--exact", "--nocapture"])
+        .env(CHILD, test)
+        .output()?;
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "{test}: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(true)
 }
 
 fn hosts() -> Result<Hosts, HostsError> {
@@ -892,6 +910,9 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
+    if run_log_test_in_child("c2s::stream::tests::cancelled_binding_phase_logs_disconnection")? {
+        return Ok(());
+    }
     let metrics = crate::c2s::metrics::C2sMetrics::detached();
     let ((), logs) = capture_logs(|| {
         drop(ConnectionLifecycle {
@@ -922,6 +943,9 @@ fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
 
 #[test]
 fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
+    if run_log_test_in_child("c2s::stream::tests::unpolled_admission_logs_disconnection")? {
+        return Ok(());
+    }
     let metrics = crate::c2s::metrics::C2sMetrics::detached();
     let (result, logs) = capture_logs(|| {
         Runtime::new()?.block_on(async {

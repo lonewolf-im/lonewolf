@@ -7,7 +7,7 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::RoutedStanza;
 
 use crate::archive::ArchiveId;
-use crate::delivery::{Delivery, DeliveryFuture};
+use crate::delivery::{Delivery, DeliveryFuture, SessionId};
 use crate::presence::PresenceTransition;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +38,10 @@ pub struct MessageEvent<'a, A: ChunkAllocator> {
     pub outcome: MessageOutcome,
     /// This account's archive entry for the message.
     pub archived: Option<ArchiveId>,
+    /// Sessions of `account` that already have the message: its sender and routed recipients.
+    pub holders: &'a [SessionId],
+    /// The error queued for the local sender when the outcome is `Rejected`.
+    pub rejection: Option<&'a RoutedStanza<A>>,
 }
 
 impl<A: ChunkAllocator> Copy for MessageEvent<'_, A> {}

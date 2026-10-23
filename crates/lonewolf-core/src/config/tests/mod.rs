@@ -60,6 +60,7 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
         ("['roster']", ["roster"].as_slice()),
         ("['offline']", ["offline"].as_slice()),
         ("['ping']", ["ping"].as_slice()),
+        ("['vcard']", ["vcard"].as_slice()),
         ("['disco']", ["disco"].as_slice()),
         ("['ping', 'disco']", ["ping", "disco"].as_slice()),
         ("['disco', 'ping']", ["disco", "ping"].as_slice()),
@@ -70,6 +71,10 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
             ["roster", "offline", "disco"].as_slice(),
         ),
         ("['offline', 'roster']", ["offline", "roster"].as_slice()),
+        (
+            "['roster', 'offline', 'ping', 'vcard']",
+            ["roster", "offline", "ping", "vcard"].as_slice(),
+        ),
     ] {
         let file = config_file(&format!("[hosts.localhost]\nextensions = {setting}"))?;
         let config = Config::load(Some(file.path()))?;
@@ -707,7 +712,6 @@ fn reference_configuration_explains_vcard_constraints() -> TestResult {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
     let reference = fs::read_to_string(path)?;
     for constraint in [
-        "vcard requires disco in the same host's extension list",
         "public to authenticated local C2S users",
         "serialized UTF-8 XML",
         "namespace, language, and whitespace-context markup",

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::*;
 use crate::discovery::DiscoScope;
 use crate::iq::{IqDestinationRule, IqRequestType, IqScope};
-use crate::{ExtensionFactory, Extensions, HostOptions, HostSelection, RegistrationError};
+use crate::{ExtensionFactory, Extensions, HostOptions, HostSelection};
 
 #[test]
 fn strict_options_defaults_boundaries_and_host_quota_isolation() -> TestResult {
@@ -63,7 +63,8 @@ fn strict_options_defaults_boundaries_and_host_quota_isolation() -> TestResult {
 }
 
 #[test]
-fn builtin_dependency_and_exact_route_constraint_and_discovery_inventory() -> TestResult {
+fn builtin_independent_selection_and_exact_route_constraint_and_discovery_inventory() -> TestResult
+{
     let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
     let factories = crate::builtin();
     assert_eq!(factories.len(), 5);
@@ -77,15 +78,12 @@ fn builtin_dependency_and_exact_route_constraint_and_discovery_inventory() -> Te
     for factory in factories {
         catalog.register_factory(factory)?;
     }
-    assert!(matches!(
-        catalog.enable_host("example.com", ["vcard"]),
-        Err(RegistrationError::MissingDependency {
-            extension: "vcard",
-            dependency: "disco"
-        })
-    ));
-    for names in [["disco", "vcard"], ["vcard", "disco"]] {
-        let enabled = catalog.enable_host("example.com", names)?;
+    for names in [
+        ["vcard"].as_slice(),
+        ["disco", "vcard"].as_slice(),
+        ["vcard", "disco"].as_slice(),
+    ] {
+        let enabled = catalog.enable_host("example.com", names.iter().copied())?;
         let iq = enabled.iq();
         for kind in [IqRequestType::Get, IqRequestType::Set] {
             assert!(

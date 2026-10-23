@@ -97,10 +97,6 @@ impl<A: ChunkAllocator, S: Storage> Extension<A, S> for VCard {
         NAME
     }
 
-    fn depends(&self) -> &'static [&'static str] {
-        &[crate::disco::NAME]
-    }
-
     fn register(
         self: Arc<Self>,
         _host: &str,

@@ -22,9 +22,13 @@ fn default_hosts_answer_discovery() -> TestResult {
 
 #[test]
 fn discovery_and_vcard_quotas_follow_each_hosts_selection() -> TestResult {
-    for (local, remote) in [
-        ("'disco', 'vcard'", "'vcard', 'disco'"),
-        ("'vcard', 'disco'", "'disco', 'vcard'"),
+    for (local, remote, local_disco, remote_disco) in [
+        ("'disco', 'vcard'", "'vcard', 'disco'", true, true),
+        ("'vcard', 'disco'", "'disco', 'vcard'", true, true),
+        ("'vcard'", "'disco', 'vcard'", false, true),
+        ("'vcard'", "'vcard', 'disco'", false, true),
+        ("'disco', 'vcard'", "'vcard'", true, false),
+        ("'vcard', 'disco'", "'vcard'", true, false),
     ] {
         let suite = C2sSuite::with_hosts(&format!(
             "[hosts.localhost]\nextensions=[{local}]\n[hosts.localhost.vcard]\nmax_bytes=512\n[hosts.'other.localhost']\nextensions=[{remote}]\n[hosts.'other.localhost'.vcard]\nmax_bytes=1\n[hosts.'other.localhost'.tls]\ncertificate_chain_path='certificate.pem'\nprivate_key_path='private-key.pem'\n"
@@ -47,16 +51,20 @@ fn discovery_and_vcard_quotas_follow_each_hosts_selection() -> TestResult {
         other.open_with(&opening)?;
         other.features()?;
         assert_eq!(other.bind(Some("desk"))?, "alice@other.localhost/desk");
-        for (client, domain, fits) in [
-            (&mut alice, "localhost", true),
-            (&mut other, "other.localhost", false),
+        for (client, domain, fits, disco) in [
+            (&mut alice, "localhost", true, local_disco),
+            (&mut other, "other.localhost", false, remote_disco),
         ] {
             for (target, category, kind) in [
                 (domain.to_owned(), "server", "im"),
                 (format!("alice@{domain}"), "account", "registered"),
             ] {
                 client.send(&format!("<iq type='get' to='{target}' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>"))?;
-                client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@{domain}/desk' id='info'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='{category}' type='{kind}'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='vcard-temp'/></query></iq>"))?;
+                if disco {
+                    client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='{target}' to='alice@{domain}/desk' id='info'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='{category}' type='{kind}'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='vcard-temp'/></query></iq>"))?;
+                } else {
+                    client.expect_xml(&format!("<iq xmlns='jabber:client' type='error' from='{target}' id='info'><query xmlns='http://jabber.org/protocol/disco#info'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>"))?;
+                }
             }
             client.send("<iq type='set' id='write'><vCard xmlns='vcard-temp'/></iq>")?;
             if fits {

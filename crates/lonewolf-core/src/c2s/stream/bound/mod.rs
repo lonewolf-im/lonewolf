@@ -1711,9 +1711,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 condition,
                 text,
             } => self.reply_rejection_with_text(&stanza, condition, None, text),
-            DeliveryOutcome::Routed | DeliveryOutcome::Stored | DeliveryOutcome::Discarded => {
-                Ok(())
-            }
+            DeliveryOutcome::Routed { .. }
+            | DeliveryOutcome::Stored { .. }
+            | DeliveryOutcome::Discarded => Ok(()),
         }
     }
 

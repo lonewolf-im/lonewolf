@@ -55,8 +55,8 @@ pub(crate) async fn session<A: ChunkAllocator + Clone>(
 impl<A: ChunkAllocator> From<&DeliveryOutcome<A>> for MessageOutcome {
     fn from(outcome: &DeliveryOutcome<A>) -> Self {
         match outcome {
-            DeliveryOutcome::Routed => Self::Routed,
-            DeliveryOutcome::Stored => Self::Stored,
+            DeliveryOutcome::Routed { .. } => Self::Routed,
+            DeliveryOutcome::Stored { .. } => Self::Stored,
             DeliveryOutcome::Discarded => Self::Discarded,
             DeliveryOutcome::Rejected { .. } => Self::Rejected,
         }

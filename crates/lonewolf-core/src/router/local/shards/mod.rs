@@ -28,7 +28,7 @@ use super::shard::Shard;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
 use crate::router::metrics::RouterMetrics;
-use crate::router::{RoutedStanza, RouterError, RouterFailure, RouterState};
+use crate::router::{Admitted, RoutedStanza, RouterError, RouterFailure, RouterState};
 
 const SHARD_COUNT: usize = 256;
 
@@ -241,6 +241,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     pub(crate) async fn deliver_full(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
         self.deliver_full_or_chat_fallback(stanza, false, None, None)
             .await
+            .map(|_| ())
     }
 
     pub(crate) async fn deliver_full_guarded(
@@ -250,13 +251,14 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     ) -> Result<(), RouterError> {
         self.deliver_full_or_chat_fallback(stanza, false, Some(source), None)
             .await
+            .map(|_| ())
     }
 
     pub(crate) async fn deliver_message(
         &self,
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         self.deliver_full_or_chat_fallback(stanza, true, None, release)
             .await
     }
@@ -267,7 +269,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         fallback_chat: bool,
         source: Option<SessionLiveness>,
         release: Option<StoredRelease<A>>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             self.full_target_shard(&view)?
@@ -301,7 +303,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             self.bare_target_shard(&view)?

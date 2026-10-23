@@ -344,7 +344,10 @@ fn headline_prefers_success_then_busy_and_keeps_closed_sessions() -> Result<(), 
         receivers[2].close();
         shard.accounts.insert(account.as_str().into(), sessions);
 
-        assert_eq!(shard.deliver_bare(stanza.clone(), false, None), Ok(()));
+        assert_eq!(
+            shard.deliver_bare(stanza.clone(), false, None),
+            Ok(Admitted::One(SessionId::new(1)))
+        );
         let delivery = receivers[0].try_recv()?;
         assert_eq!(
             delivery.stanza.resolve()?.stanza_type(),
@@ -420,7 +423,7 @@ fn full_normal_delivery_linearizes_at_exact_resource_binding_and_disconnect()
                         .get_mut("desk")
                         .ok_or("missing resource")?
                         .priority = priority;
-                    assert_eq!(shard.deliver(stanza.clone(), true, None), Ok(()));
+                    assert!(shard.deliver(stanza.clone(), true, None).is_ok());
                     let delivered = desk.links.inbound.try_recv()?;
                     assert_eq!(
                         delivered
@@ -993,6 +996,27 @@ fn register_probe_session(
         inbound,
         router.clone(),
     )?)
+}
+
+#[test]
+fn guarded_delivery_from_a_stopped_source_reports_no_session() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let owner = account()?;
+        let router = test_router();
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let source = register_probe_session(&mut shard, &router, &owner, "source")?;
+        let target = register_probe_session(&mut shard, &router, &owner, "target")?;
+        let liveness = source.liveness();
+        let message = routed("<message from='alice@localhost/source' to='alice@localhost/target' type='chat' id='guarded'/>").await?;
+        shard.remove(owner.as_str(), "source", source.token, RetireCause::Evicted);
+        assert!(!liveness.is_alive());
+        let admitted = shard.deliver_with_guard(message, true, || liveness.is_alive(), None)?;
+        assert!(matches!(admitted, Admitted::None));
+        assert_eq!(admitted.as_slice(), []);
+        assert!(target.take_queued().is_empty());
+        assert!(target.liveness().is_alive());
+        Ok(())
+    })
 }
 
 #[test]

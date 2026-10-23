@@ -15,11 +15,17 @@ use crate::delivery::{
     storage_failure,
 };
 use crate::router::metrics::MessageOutcome;
-use crate::router::{Destination, RoutedStanza, RouterError};
+use crate::router::{Admitted, Destination, RoutedStanza, RouterError};
 
 pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
-    Routed,
-    Stored,
+    Routed {
+        #[expect(dead_code)]
+        admitted: Admitted,
+    },
+    Stored {
+        #[expect(dead_code)]
+        admitted: Admitted,
+    },
     /// RFC 6121 or the offline fallback discards the message without a reply.
     Discarded,
     Rejected {
@@ -35,7 +41,7 @@ enum StorePreparation<A: ChunkAllocator> {
         error: HandlerError,
     },
     Discarded,
-    Committed(Pending<Result<(), crate::delivery::EffectsError>>),
+    Committed(Pending<Result<Admitted, crate::delivery::EffectsError>>),
 }
 
 /// Requires a stanza with an authenticated sender.
@@ -46,8 +52,8 @@ pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
     let result = deliver_unrecorded(stage, routed, kind).await;
     let outcome = match &result {
-        Ok(DeliveryOutcome::Routed) => MessageOutcome::Routed,
-        Ok(DeliveryOutcome::Stored) => MessageOutcome::Stored,
+        Ok(DeliveryOutcome::Routed { .. }) => MessageOutcome::Routed,
+        Ok(DeliveryOutcome::Stored { .. }) => MessageOutcome::Stored,
         Ok(DeliveryOutcome::Discarded) => MessageOutcome::Discarded,
         Ok(DeliveryOutcome::Rejected { .. }) => MessageOutcome::Rejected,
         Err(_) => MessageOutcome::Failed,
@@ -76,41 +82,45 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
             text: StanzaErrorCondition::ServiceUnavailable.default_text(),
         });
     }
-    if let Err(error) = stage.router.route_message(routed.clone()).await {
-        if kind == MessageType::Error
-            || (bare && kind == MessageType::Headline && error == RouterError::NotFound)
-            || (kind == MessageType::Headline && error == RouterError::Offline)
-        {
-            return Ok(DeliveryOutcome::Discarded);
+    let admitted = match stage.router.route_message(routed.clone()).await {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            if kind == MessageType::Error
+                || (bare && kind == MessageType::Headline && error == RouterError::NotFound)
+                || (kind == MessageType::Headline && error == RouterError::Offline)
+            {
+                return Ok(DeliveryOutcome::Discarded);
+            }
+            if error == RouterError::Offline
+                && matches!(kind, MessageType::Normal | MessageType::Chat)
+            {
+                return store(stage, routed).await;
+            }
+            let condition = match error {
+                RouterError::Busy
+                | RouterError::ResourceLimit
+                | RouterError::DirectedPresenceLimit => StanzaErrorCondition::ResourceConstraint,
+                RouterError::InvalidTarget | RouterError::InvalidResource => {
+                    StanzaErrorCondition::BadRequest
+                }
+                RouterError::RemoteUnsupported if destination == Destination::Remote => {
+                    StanzaErrorCondition::RemoteServerNotFound
+                }
+                RouterError::NotFound | RouterError::Offline | RouterError::RemoteUnsupported => {
+                    StanzaErrorCondition::ServiceUnavailable
+                }
+                RouterError::Unavailable | RouterError::Stopped => {
+                    return Err(StageFailure);
+                }
+            };
+            return Ok(DeliveryOutcome::Rejected {
+                stanza: routed,
+                condition,
+                text: condition.default_text(),
+            });
         }
-        if error == RouterError::Offline && matches!(kind, MessageType::Normal | MessageType::Chat)
-        {
-            return store(stage, routed).await;
-        }
-        let condition = match error {
-            RouterError::Busy | RouterError::ResourceLimit | RouterError::DirectedPresenceLimit => {
-                StanzaErrorCondition::ResourceConstraint
-            }
-            RouterError::InvalidTarget | RouterError::InvalidResource => {
-                StanzaErrorCondition::BadRequest
-            }
-            RouterError::RemoteUnsupported if destination == Destination::Remote => {
-                StanzaErrorCondition::RemoteServerNotFound
-            }
-            RouterError::NotFound | RouterError::Offline | RouterError::RemoteUnsupported => {
-                StanzaErrorCondition::ServiceUnavailable
-            }
-            RouterError::Unavailable | RouterError::Stopped => {
-                return Err(StageFailure);
-            }
-        };
-        return Ok(DeliveryOutcome::Rejected {
-            stanza: routed,
-            condition,
-            text: condition.default_text(),
-        });
-    }
-    Ok(DeliveryOutcome::Routed)
+    };
+    Ok(DeliveryOutcome::Routed { admitted })
 }
 
 async fn store<A: ChunkAllocator + Clone + 'static>(
@@ -194,12 +204,12 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
         }),
         StorePreparation::Discarded => Ok(DeliveryOutcome::Discarded),
         StorePreparation::Committed(pending) => {
-            pending
+            let admitted = pending
                 .finished()
                 .await
                 .ok_or(StageFailure)?
                 .map_err(|_| StageFailure)?;
-            Ok(DeliveryOutcome::Stored)
+            Ok(DeliveryOutcome::Stored { admitted })
         }
     }
 }

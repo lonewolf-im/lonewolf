@@ -111,7 +111,7 @@ fn deliver_routes_a_chat_message_to_a_bound_resource() -> TestResult {
 
         let outcome = deliver(&fixture.stage(), stanza, MessageType::Chat).await;
 
-        assert!(matches!(outcome, Ok(DeliveryOutcome::Routed)));
+        assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { .. })));
         let delivered = registration.recv().await.ok_or("missing routed message")?;
         let mut actual = String::new();
         delivered.stanza.resolve()?.write_xml(&mut actual)?;
@@ -157,7 +157,7 @@ fn deliver_records_each_completed_outcome_once() -> TestResult {
         ] {
             let result = deliver(&fixture.stage(), parsed(xml).await?, kind).await;
             match outcome {
-                MessageOutcome::Routed => assert!(matches!(result, Ok(DeliveryOutcome::Routed))),
+                MessageOutcome::Routed => assert!(matches!(result, Ok(DeliveryOutcome::Routed { .. }))),
                 MessageOutcome::Discarded => {
                     assert!(matches!(result, Ok(DeliveryOutcome::Discarded)))
                 }

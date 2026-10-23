@@ -29,8 +29,8 @@ use lonewolf_xmpp::stanza::{IqType, StanzaType};
 use crate::order::{Order, Ticket};
 use crate::router::iq_requests::{ID_PREFIX, MAX_TIMEOUT};
 use crate::router::{
-    Destination, Mailbox, MailboxEntry, Registration, RoutedStanza, RouterError, RouterHandle,
-    SessionHandle, StoredRelease,
+    Admitted, Destination, Mailbox, MailboxEntry, Registration, RoutedStanza, RouterError,
+    RouterHandle, SessionHandle, StoredRelease,
 };
 
 pub(crate) struct WorkGroup {
@@ -255,11 +255,11 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
     transaction: RedbWrite,
     handler: Arc<dyn MessageHandler<A, RedbStorage>>,
     stored: StoredDelivery<A>,
-) -> Pending<Result<(), EffectsError>> {
+) -> Pending<Result<Admitted, EffectsError>> {
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
     compio::runtime::spawn(guard.run(async move {
-        let result: Result<(), EffectsError> = async {
+        let result: Result<Admitted, EffectsError> = async {
             let ((), mut ticket) = router
                 .order()
                 .fix(vec![stored.recipient.clone()], transaction.commit())
@@ -277,7 +277,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
             );
             ticket.turn().await;
             let _ = report_turned.send(());
-            match router
+            let admitted = match router
                 .route_stored_message(
                     stored.stanza,
                     StoredRelease {
@@ -287,13 +287,14 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(admitted) => {
                     tracing::info!(
                         operation = "reroute",
                         outcome = "queued",
                         recipient_jid = ?stored.recipient.as_str(),
                         "offline message rerouted"
                     );
+                    admitted
                 }
                 Err(error) => {
                     let reason = match error {
@@ -315,9 +316,10 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                         recipient_jid = ?stored.recipient.as_str(),
                         "offline message rerouted"
                     );
+                    Admitted::None
                 }
-            }
-            Ok(())
+            };
+            Ok(admitted)
         }
         .await;
         if let Err(error) = &result {

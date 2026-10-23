@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_channel::{Receiver, WeakSender};
 use futures_channel::oneshot;
 use futures_util::future::Shared;
-use lonewolf_extension::delivery::SessionTag;
+use lonewolf_extension::delivery::{SessionTag, TagChange};
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
@@ -330,6 +330,18 @@ impl<A: ChunkAllocator> SessionHandle<A> {
             .await?
     }
 
+    #[expect(dead_code)]
+    pub(crate) async fn change_tag(
+        &self,
+        change: TagChange,
+    ) -> Result<Vec<MailboxEntry<A>>, RouterError> {
+        self.router
+            .with_shard(self.shard, |shard| {
+                shard.change_tag(&self.account, &self.resource, self.token, change)
+            })
+            .await?
+    }
+
     pub(crate) async fn set_presence(
         &self,
         priority: Option<i8>,
@@ -429,7 +441,7 @@ impl<A: ChunkAllocator> Drop for RegistrationCleanup<A> {
 impl<A: ChunkAllocator> Drop for Registration<A> {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        // SAFETY: `links` is taken exactly once, here, and never touched again.
+        // SAFETY: Take `links` only once and do not use it again.
         let links = unsafe { mem::ManuallyDrop::take(&mut self.links) };
         let cleanup = RegistrationCleanup {
             links,

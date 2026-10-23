@@ -46,6 +46,154 @@ async fn routed(xml: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn
 }
 
 #[test]
+fn change_tag_inserts_and_removes_idempotently() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let account = account()?;
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let (outbound, inbound) = async_channel::bounded(4);
+        let registration = shard.register(
+            account.clone(),
+            Some("desk".into()),
+            NonZeroUsize::MIN,
+            outbound,
+            inbound,
+            test_router(),
+        )?;
+        shard.tag(&account, "desk", registration.token, SessionTag::Interested)?;
+        let push = routed("<presence to='alice@localhost' id='push'/>").await?;
+        for (change, enabled) in [
+            (TagChange::Insert(SessionTag::Carbons), true),
+            (TagChange::Insert(SessionTag::Carbons), true),
+            (TagChange::Remove(SessionTag::Carbons), false),
+            (TagChange::Remove(SessionTag::Carbons), false),
+            (TagChange::Insert(SessionTag::Carbons), true),
+            (TagChange::Remove(SessionTag::Carbons), false),
+        ] {
+            assert!(
+                shard
+                    .change_tag(&account, "desk", registration.token, change)?
+                    .is_empty()
+            );
+            shard.deliver_presence_to_tagged(SessionTag::Carbons, push.clone())?;
+            let queued = registration.take_queued();
+            assert_eq!(queued.len(), usize::from(enabled));
+            if enabled {
+                assert_eq!(queued[0].stanza.resolve()?.id()?, Some("push"));
+            }
+            assert!(
+                shard.accounts[account.as_str()]["desk"]
+                    .tags
+                    .contains(SessionTag::Interested)
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn change_tag_returns_entries_admitted_before_the_change() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        for change in [
+            TagChange::Insert(SessionTag::Carbons),
+            TagChange::Remove(SessionTag::Carbons),
+        ] {
+            let account = account()?;
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let (outbound, inbound) = async_channel::bounded(4);
+            let registration = shard.register(
+                account.clone(),
+                Some("desk".into()),
+                NonZeroUsize::MIN,
+                outbound,
+                inbound,
+                test_router(),
+            )?;
+            shard.tag(&account, "desk", registration.token, SessionTag::Carbons)?;
+            for id in ["first", "second"] {
+                shard.deliver(
+                    routed(&format!("<message to='alice@localhost/desk' id='{id}'/>")).await?,
+                    false,
+                    None,
+                )?;
+            }
+            let queued = shard.change_tag(&account, "desk", registration.token, change)?;
+            assert_eq!(queued.len(), 2);
+            assert_eq!(queued[0].stanza.resolve()?.id()?, Some("first"));
+            assert_eq!(queued[1].stanza.resolve()?.id()?, Some("second"));
+            assert!(registration.links.inbound.is_empty());
+            shard.deliver(
+                routed("<message to='alice@localhost/desk' id='after'/>").await?,
+                false,
+                None,
+            )?;
+            let after = registration.take_queued();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].stanza.resolve()?.id()?, Some("after"));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn change_tag_rejects_stale_tokens_and_retired_sessions() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        for state in ["stale", "missing", "retired", "removed"] {
+            for change in [
+                TagChange::Insert(SessionTag::Carbons),
+                TagChange::Remove(SessionTag::Carbons),
+            ] {
+                let account = account()?;
+                let mut shard = Shard::<GlobalChunkAllocator>::new();
+                let (outbound, inbound) = async_channel::bounded(4);
+                let registration = shard.register(
+                    account.clone(),
+                    Some("desk".into()),
+                    NonZeroUsize::MIN,
+                    outbound,
+                    inbound,
+                    test_router(),
+                )?;
+                shard.tag(&account, "desk", registration.token, SessionTag::Interested)?;
+                if matches!(change, TagChange::Remove(_)) {
+                    shard.tag(&account, "desk", registration.token, SessionTag::Carbons)?;
+                }
+                let tags = shard.accounts[account.as_str()]["desk"].tags;
+                shard.deliver(
+                    routed("<message to='alice@localhost/desk' id='queued'/>").await?,
+                    false,
+                    None,
+                )?;
+                match state {
+                    "retired" => registration.alive.store(false, Ordering::Release),
+                    "removed" => shard.remove(
+                        account.as_str(),
+                        "desk",
+                        registration.token,
+                        RetireCause::Evicted,
+                    ),
+                    _ => {}
+                }
+                let token = registration.token + u64::from(state == "stale");
+                let resource = if state == "missing" { "absent" } else { "desk" };
+                assert!(matches!(
+                    shard.change_tag(&account, resource, token, change),
+                    Err(RouterError::NotFound)
+                ));
+                if state == "removed" {
+                    assert!(!shard.accounts.contains_key(account.as_str()));
+                } else {
+                    assert_eq!(shard.accounts[account.as_str()]["desk"].tags, tags);
+                }
+                let queued = registration.take_queued();
+                assert_eq!(queued.len(), 1);
+                assert_eq!(queued[0].stanza.resolve()?.id()?, Some("queued"));
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn invalid_target_forms_fail_without_touching_a_shard() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
 

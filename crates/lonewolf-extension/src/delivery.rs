@@ -17,6 +17,8 @@ use crate::{Deliver, ExtensionFuture};
 pub enum SessionTag {
     /// The resource requested the roster and receives roster pushes.
     Interested,
+    /// The resource enabled Message Carbons and receives forwarded copies.
+    Carbons,
 }
 
 impl SessionTag {
@@ -33,9 +35,19 @@ impl SessionTags {
         self.0 |= tag.bit();
     }
 
+    pub const fn remove(&mut self, tag: SessionTag) {
+        self.0 &= !tag.bit();
+    }
+
     pub const fn contains(self, tag: SessionTag) -> bool {
         self.0 & tag.bit() != 0
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagChange {
+    Insert(SessionTag),
+    Remove(SessionTag),
 }
 
 /// The server could not perform a delivery, so the client stream is closed instead of answered.
@@ -235,4 +247,35 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
         from: &'a AccountKey,
         to: &'a AccountKey,
     ) -> DeliveryFuture<'a>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionTag, SessionTags};
+
+    #[test]
+    fn session_tags_insert_and_remove_each_tag_independently() {
+        for (tag, other) in [
+            (SessionTag::Interested, SessionTag::Carbons),
+            (SessionTag::Carbons, SessionTag::Interested),
+        ] {
+            let mut tags = SessionTags::default();
+            tags.remove(tag);
+            assert_eq!(tags, SessionTags::default());
+            tags.insert(other);
+            tags.remove(tag);
+            assert!(tags.contains(other));
+            assert!(!tags.contains(tag));
+            tags.insert(tag);
+            assert!(tags.contains(tag));
+            assert!(tags.contains(other));
+            for _ in 0..2 {
+                tags.remove(tag);
+                assert!(!tags.contains(tag));
+                assert!(tags.contains(other));
+            }
+            tags.remove(other);
+            assert_eq!(tags, SessionTags::default());
+        }
+    }
 }

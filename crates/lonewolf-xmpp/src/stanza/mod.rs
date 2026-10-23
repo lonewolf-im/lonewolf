@@ -25,7 +25,7 @@ pub use error::{StanzaErrorText, error_element_in};
 pub use incoming::{RejectedStanza, StanzaRejection};
 pub use routed::RoutedStanza;
 
-use element::{Attribute, AttributesBuilder};
+use element::{Attribute, AttributesBuilder, ElementFrame};
 use namespace::{NamespaceContext, NamespaceCopies};
 use storage::{SliceBuilder, StoredSlice};
 
@@ -589,6 +589,53 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
             attributes,
             children,
         })
+    }
+
+    /// Copies the stanza into an element with its header written as attributes.
+    pub fn to_element_builder_in_filtered<'b, A: ChunkAllocator>(
+        &self,
+        arena: &'b mut Arena<A>,
+        mut keep: impl FnMut(&ElementRef<'a, R>) -> Result<bool, HandleError>,
+    ) -> Result<ElementBuilder<'b, A>, BuildError> {
+        let mut frame = ElementFrame::new(self.kind().as_str(), self.namespace().as_str(), arena)?;
+        if let Some(from) = self.from()? {
+            frame.attribute("from", "", from.as_str(), arena)?;
+        }
+        if let Some(to) = self.to()? {
+            frame.attribute("to", "", to.as_str(), arena)?;
+        }
+        if let Some(id) = self.id()? {
+            frame.attribute("id", "", id, arena)?;
+        }
+        if let Some(stanza_type) = self.serialized_type()? {
+            frame.attribute("type", "", stanza_type, arena)?;
+        }
+        if let Some(lang) = self.lang()? {
+            frame.attribute("lang", XML_NAMESPACE, lang, arena)?;
+        }
+        frame.append_attributes_from(self.data.attributes, self.arena, arena)?;
+        let mut copies = NamespaceCopies::default();
+        frame.namespaces = self
+            .data
+            .namespaces
+            .clone_in(self.arena, arena, &mut copies)?;
+        for child in self.children()? {
+            let child = child?;
+            if keep(&child)? {
+                let copied = child.clone_with_namespaces(arena, &mut copies)?;
+                frame.child(copied, arena)?;
+            }
+        }
+        Ok(frame.into_builder(arena))
+    }
+
+    /// Copies all content into an element that can outlive the source arena.
+    pub fn to_element_in<A: ChunkAllocator>(
+        &self,
+        arena: &mut Arena<A>,
+    ) -> Result<Element, BuildError> {
+        self.to_element_builder_in_filtered(arena, |_| Ok(true))?
+            .build()
     }
 
     fn serialized_type(&self) -> Result<Option<&str>, HandleError> {

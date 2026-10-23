@@ -272,6 +272,18 @@ fn builtin_extensions_declare_their_discovery_features() -> Result<(), Registrat
     );
     assert!(enabled.discovery().features(DiscoScope::Account).is_empty());
 
+    let carbons_only = extensions.enable_host("example.com", ["carbons"])?;
+    assert_eq!(
+        carbons_only.discovery().features(DiscoScope::Server),
+        [crate::carbons::NAMESPACE, crate::carbons::RULES_FEATURE]
+    );
+    assert!(
+        carbons_only
+            .discovery()
+            .features(DiscoScope::Account)
+            .is_empty()
+    );
+
     let roster_only = extensions.enable_host("example.com", ["roster"])?;
     assert_eq!(
         roster_only.discovery().features(DiscoScope::Server),

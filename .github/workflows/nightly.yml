@@ -1,0 +1,109 @@
+name: Nightly flake checks
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  stress:
+    name: Flake checks (${{ matrix.os }}, ${{ matrix.threads }} threads)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 135
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        threads: [1, 8, 32]
+    env:
+      TEST_THREADS: ${{ matrix.threads }}
+      RUNNER_IMAGE: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
+        with:
+          tool: nextest@0.9.149
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.threads == 8 }}
+      - name: Record environment
+        run: |
+          rm -rf target/nextest/nightly
+          mkdir -p target/nextest/nightly
+          {
+            date -u
+            git rev-parse HEAD
+            uname -a
+            printf 'runner=%s\nthreads=%s\ncargo_repetitions=3\n' "$RUNNER_IMAGE" "$TEST_THREADS"
+            rustc --version --verbose
+            cargo --version
+            cargo nextest --version
+          } | tee target/nextest/nightly/environment.log
+      - name: Build tests
+        id: build
+        timeout-minutes: 20
+        run: |
+          cargo nextest run --workspace --all-targets --all-features --locked \
+            --profile nightly --no-run 2>&1 | tee target/nextest/nightly/build.log
+      - name: Stress tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 45
+        run: |
+          if [[ "$TEST_THREADS" == 1 ]]; then
+            stress=(--stress-count 2)
+          else
+            stress=(--stress-duration 15m)
+          fi
+          printf 'stress_options=%s\n' "${stress[*]}" >> target/nextest/nightly/environment.log
+          cargo nextest run --workspace --all-targets --all-features --locked \
+            --profile nightly --test-threads "$TEST_THREADS" \
+            "${stress[@]}" --retries 0 --no-fail-fast \
+            --status-level fail --final-status-level fail \
+            2>&1 | tee target/nextest/nightly/nextest.log
+      - name: Repeat shared-process tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 60
+        run: |
+          result=0
+          for iteration in 1 2 3; do
+            if cargo test --workspace --all-features --locked --no-fail-fast \
+              -- --test-threads="$TEST_THREADS" \
+              2>&1 | tee "target/nextest/nightly/cargo-${iteration}.log"; then
+              printf 'Cargo iteration %s passed\n' "$iteration"
+            else
+              result=1
+              printf '::error::Cargo iteration %s failed\n' "$iteration"
+            fi
+          done
+          exit "$result"
+      - name: Upload test evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flake-check-${{ matrix.os }}-${{ matrix.threads }}-threads-${{ github.run_attempt }}
+          path: target/nextest/nightly/
+          if-no-files-found: warn
+          retention-days: 14

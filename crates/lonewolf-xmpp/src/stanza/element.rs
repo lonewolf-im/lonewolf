@@ -160,6 +160,15 @@ impl ElementFrame {
         self.attributes.set(name, namespace, value, arena)
     }
 
+    pub(super) fn append_attributes_from<A: ChunkAllocator>(
+        &mut self,
+        values: StoredSlice<Attribute>,
+        source: &impl ArenaRead,
+        arena: &mut Arena<A>,
+    ) -> Result<(), BuildError> {
+        self.attributes.append_from(values, source, arena)
+    }
+
     pub(super) fn text<A: ChunkAllocator>(
         &mut self,
         text: &str,
@@ -182,6 +191,13 @@ impl ElementFrame {
         self,
         arena: &mut Arena<A>,
     ) -> Result<Element, BuildError> {
+        self.into_builder(arena).build()
+    }
+
+    pub(super) fn into_builder<'a, A: ChunkAllocator>(
+        self,
+        arena: &'a mut Arena<A>,
+    ) -> ElementBuilder<'a, A> {
         ElementBuilder {
             arena,
             name: self.name,
@@ -189,7 +205,6 @@ impl ElementFrame {
             attributes: self.attributes,
             children: self.children,
         }
-        .build()
     }
 }
 
@@ -756,15 +771,26 @@ impl AttributesBuilder {
         arena: &mut Arena<A>,
     ) -> Result<Self, BuildError> {
         let mut result = Self::new();
+        result.append_from(values, source, arena)?;
+        Ok(result)
+    }
+
+    /// Incoming attribute names must be unique and absent from this builder.
+    pub(super) fn append_from<A: ChunkAllocator>(
+        &mut self,
+        values: StoredSlice<Attribute>,
+        source: &impl ArenaRead,
+        arena: &mut Arena<A>,
+    ) -> Result<(), BuildError> {
         for value in values.get(source)? {
             let value = value.resolve(source)?;
             let value = Attribute {
                 name: Name::new(value.name, value.namespace, true, arena)?,
                 value: arena.try_alloc_str(value.value)?,
             };
-            result.values.push(value, arena)?;
+            self.values.push(value, arena)?;
         }
-        Ok(result)
+        Ok(())
     }
 
     pub(super) fn finish(self) -> StoredSlice<Attribute> {

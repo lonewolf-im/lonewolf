@@ -332,6 +332,344 @@ fn filtered_copy_propagates_predicate_access_errors() -> TestResult {
     Ok(())
 }
 
+fn parsed_stanza(xml: &str) -> Result<(Stanza, Arena), Box<dyn std::error::Error>> {
+    futures_executor::block_on(async {
+        let input = format!(
+            "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>{xml}"
+        );
+        let mut parser = XmppParser::new(
+            input.as_bytes(),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(4096).ok_or("zero limit")?,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        );
+        assert!(matches!(
+            parser.next_event().await?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+            return Err("expected stanza".into());
+        };
+        Ok(parsed.into_parts())
+    })
+}
+
+#[test]
+fn stanza_elements_keep_addresses_type_language_and_extension_attributes() -> TestResult {
+    for lang in ["es", ""] {
+        let (stanza, source) = parsed_stanza(&format!(
+            "<message from='alice@example.org/desk' to='bob@example.org' id='m&amp;1' type='chat' xml:lang='{lang}' a='1&amp;&quot;' xmlns:p='urn:p' p:b='2'/>"
+        ))?;
+        let mut destination = Arena::try_new(ArenaConfig::default())?;
+        let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+        let xml = format!("<wrapper>{}</wrapper>", element_xml(element, &destination)?);
+        let parsed = futures_executor::block_on(crate::parser::parse_element(
+            xml.as_bytes(),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(4096).ok_or("zero limit")?,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        ))?;
+        let wrapper = parsed.value().resolve(parsed.arena())?;
+        let copied = wrapper
+            .child("message", CLIENT_NAMESPACE)?
+            .ok_or("message")?;
+        let attributes = copied
+            .attributes()?
+            .map(|attribute| {
+                attribute.map(|attribute| (attribute.name, attribute.namespace, attribute.value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            attributes,
+            [
+                ("from", "", "alice@example.org/desk"),
+                ("to", "", "bob@example.org"),
+                ("id", "", "m&1"),
+                ("type", "", "chat"),
+                ("lang", XML_NAMESPACE, lang),
+                ("a", "", "1&\""),
+                ("b", "urn:p", "2"),
+            ]
+        );
+    }
+    for (xml, name, namespace) in [
+        ("<presence/>", "presence", CLIENT_NAMESPACE),
+        ("<iq type='result' id='reply'/>", "iq", CLIENT_NAMESPACE),
+        (
+            "<message xmlns='jabber:server' from='example.org' to='example.net'/>",
+            "message",
+            SERVER_NAMESPACE,
+        ),
+    ] {
+        let (stanza, source) = parsed_stanza(xml)?;
+        let mut destination = Arena::try_new(ArenaConfig::default())?;
+        let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+        let view = element.resolve(&destination)?;
+        assert_eq!(view.name(), name);
+        assert_eq!(view.namespace(), namespace);
+    }
+    Ok(())
+}
+
+#[test]
+fn stanza_elements_preserve_omitted_and_unknown_message_types() -> TestResult {
+    for (input, expected) in [
+        ("<message/>", None),
+        ("<message type='custom'/>", Some("custom")),
+        ("<message type='normal'/>", Some("normal")),
+    ] {
+        let (stanza, source) = parsed_stanza(input)?;
+        let mut destination = Arena::try_new(ArenaConfig::default())?;
+        let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+        assert_eq!(
+            element.resolve(&destination)?.attribute("type", "")?,
+            expected
+        );
+        assert_eq!(
+            element_xml(element, &destination)?,
+            stanza_xml(stanza, &source)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stanza_elements_keep_prefixed_children_and_namespace_bindings() -> TestResult {
+    let (stanza, source) = parsed_stanza(
+        "<message xmlns:r='urn:root' xmlns:q='urn:qname'><x:a xmlns:x='urn:x'/><r:b/><value>q:value</value></message>",
+    )?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+    let xml = element_xml(element, &destination)?;
+    assert_eq!(xml, stanza_xml(stanza, &source)?);
+    assert!(xml.contains("xmlns:q=\"urn:qname\""));
+    assert!(xml.contains("<x:a xmlns:x=\"urn:x\"/>"));
+    assert!(xml.contains("<r:b/>"));
+    let (reparsed, arena) = parsed_stanza(&xml)?;
+    let view = reparsed.resolve(&arena)?;
+    assert!(view.child("a", "urn:x")?.is_some());
+    assert!(view.child("b", "urn:root")?.is_some());
+    assert_eq!(
+        view.child("value", CLIENT_NAMESPACE)?
+            .ok_or("value")?
+            .text()?,
+        Some("q:value")
+    );
+    Ok(())
+}
+
+#[test]
+fn forwarded_stanza_elements_declare_the_client_namespace() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let payload = body(&mut source, "hello")?;
+    let stanza = message(&mut source, payload)?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+    let forwarded = Element::builder_in("forwarded", "urn:xmpp:forward:0", &mut destination)?
+        .child(element)?
+        .build()?;
+    let expected = "<forwarded xmlns=\"urn:xmpp:forward:0\"><message xmlns=\"jabber:client\" type=\"chat\"><body>hello</body></message></forwarded>";
+    assert_eq!(element_xml(forwarded, &destination)?, expected);
+    let outer = message(&mut destination, forwarded)?;
+    assert_eq!(
+        stanza_xml(outer, &destination)?,
+        format!("<message xmlns=\"jabber:client\" type=\"chat\">{expected}</message>")
+    );
+    let mut writer = FragmentedWriter::default();
+    futures_executor::block_on(
+        forwarded
+            .resolve(&destination)?
+            .write_xml_async(&mut writer),
+    )?;
+    assert_eq!(writer.bytes, expected.as_bytes());
+    assert_eq!(writer.flushes, 0);
+    Ok(())
+}
+
+#[test]
+fn stanza_elements_filter_children_before_copying() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let first = body(&mut source, "first")?;
+    let removed = Element::builder_in("large", "urn:large", &mut source)?
+        .text(&"x".repeat(65_536))?
+        .build()?;
+    let last = body(&mut source, "last")?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Normal),
+        StanzaNamespace::Client,
+        &mut source,
+    )
+    .child(first)?
+    .child(removed)?
+    .child(last)?
+    .build()?;
+    let config = ArenaConfig {
+        chunk_size: NonZeroUsize::new(1024).ok_or("chunk size")?,
+        max_reserved_bytes: NonZeroUsize::new(4096).ok_or("arena limit")?,
+    };
+    let mut destination = Arena::try_new(config)?;
+    let mut visited = Vec::new();
+    let element = stanza
+        .resolve(&source)?
+        .to_element_builder_in_filtered(&mut destination, |child| {
+            visited.push(child.name());
+            Ok(child.name() != "large")
+        })?
+        .build()?;
+    assert_eq!(visited, ["body", "large", "body"]);
+    assert_eq!(
+        element_xml(element, &destination)?,
+        "<message xmlns=\"jabber:client\"><body>first</body><body>last</body></message>"
+    );
+    let mut unfiltered = Arena::try_new(config)?;
+    assert!(matches!(
+        stanza.resolve(&source)?.to_element_in(&mut unfiltered),
+        Err(BuildError::Allocation(_))
+    ));
+    assert!(matches!(
+        stanza
+            .resolve(&source)?
+            .to_element_builder_in_filtered(&mut destination, |_| Err(HandleError::WrongArena)),
+        Err(BuildError::Access(HandleError::WrongArena))
+    ));
+    Ok(())
+}
+
+#[test]
+fn stanza_elements_copy_error_stanzas_with_their_error_child() -> TestResult {
+    let (stanza, source) = parsed_stanza(
+        "<message type='error'><body>hello</body><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>",
+    )?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+    assert_eq!(
+        element_xml(element, &destination)?,
+        stanza_xml(stanza, &source)?
+    );
+    let view = element.resolve(&destination)?;
+    let names = view
+        .children()?
+        .map(|node| -> Result<_, Box<dyn std::error::Error>> {
+            match node? {
+                NodeRef::Element(child) => Ok(child.name()),
+                NodeRef::Text(_) => Err("unexpected text".into()),
+            }
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    assert_eq!(names, ["body", "error"]);
+    Ok(())
+}
+
+#[test]
+fn stanza_elements_respect_tree_limits() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let mut deep = Element::builder_in("leaf", "urn:tree", &mut source)?.build()?;
+    for _ in 1..MAX_ELEMENT_DEPTH - 1 {
+        deep = Element::builder_in("node", "urn:tree", &mut source)?
+            .child(deep)?
+            .build()?;
+    }
+    let stanza = message(&mut source, deep)?;
+    let config = ArenaConfig {
+        max_reserved_bytes: NonZeroUsize::new(64 * 1024 * 1024).ok_or("arena limit")?,
+        ..ArenaConfig::default()
+    };
+    let mut destination = Arena::try_new(config)?;
+    let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+    assert_eq!(element.resolve(&destination)?.size().0, MAX_ELEMENT_DEPTH);
+    assert_eq!(
+        Element::builder_in("wrapper", "urn:tree", &mut destination)?
+            .child(element)?
+            .build()
+            .err(),
+        Some(BuildError::TreeLimitExceeded)
+    );
+    let mut shared = Element::builder_in("leaf", "urn:tree", &mut source)?.build()?;
+    for _ in 0..15 {
+        shared = Element::builder_in("node", "urn:tree", &mut source)?
+            .child(shared)?
+            .child(shared)?
+            .build()?;
+    }
+    let stanza = message(&mut source, shared)?;
+    let element = stanza.resolve(&source)?.to_element_in(&mut destination)?;
+    assert_eq!(
+        element.resolve(&destination)?.size().1,
+        super::MAX_ELEMENT_NODES
+    );
+    assert_eq!(
+        Element::builder_in("wrapper", "urn:tree", &mut destination)?
+            .child(element)?
+            .build()
+            .err(),
+        Some(BuildError::TreeLimitExceeded)
+    );
+    Ok(())
+}
+
+#[test]
+fn stanza_elements_outlive_the_source_arena() -> TestResult {
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let element = {
+        let (stanza, source) = parsed_stanza(
+            "<message from='alice@example.org/desk' to='bob@example.org' id='hello' xml:lang='es' xmlns:p='urn:p' p:a='value'><p:body>p:text</p:body></message>",
+        )?;
+        stanza.resolve(&source)?.to_element_in(&mut destination)?
+    };
+    let view = element.resolve(&destination)?;
+    assert_eq!(view.attribute("from", "")?, Some("alice@example.org/desk"));
+    assert_eq!(view.attribute("to", "")?, Some("bob@example.org"));
+    assert_eq!(view.attribute("id", "")?, Some("hello"));
+    assert_eq!(view.attribute("lang", XML_NAMESPACE)?, Some("es"));
+    assert_eq!(view.attribute("a", "urn:p")?, Some("value"));
+    assert_eq!(
+        view.child("body", "urn:p")?.ok_or("body")?.text()?,
+        Some("p:text")
+    );
+    assert!(element_xml(element, &destination)?.contains("xmlns:p=\"urn:p\""));
+    Ok(())
+}
+
+#[test]
+fn stanza_element_builders_accept_appended_children() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let original = body(&mut source, "hello")?;
+    let stanza = message(&mut source, original)?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let appended = Element::builder_in("stanza-id", "urn:xmpp:sid:0", &mut destination)?
+        .attribute("id", "", "archive")?
+        .build()?;
+    let element = stanza
+        .resolve(&source)?
+        .to_element_builder_in_filtered(&mut destination, |_| Ok(true))?
+        .child(appended)?
+        .build()?;
+    assert_eq!(
+        element_xml(element, &destination)?,
+        "<message xmlns=\"jabber:client\" type=\"chat\"><body>hello</body><stanza-id xmlns=\"urn:xmpp:sid:0\" id=\"archive\"/></message>"
+    );
+    let mut deep = Element::builder_in("leaf", "urn:tree", &mut destination)?.build()?;
+    for _ in 1..MAX_ELEMENT_DEPTH {
+        deep = Element::builder_in("node", "urn:tree", &mut destination)?
+            .child(deep)?
+            .build()?;
+    }
+    assert_eq!(
+        stanza
+            .resolve(&source)?
+            .to_element_builder_in_filtered(&mut destination, |_| Ok(true))?
+            .child(deep)?
+            .build()
+            .err(),
+        Some(BuildError::TreeLimitExceeded)
+    );
+    Ok(())
+}
+
 #[test]
 fn writes_default_and_explicit_stanza_types() -> TestResult {
     let mut arena = Arena::try_new(ArenaConfig::default())?;

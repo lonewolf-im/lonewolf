@@ -250,7 +250,7 @@ impl<R: Read> XmlStream<R> {
         let start_offset = self.reader.buffer_position();
         let mut stack: Vec<Element> = Vec::new();
         loop {
-            if self.reader.buffer_position() - start_offset > 1024 * 1024 || stack.len() > 32 {
+            if self.reader.buffer_position() - start_offset > 1024 * 1024 || stack.len() > 128 {
                 return Err("XML response exceeded test limits".into());
             }
             self.buffer.clear();

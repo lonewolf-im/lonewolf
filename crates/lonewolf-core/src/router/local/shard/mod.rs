@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use lonewolf_extension::delivery::{BoundResource, SessionTag, SessionTags};
+use lonewolf_extension::delivery::{BoundResource, SessionTag, SessionTags, TagChange};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::jid::JidRef;
@@ -303,6 +303,28 @@ impl<A: ChunkAllocator> Shard<A> {
         }
         session.tags.insert(tag);
         Ok(())
+    }
+
+    pub(super) fn change_tag(
+        &mut self,
+        account: &AccountKey,
+        resource: &str,
+        token: u64,
+        change: TagChange,
+    ) -> Result<Vec<MailboxEntry<A>>, RouterError> {
+        let session = self
+            .accounts
+            .get_mut(account.as_str())
+            .and_then(|sessions| sessions.get_mut(resource))
+            .ok_or(RouterError::NotFound)?;
+        if session.token != token || !session.alive.load(Ordering::Acquire) {
+            return Err(RouterError::NotFound);
+        }
+        match change {
+            TagChange::Insert(tag) => session.tags.insert(tag),
+            TagChange::Remove(tag) => session.tags.remove(tag),
+        }
+        Ok(take_queued(&session.inbound))
     }
 
     pub(super) fn presence(

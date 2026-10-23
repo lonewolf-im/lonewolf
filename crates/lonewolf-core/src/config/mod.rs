@@ -228,6 +228,7 @@ impl Default for HostConfig {
                 lonewolf_extension::disco::NAME.into(),
                 lonewolf_extension::ping::NAME.into(),
                 lonewolf_extension::vcard::NAME.into(),
+                lonewolf_extension::carbons::NAME.into(),
             ],
             options: BTreeMap::new(),
         }

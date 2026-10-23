@@ -2,7 +2,7 @@
 
 This reference covers receiving client-to-server (C2S) connections and local account/server behavior on one node. Revisions identify reviewed specifications; support is limited to the roles described below. Source and test links provide representative implementation evidence, not certification of every role or recommendation in a specification.
 
-The default host extensions are `roster,offline,disco,ping,vcard`. Explicit `hosts.<domain>.extensions` lists replace those defaults. See the [configuration reference](../examples/lonewolf.toml) for settings and limits.
+The default host extensions are `roster,offline,disco,ping,vcard,carbons`. Explicit `hosts.<domain>.extensions` lists replace those defaults. See the [configuration reference](../examples/lonewolf.toml) for settings and limits.
 
 ## XEP server behavior
 

@@ -46,6 +46,194 @@ async fn routed(xml: &str) -> Result<RoutedStanza<GlobalChunkAllocator>, Box<dyn
 }
 
 #[test]
+fn copy_builders_run_outside_the_shard_lock() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let local = LocalRouter::new(GlobalChunkAllocator);
+        let local_handle = local.handle();
+        let config = crate::config::Config::default();
+        let hosts = crate::hosts::Hosts::new(&config.hosts, None)?;
+        let router = crate::router::Router::new(hosts, local);
+        let handle = router.handle();
+        let account = account()?;
+        let registration = handle
+            .register(&account, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        registration.handle().tag(SessionTag::Carbons).await?;
+        let stanza = routed("<message to='alice@localhost/desk'/>").await?;
+        let index = local_handle.shard_index(account.as_str());
+        handle
+            .copy_to_tagged(
+                &account,
+                SessionTag::Carbons,
+                &[],
+                Box::new(|targets| {
+                    assert_eq!(targets, ["alice@localhost/desk"]);
+                    assert_eq!(local_handle.try_with_shard(index, |_| ()), Some(Ok(())));
+                    Ok(vec![stanza])
+                }),
+            )
+            .await?;
+        assert_eq!(registration.take_queued().len(), 1);
+        drop(registration);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn copies_skip_sessions_that_change_before_delivery() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let account = account()?;
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let limit = NonZeroUsize::MIN.saturating_add(7);
+        let mut registrations = Vec::new();
+        for resource in ["disabled", "rebound", "ended", "closed", "gone", "steady"] {
+            let (outbound, inbound) = async_channel::bounded(2);
+            let registration = shard.register(
+                account.clone(),
+                Some(resource.into()),
+                limit,
+                outbound,
+                inbound,
+                test_router(),
+            )?;
+            shard.tag(&account, resource, registration.token, SessionTag::Carbons)?;
+            registrations.push(registration);
+        }
+        let targets = shard.tagged_sessions(&account, SessionTag::Carbons, &[]);
+        assert_eq!(targets.len(), 6);
+        let mut copies = Vec::new();
+        for (resource, token) in targets {
+            let stanza = routed(&format!(
+                "<message to='alice@localhost/{resource}' id='copy'/>"
+            ))
+            .await?;
+            copies.push((resource, token, stanza));
+        }
+        let disabled = &registrations[0];
+        assert!(
+            shard
+                .change_tag(
+                    &account,
+                    "disabled",
+                    disabled.token,
+                    TagChange::Remove(SessionTag::Carbons)
+                )?
+                .is_empty()
+        );
+        shard.cleanup(&account, "rebound", registrations[1].token);
+        let (outbound, inbound) = async_channel::bounded(2);
+        let replacement = shard.register(
+            account.clone(),
+            Some("rebound".into()),
+            limit,
+            outbound,
+            inbound,
+            test_router(),
+        )?;
+        assert_ne!(replacement.token, registrations[1].token);
+        shard.tag(&account, "rebound", replacement.token, SessionTag::Carbons)?;
+        shard.cleanup(&account, "gone", registrations[4].token);
+        let (outbound, inbound) = async_channel::bounded(2);
+        let late = shard.register(
+            account.clone(),
+            Some("late".into()),
+            limit,
+            outbound,
+            inbound,
+            test_router(),
+        )?;
+        shard.tag(&account, "late", late.token, SessionTag::Carbons)?;
+        registrations[2].alive.store(false, Ordering::Release);
+        registrations[3].links.inbound.close();
+        shard.deliver_copies(&account, SessionTag::Carbons, copies);
+        for registration in &registrations {
+            let queued = registration.take_queued();
+            if registration.resource() == "steady" {
+                assert_eq!(queued.len(), 1);
+                assert_eq!(queued[0].stanza.resolve()?.id()?, Some("copy"));
+            } else {
+                assert!(queued.is_empty(), "{}", registration.resource());
+            }
+        }
+        for registration in &registrations[1..5] {
+            assert_eq!(
+                registration.wait_retired().await?.cause,
+                RetireCause::Evicted
+            );
+            assert!(!registration.liveness().is_alive());
+            if registration.resource() != "rebound" {
+                assert!(!shard.accounts[account.as_str()].contains_key(registration.resource()));
+            }
+        }
+        assert!(replacement.take_queued().is_empty());
+        assert!(late.take_queued().is_empty());
+        assert!(replacement.liveness().is_alive());
+        assert!(late.liveness().is_alive());
+        assert_eq!(shard.session_count(), shard.counted_sessions());
+        Ok(())
+    })
+}
+
+#[test]
+fn copies_never_reach_another_account() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let alice = account()?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let bob_jid = Jid::parse_in("bob@localhost", &mut arena)?;
+        let bob = AccountKey::try_from(bob_jid.resolve(&arena)?)?;
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let mut mailboxes = Vec::new();
+        let mut retirements = Vec::new();
+        for owner in [&alice, &bob] {
+            for (resource, token) in [("desk", 1), ("phone", 2)] {
+                let (mailbox, retirement) =
+                    retirement_session(&mut shard, owner, resource, token, None);
+                shard.tag(owner, resource, token, SessionTag::Carbons)?;
+                mailboxes.push(mailbox);
+                retirements.push(retirement);
+            }
+        }
+        let targets = shard.tagged_sessions(&alice, SessionTag::Carbons, &[SessionId::new(1)]);
+        assert_eq!(targets, vec![(Box::<str>::from("phone"), 2)]);
+        let stanza = routed("<message to='alice@localhost/phone'/>").await?;
+        shard.deliver_copies(
+            &alice,
+            SessionTag::Carbons,
+            vec![("phone".into(), 2, stanza)],
+        );
+        for (index, mailbox) in mailboxes.iter().enumerate() {
+            assert_eq!(mailbox.len(), usize::from(index == 1));
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn tagged_copy_snapshots_skip_dead_and_closed_sessions_without_mutation()
+-> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let account = account()?;
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let (dead, _dead_retired) = retirement_session(&mut shard, &account, "dead", 1, None);
+        let (closed, _closed_retired) = retirement_session(&mut shard, &account, "closed", 2, None);
+        for (resource, token) in [("dead", 1), ("closed", 2)] {
+            shard.tag(&account, resource, token, SessionTag::Carbons)?;
+        }
+        shard.accounts[account.as_str()]["dead"]
+            .alive
+            .store(false, Ordering::Release);
+        closed.close();
+        let targets = shard.tagged_sessions(&account, SessionTag::Carbons, &[]);
+        assert!(targets.is_empty());
+        assert_eq!(targets.capacity(), 0);
+        assert_eq!(shard.accounts[account.as_str()].len(), 2);
+        assert!(dead.is_empty());
+        Ok(())
+    })
+}
+
+#[test]
 fn change_tag_inserts_and_removes_idempotently() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
         let account = account()?;

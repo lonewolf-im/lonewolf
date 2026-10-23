@@ -188,6 +188,10 @@ pub type IqResponseFuture<'a, A> = ExtensionFuture<'a, Result<RoutedStanza<A>, D
 pub type StanzaFactory<A> =
     Box<dyn FnMut(Jid, &mut Arena<A>) -> Result<Stanza, DeliveryError> + Send>;
 
+/// Builds one stanza per full JID, in order, or no stanzas to deliver nothing.
+pub type CopyFactory<'a, A> =
+    Box<dyn FnOnce(&[&str]) -> Result<Vec<RoutedStanza<A>>, DeliveryError> + 'a>;
+
 pub trait HostLookup {
     fn is_local_host(&self, domain: &str) -> bool;
 }
@@ -244,6 +248,19 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
         tag: SessionTag,
         build: StanzaFactory<A>,
     ) -> DeliveryFuture<'a>;
+
+    /// Delivers copies to tagged sessions except `holders`, with `build` outside router locks.
+    /// Changed sessions are skipped; full mailboxes retire their session.
+    fn copy_to_tagged<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        tag: SessionTag,
+        holders: &'a [SessionId],
+        build: CopyFactory<'a, A>,
+    ) -> DeliveryFuture<'a> {
+        let _ = (account, tag, holders, build);
+        Box::pin(async { Err(DeliveryError) })
+    }
 
     /// Evicts tagged resources whose committed roster state cannot be sent safely.
     fn retire_tagged<'a>(&'a self, account: &'a AccountKey, tag: SessionTag) -> DeliveryFuture<'a>;

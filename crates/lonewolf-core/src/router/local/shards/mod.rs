@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crossbeam_utils::CachePadded;
 use futures_channel::oneshot;
-use lonewolf_extension::delivery::{BoundResource, SessionTag};
+use lonewolf_extension::delivery::{BoundResource, SessionId, SessionTag};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 #[cfg(test)]
@@ -394,6 +394,30 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     ) -> Result<(), RouterError> {
         self.with_shard(self.shard_index(account.as_str()), |shard| {
             shard.retire_tagged(account, tag)
+        })
+        .await
+    }
+
+    pub(crate) async fn tagged_sessions(
+        &self,
+        account: &AccountKey,
+        tag: SessionTag,
+        holders: &[SessionId],
+    ) -> Result<Vec<(Box<str>, u64)>, RouterError> {
+        self.with_shard(self.shard_index(account.as_str()), |shard| {
+            shard.tagged_sessions(account, tag, holders)
+        })
+        .await
+    }
+
+    pub(crate) async fn deliver_copies(
+        &self,
+        account: &AccountKey,
+        tag: SessionTag,
+        copies: Vec<(Box<str>, u64, RoutedStanza<A>)>,
+    ) -> Result<(), RouterError> {
+        self.with_shard(self.shard_index(account.as_str()), |shard| {
+            shard.deliver_copies(account, tag, copies)
         })
         .await
     }

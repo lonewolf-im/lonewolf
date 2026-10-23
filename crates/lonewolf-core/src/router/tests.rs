@@ -19,8 +19,8 @@ use crate::router::{
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_extension::ExtensionFuture;
-use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::delivery::{BoundResource, HandlerError};
+use lonewolf_extension::delivery::{DeliveryError, SessionTag};
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_storage::RedbStorage;
@@ -1003,6 +1003,318 @@ fn exact_delivery_respects_mailbox_capacity_and_lease() -> TestResult {
             Err(RouterError::NotFound)
         ));
 
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+fn copy_stanzas(
+    targets: &[&str],
+) -> Result<Vec<RoutedStanza<GlobalChunkAllocator>>, DeliveryError> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let mut stanzas = Vec::with_capacity(targets.len());
+    for target in targets {
+        let to = Jid::parse_in(target, &mut arena)?;
+        stanzas.push(
+            Stanza::builder_in(
+                StanzaType::Message(lonewolf_xmpp::stanza::MessageType::Chat),
+                StanzaNamespace::Client,
+                &mut arena,
+            )
+            .to(Some(to))?
+            .id(Some(target))?
+            .build()?,
+        );
+    }
+    Ok(RoutedStanza::from_parts_shared(stanzas, arena))
+}
+
+#[test]
+fn copies_reach_tagged_sessions_except_holders() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::MIN.saturating_add(3);
+        let tablet = handle.register(&owner, Some("tablet"), limit).await?;
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        let quiet = handle.register(&owner, Some("quiet"), limit).await?;
+        for registration in [&tablet, &desk, &phone] {
+            registration.handle().tag(SessionTag::Carbons).await?;
+        }
+        let mut calls = 0;
+        handle
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[phone.session_id()],
+                Box::new(|targets| {
+                    calls += 1;
+                    assert_eq!(targets, ["alice@localhost/desk", "alice@localhost/tablet"]);
+                    copy_stanzas(targets)
+                }),
+            )
+            .await?;
+        assert_eq!(calls, 1);
+        for registration in [&desk, &tablet] {
+            let queued = registration.take_queued();
+            assert_eq!(queued.len(), 1);
+            let stanza = queued[0].stanza.resolve()?;
+            assert_eq!(
+                stanza.to()?.ok_or("missing target")?.as_str(),
+                registration.full_jid()
+            );
+            assert_eq!(stanza.id()?, Some(registration.full_jid().as_str()));
+            assert!(queued[0].release.is_none());
+        }
+        assert!(phone.take_queued().is_empty());
+        assert!(quiet.take_queued().is_empty());
+        drop((tablet, desk, phone, quiet));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn full_mailboxes_retire_the_copy_target() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::MIN.saturating_add(1);
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        for registration in [&desk, &phone] {
+            registration.handle().tag(SessionTag::Carbons).await?;
+        }
+        let fill = stanza("alice@localhost/desk").await?;
+        for _ in 0..64 {
+            handle.route_full(fill.clone()).await?;
+        }
+        handle
+            .copy_to_tagged(&owner, SessionTag::Carbons, &[], Box::new(copy_stanzas))
+            .await?;
+        assert_eq!(
+            desk.wait_retired().await?.cause,
+            RetireCause::MailboxOverflow
+        );
+        assert!(!desk.liveness().is_alive());
+        assert_eq!(desk.take_queued().len(), 64);
+        assert!(desk.recv().await.is_none());
+        assert_eq!(handle.resource_match(&owner, "desk").await?, None);
+        let queued = phone.take_queued();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].stanza.resolve()?.id()?,
+            Some("alice@localhost/phone")
+        );
+        assert!(phone.liveness().is_alive());
+        drop((desk, phone));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn misaddressed_or_miscounted_copies_deliver_nothing() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::MIN.saturating_add(1);
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        for registration in [&desk, &phone] {
+            registration.handle().tag(SessionTag::Carbons).await?;
+        }
+        for targets in [
+            vec!["alice@localhost/desk"],
+            vec![
+                "alice@localhost/desk",
+                "alice@localhost/phone",
+                "alice@localhost/extra",
+            ],
+            vec!["alice@localhost/phone", "alice@localhost/desk"],
+            vec!["alice@localhost/desk", "bob@localhost/phone"],
+            vec!["alice@localhost/desk", "alice@localhost"],
+        ] {
+            assert_eq!(
+                handle
+                    .copy_to_tagged(
+                        &owner,
+                        SessionTag::Carbons,
+                        &[],
+                        Box::new(|_| copy_stanzas(&targets)),
+                    )
+                    .await,
+                Err(RouterError::InvalidTarget),
+            );
+            for registration in [&desk, &phone] {
+                assert!(registration.take_queued().is_empty());
+                assert!(registration.liveness().is_alive());
+            }
+        }
+        let missing_target = parse_stanza("<message/>").await?;
+        assert_eq!(
+            handle
+                .copy_to_tagged(
+                    &owner,
+                    SessionTag::Carbons,
+                    &[],
+                    Box::new(|_| Ok(vec![
+                        copy_stanzas(&["alice@localhost/desk"])?.remove(0),
+                        missing_target
+                    ])),
+                )
+                .await,
+            Err(RouterError::InvalidTarget),
+        );
+        for registration in [&desk, &phone] {
+            assert!(registration.take_queued().is_empty());
+            assert!(registration.liveness().is_alive());
+        }
+        drop((desk, phone));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn empty_copy_builds_deliver_nothing() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let desk = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.handle().tag(SessionTag::Carbons).await?;
+        let mut calls = 0;
+        handle
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[],
+                Box::new(|targets| {
+                    calls += 1;
+                    assert_eq!(targets, ["alice@localhost/desk"]);
+                    Ok(Vec::new())
+                }),
+            )
+            .await?;
+        assert_eq!(calls, 1);
+        assert!(desk.take_queued().is_empty());
+        assert!(desk.liveness().is_alive());
+        drop(desk);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn accounts_without_tagged_sessions_do_not_call_the_builder() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let mut calls = 0;
+        handle
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[],
+                Box::new(|_| {
+                    calls += 1;
+                    Err(DeliveryError)
+                }),
+            )
+            .await?;
+        let desk = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        handle
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[],
+                Box::new(|_| {
+                    calls += 1;
+                    Err(DeliveryError)
+                }),
+            )
+            .await?;
+        desk.handle().tag(SessionTag::Carbons).await?;
+        handle
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[desk.session_id()],
+                Box::new(|_| {
+                    calls += 1;
+                    Err(DeliveryError)
+                }),
+            )
+            .await?;
+        assert_eq!(calls, 0);
+        assert!(desk.take_queued().is_empty());
+        drop(desk);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn remote_accounts_are_rejected() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@example.org")?;
+        let mut calls = 0;
+        assert_eq!(
+            handle
+                .copy_to_tagged(
+                    &owner,
+                    SessionTag::Carbons,
+                    &[],
+                    Box::new(|_| {
+                        calls += 1;
+                        Ok(Vec::new())
+                    })
+                )
+                .await,
+            Err(RouterError::RemoteUnsupported)
+        );
+        assert_eq!(calls, 0);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn copy_build_errors_leave_sessions_unchanged() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let desk = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.handle().tag(SessionTag::Carbons).await?;
+        assert_eq!(
+            handle
+                .copy_to_tagged(
+                    &owner,
+                    SessionTag::Carbons,
+                    &[],
+                    Box::new(|_| { Err(DeliveryError) })
+                )
+                .await,
+            Err(RouterError::Unavailable)
+        );
+        assert!(desk.take_queued().is_empty());
+        assert!(desk.liveness().is_alive());
+        drop(desk);
         router.shutdown().await?;
         Ok(())
     })

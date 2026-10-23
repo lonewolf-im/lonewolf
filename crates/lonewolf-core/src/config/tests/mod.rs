@@ -30,20 +30,20 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
 }
 
 #[test]
-fn host_extensions_default_to_roster_offline_disco_ping_and_vcard() -> TestResult {
+fn host_extensions_default_to_roster_offline_disco_ping_vcard_and_carbons() -> TestResult {
     assert_eq!(
         HostConfig::default().extensions,
-        ["roster", "offline", "disco", "ping", "vcard"]
+        ["roster", "offline", "disco", "ping", "vcard", "carbons"]
     );
     assert_eq!(
         Config::default().hosts["localhost"].extensions,
-        ["roster", "offline", "disco", "ping", "vcard"]
+        ["roster", "offline", "disco", "ping", "vcard", "carbons"]
     );
     for contents in ["", "[hosts.localhost]"] {
         let file = config_file(contents)?;
         assert_eq!(
             Config::load(Some(file.path()))?.hosts["localhost"].extensions,
-            ["roster", "offline", "disco", "ping", "vcard"]
+            ["roster", "offline", "disco", "ping", "vcard", "carbons"]
         );
     }
     Ok(())
@@ -61,7 +61,10 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
         ("['offline']", ["offline"].as_slice()),
         ("['ping']", ["ping"].as_slice()),
         ("['vcard']", ["vcard"].as_slice()),
+        ("['carbons']", ["carbons"].as_slice()),
         ("['disco']", ["disco"].as_slice()),
+        ("['disco', 'carbons']", ["disco", "carbons"].as_slice()),
+        ("['carbons', 'disco']", ["carbons", "disco"].as_slice()),
         ("['ping', 'disco']", ["ping", "disco"].as_slice()),
         ("['disco', 'ping']", ["disco", "ping"].as_slice()),
         ("['disco', 'vcard']", ["disco", "vcard"].as_slice()),
@@ -98,6 +101,13 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
                     expected.contains(&extension),
                 );
             }
+            for feature in ["urn:xmpp:carbons:2", "urn:xmpp:carbons:rules:0"] {
+                assert_eq!(
+                    registry.discovery().features(scope).contains(&feature),
+                    matches!(scope, lonewolf_extension::discovery::DiscoScope::Server)
+                        && expected.contains(&"carbons"),
+                );
+            }
         }
     }
     Ok(())
@@ -112,7 +122,7 @@ fn no_configuration_file_enables_default_extensions() -> TestResult {
         assert_eq!(config, Config::default());
         assert_eq!(
             config.hosts["localhost"].extensions,
-            ["roster", "offline", "disco", "ping", "vcard"]
+            ["roster", "offline", "disco", "ping", "vcard", "carbons"]
         );
     } else {
         let directory = tempfile::tempdir()?;
@@ -809,6 +819,7 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
                 "disco".into(),
                 "ping".into(),
                 "vcard".into(),
+                "carbons".into(),
             ],
             options: BTreeMap::from([
                 (
@@ -870,6 +881,10 @@ fn reference_configuration_extensions_enable_for_each_host() -> TestResult {
     let (uncommented, _) = documented_settings_and_examples()?;
     let file = config_file(&uncommented)?;
     let loaded = Config::load(Some(file.path()))?;
+    assert_eq!(
+        loaded.hosts["localhost"].extensions,
+        ["roster", "offline", "disco", "ping", "vcard", "carbons"]
+    );
     let mut extensions = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
     for factory in lonewolf_extension::builtin() {
         extensions.register_factory(factory)?;

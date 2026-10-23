@@ -15,6 +15,7 @@ use lonewolf_util::arena::ChunkAllocator;
 
 pub mod account;
 pub mod archive;
+pub mod carbons;
 pub mod delivery;
 pub mod disco;
 pub mod discovery;

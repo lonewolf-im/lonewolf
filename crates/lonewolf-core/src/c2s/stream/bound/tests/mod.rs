@@ -34,6 +34,7 @@ use crate::router::{Router, StoredRelease};
 mod iq_destinations;
 mod iq_errors;
 mod observers;
+mod session_iq;
 mod vcard;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;

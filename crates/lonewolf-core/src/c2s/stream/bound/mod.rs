@@ -18,7 +18,7 @@ use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::{
     IqDestinationRule, IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType,
-    IqScope, Requester, XmlSpace,
+    IqScope, Requester, SessionIqHandler, SessionIqReply, XmlSpace,
 };
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
@@ -930,6 +930,18 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 | Destination::Service
                 | Destination::Remote => None,
             };
+            if kind == IqRequestType::Set
+                && scope == Some(IqScope::Account)
+                && let Some(handler) = self
+                    .router
+                    .iq_handlers(target.domainpart())
+                    .and_then(|registry| registry.find_session(payload.namespace(), payload.name()))
+                    .map(Arc::clone)
+            {
+                return self
+                    .handle_session_iq(request, route.sender, arena, response, handler)
+                    .await;
+            }
             let handler = scope.and_then(|scope| {
                 self.router.iq_handlers(target.domainpart())?.find(
                     scope,
@@ -981,6 +993,80 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .await
             }
         }
+    }
+
+    async fn handle_session_iq(
+        &mut self,
+        request: Stanza,
+        sender: Jid,
+        arena: Arena<A>,
+        mut response: Arena<A>,
+        handler: Arc<dyn SessionIqHandler<A>>,
+    ) -> Result<(), CloseOutcome> {
+        let reply = {
+            let sender = sender.resolve(&arena)?;
+            let stanza = request.resolve(&arena)?;
+            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
+            let discovery = self
+                .router
+                .discovery(target.domainpart())
+                .ok_or(CloseOutcome::InternalError)?;
+            let payload = stanza
+                .children()?
+                .next()
+                .transpose()?
+                .ok_or(CloseOutcome::InternalError)?;
+            let delivery = self.delivery();
+            handler.set(
+                IqRequest {
+                    sender,
+                    target,
+                    discovery,
+                    sessions: &delivery,
+                    requester: None,
+                    lang: stanza.lang()?,
+                    space: stanza
+                        .attribute("space", XML_NAMESPACE)?
+                        .map(XmlSpace::from_attribute),
+                    payload,
+                },
+                &mut response,
+            )
+        };
+        let reply = match reply {
+            Ok(SessionIqReply { payload, change }) => {
+                if let Some(change) = change {
+                    match self.registration.handle().change_tag(change).await {
+                        Ok(preceding) => self.outbox.delivered(preceding),
+                        Err(RouterError::NotFound) => {
+                            tracing::debug!(
+                                account_jid = ?self.registration.account().as_str(),
+                                operation = "session_iq",
+                                outcome = "session_retired",
+                                "session IQ tag change skipped"
+                            );
+                            return self.queue_iq_reply(
+                                request,
+                                sender,
+                                arena,
+                                response,
+                                Err(IqError::without_payload(
+                                    StanzaErrorCondition::InternalServerError.into(),
+                                )),
+                                Vec::new(),
+                            );
+                        }
+                        Err(_) => return Err(CloseOutcome::InternalError),
+                    }
+                }
+                Ok(payload)
+            }
+            Err(error) => {
+                report_handler_failure(error.handler_error(), self.registration.account());
+                Err(error)
+            }
+        };
+        self.queue_iq_reply(request, sender, arena, response, reply, Vec::new())
     }
 
     async fn route_resource_iq(

@@ -334,7 +334,6 @@ impl<A: ChunkAllocator> SessionHandle<A> {
             .await?
     }
 
-    #[expect(dead_code)]
     pub(crate) async fn change_tag(
         &self,
         change: TagChange,

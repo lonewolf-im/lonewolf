@@ -25,7 +25,10 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::RoutedStanza;
 
-use super::{EffectsDiagnostics, StoredDelivery, WorkGroup, commit_and_deliver, commit_and_store};
+use super::{
+    EffectsDiagnostics, RouterDelivery, StoredDelivery, WorkGroup, commit_and_deliver,
+    commit_and_store,
+};
 use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::order::Order;
@@ -54,6 +57,104 @@ async fn parsed(xml: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
         Some(StreamEvent::Stanza(stanza)) => Ok(RoutedStanza::from_parsed(stanza)),
         _ => Err("expected stanza".into()),
     }
+}
+
+#[test]
+fn router_delivery_copies_preserve_holders_and_map_failures() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let config = Config::default();
+        let hosts = Hosts::new(&config.hosts, None)?;
+        let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator));
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::MIN.saturating_add(1);
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        for registration in [&desk, &phone] {
+            registration.handle().tag(SessionTag::Carbons).await?;
+        }
+        let delivery = RouterDelivery::new(&handle, &GlobalChunkAllocator, Some(&desk));
+        let copy = parsed("<message to='alice@localhost/phone' id='copy'/>").await?;
+        delivery
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[desk.session_id()],
+                Box::new(|targets| {
+                    assert_eq!(targets, ["alice@localhost/phone"]);
+                    Ok(vec![copy])
+                }),
+            )
+            .await?;
+        assert!(desk.take_queued().is_empty());
+        let queued = phone.take_queued();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].stanza.resolve()?.id()?, Some("copy"));
+        assert!(
+            delivery
+                .copy_to_tagged(
+                    &owner,
+                    SessionTag::Carbons,
+                    &[],
+                    Box::new(|_| Err(DeliveryError))
+                )
+                .await
+                .is_err()
+        );
+        let invalid = parsed("<message to='bob@localhost/phone'/>").await?;
+        assert!(
+            delivery
+                .copy_to_tagged(
+                    &owner,
+                    SessionTag::Carbons,
+                    &[desk.session_id()],
+                    Box::new(|_| Ok(vec![invalid]))
+                )
+                .await
+                .is_err()
+        );
+        let remote = account("alice@example.org")?;
+        assert!(
+            delivery
+                .copy_to_tagged(
+                    &remote,
+                    SessionTag::Carbons,
+                    &[],
+                    Box::new(|_| panic!("remote copy builder ran"))
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            NoDelivery
+                .copy_to_tagged(
+                    &owner,
+                    SessionTag::Carbons,
+                    &[],
+                    Box::new(|_| panic!("default copy builder ran"))
+                )
+                .await
+                .is_err()
+        );
+        for registration in [&desk, &phone] {
+            assert!(registration.take_queued().is_empty());
+            assert!(registration.liveness().is_alive());
+        }
+        drop((desk, phone));
+        router.shutdown().await?;
+        assert!(
+            delivery
+                .copy_to_tagged(
+                    &owner,
+                    SessionTag::Carbons,
+                    &[],
+                    Box::new(|_| panic!("stopped copy builder ran"))
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    }))?
 }
 
 #[test]

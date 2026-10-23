@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::account::AccountHandler;
 use lonewolf_extension::archive::ArchiveHandler;
-use lonewolf_extension::delivery::{BoundResource, SessionId, SessionTag};
+use lonewolf_extension::delivery::{BoundResource, CopyFactory, SessionId, SessionTag};
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
@@ -859,6 +859,43 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.retire_tagged(account, tag).await
     }
 
+    pub(crate) async fn copy_to_tagged(
+        &self,
+        account: &AccountKey,
+        tag: SessionTag,
+        holders: &[SessionId],
+        build: CopyFactory<'_, A>,
+    ) -> Result<(), RouterError> {
+        if !self.hosts.is_local_host(account.domain()) {
+            return Err(RouterError::RemoteUnsupported);
+        }
+        let sessions = self.local.tagged_sessions(account, tag, holders).await?;
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let targets: Vec<_> = sessions
+            .iter()
+            .map(|(resource, _)| format!("{}/{resource}", account.as_str()))
+            .collect();
+        let targets: Vec<_> = targets.iter().map(String::as_str).collect();
+        let stanzas = build(&targets).map_err(|_| RouterError::Unavailable)?;
+        if stanzas.is_empty() {
+            return Ok(());
+        }
+        if stanzas.len() != targets.len() {
+            return Err(RouterError::InvalidTarget);
+        }
+        for (stanza, target) in stanzas.iter().zip(targets) {
+            validate_target(stanza, target)?;
+        }
+        let copies = sessions
+            .into_iter()
+            .zip(stanzas)
+            .map(|((resource, token), stanza)| (resource, token, stanza))
+            .collect();
+        self.local.deliver_copies(account, tag, copies).await
+    }
+
     /// The builder must use the supplied full JID and must not block the calling thread.
     /// Build failures retire all tagged sessions; mailbox failures retire the affected session.
     pub(crate) async fn route_to_tagged(
@@ -871,6 +908,23 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             return Err(RouterError::RemoteUnsupported);
         }
         self.local.deliver_to_tagged(account, tag, build).await
+    }
+}
+
+fn validate_target<A: ChunkAllocator>(
+    stanza: &RoutedStanza<A>,
+    expected: &str,
+) -> Result<(), RouterError> {
+    let target = stanza
+        .resolve()
+        .map_err(|_| RouterError::InvalidTarget)?
+        .to()
+        .map_err(|_| RouterError::InvalidTarget)?
+        .ok_or(RouterError::InvalidTarget)?;
+    if target.as_str() == expected {
+        Ok(())
+    } else {
+        Err(RouterError::InvalidTarget)
     }
 }
 

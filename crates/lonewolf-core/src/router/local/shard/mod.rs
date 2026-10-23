@@ -25,7 +25,7 @@ use super::registration::{
 use super::shards::LocalRouterHandle;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
-use crate::router::{Admitted, RoutedStanza, RouterError, RouterState};
+use crate::router::{Admitted, RoutedStanza, RouterError, RouterState, validate_target};
 
 const LAST_UNAVAILABLE_PER_SHARD: usize = 64;
 
@@ -1263,6 +1263,55 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         self.remove_batch(account.as_str(), &failed);
     }
 
+    pub(super) fn tagged_sessions(
+        &self,
+        account: &AccountKey,
+        tag: SessionTag,
+        holders: &[SessionId],
+    ) -> Vec<(Box<str>, u64)> {
+        let mut targets: Vec<_> = self
+            .accounts
+            .get(account.as_str())
+            .into_iter()
+            .flat_map(|sessions| sessions.iter())
+            .filter(|(_, session)| {
+                session.tags.contains(tag)
+                    && !holders.contains(&SessionId::new(session.token))
+                    && session.alive.load(Ordering::Acquire)
+                    && !session.outbound.is_closed()
+            })
+            .map(|(resource, session)| (resource.clone(), session.token))
+            .collect();
+        targets.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        targets
+    }
+
+    pub(super) fn deliver_copies(
+        &mut self,
+        account: &AccountKey,
+        tag: SessionTag,
+        copies: Vec<(Box<str>, u64, RoutedStanza<A>)>,
+    ) {
+        let Some(sessions) = self.accounts.get(account.as_str()) else {
+            return;
+        };
+        let mut failed = Vec::new();
+        for (resource, token, stanza) in copies {
+            let Some(session) = sessions.get(resource.as_ref()) else {
+                continue;
+            };
+            if session.token != token || !session.tags.contains(tag) {
+                continue;
+            }
+            if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
+                failed.push((resource, token, RetireCause::Evicted));
+            } else if let Err(error) = session.outbound.try_send(MailboxEntry::new(stanza)) {
+                failed.push((resource, token, mailbox_retire_cause(error)));
+            }
+        }
+        self.remove_batch(account.as_str(), &failed);
+    }
+
     pub(super) fn deliver_to_tagged(
         &mut self,
         account: &AccountKey,
@@ -1344,23 +1393,6 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             })
             .collect();
         self.remove_batch(account.as_str(), &bound);
-    }
-}
-
-fn validate_target<A: ChunkAllocator>(
-    stanza: &RoutedStanza<A>,
-    expected: &str,
-) -> Result<(), RouterError> {
-    let target = stanza
-        .resolve()
-        .map_err(|_| RouterError::InvalidTarget)?
-        .to()
-        .map_err(|_| RouterError::InvalidTarget)?
-        .ok_or(RouterError::InvalidTarget)?;
-    if target.as_str() == expected {
-        Ok(())
-    } else {
-        Err(RouterError::InvalidTarget)
     }
 }
 

@@ -12,8 +12,9 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
 use lonewolf_extension::delivery::{
-    BoundResource, Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError,
-    HostLookup, IqResponseFuture, SessionLookup, SessionTag, StanzaFactory,
+    BoundResource, CopyFactory, Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind,
+    HandlerError, HostLookup, IqResponseFuture, SessionId, SessionLookup, SessionTag,
+    StanzaFactory,
 };
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_extension::{Deliver, Effects, ExtensionFuture};
@@ -525,6 +526,21 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
                     let stanza = build(to, &mut arena).map_err(|_| RouterError::Unavailable)?;
                     Ok(RoutedStanza::from_parts(stanza, arena))
                 })
+                .await
+                .map_err(|_| DeliveryError)
+        })
+    }
+
+    fn copy_to_tagged<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        tag: SessionTag,
+        holders: &'a [SessionId],
+        build: CopyFactory<'a, A>,
+    ) -> DeliveryFuture<'a> {
+        Box::pin(async move {
+            self.router
+                .copy_to_tagged(account, tag, holders, build)
                 .await
                 .map_err(|_| DeliveryError)
         })

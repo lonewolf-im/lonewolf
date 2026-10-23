@@ -30,7 +30,7 @@ use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::order::Order;
 use crate::router::local::LocalRouter;
-use crate::router::{Router, RouterError};
+use crate::router::{Admitted, Router, RouterError};
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -54,6 +54,101 @@ async fn parsed(xml: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
         Some(StreamEvent::Stanza(stanza)) => Ok(RoutedStanza::from_parsed(stanza)),
         _ => Err("expected stanza".into()),
     }
+}
+
+#[test]
+fn stored_messages_report_the_rerouted_session() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        for reroute in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+            let config = Config::default();
+            let hosts = Hosts::new(&config.hosts, None)?;
+            let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator));
+            let handle = router.handle();
+            let owner = account("bob@localhost")?;
+            let mut transaction = storage.begin_write().await?;
+            transaction
+                .create_account(NewAccount {
+                    key: owner.clone(),
+                    credentials: ScramCredentials::new(ScramVerifier::Sha1(
+                        ScramSha1Verifier::new(
+                            [11; 16],
+                            SCRAM_POLICY_ITERATIONS,
+                            [12; 20],
+                            [13; 20],
+                        ),
+                    )),
+                })
+                .await?;
+            transaction.commit().await?;
+            let registration = handle
+                .register(&owner, Some("phone"), NonZeroUsize::MIN)
+                .await?;
+            let ((), ahead) = handle
+                .order()
+                .fix(vec![owner.clone()], async { Ok::<_, DeliveryError>(()) })
+                .await?;
+            let mut transaction = storage.begin_write().await?;
+            let sequence = transaction
+                .push_offline_message(&owner, 0, b"<message to='bob@localhost'/>")
+                .await?;
+            let pending = commit_and_store(
+                WorkGroup::new().start(),
+                handle.clone(),
+                transaction,
+                Arc::new(Offline::new(Default::default())),
+                StoredDelivery {
+                    recipient: owner.clone(),
+                    sequence,
+                    stanza: parsed("<message to='bob@localhost' type='chat' id='reported'/>")
+                        .await?,
+                    bytes: 0,
+                },
+            );
+            let committed = storage.begin_write().await?;
+            assert_eq!(committed.offline_count(&owner).await?, 1);
+            drop(committed);
+            assert!(registration.take_queued().is_empty());
+            if reroute {
+                registration
+                    .handle()
+                    .set_presence(
+                        Some(0),
+                        parsed("<presence from='bob@localhost/phone'/>").await?,
+                        None,
+                    )
+                    .await?;
+            }
+            drop(ahead);
+            let admitted = pending
+                .finished()
+                .await
+                .ok_or("missing store completion")?
+                .map_err(|_| "offline store failed")?;
+            if reroute {
+                assert!(matches!(admitted, Admitted::One(_)));
+                assert_eq!(admitted.as_slice(), [registration.session_id()]);
+                let delivered = registration
+                    .recv()
+                    .await
+                    .ok_or("missing reported reroute")?;
+                assert_eq!(delivered.stanza.resolve()?.id()?, Some("reported"));
+                assert_eq!(
+                    delivered.release.as_ref().map(|release| release.sequence),
+                    Some(sequence)
+                );
+            } else {
+                assert!(matches!(admitted, Admitted::None));
+                assert_eq!(admitted.as_slice(), []);
+            }
+            assert!(registration.take_queued().is_empty());
+            assert_eq!(storage.begin_read().await?.offline_count(&owner).await?, 1);
+            drop(registration);
+            router.shutdown().await?;
+        }
+        Ok(())
+    }))?
 }
 
 #[test]

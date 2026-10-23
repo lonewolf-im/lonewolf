@@ -13,7 +13,8 @@ use crate::config::Config;
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{
-    Destination, Registration, RoutedStanza, Router, RouterError, ServiceRoute, StoredRelease,
+    Admitted, Destination, Registration, RoutedStanza, Router, RouterError, ServiceRoute,
+    StoredRelease,
 };
 use compio::runtime::Runtime;
 use compio::time::timeout;
@@ -78,6 +79,201 @@ fn destination_classifies_each_address_shape() -> TestResult {
             let jid = Jid::parse_in(address, &mut arena)?;
             assert_eq!(handle.destination(jid.resolve(&arena)?), expected);
         }
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bare_chat_reports_the_highest_priority_session() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero limit")?;
+        let high = handle.register(&owner, Some("high"), limit).await?;
+        let low = handle.register(&owner, Some("low"), limit).await?;
+        let quiet = handle.register(&owner, Some("quiet"), limit).await?;
+        for (registration, priority) in [(&high, 5), (&low, 1)] {
+            registration
+                .handle()
+                .set_presence(
+                    Some(priority),
+                    presence(registration.resource()).await?,
+                    None,
+                )
+                .await?;
+        }
+        for registration in [&high, &low, &quiet] {
+            registration.take_queued();
+        }
+        let admitted = handle
+            .route_message(
+                parse_stanza("<message to='alice@localhost' type='chat' id='priority'/>").await?,
+            )
+            .await?;
+        assert!(matches!(admitted, Admitted::One(_)));
+        assert_eq!(admitted.as_slice(), [high.session_id()]);
+        assert_eq!(
+            receive_routed(&high).await?.resolve()?.id()?,
+            Some("priority")
+        );
+        assert!(low.take_queued().is_empty());
+        assert!(quiet.take_queued().is_empty());
+        drop((high, low, quiet));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bare_chat_ties_report_the_oldest_session() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
+        let oldest = handle.register(&owner, Some("oldest"), limit).await?;
+        let newest = handle.register(&owner, Some("newest"), limit).await?;
+        assert!(oldest.session_id() < newest.session_id());
+        for registration in [&oldest, &newest] {
+            registration
+                .handle()
+                .set_presence(Some(1), presence(registration.resource()).await?, None)
+                .await?;
+        }
+        oldest.take_queued();
+        newest.take_queued();
+        let admitted = handle
+            .route_message(
+                parse_stanza("<message to='alice@localhost' type='chat' id='tie'/>").await?,
+            )
+            .await?;
+        assert!(matches!(admitted, Admitted::One(_)));
+        assert_eq!(admitted.as_slice(), [oldest.session_id()]);
+        assert_eq!(receive_routed(&oldest).await?.resolve()?.id()?, Some("tie"));
+        assert!(newest.take_queued().is_empty());
+        drop((oldest, newest));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn full_jid_messages_report_the_addressed_session() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        let admitted = handle
+            .route_message(parse_stanza("<message to='alice@localhost/phone' id='full'/>").await?)
+            .await?;
+        assert!(matches!(admitted, Admitted::One(_)));
+        assert_eq!(admitted.as_slice(), [phone.session_id()]);
+        assert_eq!(receive_routed(&phone).await?.resolve()?.id()?, Some("full"));
+        assert!(desk.take_queued().is_empty());
+        drop((desk, phone));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn missing_full_chat_reports_the_fallback_session() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let phone = handle
+            .register(&owner, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        phone
+            .handle()
+            .set_presence(Some(0), presence("phone").await?, None)
+            .await?;
+        let admitted = handle
+            .route_message(
+                parse_stanza("<message to='alice@localhost/missing' type='chat' id='fallback'/>")
+                    .await?,
+            )
+            .await?;
+        assert!(matches!(admitted, Admitted::One(_)));
+        assert_eq!(admitted.as_slice(), [phone.session_id()]);
+        let delivered = receive_routed(&phone).await?;
+        assert_eq!(delivered.resolve()?.id()?, Some("fallback"));
+        assert_eq!(
+            delivered.resolve()?.to()?.ok_or("missing target")?.as_str(),
+            "alice@localhost/missing"
+        );
+        drop(phone);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bare_headline_reports_every_eligible_session() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(4).ok_or("zero limit")?;
+        let high = handle.register(&owner, Some("high"), limit).await?;
+        let low = handle.register(&owner, Some("low"), limit).await?;
+        let negative = handle.register(&owner, Some("negative"), limit).await?;
+        let quiet = handle.register(&owner, Some("quiet"), limit).await?;
+        for (registration, priority) in [(&high, 5), (&low, 0), (&negative, -1)] {
+            registration
+                .handle()
+                .set_presence(
+                    Some(priority),
+                    presence(registration.resource()).await?,
+                    None,
+                )
+                .await?;
+        }
+        for registration in [&high, &low, &negative, &quiet] {
+            registration.take_queued();
+        }
+        let admitted = handle
+            .route_message(
+                parse_stanza("<message to='alice@localhost' type='headline' id='many'/>").await?,
+            )
+            .await?;
+        assert!(matches!(admitted, Admitted::Many(_)));
+        assert!(
+            admitted.as_slice() == [high.session_id(), low.session_id()]
+                || admitted.as_slice() == [low.session_id(), high.session_id()]
+        );
+        for registration in [&high, &low] {
+            assert_eq!(
+                receive_routed(registration).await?.resolve()?.id()?,
+                Some("many")
+            );
+        }
+        assert!(negative.take_queued().is_empty());
+        assert!(quiet.take_queued().is_empty());
+        low.handle()
+            .set_presence(None, unavailable_presence("low").await?, None)
+            .await?;
+        for registration in [&high, &low, &negative, &quiet] {
+            registration.take_queued();
+        }
+        let admitted = handle
+            .route_message(
+                parse_stanza("<message to='alice@localhost' type='headline' id='one'/>").await?,
+            )
+            .await?;
+        assert!(matches!(admitted, Admitted::One(_)));
+        assert_eq!(admitted.as_slice(), [high.session_id()]);
+        assert_eq!(receive_routed(&high).await?.resolve()?.id()?, Some("one"));
+        for registration in [&low, &negative, &quiet] {
+            assert!(registration.take_queued().is_empty());
+        }
+        drop((high, low, negative, quiet));
         router.shutdown().await?;
         Ok(())
     })

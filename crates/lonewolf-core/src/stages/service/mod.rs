@@ -170,7 +170,7 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                         if let (
                             Some(observed),
                             Some(recipient),
-                            DeliveryOutcome::Routed | DeliveryOutcome::Stored,
+                            DeliveryOutcome::Routed { .. } | DeliveryOutcome::Stored { .. },
                         ) = (observed.as_ref(), recipient.as_ref(), &outcome)
                         {
                             let delivery = RouterDelivery::new(self.router, self.allocator, None);
@@ -188,8 +188,8 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                             .await;
                         }
                         match outcome {
-                            DeliveryOutcome::Routed
-                            | DeliveryOutcome::Stored
+                            DeliveryOutcome::Routed { .. }
+                            | DeliveryOutcome::Stored { .. }
                             | DeliveryOutcome::Discarded => Ok(()),
                             DeliveryOutcome::Rejected { .. } => Err(DeliveryError),
                         }

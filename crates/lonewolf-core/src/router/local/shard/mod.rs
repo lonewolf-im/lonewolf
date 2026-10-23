@@ -10,7 +10,7 @@ use std::time::SystemTime;
 use async_channel::{Receiver, Sender, TrySendError};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use lonewolf_extension::delivery::{BoundResource, SessionTag, SessionTags, TagChange};
+use lonewolf_extension::delivery::{BoundResource, SessionId, SessionTag, SessionTags, TagChange};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::jid::JidRef;
@@ -25,7 +25,7 @@ use super::registration::{
 use super::shards::LocalRouterHandle;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
-use crate::router::{RoutedStanza, RouterError, RouterState};
+use crate::router::{Admitted, RoutedStanza, RouterError, RouterState};
 
 const LAST_UNAVAILABLE_PER_SHARD: usize = 64;
 
@@ -929,7 +929,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         stanza: RoutedStanza<A>,
         fallback_chat: bool,
         release: Option<StoredRelease<A>>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         self.deliver_with_guard(stanza, fallback_chat, || true, release)
     }
 
@@ -939,7 +939,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         fallback_chat: bool,
         valid: impl Fn() -> bool,
         release: Option<StoredRelease<A>>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         let mut release = release;
         self.prune_directed(&stanza, None)?;
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -956,7 +956,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             .and_then(|sessions| sessions.get(resource));
         let result = recipient.map(|session| {
             let delivery = if !valid() {
-                Ok(())
+                Ok(Admitted::None)
             } else if session.alive.load(Ordering::Acquire) {
                 session
                     .outbound
@@ -964,6 +964,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                         stanza: stanza.clone(),
                         release: release.take(),
                     })
+                    .map(|()| Admitted::One(SessionId::new(session.token)))
                     .map_err(|error| {
                         let closed = error.is_closed();
                         release = error.into_inner().release;
@@ -1039,6 +1040,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             || source.as_ref().is_none_or(SessionLiveness::is_alive),
             None,
         )
+        .map(|_| ())
     }
 
     pub(super) fn deliver_bare(
@@ -1046,7 +1048,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         stanza: RoutedStanza<A>,
         allow_full: bool,
         release: Option<StoredRelease<A>>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let to = view
             .to()
@@ -1075,24 +1077,31 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             }
             StanzaType::Message(MessageType::Headline) => {
                 debug_assert!(release.is_none());
-                let mut delivered = false;
+                let mut admitted = Admitted::None;
                 let mut busy = false;
                 for session in sessions
                     .values()
                     .filter(|session| session.accepts_bare_message())
                 {
                     match session.outbound.try_send(MailboxEntry::new(stanza.clone())) {
-                        Ok(()) => delivered = true,
+                        Ok(()) => {
+                            let id = SessionId::new(session.token);
+                            match &mut admitted {
+                                Admitted::None => admitted = Admitted::One(id),
+                                Admitted::One(first) => {
+                                    admitted = Admitted::Many(vec![*first, id]);
+                                }
+                                Admitted::Many(sessions) => sessions.push(id),
+                            }
+                        }
                         Err(TrySendError::Full(_)) => busy = true,
                         Err(TrySendError::Closed(_)) => {}
                     }
                 }
-                if delivered {
-                    Ok(())
-                } else if busy {
-                    Err(RouterError::Busy)
-                } else {
-                    Err(RouterError::Offline)
+                match admitted {
+                    Admitted::None if busy => Err(RouterError::Busy),
+                    Admitted::None => Err(RouterError::Offline),
+                    admitted => Ok(admitted),
                 }
             }
             _ => Err(RouterError::InvalidTarget),
@@ -1367,7 +1376,7 @@ fn enqueue_bare_message<A: ChunkAllocator>(
     recipient: &Session<A>,
     stanza: RoutedStanza<A>,
     release: Option<StoredRelease<A>>,
-) -> Result<(), RouterError> {
+) -> Result<Admitted, RouterError> {
     match recipient
         .outbound
         .try_send(MailboxEntry { stanza, release })
@@ -1375,7 +1384,9 @@ fn enqueue_bare_message<A: ChunkAllocator>(
         Err(TrySendError::Closed(_)) if !sessions.values().any(Session::accepts_bare_message) => {
             Err(RouterError::Offline)
         }
-        result => result.map_err(mailbox_error),
+        result => result
+            .map(|()| Admitted::One(SessionId::new(recipient.token)))
+            .map_err(mailbox_error),
     }
 }
 

@@ -12,6 +12,20 @@ use lonewolf_xmpp::stanza::{BuildError, RoutedStanza, Stanza, StanzaErrorConditi
 
 use crate::{Deliver, ExtensionFuture};
 
+/// Identifies one bound session among its account's sessions; a rebound resource gets a new value.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// A marker a handler attaches to a bound resource to select it for later deliveries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionTag {

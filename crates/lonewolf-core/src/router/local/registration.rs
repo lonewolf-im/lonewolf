@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_channel::{Receiver, WeakSender};
 use futures_channel::oneshot;
 use futures_util::future::Shared;
-use lonewolf_extension::delivery::{SessionTag, TagChange};
+use lonewolf_extension::delivery::{SessionId, SessionTag, TagChange};
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
@@ -103,6 +103,11 @@ impl<A: ChunkAllocator> Clone for Retired<A> {
 }
 
 impl<A: ChunkAllocator> Registration<A> {
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn session_id(&self) -> SessionId {
+        SessionId::new(self.token)
+    }
+
     pub(crate) fn liveness(&self) -> SessionLiveness {
         SessionLiveness(Arc::clone(&self.alive))
     }

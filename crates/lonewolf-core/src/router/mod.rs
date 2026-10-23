@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::account::AccountHandler;
 use lonewolf_extension::archive::ArchiveHandler;
-use lonewolf_extension::delivery::{BoundResource, SessionTag};
+use lonewolf_extension::delivery::{BoundResource, SessionId, SessionTag};
 use lonewolf_extension::discovery::Discovery;
 use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
@@ -40,6 +40,25 @@ use iq_requests::IqRequests;
 use metrics::{RouterCollector, RouterMetrics};
 
 const MAX_DETACHED: usize = 4096;
+
+/// Sessions of the recipient account that a message was enqueued to.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Admitted {
+    None,
+    One(SessionId),
+    Many(Vec<SessionId>),
+}
+
+impl Admitted {
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn as_slice(&self) -> &[SessionId] {
+        match self {
+            Self::None => &[],
+            Self::One(session) => std::slice::from_ref(session),
+            Self::Many(sessions) => sessions,
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct DetachedWork {
@@ -508,7 +527,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.deliver_full_guarded(stanza, source).await
     }
 
-    pub(crate) async fn route_message(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+    pub(crate) async fn route_message(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<Admitted, RouterError> {
         self.route_message_with(stanza, None).await
     }
 
@@ -516,7 +538,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
         release: StoredRelease<A>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         self.route_message_with(stanza, Some(release)).await
     }
 
@@ -524,7 +546,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
-    ) -> Result<(), RouterError> {
+    ) -> Result<Admitted, RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if !matches!(view.stanza_type(), StanzaType::Message(_)) {
             return Err(RouterError::InvalidTarget);

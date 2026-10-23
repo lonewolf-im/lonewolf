@@ -67,7 +67,7 @@ jobs:
           components: clippy
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
-          tool: nextest@0.9.146
+          tool: nextest@0.9.149
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}

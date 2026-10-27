@@ -6,10 +6,10 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
-    BuildError, Element, MessageType, RoutedStanza, Stanza, StanzaNamespace, StanzaType,
+    BuildError, Element, MessageType, RoutedStanza, Stanza, StanzaNamespace, StanzaType, forwarding,
 };
 
-use super::{FORWARD_NAMESPACE, NAMESPACE};
+use super::NAMESPACE;
 use crate::archive::ArchiveId;
 use crate::delivery::{DeliveryError, HostLookup};
 use crate::observer::MessageRole;
@@ -77,9 +77,7 @@ pub fn build<A: ChunkAllocator>(
                 builder.build()?
             }
         };
-        let forwarded = Element::builder_in("forwarded", FORWARD_NAMESPACE, &mut arena)?
-            .child(inner)?
-            .build()?;
+        let forwarded = forwarding::build_in(inner, None, &mut arena)?;
         let container = Element::builder_in(
             match original.role {
                 MessageRole::Sent => "sent",

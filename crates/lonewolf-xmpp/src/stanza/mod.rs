@@ -14,6 +14,7 @@ use crate::jid::{Jid, JidError, JidRef};
 
 mod element;
 mod error;
+pub mod forwarding;
 pub(crate) mod incoming;
 pub(crate) mod namespace;
 mod routed;

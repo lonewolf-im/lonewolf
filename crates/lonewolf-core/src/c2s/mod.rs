@@ -167,6 +167,7 @@ pub(crate) struct Listeners {
     stop: Option<oneshot::Sender<Instant>>,
     tasks: FuturesUnordered<Task<io::Result<()>>>,
     failures: async_channel::Receiver<io::Error>,
+    addresses: Vec<SocketAddr>,
     listener_count: usize,
     worker_count: usize,
 }
@@ -206,6 +207,7 @@ impl Listeners {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
             failures,
+            addresses: Vec::with_capacity(config.listeners.len()),
             listener_count: config.listeners.len(),
             worker_count: dispatcher.worker_count(),
         };
@@ -294,6 +296,7 @@ impl Listeners {
                 port = address.port(),
                 "c2s TCP listener started"
             );
+            listeners.addresses.push(address);
         }
         Ok(())
         }.await;
@@ -304,6 +307,11 @@ impl Listeners {
             return Err(StartError { error, deadline });
         }
         Ok(listeners)
+    }
+
+    /// Bound addresses in configuration order.
+    pub(crate) fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
     }
 
     pub(crate) fn stop(&mut self, deadline: Instant) {

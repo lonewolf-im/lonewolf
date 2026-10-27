@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lonewolf_acme::test_support::{ClockMode, ClockSnapshot, Parked, TestClock};
 
+use super::readiness::ReadinessSocket;
 use super::{TIMEOUT, TestResult};
 
 const INIT: u8 = 1;
@@ -132,13 +133,15 @@ impl Drop for ClockControl {
 
 pub fn spawn(
     directory: &Path,
+    readiness: &ReadinessSocket,
     now: SystemTime,
     mode: ClockMode,
 ) -> io::Result<(Child, ClockControl)> {
     let (parent, child) = UnixStream::pair()?;
     parent.set_read_timeout(Some(TIMEOUT))?;
     parent.set_write_timeout(Some(TIMEOUT))?;
-    let mut process = Command::new(std::env::current_exe()?)
+    let mut process = readiness
+        .configure(&mut Command::new(std::env::current_exe()?))
         .args([
             "--exact",
             "support::clock::server_process",

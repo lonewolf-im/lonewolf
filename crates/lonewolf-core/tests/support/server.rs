@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar as PlCondvar, Mutex as PlMutex};
 use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
+use super::readiness::ReadinessSocket;
 use super::{Client, PlainClient, Signal, TIMEOUT, TestResult, tls};
 
 static ACTIVE_SERVERS: PlMutex<usize> = PlMutex::new(0);
@@ -29,8 +30,9 @@ impl C2sSuitePermit {
     }
 }
 
-fn spawn_process(directory: &Path) -> std::io::Result<Child> {
-    Command::new(std::env::current_exe()?)
+fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> std::io::Result<Child> {
+    readiness
+        .configure(&mut Command::new(std::env::current_exe()?))
         .args([
             "--exact",
             "support::server::server_process",
@@ -57,7 +59,9 @@ pub struct C2sSuite {
     _permit: C2sSuitePermit,
     child: Child,
     directory: tempfile::TempDir,
+    readiness: ReadinessSocket,
     pub address: SocketAddr,
+    listeners: Vec<SocketAddr>,
     metrics: SocketAddr,
     pub tls: Arc<ClientConfig>,
     tls_roots: RootCertStore,
@@ -295,12 +299,15 @@ max_resources_per_account = {resources}
             ),
         )?;
         setup(directory.path())?;
-        let child = spawn_process(directory.path())?;
+        let readiness = ReadinessSocket::bind()?;
+        let child = spawn_process(directory.path(), &readiness)?;
         let mut server = Self {
             _permit: permit,
             child,
             directory,
+            readiness,
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            listeners: Vec::new(),
             metrics: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             tls: Arc::new(tls),
             tls_roots,
@@ -311,9 +318,7 @@ max_resources_per_account = {resources}
 
     pub fn restart(&mut self) -> TestResult {
         self.stop()?;
-        self.child = spawn_process(self.directory.path())?;
-        self.address.set_port(0);
-        self.metrics.set_port(0);
+        self.child = spawn_process(self.directory.path(), &self.readiness)?;
         self.wait_until_ready()
     }
 
@@ -330,42 +335,28 @@ max_resources_per_account = {resources}
     fn wait_until_ready(&mut self) -> TestResult {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
             if self.child.try_wait()?.is_some() {
                 let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 return Err(format!("server exited before readiness: {logs}").into());
             }
-            if logs.contains("waiting for stop signal") && logs.contains("metrics service started")
-            {
-                self.address
-                    .set_port(started_port(&logs, "c2s TCP listener started")?);
-                self.metrics
-                    .set_port(started_port(&logs, "metrics service started")?);
+            if let Some(readiness) = self.readiness.receive(Duration::from_millis(10))? {
+                self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
+                self.metrics = readiness.metrics.ok_or("metrics service is not ready")?;
+                self.listeners = readiness.c2s;
                 return Ok(());
             }
             if Instant::now() >= deadline {
+                let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 return Err(format!("server did not become ready: {logs}").into());
             }
-            thread::sleep(Duration::from_millis(10));
         }
     }
 
     pub fn listener_address(&self, listener_id: usize) -> TestResult<SocketAddr> {
-        let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
-        let listener = format!("listener_id={listener_id}");
-        let port = logs
-            .lines()
-            .find(|line| {
-                line.contains("c2s TCP listener started")
-                    && line.split_whitespace().any(|field| field == listener)
-            })
-            .and_then(|line| {
-                line.split_whitespace()
-                    .find_map(|field| field.strip_prefix("port="))
-            })
-            .ok_or("missing listener port")?
-            .parse()?;
-        Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        Ok(*self
+            .listeners
+            .get(listener_id)
+            .ok_or("missing listener address")?)
     }
 
     pub fn wait_for_failure(&mut self) -> TestResult<String> {
@@ -494,18 +485,6 @@ max_resources_per_account = {resources}
         assert!(response.starts_with("HTTP/1.1 204 "), "{response}");
         Ok(())
     }
-}
-
-fn started_port(logs: &str, event: &str) -> TestResult<u16> {
-    Ok(logs
-        .lines()
-        .find(|line| line.contains(event))
-        .and_then(|line| {
-            line.split_whitespace()
-                .find_map(|field| field.strip_prefix("port="))
-        })
-        .ok_or_else(|| format!("missing port for {event}"))?
-        .parse()?)
 }
 
 impl Drop for C2sSuite {

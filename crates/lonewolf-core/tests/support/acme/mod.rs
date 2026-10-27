@@ -7,6 +7,8 @@ mod client;
 pub mod clock;
 pub mod process;
 mod proxy;
+#[path = "../readiness.rs"]
+mod readiness;
 #[allow(dead_code)]
 #[path = "../tls.rs"]
 pub mod tls;

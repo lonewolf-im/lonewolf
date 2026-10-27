@@ -18,6 +18,9 @@ Start small, grow when you need to, and keep your server easy to run.
 > Lonewolf is early, pre-1.0 software. Today it can host chat between accounts on
 > domains you run. Federation with other XMPP servers is next on the
 > [roadmap](docs/ROADMAP.md); clustering comes later.
+>
+> Most of Lonewolf's code, tests and docs are written with AI coding agents. The
+> maintainer sets the design and scope and reviews the changes.
 
 ## Why Lonewolf?
 
@@ -28,9 +31,9 @@ Start small, grow when you need to, and keep your server easy to run.
   operation are on the [roadmap](docs/ROADMAP.md).
 - **Light on resources.** It's a native Rust binary built to be frugal with
   memory and CPU.
-- **Correct by design.** Lonewolf follows the core XMPP RFCs
+- **Standards first.** Lonewolf follows the core XMPP RFCs
   ([RFC 6120](https://www.rfc-editor.org/rfc/rfc6120.html) and friends) closely,
-  so standards-compliant clients behave the way you'd expect.
+  aiming for standards-compliant clients to behave the way you'd expect.
 - **Limits you can see.** Connections, stanzas, rates, and resources all have
   explicit, configurable limits, so one misbehaving client can't quietly take
   down your server.
@@ -121,6 +124,7 @@ undelivered messages are saved in `./data/lonewolf.dat`.
 
 - TCP connections secured with STARTTLS
 - SCRAM authentication, plus optional client-certificate login
+- Automatic TLS certificates from Let's Encrypt, or your own certificate files
 
 **Messaging and presence**
 
@@ -159,8 +163,9 @@ file has to exist.
 
 ### Hosting your own domain
 
-To serve a real domain instead of `localhost`, give Lonewolf a PEM certificate
-chain and private key for it:
+To serve a real domain instead of `localhost`, Lonewolf needs a certificate for
+it. You can hand it your own PEM files, or let it get one from Let's Encrypt.
+With files, it looks like this:
 
 ```toml
 [hosts."example.com"]
@@ -181,6 +186,38 @@ server.
 > [!TIP]
 > Relative paths, including the certificate, database, and admin socket paths,
 > are resolved from the directory you launch the server in.
+
+### Let's Encrypt certificates
+
+Don't want to manage certificates yourself? Replace the file paths with a single
+line, and Lonewolf gets a certificate from Let's Encrypt and renews it before it
+expires:
+
+```toml
+[hosts."example.com".tls]
+provider = "letsencrypt"
+```
+
+The choice is per host. You can switch a domain that already uses certificate
+files over to Let's Encrypt by changing just its `tls` table, and keep files for
+the rest.
+
+Choosing `letsencrypt` registers an ACME account and accepts Let's Encrypt's
+subscriber terms. To prove you control the domain, Let's Encrypt connects to
+public port 80 on every A and AAAA address the domain publishes, so that port has
+to reach Lonewolf. If something else already serves port 80, or you'd rather not
+let Lonewolf bind it, have your proxy forward it to a local port instead. The
+proxy must keep the original Host header and path:
+
+```toml
+[letsencrypt]
+listen = ["127.0.0.1:8080"]
+```
+
+Lonewolf keeps the ACME account and certificates in `./data/lonewolf/acme.redb`
+by default, so put that on durable storage. To try it out first, point
+`directory_url` at Let's Encrypt's staging server; the config reference shows
+how.
 
 Every setting, its default, and the certificate requirements are documented in
 [`examples/lonewolf.toml`](examples/lonewolf.toml). Everything there is commented
@@ -215,6 +252,9 @@ Found a bug or have an idea? [Open an issue](https://github.com/lonewolf-im/lone
 For bug reports, it helps to include the commit you built, your platform, the
 relevant config, and steps to reproduce. Please strip out passwords and private
 messages first.
+
+Found a security problem? Please report it privately instead; see
+[SECURITY.md](SECURITY.md).
 
 Thinking about a new feature? Check the [roadmap](docs/ROADMAP.md) first. It may
 already be planned, and it helps us figure out where the feature fits.

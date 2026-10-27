@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 mod client;
 mod extensions;
+mod readiness;
 mod server;
 pub mod tls;
 pub mod xml;

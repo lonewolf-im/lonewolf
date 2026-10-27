@@ -21,6 +21,7 @@ use crate::config::{AuthMechanisms, Config, TcpListenerConfig};
 use crate::hosts::HostsError;
 use crate::router::Router;
 use crate::router::local::LocalRouter;
+use crate::test_ports::{bind_released_listener, reserve_listener_address};
 
 type TestResult = Result<(), Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -474,8 +475,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
 fn failed_start_releases_previously_bound_endpoints() -> TestResult {
     run_test(async {
         let dispatcher = dispatcher()?;
-        let probe = bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
-        let first = probe.local_addr()?;
+        let (_reservation, first) = reserve_listener_address()?;
         let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let config = C2sConfig {
             listeners: vec![
@@ -509,8 +509,8 @@ fn failed_start_releases_previously_bound_endpoints() -> TestResult {
         assert!(error.to_string().contains("listener 1 on worker 0"));
         dispatcher.shutdown_at(error.deadline).await?;
         router.shutdown().await?;
-        probe.close().await?;
-        let _rebound = std::net::TcpListener::bind(first)?;
+        let _rebound =
+            bind_released_listener(first, Instant::now() + Duration::from_secs(2)).await?;
         Ok(())
     })
 }
@@ -563,6 +563,7 @@ fn listener_failures_reach_the_supervisor() -> TestResult {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
             failures: async_channel::bounded(1).1,
+            addresses: Vec::new(),
             listener_count: 0,
             worker_count: dispatcher.handle().worker_count(),
         };
@@ -590,6 +591,7 @@ fn fatal_listener_notification_precedes_connection_drain() -> TestResult {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
             failures,
+            addresses: Vec::new(),
             listener_count: 0,
             worker_count: dispatcher.handle().worker_count(),
         };

@@ -102,6 +102,29 @@ async fn failed_start_remains_owned_until_stop() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn exit_after_closing_stderr_is_reported_as_a_startup_exit() -> TestResult {
+    let scripts = tempfile::tempdir()?;
+    let server = scripts.path().join("server");
+    std::fs::write(&server, "#!/bin/sh\nexec 2>&-\nsleep 0.3\nexit 3\n")?;
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755))?;
+    let mut config = config()?;
+    let TargetConfig::Local { server_binary, .. } = &mut config.target else {
+        return Err("local target".into());
+    };
+    *server_binary = server;
+    let cpu = CpuPool::new(NonZeroUsize::MIN);
+    let mut fixture = LocalFixture::prepare(&config, &cpu).await?;
+    let error = fixture
+        .start(Instant::now() + Duration::from_secs(2))
+        .await
+        .err()
+        .ok_or("script unexpectedly started as a server")?;
+    assert_eq!(error.context(), "fixture_startup_exit");
+    fixture.stop(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
 #[test]
 #[ignore = "subprocess entry point for the owned-child force-kill fixture"]
 fn owned_child_helper() -> TestResult {

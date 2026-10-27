@@ -4,6 +4,8 @@ This reference covers receiving client-to-server (C2S) connections and local acc
 
 The default host extensions are `roster,offline,disco,ping,vcard,carbons`. Explicit `hosts.<domain>.extensions` lists replace those defaults. See the [configuration reference](../examples/lonewolf.toml) for settings and limits.
 
+[`lonewolf.doap`](../lonewolf.doap) summarizes these tables in the [XEP-0453](https://xmpp.org/extensions/xep-0453.html) format that software directories read. Update both together.
+
 ## XEP server behavior
 
 | XEP and reviewed revision | Implemented role and limits | Configuration | Evidence |

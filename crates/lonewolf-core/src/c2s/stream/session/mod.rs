@@ -399,12 +399,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
 
     pub(super) async fn send(&mut self, xml: &str) -> Result<(), CloseOutcome> {
         self.intact = false;
-        self.output
-            .as_mut()
-            .ok_or(CloseOutcome::TransportError)?
-            .write_all(xml.as_bytes())
-            .await
-            .map_err(|error| CloseOutcome::from_io_error(&error))?;
+        self.queue(xml).await?;
         self.flush().await?;
         self.intact = true;
         Ok(())
@@ -416,9 +411,22 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         xml: &str,
         kind: StanzaKind,
     ) -> Result<(), CloseOutcome> {
-        self.send(xml).await?;
+        self.intact = false;
+        self.queue(xml).await?;
+        // A stanza never switches protocols, so a stream error may follow it after a cancelled flush.
+        self.intact = true;
+        self.flush().await?;
         self.metrics.stanza_sent(kind);
         Ok(())
+    }
+
+    async fn queue(&mut self, xml: &str) -> Result<(), CloseOutcome> {
+        self.output
+            .as_mut()
+            .ok_or(CloseOutcome::TransportError)?
+            .write_all(xml.as_bytes())
+            .await
+            .map_err(|error| CloseOutcome::from_io_error(&error))
     }
 
     /// The caller must flush buffered output.

@@ -359,11 +359,13 @@ fn deletion_waits_for_older_effects_before_session_retirement_and_completion() -
         }
         assert!(storage.begin_read().await?.vcard(&alice).await?.is_none());
         assert!(session.liveness().is_alive());
+        let carol = key("carol@localhost")?;
+        // The commit is visible before the deletion is polled to admit its barrier and release the ordering lock.
+        let (_, mut later) = select_biased! {
+            result = deletion.as_mut().fuse() => { result?; return Err("deletion completed ahead of older effects".into()); },
+            later = handle.order().fix(vec![carol], async { TestResult::Ok(()) }).fuse() => later?,
+        };
         assert!(poll!(deletion.as_mut()).is_pending());
-        let (_, mut later) = handle
-            .order()
-            .fix(vec![key("carol@localhost")?], async { TestResult::Ok(()) })
-            .await?;
         assert!(poll!(pin!(later.turn())).is_pending());
         drop(older);
         assert!(deletion.await?);

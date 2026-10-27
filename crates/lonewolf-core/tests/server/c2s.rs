@@ -270,11 +270,19 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
             && total(body, REJECTED, "reason=\"connection_attempts_per_ip\"") == 15
     })?;
     let logs = server.stop_with_logs(Signal::SIGINT)?;
-    assert_eq!(
-        logs.matches("c2s connection attempt rejected").count(),
-        1,
-        "{logs}"
-    );
+    let rejections: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("c2s connection attempt rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 1, "{logs}");
+    for field in [
+        "connection_type=\"c2s\"",
+        "listener_id=0",
+        "outcome=\"rate_limited\"",
+        "rejected_attempts=1",
+    ] {
+        assert!(rejections[0].contains(field), "missing {field}: {logs}");
+    }
     assert!(!logs.contains("127.0.0.1"));
     Ok(())
 }
@@ -323,6 +331,19 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     let logs = server.stop_with_logs(Signal::SIGINT)?;
     replacement.set_read_timeout(Some(TIMEOUT))?;
     assert_eq!(read_until_closed(&mut replacement)?, b"<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
+    let rejections: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("c2s connection rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 1, "{logs}");
+    for field in [
+        "connection_type=\"c2s\"",
+        "listener_id=0",
+        "outcome=\"connection_limit\"",
+        "rejected_connections=1",
+    ] {
+        assert!(rejections[0].contains(field), "missing {field}: {logs}");
+    }
     assert!(!logs.contains("127.0.0.1"));
     Ok(())
 }

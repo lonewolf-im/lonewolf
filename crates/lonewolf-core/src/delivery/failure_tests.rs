@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use compio::runtime::Runtime;
@@ -17,6 +17,7 @@ use lonewolf_util::arena::GlobalChunkAllocator;
 use parking_lot::Mutex as PlMutex;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
+use tracing::subscriber::Interest;
 use tracing::{Event, Metadata, Subscriber};
 
 use super::tests::{NoDelivery, TestResult, account};
@@ -36,8 +37,38 @@ pub(crate) fn seeded_error(kind: StorageErrorKind) -> StorageError {
     StorageError::with_source(kind, std::io::Error::other(SENSITIVE_SOURCE))
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Capture(Arc<PlMutex<Vec<BTreeMap<&'static str, String>>>>);
+
+impl Default for Capture {
+    fn default() -> Self {
+        static DYNAMIC_INTEREST: Once = Once::new();
+        DYNAMIC_INTEREST.call_once(|| {
+            assert!(tracing::subscriber::set_global_default(DynamicInterest).is_ok());
+        });
+        Self(Arc::default())
+    }
+}
+
+/// Keeps callsite interest dynamic so tracing's process-wide interest cache cannot hide events from a capture.
+struct DynamicInterest;
+
+impl Subscriber for DynamicInterest {
+    fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+    fn event(&self, _: &Event<'_>) {}
+    fn enter(&self, _: &Id) {}
+    fn exit(&self, _: &Id) {}
+}
 
 struct Fields(BTreeMap<&'static str, String>);
 impl Visit for Fields {

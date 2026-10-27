@@ -127,3 +127,11 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Write named integration scenarios with visible setup, actions, and expected replies. Share transport and setup helpers without hiding the interaction being tested.
 - When a workflow tests an executable, declare its Cargo test target in the executable's package with a `path` under `crates/lonewolf-core/tests/`, so Cargo supplies the executable path.
 - Run `cargo test --workspace` to cover the central integration suite and each crate's implementation tests.
+
+## 14. Standards Reference Rule
+
+- Keep `docs/STANDARDS.md` as the reference for every supported XEP and RFC. Keep `lonewolf.doap` as its [XEP-0453](https://xmpp.org/extensions/xep-0453.html) summary for software directories such as xmpp.org.
+- When a change adds, removes, or changes support for a XEP or RFC, update both files in the same change. This covers the reviewed XEP version, the support status, and the documented limits.
+- In `lonewolf.doap`, mark a XEP `partial` when `docs/STANDARDS.md` lists a limit within that XEP's own scope. Otherwise mark it `complete`.
+- For support that is not in a release yet, omit `since` and end the XEP's note with "Not in a release yet."
+- When preparing a release, add a `<release>` entry to `lonewolf.doap` with the version and date. Set `since` to that version for every XEP the release ships for the first time, and remove "Not in a release yet." from their notes.

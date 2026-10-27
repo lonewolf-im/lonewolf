@@ -801,11 +801,10 @@ fn vcard_corrupt_retained_records_produce_sanitized_payload_free_internal_errors
         alice.send("<iq type='get' id='corrupt'><vCard xmlns='vcard-temp'/></iq>")?;
         omitted_error(&mut alice,"corrupt","internal-server-error","cancel")?;
         barrier(&mut alice)?;
-        let logs=suite.wait_for_log("internal operation failed")?;
+        alice.close()?;
+        let logs=suite.stop_with_logs()?;
         assert!(!logs.contains(MARKER));assert!(!logs.contains("<vCard"));
         assert_eq!(logs.lines().filter(|line|line.contains("internal operation failed")).count(),1);
-        alice.close()?;
-        suite.stop()?;
         fixtures::assert_raw(suite.fixture_path(),"alice@localhost",&bytes)?;
 
     }

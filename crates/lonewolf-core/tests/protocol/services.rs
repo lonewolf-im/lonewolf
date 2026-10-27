@@ -4,7 +4,7 @@ use crate::support::PASSWORD;
 
 use std::time::{Duration, Instant};
 
-use crate::support::{C2sSuite, Client, TestResult};
+use crate::support::{C2sSuite, Client, Signal, TestResult};
 
 const NAMESPACE: &str = "urn:lonewolf:test:service";
 
@@ -97,7 +97,7 @@ fn service_can_store_a_message_to_the_account_becoming_unavailable() -> TestResu
     assert_eq!(joined(&mut alice)?, 1);
     alice.send("<presence type='unavailable'/>")?;
     alice.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost' type='unavailable'/>")?;
-    suite.wait_for_log("test service withdrawal message stored")?;
+    suite.wait_for_signal(Signal::ServiceWithdrawalStored, 1)?;
     alice.send("<presence/>")?;
     alice.expect_xml(
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
@@ -121,7 +121,7 @@ fn service_can_store_a_message_to_the_account_whose_session_ends() -> TestResult
     alice.send("<presence to='room@echo.localhost/a'/>")?;
     assert_eq!(joined(&mut alice)?, 1);
     alice.close()?;
-    suite.wait_for_log("test service withdrawal message stored")?;
+    suite.wait_for_signal(Signal::ServiceWithdrawalStored, 1)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<presence/>")?;
     alice.expect_xml(
@@ -149,7 +149,7 @@ fn pending_service_unavailable_survives_session_replacement() -> TestResult {
     alice.send("<presence to='room@echo.localhost/a'/>")?;
     assert_eq!(joined(&mut alice)?, 1);
     alice.send("<presence type='unavailable' to='room@echo.localhost/a'/>")?;
-    suite.wait_for_log("test service presence waiting")?;
+    suite.wait_for_signal(Signal::ServicePresenceWaiting, 1)?;
     bob.send(
         "<message type='chat' to='alice@localhost/desk'><body>check transport</body></message>",
     )?;
@@ -159,7 +159,7 @@ fn pending_service_unavailable_survives_session_replacement() -> TestResult {
     let mut replacement = suite.connect("alice", PASSWORD, "desk")?;
     assert_eq!(joined(&mut bob)?, 1);
     release(&mut bob)?;
-    suite.wait_for_log("test service withdrawal handled")?;
+    suite.wait_for_signal(Signal::ServiceWithdrawalHandled, 1)?;
     wait_for_count(&mut bob, 0)?;
     replacement.close()?;
     bob.close()
@@ -178,7 +178,7 @@ fn delayed_service_available_is_withdrawn_before_replacement_joins() -> TestResu
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone'/>",
     )?;
     alice.send("<presence to='room@echo.localhost/a'/>")?;
-    suite.wait_for_log("test service presence waiting")?;
+    suite.wait_for_signal(Signal::ServicePresenceWaiting, 1)?;
     bob.send(
         "<message type='chat' to='alice@localhost/desk'><body>check transport</body></message>",
     )?;
@@ -189,7 +189,7 @@ fn delayed_service_available_is_withdrawn_before_replacement_joins() -> TestResu
     replacement.send("<presence to='room@echo.localhost/a'/>")?;
     assert_eq!(joined(&mut bob)?, 0);
     release(&mut bob)?;
-    suite.wait_for_log("test service withdrawal handled")?;
+    suite.wait_for_signal(Signal::ServiceWithdrawalHandled, 1)?;
     assert_eq!(joined(&mut replacement)?, 1);
     assert_eq!(joined(&mut bob)?, 1);
     replacement.close()?;

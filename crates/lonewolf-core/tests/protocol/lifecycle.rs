@@ -11,12 +11,12 @@ use super::support::{C2sSuite, Client, SASL_NAMESPACE, TestResult};
 #[test]
 fn resource_assignment_logs_ordered_transitions_without_exposing_jids() -> TestResult {
     for (resource, requested) in [(Some("desk"), true), (None, false)] {
-        let suite = C2sSuite::start()?;
+        let mut suite = C2sSuite::start()?;
         suite.create_account("alice", ALTERNATE_PASSWORD)?;
         let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
         client.bind(resource)?;
         client.close()?;
-        let logs = suite.wait_for_log("stream disconnected")?;
+        let logs = suite.stop_with_logs()?;
         let events = [
             "connection established",
             "connection authenticated",
@@ -234,7 +234,7 @@ fn failed_exporter_proof_refuses_exporter_reuse_and_allows_a_fresh_connection() 
             fresh.close()?;
         }
     }
-    suite.wait_for_log("outcome=\"channel_binding_reused\"")?;
+    suite.wait_for_closed("channel_binding_reused", 4)?;
     Ok(())
 }
 
@@ -272,11 +272,7 @@ fn reusing_exporter_after_failure_abort_or_replacement_is_a_policy_violation() -
             }
         }
     }
-    let logs = suite.wait_for_log("outcome=\"channel_binding_reused\"")?;
-    assert!(
-        !logs.contains("outcome=\"authentication_attempts_exceeded\""),
-        "{logs}"
-    );
+    suite.wait_for_closed("channel_binding_reused", 12)?;
     Ok(())
 }
 
@@ -297,7 +293,7 @@ fn replacing_an_exporter_attempt_with_exporter_is_a_policy_violation() -> TestRe
         }
         client.expect_stream_error("policy-violation")?;
     }
-    suite.wait_for_log("outcome=\"channel_binding_reused\"")?;
+    suite.wait_for_closed("channel_binding_reused", 2)?;
     Ok(())
 }
 
@@ -320,7 +316,7 @@ fn mixed_exporter_and_non_exporter_failures_share_the_retry_budget() -> TestResu
         }
         client.expect_stream_error("policy-violation")?;
     }
-    suite.wait_for_log("outcome=\"authentication_attempts_exceeded\"")?;
+    suite.wait_for_closed("authentication_attempts_exceeded", 2)?;
     Ok(())
 }
 
@@ -344,7 +340,7 @@ fn replacing_exporter_and_non_exporter_attempts_shares_the_retry_budget() -> Tes
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
         )?;
     client.expect_stream_error("policy-violation")?;
-    suite.wait_for_log("outcome=\"authentication_attempts_exceeded\"")?;
+    suite.wait_for_closed("authentication_attempts_exceeded", 1)?;
     Ok(())
 }
 
@@ -471,7 +467,7 @@ fn authentication_deadline_caps_a_local_close_wait() -> TestResult {
 
 #[test]
 fn account_retirement_preserves_a_partial_read_while_recreation_proceeds() -> TestResult {
-    let suite = C2sSuite::with_metrics()?;
+    let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut retiring = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     let idle = suite.wait_for_metrics("all stanza chunks available", |body| {

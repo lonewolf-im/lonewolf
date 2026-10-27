@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -13,9 +13,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar as PlCondvar, Mutex as PlMutex};
 use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
-use super::{Client, PlainClient, TIMEOUT, TestResult, tls};
-
-const METRICS_SETTINGS: &str = "[metrics]\nenabled = true\naddress = \"127.0.0.1:0\"";
+use super::{Client, PlainClient, Signal, TIMEOUT, TestResult, tls};
 
 static ACTIVE_SERVERS: PlMutex<usize> = PlMutex::new(0);
 static SERVER_SLOT: PlCondvar = PlCondvar::new();
@@ -60,6 +58,7 @@ pub struct C2sSuite {
     child: Child,
     directory: tempfile::TempDir,
     pub address: SocketAddr,
+    metrics: SocketAddr,
     pub tls: Arc<ClientConfig>,
     tls_roots: RootCertStore,
 }
@@ -73,30 +72,12 @@ impl C2sSuite {
         Self::configured("", "")
     }
 
-    pub fn with_metrics() -> TestResult<Self> {
-        Self::with_metrics_settings("", 10)
-    }
-
-    pub fn with_metrics_settings(limits: &str, resources: usize) -> TestResult<Self> {
-        Self::settings("", limits, resources, METRICS_SETTINGS)
-    }
-
-    pub fn metrics_address(&self) -> TestResult<SocketAddr> {
-        let logs = self.wait_for_log("metrics service started")?;
-        let port = logs
-            .lines()
-            .find(|line| line.contains("metrics service started"))
-            .and_then(|line| {
-                line.split_whitespace()
-                    .find_map(|field| field.strip_prefix("port="))
-            })
-            .ok_or("missing metrics listener port")?
-            .parse()?;
-        Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    pub fn metrics_address(&self) -> SocketAddr {
+        self.metrics
     }
 
     pub fn scrape_metrics(&self) -> TestResult<String> {
-        let mut stream = TcpStream::connect_timeout(&self.metrics_address()?, TIMEOUT)?;
+        let mut stream = TcpStream::connect_timeout(&self.metrics_address(), TIMEOUT)?;
         stream.set_read_timeout(Some(TIMEOUT))?;
         stream.set_write_timeout(Some(TIMEOUT))?;
         stream
@@ -128,7 +109,63 @@ impl C2sSuite {
             if Instant::now() >= deadline {
                 return Err(format!("missing metrics {expected}: {body}").into());
             }
+            thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Waits until at least `count` admitted connections closed with `outcome`.
+    pub fn wait_for_closed(&self, outcome: &str, count: u64) -> TestResult {
+        let series = format!(",outcome=\"{outcome}\"}} ");
+        self.wait_for_metrics(
+            &format!("{count} connections closed with {outcome}"),
+            |body| {
+                body.lines()
+                    .filter(|line| line.starts_with("lonewolf_c2s_connections_closed_total{"))
+                    .filter_map(|line| line.split_once(&series))
+                    .filter_map(|(_, value)| value.parse::<u64>().ok())
+                    .sum::<u64>()
+                    >= count
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn wait_for_signal(&self, signal: Signal, count: u64) -> TestResult {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let raised = self.signal_count(signal)?;
+            if raised >= count {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
+                return Err(format!("{signal:?} raised {raised} of {count} times: {logs}").into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub fn signal_count(&self, signal: Signal) -> TestResult<u64> {
+        match fs::metadata(signal.path(self.fixture_path())) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Returns the full log after a clean stop and fails if earlier lines were dropped.
+    pub fn stop_with_logs(&mut self) -> TestResult<String> {
+        let metrics = self.scrape_metrics()?;
+        assert!(
+            metrics
+                .lines()
+                .any(|line| line == "lonewolf_log_dropped_lines_total 0"),
+            "{metrics}"
+        );
+        self.stop()?;
+        Ok(fs::read_to_string(
+            self.directory.path().join("server.log"),
+        )?)
     }
 
     pub fn with_extensions(extensions: &str) -> TestResult<Self> {
@@ -239,6 +276,9 @@ impl C2sSuite {
 [xmpp]
 stanza_pool_size_mib = 8
 default_host = "localhost"
+[metrics]
+enabled = true
+address = "127.0.0.1:0"
 [[c2s.listeners]]
 address = "127.0.0.1:0"
 {listener}
@@ -261,6 +301,7 @@ max_resources_per_account = {resources}
             child,
             directory,
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            metrics: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             tls: Arc::new(tls),
             tls_roots,
         };
@@ -272,6 +313,7 @@ max_resources_per_account = {resources}
         self.stop()?;
         self.child = spawn_process(self.directory.path())?;
         self.address.set_port(0);
+        self.metrics.set_port(0);
         self.wait_until_ready()
     }
 
@@ -293,35 +335,16 @@ max_resources_per_account = {resources}
                 let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 return Err(format!("server exited before readiness: {logs}").into());
             }
-            if logs.contains("waiting for stop signal") {
-                let port = logs
-                    .lines()
-                    .find(|line| line.contains("c2s TCP listener started"))
-                    .and_then(|line| {
-                        line.split_whitespace()
-                            .find_map(|part| part.strip_prefix("port="))
-                    })
-                    .ok_or("missing C2S listener port")?
-                    .parse()?;
-                self.address.set_port(port);
+            if logs.contains("waiting for stop signal") && logs.contains("metrics service started")
+            {
+                self.address
+                    .set_port(started_port(&logs, "c2s TCP listener started")?);
+                self.metrics
+                    .set_port(started_port(&logs, "metrics service started")?);
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!("server did not become ready: {logs}").into());
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    pub fn wait_for_log(&self, event: &str) -> TestResult<String> {
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
-            if logs.contains(event) {
-                return Ok(logs);
-            }
-            if Instant::now() >= deadline {
-                return Err(format!("missing log event {event}: {logs}").into());
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -471,6 +494,18 @@ max_resources_per_account = {resources}
         assert!(response.starts_with("HTTP/1.1 204 "), "{response}");
         Ok(())
     }
+}
+
+fn started_port(logs: &str, event: &str) -> TestResult<u16> {
+    Ok(logs
+        .lines()
+        .find(|line| line.contains(event))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("port="))
+        })
+        .ok_or_else(|| format!("missing port for {event}"))?
+        .parse()?)
 }
 
 impl Drop for C2sSuite {

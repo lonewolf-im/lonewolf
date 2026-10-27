@@ -48,7 +48,7 @@ use lonewolf_xmpp::stanza::{
 };
 use parking_lot::Mutex as PlMutex;
 
-use super::TestResult;
+use super::{Signal, TestResult};
 
 const NAMESPACE: &str = "urn:lonewolf:test:iq";
 const SERVICE_NAMESPACE: &str = "urn:lonewolf:test:service";
@@ -487,9 +487,10 @@ impl<A: ChunkAllocator> ServiceHandler<A, RedbStorage> for ServiceLifecycle {
                     )
                 );
                 if delayed && self.delay.swap(false, Ordering::Relaxed) {
-                    tracing::info!("test service presence waiting");
+                    Signal::ServicePresenceWaiting
+                        .raise()
+                        .map_err(|_| DeliveryError)?;
                     self.release.acquire().await.forget();
-                    tracing::info!("test service presence released");
                 }
                 if matches!(self.kind, ServiceLifecycleKind::OfflineWithdrawal)
                     && kind == StanzaType::Presence(PresenceType::Unavailable)
@@ -516,7 +517,9 @@ impl<A: ChunkAllocator> ServiceHandler<A, RedbStorage> for ServiceLifecycle {
                         .outbound
                         .route(RoutedStanza::from_parts(notice, arena))
                         .await?;
-                    tracing::info!("test service withdrawal message stored");
+                    Signal::ServiceWithdrawalStored
+                        .raise()
+                        .map_err(|_| DeliveryError)?;
                 }
                 Ok(false)
             }
@@ -534,7 +537,9 @@ impl<A: ChunkAllocator> ServiceHandler<A, RedbStorage> for ServiceLifecycle {
                 == StanzaType::Presence(PresenceType::Unavailable);
             self.inner.route(stanza, context).await?;
             if unavailable {
-                tracing::info!("test service withdrawal handled");
+                Signal::ServiceWithdrawalHandled
+                    .raise()
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             }
             Ok(())
         })
@@ -720,7 +725,7 @@ struct PrecommitCancellation(bool);
 impl Drop for PrecommitCancellation {
     fn drop(&mut self) {
         if !self.0 {
-            tracing::info!("test precommit handler cancelled");
+            let _ = Signal::PrecommitHandlerCancelled.raise();
         }
     }
 }
@@ -762,7 +767,9 @@ impl<A: ChunkAllocator> PresenceHandler<A, RedbStorage> for PrecommitIq {
         _transaction: &'a RedbRead,
     ) -> PresenceFuture<'a, Option<PresenceAudience>> {
         Box::pin(async move {
-            tracing::info!("test precommit audience waiting");
+            Signal::PrecommitAudienceWaiting
+                .raise()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             self.release.acquire().await.forget();
             Ok(None)
         })
@@ -776,7 +783,9 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for PrecommitIq {
         _transaction: &'a RedbRead,
     ) -> PresenceFuture<'a, Option<lonewolf_extension::message::Backlog>> {
         Box::pin(async move {
-            tracing::info!("test precommit backlog waiting");
+            Signal::PrecommitBacklogWaiting
+                .raise()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             self.release.acquire().await.forget();
             Ok(None)
         })
@@ -812,17 +821,22 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for PrecommitIq {
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             if request.payload.name() == "stall" {
                 let mut cancellation = PrecommitCancellation(false);
-                tracing::info!(account_jid = ?account.as_str(), "test precommit handler waiting");
+                Signal::PrecommitHandlerWaiting
+                    .raise()
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
                 self.release.acquire().await.forget();
                 cancellation.0 = true;
             }
-            tracing::info!(account_jid = ?account.as_str(), "test precommit handler completed");
+            Signal::PrecommitHandlerCompleted
+                .raise()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             Ok(IqReply::new(
                 None,
                 Effects::new(vec![account], |_| {
                     Box::pin(async {
-                        tracing::info!("test precommit effects delivered");
-                        Ok(())
+                        Signal::PrecommitEffectsDelivered
+                            .raise()
+                            .map_err(|_| DeliveryError)
                     })
                 }),
             ))
@@ -984,7 +998,9 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for SlowOffline {
     ) -> StoreFuture<'a> {
         Box::pin(async move {
             self.entered.fetch_add(1, Ordering::Release);
-            tracing::info!("test offline store waiting");
+            Signal::OfflineStoreWaiting
+                .raise()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
             let _ready = self.ready.acquire().await;
             <Offline as MessageHandler<A, RedbStorage>>::store(
                 &self.offline,
@@ -1003,7 +1019,9 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for SlowOffline {
     ) -> lonewolf_extension::ExtensionFuture<'a, Result<(), HandlerError>> {
         Box::pin(async move {
             if self.block_ack {
-                tracing::info!("test offline acknowledgement waiting");
+                Signal::OfflineAcknowledgementWaiting
+                    .raise()
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
                 let _ready = self.acknowledge.acquire().await;
                 if self.fail_ack.load(Ordering::Acquire) {
                     return Err(HandlerError::Internal {

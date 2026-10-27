@@ -22,7 +22,7 @@ use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 
-use super::support::{C2sSuite, Client, TestResult};
+use super::support::{C2sSuite, Client, Signal, TestResult};
 
 fn accounts(suite: &C2sSuite) -> TestResult {
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
@@ -109,7 +109,7 @@ fn default_host_answers_roster_get_and_delivers_offline_messages_on_login() -> T
 
 #[test]
 fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messages() -> TestResult {
-    let suite = C2sSuite::with_extensions_and_setup(
+    let mut suite = C2sSuite::with_extensions_and_setup(
         "'roster', 'offline', 'test-offline-inspect'",
         seed_replay_roster,
     )?;
@@ -142,7 +142,9 @@ fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messag
         )?;
     }
     await_empty(&mut bob, "bob@localhost/phone")?;
-    let logs = suite.wait_for_log("messages_written=3 messages_skipped=0")?;
+    bob.close()?;
+    alice.close()?;
+    let logs = suite.stop_with_logs()?;
     for summary in [
         "pending subscriptions flushed operation=\"replay\" outcome=\"flushed\" pending_count=1",
         "offline replay flushed operation=\"replay\" outcome=\"flushed\" messages_written=3 messages_skipped=0",
@@ -155,8 +157,7 @@ fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messag
         assert!(line.contains("owner_jid=\"bob@localhost\""));
         assert!(!line.contains("stored-") && !line.contains("<presence"));
     }
-    bob.close()?;
-    alice.close()
+    Ok(())
 }
 
 fn seed_replay_roster(directory: &Path) -> TestResult {
@@ -216,7 +217,7 @@ fn seed_offline_records(directory: &Path, messages: &[&[u8]]) -> TestResult {
 #[test]
 fn corrupt_stored_records_are_logged_once_skipped_and_removed_without_ending_the_stream()
 -> TestResult {
-    let suite = C2sSuite::with_extensions_and_setup(
+    let mut suite = C2sSuite::with_extensions_and_setup(
         "'offline', 'test-offline-inspect'",
         |directory| {
             seed_replay_roster(directory)?;
@@ -237,17 +238,22 @@ fn corrupt_stored_records_are_logged_once_skipped_and_removed_without_ending_the
         "<message xmlns='jabber:client' to='bob@localhost/old' type='chat' id='valid'/>",
     )?;
     await_empty(&mut bob, "bob@localhost/phone")?;
-    let logs = suite.wait_for_log("offline replay flushed operation=\"replay\" outcome=\"flushed\" messages_written=1 messages_skipped=3")?;
+    bob.close()?;
+    let logs = suite.stop_with_logs()?;
+    assert!(
+        logs.contains("offline replay flushed operation=\"replay\" outcome=\"flushed\" messages_written=1 messages_skipped=3"),
+        "{logs}"
+    );
     assert_eq!(logs.matches("stored offline message rejected").count(), 3);
     for sequence in 1..=3 {
         assert!(logs.contains(&format!("sequence={sequence}")));
     }
-    bob.close()
+    Ok(())
 }
 
 #[test]
 fn prefixed_stored_stanzas_are_logged_once_skipped_and_allow_valid_replay() -> TestResult {
-    let suite = C2sSuite::with_extensions_and_setup(
+    let mut suite = C2sSuite::with_extensions_and_setup(
         "'offline', 'test-offline-inspect'",
         |directory| {
             seed_replay_roster(directory)?;
@@ -265,13 +271,14 @@ fn prefixed_stored_stanzas_are_logged_once_skipped_and_allow_valid_replay() -> T
     )?;
     bob.expect_xml("<message xmlns='jabber:client' to='bob@localhost' type='chat' id='valid'/>")?;
     await_empty(&mut bob, "bob@localhost/phone")?;
-    let logs = suite.wait_for_log("offline replay flushed")?;
+    bob.close()?;
+    let logs = suite.stop_with_logs()?;
     assert_eq!(logs.matches("stored offline message rejected").count(), 2);
     assert!(logs.contains("sequence=1"));
     assert!(logs.contains("sequence=2"));
     assert!(logs.contains("messages_written=1 messages_skipped=2"));
     assert!(!logs.contains("private stored body"));
-    bob.close()
+    Ok(())
 }
 
 #[test]
@@ -631,7 +638,7 @@ fn availability_fixed_before_store_commit_gets_the_chat_live_without_a_delay() -
     let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     alice
         .send("<message to='bob@localhost' type='chat' id='raced'><body>Hello</body></message>")?;
-    suite.wait_for_log("test offline store waiting")?;
+    suite.wait_for_signal(Signal::OfflineStoreWaiting, 1)?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
@@ -752,13 +759,13 @@ fn sender_drains_more_than_mailbox_capacity_while_live_acknowledgement_is_blocke
         "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
     )?;
     alice.send("<message to='bob@localhost' type='chat' id='raced'/>")?;
-    suite.wait_for_log("test offline store waiting")?;
+    suite.wait_for_signal(Signal::OfflineStoreWaiting, 1)?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
     )?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='raced'/>")?;
-    suite.wait_for_log("test offline acknowledgement waiting")?;
+    suite.wait_for_signal(Signal::OfflineAcknowledgementWaiting, 1)?;
     for index in 0..80 {
         charlie.send(&format!(
             "<message to='alice@localhost/desk' type='chat' id='incoming-{index}'/>"
@@ -776,31 +783,39 @@ fn sender_drains_more_than_mailbox_capacity_while_live_acknowledgement_is_blocke
 
 #[test]
 fn failed_live_acknowledgement_retains_the_stored_copy_and_logs_once() -> TestResult {
-    let suite = C2sSuite::with_extensions("'test-blocked-offline-ack'")?;
+    let mut suite = C2sSuite::with_extensions("'test-blocked-offline-ack'")?;
     accounts(&suite)?;
     let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost' type='chat' id='raced'/>")?;
-    suite.wait_for_log("test offline store waiting")?;
+    suite.wait_for_signal(Signal::OfflineStoreWaiting, 1)?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
     )?;
     bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='raced'/>")?;
-    suite.wait_for_log("test offline acknowledgement waiting")?;
+    suite.wait_for_signal(Signal::OfflineAcknowledgementWaiting, 1)?;
     bob.send("<iq to='localhost' type='get' id='release'><release xmlns='urn:lonewolf:test:offline' fail='true'/></iq>")?;
     bob.expect_xml("<iq xmlns='jabber:client' from='localhost' to='bob@localhost/phone' type='result' id='release'><released xmlns='urn:lonewolf:test:offline'/></iq>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
     inspect(&mut bob, "bob@localhost/phone", 1, 1, Some("bob@localhost"))?;
-    let logs = suite.wait_for_log("internal operation failed")?;
-    assert_eq!(logs.matches("internal operation failed").count(), 1);
+    bob.close()?;
+    alice.close()?;
+    let logs = suite.stop_with_logs()?;
+    let failures: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("internal operation failed"))
+        .collect();
+    assert_eq!(failures.len(), 1, "{logs}");
     assert!(
-        logs.contains("failure_kind=\"storage_unavailable\""),
+        failures[0].contains("failure_kind=\"storage_unavailable\""),
         "{logs}"
     );
-    assert!(logs.contains("operation=\"offline_acknowledge\""), "{logs}");
-    bob.close()?;
-    alice.close()
+    assert!(
+        failures[0].contains("operation=\"offline_acknowledge\""),
+        "{logs}"
+    );
+    Ok(())
 }
 
 #[test]

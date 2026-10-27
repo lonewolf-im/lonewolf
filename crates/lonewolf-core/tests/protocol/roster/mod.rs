@@ -4233,7 +4233,7 @@ fn seed_corrupt_reciprocal_metadata(directory: &Path) -> TestResult {
 #[test]
 fn account_deletion_retires_corrupt_reciprocal_metadata_and_continues_healthy_notifications()
 -> TestResult {
-    let suite = C2sSuite::with_hosts_and_setup(
+    let mut suite = C2sSuite::with_hosts_and_setup(
         "[hosts.localhost]\nextensions=['roster']\n[hosts.localhost.roster]\nmax_bytes=128",
         seed_corrupt_reciprocal_metadata,
     )?;
@@ -4253,11 +4253,14 @@ fn account_deletion_retires_corrupt_reciprocal_metadata_and_continues_healthy_no
     mark_roster_version(&mut carol, "carol", 2)?;
     let mut bob = suite.connect("bob", PASSWORD, "desk")?;
     mark_roster_version(&mut bob, "bob", 2)?;
-    assert!(
-        suite
-            .wait_for_log("account_deletion_effects")?
-            .contains("internal operation failed")
-    );
     bob.close()?;
-    carol.close()
+    carol.close()?;
+    let logs = suite.stop_with_logs()?;
+    assert!(
+        logs.lines()
+            .any(|line| line.contains("internal operation failed")
+                && line.contains("operation=\"account_deletion_effects\"")),
+        "{logs}"
+    );
+    Ok(())
 }

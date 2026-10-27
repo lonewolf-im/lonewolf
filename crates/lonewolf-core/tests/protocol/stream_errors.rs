@@ -68,7 +68,7 @@ fn plaintext_parser_failure_half_closes_and_holds_capacity_until_peer_eof() -> T
         .set_read_timeout(Some(Duration::from_millis(200)))?;
     rejected.expect_eof()?;
     client.transport().shutdown(Shutdown::Write)?;
-    suite.wait_for_log("outcome=\"not_well_formed\"")?;
+    suite.wait_for_closed("not_well_formed", 1)?;
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;
     replacement.close()
@@ -92,7 +92,7 @@ fn silent_plaintext_drain_peer_releases_capacity_at_the_original_deadline() -> T
         .transport()
         .set_read_timeout(Some(Duration::from_millis(200)))?;
     rejected.expect_eof()?;
-    suite.wait_for_log("outcome=\"not_well_formed\"")?;
+    suite.wait_for_closed("not_well_formed", 1)?;
     assert!((Duration::from_secs(5)..Duration::from_secs(7)).contains(&started.elapsed()));
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;
@@ -132,7 +132,7 @@ fn healthy_plaintext_close_waits_for_footer_then_holds_capacity_until_peer_eof()
         .set_read_timeout(Some(Duration::from_millis(200)))?;
     rejected.expect_eof()?;
     client.transport().shutdown(Shutdown::Write)?;
-    suite.wait_for_log("outcome=\"unsupported_input\"")?;
+    suite.wait_for_closed("unsupported_input", 1)?;
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;
     replacement.close()
@@ -184,7 +184,7 @@ fn prefixed_content_returns_bad_namespace_prefix_before_binding() -> TestResult 
 
 #[test]
 fn prefixed_content_returns_bad_namespace_prefix_without_delivery_after_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     suite.create_account("bob", ALTERNATE_PASSWORD)?;
     let mut recipient = suite.connect("bob", ALTERNATE_PASSWORD, "desk")?;
@@ -198,9 +198,14 @@ fn prefixed_content_returns_bad_namespace_prefix_without_delivery_after_binding(
         recipient.expect_xml("<message xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost/desk' id='sentinel'/>")?;
     }
     recipient.expect_no_tls_input()?;
-    let logs = suite.wait_for_log("outcome=\"bad_namespace_prefix\"")?;
-    assert!(!logs.contains("<c:message"));
-    recipient.close()
+    suite.wait_for_closed(
+        "bad_namespace_prefix",
+        u64::try_from(PREFIXED_CONTENT_STANZAS.len())?,
+    )?;
+    recipient.close()?;
+    let logs = suite.stop_with_logs()?;
+    assert!(!logs.contains("<c:message"), "{logs}");
+    Ok(())
 }
 
 #[test]
@@ -916,7 +921,7 @@ fn unknown_extension_namespace_stanza_after_binding_closes_the_stream() -> TestR
 
 #[test]
 fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
     for (request, kind, id, condition, from) in [
@@ -1023,8 +1028,11 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
         client.expect_xml("<iq xmlns='jabber:client' type='result' id='sentinel' to='alice@localhost/desktop'><query xmlns='jabber:iq:roster'/></iq>")?;
     }
     client.close()?;
-    let logs = suite.wait_for_log("stream disconnected")?;
-    assert!(!logs.contains("bad@") && !logs.contains("private payload"));
+    let logs = suite.stop_with_logs()?;
+    assert!(
+        !logs.contains("bad@") && !logs.contains("private payload"),
+        "{logs}"
+    );
     Ok(())
 }
 
@@ -1141,7 +1149,7 @@ fn fatal_errors_in_rejected_envelopes_withdraw_the_bound_resource() -> TestResul
 
 #[test]
 fn peer_stream_errors_end_each_open_stream_phase_without_a_reciprocal_error() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for condition in ["policy-violation", "future-condition"] {
         let error = format!(
@@ -1167,8 +1175,9 @@ fn peer_stream_errors_end_each_open_stream_phase_without_a_reciprocal_error() ->
             client.expect_end()?;
         }
     }
-    let logs = suite.wait_for_log("peer_stream_error")?;
-    assert!(!logs.contains("private peer error text"));
+    suite.wait_for_closed("peer_stream_error", 10)?;
+    let logs = suite.stop_with_logs()?;
+    assert!(!logs.contains("private peer error text"), "{logs}");
     Ok(())
 }
 

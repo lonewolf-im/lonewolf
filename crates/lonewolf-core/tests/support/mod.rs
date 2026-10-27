@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 mod client;
 mod extensions;
 mod server;
@@ -25,6 +29,56 @@ pub const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
 pub const ROSTER_VERSIONING_NAMESPACE: &str = "urn:xmpp:features:rosterver";
 pub const PRE_APPROVAL_NAMESPACE: &str = "urn:xmpp:features:pre-approval";
 pub const STREAM_ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-streams";
+
+const SIGNAL_DIRECTORY: &str = "signals";
+
+#[derive(Clone, Copy, Debug)]
+pub enum Signal {
+    PrecommitHandlerWaiting,
+    PrecommitHandlerCompleted,
+    PrecommitHandlerCancelled,
+    PrecommitEffectsDelivered,
+    PrecommitAudienceWaiting,
+    PrecommitBacklogWaiting,
+    OfflineStoreWaiting,
+    OfflineAcknowledgementWaiting,
+    ServicePresenceWaiting,
+    ServiceWithdrawalStored,
+    ServiceWithdrawalHandled,
+}
+
+impl Signal {
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::PrecommitHandlerWaiting => "precommit-handler-waiting",
+            Self::PrecommitHandlerCompleted => "precommit-handler-completed",
+            Self::PrecommitHandlerCancelled => "precommit-handler-cancelled",
+            Self::PrecommitEffectsDelivered => "precommit-effects-delivered",
+            Self::PrecommitAudienceWaiting => "precommit-audience-waiting",
+            Self::PrecommitBacklogWaiting => "precommit-backlog-waiting",
+            Self::OfflineStoreWaiting => "offline-store-waiting",
+            Self::OfflineAcknowledgementWaiting => "offline-acknowledgement-waiting",
+            Self::ServicePresenceWaiting => "service-presence-waiting",
+            Self::ServiceWithdrawalStored => "service-withdrawal-stored",
+            Self::ServiceWithdrawalHandled => "service-withdrawal-handled",
+        }
+    }
+
+    /// Each raise appends one byte, so the file length counts occurrences.
+    pub fn path(self, fixture: &Path) -> PathBuf {
+        fixture.join(SIGNAL_DIRECTORY).join(self.file_name())
+    }
+
+    // The server runs in the fixture directory, so relative paths reach the test.
+    fn raise(self) -> std::io::Result<()> {
+        fs::create_dir_all(SIGNAL_DIRECTORY)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path(Path::new("")))?
+            .write_all(b"\n")
+    }
+}
 
 pub fn barrier(client: &mut Client) -> TestResult {
     client.send("<iq type='get' id='barrier'><query xmlns='urn:test:barrier'/></iq>")?;

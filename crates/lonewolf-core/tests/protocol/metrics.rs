@@ -11,7 +11,7 @@ fn sample_value(body: &str, series: &str) -> Option<f64> {
 
 #[test]
 fn metrics_endpoint_reports_build_information() -> TestResult {
-    let mut suite = C2sSuite::with_metrics()?;
+    let mut suite = C2sSuite::start()?;
     let body = suite.wait_for_metric("lonewolf_log_dropped_lines_total 0")?;
     assert_eq!(
         sample_value(
@@ -36,7 +36,7 @@ fn metrics_endpoint_reports_build_information() -> TestResult {
 
 #[test]
 fn storage_commits_are_reported_per_store() -> TestResult {
-    let mut suite = C2sSuite::with_metrics()?;
+    let mut suite = C2sSuite::start()?;
     let series = "lonewolf_storage_commit_duration_seconds_count{store=\"primary\"}";
     let before = suite.scrape_metrics()?;
     let before = sample_value(&before, series).ok_or("missing storage commit count")?;
@@ -50,7 +50,7 @@ fn storage_commits_are_reported_per_store() -> TestResult {
 
 #[test]
 fn router_sessions_and_message_outcomes_are_reported() -> TestResult {
-    let mut suite = C2sSuite::with_metrics()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     suite.create_account("bob", OTHER_PASSWORD)?;
     let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
@@ -74,7 +74,7 @@ fn router_sessions_and_message_outcomes_are_reported() -> TestResult {
 
 #[test]
 fn client_connection_lifecycle_is_reported() -> TestResult {
-    let mut suite = C2sSuite::with_metrics()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     client.bind(Some("desk"))?;
@@ -102,10 +102,8 @@ fn admission_rejections_are_reported_by_limit() -> TestResult {
     use std::net::TcpStream;
     use std::time::{Duration, Instant};
 
-    let mut suite = C2sSuite::with_metrics_settings(
-        "connection_attempts_per_ip = { per_second = 1, burst = 1 }",
-        10,
-    )?;
+    let mut suite =
+        C2sSuite::with_limits("connection_attempts_per_ip = { per_second = 1, burst = 1 }")?;
     let connections: Vec<_> = (0..5)
         .map(|_| TcpStream::connect(suite.address))
         .collect::<Result<_, _>>()?;
@@ -126,7 +124,7 @@ fn admission_rejections_are_reported_by_limit() -> TestResult {
 
 #[test]
 fn authentication_and_binding_outcomes_are_reported() -> TestResult {
-    let mut suite = C2sSuite::with_metrics_settings("", 1)?;
+    let mut suite = C2sSuite::resource_limit(1)?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     client.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'/>")?;
@@ -167,10 +165,8 @@ fn authentication_and_binding_outcomes_are_reported() -> TestResult {
 fn stanza_byte_and_rate_limit_counters_are_reported() -> TestResult {
     use std::time::{Duration, Instant};
 
-    let mut suite = C2sSuite::with_metrics_settings(
-        "new_recipients_per_connection = { per_second = 1, burst = 1 }",
-        10,
-    )?;
+    let mut suite =
+        C2sSuite::with_limits("new_recipients_per_connection = { per_second = 1, burst = 1 }")?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<message to='bob@localhost' type='chat'/><message to='carol@localhost' type='chat'/><message to='dave@localhost' type='chat'/><iq type='get' id='metrics-barrier'><query xmlns='urn:test:metrics-barrier'/></iq>")?;

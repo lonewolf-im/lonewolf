@@ -3,14 +3,13 @@
 #[path = "support/process.rs"]
 mod process;
 
-use process::{Server, TIMEOUT, field};
+use process::{Server, TIMEOUT, field, request};
 
 #[path = "../support/ports.rs"]
 mod ports;
 
 use std::error::Error;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener};
 use std::time::Instant;
 
 use nix::sys::signal::Signal;
@@ -24,20 +23,6 @@ impl Server {
                 && (!metrics_enabled || logs.contains("metrics service started"))
         })
     }
-}
-
-fn request(port: u16, path: &str) -> Result<String, Box<dyn Error>> {
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    )?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
 }
 
 #[test]

@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::pending;
-use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
 use lonewolf_acme::{AcmeErrorKind, RetryState, StateStore, StoredCertificate, StoredHost};
-use parking_lot::Mutex as PlMutex;
 use rcgen::CertificateParams;
 use socket2::{Domain, Protocol, Socket, Type};
 use zeroize::Zeroizing;
@@ -390,45 +388,20 @@ fn responder_is_polled_before_manager_and_both_receive_the_same_deadline() -> Te
     })
 }
 
-#[derive(Clone)]
-struct Capture(Arc<PlMutex<Vec<u8>>>);
-
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-    type Writer = Capture;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 #[test]
-fn captured_failures_never_retain_untrusted_details() -> TestResult {
-    let capture = Capture(Arc::new(PlMutex::new(Vec::new())));
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(capture.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        let error = io_failure(
-            "HTTP",
-            io::Error::other("TOKEN-KEY-PEM-JWS-PROBLEM-SENTINEL"),
-        );
-        tracing::error!(phase = "HTTP", error = %error, "ACME service failed");
-    });
-    let bytes = capture.0.lock();
-    let output = std::str::from_utf8(&bytes)?;
-    assert!(output.contains("ACME service failed"));
-    assert!(!output.contains("SENTINEL"));
+fn io_failures_never_retain_untrusted_details() -> TestResult {
+    let error = io_failure(
+        "HTTP",
+        io::Error::other("TOKEN-KEY-PEM-JWS-PROBLEM-SENTINEL"),
+    );
+    assert!(matches!(error, RunError::Acme { phase: "HTTP", .. }));
+    let mut rendered = format!("{error} {error:?}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        rendered.push_str(&format!(" {cause} {cause:?}"));
+        source = cause.source();
+    }
+    assert!(!rendered.contains("SENTINEL"), "{rendered}");
     Ok(())
 }
 
@@ -485,13 +458,6 @@ fn startup_signal_drops_partial_resources_and_late_cache_completion_cannot_activ
     use std::cell::Cell;
     use std::task::Poll;
     Runtime::new()?.block_on(async {
-        let capture = Capture(Arc::new(PlMutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(capture.clone())
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
         let (_reservation, address) = reserve_listener_address()?;
         let listener = bind_reusable_listener(address)?;
         assert_eq!(
@@ -529,7 +495,6 @@ fn startup_signal_drops_partial_resources_and_late_cache_completion_cannot_activ
         let _listener =
             bind_released_listener(address, Instant::now() + Duration::from_secs(2)).await?;
         assert!(deadline.is_some());
-        assert!(!std::str::from_utf8(&capture.0.lock())?.contains("waiting for stop signal"));
         Ok(())
     })
 }

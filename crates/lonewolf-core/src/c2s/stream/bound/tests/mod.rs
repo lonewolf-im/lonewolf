@@ -22,7 +22,7 @@ use lonewolf_storage::account::{AccountWrites, NewAccount};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_util::arena::{AllocationError, Chunk, GlobalChunkAllocator};
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
-use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
+use parking_lot::Mutex as PlMutex;
 
 use super::super::close;
 use super::*;
@@ -1085,9 +1085,8 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ControlledAcknowledge
                 return Err(HandlerError::Internal {
                     condition: StanzaErrorCondition::InternalServerError,
                     failure: storage_failure(
-                        lonewolf_storage::StorageError::with_source(
+                        crate::delivery::failure_tests::seeded_error(
                             lonewolf_storage::StorageErrorKind::Unavailable,
-                            std::io::Error::other("sensitive-seeded-storage-source"),
                         ),
                         "offline_acknowledge",
                     ),
@@ -1104,50 +1103,11 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ControlledAcknowledge
     }
 }
 
-struct LogWriter(PlMutex<std::fs::File>);
-
-struct LogWriterGuard<'a>(PlMutexGuard<'a, std::fs::File>);
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
-    type Writer = LogWriterGuard<'a>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        LogWriterGuard(self.0.lock())
-    }
-}
-
-impl std::io::Write for LogWriterGuard<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.write(bytes)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-
-    fn write_vectored(&mut self, buffers: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
-        self.0.write_vectored(buffers)
-    }
-
-    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.0.write_all(bytes)
-    }
-
-    fn write_fmt(&mut self, arguments: std::fmt::Arguments<'_>) -> std::io::Result<()> {
-        self.0.write_fmt(arguments)
-    }
-}
-
 #[test]
 fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_later_flush()
 -> TestResult {
-    let log = tempfile::NamedTempFile::new()?;
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(LogWriter(PlMutex::new(log.reopen()?)))
-        .finish();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let capture = crate::delivery::failure_tests::Capture::default();
+    let _subscriber = tracing::subscriber::set_default(capture.clone());
     Runtime::new()?.block_on(async {
         let fixture = Fixture::new(&[MESSAGE]).await?;
         let handler = Arc::new(ControlledAcknowledgement {
@@ -1193,11 +1153,10 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
             .await?;
         assert_eq!(handler.calls.load(Ordering::Relaxed), 2);
         assert_eq!(fixture.count().await?, 0);
-        let logs = std::fs::read_to_string(log.path())?;
-        assert_eq!(logs.matches("internal operation failed").count(), 1);
-        assert!(logs.contains("failure_kind=\"storage_unavailable\""));
-        assert!(logs.contains("operation=\"offline_acknowledge\""));
-        assert!(!logs.contains("sensitive-seeded-storage-source"));
+        capture.assert_one(
+            FailureKind::Storage(lonewolf_storage::StorageErrorKind::Unavailable),
+            "offline_acknowledge",
+        );
         drop(outbox);
         fixture.finish().await
     })

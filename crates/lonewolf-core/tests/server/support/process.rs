@@ -2,6 +2,8 @@
 
 use std::error::Error;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -89,4 +91,18 @@ pub(super) fn field(line: &str, key: &str) -> Result<usize, Box<dyn Error>> {
         .find_map(|field| field.strip_prefix(key))
         .ok_or_else(|| format!("missing {key} in {line}").into())
         .and_then(|value| value.parse().map_err(Into::into))
+}
+
+pub(super) fn request(port: u16, path: &str) -> Result<String, Box<dyn Error>> {
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_write_timeout(Some(TIMEOUT))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }

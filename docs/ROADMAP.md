@@ -59,7 +59,7 @@ numbers or require unrelated features to ship together.
 
 ## Current development foundation
 
-The workspace version is 0.2.0. The [release notes](releases/v0.2.0.md) describe
+The workspace version is 0.2.0. The [release notes](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.2.0) describe
 the changes since v0.1.0. Development releases do not imply full server compliance.
 
 The foundation includes local routing, roster and subscriptions, presence,

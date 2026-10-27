@@ -3,13 +3,13 @@
 use lonewolf_util::arena::ArenaRead;
 use lonewolf_xmpp::stanza::{
     CLIENT_NAMESPACE, Element, ElementRef, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, MessageType,
-    NodeRef, Stanza, StanzaNamespace, StanzaType,
+    NodeRef, Stanza, StanzaNamespace, StanzaType, forwarding,
 };
 
 use super::*;
 use crate::archive::ArchiveId;
+use crate::carbons::NAMESPACE;
 use crate::carbons::copy::{Original, build};
-use crate::carbons::{FORWARD_NAMESPACE, NAMESPACE};
 use crate::delivery::HostLookup;
 use crate::observer::MessageRole;
 
@@ -308,7 +308,7 @@ fn copies_reparse_as_client_stanzas() -> TestResult {
                 )?
                 .ok_or("container")?;
             let forwarded = container
-                .child("forwarded", FORWARD_NAMESPACE)?
+                .child("forwarded", forwarding::NAMESPACE)?
                 .ok_or("forwarded")?;
             let inner = forwarded
                 .child("message", CLIENT_NAMESPACE)?

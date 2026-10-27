@@ -3,11 +3,13 @@
 use std::cell::{Cell, RefCell};
 
 use lonewolf_storage::RedbStorage;
-use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, MAX_ELEMENT_DEPTH, MessageType, StanzaType};
+use lonewolf_xmpp::stanza::{
+    CLIENT_NAMESPACE, MAX_ELEMENT_DEPTH, MessageType, StanzaType, forwarding,
+};
 
 use super::*;
 use crate::archive::ArchiveId;
-use crate::carbons::{FORWARD_NAMESPACE, NAMESPACE};
+use crate::carbons::NAMESPACE;
 use crate::delivery::{
     CopyFactory, Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionId, SessionTag,
     StanzaFactory,
@@ -305,7 +307,7 @@ fn observer_adds_the_senders_archive_id_only_to_sent_copies() -> TestResult {
                     )?
                     .ok_or("container")?;
                 let forwarded = container
-                    .child("forwarded", FORWARD_NAMESPACE)?
+                    .child("forwarded", forwarding::NAMESPACE)?
                     .ok_or("forwarded")?;
                 let inner = forwarded
                     .child("message", CLIENT_NAMESPACE)?

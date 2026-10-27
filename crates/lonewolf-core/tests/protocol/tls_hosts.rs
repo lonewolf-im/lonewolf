@@ -138,7 +138,7 @@ fn selected_idn_and_ip_hosts_reject_unrelated_sni() -> TestResult {
             ServerName::try_from("unrelated.example")?,
         )?;
         assert!(client.transport().flush().is_err() || client.open_with(&opening(domain)).is_err());
-        suite.wait_for_log("outcome=\"tls_failure\"")?;
+        suite.wait_for_closed("tls_failure", 1)?;
         let mut selected = suite.unauthenticated_client()?;
         selected.close()?;
         suite.stop()?;
@@ -230,7 +230,7 @@ fn pending_managed_host_rejects_starttls_before_proceed_without_disrupting_file_
     pending.expect_footer()?;
     pending.send("</stream:stream>")?;
     pending.expect_eof()?;
-    suite.wait_for_log("outcome=\"starttls_rejected\"")?;
+    suite.wait_for_closed("starttls_rejected", 1)?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut healthy = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     healthy.close()?;

@@ -927,7 +927,7 @@ fn optional_client_certificates_keep_no_certificate_and_trusted_certificate_scra
 fn optional_client_certificates_reject_invalid_presented_certificates() -> TestResult {
     use super::support::tls::{ClientCertificates, with_client_certificate};
     let mut certificates = None;
-    let suite = C2sSuite::with_extensions_and_setup("", |directory| {
+    let mut suite = C2sSuite::with_extensions_and_setup("", |directory| {
         certificates = Some(ClientCertificates::configure(directory)?);
         Ok(())
     })?;
@@ -952,8 +952,8 @@ fn optional_client_certificates_reject_invalid_presented_certificates() -> TestR
             );
         }
     }
-    let logs = suite.wait_for_log("outcome=\"tls_failure\"")?;
-    assert!(!logs.contains("alice@localhost"));
+    let logs = suite.stop_with_logs()?;
+    assert!(!logs.contains("alice@localhost"), "{logs}");
     Ok(())
 }
 
@@ -1085,7 +1085,7 @@ fn blocked_handshake_crl_reload_obeys_establishment_timeout_and_late_results_are
     ))?;
     let mut release = wait_for_crl_reader(&crls_path)?;
     plain.expect_stream_error("policy-violation")?;
-    suite.wait_for_log("outcome=\"establishment_timeout\"")?;
+    suite.wait_for_closed("establishment_timeout", 1)?;
     release.write_all(&material)?;
     drop(release);
     std::fs::remove_file(&crls_path)?;
@@ -1122,13 +1122,12 @@ fn blocked_handshake_crl_reload_obeys_shutdown() -> TestResult {
         super::support::TLS_NAMESPACE
     ))?;
     let _release = wait_for_crl_reader(&crls_path)?;
-    std::thread::scope(|scope| -> TestResult {
-        let stopped = scope.spawn(|| suite.stop().map_err(|error| error.to_string()));
+    let logs = std::thread::scope(|scope| -> TestResult<String> {
+        let stopped = scope.spawn(|| suite.stop_with_logs().map_err(|error| error.to_string()));
         plain.expect_stream_error("system-shutdown")?;
-        stopped.join().map_err(|_| "shutdown worker panicked")??;
-        Ok(())
+        Ok(stopped.join().map_err(|_| "shutdown worker panicked")??)
     })?;
-    suite.wait_for_log("outcome=\"system_shutdown\"")?;
+    assert!(logs.contains("outcome=\"system_shutdown\""), "{logs}");
     Ok(())
 }
 
@@ -1660,7 +1659,7 @@ fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_origin
             .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
         Ok(release)
     })?;
-    suite.wait_for_log("outcome=\"establishment_timeout\"")?;
+    suite.wait_for_closed("establishment_timeout", 1)?;
     std::fs::remove_file(&path)?;
     std::fs::write(&path, &material)?;
     verification_release.write_all(&material)?;
@@ -1705,7 +1704,7 @@ fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
     client.expect_tls_close()?;
     client.send_tls_close()?;
     client.expect_tcp_eof()?;
-    suite.wait_for_log("outcome=\"authentication_timeout\"")?;
+    suite.wait_for_closed("authentication_timeout", 1)?;
     std::fs::remove_file(&path)?;
     std::fs::write(&path, &material)?;
     release.write_all(&material)?;

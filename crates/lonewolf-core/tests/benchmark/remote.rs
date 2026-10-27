@@ -28,15 +28,8 @@ fn binary() -> &'static Path {
 }
 
 fn server() -> TestResult<C2sSuite> {
-    C2sSuite::with_extensions_limits_and_setup("'roster', 'offline'", LIMITS, |path| {
-        fs::OpenOptions::new()
-            .append(true)
-            .open(path.join("lonewolf.toml"))?
-            .write_all(b"\n[metrics]\nenabled=true\naddress='127.0.0.1:0'\n")?;
-        Ok(())
-    })
+    C2sSuite::with_extensions_limits_and_setup("'roster', 'offline'", LIMITS, |_| Ok(()))
 }
-use std::io::Write;
 
 fn inputs(
     directory: &Path,
@@ -201,7 +194,7 @@ fn remote_cli_verifies_dns_over_loopback_and_runs_all_topologies_without_admin_e
             scenario,
         )?;
         if let TargetConfig::Remote { metrics_url, .. } = &mut config.target {
-            *metrics_url = Some(format!("http://{}/metrics", server.metrics_address()?));
+            *metrics_url = Some(format!("http://{}/metrics", server.metrics_address()));
         }
         let path = config_file(directory.path(), name, &config)?;
         let output_path = directory.path().join(name);

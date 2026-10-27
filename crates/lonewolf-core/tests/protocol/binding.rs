@@ -227,8 +227,8 @@ fn assert_generated_identifier(jid: &str) -> TestResult {
     Ok(())
 }
 
-fn assert_generated_resource_lifecycle(suite: &C2sSuite, resource: &str) -> TestResult {
-    let logs = suite.wait_for_log("stream disconnected")?;
+fn assert_generated_resource_lifecycle(suite: &mut C2sSuite, resource: &str) -> TestResult {
+    let logs = suite.stop_with_logs()?;
     let bound = logs
         .lines()
         .find(|line| line.contains("resource bound"))
@@ -242,37 +242,37 @@ fn assert_generated_resource_lifecycle(suite: &C2sSuite, resource: &str) -> Test
 
 #[test]
 fn empty_resource_gets_a_generated_identifier() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     assert_generated_identifier(&client.bind(Some(""))?)?;
     client.close()?;
-    assert_generated_resource_lifecycle(&suite, "")
+    assert_generated_resource_lifecycle(&mut suite, "")
 }
 
 #[test]
 fn oversized_resource_gets_a_generated_identifier() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let resource = "x".repeat(1100);
 
     assert_generated_identifier(&client.bind(Some(&resource))?)?;
     client.close()?;
-    assert_generated_resource_lifecycle(&suite, &resource)
+    assert_generated_resource_lifecycle(&mut suite, &resource)
 }
 
 #[test]
 fn unpreparable_resource_gets_a_generated_identifier() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let mut suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let resource = "private\u{200b}resource";
 
     assert_generated_identifier(&client.bind(Some(resource))?)?;
     client.close()?;
-    assert_generated_resource_lifecycle(&suite, resource)
+    assert_generated_resource_lifecycle(&mut suite, resource)
 }
 
 #[test]
@@ -482,7 +482,7 @@ fn resource_limit_allows_retry_after_another_client_disconnects() -> TestResult 
     </iq>")?;
 
     desktop.close()?;
-    suite.wait_for_log("stream disconnected")?;
+    suite.wait_for_closed("stream_end", 1)?;
     assert_eq!(phone.bind(Some("phone"))?, "alice@localhost/phone");
     phone.close()
 }
@@ -867,7 +867,7 @@ fn ignored_pre_bind_responses_do_not_extend_the_shaped_binding_deadline() -> Tes
     client.send("<iq type='result' id='reply'/><iq type='result'/><iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
     client.expect_stream_error("policy-violation")?;
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    suite.wait_for_log("outcome=\"binding_timeout\"")?;
+    suite.wait_for_closed("binding_timeout", 1)?;
     let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()
 }

@@ -199,7 +199,7 @@ fn stanza_shaping_does_not_extend_the_resource_binding_deadline() -> TestResult 
 
 #[test]
 fn new_recipient_budget_rejects_fourth_without_poisoning_recent_recipients() -> TestResult {
-    let suite = C2sSuite::with_extensions_limits_and_setup(
+    let mut suite = C2sSuite::with_extensions_limits_and_setup(
         "'roster'",
         "new_recipients_per_connection = { per_second = 1, burst = 3 }",
         |directory| {
@@ -237,7 +237,10 @@ fn new_recipient_budget_rejects_fourth_without_poisoning_recent_recipients() -> 
     }
     recipients[3].expect_no_tls_input()?;
     alice.close()?;
-    let logs = suite.wait_for_log("stream disconnected")?;
+    for recipient in &mut recipients {
+        recipient.close()?;
+    }
+    let logs = suite.stop_with_logs()?;
     let rejections: Vec<_> = logs
         .lines()
         .filter(|line| line.contains("recipient_rate"))
@@ -251,9 +254,6 @@ fn new_recipient_budget_rejects_fourth_without_poisoning_recent_recipients() -> 
             !event.contains("fourth") && !event.contains("retry"),
             "{event}"
         );
-    }
-    for recipient in &mut recipients {
-        recipient.close()?;
     }
     Ok(())
 }

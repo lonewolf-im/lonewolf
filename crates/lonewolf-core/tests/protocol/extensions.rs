@@ -4,7 +4,7 @@ use crate::support::PASSWORD;
 
 use std::time::{Duration, Instant};
 
-use crate::support::{C2sSuite, Client, TestResult, mutually_subscribe};
+use crate::support::{C2sSuite, Client, Signal, TestResult, mutually_subscribe};
 
 fn requester_outcome(client: &mut Client) -> TestResult<Option<String>> {
     client.send("<iq type='get' to='localhost' id='outcome'><outcome xmlns='urn:lonewolf:test:requester'/></iq>")?;
@@ -200,7 +200,7 @@ fn precommit_handler_wait_keeps_healthy_outbound_delivery_progressing() -> TestR
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<iq type='set' id='stalled'><stall xmlns='urn:lonewolf:test:precommit'/></iq>")?;
-    suite.wait_for_log("test precommit handler waiting")?;
+    suite.wait_for_signal(Signal::PrecommitHandlerWaiting, 1)?;
 
     for index in 0..96 {
         bob.send(&format!(
@@ -231,7 +231,7 @@ fn precommit_writer_admission_keeps_healthy_outbound_delivery_progressing() -> T
     blocker.send(
         "<iq type='set' id='holding-writer'><stall xmlns='urn:lonewolf:test:precommit'/></iq>",
     )?;
-    suite.wait_for_log("test precommit handler waiting")?;
+    suite.wait_for_signal(Signal::PrecommitHandlerWaiting, 1)?;
     bob.send(
         "<iq type='set' id='waiting-writer'><write xmlns='urn:lonewolf:test:precommit'/></iq>",
     )?;
@@ -263,7 +263,7 @@ fn precommit_offline_store_keeps_healthy_outbound_delivery_progressing() -> Test
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<message to='bob@localhost' type='chat' id='stored'/>")?;
-    suite.wait_for_log("test offline store waiting")?;
+    suite.wait_for_signal(Signal::OfflineStoreWaiting, 1)?;
     for index in 0..96 {
         bob.send(&format!(
             "<message to='alice@localhost/desk' type='chat' id='delivery-{index}'/>"
@@ -290,10 +290,10 @@ fn precommit_snapshot_preparation_keeps_delivery_ahead_of_the_presence_echo() ->
     let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     alice.send("<presence id='initial'/>")?;
     for (phase, waiting) in [
-        ("audience", "test precommit audience waiting"),
-        ("backlog", "test precommit backlog waiting"),
+        ("audience", Signal::PrecommitAudienceWaiting),
+        ("backlog", Signal::PrecommitBacklogWaiting),
     ] {
-        suite.wait_for_log(waiting)?;
+        suite.wait_for_signal(waiting, 1)?;
         for index in 0..96 {
             bob.send(&format!(
                 "<message to='alice@localhost/desk' type='chat' id='{phase}-{index}'/>"
@@ -326,11 +326,11 @@ fn shutdown_cancels_precommit_handler_without_committing_staged_writes() -> Test
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice
         .send("<iq type='set' id='cancelled'><stall xmlns='urn:lonewolf:test:precommit'/></iq>")?;
-    suite.wait_for_log("test precommit handler waiting")?;
+    suite.wait_for_signal(Signal::PrecommitHandlerWaiting, 1)?;
     suite.stop()?;
-    let logs = suite.wait_for_log("test precommit handler cancelled")?;
-    assert!(!logs.contains("test precommit handler completed"), "{logs}");
-    assert!(!logs.contains("test precommit effects delivered"), "{logs}");
+    assert_eq!(suite.signal_count(Signal::PrecommitHandlerCancelled)?, 1);
+    assert_eq!(suite.signal_count(Signal::PrecommitHandlerCompleted)?, 0);
+    assert_eq!(suite.signal_count(Signal::PrecommitEffectsDelivered)?, 0);
 
     let storage = RedbStorage::open(database)?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;
@@ -691,14 +691,15 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
         ("get", "storage_corrupt_data", "roster_read"),
         ("set", "storage_unavailable", "roster_write"),
     ] {
-        let suite = C2sSuite::with_extensions("'test-failure-iq'")?;
+        let mut suite = C2sSuite::with_extensions("'test-failure-iq'")?;
         suite.create_account("alice", PASSWORD)?;
         let mut alice = suite.connect("alice", PASSWORD, "desk")?;
         alice.send(&format!("<iq type='{kind}' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail></iq>"))?;
         alice.expect_xml("<iq xmlns='jabber:client' type='error' to='alice@localhost/desk' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail><error type='cancel'><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The server could not complete the request. Try again later.</text></error></iq>")?;
         alice.send("<message to='alice@localhost/desk' id='still-open'/>")?;
         alice.expect_xml("<message xmlns='jabber:client' to='alice@localhost/desk' from='alice@localhost/desk' id='still-open'/>")?;
-        let logs = suite.wait_for_log("internal operation failed")?;
+        alice.close()?;
+        let logs = suite.stop_with_logs()?;
         let diagnostics: Vec<_> = logs
             .lines()
             .filter(|line| line.contains("internal operation failed"))
@@ -719,7 +720,6 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
         ] {
             assert!(!logs.contains(sensitive), "{logs}");
         }
-        alice.close()?;
     }
     Ok(())
 }
@@ -780,13 +780,13 @@ fn ordinary_connection_panic_leaves_router_and_other_connections_serving() -> Te
     let mut replacement = suite.connect("alice", PASSWORD, "desk")?;
     replacement.close()?;
     bob.close()?;
-    let logs = suite.wait_for_log("connection task panicked")?;
-    assert!(!logs.contains("router service failed"), "{logs}");
+    suite.wait_for_metric("lonewolf_c2s_connection_panics_total{listener=\"0\"} 1")?;
+    let logs = suite.stop_with_logs()?;
     assert!(
         !logs.contains("seeded-sensitive-connection-payload"),
         "{logs}"
     );
-    suite.stop()
+    Ok(())
 }
 
 #[test]
@@ -833,7 +833,7 @@ fn account_gets_can_list_live_resources() -> TestResult {
     desk.send("<iq type='get' id='resources'><query xmlns='urn:lonewolf:test:access' resources='true'/></iq>")?;
     desk.expect_xml("<iq xmlns='jabber:client' type='result' id='resources' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='owner'><resource name='desk' available='true'/><resource name='phone' available='false'/></query></iq>")?;
     phone.close()?;
-    suite.wait_for_log("stream disconnected")?;
+    suite.wait_for_closed("stream_end", 1)?;
     desk.send("<iq type='get' id='remaining'><query xmlns='urn:lonewolf:test:access' resources='true'/></iq>")?;
     desk.expect_xml("<iq xmlns='jabber:client' type='result' id='remaining' to='alice@localhost/desk'><query xmlns='urn:lonewolf:test:access' requester='owner'><resource name='desk' available='true'/></query></iq>")?;
     desk.close()

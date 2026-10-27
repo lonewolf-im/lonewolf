@@ -160,7 +160,7 @@ fn directed_presence_follows_policy() -> TestResult {
     alice.send("<presence to='blocked@localhost/x'/>")?;
     barrier(&mut alice)?;
     alice.close()?;
-    suite.wait_for_log("stream disconnected")?;
+    suite.wait_for_closed("stream_end", 1)?;
     toggle(&mut bob, false)?;
     bob.send("<message type='chat' to='blocked@localhost/x' id='first'/>")?;
     blocked.expect_xml("<message xmlns='jabber:client' from='bob@localhost/res' to='blocked@localhost/x' type='chat' id='first'/>")?;

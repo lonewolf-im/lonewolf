@@ -275,7 +275,7 @@ fn account_items_list_resources_by_relationship() -> TestResult {
     carol.send("<iq type='get' to='alice@localhost' id='items'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
     carol.expect_xml("<iq xmlns='jabber:client' type='result' id='items' from='alice@localhost' to='carol@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
     alice_phone.close()?;
-    suite.wait_for_log("stream disconnected")?;
+    suite.wait_for_closed("stream_end", 1)?;
     alice_desk.send("<iq type='get' to='alice@localhost' id='after-close'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
     alice_desk.expect_xml("<iq xmlns='jabber:client' type='result' id='after-close' from='alice@localhost' to='alice@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'><item jid='alice@localhost/desk'/></query></iq>")?;
     alice_desk.close()?;

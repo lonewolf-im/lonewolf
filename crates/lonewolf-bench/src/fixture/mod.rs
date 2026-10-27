@@ -470,6 +470,7 @@ impl LocalFixture {
                 .collector
                 .as_ref()
                 .ok_or_else(|| failure("fixture_capture"))?;
+            let mut capture_closed = false;
             loop {
                 match collector.receiver.try_recv() {
                     Ok(Startup::C2s(port)) => c2s = Some(port),
@@ -478,9 +479,13 @@ impl LocalFixture {
                     Ok(Startup::Failed) => return Err(failure("fixture_startup_capture")),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        return Err(failure("fixture_startup_capture"));
+                        capture_closed = true;
+                        break;
                     }
                 }
+            }
+            if capture_closed {
+                return Err(self.closed_capture_failure(deadline).await);
             }
             if let (Some(port), Some(metrics_port), true) = (c2s, metrics, ready) {
                 self.metrics = format!("http://127.0.0.1:{metrics_port}/metrics");
@@ -496,6 +501,22 @@ impl LocalFixture {
             sleep(Duration::from_millis(5)).await;
         }
     }
+    // An exiting server closes stderr before its exit status is observable.
+    async fn closed_capture_failure(&mut self, deadline: Instant) -> BenchError {
+        loop {
+            match self.child.as_mut().map(Child::try_wait) {
+                Some(Ok(Some(_))) => {
+                    self.reaped = true;
+                    return failure("fixture_startup_exit");
+                }
+                Some(Ok(None)) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(5)).await;
+                }
+                _ => return failure("fixture_startup_capture"),
+            }
+        }
+    }
+
     pub async fn stop(&mut self, timeout: Duration) -> BenchResult<StopOutcome> {
         let deadline = Instant::now()
             .checked_add(timeout)

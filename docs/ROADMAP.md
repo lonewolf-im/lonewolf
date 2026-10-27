@@ -59,8 +59,8 @@ numbers or require unrelated features to ship together.
 
 ## Current development foundation
 
-The workspace version is 0.1.0. This describes the implemented foundation, not a
-published release or a claim of full server compliance.
+The workspace version is 0.2.0. The [release notes](releases/v0.2.0.md) describe
+the changes since v0.1.0. Development releases do not imply full server compliance.
 
 The foundation includes local routing, roster and subscriptions, presence,
 offline storage and replay, STARTTLS, authentication, resource binding, and
@@ -89,8 +89,10 @@ they do not establish S2S or extension compliance.
 
 ## Desktop discovery, profiles, and synchronization
 
-Implement discovery first, then vCards and Carbons. Use the existing per-host
-extension slots and discovery data.
+Version 0.2.0 includes the local C2S discovery, vCard, Ping, and Carbons roles
+listed below. See the [standards reference](STANDARDS.md) for reviewed revisions,
+limits, and verification evidence. Milestone completion still requires the
+client checks below.
 
 | XEP | Required scope | Basis |
 | --- | --- | --- |

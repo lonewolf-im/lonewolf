@@ -18,6 +18,9 @@ Start small, grow when you need to, and keep your server easy to run.
 > Lonewolf is early, pre-1.0 software. Today it can host chat between accounts on
 > domains you run. Federation with other XMPP servers is next on the
 > [roadmap](docs/ROADMAP.md); clustering comes later.
+>
+> Most of Lonewolf's code, tests and docs are written with AI coding agents. The
+> maintainer sets the design and scope and reviews the changes.
 
 ## Why Lonewolf?
 
@@ -28,9 +31,9 @@ Start small, grow when you need to, and keep your server easy to run.
   operation are on the [roadmap](docs/ROADMAP.md).
 - **Light on resources.** It's a native Rust binary built to be frugal with
   memory and CPU.
-- **Correct by design.** Lonewolf follows the core XMPP RFCs
+- **Standards first.** Lonewolf follows the core XMPP RFCs
   ([RFC 6120](https://www.rfc-editor.org/rfc/rfc6120.html) and friends) closely,
-  so standards-compliant clients behave the way you'd expect.
+  aiming for standards-compliant clients to behave the way you'd expect.
 - **Limits you can see.** Connections, stanzas, rates, and resources all have
   explicit, configurable limits, so one misbehaving client can't quietly take
   down your server.
@@ -215,6 +218,9 @@ Found a bug or have an idea? [Open an issue](https://github.com/lonewolf-im/lone
 For bug reports, it helps to include the commit you built, your platform, the
 relevant config, and steps to reproduce. Please strip out passwords and private
 messages first.
+
+Found a security problem? Please report it privately instead; see
+[SECURITY.md](SECURITY.md).
 
 Thinking about a new feature? Check the [roadmap](docs/ROADMAP.md) first. It may
 already be planned, and it helps us figure out where the feature fits.

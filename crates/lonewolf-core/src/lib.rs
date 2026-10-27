@@ -39,6 +39,8 @@ pub(crate) mod router;
 mod shutdown;
 mod stages;
 mod storage;
+#[cfg(test)]
+mod test_ports;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support;

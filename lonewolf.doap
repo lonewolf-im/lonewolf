@@ -5,7 +5,7 @@
          xmlns="http://usefulinc.com/ns/doap#">
   <Project>
     <name>Lonewolf</name>
-    <shortdesc xml:lang="en">Self-hosted XMPP server in Rust with embedded storage</shortdesc>
+    <shortdesc xml:lang="en">A standalone XMPP server written in Rust</shortdesc>
     <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as one binary with embedded storage, so there is no separate database to set up. It is early, pre-1.0 software that hosts chat between accounts on the domains you run. Federation with other servers is next on the roadmap.</description>
 
     <homepage rdf:resource="https://github.com/lonewolf-im/lonewolf"/>

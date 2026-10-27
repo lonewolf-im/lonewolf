@@ -315,19 +315,6 @@ ca_certificates_path = {:?}
     pub fn logs(&self) -> TestResult<String> {
         Ok(fs::read_to_string(self.path().join("server.log"))?)
     }
-    pub fn wait_log(&self, event: &str) -> TestResult<String> {
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let logs = self.logs()?;
-            if logs.contains(event) {
-                return Ok(logs);
-            }
-            if Instant::now() >= deadline {
-                return Err(format!("missing {event}: {logs}").into());
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
     pub fn wait_exit(&mut self) -> TestResult<ExitStatus> {
         let deadline = Instant::now() + TIMEOUT;
         loop {

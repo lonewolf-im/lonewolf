@@ -2,7 +2,6 @@
 
 use std::error::Error;
 use std::future::Future;
-use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
@@ -14,9 +13,7 @@ use compio::time::timeout;
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_util::core_dispatcher::CoreDispatcher;
-use parking_lot::Mutex as PlMutex;
 use socket2::{Domain, Protocol, Socket, Type};
-use tracing::instrument::WithSubscriber;
 
 use super::*;
 use crate::config::limits::{C2sLimitProfile, C2sLimits};
@@ -58,40 +55,15 @@ fn auth() -> Result<(Arc<AuthService>, tempfile::TempDir), Box<dyn Error>> {
     Ok((Arc::new(AuthService { storage }), directory))
 }
 
-#[derive(Clone)]
-struct RejectionLog {
-    bytes: Arc<PlMutex<Vec<u8>>>,
-    unauthenticated: Arc<UnauthenticatedLimiter>,
-}
-
-impl Write for RejectionLog {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        assert_eq!(self.unauthenticated.active_count(), 1);
-        self.bytes.lock().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, Box<dyn Error>> {
+async fn rejected_connection_metrics(
+    admission: AdmissionLimits,
+) -> Result<Vec<String>, Box<dyn Error>> {
     let dispatcher = dispatcher()?;
     let hosts = hosts()?;
     let router = router(&hosts).await?;
     let (auth, _directory) = auth()?;
-    let log = RejectionLog {
-        bytes: Arc::new(PlMutex::new(Vec::new())),
-        unauthenticated: Arc::clone(&admission.unauthenticated),
-    };
-    let output = Arc::clone(&log.bytes);
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(move || log.clone())
-        .finish();
+    let metrics = crate::c2s::metrics::C2sMetrics::detached();
+    let worker = metrics.worker(0, 0);
     let (ready, readiness) = oneshot::channel();
     let (stop, stopped) = oneshot::channel::<()>();
     let router_handle = router.handle();
@@ -130,11 +102,10 @@ async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, B
                     },
                     NonZeroUsize::MIN,
                     GlobalChunkAllocator,
-                    C2sWorkerMetrics::detached(),
+                    worker.clone(),
                 ),
-                C2sWorkerMetrics::detached(),
+                worker,
             )
-            .with_subscriber(subscriber)
             .await
         })
         .await?;
@@ -152,8 +123,12 @@ async fn rejected_connection_log(admission: AdmissionLimits) -> Result<String, B
     task.await??;
     dispatcher.shutdown(TIMEOUT).await?;
     router.shutdown().await?;
-    let bytes = std::mem::take(&mut *output.lock());
-    Ok(String::from_utf8(bytes)?)
+    Ok(metrics
+        .render()?
+        .lines()
+        .filter(|line| line.starts_with("lonewolf_c2s_connections_rejected_total{"))
+        .map(str::to_owned)
+        .collect())
 }
 
 fn rejection_limits() -> AdmissionLimits {
@@ -189,13 +164,12 @@ fn attempt_rejection_precedes_both_capacity_limits() -> TestResult {
         else {
             return Err("unauthenticated capacity unavailable".into());
         };
-        let log = rejected_connection_log(admission).await?;
-        assert!(log.contains("c2s connection attempt rejected"));
-        assert!(log.contains("outcome=\"rate_limited\""));
-        assert!(log.contains("rejected_attempts=1"));
-        assert!(log.contains("listener_id=7"));
-        assert!(log.contains("worker_id=0"));
-        assert!(log.contains("connection_type=\"c2s\""));
+        assert_eq!(
+            rejected_connection_metrics(admission).await?,
+            [
+                "lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"connection_attempts_per_ip\"} 1"
+            ]
+        );
         Ok(())
     })
 }
@@ -209,23 +183,27 @@ fn unauthenticated_rejection_precedes_per_ip_capacity() -> TestResult {
         else {
             return Err("unauthenticated capacity unavailable".into());
         };
-        let log = rejected_connection_log(admission).await?;
-        assert!(log.contains("outcome=\"unauthenticated_connection_limit\""));
-        assert!(log.contains("c2s connection rejected"));
-        assert!(log.contains("rejected_connections=1"));
+        assert_eq!(
+            rejected_connection_metrics(admission).await?,
+            [
+                "lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"max_unauthenticated_connections\"} 1"
+            ]
+        );
         Ok(())
     })
 }
 
 #[test]
-fn per_ip_rejection_releases_unauthenticated_permit_after_logging() -> TestResult {
+fn per_ip_rejection_releases_unauthenticated_permit() -> TestResult {
     run_test(async {
         let admission = rejection_limits();
         let unauthenticated = Arc::clone(&admission.unauthenticated);
-        let log = rejected_connection_log(admission).await?;
-        assert!(log.contains("outcome=\"connection_limit\""));
-        assert!(log.contains("c2s connection rejected"));
-        assert!(log.contains("rejected_connections=1"));
+        assert_eq!(
+            rejected_connection_metrics(admission).await?,
+            [
+                "lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"max_connections_per_ip\"} 1"
+            ]
+        );
         assert_eq!(unauthenticated.active_count(), 0);
         Ok(())
     })

@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream as StdTcpStream};
 use std::num::NonZeroUsize;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,71 +44,6 @@ const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/stream
 const PSI_OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' to='localhost' version='1.0' xmlns='jabber:client' xml:lang='es' xmlns:xml='http://www.w3.org/XML/1998/namespace'>";
 const CLOSE: &str = "</stream:stream>";
 const MAX_STANZA_BYTES: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
-
-thread_local! {
-    static LOG_CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
-}
-
-struct LogWriter;
-
-impl Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        LOG_CAPTURE.with(|capture| {
-            if let Some(output) = capture.borrow_mut().as_mut() {
-                output.extend_from_slice(bytes);
-            }
-        });
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn capture_logs<R>(run: impl FnOnce() -> R) -> io::Result<(R, String)> {
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(|| LogWriter)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        LOG_CAPTURE.with(|capture| {
-            if capture.borrow().is_some() {
-                return Err(io::Error::other("nested log capture"));
-            }
-            capture.replace(Some(Vec::new()));
-            let result = run();
-            let bytes = capture
-                .replace(None)
-                .ok_or_else(|| io::Error::other("log capture missing"))?;
-            Ok((result, String::from_utf8(bytes).map_err(io::Error::other)?))
-        })
-    })
-}
-
-// Sibling tests share the tracing callsite registry.
-fn run_log_test_in_child(test: &str) -> io::Result<bool> {
-    const CHILD: &str = "LONEWOLF_C2S_LOG_TEST_CHILD";
-    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
-        return Ok(false);
-    }
-    let output = Command::new(std::env::current_exe()?)
-        .args([test, "--exact", "--nocapture"])
-        .env(CHILD, test)
-        .output()?;
-    assert!(
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
-        "{test}: {}\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(true)
-}
 
 fn hosts() -> Result<Hosts, HostsError> {
     let config = Config::default();
@@ -909,27 +843,18 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
-    if run_log_test_in_child("c2s::stream::tests::cancelled_binding_phase_logs_disconnection")? {
-        return Ok(());
-    }
+fn cancelled_binding_phase_records_a_cancelled_close() -> io::Result<()> {
     let metrics = crate::c2s::metrics::C2sMetrics::detached();
-    let ((), logs) = capture_logs(|| {
-        drop(ConnectionLifecycle {
-            connection_id: 7,
-            listener_id: 2,
-            worker_id: 3,
-            accepted_at: Instant::now(),
-            phase: StreamPhase::Binding,
-            bound_at: None,
-            metrics: metrics.worker(0, 0),
-            outcome: None,
-        });
-    })?;
-    assert!(logs.contains("stream disconnected"), "{logs}");
-    assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
-    assert!(logs.contains("stream_phase=\"binding\""), "{logs}");
-    assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
+    drop(ConnectionLifecycle {
+        connection_id: 7,
+        listener_id: 2,
+        worker_id: 3,
+        accepted_at: Instant::now(),
+        phase: StreamPhase::Binding,
+        bound_at: None,
+        metrics: metrics.worker(0, 0),
+        outcome: None,
+    });
     let output = metrics.render().map_err(io::Error::other)?;
     assert!(output.lines().any(|line| line == "lonewolf_c2s_connections_closed_total{listener=\"0\",phase=\"binding\",outcome=\"cancelled\"} 1"), "{output}");
     assert!(
@@ -942,43 +867,32 @@ fn cancelled_binding_phase_logs_disconnection() -> io::Result<()> {
 }
 
 #[test]
-fn unpolled_admission_logs_disconnection() -> Result<(), Box<dyn Error>> {
-    if run_log_test_in_child("c2s::stream::tests::unpolled_admission_logs_disconnection")? {
-        return Ok(());
-    }
+fn unpolled_admission_records_a_cancelled_close() -> Result<(), Box<dyn Error>> {
     let metrics = crate::c2s::metrics::C2sMetrics::detached();
-    let (result, logs) = capture_logs(|| {
-        Runtime::new()?.block_on(async {
-            let limiter = ConnectionLimiter::new(1);
-            let ConnectionAdmission::Allowed(permit) = limiter
-                .reserve(Ipv4Addr::LOCALHOST.into(), Instant::now())
-                .await
-            else {
-                return Err("connection denied".into());
-            };
-            let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
-            let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
-                unauthenticated.reserve(Instant::now()).await
-            else {
-                return Err("unauthenticated connection denied".into());
-            };
-            drop(StreamAdmission::new(
-                permit,
-                unauthenticated_permit,
-                2,
-                3,
-                metrics.worker(0, 0),
-            ));
-            assert_eq!(unauthenticated.active_count(), 0);
-            Ok::<_, Box<dyn Error>>(())
-        })
+    Runtime::new()?.block_on(async {
+        let limiter = ConnectionLimiter::new(1);
+        let ConnectionAdmission::Allowed(permit) = limiter
+            .reserve(Ipv4Addr::LOCALHOST.into(), Instant::now())
+            .await
+        else {
+            return Err("connection denied".into());
+        };
+        let unauthenticated = Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN));
+        let UnauthenticatedAdmission::Allowed(unauthenticated_permit) =
+            unauthenticated.reserve(Instant::now()).await
+        else {
+            return Err("unauthenticated connection denied".into());
+        };
+        drop(StreamAdmission::new(
+            permit,
+            unauthenticated_permit,
+            2,
+            3,
+            metrics.worker(0, 0),
+        ));
+        assert_eq!(unauthenticated.active_count(), 0);
+        Ok::<_, Box<dyn Error>>(())
     })?;
-    result?;
-    assert!(logs.contains("stream disconnected"), "{logs}");
-    assert!(logs.contains("connection_type=\"c2s\""), "{logs}");
-    assert!(logs.contains("listener_id=2"), "{logs}");
-    assert!(logs.contains("worker_id=3"), "{logs}");
-    assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
     let output = metrics.render()?;
     assert!(output.lines().any(|line| line == "lonewolf_c2s_connections_closed_total{listener=\"0\",phase=\"establishing\",outcome=\"cancelled\"} 1"), "{output}");
     Ok(())

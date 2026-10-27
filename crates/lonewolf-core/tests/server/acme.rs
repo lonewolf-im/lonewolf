@@ -164,6 +164,30 @@ fn wait_until(mut condition: impl FnMut() -> bool, description: &str) -> TestRes
     }
 }
 
+fn wait_for_failed_attempt(server: &C2sSuite, outcome: Option<&str>) -> TestResult {
+    wait_until(
+        || {
+            server.metrics().is_ok_and(|metrics| {
+                metrics
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("lonewolf_acme_attempts_total{")
+                            && line.contains("host=\"xmpp.example.test\"")
+                            && !line.contains("outcome=\"success\"")
+                            && outcome.is_none_or(|outcome| {
+                                line.contains(&format!("outcome=\"{outcome}\""))
+                            })
+                    })
+                    .filter_map(|line| line.rsplit_once(' '))
+                    .filter_map(|(_, value)| value.parse::<u64>().ok())
+                    .sum::<u64>()
+                    == 1
+            })
+        },
+        "failed attempt metric",
+    )
+}
+
 fn rotation(versions: &[&'static rustls::SupportedProtocolVersion], binding: &str) -> TestResult {
     let ca = FakeAcmeCa::start()?;
     ca.renew();
@@ -420,24 +444,11 @@ fn failure_preserves(stage: AcmeStage, fault: AcmeFault, expected: &str) -> Test
     ca.set_fault(stage, fault);
     ca.release(AcmeStage::Ari);
     ca.wait_count(stage, before + 1)?;
-    server.wait_log("ACME certificate will retry")?;
+    wait_for_failed_attempt(&server, Some(expected))?;
     assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
     bound.send("<iq type='get' id='survived'><query xmlns='jabber:iq:roster'/></iq>")?;
     assert_eq!(bound.receive()?.attribute("type"), Some("result"));
     bound.close()?;
-    wait_until(
-        || {
-            server.metrics().is_ok_and(|metrics| {
-                metrics.lines().any(|line| {
-                    line.contains("acme_attempts_total{")
-                        && line.contains("host=\"xmpp.example.test\"")
-                        && line.contains(&format!("outcome=\"{expected}\""))
-                        && line.ends_with(" 1")
-                })
-            })
-        },
-        "failure metric",
-    )?;
     assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
     let (_, record) = server.records()?;
     let record = record.ok_or("record")?;
@@ -510,13 +521,17 @@ fn slow_https_ca_times_out_preserving_old_material_and_shutdown_deadline() -> Te
     let ca = FakeAcmeCa::start()?;
     ca.renew();
     ca.set_fault(AcmeStage::Ari, AcmeFault::Hold);
-    let mut server = C2sSuite::managed(&ca)?;
+    let mut server = C2sSuite::configure(
+        &ca,
+        "[hosts.\"xmpp.example.test\".tls]\nprovider='letsencrypt'",
+        "[metrics]\nenabled=true\naddress='127.0.0.1:0'",
+    )?;
     server.start(&ca)?;
     let a = server.wait_certificate(None)?;
     ca.set_fault(AcmeStage::Certificate, AcmeFault::Hold);
     ca.release(AcmeStage::Ari);
     ca.wait_count(AcmeStage::Certificate, 2)?;
-    server.wait_log("ACME certificate will retry")?;
+    wait_for_failed_attempt(&server, None)?;
     assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
     let start = std::time::Instant::now();
     assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());

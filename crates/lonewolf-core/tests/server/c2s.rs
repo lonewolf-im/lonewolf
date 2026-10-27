@@ -3,7 +3,7 @@
 #[path = "support/process.rs"]
 mod process;
 
-use process::{Server, TIMEOUT, field};
+use process::{Server, TIMEOUT, field, request};
 
 use std::error::Error;
 use std::io::{Read, Write};
@@ -18,11 +18,70 @@ type TestResult = Result<(), Box<dyn Error>>;
 const OPEN: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";
 const FEATURES_END: &[u8] = b"</stream:features>";
+const CLOSED: &str = "lonewolf_c2s_connections_closed_total{";
+const REJECTED: &str = "lonewolf_c2s_connections_rejected_total{";
 
 impl Server {
-    fn ready(&mut self, listener_count: usize) -> Result<String, Box<dyn Error>> {
-        self.ready_when(|logs| logs.matches("c2s TCP listener started").count() == listener_count)
+    fn with_metrics(config: &str, workers: usize) -> Result<Self, Box<dyn Error>> {
+        Self::start(
+            &format!("{config}\n[metrics]\nenabled = true\naddress = '127.0.0.1:0'\n"),
+            workers,
+        )
     }
+
+    fn ready(&mut self, listener_count: usize) -> Result<String, Box<dyn Error>> {
+        self.ready_when(|logs| {
+            logs.matches("c2s TCP listener started").count() == listener_count
+                && logs.contains("metrics service started")
+        })
+    }
+
+    fn metrics(&self) -> Result<String, Box<dyn Error>> {
+        let logs = self.logs()?;
+        let started = logs
+            .lines()
+            .find(|line| line.contains("metrics service started"))
+            .ok_or("missing metrics start log")?;
+        let response = request(u16::try_from(field(started, "port=")?)?, "/metrics")?;
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or("missing metrics body")?;
+        Ok(body.to_owned())
+    }
+
+    fn wait_for_metrics(&self, ready: impl Fn(&str) -> bool) -> Result<String, Box<dyn Error>> {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let body = self.metrics()?;
+            if ready(&body) {
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("metrics did not reach the expected values: {body}").into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Returns the full log after a clean stop and fails if earlier lines were dropped.
+    fn stop_with_logs(&mut self, signal: Signal) -> Result<String, Box<dyn Error>> {
+        let body = self.metrics()?;
+        assert!(
+            body.lines()
+                .any(|line| line == "lonewolf_log_dropped_lines_total 0"),
+            "{body}"
+        );
+        self.stop(signal)?;
+        Ok(self.logs()?)
+    }
+}
+
+fn total(body: &str, family: &str, label: &str) -> u64 {
+    body.lines()
+        .filter(|line| line.starts_with(family) && line.contains(label))
+        .filter_map(|line| line.rsplit_once(' '))
+        .filter_map(|(_, value)| value.parse::<u64>().ok())
+        .sum()
 }
 
 fn connect_until_eof(port: u16) -> TestResult {
@@ -72,7 +131,7 @@ fn read_until_closed(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 #[test]
 fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[logging]\nlevel = 'trace'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
@@ -112,9 +171,9 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
     let mut response = String::new();
     admin.read_to_string(&mut response)?;
     assert!(response.starts_with("HTTP/1.1 200"));
-    server.stop(Signal::SIGTERM)?;
+    server.wait_for_metrics(|body| total(body, CLOSED, "") == 32)?;
+    let logs = server.stop_with_logs(Signal::SIGTERM)?;
     assert!(!socket.exists());
-    let logs = server.logs()?;
     let mut sockets = std::collections::BTreeSet::new();
     for line in logs
         .lines()
@@ -152,7 +211,6 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
         assert!(stopped_listeners.insert(field(line, "listener_id=")?));
     }
     assert_eq!(stopped_listeners, std::collections::BTreeSet::from([0, 1]));
-    assert_eq!(logs.matches("stream disconnected").count(), 32);
     assert!(logs.contains("core dispatcher stopped"));
     assert!(!logs.contains("127.0.0.1"));
     for port in ports {
@@ -164,7 +222,7 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
 #[test]
 fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[admin]\nenabled = false\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
@@ -175,8 +233,7 @@ fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
         .find(|line| line.contains("c2s TCP listener started"))
         .ok_or("missing listener start log")?;
     assert_eq!(field(started, "worker_count=")?, workers);
-    server.stop(Signal::SIGINT)?;
-    let logs = server.logs()?;
+    let logs = server.stop_with_logs(Signal::SIGINT)?;
     assert_eq!(logs.matches("c2s TCP listener started").count(), 1);
     let stopped = logs
         .lines()
@@ -195,7 +252,7 @@ fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
 #[test]
 fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.default]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
@@ -208,15 +265,24 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
     for _ in 0..16 {
         connect_until_eof(port)?;
     }
-    server.stop(Signal::SIGINT)?;
-    let logs = server.logs()?;
-    assert_eq!(logs.matches("outcome=\"eof\"").count(), 1, "{logs}");
-    assert_eq!(
-        logs.matches("c2s connection attempt rejected").count(),
-        1,
-        "{logs}"
-    );
-    assert!(logs.contains("outcome=\"rate_limited\""));
+    server.wait_for_metrics(|body| {
+        total(body, CLOSED, "outcome=\"eof\"") == 1
+            && total(body, REJECTED, "reason=\"connection_attempts_per_ip\"") == 15
+    })?;
+    let logs = server.stop_with_logs(Signal::SIGINT)?;
+    let rejections: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("c2s connection attempt rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 1, "{logs}");
+    for field in [
+        "connection_type=\"c2s\"",
+        "listener_id=0",
+        "outcome=\"rate_limited\"",
+        "rejected_attempts=1",
+    ] {
+        assert!(rejections[0].contains(field), "missing {field}: {logs}");
+    }
     assert!(!logs.contains("127.0.0.1"));
     Ok(())
 }
@@ -224,7 +290,7 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
 #[test]
 fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.default]\nmax_connections_per_ip = 1\nconnection_attempts_per_ip = { per_second = 1000, burst = 1000 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
@@ -250,13 +316,10 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
     assert_eq!(rejected.read(&mut [0; 1])?, 0);
     first.shutdown(Shutdown::Write)?;
     assert_eq!(first.read(&mut [0; 1])?, 0);
-    let deadline = Instant::now() + TIMEOUT;
-    while !server.logs()?.contains("stream disconnected") {
-        if Instant::now() >= deadline {
-            return Err("accepted connection did not finish after EOF".into());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
+    server.wait_for_metrics(|body| {
+        total(body, CLOSED, "outcome=\"eof\"") == 1
+            && total(body, REJECTED, "reason=\"max_connections_per_ip\"") == 1
+    })?;
     let mut replacement = TcpStream::connect_timeout(&address, TIMEOUT)?;
     replacement.set_read_timeout(Some(Duration::from_millis(200)))?;
     replacement.write_all(OPEN)?;
@@ -265,11 +328,22 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
         replacement.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
     ));
-    server.stop(Signal::SIGINT)?;
+    let logs = server.stop_with_logs(Signal::SIGINT)?;
     replacement.set_read_timeout(Some(TIMEOUT))?;
     assert_eq!(read_until_closed(&mut replacement)?, b"<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
-    let logs = server.logs()?;
-    assert!(logs.contains("outcome=\"connection_limit\""));
+    let rejections: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("c2s connection rejected"))
+        .collect();
+    assert_eq!(rejections.len(), 1, "{logs}");
+    for field in [
+        "connection_type=\"c2s\"",
+        "listener_id=0",
+        "outcome=\"connection_limit\"",
+        "rejected_connections=1",
+    ] {
+        assert!(rejections[0].contains(field), "missing {field}: {logs}");
+    }
     assert!(!logs.contains("127.0.0.1"));
     Ok(())
 }
@@ -277,7 +351,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
 #[test]
 fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.shared]\nmax_connections_per_ip = 1\nconnection_attempts_per_ip = { per_second = 1000, burst = 1000 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n",
         workers,
     )?;
@@ -306,27 +380,26 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
         assert_eq!(rejected.read(&mut [0; 1])?, 0);
         held.push(first);
     }
+    server.wait_for_metrics(|body| {
+        ["0", "1"].iter().all(|listener| {
+            body.lines().any(|line| {
+                line == format!(
+                    "{REJECTED}listener=\"{listener}\",reason=\"max_connections_per_ip\"}} 1"
+                )
+            })
+        })
+    })?;
     server.stop(Signal::SIGINT)?;
     for mut stream in held {
         stream.set_read_timeout(Some(TIMEOUT))?;
         assert_eq!(read_until_closed(&mut stream)?, b"<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
     }
-    let logs = server.logs()?;
-    let mut rejected = std::collections::BTreeSet::new();
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s connection rejected"))
-    {
-        assert!(line.contains("outcome=\"connection_limit\""));
-        assert!(rejected.insert(field(line, "listener_id=")?));
-    }
-    assert_eq!(rejected, std::collections::BTreeSet::from([0, 1]));
     Ok(())
 }
 
 #[test]
 fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s]\ndefault = 'large'\n[limits.c2s.profiles.large]\nmax_stanza_bytes = 262144\n[limits.c2s.profiles.small]\nmax_stanza_bytes = 10000\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'small'\n",
         1,
     )?;
@@ -363,9 +436,13 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
     large.shutdown(Shutdown::Write)?;
     large.set_read_timeout(Some(TIMEOUT))?;
     assert_eq!(large.read(&mut [0; 1])?, 0);
-    server.stop(Signal::SIGINT)?;
-    let logs = server.logs()?;
-    assert!(logs.contains("outcome=\"size_limit_exceeded\""));
+    server.wait_for_metrics(|body| {
+        body.lines().any(|line| {
+            line.starts_with(&format!("{CLOSED}listener=\"1\","))
+                && line.ends_with(",outcome=\"size_limit_exceeded\"} 1")
+        })
+    })?;
+    let logs = server.stop_with_logs(Signal::SIGINT)?;
     assert!(!logs.contains("127.0.0.1"));
     Ok(())
 }
@@ -377,7 +454,7 @@ fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
         "[admin]\nenabled = false\n[limits.c2s]\ndefault = 'fast'\n[limits.c2s.profiles.fast]\nincoming_xml_per_connection = {{ bytes_per_second = 1000000, burst_bytes = 1000000 }}\n[limits.c2s.profiles.slow]\nincoming_xml_per_connection = {{ bytes_per_second = 1, burst_bytes = {} }}\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'slow'\n",
         payload.len() - 1
     );
-    let mut server = Server::start(&config, 1)?;
+    let mut server = Server::with_metrics(&config, 1)?;
     let logs = server.ready(2)?;
     let mut ports = [0_u16; 2];
     for line in logs
@@ -409,7 +486,7 @@ fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
 #[test]
 fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult {
     let workers = thread::available_parallelism()?.get().min(2);
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.shared]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n",
         workers,
     )?;
@@ -427,25 +504,22 @@ fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult
             connect_until_eof(port)?;
         }
     }
-    server.stop(Signal::SIGINT)?;
-    let logs = server.logs()?;
-    assert_eq!(logs.matches("outcome=\"eof\"").count(), 2, "{logs}");
-    let mut rejected = std::collections::BTreeSet::new();
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s connection attempt rejected"))
-    {
-        assert!(line.contains("outcome=\"rate_limited\""));
-        assert!(rejected.insert(field(line, "listener_id=")?));
-    }
-    assert_eq!(rejected, std::collections::BTreeSet::from([0, 1]));
+    server.wait_for_metrics(|body| {
+        ["0", "1"].iter().all(|listener| {
+            total(body, CLOSED, &format!("listener=\"{listener}\"")) == 1
+                && body.lines().any(|line| {
+                    line == format!("{REJECTED}listener=\"{listener}\",reason=\"connection_attempts_per_ip\"}} 1")
+                })
+        })
+    })?;
+    let logs = server.stop_with_logs(Signal::SIGINT)?;
     assert!(!logs.contains("127.0.0.1"));
     Ok(())
 }
 
 #[test]
 fn listener_uses_its_selected_attempt_limit_profile() -> TestResult {
-    let mut server = Server::start(
+    let mut server = Server::with_metrics(
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s]\ndefault = 'strict'\n[limits.c2s.profiles.strict]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[limits.c2s.profiles.relaxed]\nconnection_attempts_per_ip = { per_second = 1, burst = 3 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'relaxed'\n",
         1,
     )?;
@@ -463,15 +537,19 @@ fn listener_uses_its_selected_attempt_limit_profile() -> TestResult {
             connect_until_eof(port)?;
         }
     }
+    let metrics = server.wait_for_metrics(|body| {
+        total(body, CLOSED, "outcome=\"eof\"") == 3 && total(body, REJECTED, "") == 1
+    })?;
+    assert_eq!(
+        total(
+            &metrics,
+            REJECTED,
+            "listener=\"0\",reason=\"connection_attempts_per_ip\""
+        ),
+        1,
+        "{metrics}"
+    );
     server.stop(Signal::SIGINT)?;
-    let logs = server.logs()?;
-    assert_eq!(logs.matches("outcome=\"eof\"").count(), 3, "{logs}");
-    let rejections: Vec<_> = logs
-        .lines()
-        .filter(|line| line.contains("c2s connection attempt rejected"))
-        .collect();
-    assert_eq!(rejections.len(), 1, "{logs}");
-    assert_eq!(field(rejections[0], "listener_id=")?, 0);
     Ok(())
 }
 

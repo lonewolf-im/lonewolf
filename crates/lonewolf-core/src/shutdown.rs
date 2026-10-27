@@ -9,6 +9,10 @@ use futures_util::poll;
 use nix::sys::signal::Signal;
 
 pub(crate) async fn wait() -> io::Result<()> {
+    wait_after_registration(|| tracing::debug!("shutdown signal handlers registered")).await
+}
+
+async fn wait_after_registration(registered: impl FnOnce()) -> io::Result<()> {
     let interrupt = pin!(compio::signal::ctrl_c());
     let terminate = pin!(compio::signal::unix::signal(Signal::SIGTERM as i32));
     let mut stop = pin!(select(interrupt, terminate));
@@ -16,7 +20,7 @@ pub(crate) async fn wait() -> io::Result<()> {
     let stopped = match poll!(stop.as_mut()) {
         Poll::Ready(result) => result,
         Poll::Pending => {
-            tracing::debug!("shutdown signal handlers registered");
+            registered();
             stop.await
         }
     };
@@ -35,43 +39,18 @@ mod tests {
     use std::time::Duration;
 
     use nix::sys::signal::{Signal, raise};
-    use tracing::field::{Field, Visit};
-    use tracing::{Event, Subscriber};
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::layer::{Context, SubscriberExt};
-
-    struct SignalAtRegistration(Signal);
-
-    impl<S: Subscriber> Layer<S> for SignalAtRegistration {
-        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
-            struct Registration(bool);
-            impl Visit for Registration {
-                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                    if field.name() == "message"
-                        && format!("{value:?}").starts_with("shutdown signal handlers registered")
-                    {
-                        self.0 = true;
-                    }
-                }
-            }
-            let mut registration = Registration(false);
-            event.record(&mut registration);
-            if registration.0 {
-                raise(self.0).unwrap();
-            }
-        }
-    }
 
     fn signal_at_registration(signal: Signal, test: &str) {
         const CHILD: &str = "LONEWOLF_TEST_STOP_AT_REGISTRATION";
         if std::env::var_os(CHILD).is_some() {
-            let subscriber = tracing_subscriber::registry().with(SignalAtRegistration(signal));
-            let _subscriber = tracing::subscriber::set_default(subscriber);
             compio::runtime::Runtime::new().unwrap().block_on(async {
-                compio::time::timeout(Duration::from_secs(2), super::wait())
-                    .await
-                    .unwrap()
-                    .unwrap();
+                compio::time::timeout(
+                    Duration::from_secs(2),
+                    super::wait_after_registration(|| raise(signal).unwrap()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
             });
             return;
         }

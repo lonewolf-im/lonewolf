@@ -124,6 +124,7 @@ undelivered messages are saved in `./data/lonewolf.dat`.
 
 - TCP connections secured with STARTTLS
 - SCRAM authentication, plus optional client-certificate login
+- Automatic TLS certificates from Let's Encrypt, or your own certificate files
 
 **Messaging and presence**
 
@@ -162,8 +163,9 @@ file has to exist.
 
 ### Hosting your own domain
 
-To serve a real domain instead of `localhost`, give Lonewolf a PEM certificate
-chain and private key for it:
+To serve a real domain instead of `localhost`, Lonewolf needs a certificate for
+it. You can hand it your own PEM files, or let it get one from Let's Encrypt.
+With files, it looks like this:
 
 ```toml
 [hosts."example.com"]
@@ -184,6 +186,38 @@ server.
 > [!TIP]
 > Relative paths, including the certificate, database, and admin socket paths,
 > are resolved from the directory you launch the server in.
+
+### Let's Encrypt certificates
+
+Don't want to manage certificates yourself? Replace the file paths with a single
+line, and Lonewolf gets a certificate from Let's Encrypt and renews it before it
+expires:
+
+```toml
+[hosts."example.com".tls]
+provider = "letsencrypt"
+```
+
+The choice is per host. You can switch a domain that already uses certificate
+files over to Let's Encrypt by changing just its `tls` table, and keep files for
+the rest.
+
+Choosing `letsencrypt` registers an ACME account and accepts Let's Encrypt's
+subscriber terms. To prove you control the domain, Let's Encrypt connects to
+public port 80 on every A and AAAA address the domain publishes, so that port has
+to reach Lonewolf. If something else already serves port 80, or you'd rather not
+let Lonewolf bind it, have your proxy forward it to a local port instead. The
+proxy must keep the original Host header and path:
+
+```toml
+[letsencrypt]
+listen = ["127.0.0.1:8080"]
+```
+
+Lonewolf keeps the ACME account and certificates in `./data/lonewolf/acme.redb`
+by default, so put that on durable storage. To try it out first, point
+`directory_url` at Let's Encrypt's staging server; the config reference shows
+how.
 
 Every setting, its default, and the certificate requirements are documented in
 [`examples/lonewolf.toml`](examples/lonewolf.toml). Everything there is commented

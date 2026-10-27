@@ -35,6 +35,7 @@ mod logging;
 mod metrics;
 mod order;
 mod panic;
+mod readiness;
 pub(crate) mod router;
 mod shutdown;
 mod stages;
@@ -392,6 +393,10 @@ async fn run_services<A: ChunkAllocator + Clone>(
         metrics,
         acme,
     } = background;
+    let readiness = readiness::message(
+        listeners.addresses(),
+        metrics.as_ref().map(|(server, _)| server.local_addr()),
+    );
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
     let metrics_task = metrics.map(|(server, registry)| {
         compio::runtime::spawn(server.run(registry, async move {
@@ -434,6 +439,7 @@ async fn run_services<A: ChunkAllocator + Clone>(
     });
     let (primary, services_done) = {
         let external_shutdown = async {
+            readiness::notify(&readiness);
             tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
             let external = async {
                 match select(pin!(stop_signal), pin!(listeners.failure())).await {

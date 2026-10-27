@@ -279,6 +279,26 @@ async fn server_exit_during_measurement_fails_the_run_instead_of_degrading_it() 
     Ok(())
 }
 
+#[test]
+#[ignore = "subprocess entry point for the forced-stop fixture"]
+fn ready_server_that_ignores_sigterm() -> TestResult {
+    let (Some(socket), Ok(c2s), Ok(metrics)) = (
+        std::env::var_os("NOTIFY_SOCKET"),
+        std::env::var("LONEWOLF_FAKE_C2S_ADDRESS"),
+        std::env::var("LONEWOLF_FAKE_METRICS_ADDRESS"),
+    ) else {
+        return Ok(());
+    };
+    std::os::unix::net::UnixDatagram::unbound()?.send_to(
+        format!("READY=1\nX_LONEWOLF_C2S_ADDRESSES={c2s}\nX_LONEWOLF_METRICS_ADDRESS={metrics}\n")
+            .as_bytes(),
+        socket,
+    )?;
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 #[tokio::test]
 async fn startup_failure_and_forced_stop_remove_private_fixture_and_reap_child() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
@@ -296,9 +316,10 @@ async fn startup_failure_and_forced_stop_remove_private_fixture_and_reap_child()
         let metrics_marker = std::net::TcpListener::bind("127.0.0.1:0")?;
         let body = if forced {
             format!(
-                "trap '' TERM\nprintf '2026:01:01 00:00:00 INFO lonewolf_core::c2s: c2s TCP listener started listener_id=0 worker_count=2 port={c2s_port}\\n2026:01:01 00:00:00 INFO lonewolf_metrics::server: metrics service started port={metrics_port}\\n2026:01:01 00:00:00 INFO lonewolf_core: waiting for stop signal... (press Ctrl+C to stop the server)\\n' >&2\nwhile :; do :; done",
-                c2s_port = c2s_marker.local_addr()?.port(),
-                metrics_port = metrics_marker.local_addr()?.port()
+                "trap '' TERM\nexport LONEWOLF_FAKE_C2S_ADDRESS={} LONEWOLF_FAKE_METRICS_ADDRESS={}\nexec '{}' --exact ready_server_that_ignores_sigterm --ignored --nocapture",
+                c2s_marker.local_addr()?,
+                metrics_marker.local_addr()?,
+                std::env::current_exe()?.display()
             )
         } else {
             "exit 1".into()

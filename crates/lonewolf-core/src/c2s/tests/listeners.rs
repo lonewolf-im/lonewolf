@@ -563,6 +563,7 @@ fn listener_failures_reach_the_supervisor() -> TestResult {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
             failures: async_channel::bounded(1).1,
+            addresses: Vec::new(),
             listener_count: 0,
             worker_count: dispatcher.handle().worker_count(),
         };
@@ -590,6 +591,7 @@ fn fatal_listener_notification_precedes_connection_drain() -> TestResult {
             stop: Some(stop),
             tasks: FuturesUnordered::new(),
             failures,
+            addresses: Vec::new(),
             listener_count: 0,
             worker_count: dispatcher.handle().worker_count(),
         };

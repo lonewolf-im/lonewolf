@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod process;
+mod readiness;
 #[cfg(test)]
 mod tests;
 mod tls;
@@ -23,10 +24,10 @@ use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
 };
-use process::{Collector, Startup};
+use process::Collector;
+use readiness::Notifications;
 use std::{
     future::Future,
-    net::{Ipv4Addr, SocketAddr},
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -432,6 +433,7 @@ impl LocalFixture {
             .directory
             .as_ref()
             .ok_or_else(|| failure("fixture_directory"))?;
+        let notifications = Notifications::bind(directory.path().join("notify.sock"))?;
         self.child = Some(
             Command::new(&self.binary)
                 .arg("--config")
@@ -439,6 +441,7 @@ impl LocalFixture {
                 .current_dir(directory.path())
                 .env("LONEWOLF_WORKER_COUNT", self.workers.to_string())
                 .env("NO_COLOR", "1")
+                .env("NOTIFY_SOCKET", notifications.path())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
@@ -451,9 +454,6 @@ impl LocalFixture {
             .and_then(|child| child.stderr.take())
             .ok_or_else(|| failure("fixture_stderr"))?;
         self.collector = Some(Collector::start(stderr)?);
-        let mut c2s = None;
-        let mut metrics = None;
-        let mut ready = false;
         loop {
             if self
                 .child
@@ -466,34 +466,21 @@ impl LocalFixture {
                 self.reaped = true;
                 return Err(failure("fixture_startup_exit"));
             }
-            let collector = self
-                .collector
-                .as_ref()
-                .ok_or_else(|| failure("fixture_capture"))?;
-            let mut capture_closed = false;
-            loop {
-                match collector.receiver.try_recv() {
-                    Ok(Startup::C2s(port)) => c2s = Some(port),
-                    Ok(Startup::Metrics(port)) => metrics = Some(port),
-                    Ok(Startup::Ready) => ready = true,
-                    Ok(Startup::Failed) => return Err(failure("fixture_startup_capture")),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        capture_closed = true;
-                        break;
-                    }
-                }
-            }
-            if capture_closed {
-                return Err(self.closed_capture_failure(deadline).await);
-            }
-            if let (Some(port), Some(metrics_port), true) = (c2s, metrics, ready) {
-                self.metrics = format!("http://127.0.0.1:{metrics_port}/metrics");
+            if let Some(readiness) = notifications.try_receive()? {
+                self.metrics = format!("http://{}/metrics", readiness.metrics);
                 return Ok(ResolvedTarget {
-                    address: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                    address: readiness.c2s,
                     xmpp_domain: "localhost".into(),
                     tls: local_tls_config(self.certificate.clone())?,
                 });
+            }
+            if self
+                .collector
+                .as_ref()
+                .ok_or_else(|| failure("fixture_capture"))?
+                .is_finished()
+            {
+                return Err(self.closed_capture_failure(deadline).await);
             }
             if Instant::now() >= deadline {
                 return Err(failure("fixture_startup_deadline"));

@@ -5,6 +5,9 @@ mod process;
 
 use process::{Server, TIMEOUT, field, request};
 
+#[path = "../support/ports.rs"]
+mod ports;
+
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -29,20 +32,15 @@ impl Server {
         )
     }
 
-    fn ready(&mut self, listener_count: usize) -> Result<String, Box<dyn Error>> {
-        self.ready_when(|logs| {
-            logs.matches("c2s TCP listener started").count() == listener_count
-                && logs.contains("metrics service started")
-        })
+    fn listeners<const N: usize>(&mut self) -> Result<[SocketAddr; N], Box<dyn Error>> {
+        self.ready()?
+            .try_into()
+            .map_err(|listeners| format!("expected {N} listeners: {listeners:?}").into())
     }
 
     fn metrics(&self) -> Result<String, Box<dyn Error>> {
-        let logs = self.logs()?;
-        let started = logs
-            .lines()
-            .find(|line| line.contains("metrics service started"))
-            .ok_or("missing metrics start log")?;
-        let response = request(u16::try_from(field(started, "port=")?)?, "/metrics")?;
+        let address = self.metrics_address().ok_or("missing metrics address")?;
+        let response = request(address, "/metrics")?;
         let (_, body) = response
             .split_once("\r\n\r\n")
             .ok_or("missing metrics body")?;
@@ -84,8 +82,7 @@ fn total(body: &str, family: &str, label: &str) -> u64 {
         .sum()
 }
 
-fn connect_until_eof(port: u16) -> TestResult {
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+fn connect_until_eof(address: SocketAddr) -> TestResult {
     let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
     stream.set_read_timeout(Some(TIMEOUT))?;
     match stream.shutdown(Shutdown::Write) {
@@ -135,33 +132,11 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
         "[logging]\nlevel = 'trace'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
-    let logs = server.ready(2)?;
-    let admin_started = logs
-        .find("admin service started")
-        .ok_or("missing admin start log")?;
-    let waiting = logs
-        .find("waiting for stop signal")
-        .ok_or("missing wait log")?;
-    assert!(admin_started < waiting);
-    let mut ports = [0_u16; 2];
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener started"))
-    {
-        assert!(line.contains(" INFO "));
-        assert_eq!(field(line, "worker_count=")?, workers);
-        assert!(!line.contains("worker_id="));
-        assert!(logs.find(line).ok_or("missing listener start log")? < waiting);
-        let listener = field(line, "listener_id=")?;
-        assert!(listener < 2);
-        assert_eq!(ports[listener], 0);
-        ports[listener] = field(line, "port=")?.try_into()?;
-    }
-    assert_ne!(ports[0], ports[1]);
-    assert!(!ports.contains(&0));
-    for port in ports {
+    let listeners: [SocketAddr; 2] = server.listeners()?;
+    assert_ne!(listeners[0], listeners[1]);
+    for address in listeners {
         for _ in 0..16 {
-            connect_until_eof(port)?;
+            connect_until_eof(address)?;
         }
     }
     let socket = server.directory.path().join("run/lonewolf/admin.sock");
@@ -174,6 +149,28 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
     server.wait_for_metrics(|body| total(body, CLOSED, "") == 32)?;
     let logs = server.stop_with_logs(Signal::SIGTERM)?;
     assert!(!socket.exists());
+    let admin_started = logs
+        .find("admin service started")
+        .ok_or("missing admin start log")?;
+    let waiting = logs
+        .find("waiting for stop signal")
+        .ok_or("missing wait log")?;
+    assert!(admin_started < waiting);
+    let mut started_listeners = std::collections::BTreeSet::new();
+    for line in logs
+        .lines()
+        .filter(|line| line.contains("c2s TCP listener started"))
+    {
+        assert!(line.contains(" INFO "));
+        assert_eq!(field(line, "worker_count=")?, workers);
+        assert!(!line.contains("worker_id="));
+        assert!(logs.find(line).ok_or("missing listener start log")? < waiting);
+        let listener = field(line, "listener_id=")?;
+        let address = listeners.get(listener).ok_or("unknown listener")?;
+        assert_eq!(field(line, "port=")?, usize::from(address.port()));
+        assert!(started_listeners.insert(listener));
+    }
+    assert_eq!(started_listeners.len(), 2);
     let mut sockets = std::collections::BTreeSet::new();
     for line in logs
         .lines()
@@ -185,7 +182,10 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
         assert!(listener < 2);
         assert!(worker < workers);
         assert!(sockets.insert((listener, worker)));
-        assert_eq!(usize::from(ports[listener]), field(line, "port=")?);
+        assert_eq!(
+            usize::from(listeners[listener].port()),
+            field(line, "port=")?
+        );
     }
     assert_eq!(sockets.len(), 2 * workers);
     assert_eq!(
@@ -213,8 +213,8 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
     assert_eq!(stopped_listeners, std::collections::BTreeSet::from([0, 1]));
     assert!(logs.contains("core dispatcher stopped"));
     assert!(!logs.contains("127.0.0.1"));
-    for port in ports {
-        assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+    for address in listeners {
+        assert!(TcpStream::connect(address).is_err());
     }
     Ok(())
 }
@@ -226,14 +226,15 @@ fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
         "[admin]\nenabled = false\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
-    let logs = server.ready(1)?;
+    let [address] = server.listeners()?;
+    let logs = server.stop_with_logs(Signal::SIGINT)?;
     assert!(!logs.contains("admin service started"));
     let started = logs
         .lines()
         .find(|line| line.contains("c2s TCP listener started"))
         .ok_or("missing listener start log")?;
     assert_eq!(field(started, "worker_count=")?, workers);
-    let logs = server.stop_with_logs(Signal::SIGINT)?;
+    assert_eq!(field(started, "port=")?, usize::from(address.port()));
     assert_eq!(logs.matches("c2s TCP listener started").count(), 1);
     let stopped = logs
         .lines()
@@ -256,14 +257,9 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.default]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
-    let logs = server.ready(1)?;
-    let started = logs
-        .lines()
-        .find(|line| line.contains("c2s TCP listener started"))
-        .ok_or("missing listener start log")?;
-    let port = u16::try_from(field(started, "port=")?)?;
+    let [address] = server.listeners()?;
     for _ in 0..16 {
-        connect_until_eof(port)?;
+        connect_until_eof(address)?;
     }
     server.wait_for_metrics(|body| {
         total(body, CLOSED, "outcome=\"eof\"") == 1
@@ -294,15 +290,7 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.default]\nmax_connections_per_ip = 1\nconnection_attempts_per_ip = { per_second = 1000, burst = 1000 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n",
         workers,
     )?;
-    let logs = server.ready(1)?;
-    let started = logs
-        .lines()
-        .find(|line| line.contains("c2s TCP listener started"))
-        .ok_or("missing listener start log")?;
-    let address = SocketAddr::from((
-        Ipv4Addr::LOCALHOST,
-        u16::try_from(field(started, "port=")?)?,
-    ));
+    let [address] = server.listeners()?;
     let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
     first.set_read_timeout(Some(Duration::from_millis(200)))?;
     first.write_all(OPEN)?;
@@ -355,18 +343,9 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.shared]\nmax_connections_per_ip = 1\nconnection_attempts_per_ip = { per_second = 1000, burst = 1000 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n",
         workers,
     )?;
-    let logs = server.ready(2)?;
-    let mut ports = [0_u16; 2];
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener started"))
-    {
-        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
-    }
-    assert!(!ports.contains(&0));
+    let listeners: [SocketAddr; 2] = server.listeners()?;
     let mut held = Vec::with_capacity(2);
-    for port in ports {
-        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    for address in listeners {
         let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
         first.set_read_timeout(Some(Duration::from_millis(200)))?;
         first.write_all(OPEN)?;
@@ -403,17 +382,9 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s]\ndefault = 'large'\n[limits.c2s.profiles.large]\nmax_stanza_bytes = 262144\n[limits.c2s.profiles.small]\nmax_stanza_bytes = 10000\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'small'\n",
         1,
     )?;
-    let logs = server.ready(2)?;
-    let mut ports = [0_u16; 2];
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener started"))
-    {
-        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
-    }
-    assert!(!ports.contains(&0));
-    let mut large = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[0]))?;
-    let mut small = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1]))?;
+    let listeners: [SocketAddr; 2] = server.listeners()?;
+    let mut large = TcpStream::connect(listeners[0])?;
+    let mut small = TcpStream::connect(listeners[1])?;
     large.set_read_timeout(Some(Duration::from_millis(200)))?;
     small.set_read_timeout(Some(TIMEOUT))?;
     let payload = format!("<message><body>{}", "x".repeat(12_000));
@@ -455,16 +426,8 @@ fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
         payload.len() - 1
     );
     let mut server = Server::with_metrics(&config, 1)?;
-    let logs = server.ready(2)?;
-    let mut ports = [0_u16; 2];
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener started"))
-    {
-        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
-    }
-    assert!(!ports.contains(&0));
-    let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[1]))?;
+    let listeners: [SocketAddr; 2] = server.listeners()?;
+    let mut slow = TcpStream::connect(listeners[1])?;
     slow.set_read_timeout(Some(Duration::from_millis(100)))?;
     slow.write_all(&payload)?;
     read_features(&mut slow)?;
@@ -472,7 +435,7 @@ fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
         slow.read(&mut [0; 1]),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
     ));
-    let mut fast = TcpStream::connect((Ipv4Addr::LOCALHOST, ports[0]))?;
+    let mut fast = TcpStream::connect(listeners[0])?;
     fast.set_read_timeout(Some(TIMEOUT))?;
     fast.write_all(&payload)?;
     read_features(&mut fast)?;
@@ -490,18 +453,10 @@ fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s.profiles.shared]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'shared'\n",
         workers,
     )?;
-    let logs = server.ready(2)?;
-    let mut ports = [0_u16; 2];
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener started"))
-    {
-        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
-    }
-    assert!(!ports.contains(&0));
-    for port in ports {
+    let listeners: [SocketAddr; 2] = server.listeners()?;
+    for address in listeners {
         for _ in 0..2 {
-            connect_until_eof(port)?;
+            connect_until_eof(address)?;
         }
     }
     server.wait_for_metrics(|body| {
@@ -523,18 +478,10 @@ fn listener_uses_its_selected_attempt_limit_profile() -> TestResult {
         "[logging]\nlevel = 'trace'\n[admin]\nenabled = false\n[limits.c2s]\ndefault = 'strict'\n[limits.c2s.profiles.strict]\nconnection_attempts_per_ip = { per_second = 1, burst = 1 }\n[limits.c2s.profiles.relaxed]\nconnection_attempts_per_ip = { per_second = 1, burst = 3 }\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\nlimits = 'relaxed'\n",
         1,
     )?;
-    let logs = server.ready(2)?;
-    let mut ports = [0_u16; 2];
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener started"))
-    {
-        ports[field(line, "listener_id=")?] = u16::try_from(field(line, "port=")?)?;
-    }
-    assert!(!ports.contains(&0));
-    for port in ports {
+    let listeners: [SocketAddr; 2] = server.listeners()?;
+    for address in listeners {
         for _ in 0..2 {
-            connect_until_eof(port)?;
+            connect_until_eof(address)?;
         }
     }
     let metrics = server.wait_for_metrics(|body| {
@@ -572,10 +519,11 @@ fn empty_listener_list_fails_before_starting_services() -> TestResult {
 
 #[test]
 fn occupied_endpoint_stops_started_listeners_and_removes_admin_socket() -> TestResult {
+    let (_reservation, released) = ports::reserve_listener_address()?;
     let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let mut server = Server::start(
         &format!(
-            "[logging]\nlevel = 'trace'\n[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[[c2s.listeners]]\naddress = '{}'\n",
+            "[logging]\nlevel = 'trace'\n[[c2s.listeners]]\naddress = '{released}'\n[[c2s.listeners]]\naddress = '{}'\n",
             occupied.local_addr()?
         ),
         1,
@@ -592,11 +540,6 @@ fn occupied_endpoint_stops_started_listeners_and_removes_admin_socket() -> TestR
             .join("run/lonewolf/admin.sock")
             .exists()
     );
-    let started = logs
-        .lines()
-        .find(|line| line.contains("c2s TCP listener started"))
-        .ok_or("missing listener start log")?;
-    let port = u16::try_from(field(started, "port=")?)?;
-    let _rebound = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    let _rebound = ports::bind_released_listener(released, Instant::now() + TIMEOUT)?;
     Ok(())
 }

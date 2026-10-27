@@ -16,15 +16,6 @@ use nix::sys::signal::Signal;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-impl Server {
-    fn ready(&mut self, metrics_enabled: bool) -> Result<String, Box<dyn Error>> {
-        self.ready_when(|logs| {
-            logs.contains("c2s TCP listener started")
-                && (!metrics_enabled || logs.contains("metrics service started"))
-        })
-    }
-}
-
 #[test]
 fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
     let (_reservation, address) = ports::reserve_listener_address()?;
@@ -34,14 +25,9 @@ fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
         ),
         2,
     )?;
-    let logs = server.ready(true)?;
-    let line = logs
-        .lines()
-        .find(|line| line.contains("metrics service started"))
-        .ok_or("missing metrics start log")?;
-    let port = field(line, "port=")?.try_into()?;
-    assert_eq!(port, address.port());
-    let response = request(port, "/metrics")?;
+    server.ready()?;
+    assert_eq!(server.metrics_address(), Some(address));
+    let response = request(address, "/metrics")?;
     let (headers, body) = response
         .split_once("\r\n\r\n")
         .ok_or("missing response body")?;
@@ -70,9 +56,15 @@ fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
         "{body}"
     );
     assert!(body.ends_with("# EOF\n"), "{body}");
-    assert!(request(port, "/missing")?.starts_with("HTTP/1.1 404"));
+    assert!(request(address, "/missing")?.starts_with("HTTP/1.1 404"));
     server.stop(Signal::SIGTERM)?;
-    assert!(server.logs()?.contains("metrics service stopped"));
+    let logs = server.logs()?;
+    let started = logs
+        .lines()
+        .find(|line| line.contains("metrics service started"))
+        .ok_or("missing metrics start log")?;
+    assert_eq!(field(started, "port=")?, usize::from(address.port()));
+    assert!(logs.contains("metrics service stopped"));
     let _listener = ports::bind_released_listener(address, Instant::now() + TIMEOUT)?;
     Ok(())
 }
@@ -107,7 +99,8 @@ fn metrics_are_disabled_by_default() -> TestResult {
         "[[c2s.listeners]]\naddress = '127.0.0.1:0'\n[admin]\nenabled = false\n",
         2,
     )?;
-    server.ready(false)?;
+    server.ready()?;
+    assert_eq!(server.metrics_address(), None);
     server.stop(Signal::SIGINT)?;
     assert!(!server.logs()?.contains("metrics service started"));
     Ok(())

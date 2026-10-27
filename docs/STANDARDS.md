@@ -6,7 +6,7 @@ The default host extensions are `roster,offline,disco,ping,vcard,carbons`. Expli
 
 [`lonewolf.doap`](../lonewolf.doap) summarizes these tables in the [XEP-0453](https://xmpp.org/extensions/xep-0453.html) format that software directories read. Update both together.
 
-The [v0.2.0 release](releases/v0.2.0.md) first ships the XEP-0030, XEP-0054, XEP-0199, XEP-0280, and XEP-0297 roles described below. The other listed XEP roles first shipped in v0.1.0.
+The [v0.2.0 release](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.2.0) first ships the XEP-0030, XEP-0054, XEP-0199, XEP-0280, and XEP-0297 roles described below. The other listed XEP roles first shipped in v0.1.0.
 
 ## XEP server behavior
 

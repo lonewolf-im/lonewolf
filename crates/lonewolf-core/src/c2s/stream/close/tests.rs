@@ -116,6 +116,52 @@ impl AsyncWrite for PartialWriter {
 }
 
 #[test]
+fn stream_error_follows_a_stanza_whose_flush_was_cancelled() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let allowance = Rc::new(Cell::new(usize::MAX));
+        let mut writer = Writer::new(
+            PartialWriter {
+                bytes: Rc::clone(&bytes),
+                allowance: Rc::clone(&allowance),
+            },
+            "localhost".into(),
+            crate::c2s::metrics::C2sWorkerMetrics::detached(),
+        );
+        writer
+            .send_header(&header())
+            .await
+            .map_err(|outcome| format!("{outcome:?}"))?;
+        bytes.borrow_mut().clear();
+        allowance.set(0);
+        let mut send = Box::pin(writer.send_stanza_xml(
+            "<iq type='result' id='bind'/>",
+            lonewolf_xmpp::stanza::StanzaKind::Iq,
+        ));
+        assert!(poll!(send.as_mut()).is_pending());
+        drop(send);
+        assert!(writer.is_intact());
+        allowance.set(usize::MAX);
+        let (mut input, _, _) =
+            probe_reader(format!("{HEADER}</stream:stream>").into_bytes(), Tail::Eof);
+        assert!(
+            xml(
+                &mut input,
+                &mut writer,
+                CloseReason::Local(CloseOutcome::AccountDeleted)
+            )
+            .await
+            .map_err(|outcome| format!("{outcome:?}"))?
+        );
+        assert_eq!(
+            String::from_utf8(bytes.borrow().clone())?,
+            "<iq type='result' id='bind'/><stream:error><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>"
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn interrupted_stanza_serialization_never_appends_or_flushes_a_footer() -> TestResult {
     Runtime::new()?.block_on(async {
         let bytes = Rc::new(RefCell::new(Vec::new()));

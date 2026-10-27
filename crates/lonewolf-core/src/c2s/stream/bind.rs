@@ -682,6 +682,7 @@ mod tests {
             .await?;
             deleted?;
             assert!(matches!(bound, Err(CloseOutcome::AccountDeleted)));
+            assert!(writer.is_intact());
             assert!(router.resource_match(&account, "desk").await?.is_none());
             assert!(bob.liveness().is_alive());
             assert!(

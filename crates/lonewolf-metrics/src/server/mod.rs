@@ -34,7 +34,7 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 
 pub struct MetricsServer {
     listener: TcpListener,
-    port: u16,
+    address: SocketAddr,
 }
 
 impl MetricsServer {
@@ -50,19 +50,19 @@ impl MetricsServer {
         socket.set_reuseaddr(true)?;
         socket.bind(address).await?;
         let listener = socket.listen(BACKLOG).await?;
-        let port = listener.local_addr()?.port();
-        Ok(Self { listener, port })
+        let address = listener.local_addr()?;
+        Ok(Self { listener, address })
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
     }
 
     /// Serves `/metrics` until `shutdown` completes, then drains accepted connections.
     ///
     /// Accept failures are logged and retried; they do not end the service.
     pub async fn run(self, registry: Arc<Registry>, shutdown: impl Future<Output = ()>) {
-        tracing::info!(port = self.port, "metrics service started");
+        tracing::info!(port = self.address.port(), "metrics service started");
         let router = router(registry);
         let mut connections = accept_connections(
             || self.listener.accept(),

@@ -17,6 +17,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use rustls::{ClientConfig, SupportedProtocolVersion};
 
+use super::readiness::ReadinessSocket;
 use super::{Client, FakeAcmeCa, PASSWORD, PlainClient, TIMEOUT, TLS_NAMESPACE, TestResult, tls};
 
 pub struct AcmeServer {
@@ -24,7 +25,9 @@ pub struct AcmeServer {
     child: Option<Child>,
     clock: Option<super::clock::ClockControl>,
     clock_start: Option<(std::time::SystemTime, ClockMode)>,
+    readiness: ReadinessSocket,
     pub address: SocketAddr,
+    metrics: Option<SocketAddr>,
     pub challenge: SocketAddr,
     pub tls: Arc<ClientConfig>,
     pub roots: rustls::RootCertStore,
@@ -109,7 +112,9 @@ ca_certificates_path = {:?}
             child: None,
             clock: None,
             clock_start: None,
+            readiness: ReadinessSocket::bind()?,
             address: "127.0.0.1:0".parse()?,
+            metrics: None,
             challenge,
             tls,
             roots,
@@ -141,14 +146,15 @@ ca_certificates_path = {:?}
         assert!(self.child.is_none());
         self.reservation.take();
         if let Some((now, mode)) = self.clock_start {
-            let (child, clock) = super::clock::spawn(self.path(), now, mode)?;
+            let (child, clock) = super::clock::spawn(self.path(), &self.readiness, now, mode)?;
             self.child = Some(child);
             self.clock = Some(clock);
             self.launch_count += 1;
             return Ok(());
         }
         self.child = Some(
-            Command::new(env!("CARGO_BIN_EXE_lonewolf"))
+            self.readiness
+                .configure(&mut Command::new(env!("CARGO_BIN_EXE_lonewolf")))
                 .current_dir(self.path())
                 .env("LONEWOLF_WORKER_COUNT", "2")
                 .stdout(Stdio::null())
@@ -285,31 +291,20 @@ ca_certificates_path = {:?}
     fn ready_until(&mut self, deadline: Instant) -> TestResult<Option<ExitStatus>> {
         loop {
             if Instant::now() >= deadline {
-                return Err("ACME fixture readiness deadline elapsed".into());
+                return Err(
+                    format!("ACME fixture readiness deadline elapsed: {}", self.logs()?).into(),
+                );
             }
-            let logs = self.logs()?;
             if let Some(status) = self.child.as_mut().ok_or("missing child")?.try_wait()? {
                 self.child.take();
                 self.clock.take();
                 return Ok(Some(status));
             }
-            if logs.contains("waiting for stop signal") {
-                let port = logs
-                    .lines()
-                    .find(|line| line.contains("c2s TCP listener started"))
-                    .and_then(|line| {
-                        line.split_whitespace()
-                            .find_map(|f| f.strip_prefix("port="))
-                    })
-                    .ok_or("listener port")?
-                    .parse()?;
-                self.address.set_port(port);
+            if let Some(readiness) = self.readiness.receive(Duration::from_millis(5))? {
+                self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
+                self.metrics = readiness.metrics;
                 return Ok(None);
             }
-            if Instant::now() >= deadline {
-                return Err(format!("server not ready: {logs}").into());
-            }
-            thread::sleep(Duration::from_millis(5));
         }
     }
     pub fn logs(&self) -> TestResult<String> {
@@ -474,17 +469,8 @@ ca_certificates_path = {:?}
         Ok((account, host))
     }
     pub fn metrics(&self) -> TestResult<String> {
-        let logs = self.logs()?;
-        let port = logs
-            .lines()
-            .find(|line| line.contains("metrics service started"))
-            .and_then(|line| {
-                line.split_whitespace()
-                    .find_map(|s| s.strip_prefix("port="))
-            })
-            .ok_or("metrics port")?;
         super::http_get(
-            format!("127.0.0.1:{port}").parse()?,
+            self.metrics.ok_or("missing metrics address")?,
             "xmpp.example.test",
             "/metrics",
         )

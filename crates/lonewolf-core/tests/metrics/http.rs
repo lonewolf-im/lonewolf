@@ -37,7 +37,7 @@ async fn with_server(
     check: impl AsyncFnOnce(SocketAddr) -> TestResult,
 ) -> TestResult {
     let server = MetricsServer::bind("127.0.0.1:0".parse()?).await?;
-    let address = server.local_addr()?;
+    let address = server.local_addr();
     let (stop, stopped) = oneshot::channel();
     let task = compio::runtime::spawn(server.run(registry, async move {
         let _ = stopped.await;
@@ -136,7 +136,7 @@ fn shutdown_drains_connections_and_releases_the_port() -> TestResult {
     Runtime::new()?.block_on(async {
         let (_reservation, address) = ports::reserve_listener_address()?;
         let server = MetricsServer::bind(address).await?;
-        assert_eq!(server.local_addr()?, address);
+        assert_eq!(server.local_addr(), address);
         assert_eq!(
             ports::bind_released_listener(address, Instant::now())
                 .unwrap_err()

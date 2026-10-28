@@ -46,6 +46,7 @@ tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 tokio-util.workspace = true
 webpki.workspace = true
+webpki-roots.workspace = true
 zeroize.workspace = true
 x509-cert.workspace = true
 

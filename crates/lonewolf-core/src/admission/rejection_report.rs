@@ -5,13 +5,13 @@ use std::time::{Duration, Instant};
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
-pub(super) struct RejectionReport {
+pub(crate) struct RejectionReport {
     last_report_at: Option<Instant>,
     unreported_rejections: u64,
 }
 
 impl RejectionReport {
-    pub(super) fn record(&mut self, now: Instant) -> Option<u64> {
+    pub(crate) fn record(&mut self, now: Instant) -> Option<u64> {
         self.unreported_rejections = self.unreported_rejections.saturating_add(1);
         if self
             .last_report_at

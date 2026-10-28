@@ -37,9 +37,9 @@ use establish::establish;
 pub(super) use outcome::CloseOutcome;
 
 use super::AuthService;
-use super::connection_limit::ConnectionPermit;
 use super::metrics::C2sWorkerMetrics;
 use super::unauthenticated_limit::UnauthenticatedPermit;
+use crate::admission::connection_limit::ConnectionPermit;
 use crate::config::AuthMechanisms;
 use crate::config::limits::C2sLimitProfile;
 use crate::hosts::Hosts;

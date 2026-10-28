@@ -26,6 +26,7 @@ use prometheus_client::registry::Registry;
 
 mod account_deletion;
 mod acme;
+mod admission;
 mod c2s;
 pub mod config;
 mod delivery;

@@ -29,7 +29,7 @@ use super::authenticate::{SASL_NAMESPACE, account_key, decoy_identity};
 use super::establish::{STARTTLS_FEATURES, STARTTLS_NAMESPACE, STARTTLS_PROCEED};
 use super::header::STREAM_FOOTER;
 use super::*;
-use crate::c2s::connection_limit::{ConnectionAdmission, ConnectionLimiter};
+use crate::admission::connection_limit::{ConnectionAdmission, ConnectionLimiter};
 use crate::c2s::unauthenticated_limit::{
     Admission as UnauthenticatedAdmission, UnauthenticatedLimiter,
 };

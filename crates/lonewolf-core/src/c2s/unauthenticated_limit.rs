@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use async_lock::Mutex;
 
-use super::rejection_report::RejectionReport;
+use crate::admission::rejection_report::RejectionReport;
 
 pub(super) struct UnauthenticatedLimiter {
     max: usize,

@@ -13,12 +13,12 @@ use super::rejection_report::RejectionReport;
 const MAX_TRACKED_SOURCES: usize = 16_384;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 
-pub(super) struct ConnectionLimiter {
+pub(crate) struct ConnectionLimiter {
     max_per_ip: usize,
     state: Mutex<State>,
 }
 
-pub(super) enum ConnectionAdmission {
+pub(crate) enum ConnectionAdmission {
     Allowed(ConnectionPermit),
     Denied {
         outcome: &'static str,
@@ -26,7 +26,7 @@ pub(super) enum ConnectionAdmission {
     },
 }
 
-pub(super) struct ConnectionPermit {
+pub(crate) struct ConnectionPermit {
     active: Arc<AtomicUsize>,
 }
 
@@ -37,7 +37,7 @@ struct State {
 }
 
 impl ConnectionLimiter {
-    pub(super) fn new(max_per_ip: usize) -> Self {
+    pub(crate) fn new(max_per_ip: usize) -> Self {
         Self {
             max_per_ip,
             state: Mutex::new(State {
@@ -48,7 +48,7 @@ impl ConnectionLimiter {
         }
     }
 
-    pub(super) async fn reserve(&self, source: IpAddr, now: Instant) -> ConnectionAdmission {
+    pub(crate) async fn reserve(&self, source: IpAddr, now: Instant) -> ConnectionAdmission {
         let mut state = self.state.lock().await;
         if !state.sources.contains_key(&source) && state.sources.len() >= MAX_TRACKED_SOURCES {
             if now >= state.next_cleanup {

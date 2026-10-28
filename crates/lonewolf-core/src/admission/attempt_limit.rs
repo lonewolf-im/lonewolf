@@ -15,13 +15,13 @@ use super::rejection_report::RejectionReport;
 const MAX_TRACKED_SOURCES: usize = 16_384;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
 
-pub(super) struct AttemptLimiter {
+pub(crate) struct AttemptLimiter {
     per_second: NonZeroUsize,
     burst: NonZeroUsize,
     state: Mutex<State>,
 }
 
-pub(super) enum Admission {
+pub(crate) enum Admission {
     Allowed,
     Denied {
         outcome: &'static str,
@@ -43,7 +43,7 @@ struct State {
 }
 
 impl AttemptLimiter {
-    pub(super) fn new(rate: &EventRate) -> Self {
+    pub(crate) fn new(rate: &EventRate) -> Self {
         Self {
             per_second: rate.per_second,
             burst: rate.burst,
@@ -55,7 +55,7 @@ impl AttemptLimiter {
         }
     }
 
-    pub(super) async fn admit(&self, source: IpAddr, now: Instant) -> Admission {
+    pub(crate) async fn admit(&self, source: IpAddr, now: Instant) -> Admission {
         let mut state = self.state.lock().await;
         if !state.sources.contains_key(&source) && state.sources.len() >= MAX_TRACKED_SOURCES {
             if now >= state.next_cleanup {

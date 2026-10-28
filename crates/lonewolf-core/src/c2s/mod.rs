@@ -23,21 +23,20 @@ use nix::errno::Errno;
 use prometheus_client::registry::Registry;
 use socket2::SockRef;
 
+use crate::admission::attempt_limit::{Admission, AttemptLimiter};
+use crate::admission::connection_limit::{
+    ConnectionAdmission, ConnectionLimiter, ConnectionPermit,
+};
 use crate::config::C2sConfig;
 use crate::config::limits::C2sLimits;
 use crate::hosts::Hosts;
 use crate::router::RouterHandle;
 
-mod attempt_limit;
-mod connection_limit;
 mod iq;
 mod metrics;
-mod rejection_report;
 mod stream;
 mod unauthenticated_limit;
 
-use attempt_limit::{Admission, AttemptLimiter};
-use connection_limit::{ConnectionAdmission, ConnectionLimiter, ConnectionPermit};
 use metrics::{C2sMetrics, C2sWorkerMetrics, RejectReason};
 use stream::{StreamAdmission, StreamSettings, StreamTimeouts, XmppStream};
 use unauthenticated_limit::{

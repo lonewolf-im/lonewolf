@@ -99,6 +99,15 @@ pub(crate) fn material(
     ))
 }
 
+pub(crate) fn signed_chain(
+    root: rcgen::CertificateParams,
+    leaf: rcgen::CertificateParams,
+) -> Result<[rustls::pki_types::CertificateDer<'static>; 2], Box<dyn std::error::Error>> {
+    let root = rcgen::CertifiedIssuer::self_signed(root, TestSigner::new()?)?;
+    let leaf = leaf.signed_by(&TestSigner::new()?, &root)?;
+    Ok([leaf.der().clone(), root.der().clone()])
+}
+
 pub(crate) fn managed_hosts() -> Result<super::Hosts, super::HostsError> {
     let mut config = crate::config::Config::default();
     config.hosts.insert(

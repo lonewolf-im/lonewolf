@@ -45,7 +45,6 @@ const HEADER_PREFIX: &str = "<?xml version='1.0'?><stream:stream xmlns:stream='h
 pub(crate) const STARTTLS_REQUIRED_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
 pub(crate) const EXTERNAL_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>";
 pub(crate) const EMPTY_FEATURES: &str = "<stream:features/>";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const STARTTLS: &str = "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 pub(crate) const PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 pub(crate) const TLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
@@ -89,7 +88,6 @@ pub(crate) enum S2sError {
     Internal,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn initial_header_xml(from: &str, to: &str) -> String {
     let mut xml = String::with_capacity(192 + from.len() + to.len());
     xml.push_str(HEADER_PREFIX);
@@ -206,7 +204,6 @@ pub(crate) fn validate_initial_header<A: ChunkAllocator>(
     Ok(InitialHeader { to, from })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_response_header<A: ChunkAllocator>(
     header: &Parsed<Element, A>,
     content_namespace: &str,
@@ -227,7 +224,6 @@ pub(crate) fn validate_response_header<A: ChunkAllocator>(
     Ok(())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_features<A: ChunkAllocator>(element: &Parsed<Element, A>) -> Features {
     let mut features = Features::default();
     if let Ok(element) = element.value().resolve(element.arena())
@@ -258,7 +254,6 @@ pub(crate) fn parse_features<A: ChunkAllocator>(element: &Parsed<Element, A>) ->
     features
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn auth_external_xml(authzid: &str) -> String {
     let mut xml = String::with_capacity(96 + authzid.len().div_ceil(3) * 4);
     xml.push_str("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='EXTERNAL'>");

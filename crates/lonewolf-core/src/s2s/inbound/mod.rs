@@ -5,10 +5,10 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use compio::net::{TcpListener, TcpSocket, TcpStream};
+use compio::net::{TcpListener, TcpSocket};
 use futures_channel::oneshot;
 use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Either, LocalBoxFuture, Shared, select};
@@ -21,6 +21,7 @@ use socket2::SockRef;
 
 use super::metrics::{ConnectionRejection, Direction, S2sMetrics};
 use super::stream::S2sReaderLimits;
+use super::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
 use crate::admission::attempt_limit::{Admission, AttemptLimiter};
 use crate::admission::connection_limit::{
     ConnectionAdmission, ConnectionLimiter, ConnectionPermit,
@@ -33,7 +34,6 @@ use crate::hosts::{Hosts, peer_identity::PeerTrust};
 
 mod negotiate;
 
-static NEXT_S2S_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 type Stop = Shared<BoxFuture<'static, Instant>>;
 type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;
 
@@ -54,14 +54,6 @@ struct GlobalLimit {
 }
 
 struct GlobalPermit(Arc<GlobalLimit>);
-
-struct ConnectionSocket(TcpStream);
-
-impl Drop for ConnectionSocket {
-    fn drop(&mut self) {
-        let _ = SockRef::from(&self.0).shutdown(std::net::Shutdown::Both);
-    }
-}
 
 impl Drop for GlobalPermit {
     fn drop(&mut self) {
@@ -433,6 +425,8 @@ fn resource_exhausted(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use compio::net::TcpStream;
+
     use super::*;
     #[test]
     fn connection_owner_shutdown_closes_retained_transport_clones()

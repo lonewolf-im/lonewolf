@@ -479,7 +479,6 @@ impl S2sMetrics {
         self.rate_limited[limit as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn dns(&self, outcome: DnsOutcome) {
         self.dns[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -632,7 +631,7 @@ impl Collector for S2sCollector {
         )?;
         let mut family = encoder.encode_descriptor(
             "s2s_negotiation_duration",
-            "Time from TCP establishment to final features.",
+            "Active S2S establishment time, excluding DNS and failure cleanup.",
             Some(&Unit::Seconds),
             MetricType::Histogram,
         )?;

@@ -40,7 +40,6 @@ pub(crate) enum ResolvedVia {
 
 #[derive(Debug)]
 pub(crate) struct Resolved {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) endpoints: Vec<SocketAddr>,
     pub(crate) via: ResolvedVia,
 }
@@ -74,7 +73,6 @@ impl Resolver {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn resolve(&self, domain: &str) -> Result<Resolved, ResolveError> {
         let result = self.resolve_inner(domain).await;
         let outcome = match &result {

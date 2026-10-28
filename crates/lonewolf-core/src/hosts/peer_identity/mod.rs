@@ -15,7 +15,7 @@ use x509_cert::Certificate;
 use x509_cert::der::{Decode, asn1::ObjectIdentifier};
 use x509_cert::ext::pkix::ExtendedKeyUsage;
 
-use super::client_identity::{certificate_expiration, validate_key_usage, webpki_error};
+use super::client_identity::{certificate_expiration, validate_key_usage_iter, webpki_error};
 use super::service_identity::{XmppService, verify_service_identity};
 use super::tls_identity;
 use crate::config::S2sTlsConfig;
@@ -110,7 +110,11 @@ impl PeerTrust {
                 None,
             )
             .map_err(webpki_error)?;
-        validate_key_usage(leaf, intermediates)?;
+        validate_key_usage_iter(
+            leaf,
+            path.intermediate_certificates()
+                .map(|certificate| certificate.der()),
+        )?;
         let parsed = Certificate::from_der(leaf.as_ref())
             .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
         let usage = parsed

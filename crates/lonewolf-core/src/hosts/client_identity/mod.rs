@@ -669,7 +669,22 @@ pub(super) fn validate_key_usage(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
 ) -> Result<(), rustls::Error> {
-    for (index, certificate) in std::iter::once(end_entity).chain(intermediates).enumerate() {
+    validate_key_usage_iter(
+        end_entity,
+        intermediates
+            .iter()
+            .map(|certificate| CertificateDer::from(certificate.as_ref())),
+    )
+}
+
+pub(super) fn validate_key_usage_iter<'a>(
+    end_entity: &'a CertificateDer<'_>,
+    intermediates: impl IntoIterator<Item = CertificateDer<'a>>,
+) -> Result<(), rustls::Error> {
+    for (index, certificate) in std::iter::once(CertificateDer::from(end_entity.as_ref()))
+        .chain(intermediates)
+        .enumerate()
+    {
         let parsed = Certificate::from_der(certificate.as_ref()).map_err(|_| {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
         })?;

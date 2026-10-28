@@ -363,10 +363,9 @@ fn only_the_verified_path_and_its_anchor_bound_validity() -> TestResult {
             .signed_by(&TestSigner::new()?, &intermediate)?
             .der()
             .clone();
-        let unrelated = CertifiedIssuer::self_signed(
-            ca_parameters("Unused", fixture.now, -1)?,
-            TestSigner::new()?,
-        )?;
+        let mut unused_params = ca_parameters("Unused", fixture.now, -1)?;
+        unused_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let unrelated = CertifiedIssuer::self_signed(unused_params, TestSigner::new()?)?;
         let expected = [
             certificate_expiration(fixture.root.der())?,
             certificate_expiration(intermediate.der())?,
@@ -375,16 +374,24 @@ fn only_the_verified_path_and_its_anchor_bound_validity() -> TestResult {
         .into_iter()
         .min()
         .ok_or("no expiry")?;
-        let result = trust.verify_chain(
-            &[
-                leaf,
-                unrelated.der().clone(),
-                intermediate.der().clone(),
-                fixture.root.der().clone(),
-            ],
+        let chain = [
+            leaf,
+            unrelated.der().clone(),
+            intermediate.der().clone(),
+            fixture.root.der().clone(),
+        ];
+        let result = trust.verify_chain(&chain, fixture.time())?;
+        assert_eq!(result.valid_until, expected);
+        trust
+            .client_verifier()
+            .verify_client_cert(&chain[0], &chain[1..], fixture.time())?;
+        trust.server_verifier().verify_server_cert(
+            &chain[0],
+            &chain[1..],
+            &tls_identity("example.test")?,
+            &[],
             fixture.time(),
         )?;
-        assert_eq!(result.valid_until, expected);
     }
     Ok(())
 }
@@ -662,8 +669,29 @@ fn a_ca_key_usage_without_cert_sign_is_rejected() -> TestResult {
         .signed_by(&TestSigner::new()?, &intermediate)?
         .der()
         .clone();
+    let chain = [leaf, intermediate.der().clone()];
     assert_eq!(
-        trust.verify_chain(&[leaf, intermediate.der().clone()], fixture.time()),
+        trust.verify_chain(&chain, fixture.time()),
+        Err(CertificateError::InvalidPurpose.into())
+    );
+    assert_eq!(
+        trust
+            .client_verifier()
+            .verify_client_cert(&chain[0], &chain[1..], fixture.time())
+            .map(|_| ()),
+        Err(CertificateError::InvalidPurpose.into())
+    );
+    assert_eq!(
+        trust
+            .server_verifier()
+            .verify_server_cert(
+                &chain[0],
+                &chain[1..],
+                &tls_identity("example.test")?,
+                &[],
+                fixture.time()
+            )
+            .map(|_| ()),
         Err(CertificateError::InvalidPurpose.into())
     );
     Ok(())

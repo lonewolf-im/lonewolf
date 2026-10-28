@@ -14,7 +14,7 @@ use nix::unistd::Pid;
 #[path = "../../support/readiness.rs"]
 mod readiness;
 
-use readiness::ReadinessSocket;
+use readiness::{Readiness, ReadinessSocket};
 
 pub(super) const TIMEOUT: Duration = Duration::from_secs(10);
 type TestResult = Result<(), Box<dyn Error>>;
@@ -53,8 +53,17 @@ impl Server {
         fs::read_to_string(self.directory.path().join("server.log"))
     }
 
-    /// Waits for the readiness notification and returns the C2S addresses in configuration order.
     pub(super) fn ready(&mut self) -> Result<Vec<SocketAddr>, Box<dyn Error>> {
+        self.ready_with(|readiness| {
+            assert!(readiness.s2s.is_none());
+            readiness.c2s
+        })
+    }
+
+    pub(super) fn ready_with<T>(
+        &mut self,
+        take: impl FnOnce(Readiness) -> T,
+    ) -> Result<T, Box<dyn Error>> {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             if self.child.try_wait()?.is_some() {
@@ -62,7 +71,7 @@ impl Server {
             }
             if let Some(readiness) = self.readiness.receive(Duration::from_millis(10))? {
                 self.metrics = readiness.metrics;
-                return Ok(readiness.c2s);
+                return Ok(take(readiness));
             }
             if Instant::now() >= deadline {
                 return Err(format!("server did not become ready: {}", self.logs()?).into());
@@ -75,15 +84,30 @@ impl Server {
     }
 
     pub(super) fn wait(&mut self) -> Result<ExitStatus, Box<dyn Error>> {
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Ok(status);
+        if let Some(status) = self.child.try_wait()? {
+            return Ok(status);
+        }
+        let pid = Pid::from_raw(self.child.id().try_into()?);
+        let result = thread::scope(|scope| {
+            let (completed, completion) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                // Keep the child unreaped while the timeout path can signal its PID.
+                let _ = completed.send(wait_unreaped(pid));
+            });
+            match completion.recv_timeout(TIMEOUT) {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = kill(pid, Signal::SIGKILL);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "server did not exit",
+                    ))
+                }
             }
-            if Instant::now() >= deadline {
-                return Err(format!("server did not exit: {}", self.logs()?).into());
-            }
-            thread::sleep(Duration::from_millis(10));
+        });
+        match result {
+            Ok(()) => Ok(self.child.wait()?),
+            Err(error) => Err(format!("{error}: {}", self.logs()?).into()),
         }
     }
 
@@ -91,6 +115,28 @@ impl Server {
         kill(Pid::from_raw(self.child.id().try_into()?), signal)?;
         assert!(self.wait()?.success(), "{}", self.logs()?);
         Ok(())
+    }
+}
+
+fn wait_unreaped(pid: Pid) -> std::io::Result<()> {
+    let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::uninit();
+    loop {
+        // waitid writes to this live buffer and does not retain its pointer.
+        let result = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                pid.as_raw() as nix::libc::id_t,
+                info.as_mut_ptr(),
+                nix::libc::WEXITED | nix::libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 

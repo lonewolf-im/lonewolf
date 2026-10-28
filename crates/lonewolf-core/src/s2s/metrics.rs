@@ -416,7 +416,6 @@ impl S2sMetrics {
         registry.register_collector(Box::new(S2sCollector(Arc::clone(self))));
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn connection_opened(self: &Arc<Self>, direction: Direction) -> ConnectionGauge {
         self.connections[direction as usize].fetch_add(1, Ordering::Relaxed);
         ConnectionGauge {
@@ -426,19 +425,16 @@ impl S2sMetrics {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn connection_accepted(&self, listener: usize) {
         self.listeners[listener]
             .accepted
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn connection_rejected(&self, listener: usize, reason: ConnectionRejection) {
         self.listeners[listener].rejected[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn authentication(
         &self,
         direction: Direction,
@@ -474,13 +470,11 @@ impl S2sMetrics {
         self.stanzas_sent[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn bytes(&self, direction: Direction, received: u64, sent: u64) {
         self.received_bytes[direction as usize].fetch_add(received, Ordering::Relaxed);
         self.sent_bytes[direction as usize].fetch_add(sent, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn rate_limited(&self, limit: InboundLimit) {
         self.rate_limited[limit as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -818,3 +812,9 @@ struct RejectedLabels {
 
 #[cfg(test)]
 mod tests;
+
+impl lonewolf_util::rate_limited_reader::RateLimitObserver for S2sMetrics {
+    fn on_throttle(&self) {
+        self.rate_limited(InboundLimit::IncomingXmlPerConnection);
+    }
+}

@@ -39,6 +39,7 @@ fn reader(xml: &str, limits: &S2sReaderLimits) -> TestReader {
         io::Cursor::new(xml.as_bytes().to_owned()),
         limits,
         GlobalChunkAllocator,
+        None,
     )
 }
 
@@ -434,6 +435,7 @@ fn reader_leaves_all_bytes_after_starttls_and_proceed_in_memory_pipe() -> TestRe
                 BufReader::with_capacity(1, input),
                 &limits(),
                 GlobalChunkAllocator,
+                None,
             );
             assert!(matches!(
                 success(reader.next_event().await)?,
@@ -443,7 +445,7 @@ fn reader_leaves_all_bytes_after_starttls_and_proceed_in_memory_pipe() -> TestRe
                 success(reader.next_event().await)?,
                 Some(StreamEvent::Element(_))
             ));
-            let mut raw = success(reader.take_input().await)?.into_inner();
+            let mut raw = success(reader.take_input().await)?.0.into_inner();
             let mut remaining = [0; 11];
             raw.read_exact(&mut remaining).await?;
             assert_eq!(&remaining, tail);
@@ -464,7 +466,7 @@ fn plain_tcp_reader_preserves_tls_record_bytes_in_raw_transport() -> TestResult 
         let compio::buf::BufResult(result, _) =
             compio::io::AsyncWriteExt::write_all(&mut &client, xml).await;
         result?;
-        let mut reader = S2sReader::plain(input.clone(), &limits(), GlobalChunkAllocator);
+        let mut reader = S2sReader::plain(input.clone(), &limits(), GlobalChunkAllocator, None);
         assert!(matches!(
             success(reader.next_event().await)?,
             Some(StreamEvent::StreamStart { .. })
@@ -662,13 +664,13 @@ fn take_input_abandons_pending_parse_and_token_wait_without_losing_trailing_byte
             let mut next = pin!(reader.next_event());
             assert!(poll!(next.as_mut()).is_pending());
         }
-        let mut input = success(reader.take_input().await)?;
+        let mut input = success(reader.take_input().await)?.0;
         let mut remaining = Vec::new();
         input.read_to_end(&mut remaining).await?;
         assert_eq!(remaining, b"trailing");
         let (input, mut output) = tokio::io::duplex(4_096);
         output.write_all(HEADER.as_bytes()).await?;
-        let mut reader = S2sReader::new(BufReader::new(input), &limits, GlobalChunkAllocator);
+        let mut reader = S2sReader::new(BufReader::new(input), &limits, GlobalChunkAllocator, None);
         assert!(matches!(
             success(reader.next_event().await)?,
             Some(StreamEvent::StreamStart { .. })
@@ -677,7 +679,7 @@ fn take_input_abandons_pending_parse_and_token_wait_without_losing_trailing_byte
             let mut next = pin!(reader.next_event());
             assert!(poll!(next.as_mut()).is_pending());
         }
-        let mut input = success(reader.take_input().await)?;
+        let mut input = success(reader.take_input().await)?.0;
         output.write_all(b"remaining").await?;
         let mut remaining = [0; 9];
         input.read_exact(&mut remaining).await?;
@@ -867,6 +869,146 @@ fn writer_buffers_stanzas_and_flushes_send_keepalive_and_one_footer() -> TestRes
                 .unwrap_or_else(|| STREAM_FOOTER.to_owned());
             assert_eq!(output.0.borrow().as_slice(), expected.as_bytes());
         }
+        Ok(())
+    })
+}
+
+fn metric_body(metrics: &Arc<S2sMetrics>) -> TestResult<String> {
+    let mut registry = prometheus_client::registry::Registry::default();
+    metrics.register(registry.sub_registry_with_prefix("lonewolf"));
+    let mut body = String::new();
+    prometheus_client::encoding::text::encode(&mut body, &registry)?;
+    Ok(body)
+}
+
+#[test]
+fn transfer_preserves_exhausted_xml_allowance_observer_and_reported_wait() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut limits = limits();
+        limits.xml = ByteRate {
+            bytes_per_second: NonZeroUsize::MIN,
+            burst_bytes: NonZeroUsize::new(HEADER.len()).ok_or("burst")?,
+        };
+        let metrics = S2sMetrics::new(1);
+        let mut before = S2sReader::new(
+            io::Cursor::new(HEADER.as_bytes().to_vec()),
+            &limits,
+            GlobalChunkAllocator,
+            Some(Arc::clone(&metrics)),
+        );
+        assert!(matches!(
+            success(before.next_event().await)?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        let (_, state) = success(before.take_input().await)?;
+        let mut after = S2sReader::from_state(
+            io::Cursor::new(HEADER.as_bytes().to_vec()),
+            state,
+            GlobalChunkAllocator,
+        );
+        for _ in 0..3 {
+            assert!(poll!(pin!(after.next_event())).is_pending());
+        }
+        let body = metric_body(&metrics)?;
+        assert!(
+            body.contains(
+                "lonewolf_s2s_rate_limited_total{limit=\"incoming_xml_per_connection\"} 1\n"
+            ),
+            "{body}"
+        );
+        let (_, state) = success(after.take_input().await)?;
+        let mut again = S2sReader::from_state(
+            io::Cursor::new(HEADER.as_bytes().to_vec()),
+            state,
+            GlobalChunkAllocator,
+        );
+        for _ in 0..3 {
+            assert!(poll!(pin!(again.next_event())).is_pending());
+        }
+        assert_eq!(metric_body(&metrics)?, body);
+        Ok(())
+    })
+}
+
+#[test]
+fn transfer_preserves_stanza_budget_and_counts_one_wait_per_stanza() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut limits = limits();
+        limits.stanzas = EventRate {
+            per_second: NonZeroUsize::MIN,
+            burst: NonZeroUsize::MIN,
+        };
+        let metrics = S2sMetrics::new(1);
+        let input = format!("{HEADER}<message from='peer.test' to='local.test'/>").into_bytes();
+        let mut before = S2sReader::new(
+            io::Cursor::new(input.clone()),
+            &limits,
+            GlobalChunkAllocator,
+            Some(Arc::clone(&metrics)),
+        );
+        success(before.next_event().await)?;
+        assert!(matches!(
+            success(before.next_event().await)?,
+            Some(StreamEvent::Stanza(_))
+        ));
+        let (_, state) = success(before.take_input().await)?;
+        assert_eq!(state.bucket.available(), 0);
+        let mut after = S2sReader::from_state(io::Cursor::new(input), state, GlobalChunkAllocator);
+        assert!(matches!(
+            success(after.next_event().await)?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        for _ in 0..3 {
+            assert!(poll!(pin!(after.next_event())).is_pending());
+        }
+        let body = metric_body(&metrics)?;
+        assert!(
+            body.contains(
+                "lonewolf_s2s_rate_limited_total{limit=\"incoming_stanzas_per_connection\"} 1\n"
+            ),
+            "{body}"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn restart_preserves_xml_budget_and_transport_pending_does_not_count() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut limits = limits();
+        limits.xml = ByteRate {
+            bytes_per_second: NonZeroUsize::MIN,
+            burst_bytes: NonZeroUsize::new(HEADER.len()).ok_or("burst")?,
+        };
+        let metrics = S2sMetrics::new(1);
+        let (input, mut output) = tokio::io::duplex(4096);
+        let mut reader = S2sReader::new(
+            BufReader::new(input),
+            &limits,
+            GlobalChunkAllocator,
+            Some(Arc::clone(&metrics)),
+        );
+        for _ in 0..3 {
+            assert!(poll!(pin!(reader.next_event())).is_pending());
+        }
+        assert!(!metric_body(&metrics)?.contains("lonewolf_s2s_rate_limited_total{"));
+        output.write_all(HEADER.as_bytes()).await?;
+        assert!(matches!(
+            success(reader.next_event().await)?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        success(reader.restart())?;
+        output.write_all(HEADER.as_bytes()).await?;
+        for _ in 0..3 {
+            assert!(poll!(pin!(reader.next_event())).is_pending());
+        }
+        let body = metric_body(&metrics)?;
+        assert!(
+            body.contains(
+                "lonewolf_s2s_rate_limited_total{limit=\"incoming_xml_per_connection\"} 1\n"
+            ),
+            "{body}"
+        );
         Ok(())
     })
 }

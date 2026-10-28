@@ -90,6 +90,8 @@ impl AcmeServer {
 [xmpp]
 stanza_pool_size_mib = 8
 default_host = "xmpp.example.test"
+[s2s]
+enabled = false
 [[c2s.listeners]]
 address = "127.0.0.1:0"
 [letsencrypt]
@@ -301,6 +303,7 @@ ca_certificates_path = {:?}
                 return Ok(Some(status));
             }
             if let Some(readiness) = self.readiness.receive(Duration::from_millis(5))? {
+                assert!(readiness.s2s.is_none());
                 self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
                 self.metrics = readiness.metrics;
                 return Ok(None);

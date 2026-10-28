@@ -317,7 +317,6 @@ impl Hosts {
         })
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn s2s_server_config(
         &self,
         domain: &str,

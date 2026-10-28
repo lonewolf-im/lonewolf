@@ -8,8 +8,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 
-/// Builds a service manager readiness message that lists C2S addresses in configuration order.
-pub(crate) fn message(c2s: &[SocketAddr], metrics: Option<SocketAddr>) -> String {
+pub(crate) fn message(
+    c2s: &[SocketAddr],
+    s2s: Option<&[SocketAddr]>,
+    metrics: Option<SocketAddr>,
+) -> String {
     let mut message = String::from("READY=1\nX_LONEWOLF_C2S_ADDRESSES=");
     for (index, address) in c2s.iter().enumerate() {
         if index > 0 {
@@ -18,6 +21,16 @@ pub(crate) fn message(c2s: &[SocketAddr], metrics: Option<SocketAddr>) -> String
         let _ = write!(message, "{address}");
     }
     message.push('\n');
+    if let Some(addresses) = s2s {
+        message.push_str("X_LONEWOLF_S2S_ADDRESSES=");
+        for (index, address) in addresses.iter().enumerate() {
+            if index > 0 {
+                message.push(',');
+            }
+            let _ = write!(message, "{address}");
+        }
+        message.push('\n');
+    }
     if let Some(address) = metrics {
         let _ = writeln!(message, "X_LONEWOLF_METRICS_ADDRESS={address}");
     }
@@ -80,16 +93,20 @@ mod tests {
                     SocketAddr::from((Ipv4Addr::LOCALHOST, 5222)),
                     SocketAddr::from((Ipv6Addr::LOCALHOST, 5223)),
                 ],
+                Some(&[
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 5269)),
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, 5270))
+                ]),
                 Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9090))),
             ),
-            "READY=1\nX_LONEWOLF_C2S_ADDRESSES=127.0.0.1:5222,[::1]:5223\nX_LONEWOLF_METRICS_ADDRESS=127.0.0.1:9090\n"
+            "READY=1\nX_LONEWOLF_C2S_ADDRESSES=127.0.0.1:5222,[::1]:5223\nX_LONEWOLF_S2S_ADDRESSES=127.0.0.1:5269,[::1]:5270\nX_LONEWOLF_METRICS_ADDRESS=127.0.0.1:9090\n"
         );
     }
 
     #[test]
     fn message_omits_the_metrics_address_when_metrics_are_disabled() {
         assert_eq!(
-            message(&[SocketAddr::from((Ipv4Addr::LOCALHOST, 5222))], None),
+            message(&[SocketAddr::from((Ipv4Addr::LOCALHOST, 5222))], None, None),
             "READY=1\nX_LONEWOLF_C2S_ADDRESSES=127.0.0.1:5222\n"
         );
     }

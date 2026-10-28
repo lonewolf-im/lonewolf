@@ -4,12 +4,18 @@ use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
 use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
 use crate::token_bucket::TokenBucket;
+
+pub trait RateLimitObserver: Send + Sync {
+    /// Called once per refill wait that blocks a read.
+    fn on_throttle(&self);
+}
 
 /// Starts with a full burst and uses the current Compio runtime for refill waits.
 pub struct RateLimitedReader<R> {
@@ -22,6 +28,8 @@ pub struct RateLimitState {
     bytes_per_second: NonZeroUsize,
     burst_bytes: NonZeroUsize,
     bucket: TokenBucket,
+    observer: Option<Arc<dyn RateLimitObserver>>,
+    wait_reported: bool,
     refill_wait: Option<Pin<Box<dyn Future<Output = ()>>>>,
     #[cfg(test)]
     clock: Option<tests::Clock>,
@@ -36,10 +44,21 @@ impl<R> RateLimitedReader<R> {
                 burst_bytes,
                 bucket: TokenBucket::new(burst_bytes, Instant::now()),
                 refill_wait: None,
+                observer: None,
+                wait_reported: false,
                 #[cfg(test)]
                 clock: None,
             },
         }
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn RateLimitObserver>) -> Self {
+        self.state.observer = Some(observer);
+        self
+    }
+
+    pub fn into_parts(self) -> (R, RateLimitState) {
+        (self.inner, self.state)
     }
 
     pub fn from_state(inner: R, state: RateLimitState) -> Self {
@@ -85,7 +104,15 @@ impl<R: AsyncBufRead + Unpin> AsyncBufRead for RateLimitedReader<R> {
                 }
                 Box::pin(compio::time::sleep(wait))
             });
-            ready!(timer.as_mut().poll(cx));
+            if timer.as_mut().poll(cx).is_pending() {
+                if !this.state.wait_reported {
+                    if let Some(observer) = &this.state.observer {
+                        observer.on_throttle();
+                    }
+                    this.state.wait_reported = true;
+                }
+                return Poll::Pending;
+            }
             this.state.refill_wait = None;
             let now = this.state.now();
             this.state
@@ -93,6 +120,7 @@ impl<R: AsyncBufRead + Unpin> AsyncBufRead for RateLimitedReader<R> {
                 .replenish(this.state.bytes_per_second, this.state.burst_bytes, now);
         }
         this.state.refill_wait = None;
+        this.state.wait_reported = false;
         let available = ready!(Pin::new(&mut this.inner).poll_fill_buf(cx))?;
         Poll::Ready(Ok(
             &available[..available.len().min(this.state.bucket.available())]

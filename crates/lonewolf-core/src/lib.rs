@@ -235,6 +235,15 @@ fn run_internal(
                         .registry()
                         .register_collector(Box::new(metrics::AcmeCollector::new(acme.status())));
                 }
+                let _s2s_metrics = if config.s2s.enabled
+                    && config.hosts.keys().any(|domain| hosts.federates(domain))
+                {
+                    let metrics = s2s::metrics::S2sMetrics::new(config.s2s.listeners.len());
+                    metrics.register(server_metrics.registry());
+                    Some(metrics)
+                } else {
+                    None
+                };
                 let metrics_server = if config.metrics.enabled {
                     Some(
                         lonewolf_metrics::MetricsServer::bind(config.metrics.address)

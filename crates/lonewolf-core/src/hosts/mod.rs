@@ -309,7 +309,6 @@ impl Hosts {
         )
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn federates(&self, domain: &str) -> bool {
         self.find_host(domain).is_some_and(|host| {
             host.config.federation

@@ -9,7 +9,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{Id, WaitPidFlag, waitid};
 use nix::unistd::Pid;
 
 #[path = "../../support/readiness.rs"]
@@ -93,13 +92,10 @@ impl Server {
             let (completed, completion) = std::sync::mpsc::sync_channel(1);
             scope.spawn(move || {
                 // Keep the child unreaped while the timeout path can signal its PID.
-                let _ = completed.send(waitid(
-                    Id::Pid(pid),
-                    WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
-                ));
+                let _ = completed.send(wait_unreaped(pid));
             });
             match completion.recv_timeout(TIMEOUT) {
-                Ok(result) => result.map(|_| ()).map_err(std::io::Error::from),
+                Ok(result) => result,
                 Err(_) => {
                     let _ = kill(pid, Signal::SIGKILL);
                     Err(std::io::Error::new(
@@ -119,6 +115,28 @@ impl Server {
         kill(Pid::from_raw(self.child.id().try_into()?), signal)?;
         assert!(self.wait()?.success(), "{}", self.logs()?);
         Ok(())
+    }
+}
+
+fn wait_unreaped(pid: Pid) -> std::io::Result<()> {
+    let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::uninit();
+    loop {
+        // waitid writes to this live buffer and does not retain its pointer.
+        let result = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                pid.as_raw() as nix::libc::id_t,
+                info.as_mut_ptr(),
+                nix::libc::WEXITED | nix::libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 

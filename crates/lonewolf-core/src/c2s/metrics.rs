@@ -19,7 +19,7 @@ use prometheus_client::registry::{Registry, Unit};
 use super::stream::{BindRejection, CloseOutcome, SaslFailure, SaslMechanism, StreamPhase};
 use super::unauthenticated_limit::UnauthenticatedLimiter;
 
-pub(super) const PHASE_BUCKETS: [f64; 13] = [
+pub(crate) const PHASE_BUCKETS: [f64; 13] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0,
 ];
 pub(super) const SESSION_BUCKETS: [f64; 13] = [

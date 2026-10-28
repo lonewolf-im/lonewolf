@@ -55,6 +55,7 @@ fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
             .any(|line| line == "lonewolf_log_dropped_lines_total 0"),
         "{body}"
     );
+    assert!(!body.contains("lonewolf_s2s_"), "{body}");
     assert!(body.ends_with("# EOF\n"), "{body}");
     assert!(request(address, "/missing")?.starts_with("HTTP/1.1 404"));
     server.stop(Signal::SIGTERM)?;

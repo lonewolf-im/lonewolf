@@ -37,6 +37,7 @@ mod metrics;
 mod stream;
 mod unauthenticated_limit;
 
+pub(crate) use metrics::PHASE_BUCKETS;
 use metrics::{C2sMetrics, C2sWorkerMetrics, RejectReason};
 use stream::{StreamAdmission, StreamSettings, StreamTimeouts, XmppStream};
 use unauthenticated_limit::{

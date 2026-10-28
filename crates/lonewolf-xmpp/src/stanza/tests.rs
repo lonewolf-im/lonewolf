@@ -357,6 +357,326 @@ fn parsed_stanza(xml: &str) -> Result<(Stanza, Arena), Box<dyn std::error::Error
 }
 
 #[test]
+fn rescope_changes_content_namespaces_and_preserves_foreign_subtrees() -> TestResult {
+    let (stanza, source) = parsed_stanza(concat!(
+        "<message from='alice@example.org/desk' to='bob@example.net' type='chat'>",
+        "<body>Hello <em>Bob</em>!</body><thread>thread-id</thread>",
+        "<forwarded xmlns='urn:xmpp:forward:0'>",
+        "<message xmlns='jabber:client'><body>original</body></message></forwarded>",
+        "<request xmlns='urn:xmpp:receipts'/></message>"
+    ))?;
+    let original = stanza_xml(stanza, &source)?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let copied = stanza
+        .resolve(&source)?
+        .rescope_in(StanzaNamespace::Server, &mut destination)?;
+    drop(source);
+    let view = copied.resolve(&destination)?;
+    assert_eq!(view.namespace(), StanzaNamespace::Server);
+    assert_eq!(
+        view.from()?.ok_or("sender")?.as_str(),
+        "alice@example.org/desk"
+    );
+    assert_eq!(view.to()?.ok_or("recipient")?.as_str(), "bob@example.net");
+    let children = view.children()?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child.name())
+            .collect::<Vec<_>>(),
+        ["body", "thread", "forwarded", "request"]
+    );
+    assert_eq!(children[0].namespace(), SERVER_NAMESPACE);
+    let body_nodes = children[0].children()?.collect::<Result<Vec<_>, _>>()?;
+    assert!(matches!(body_nodes[0], NodeRef::Text("Hello ")));
+    let NodeRef::Element(emphasis) = &body_nodes[1] else {
+        return Err("emphasis".into());
+    };
+    assert_eq!(emphasis.namespace(), SERVER_NAMESPACE);
+    assert_eq!(emphasis.text()?, Some("Bob"));
+    assert!(matches!(body_nodes[2], NodeRef::Text("!")));
+    assert_eq!(children[1].namespace(), SERVER_NAMESPACE);
+    assert_eq!(children[1].text()?, Some("thread-id"));
+    assert_eq!(children[2].namespace(), "urn:xmpp:forward:0");
+    let inner = children[2]
+        .child("message", CLIENT_NAMESPACE)?
+        .ok_or("forwarded message")?;
+    assert_eq!(
+        inner
+            .child("body", CLIENT_NAMESPACE)?
+            .ok_or("forwarded body")?
+            .text()?,
+        Some("original")
+    );
+    assert_eq!(children[3].namespace(), "urn:xmpp:receipts");
+    assert_eq!(
+        stanza_xml(copied, &destination)?,
+        original.replacen("xmlns=\"jabber:client\"", "xmlns=\"jabber:server\"", 1)
+    );
+    let mut restored = Arena::try_new(ArenaConfig::default())?;
+    let roundtrip = view.rescope_in(StanzaNamespace::Client, &mut restored)?;
+    assert_eq!(stanza_xml(roundtrip, &restored)?, original);
+    Ok(())
+}
+
+#[test]
+fn rescope_shared_namespace_bindings_fit_the_source_arena_limit() -> TestResult {
+    use std::fmt::Write as _;
+
+    let mut input = String::with_capacity(100_000);
+    input.push_str(concat!(
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>",
+        "<message from='example.org' to='example.net'"
+    ));
+    for index in 0..120 {
+        write!(input, " xmlns:n{index}='urn:test:{index}'")?;
+    }
+    input.push('>');
+    for _ in 0..1024 {
+        input.push_str(concat!(
+            "<body/>",
+            "<extension xmlns='urn:test:extension'><body xmlns='jabber:client'/></extension>"
+        ));
+    }
+    input.push_str("</message>");
+    let config = ArenaConfig::default();
+    let (stanza, source) = futures_executor::block_on(async {
+        let mut parser = XmppParser::new(
+            input.as_bytes(),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(input.len()).ok_or("zero limit")?,
+                arena: config,
+            },
+            GlobalChunkAllocator,
+        );
+        assert!(matches!(
+            parser.next_event().await?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+            return Err("expected stanza".into());
+        };
+        Ok::<_, Box<dyn std::error::Error>>(parsed.into_parts())
+    })?;
+    let view = stanza.resolve(&source)?;
+    let mut cloned = Arena::try_new(config)?;
+    let clone = view.clone_in(&mut cloned)?;
+    assert_eq!(clone.resolve(&cloned)?.children()?.count(), 2048);
+    let mut destination = Arena::try_new(config)?;
+    let copied = view.rescope_in(StanzaNamespace::Server, &mut destination)?;
+    drop(source);
+    let view = copied.resolve(&destination)?;
+    assert_eq!(view.namespace(), StanzaNamespace::Server);
+    assert_eq!(view.children()?.count(), 2048);
+    for child in view.children()? {
+        let child = child?;
+        if child.name() == "body" {
+            assert_eq!(child.namespace(), SERVER_NAMESPACE);
+        } else {
+            assert_eq!(child.namespace(), "urn:test:extension");
+            assert!(child.child("body", CLIENT_NAMESPACE)?.is_some());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rescope_preserves_unknown_type_headers_and_attribute_namespaces() -> TestResult {
+    let (stanza, source) = parsed_stanza(concat!(
+        "<message from='alice@example.org' to='bob@example.net' id='m&amp;1' type='future' xml:lang='es'",
+        " plain='yes' xmlns:c='jabber:client' c:flag='root'>",
+        "<body c:flag='child'>hola</body></message>"
+    ))?;
+    let original = stanza_xml(stanza, &source)?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let copied = stanza
+        .resolve(&source)?
+        .rescope_in(StanzaNamespace::Server, &mut destination)?;
+    let view = copied.resolve(&destination)?;
+    assert_eq!(view.id()?, Some("m&1"));
+    assert_eq!(view.lang()?, Some("es"));
+    assert_eq!(view.attribute("plain", "")?, Some("yes"));
+    assert_eq!(view.attribute("flag", CLIENT_NAMESPACE)?, Some("root"));
+    let child = view.child("body", SERVER_NAMESPACE)?.ok_or("body")?;
+    assert_eq!(child.attribute("flag", CLIENT_NAMESPACE)?, Some("child"));
+    assert!(stanza_xml(copied, &destination)?.contains("type=\"future\""));
+    let mut restored = Arena::try_new(ArenaConfig::default())?;
+    let roundtrip = view.rescope_in(StanzaNamespace::Client, &mut restored)?;
+    assert_eq!(stanza_xml(roundtrip, &restored)?, original);
+    Ok(())
+}
+
+#[test]
+fn rescope_preserves_prefixed_content_under_a_foreign_default_namespace() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let from = Jid::parse_in("example.org", &mut source)?;
+    let to = Jid::parse_in("example.net", &mut source)?;
+    let mut namespaces = super::NamespaceContext::default();
+    namespaces.bind("", "urn:foreign", &mut source)?;
+    namespaces.bind("c", CLIENT_NAMESPACE, &mut source)?;
+    let mut frame = super::ElementFrame::new("body", CLIENT_NAMESPACE, &mut source)?;
+    frame.set_namespaces(namespaces);
+    frame.text("body", &mut source)?;
+    let body = frame.finish(&mut source)?;
+    assert!(element_xml(body, &source)?.starts_with("<c:body"));
+    let nested = Element::builder_in("body", CLIENT_NAMESPACE, &mut source)?
+        .text("foreign subtree")?
+        .build()?;
+    let extension = Element::builder_in("extension", "urn:foreign", &mut source)?
+        .child(nested)?
+        .build()?;
+    let mut builder = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut source,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .child(body)?
+    .child(extension)?;
+    builder.namespaces = namespaces;
+    let stanza = builder.build()?;
+    let original = stanza_xml(stanza, &source)?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let copied = stanza
+        .resolve(&source)?
+        .rescope_in(StanzaNamespace::Server, &mut destination)?;
+    let view = copied.resolve(&destination)?;
+    assert_eq!(
+        view.child("body", SERVER_NAMESPACE)?
+            .ok_or("body")?
+            .text()?,
+        Some("body")
+    );
+    assert_eq!(
+        view.child("extension", "urn:foreign")?
+            .ok_or("extension")?
+            .child("body", CLIENT_NAMESPACE)?
+            .ok_or("nested body")?
+            .text()?,
+        Some("foreign subtree")
+    );
+    let mut restored = Arena::try_new(ArenaConfig::default())?;
+    let roundtrip = view.rescope_in(StanzaNamespace::Client, &mut restored)?;
+    assert_eq!(stanza_xml(roundtrip, &restored)?, original);
+    Ok(())
+}
+
+#[test]
+fn rescope_changes_error_payload_namespace() -> TestResult {
+    let (stanza, source) = parsed_stanza(concat!(
+        "<message from='example.org' to='example.net' type='error'><body>body</body>",
+        "<error type='wait'><remote-server-timeout xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"
+    ))?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let copied = stanza
+        .resolve(&source)?
+        .rescope_in(StanzaNamespace::Server, &mut destination)?;
+    let error = copied
+        .resolve(&destination)?
+        .child("error", SERVER_NAMESPACE)?
+        .ok_or("error")?;
+    assert_eq!(error.attribute("type", "")?, Some("wait"));
+    assert!(
+        error
+            .child("remote-server-timeout", STANZA_ERROR_NAMESPACE)?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn remote_server_timeout_reply_uses_wait_and_default_text() -> TestResult {
+    let (stanza, mut arena) = parsed_stanza("<message from='example.org' to='example.net'/>")?;
+    let reply = stanza
+        .error_reply_in(&mut arena, StanzaErrorCondition::RemoteServerTimeout)?
+        .build()?;
+    let error = reply
+        .resolve(&arena)?
+        .child("error", CLIENT_NAMESPACE)?
+        .ok_or("error")?;
+    assert_eq!(error.attribute("type", "")?, Some("wait"));
+    assert!(
+        error
+            .child("remote-server-timeout", STANZA_ERROR_NAMESPACE)?
+            .is_some()
+    );
+    assert_eq!(
+        error
+            .child("text", STANZA_ERROR_NAMESPACE)?
+            .ok_or("text")?
+            .text()?,
+        Some("The server could not reach the remote domain in time.")
+    );
+    Ok(())
+}
+
+#[test]
+fn rescope_to_same_namespace_preserves_serialization() -> TestResult {
+    let (stanza, source) =
+        parsed_stanza("<presence xml:lang='en'><show>away</show><x xmlns='urn:test'/></presence>")?;
+    let original = stanza_xml(stanza, &source)?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let copied = stanza
+        .resolve(&source)?
+        .rescope_in(StanzaNamespace::Client, &mut destination)?;
+    drop(source);
+    assert_eq!(stanza_xml(copied, &destination)?, original);
+    Ok(())
+}
+
+#[test]
+fn rescope_to_server_requires_both_addresses() -> TestResult {
+    for input in [
+        "<message from='example.org'/>",
+        "<message to='example.net'/>",
+        "<message/>",
+    ] {
+        let (stanza, source) = parsed_stanza(input)?;
+        let mut destination = Arena::try_new(ArenaConfig::default())?;
+        assert!(matches!(
+            stanza
+                .resolve(&source)?
+                .rescope_in(StanzaNamespace::Server, &mut destination),
+            Err(BuildError::MissingServerAddresses)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn rescope_copies_maximum_stanza_depth() -> TestResult {
+    let mut source = Arena::try_new(ArenaConfig::default())?;
+    let from = Jid::parse_in("example.org", &mut source)?;
+    let to = Jid::parse_in("example.net", &mut source)?;
+    let mut child = body(&mut source, "deep")?;
+    for _ in 1..MAX_ELEMENT_DEPTH - 1 {
+        child = Element::builder_in("nested", CLIENT_NAMESPACE, &mut source)?
+            .child(child)?
+            .build()?;
+    }
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut source,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .child(child)?
+    .build()?;
+    let mut destination = Arena::try_new(ArenaConfig::default())?;
+    let copied = stanza
+        .resolve(&source)?
+        .rescope_in(StanzaNamespace::Server, &mut destination)?;
+    let child = copied
+        .resolve(&destination)?
+        .child("nested", SERVER_NAMESPACE)?
+        .ok_or("nested")?;
+    assert_eq!(child.size().0, MAX_ELEMENT_DEPTH - 1);
+    Ok(())
+}
+
+#[test]
 fn stanza_elements_keep_addresses_type_language_and_extension_attributes() -> TestResult {
     for lang in ["es", ""] {
         let (stanza, source) = parsed_stanza(&format!(
@@ -1469,6 +1789,7 @@ fn stanza_error_conditions_have_expected_names_and_types() {
         StanzaErrorCondition::NotAllowed,
         StanzaErrorCondition::PolicyViolation,
         StanzaErrorCondition::RemoteServerNotFound,
+        StanzaErrorCondition::RemoteServerTimeout,
         StanzaErrorCondition::ResourceConstraint,
         StanzaErrorCondition::ServiceUnavailable,
     ] {
@@ -1483,6 +1804,7 @@ fn stanza_error_conditions_have_expected_names_and_types() {
             StanzaErrorCondition::NotAllowed => ("not-allowed", "cancel"),
             StanzaErrorCondition::PolicyViolation => ("policy-violation", "wait"),
             StanzaErrorCondition::RemoteServerNotFound => ("remote-server-not-found", "cancel"),
+            StanzaErrorCondition::RemoteServerTimeout => ("remote-server-timeout", "wait"),
             StanzaErrorCondition::ResourceConstraint => ("resource-constraint", "wait"),
             StanzaErrorCondition::ServiceUnavailable => ("service-unavailable", "cancel"),
         };

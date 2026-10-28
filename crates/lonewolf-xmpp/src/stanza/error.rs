@@ -48,6 +48,7 @@ impl StanzaErrorCondition {
             Self::RemoteServerNotFound => {
                 "The server cannot deliver this request to a remote domain."
             }
+            Self::RemoteServerTimeout => "The server could not reach the remote domain in time.",
             Self::ResourceConstraint => {
                 "The server cannot complete this request within its resource limits."
             }

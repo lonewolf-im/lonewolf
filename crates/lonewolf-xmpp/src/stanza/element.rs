@@ -348,6 +348,36 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         self.to_builder_in(arena)?.build()
     }
 
+    pub(super) fn rescope_with_namespaces<A: ChunkAllocator>(
+        &self,
+        from: &str,
+        to: &str,
+        arena: &mut Arena<A>,
+        copies: &mut NamespaceCopies,
+        rescoped: &mut NamespaceCopies,
+    ) -> Result<Element, BuildError> {
+        if self.namespace != from || from == to {
+            return self.clone_with_namespaces(arena, copies);
+        }
+        let mut frame = ElementFrame::new(self.name, to, arena)?;
+        frame.namespaces = self
+            .data
+            .namespaces
+            .rescope_in(from, to, self.arena, arena, rescoped)?;
+        frame.append_attributes_from(self.data.attributes, self.arena, arena)?;
+        for node in self.children()? {
+            match node? {
+                NodeRef::Element(element) => {
+                    let child =
+                        element.rescope_with_namespaces(from, to, arena, copies, rescoped)?;
+                    frame.child(child, arena)?;
+                }
+                NodeRef::Text(text) => frame.text(text, arena)?,
+            }
+        }
+        frame.finish(arena)
+    }
+
     /// Copies all content into the destination before applying edits.
     pub fn to_builder_in<'b, A: ChunkAllocator>(
         &self,

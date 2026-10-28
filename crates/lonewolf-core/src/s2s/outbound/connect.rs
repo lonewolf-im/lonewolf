@@ -224,6 +224,17 @@ fn tls_failure(error: io::Error) -> Failure {
     EstablishError::Tls(reason).into()
 }
 
+fn unexpired_validity(
+    valid_until: SystemTime,
+    completed_at: SystemTime,
+) -> Result<SystemTime, Failure> {
+    if valid_until <= completed_at {
+        Err(EstablishError::Tls("certificate_expired").into())
+    } else {
+        Ok(valid_until)
+    }
+}
+
 fn sasl_condition(name: &str) -> &'static str {
     if name.len() > 32 || !name.is_ascii() {
         return "other";
@@ -573,11 +584,11 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     flow.send(&header).await?;
     flow.header(remote).await?;
     features(flow.expected().await?)?;
-    context
+    let validity = context
         .trust
         .verify_chain(certificates.as_deref().unwrap_or(&[]), UnixTime::now())
-        .map(|validity| validity.valid_until)
-        .map_err(|error| EstablishError::Tls(tls_reason(&error)).into())
+        .map_err(|error| Failure::from(EstablishError::Tls(tls_reason(&error))))?;
+    unexpired_validity(validity.valid_until, SystemTime::now())
 }
 
 #[allow(dead_code)]

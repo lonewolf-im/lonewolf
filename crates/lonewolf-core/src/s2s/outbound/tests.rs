@@ -221,6 +221,80 @@ fn tls_classification_uses_typed_errors_and_io_sources() -> TestResult {
 }
 
 #[test]
+fn peer_validity_must_extend_past_negotiation_completion() {
+    let completion = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    let expired = Failure::from(EstablishError::Tls("certificate_expired"));
+    for valid_until in [completion - Duration::from_nanos(1), completion] {
+        assert_eq!(unexpired_validity(valid_until, completion), Err(expired));
+    }
+    let valid_until = completion + Duration::from_nanos(1);
+    assert_eq!(unexpired_validity(valid_until, completion), Ok(valid_until));
+}
+
+#[test]
+fn configured_anchor_expiry_rejects_an_otherwise_valid_peer_at_completion() -> TestResult {
+    use base64::Engine as _;
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose,
+    };
+
+    let epoch = 2_000_000_000;
+    let now = time::OffsetDateTime::from_unix_timestamp(epoch)?;
+    let mut root = CertificateParams::new(Vec::<String>::new())?;
+    root.serial_number = Some(1u64.into());
+    root.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    root.not_before = now - time::Duration::days(1);
+    root.not_after = now + time::Duration::seconds(10);
+    let mut leaf = CertificateParams::new(vec!["remote.test".into()])?;
+    leaf.serial_number = Some(2u64.into());
+    leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    leaf.not_before = now - time::Duration::days(1);
+    leaf.not_after = now + time::Duration::days(1);
+    let [leaf, root] = crate::hosts::test_support::signed_chain(root, leaf)?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("anchors.pem");
+    std::fs::write(
+        &path,
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            base64::engine::general_purpose::STANDARD.encode(root.as_ref()),
+        ),
+    )?;
+    let trust = PeerTrust::load(
+        &crate::config::S2sTlsConfig {
+            trust_anchors_path: Some(path),
+        },
+        Arc::new(rustls_graviola::default_provider()),
+    )?;
+    let expiry = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch as u64 + 10);
+    let initial = trust.verify_chain(
+        std::slice::from_ref(&leaf),
+        UnixTime::since_unix_epoch(Duration::from_secs(epoch as u64)),
+    )?;
+    assert_eq!(initial.valid_until, expiry);
+    for (seconds, expired) in [(9, false), (10, true), (11, true)] {
+        let elapsed = Duration::from_secs(epoch as u64 + seconds);
+        let validity = trust.verify_chain(
+            std::slice::from_ref(&leaf),
+            UnixTime::since_unix_epoch(elapsed),
+        )?;
+        assert_eq!(validity.valid_until, expiry);
+        let result = unexpired_validity(validity.valid_until, SystemTime::UNIX_EPOCH + elapsed);
+        assert_eq!(
+            result,
+            if expired {
+                Err(EstablishError::Tls("certificate_expired").into())
+            } else {
+                Ok(expiry)
+            }
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn sasl_failure_names_remain_static_and_bounded() {
     for name in [
         "aborted",

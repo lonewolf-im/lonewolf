@@ -97,18 +97,23 @@ impl AdmissionLimits {
                 report_count,
             });
         }
-        if self
-            .global
-            .active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.global.max).then_some(active + 1)
-            })
-            .is_err()
-        {
-            return Err(Rejection {
-                reason: ConnectionRejection::MaxInboundConnections,
-                report_count: self.global.report.lock().record(now),
-            });
+        let mut active = self.global.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.global.max {
+                return Err(Rejection {
+                    reason: ConnectionRejection::MaxInboundConnections,
+                    report_count: self.global.report.lock().record(now),
+                });
+            }
+            match self.global.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
         }
         let global = GlobalPermit(Arc::clone(&self.global));
         match self.connections.reserve(ip, now).await {

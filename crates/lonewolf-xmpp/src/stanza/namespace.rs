@@ -342,6 +342,27 @@ impl NamespaceContext {
         arena: &mut Arena<A>,
         copies: &mut NamespaceCopies,
     ) -> Result<Self, BuildError> {
+        self.copy_in(source, arena, copies, None)
+    }
+
+    pub(super) fn rescope_in<A: ChunkAllocator>(
+        self,
+        from: &str,
+        to: &str,
+        source: &impl ArenaRead,
+        arena: &mut Arena<A>,
+        copies: &mut NamespaceCopies,
+    ) -> Result<Self, BuildError> {
+        self.copy_in(source, arena, copies, Some((from, to)))
+    }
+
+    fn copy_in<A: ChunkAllocator>(
+        self,
+        source: &impl ArenaRead,
+        arena: &mut Arena<A>,
+        copies: &mut NamespaceCopies,
+        rescope: Option<(&str, &str)>,
+    ) -> Result<Self, BuildError> {
         let mut missing = SmallVec::<[Handle<Binding>; 8]>::new();
         let mut current = self;
         let mut result = Self::default();
@@ -356,11 +377,13 @@ impl NamespaceContext {
         }
         for handle in missing.into_iter().rev() {
             let binding = source.get(handle)?;
-            result.bind(
-                source.get(binding.prefix)?,
-                source.get(binding.namespace)?,
-                arena,
-            )?;
+            let prefix = source.get(binding.prefix)?;
+            let namespace = source.get(binding.namespace)?;
+            let namespace = match rescope {
+                Some((from, to)) if prefix.is_empty() && namespace == from => to,
+                _ => namespace,
+            };
+            result.bind(prefix, namespace, arena)?;
             if let Some(copied) = result.0 {
                 copies.copied.insert(std::ptr::from_ref(binding), copied);
             }

@@ -122,6 +122,7 @@ pub enum StanzaErrorCondition {
     /// Uses `wait` because the client can retry after the policy allows it.
     PolicyViolation,
     RemoteServerNotFound,
+    RemoteServerTimeout,
     ResourceConstraint,
     ServiceUnavailable,
 }
@@ -139,6 +140,7 @@ impl StanzaErrorCondition {
             Self::NotAllowed => "not-allowed",
             Self::PolicyViolation => "policy-violation",
             Self::RemoteServerNotFound => "remote-server-not-found",
+            Self::RemoteServerTimeout => "remote-server-timeout",
             Self::ResourceConstraint => "resource-constraint",
             Self::ServiceUnavailable => "service-unavailable",
         }
@@ -154,7 +156,7 @@ impl StanzaErrorCondition {
             | Self::ServiceUnavailable => "cancel",
             Self::Forbidden => "auth",
             Self::InternalServerError => "cancel",
-            Self::PolicyViolation | Self::ResourceConstraint => "wait",
+            Self::PolicyViolation | Self::RemoteServerTimeout | Self::ResourceConstraint => "wait",
         }
     }
 }
@@ -537,6 +539,48 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         self.to_builder_in(arena)?.build()
     }
 
+    /// Copies the content namespace per RFC 6120 §4.8.3, preserving foreign subtrees.
+    pub fn rescope_in<A: ChunkAllocator>(
+        &self,
+        namespace: StanzaNamespace,
+        arena: &mut Arena<A>,
+    ) -> Result<Stanza, BuildError> {
+        if namespace == self.namespace() {
+            return self.clone_in(arena);
+        }
+        let mut header = self.copy_header_in(arena)?;
+        header.namespace = namespace;
+        let mut copies = NamespaceCopies::default();
+        let mut rescoped = NamespaceCopies::default();
+        let namespaces = self.data.namespaces.rescope_in(
+            self.namespace().as_str(),
+            namespace.as_str(),
+            self.arena,
+            arena,
+            &mut rescoped,
+        )?;
+        let attributes = AttributesBuilder::copy_from(self.data.attributes, self.arena, arena)?;
+        let mut children = SliceBuilder::new();
+        for child in self.children()? {
+            let child = child?.rescope_with_namespaces(
+                self.namespace().as_str(),
+                namespace.as_str(),
+                arena,
+                &mut copies,
+                &mut rescoped,
+            )?;
+            children.push(child, arena)?;
+        }
+        StanzaBuilder {
+            arena,
+            header,
+            namespaces,
+            attributes,
+            children,
+        }
+        .build()
+    }
+
     /// Copies all content into the destination before applying edits.
     pub fn to_builder_in<'b, A: ChunkAllocator>(
         &self,
@@ -551,25 +595,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         arena: &'b mut Arena<A>,
         mut keep: impl FnMut(&ElementRef<'a, R>) -> Result<bool, HandleError>,
     ) -> Result<StanzaBuilder<'b, A>, BuildError> {
-        let header = Header {
-            stanza_type: self.stanza_type(),
-            original_message_type: self
-                .data
-                .header
-                .original_message_type
-                .map(|value| self.arena.get(value))
-                .transpose()?
-                .map(|value| arena.try_alloc_str(value))
-                .transpose()?,
-            namespace: self.namespace(),
-            from: self.from()?.map(|jid| jid.clone_in(arena)).transpose()?,
-            to: self.to()?.map(|jid| jid.clone_in(arena)).transpose()?,
-            id: self.id()?.map(|id| arena.try_alloc_str(id)).transpose()?,
-            lang: self
-                .lang()?
-                .map(|lang| arena.try_alloc_str(lang))
-                .transpose()?,
-        };
+        let header = self.copy_header_in(arena)?;
         let mut copies = NamespaceCopies::default();
         let namespaces = self
             .data
@@ -589,6 +615,31 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
             namespaces,
             attributes,
             children,
+        })
+    }
+
+    fn copy_header_in<A: ChunkAllocator>(
+        &self,
+        arena: &mut Arena<A>,
+    ) -> Result<Header, BuildError> {
+        Ok(Header {
+            stanza_type: self.stanza_type(),
+            original_message_type: self
+                .data
+                .header
+                .original_message_type
+                .map(|value| self.arena.get(value))
+                .transpose()?
+                .map(|value| arena.try_alloc_str(value))
+                .transpose()?,
+            namespace: self.namespace(),
+            from: self.from()?.map(|jid| jid.clone_in(arena)).transpose()?,
+            to: self.to()?.map(|jid| jid.clone_in(arena)).transpose()?,
+            id: self.id()?.map(|id| arena.try_alloc_str(id)).transpose()?,
+            lang: self
+                .lang()?
+                .map(|lang| arena.try_alloc_str(lang))
+                .transpose()?,
         })
     }
 

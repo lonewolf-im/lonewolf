@@ -38,6 +38,7 @@ mod order;
 mod panic;
 mod readiness;
 pub(crate) mod router;
+mod s2s;
 mod shutdown;
 mod stages;
 mod storage;

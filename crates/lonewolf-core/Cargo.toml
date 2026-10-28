@@ -19,6 +19,7 @@ futures-channel.workspace = true
 futures-rustls.workspace = true
 futures-util = { workspace = true, features = ["io"] }
 graviola.workspace = true
+hickory-proto.workspace = true
 http.workspace = true
 idna.workspace = true
 oxilangtag.workspace = true

@@ -42,6 +42,7 @@ futures-rustls = { version = "0.26.0", default-features = false }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
 graviola = "0.4.1"
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 hdrhistogram = { version = "7.6.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false, features = ["zeroize"] }
 http = { version = "1.4.2", default-features = false, features = ["std"] }

@@ -8,8 +8,9 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use http::Uri;
 use lonewolf_auth::server::Mechanism;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Deserializer};
 pub mod limits;
 
 use limits::LimitsConfig;
+pub use limits::S2sLimits;
 
 pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 const MEBIBYTE: usize = 1024 * 1024;
@@ -35,6 +37,7 @@ pub struct Config {
     #[serde(default = "default_hosts")]
     pub hosts: BTreeMap<String, HostConfig>,
     pub c2s: C2sConfig,
+    pub s2s: S2sConfig,
     pub limits: LimitsConfig,
     pub storage: StorageConfig,
     pub account: AccountConfig,
@@ -50,6 +53,7 @@ impl Default for Config {
             xmpp: XmppConfig::default(),
             hosts: default_hosts(),
             c2s: C2sConfig::default(),
+            s2s: S2sConfig::default(),
             limits: LimitsConfig::default(),
             storage: StorageConfig::default(),
             account: AccountConfig::default(),
@@ -102,6 +106,7 @@ impl Config {
         self.metrics.validate(&self.c2s)?;
         self.letsencrypt
             .validate(&self.hosts, &self.c2s, &self.metrics)?;
+        self.s2s.validate(self)?;
         self.limits.validate()?;
         for (index, listener) in self.c2s.listeners.iter().enumerate() {
             if !listener.auth_mechanisms.has_scram() {
@@ -156,19 +161,7 @@ impl Config {
             _ => {}
         }
         for (domain, host) in &self.hosts {
-            let mut arena = Arena::try_new(ArenaConfig::default())
-                .map_err(|error| format!("cannot validate hosts.{domain}: {error}"))?;
-            let jid = Jid::from_parts_in(None, domain, None, &mut arena)
-                .map_err(|error| format!("hosts.{domain} is not a valid XMPP domain: {error}"))?;
-            let normalized = jid
-                .resolve(&arena)
-                .map_err(|error| format!("cannot validate hosts.{domain}: {error}"))?;
-            if normalized.domainpart() != domain {
-                return Err(format!(
-                    "hosts.{domain} must use the normalized form {:?}",
-                    normalized.domainpart()
-                ));
-            }
+            validate_domain(domain, "hosts")?;
             if domain != "localhost" && host.tls.is_none() {
                 return Err(format!("hosts.{domain}.tls is required"));
             }
@@ -205,6 +198,23 @@ impl Config {
     }
 }
 
+fn validate_domain(domain: &str, prefix: &str) -> Result<(), String> {
+    let mut arena = Arena::try_new(ArenaConfig::default())
+        .map_err(|error| format!("cannot validate {prefix}.{domain}: {error}"))?;
+    let jid = Jid::from_parts_in(None, domain, None, &mut arena)
+        .map_err(|error| format!("{prefix}.{domain} is not a valid XMPP domain: {error}"))?;
+    let normalized = jid
+        .resolve(&arena)
+        .map_err(|error| format!("cannot validate {prefix}.{domain}: {error}"))?;
+    if normalized.domainpart() != domain {
+        return Err(format!(
+            "{prefix}.{domain} must use the normalized form {:?}",
+            normalized.domainpart()
+        ));
+    }
+    Ok(())
+}
+
 fn default_hosts() -> BTreeMap<String, HostConfig> {
     BTreeMap::from([(String::from("localhost"), HostConfig::default())])
 }
@@ -214,6 +224,7 @@ fn default_hosts() -> BTreeMap<String, HostConfig> {
 pub struct HostConfig {
     pub tls: Option<HostTlsConfig>,
     pub extensions: Vec<String>,
+    pub federation: bool,
     #[serde(flatten)]
     pub options: BTreeMap<String, toml::Table>,
 }
@@ -230,6 +241,7 @@ impl Default for HostConfig {
                 lonewolf_extension::vcard::NAME.into(),
                 lonewolf_extension::carbons::NAME.into(),
             ],
+            federation: true,
             options: BTreeMap::new(),
         }
     }
@@ -502,6 +514,149 @@ impl C2sConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct S2sConfig {
+    pub enabled: bool,
+    pub listeners: Vec<S2sListenerConfig>,
+    pub tls: S2sTlsConfig,
+    pub dns: S2sDnsConfig,
+    /// Replaces DNS endpoints for each domain; certificate checks still use that domain.
+    pub routes: BTreeMap<String, Vec<SocketAddr>>,
+}
+
+impl Default for S2sConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listeners: vec![S2sListenerConfig::default()],
+            tls: S2sTlsConfig::default(),
+            dns: S2sDnsConfig::default(),
+            routes: BTreeMap::new(),
+        }
+    }
+}
+
+impl S2sConfig {
+    fn validate(&self, config: &Config) -> Result<(), String> {
+        if self
+            .tls
+            .trust_anchors_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err("s2s.tls.trust_anchors_path must not be empty".into());
+        }
+        if Instant::now()
+            .checked_add(Duration::from_secs(self.dns.timeout_secs.get()))
+            .is_none()
+        {
+            return Err("s2s.dns.timeout_secs exceeds the platform clock range".into());
+        }
+        for (domain, endpoints) in &self.routes {
+            validate_domain(domain, "s2s.routes")?;
+            if config.hosts.contains_key(domain) {
+                return Err(format!("s2s.routes.{domain} must not be a configured host"));
+            }
+            if endpoints.is_empty() {
+                return Err(format!(
+                    "s2s.routes.{domain} must define at least one endpoint"
+                ));
+            }
+            for (index, endpoint) in endpoints.iter().enumerate() {
+                if endpoint.port() == 0 {
+                    return Err(format!(
+                        "s2s.routes.{domain}[{index}] must not use port zero"
+                    ));
+                }
+            }
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.listeners.is_empty() {
+            return Err("s2s.listeners must define at least one listener".into());
+        }
+        let managed = config.hosts.values().any(|host| {
+            host.tls
+                .as_ref()
+                .is_some_and(|tls| matches!(tls.source, HostTlsSource::LetsEncrypt))
+        });
+        for (index, listener) in self.listeners.iter().enumerate() {
+            for (previous, other) in self.listeners[..index].iter().enumerate() {
+                if endpoints_overlap(listener.address, other.address) {
+                    return Err(format!(
+                        "s2s.listeners[{index}] overlaps s2s.listeners[{previous}]"
+                    ));
+                }
+            }
+            for (other, client) in config.c2s.listeners.iter().enumerate() {
+                if endpoints_overlap(listener.address, client.address) {
+                    return Err(format!(
+                        "s2s.listeners[{index}] overlaps c2s.listeners[{other}]"
+                    ));
+                }
+            }
+            if config.metrics.enabled && endpoints_overlap(listener.address, config.metrics.address)
+            {
+                return Err(format!("s2s.listeners[{index}] overlaps metrics.address"));
+            }
+            if managed {
+                for (other, &address) in config.letsencrypt.listen.iter().enumerate() {
+                    if endpoints_overlap(listener.address, address) {
+                        return Err(format!(
+                            "s2s.listeners[{index}] overlaps letsencrypt.listen[{other}]"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct S2sListenerConfig {
+    /// IPv6 addresses accept IPv6 only; port zero selects one port for all workers.
+    pub address: SocketAddr,
+}
+
+impl Default for S2sListenerConfig {
+    fn default() -> Self {
+        Self {
+            address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5269)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct S2sTlsConfig {
+    pub trust_anchors_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct S2sDnsConfig {
+    pub nameservers: Vec<SocketAddr>,
+    pub timeout_secs: NonZeroU64,
+}
+
+impl Default for S2sDnsConfig {
+    fn default() -> Self {
+        Self {
+            nameservers: Vec::new(),
+            timeout_secs: const {
+                match NonZeroU64::new(5) {
+                    Some(value) => value,
+                    None => panic!("default timeout must be positive"),
+                }
+            },
+        }
     }
 }
 

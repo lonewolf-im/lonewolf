@@ -10,11 +10,200 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
     pub c2s: C2sLimits,
+    pub s2s: S2sLimits,
 }
 
 impl LimitsConfig {
     pub(super) fn validate(&self) -> Result<(), String> {
-        self.c2s.validate()
+        self.c2s.validate()?;
+        self.s2s.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(from = "S2sLimitsInput")]
+pub struct S2sLimits {
+    pub max_inbound_connections: NonZeroUsize,
+    pub max_connections_per_ip: NonZeroUsize,
+    pub connection_attempts_per_ip: EventRate,
+    pub max_inbound_streams_per_domain: NonZeroUsize,
+    pub negotiation_timeout_secs: NonZeroU64,
+    pub connect_timeout_secs: NonZeroU64,
+    pub max_stanza_bytes: NonZeroUsize,
+    pub incoming_stanzas_per_connection: EventRate,
+    pub incoming_xml_per_connection: ByteRate,
+    pub max_outbound_links: NonZeroUsize,
+    pub max_queued_stanzas_per_link: NonZeroUsize,
+    pub max_queued_bytes_per_link: NonZeroUsize,
+    pub idle_timeout_secs: NonZeroU64,
+    pub stalled_write_timeout_secs: NonZeroU64,
+    pub failure_backoff_initial_secs: NonZeroU64,
+    pub failure_backoff_max_secs: NonZeroU64,
+}
+
+impl Default for S2sLimits {
+    fn default() -> Self {
+        const {
+            Self {
+                max_inbound_connections: nonzero(1_024),
+                max_connections_per_ip: nonzero(32),
+                connection_attempts_per_ip: EventRate {
+                    per_second: nonzero(10),
+                    burst: nonzero(50),
+                },
+                max_inbound_streams_per_domain: nonzero(4),
+                negotiation_timeout_secs: nonzero_secs(30),
+                connect_timeout_secs: nonzero_secs(10),
+                max_stanza_bytes: nonzero(524_288),
+                incoming_stanzas_per_connection: EventRate {
+                    per_second: nonzero(200),
+                    burst: nonzero(2_000),
+                },
+                incoming_xml_per_connection: ByteRate {
+                    bytes_per_second: nonzero(1_048_576),
+                    burst_bytes: nonzero(4_194_304),
+                },
+                max_outbound_links: nonzero(1_024),
+                max_queued_stanzas_per_link: nonzero(512),
+                max_queued_bytes_per_link: nonzero(4_194_304),
+                idle_timeout_secs: nonzero_secs(600),
+                stalled_write_timeout_secs: nonzero_secs(60),
+                failure_backoff_initial_secs: nonzero_secs(30),
+                failure_backoff_max_secs: nonzero_secs(900),
+            }
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct S2sLimitsInput {
+    max_inbound_connections: Option<NonZeroUsize>,
+    max_connections_per_ip: Option<NonZeroUsize>,
+    connection_attempts_per_ip: Option<EventRateInput>,
+    max_inbound_streams_per_domain: Option<NonZeroUsize>,
+    negotiation_timeout_secs: Option<NonZeroU64>,
+    connect_timeout_secs: Option<NonZeroU64>,
+    max_stanza_bytes: Option<NonZeroUsize>,
+    incoming_stanzas_per_connection: Option<EventRateInput>,
+    incoming_xml_per_connection: Option<ByteRateInput>,
+    max_outbound_links: Option<NonZeroUsize>,
+    max_queued_stanzas_per_link: Option<NonZeroUsize>,
+    max_queued_bytes_per_link: Option<NonZeroUsize>,
+    idle_timeout_secs: Option<NonZeroU64>,
+    stalled_write_timeout_secs: Option<NonZeroU64>,
+    failure_backoff_initial_secs: Option<NonZeroU64>,
+    failure_backoff_max_secs: Option<NonZeroU64>,
+}
+
+impl From<S2sLimitsInput> for S2sLimits {
+    fn from(input: S2sLimitsInput) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_inbound_connections: input
+                .max_inbound_connections
+                .unwrap_or(defaults.max_inbound_connections),
+            max_connections_per_ip: input
+                .max_connections_per_ip
+                .unwrap_or(defaults.max_connections_per_ip),
+            connection_attempts_per_ip: input
+                .connection_attempts_per_ip
+                .unwrap_or_default()
+                .with_defaults(defaults.connection_attempts_per_ip),
+            max_inbound_streams_per_domain: input
+                .max_inbound_streams_per_domain
+                .unwrap_or(defaults.max_inbound_streams_per_domain),
+            negotiation_timeout_secs: input
+                .negotiation_timeout_secs
+                .unwrap_or(defaults.negotiation_timeout_secs),
+            connect_timeout_secs: input
+                .connect_timeout_secs
+                .unwrap_or(defaults.connect_timeout_secs),
+            max_stanza_bytes: input.max_stanza_bytes.unwrap_or(defaults.max_stanza_bytes),
+            incoming_stanzas_per_connection: input
+                .incoming_stanzas_per_connection
+                .unwrap_or_default()
+                .with_defaults(defaults.incoming_stanzas_per_connection),
+            incoming_xml_per_connection: input
+                .incoming_xml_per_connection
+                .unwrap_or_default()
+                .with_defaults(defaults.incoming_xml_per_connection),
+            max_outbound_links: input
+                .max_outbound_links
+                .unwrap_or(defaults.max_outbound_links),
+            max_queued_stanzas_per_link: input
+                .max_queued_stanzas_per_link
+                .unwrap_or(defaults.max_queued_stanzas_per_link),
+            max_queued_bytes_per_link: input
+                .max_queued_bytes_per_link
+                .unwrap_or(defaults.max_queued_bytes_per_link),
+            idle_timeout_secs: input
+                .idle_timeout_secs
+                .unwrap_or(defaults.idle_timeout_secs),
+            stalled_write_timeout_secs: input
+                .stalled_write_timeout_secs
+                .unwrap_or(defaults.stalled_write_timeout_secs),
+            failure_backoff_initial_secs: input
+                .failure_backoff_initial_secs
+                .unwrap_or(defaults.failure_backoff_initial_secs),
+            failure_backoff_max_secs: input
+                .failure_backoff_max_secs
+                .unwrap_or(defaults.failure_backoff_max_secs),
+        }
+    }
+}
+
+impl S2sLimits {
+    fn validate(&self) -> Result<(), String> {
+        if !(10_000..=isize::MAX as usize).contains(&self.max_stanza_bytes.get()) {
+            return Err(format!(
+                "limits.s2s.max_stanza_bytes must be between 10000 and {}",
+                isize::MAX
+            ));
+        }
+        for (field, value) in [
+            ("negotiation_timeout_secs", self.negotiation_timeout_secs),
+            ("connect_timeout_secs", self.connect_timeout_secs),
+            ("idle_timeout_secs", self.idle_timeout_secs),
+            (
+                "stalled_write_timeout_secs",
+                self.stalled_write_timeout_secs,
+            ),
+            (
+                "failure_backoff_initial_secs",
+                self.failure_backoff_initial_secs,
+            ),
+            ("failure_backoff_max_secs", self.failure_backoff_max_secs),
+        ] {
+            if Instant::now()
+                .checked_add(Duration::from_secs(value.get()))
+                .is_none()
+            {
+                return Err(format!(
+                    "limits.s2s.{field} exceeds the platform clock range"
+                ));
+            }
+        }
+        if self.failure_backoff_initial_secs > self.failure_backoff_max_secs {
+            return Err("limits.s2s.failure_backoff_initial_secs must not exceed limits.s2s.failure_backoff_max_secs".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ByteRateInput {
+    bytes_per_second: Option<NonZeroUsize>,
+    burst_bytes: Option<NonZeroUsize>,
+}
+
+impl ByteRateInput {
+    fn with_defaults(self, defaults: ByteRate) -> ByteRate {
+        ByteRate {
+            bytes_per_second: self.bytes_per_second.unwrap_or(defaults.bytes_per_second),
+            burst_bytes: self.burst_bytes.unwrap_or(defaults.burst_bytes),
+        }
     }
 }
 
@@ -269,7 +458,7 @@ impl From<C2sLimitProfileInput> for C2sLimitProfile {
 }
 
 /// Token-bucket refill rate and capacity, measured in events.
-#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EventRate {
     pub per_second: NonZeroUsize,
@@ -293,7 +482,7 @@ impl EventRateInput {
 }
 
 /// Token-bucket refill rate and capacity, measured in bytes.
-#[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ByteRate {
     pub bytes_per_second: NonZeroUsize,

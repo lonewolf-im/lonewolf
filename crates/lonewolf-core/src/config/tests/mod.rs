@@ -393,6 +393,11 @@ fn omitted_settings_use_defaults() -> TestResult {
         "c2s = {}",
         "[c2s]",
         "[[c2s.listeners]]",
+        "[s2s]",
+        "[[s2s.listeners]]",
+        "[s2s.tls]",
+        "[s2s.dns]",
+        "[s2s.routes]",
     ] {
         let file = config_file(contents)?;
         assert_eq!(Config::load(Some(file.path()))?, Config::default());
@@ -813,6 +818,7 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
     expected.hosts.insert(
         "example.com".into(),
         HostConfig {
+            federation: true,
             extensions: vec![
                 "roster".into(),
                 "offline".into(),
@@ -857,6 +863,11 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
             }),
         },
     );
+    expected.s2s.tls.trust_anchors_path = Some("./certs/federation-roots.pem".into());
+    expected
+        .s2s
+        .routes
+        .insert("remote.example".into(), vec!["127.0.0.1:5269".parse()?]);
     expected.xmpp.default_host = Some("localhost".into());
     expected.c2s.listeners[0].limits = Some("default".into());
     expected.c2s.listeners.push(TcpListenerConfig {
@@ -1150,5 +1161,278 @@ fn inactive_letsencrypt_configuration_does_not_bind_or_create_state() -> TestRes
     assert!(!state.exists());
     assert!(!trust.exists());
     assert!(!directory.path().join("absent").exists());
+    Ok(())
+}
+
+#[test]
+fn s2s_defaults_preserve_localhost_without_a_certificate() -> TestResult {
+    let config = Config::load(Some(config_file("")?.path()))?;
+    assert!(config.s2s.enabled);
+    assert_eq!(config.s2s.listeners.len(), 1);
+    assert_eq!(config.s2s.listeners[0].address, "0.0.0.0:5269".parse()?);
+    assert_eq!(config.s2s.tls.trust_anchors_path, None);
+    assert!(config.s2s.dns.nameservers.is_empty());
+    assert_eq!(config.s2s.dns.timeout_secs.get(), 5);
+    assert!(config.s2s.routes.is_empty());
+    assert!(config.hosts["localhost"].federation);
+    assert!(config.hosts["localhost"].tls.is_none());
+    Ok(())
+}
+
+#[test]
+fn host_federation_is_a_boolean_outside_extension_options() -> TestResult {
+    assert!(HostConfig::default().federation);
+    for (setting, expected) in [
+        ("", true),
+        ("federation = true", true),
+        ("federation = false", false),
+    ] {
+        let file = config_file(&format!("[hosts.localhost]\n{setting}\n"))?;
+        let config = Config::load(Some(file.path()))?;
+        assert_eq!(config.hosts["localhost"].federation, expected);
+        assert!(config.hosts["localhost"].options.is_empty());
+    }
+    let file = config_file("[hosts.localhost]\nfederation = 'false'")?;
+    assert!(matches!(
+        Config::load(Some(file.path())),
+        Err(ConfigError::Parse { .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn s2s_explicit_settings_replace_defaults() -> TestResult {
+    let file = config_file(
+        r#"
+[s2s]
+enabled = false
+[[s2s.listeners]]
+address = "[::]:5269"
+[s2s.tls]
+trust_anchors_path = "private.pem"
+[s2s.dns]
+nameservers = ["127.0.0.1:53", "[::1]:5353"]
+timeout_secs = 7
+[s2s.routes]
+"remote.example" = ["127.0.0.1:5270", "[::1]:5270"]
+"#,
+    )?;
+    let config = Config::load(Some(file.path()))?;
+    assert!(!config.s2s.enabled);
+    assert_eq!(
+        config.s2s.listeners,
+        vec![super::S2sListenerConfig {
+            address: "[::]:5269".parse()?
+        }]
+    );
+    assert_eq!(
+        config.s2s.tls.trust_anchors_path.as_deref(),
+        Some(Path::new("private.pem"))
+    );
+    assert_eq!(
+        config.s2s.dns.nameservers,
+        vec!["127.0.0.1:53".parse()?, "[::1]:5353".parse()?]
+    );
+    assert_eq!(config.s2s.dns.timeout_secs.get(), 7);
+    assert_eq!(
+        config.s2s.routes["remote.example"],
+        vec!["127.0.0.1:5270".parse()?, "[::1]:5270".parse()?]
+    );
+    Ok(())
+}
+
+#[test]
+fn s2s_rejects_unknown_fields_and_invalid_shapes() -> TestResult {
+    for contents in [
+        "[s2s]\nunknown = true",
+        "[[s2s.listeners]]\nunknown = true",
+        "[s2s.tls]\nunknown = true",
+        "[s2s.dns]\nunknown = true",
+        "[s2s.dns]\ntimeout_secs = 0",
+        "[s2s.dns]\nnameservers = ['resolver.example:53']",
+        "[s2s.routes]\n'remote.example' = ['127.0.0.1']",
+        "[[s2s.listeners]]\naddress = 'example.com:5269'",
+    ] {
+        let file = config_file(contents)?;
+        let result = Config::load(Some(file.path()));
+        assert!(
+            matches!(result, Err(ConfigError::Parse { .. })),
+            "{contents}: {result:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn s2s_unconditional_validation_applies_when_disabled() -> TestResult {
+    for enabled in [false, true] {
+        for (settings, reason) in [
+            (
+                "[s2s.tls]\ntrust_anchors_path = ''",
+                "s2s.tls.trust_anchors_path must not be empty",
+            ),
+            (
+                "[s2s.routes]\n'localhost' = ['127.0.0.1:5269']",
+                "s2s.routes.localhost must not be a configured host",
+            ),
+            (
+                "[s2s.routes]\n'remote.example' = []",
+                "s2s.routes.remote.example must define at least one endpoint",
+            ),
+            (
+                "[s2s.routes]\n'remote.example' = ['[::1]:5269', '127.0.0.1:0']",
+                "s2s.routes.remote.example[1] must not use port zero",
+            ),
+            (
+                "[s2s.routes]\n'Remote.Example' = ['127.0.0.1:5269']",
+                "s2s.routes.Remote.Example must use the normalized form",
+            ),
+            (
+                "[s2s.routes]\n'bad domain' = ['127.0.0.1:5269']",
+                "s2s.routes.bad domain is not a valid XMPP domain",
+            ),
+            (
+                "[limits.s2s]\nmax_stanza_bytes = 9999",
+                "limits.s2s.max_stanza_bytes must be between 10000",
+            ),
+            (
+                "[limits.s2s]\nfailure_backoff_initial_secs = 901",
+                "limits.s2s.failure_backoff_initial_secs must not exceed limits.s2s.failure_backoff_max_secs",
+            ),
+        ] {
+            let file = config_file(&format!("[s2s]\nenabled = {enabled}\n{settings}"))?;
+            let result = Config::load(Some(file.path()));
+            assert!(
+                matches!(result, Err(ConfigError::Invalid { reason: ref actual, .. }) if actual.starts_with(reason)),
+                "{settings}: {result:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn s2s_timeouts_reject_platform_clock_overflow() -> TestResult {
+    for path in [
+        "s2s.dns.timeout_secs",
+        "limits.s2s.negotiation_timeout_secs",
+        "limits.s2s.connect_timeout_secs",
+        "limits.s2s.idle_timeout_secs",
+        "limits.s2s.stalled_write_timeout_secs",
+        "limits.s2s.failure_backoff_initial_secs",
+        "limits.s2s.failure_backoff_max_secs",
+    ] {
+        for enabled in [false, true] {
+            let mut config = Config::default();
+            config.s2s.enabled = enabled;
+            let overflow = std::num::NonZeroU64::MAX;
+            match path {
+                "s2s.dns.timeout_secs" => config.s2s.dns.timeout_secs = overflow,
+                "limits.s2s.negotiation_timeout_secs" => {
+                    config.limits.s2s.negotiation_timeout_secs = overflow
+                }
+                "limits.s2s.connect_timeout_secs" => {
+                    config.limits.s2s.connect_timeout_secs = overflow
+                }
+                "limits.s2s.idle_timeout_secs" => config.limits.s2s.idle_timeout_secs = overflow,
+                "limits.s2s.stalled_write_timeout_secs" => {
+                    config.limits.s2s.stalled_write_timeout_secs = overflow
+                }
+                "limits.s2s.failure_backoff_initial_secs" => {
+                    config.limits.s2s.failure_backoff_initial_secs = overflow
+                }
+                "limits.s2s.failure_backoff_max_secs" => {
+                    config.limits.s2s.failure_backoff_max_secs = overflow
+                }
+                _ => return Err("missing timeout field".into()),
+            }
+            assert_eq!(
+                config.validate(),
+                Err(format!("{path} exceeds the platform clock range"))
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn s2s_stanza_size_and_backoff_accept_their_boundaries() -> TestResult {
+    for size in [10_000, isize::MAX as usize] {
+        let mut config = Config::default();
+        config.limits.s2s.max_stanza_bytes = NonZeroUsize::new(size).ok_or("invalid size")?;
+        config.limits.s2s.failure_backoff_initial_secs = config.limits.s2s.failure_backoff_max_secs;
+        config.validate()?;
+    }
+    let mut config = Config::default();
+    config.limits.s2s.max_stanza_bytes =
+        NonZeroUsize::new(isize::MAX as usize + 1).ok_or("invalid size")?;
+    assert_eq!(
+        config.validate(),
+        Err(format!(
+            "limits.s2s.max_stanza_bytes must be between 10000 and {}",
+            isize::MAX
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn s2s_enabled_listeners_reject_overlaps() -> TestResult {
+    for (contents, reason) in [
+        (
+            "listeners = []",
+            "s2s.listeners must define at least one listener",
+        ),
+        (
+            "[[s2s.listeners]]\naddress = '0.0.0.0:5269'\n[[s2s.listeners]]\naddress = '127.0.0.1:5269'",
+            "s2s.listeners[1] overlaps s2s.listeners[0]",
+        ),
+        (
+            "[[s2s.listeners]]\naddress = '127.0.0.1:5222'",
+            "s2s.listeners[0] overlaps c2s.listeners[0]",
+        ),
+        (
+            "[[s2s.listeners]]\naddress = '[::1]:5269'\n[[s2s.listeners]]\naddress = '[::]:5269'",
+            "s2s.listeners[1] overlaps s2s.listeners[0]",
+        ),
+        (
+            "[metrics]\nenabled = true\naddress = '127.0.0.1:5269'",
+            "s2s.listeners[0] overlaps metrics.address",
+        ),
+        (
+            "[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n[letsencrypt]\nlisten = ['127.0.0.1:5269']",
+            "s2s.listeners[0] overlaps letsencrypt.listen[0]",
+        ),
+    ] {
+        for enabled in [true, false] {
+            let file = config_file(&format!("[s2s]\nenabled = {enabled}\n{contents}"))?;
+            let result = Config::load(Some(file.path()));
+            if enabled {
+                assert!(
+                    matches!(result, Err(ConfigError::Invalid { reason: ref actual, .. }) if actual == reason),
+                    "{contents}: {result:?}"
+                );
+            } else {
+                assert!(!result?.s2s.enabled);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn s2s_listener_overlap_exemptions_and_normalized_routes_are_valid() -> TestResult {
+    for contents in [
+        "[[s2s.listeners]]\naddress = '0.0.0.0:5269'\n[[s2s.listeners]]\naddress = '[::]:5269'",
+        "[[s2s.listeners]]\naddress = '127.0.0.1:0'\n[[s2s.listeners]]\naddress = '127.0.0.1:0'",
+        "[[s2s.listeners]]\naddress = '127.0.0.1:5269'\n[[s2s.listeners]]\naddress = '127.0.0.2:5269'",
+        "[metrics]\nenabled = false\naddress = '127.0.0.1:5269'",
+        "[letsencrypt]\nlisten = ['127.0.0.1:5269']",
+        "[[s2s.listeners]]\naddress = '[::]:5222'",
+        "[s2s.routes]\n'remote.example' = ['127.0.0.1:5269']\n'127.0.0.2' = ['[::1]:5269']\n'[::1]' = ['127.0.0.1:5269']",
+    ] {
+        let file = config_file(contents)?;
+        Config::load(Some(file.path()))?;
+    }
     Ok(())
 }

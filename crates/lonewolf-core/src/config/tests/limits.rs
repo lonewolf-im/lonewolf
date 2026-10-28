@@ -9,6 +9,10 @@ use super::{TestResult, config_file};
 const TABLES: &[&str] = &[
     "limits",
     "limits.c2s",
+    "limits.s2s",
+    "limits.s2s.connection_attempts_per_ip",
+    "limits.s2s.incoming_stanzas_per_connection",
+    "limits.s2s.incoming_xml_per_connection",
     "limits.c2s.profiles.default",
     "limits.c2s.profiles.default.connection_attempts_per_ip",
     "limits.c2s.profiles.default.incoming_stanzas_per_connection",
@@ -105,7 +109,34 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("incoming_xml_per_connection.burst_bytes", 1_048_576),
     ];
     let actual = limit_values()?;
-    assert_eq!(actual.len(), expected.len() + 3);
+    let s2s_expected = [
+        ("max_inbound_connections", 1_024),
+        ("max_connections_per_ip", 32),
+        ("connection_attempts_per_ip.per_second", 10),
+        ("connection_attempts_per_ip.burst", 50),
+        ("max_inbound_streams_per_domain", 4),
+        ("negotiation_timeout_secs", 30),
+        ("connect_timeout_secs", 10),
+        ("max_stanza_bytes", 524_288),
+        ("incoming_stanzas_per_connection.per_second", 200),
+        ("incoming_stanzas_per_connection.burst", 2_000),
+        ("incoming_xml_per_connection.bytes_per_second", 1_048_576),
+        ("incoming_xml_per_connection.burst_bytes", 4_194_304),
+        ("max_outbound_links", 1_024),
+        ("max_queued_stanzas_per_link", 512),
+        ("max_queued_bytes_per_link", 4_194_304),
+        ("idle_timeout_secs", 600),
+        ("stalled_write_timeout_secs", 60),
+        ("failure_backoff_initial_secs", 30),
+        ("failure_backoff_max_secs", 900),
+    ];
+    assert_eq!(actual.len(), expected.len() + s2s_expected.len() + 3);
+    for (path, value) in s2s_expected {
+        assert!(
+            actual.contains(&(format!("s2s.{path}"), value)),
+            "unexpected default for {path}"
+        );
+    }
     assert!(actual.contains(&("c2s.max_unauthenticated_connections".into(), 1_024)));
     assert!(actual.contains(&("c2s.max_resources_per_account".into(), 10)));
     assert!(actual.contains(&(

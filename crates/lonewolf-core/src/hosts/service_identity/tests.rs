@@ -342,3 +342,62 @@ fn malformed_certificate_is_bad_encoding() -> TestResult {
     );
     Ok(())
 }
+
+fn xmpp_name(value: &str) -> TestResult<GeneralName> {
+    Ok(GeneralName::OtherName(OtherName {
+        type_id: XMPP_ADDR,
+        value: Utf8StringRef::new(value)?.into(),
+    }))
+}
+
+#[test]
+fn xmpp_addresses_authorize_only_server_domains() -> TestResult {
+    for (presented, reference) in [
+        ("example.com", "example.com"),
+        ("EXAMPLE.com", "example.com"),
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("xn--bcher-kva.example", "bücher.example"),
+    ] {
+        let leaf = certificate(vec![xmpp_name(presented)?])?;
+        let identity = tls_identity(reference)?;
+        verify_service_identity(&leaf, &identity, XmppService::Server)?;
+        assert_mismatch(&leaf, &identity, XmppService::Client)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn unusable_xmpp_addresses_do_not_authorize_a_server_or_hide_a_valid_name() -> TestResult {
+    let identity = tls_identity("example.com")?;
+    let mut invalid = vec![GeneralName::OtherName(OtherName {
+        type_id: XMPP_ADDR,
+        value: (&Ia5String::new("example.com")?).into(),
+    })];
+    for value in [
+        "",
+        "alice@example.com",
+        "example.com/resource",
+        "alice@example.com/resource",
+        "other.com",
+        "*.example.com",
+        "example.com\0",
+        "example.com/",
+    ] {
+        invalid.push(xmpp_name(value)?);
+    }
+    for name in invalid {
+        assert_mismatch(
+            &certificate(vec![name.clone()])?,
+            &identity,
+            XmppService::Server,
+        )?;
+        for first in [true, false] {
+            let mut names = vec![name.clone(), xmpp_name("example.com")?];
+            if !first {
+                names.reverse();
+            }
+            verify_service_identity(&certificate(names)?, &identity, XmppService::Server)?;
+        }
+    }
+    Ok(())
+}

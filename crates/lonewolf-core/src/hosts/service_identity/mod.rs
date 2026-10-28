@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_util::arena::{Arena, ArenaConfig};
+use lonewolf_xmpp::jid::Jid;
 use rustls::pki_types::{CertificateDer, DnsName, ServerName};
 use rustls::server::ParsedCertificate;
 use rustls::{CertificateError, Error};
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
-use x509_cert::der::asn1::{Ia5StringRef, ObjectIdentifier};
+use x509_cert::der::asn1::{Ia5StringRef, ObjectIdentifier, Utf8StringRef};
 use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::ext::pkix::name::GeneralName;
 
+const XMPP_ADDR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.8.5");
 const SRV_ID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.8.7");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,7 +21,7 @@ pub(crate) enum XmppService {
 }
 
 /// Checks name and service correspondence, without authenticating the peer.
-/// Callers must also verify trust, validity, usage, revocation, and key possession.
+/// Callers must also verify trust, validity, usage, and key possession.
 pub(crate) fn verify_service_identity(
     certificate: &CertificateDer<'_>,
     identity: &ServerName<'_>,
@@ -48,6 +51,14 @@ pub(crate) fn verify_service_identity(
             let GeneralName::OtherName(name) = name else {
                 continue;
             };
+            if service == XmppService::Server && name.type_id == XMPP_ADDR {
+                if let Ok(value) = Utf8StringRef::try_from(&name.value)
+                    && matches_xmpp_domain(value.as_str(), identity)
+                {
+                    return Ok(());
+                }
+                continue;
+            }
             if name.type_id != SRV_ID {
                 continue;
             }
@@ -63,6 +74,22 @@ pub(crate) fn verify_service_identity(
         }
     }
     Err(mismatch)
+}
+
+fn matches_xmpp_domain(value: &str, identity: &DnsName<'_>) -> bool {
+    let Ok(mut arena) = Arena::try_new(ArenaConfig::default()) else {
+        return false;
+    };
+    let Ok(jid) = Jid::parse_in(value, &mut arena) else {
+        return false;
+    };
+    let Ok(jid) = jid.resolve(&arena) else {
+        return false;
+    };
+    jid.localpart().is_none()
+        && !jid.is_full()
+        && idna::domain_to_ascii_strict(jid.domainpart())
+            .is_ok_and(|domain| domain.eq_ignore_ascii_case(identity.as_ref()))
 }
 
 fn from_srv_label(label: &str) -> Option<XmppService> {

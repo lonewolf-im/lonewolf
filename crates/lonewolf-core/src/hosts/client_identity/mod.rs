@@ -375,7 +375,7 @@ impl ClientCertificatePolicy {
     }
 }
 
-fn certificate_expiration(
+pub(super) fn certificate_expiration(
     certificate: &CertificateDer<'_>,
 ) -> Result<SystemTime, ClientIdentityError> {
     let parsed = Certificate::from_der(certificate.as_ref())
@@ -520,7 +520,7 @@ impl ClientCertVerifier for KeyUsageVerifier {
     }
 }
 
-fn webpki_error(error: webpki::Error) -> rustls::Error {
+pub(super) fn webpki_error(error: webpki::Error) -> rustls::Error {
     use rustls::{CertRevocationListError, CertificateError, OtherError};
     use webpki::Error::*;
     use webpki::InvalidNameContext;
@@ -665,7 +665,7 @@ impl ClientCertVerifier for UnavailableRevocationVerifier {
 }
 
 // WebPki checks EKU but omits the restrictions in the KeyUsage extension.
-fn validate_key_usage(
+pub(super) fn validate_key_usage(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
 ) -> Result<(), rustls::Error> {

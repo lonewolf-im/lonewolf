@@ -118,7 +118,15 @@ pub(crate) fn handshake(
     client_config: std::sync::Arc<rustls::ClientConfig>,
     server_config: std::sync::Arc<rustls::ServerConfig>,
 ) -> Result<rustls::ClientConnection, Box<dyn std::error::Error>> {
-    let mut client = rustls::ClientConnection::new(client_config, "example.com".try_into()?)?;
+    handshake_named(client_config, server_config, "example.com").map(|(client, _)| client)
+}
+
+pub(in crate::hosts) fn handshake_named(
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+    domain: &str,
+) -> Result<(rustls::ClientConnection, rustls::ServerConnection), Box<dyn std::error::Error>> {
+    let mut client = rustls::ClientConnection::new(client_config, domain.to_owned().try_into()?)?;
     let mut server = rustls::ServerConnection::new(server_config)?;
     let mut wire = Vec::new();
     for _ in 0..32 {
@@ -149,7 +157,7 @@ pub(crate) fn handshake(
             && !client.wants_write()
             && !server.wants_write()
         {
-            return Ok(client);
+            return Ok((client, server));
         }
     }
     Err("in-memory TLS handshake did not complete".into())

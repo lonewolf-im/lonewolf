@@ -1482,6 +1482,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "webpki-roots",
  "x509-cert",
  "zeroize",
 ]

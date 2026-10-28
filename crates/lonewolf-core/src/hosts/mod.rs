@@ -30,9 +30,11 @@ use crate::config::{HostConfig, HostTlsConfig, HostTlsSource};
 use lonewolf_util::blocking::BlockingExecutor;
 
 pub mod client_identity;
+pub(crate) mod peer_identity;
 pub(crate) mod service_identity;
 
 use client_identity::{ClientCertificatePolicy, ClientIdentityError};
+use peer_identity::PeerTrust;
 use service_identity::{XmppService, verify_service_identity};
 
 #[derive(Clone, Debug)]
@@ -123,6 +125,48 @@ impl ResolvesServerCert for HostCertResolver {
             }
             _ => None,
         }
+    }
+}
+
+#[derive(Debug)]
+struct HostClientCertResolver {
+    tls: Arc<PlRwLock<Option<Arc<TlsSnapshot>>>>,
+}
+
+impl rustls::client::ResolvesClientCert for HostClientCertResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        let snapshot = self.tls.read();
+        let snapshot = snapshot.as_ref()?;
+        if !snapshot.is_current()
+            || snapshot
+                .certified_key
+                .key
+                .choose_scheme(sigschemes)
+                .is_none()
+        {
+            return None;
+        }
+        Some(Arc::clone(&snapshot.certified_key))
+    }
+
+    fn has_certs(&self) -> bool {
+        self.tls
+            .read()
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.is_current())
+    }
+}
+
+impl TlsSnapshot {
+    fn is_current(&self) -> bool {
+        self.validity.is_none_or(|(start, end)| {
+            let now = UnixTime::now().as_secs();
+            now >= start && now < end
+        })
     }
 }
 
@@ -255,6 +299,60 @@ impl Hosts {
             config,
             server_end_point: Arc::clone(&snapshot.server_end_point),
         })
+    }
+
+    pub(crate) fn crypto_provider(&self) -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::clone(
+            self.hosts[self.default_host_index]
+                .tls_builder
+                .crypto_provider(),
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn federates(&self, domain: &str) -> bool {
+        self.find_host(domain).is_some_and(|host| {
+            host.config.federation
+                && host.config.tls.is_some()
+                && crate::config::managed_dns_name(domain).is_ok()
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn s2s_server_config(
+        &self,
+        domain: &str,
+        trust: &Arc<PeerTrust>,
+    ) -> Option<Arc<rustls::ServerConfig>> {
+        let host = self.find_host(domain)?;
+        let snapshot = self.snapshot(domain)?;
+        if !snapshot.is_current() {
+            return None;
+        }
+        Some(Arc::new(
+            host.tls_builder
+                .clone()
+                .with_client_cert_verifier(trust.client_verifier())
+                .with_cert_resolver(snapshot.resolver.clone()),
+        ))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn s2s_client_config(
+        &self,
+        domain: &str,
+        trust: &Arc<PeerTrust>,
+    ) -> Option<Arc<rustls::ClientConfig>> {
+        let host = self.find_host(domain)?;
+        let config = rustls::ClientConfig::builder_with_provider(self.crypto_provider())
+            .with_safe_default_protocol_versions()
+            .ok()?
+            .dangerous()
+            .with_custom_certificate_verifier(trust.server_verifier())
+            .with_client_cert_resolver(Arc::new(HostClientCertResolver {
+                tls: Arc::clone(&host.tls),
+            }));
+        Some(Arc::new(config))
     }
 
     pub fn tls_server_end_point(&self, domain: &str) -> Option<Arc<[u8]>> {
@@ -449,7 +547,7 @@ fn managed_validity(
     Ok((start, end))
 }
 
-fn tls_identity(domain: &str) -> Result<ServerName<'static>, HostsError> {
+pub(crate) fn tls_identity(domain: &str) -> Result<ServerName<'static>, HostsError> {
     let invalid = || HostsError::InvalidCertificate {
         domain: domain.into(),
         source: rustls::Error::General("invalid TLS identity".into()),

@@ -117,7 +117,6 @@ impl C2sSuite {
         }
     }
 
-    /// Waits until at least `count` admitted connections closed with `outcome`.
     pub fn wait_for_closed(&self, outcome: &str, count: u64) -> TestResult {
         let series = format!(",outcome=\"{outcome}\"}} ");
         self.wait_for_metrics(
@@ -287,6 +286,8 @@ address = "127.0.0.1:0"
 address = "127.0.0.1:0"
 {listener}
 {hosts}
+[s2s]
+enabled = false
 [hosts.localhost.tls]
 certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
@@ -340,6 +341,7 @@ max_resources_per_account = {resources}
                 return Err(format!("server exited before readiness: {logs}").into());
             }
             if let Some(readiness) = self.readiness.receive(Duration::from_millis(10))? {
+                assert!(readiness.s2s.is_none());
                 self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
                 self.metrics = readiness.metrics.ok_or("metrics service is not ready")?;
                 self.listeners = readiness.c2s;

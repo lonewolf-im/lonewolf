@@ -238,3 +238,58 @@ fn consuming_more_than_the_reader_allowance_panics() {
     );
     Pin::new(&mut reader).consume(2);
 }
+
+#[derive(Default)]
+struct Throttles(std::sync::atomic::AtomicUsize);
+
+impl RateLimitObserver for Throttles {
+    fn on_throttle(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn observer_reports_own_wait_once_across_cancellation_and_transport_transfer()
+-> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let clock = Clock::new();
+        let observer = Arc::new(Throttles::default());
+        let mut reader = clock.reader(b"abc", 10, 1)?.with_observer(observer.clone());
+        let mut byte = [0];
+        reader.read_exact(&mut byte).await?;
+        for _ in 0..3 {
+            assert!(poll!(std::pin::pin!(reader.read_exact(&mut byte))).is_pending());
+        }
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let (_, state) = reader.into_parts();
+        let mut reader = RateLimitedReader::from_state(SliceReader { bytes: b"de" }, state);
+        assert!(poll!(std::pin::pin!(reader.read_exact(&mut byte))).is_pending());
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        clock.advance(Duration::from_millis(100));
+        reader.read_exact(&mut byte).await?;
+        assert_eq!(byte, *b"d");
+        assert!(poll!(std::pin::pin!(reader.read_exact(&mut byte))).is_pending());
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn observer_does_not_report_transport_pending() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let observer = Arc::new(Throttles::default());
+        let (input, _output) = tokio::io::duplex(16);
+        let mut reader = RateLimitedReader::new(
+            tokio::io::BufReader::new(input),
+            NonZeroUsize::MIN,
+            NonZeroUsize::MIN,
+        )
+        .with_observer(observer.clone());
+        let mut byte = [0];
+        for _ in 0..3 {
+            assert!(poll!(std::pin::pin!(reader.read_exact(&mut byte))).is_pending());
+        }
+        assert_eq!(observer.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        Ok(())
+    })
+}

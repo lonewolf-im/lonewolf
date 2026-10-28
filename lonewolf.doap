@@ -6,7 +6,7 @@
   <Project>
     <name>Lonewolf</name>
     <shortdesc xml:lang="en">A standalone XMPP server written in Rust</shortdesc>
-    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as one binary with embedded storage, so there is no separate database to set up. It is early, pre-1.0 software that hosts chat between accounts on the domains you run. Federation with other servers is next on the roadmap.</description>
+    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as one binary with embedded storage, so there is no separate database to set up. It is early, pre-1.0 software that hosts chat between accounts on the domains you run. Inbound server connections can negotiate STARTTLS and SASL EXTERNAL. Outbound federation and remote stanza delivery are not supported yet.</description>
 
     <homepage rdf:resource="https://github.com/lonewolf-im/lonewolf"/>
     <download-page rdf:resource="https://github.com/lonewolf-im/lonewolf/releases"/>
@@ -81,8 +81,7 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0178.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
-        <xmpp:since>0.1.0</xmpp:since>
-        <xmpp:note xml:lang="en">Client connections only.</xmpp:note>
+        <xmpp:note xml:lang="en">Client certificate authentication and partial inbound server STARTTLS and EXTERNAL negotiation. Server peers require a valid certificate for their domain with explicit serverAuth EKU. No outbound streams, server stanza dispatch, certificate revocation checks, or authenticated server stream certificate-expiry closure. Inbound server support: Not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

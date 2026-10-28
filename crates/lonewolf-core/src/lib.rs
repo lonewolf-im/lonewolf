@@ -165,6 +165,7 @@ fn run_internal(
             let mut stop_signal = pin!(shutdown::wait());
             let mut acme = None;
             let mut listeners = None;
+            let mut s2s_listeners = None;
             let mut router = None;
             let mut shutdown_deadline = None;
             let result = async {
@@ -235,13 +236,21 @@ fn run_internal(
                         .registry()
                         .register_collector(Box::new(metrics::AcmeCollector::new(acme.status())));
                 }
-                let _s2s_metrics = if config.s2s.enabled
+                let s2s_metrics = if config.s2s.enabled
                     && config.hosts.keys().any(|domain| hosts.federates(domain))
                 {
                     let metrics = s2s::metrics::S2sMetrics::new(config.s2s.listeners.len());
                     metrics.register(server_metrics.registry());
                     Some(metrics)
                 } else {
+                    tracing::info!(
+                        reason = if config.s2s.enabled {
+                            "no_federating_host"
+                        } else {
+                            "disabled"
+                        },
+                        "s2s federation inactive"
+                    );
                     None
                 };
                 let metrics_server = if config.metrics.enabled {
@@ -287,7 +296,7 @@ fn run_internal(
                     c2s::Listeners::start(
                         &config.c2s,
                         &config.limits.c2s,
-                        hosts,
+                        hosts.clone(),
                         storage,
                         router_handle,
                         &dispatcher.handle(),
@@ -300,6 +309,29 @@ fn run_internal(
                         RunError::C2s(failure.error)
                     })?,
                 );
+                if let Some(metrics) = s2s_metrics {
+                    let trust = hosts::peer_identity::PeerTrust::load(
+                        &config.s2s.tls,
+                        hosts.crypto_provider(),
+                    )
+                    .map_err(|error| RunError::S2s(io::Error::other(error)))?;
+                    s2s_listeners = Some(
+                        s2s::inbound::S2sListeners::start(
+                            &config.s2s,
+                            &config.limits.s2s,
+                            hosts,
+                            trust,
+                            &dispatcher.handle(),
+                            Arc::clone(&stanza_pool),
+                            metrics,
+                        )
+                        .await
+                        .map_err(|failure| {
+                            shutdown_deadline = Some(failure.deadline);
+                            RunError::S2s(failure.error)
+                        })?,
+                    );
+                }
                 let registry = server_metrics.into_registry();
                 run_services(
                     BackgroundServices {
@@ -308,6 +340,7 @@ fn run_internal(
                         acme: acme.as_mut(),
                     },
                     listeners,
+                    s2s_listeners.as_mut(),
                     serving_router,
                     &mut shutdown_deadline,
                     stop_signal.as_mut(),
@@ -332,6 +365,16 @@ fn run_internal(
             if let Some(listeners) = listeners.as_mut() {
                 listeners.stop(deadline);
             }
+            if let Some(listeners) = s2s_listeners.as_mut() {
+                listeners.stop(deadline);
+            }
+            let s2s_stopped = match s2s_listeners.as_mut() {
+                Some(listeners) => compio::time::timeout_at(deadline, listeners.join())
+                    .await
+                    .unwrap_or_else(|_| Err(shutdown_timeout()))
+                    .map_err(RunError::S2s),
+                None => Ok(()),
+            };
             let acme_stopped = match acme.as_mut() {
                 Some(acme) => acme.drain(deadline).await,
                 None => Ok(()),
@@ -363,6 +406,7 @@ fn run_internal(
             result
                 .and(stopped)
                 .and(listeners_stopped)
+                .and(s2s_stopped)
                 .and(router_stopped)
                 .and(acme_stopped)
         })?;
@@ -396,6 +440,7 @@ struct BackgroundServices<'a> {
 async fn run_services<A: ChunkAllocator + Clone>(
     background: BackgroundServices<'_>,
     listeners: &mut c2s::Listeners,
+    mut s2s_listeners: Option<&mut s2s::inbound::S2sListeners>,
     router: &mut Router<A>,
     shutdown_deadline: &mut Option<Instant>,
     stop_signal: impl Future<Output = io::Result<()>>,
@@ -408,6 +453,9 @@ async fn run_services<A: ChunkAllocator + Clone>(
     } = background;
     let readiness = readiness::message(
         listeners.addresses(),
+        s2s_listeners
+            .as_ref()
+            .map(|listeners| listeners.addresses()),
         metrics.as_ref().map(|(server, _)| server.local_addr()),
     );
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
@@ -455,9 +503,21 @@ async fn run_services<A: ChunkAllocator + Clone>(
             readiness::notify(&readiness);
             tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
             let external = async {
-                match select(pin!(stop_signal), pin!(listeners.failure())).await {
+                let listener_failure = async {
+                    let s2s_failure = async {
+                        match s2s_listeners.as_mut() {
+                            Some(listeners) => listeners.failure().await,
+                            None => pending().await,
+                        }
+                    };
+                    match select(pin!(listeners.failure()), pin!(s2s_failure)).await {
+                        Either::Left((error, _)) => RunError::C2s(error),
+                        Either::Right((error, _)) => RunError::S2s(error),
+                    }
+                };
+                match select(pin!(stop_signal), pin!(listener_failure)).await {
                     Either::Left((result, _)) => result.map_err(RunError::Signal),
-                    Either::Right((error, _)) => Err(RunError::C2s(error)),
+                    Either::Right((error, _)) => Err(error),
                 }
             };
             match select(pin!(router.failure()), pin!(external)).await {
@@ -491,6 +551,9 @@ async fn run_services<A: ChunkAllocator + Clone>(
     let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
     *shutdown_deadline = Some(deadline);
     listeners.stop(deadline);
+    if let Some(listeners) = s2s_listeners.as_mut() {
+        listeners.stop(deadline);
+    }
     let _ = stop_acme.send(deadline);
     drop(stop_admin);
     drop(stop_metrics);
@@ -517,10 +580,20 @@ async fn run_services<A: ChunkAllocator + Clone>(
                 Ok(())
             }
         };
-        let (((services, listeners), metrics), acme) =
-            join(join(join(services, listeners.join()), metrics), acme).await;
+        let s2s = async {
+            match s2s_listeners.as_mut() {
+                Some(listeners) => listeners.join().await.map_err(RunError::S2s),
+                None => Ok(()),
+            }
+        };
+        let ((((services, listeners), metrics), acme), s2s) = join(
+            join(join(join(services, listeners.join()), metrics), acme),
+            s2s,
+        )
+        .await;
         services
             .and(listeners.map_err(RunError::C2s))
+            .and(s2s)
             .and(metrics)
             .and(acme)
     };

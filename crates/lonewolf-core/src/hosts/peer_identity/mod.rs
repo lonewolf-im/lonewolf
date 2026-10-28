@@ -29,7 +29,6 @@ pub(crate) struct PeerTrust {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PeerValidity {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) valid_until: SystemTime,
 }
 
@@ -47,7 +46,6 @@ impl fmt::Display for PeerIdentityError {
 impl std::error::Error for PeerIdentityError {}
 
 impl PeerTrust {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn load(
         config: &S2sTlsConfig,
         provider: Arc<CryptoProvider>,

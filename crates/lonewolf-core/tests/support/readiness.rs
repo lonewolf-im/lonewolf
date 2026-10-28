@@ -9,6 +9,7 @@ use std::time::Duration;
 
 pub struct Readiness {
     pub c2s: Vec<SocketAddr>,
+    pub s2s: Option<Vec<SocketAddr>>,
     pub metrics: Option<SocketAddr>,
 }
 
@@ -61,6 +62,7 @@ fn parse(message: &[u8]) -> io::Result<Option<Readiness>> {
     let mut ready = false;
     let mut c2s = None;
     let mut metrics = None;
+    let mut s2s = None;
     for line in message.lines() {
         let (key, value) = line
             .split_once('=')
@@ -75,6 +77,16 @@ fn parse(message: &[u8]) -> io::Result<Option<Readiness>> {
                         .map(str::parse)
                         .collect::<Result<Vec<SocketAddr>, _>>()
                         .map_err(|_| invalid("invalid C2S address"))?,
+                );
+            }
+            "X_LONEWOLF_S2S_ADDRESSES" => {
+                s2s = Some(
+                    value
+                        .split(',')
+                        .filter(|address| !address.is_empty())
+                        .map(str::parse)
+                        .collect::<Result<Vec<SocketAddr>, _>>()
+                        .map_err(|_| invalid("invalid S2S address"))?,
                 );
             }
             "X_LONEWOLF_METRICS_ADDRESS" => {
@@ -92,6 +104,7 @@ fn parse(message: &[u8]) -> io::Result<Option<Readiness>> {
     }
     Ok(Some(Readiness {
         c2s: c2s.ok_or_else(|| invalid("readiness has no C2S addresses"))?,
+        s2s,
         metrics,
     }))
 }

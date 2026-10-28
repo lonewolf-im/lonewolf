@@ -32,7 +32,7 @@
 # The domain below is an example.
 # [hosts."example.com"]
 
-# Choose whether this host exchanges stanzas with other XMPP domains.
+# Choose whether this host accepts authenticated streams from other XMPP domains.
 # federation = true
 
 # Stored profiles are public to authenticated local C2S users.
@@ -289,8 +289,8 @@
 
 # [s2s]
 
-# Exchange stanzas with other XMPP domains for hosts with a configured certificate
-# and a public domain name. Hosts without a certificate, such as localhost, stay local.
+# Accept authenticated streams from other XMPP domains for hosts with a configured
+# certificate and a public domain name. Hosts without a certificate stay local.
 # No listener opens while no host federates.
 # enabled = true
 

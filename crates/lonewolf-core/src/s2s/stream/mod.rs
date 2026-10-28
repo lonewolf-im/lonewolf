@@ -20,7 +20,7 @@ use futures_util::io::{AsyncWrite, AsyncWriteExt as _, BufWriter};
 use lonewolf_util::arena::{
     Arena, ArenaConfig, ArenaError, ArenaRead, ChunkAllocator, HandleError,
 };
-use lonewolf_util::rate_limited_reader::RateLimitedReader;
+use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_util::token_bucket::TokenBucket;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
@@ -32,28 +32,24 @@ use oxilangtag::LanguageTag;
 use tokio::io::AsyncBufRead;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
+use super::metrics::{InboundLimit, S2sMetrics};
 use crate::config::limits::{ByteRate, EventRate};
+
+pub(crate) mod traffic;
 
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const STREAM_FOOTER: &str = "</stream:stream>";
 const HEADER_PREFIX: &str = "<?xml version='1.0'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' from='";
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const STARTTLS_REQUIRED_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EXTERNAL_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EMPTY_FEATURES: &str = "<stream:features/>";
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const STARTTLS: &str = "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const TLS_FAILURE: &str = "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SASL_SUCCESS: &str = "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>";
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const EMPTY_CHALLENGE: &str = "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -76,19 +72,15 @@ pub(crate) enum Auth {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SaslFailure {
-    #[cfg_attr(not(test), allow(dead_code))]
     Aborted,
-    #[cfg_attr(not(test), allow(dead_code))]
     InvalidAuthzid,
     InvalidMechanism,
     MalformedRequest,
-    #[cfg_attr(not(test), allow(dead_code))]
     NotAuthorized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum S2sError {
-    #[allow(dead_code)]
     Eof,
     Io,
     Timeout,
@@ -108,7 +100,6 @@ pub(crate) fn initial_header_xml(from: &str, to: &str) -> String {
     xml
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn response_header_xml(from: &str, to: Option<&str>) -> Result<String, S2sError> {
     let mut id = [0_u8; 16];
     graviola::random::fill(&mut id).map_err(|_| S2sError::Internal)?;
@@ -193,7 +184,6 @@ fn domain(value: &str, invalid: StreamErrorCondition) -> Result<Box<str>, Stream
     Ok(jid.domainpart().into())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn validate_initial_header<A: ChunkAllocator>(
     header: &Parsed<Element, A>,
     content_namespace: &str,
@@ -281,7 +271,6 @@ pub(crate) fn auth_external_xml(authzid: &str) -> String {
     xml
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_auth<A: ChunkAllocator>(
     element: &Parsed<Element, A>,
 ) -> Result<Auth, SaslFailure> {
@@ -309,7 +298,6 @@ pub(crate) fn parse_auth<A: ChunkAllocator>(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sasl_failure_xml(failure: SaslFailure) -> String {
     let name = match failure {
         SaslFailure::Aborted => "aborted",
@@ -328,6 +316,7 @@ pub(crate) fn stream_error_xml(condition: StreamErrorCondition) -> String {
     xml
 }
 
+#[derive(Clone)]
 pub(crate) struct S2sReaderLimits {
     pub(crate) max_stanza_bytes: NonZeroUsize,
     pub(crate) stanzas: EventRate,
@@ -342,8 +331,18 @@ pub(crate) struct S2sReader<A: ChunkAllocator, R> {
 
 struct ReadState<A: ChunkAllocator, R> {
     parser: XmppParser<RateLimitedReader<R>, A>,
+    max_stanza_bytes: NonZeroUsize,
     stanzas: EventRate,
     bucket: TokenBucket,
+    metrics: Option<Arc<S2sMetrics>>,
+}
+
+pub(crate) struct S2sReaderState {
+    max_stanza_bytes: NonZeroUsize,
+    xml: RateLimitState,
+    stanzas: EventRate,
+    bucket: TokenBucket,
+    metrics: Option<Arc<S2sMetrics>>,
 }
 
 type PendingRead<A, R> =
@@ -351,35 +350,64 @@ type PendingRead<A, R> =
 type PlainInput = Compat<Pin<Box<AsyncReadStream<TcpStream>>>>;
 
 impl<A: ChunkAllocator + Clone> S2sReader<A, PlainInput> {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn plain(tcp: TcpStream, limits: &S2sReaderLimits, allocator: A) -> Self {
+    pub(crate) fn plain(
+        tcp: TcpStream,
+        limits: &S2sReaderLimits,
+        allocator: A,
+        metrics: Option<Arc<S2sMetrics>>,
+    ) -> Self {
         // One-byte reads cannot consume TLS records before the STARTTLS boundary.
         Self::new(
             Box::pin(AsyncReadStream::with_capacity(1, tcp)).compat(),
             limits,
             allocator,
+            metrics,
         )
     }
 }
 
 impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, R> {
-    pub(crate) fn new(input: R, limits: &S2sReaderLimits, allocator: A) -> Self {
+    pub(crate) fn new(
+        input: R,
+        limits: &S2sReaderLimits,
+        allocator: A,
+        metrics: Option<Arc<S2sMetrics>>,
+    ) -> Self {
+        let mut xml =
+            RateLimitedReader::new(input, limits.xml.bytes_per_second, limits.xml.burst_bytes);
+        if let Some(metrics) = &metrics {
+            xml = xml.with_observer(Arc::clone(metrics)
+                as Arc<dyn lonewolf_util::rate_limited_reader::RateLimitObserver>);
+        }
+        let (input, xml) = xml.into_parts();
+        Self::from_state(
+            input,
+            S2sReaderState {
+                max_stanza_bytes: limits.max_stanza_bytes,
+                xml,
+                stanzas: limits.stanzas.clone(),
+                bucket: TokenBucket::new(limits.stanzas.burst, Instant::now()),
+                metrics,
+            },
+            allocator,
+        )
+    }
+
+    pub(crate) fn from_state(input: R, state: S2sReaderState, allocator: A) -> Self {
         Self {
             ready: Some(ReadState {
                 parser: XmppParser::new(
-                    RateLimitedReader::new(
-                        input,
-                        limits.xml.bytes_per_second,
-                        limits.xml.burst_bytes,
-                    ),
+                    RateLimitedReader::from_state(input, state.xml),
                     ParserConfig {
-                        max_stanza_bytes: limits.max_stanza_bytes,
+                        max_stanza_bytes: state.max_stanza_bytes,
                         arena: ArenaConfig::default(),
                     },
                     allocator,
                 ),
-                stanzas: limits.stanzas.clone(),
-                bucket: TokenBucket::new(limits.stanzas.burst, Instant::now()),
+                max_stanza_bytes: state.max_stanza_bytes,
+                stanzas: state.stanzas,
+                bucket: state.bucket,
+                metrics: state.metrics,
             }),
             pending: None,
             abandon: Rc::new(Cell::new(false)),
@@ -408,6 +436,7 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
                         StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_)
                     ))
                 ) {
+                    let mut reported = false;
                     loop {
                         if abandon.get() {
                             break;
@@ -428,7 +457,16 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
                             if abandon.get() {
                                 Poll::Ready(())
                             } else {
-                                wait.as_mut().poll(cx)
+                                let result = wait.as_mut().poll(cx);
+                                if result.is_pending() && !reported {
+                                    if let Some(metrics) = &state.metrics {
+                                        metrics.rate_limited(
+                                            InboundLimit::IncomingStanzasPerConnection,
+                                        );
+                                    }
+                                    reported = true;
+                                }
+                                result
                             }
                         })
                         .await;
@@ -449,7 +487,6 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
         Ok(event)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn restart(&mut self) -> Result<(), S2sError> {
         let mut state = self.ready.take().ok_or(S2sError::Internal)?;
         let (parser, result) = match state.parser.try_restart() {
@@ -461,15 +498,26 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
         result
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn take_input(&mut self) -> Result<R, S2sError> {
+    pub(crate) async fn take_input(&mut self) -> Result<(R, S2sReaderState), S2sError> {
         if self.pending.is_some() {
             self.abandon.set(true);
             let _ = self.next_event().await;
         }
         self.ready
             .take()
-            .map(|state| state.parser.into_inner().into_inner())
+            .map(|state| {
+                let (input, xml) = state.parser.into_inner().into_parts();
+                (
+                    input,
+                    S2sReaderState {
+                        max_stanza_bytes: state.max_stanza_bytes,
+                        xml,
+                        stanzas: state.stanzas,
+                        bucket: state.bucket,
+                        metrics: state.metrics,
+                    },
+                )
+            })
             .ok_or(S2sError::Internal)
     }
 }
@@ -509,7 +557,6 @@ pub(crate) struct S2sWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> S2sWriter<W> {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(output: W) -> Self {
         Self {
             output: BufWriter::with_capacity(4_096, output),
@@ -544,7 +591,10 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
         self.send(" ").await
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn shutdown(&mut self) -> Result<(), S2sError> {
+        self.output.close().await.map_err(Into::into)
+    }
+
     pub(crate) async fn close(
         &mut self,
         condition: Option<StreamErrorCondition>,

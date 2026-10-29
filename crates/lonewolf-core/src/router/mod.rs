@@ -322,7 +322,6 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn route_remote_or_bounce(
         &self,
         stanza: RoutedStanza<A>,
@@ -626,6 +625,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .ok_or(RouterError::InvalidTarget)?;
         let destination = self.destination(to);
         match destination {
+            Destination::Remote if release.is_some() => Err(RouterError::InvalidTarget),
+            Destination::Remote if self.federation_enabled() => {
+                self.route_remote(stanza).map(|()| Admitted::None)
+            }
             Destination::Service | Destination::Remote => Err(RouterError::RemoteUnsupported),
             Destination::Server | Destination::ServerResource => Err(RouterError::NotFound),
             Destination::Resource => self.local.deliver_message(stanza, release).await,

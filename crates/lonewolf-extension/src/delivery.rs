@@ -238,6 +238,12 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// An offline target is not an error.
     fn to_available<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a>;
 
+    /// Routes to a non-local domain; `from` must be on a local host.
+    /// Overload and remote failures bounce to the sender instead of failing.
+    fn to_remote<'a>(&'a self, _stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
+        Box::pin(async { Err(DeliveryError) })
+    }
+
     /// Delivers a presence to the resources of its bare `to` JID that carry `tag`.
     fn to_tagged<'a>(&'a self, tag: SessionTag, stanza: RoutedStanza<A>) -> DeliveryFuture<'a>;
 

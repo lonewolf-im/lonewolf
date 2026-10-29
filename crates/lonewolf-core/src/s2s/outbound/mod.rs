@@ -52,6 +52,8 @@ mod bounce;
 mod link;
 #[cfg(test)]
 mod manager_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) use bounce::bounce;
 
 type Pair = (Box<str>, Box<str>);

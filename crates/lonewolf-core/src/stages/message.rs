@@ -70,7 +70,10 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
         let to = view.to()?.ok_or(StageFailure)?;
         (to.resourcepart().is_none(), stage.router.destination(to))
     };
-    if bare && kind == MessageType::Error {
+    if bare
+        && kind == MessageType::Error
+        && !(destination == Destination::Remote && stage.router.federation_enabled())
+    {
         return Ok(DeliveryOutcome::Discarded);
     }
     if bare && kind == MessageType::Groupchat && destination != Destination::Remote {

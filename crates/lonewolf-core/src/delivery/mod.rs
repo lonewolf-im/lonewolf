@@ -502,6 +502,14 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
         })
     }
 
+    fn to_remote<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
+        Box::pin(async move {
+            self.router
+                .route_remote_or_bounce(stanza)
+                .map_err(|_| DeliveryError)
+        })
+    }
+
     fn to_tagged<'a>(&'a self, tag: SessionTag, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.router

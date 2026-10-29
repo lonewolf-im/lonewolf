@@ -811,9 +811,35 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     async fn handle_iq(&mut self, parsed: Parsed<Stanza, A>) -> Result<(), CloseOutcome> {
         let (request, mut arena) = parsed.into_parts();
         let route = iq::route(&request, &mut arena, &self.registration, &self.router)?;
+        let remote = route.destination == Destination::Remote && self.router.federation_enabled();
         let verdict = {
             let view = request.resolve(&arena)?;
             match view.to()? {
+                Some(to)
+                    if remote
+                        && !self
+                            .router
+                            .policies(self.registration.account().domain())
+                            .is_empty() =>
+                {
+                    let checks = [policy::Check {
+                        account: self.registration.account(),
+                        direction: Direction::Outbound,
+                        peer: to,
+                    }];
+                    let stage = Stage {
+                        router: &self.router,
+                        storage: &self.storage,
+                        allocator: &self.allocator,
+                        work: &self.work,
+                    };
+                    self.outbox
+                        .drain_until(
+                            &self.registration,
+                            policy::evaluate(&stage, view.stanza_type(), &checks),
+                        )
+                        .await??
+                }
                 Some(to)
                     if matches!(
                         route.destination,
@@ -877,6 +903,44 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 return Ok(());
             }
             Verdict::Drop => return Ok(()),
+        }
+        if remote {
+            let routed = request
+                .derive_in(&mut arena)?
+                .from(Some(route.sender))?
+                .build()?;
+            let stanza = RoutedStanza::from_parts(routed, arena);
+            let result = self.router.route_remote(stanza.clone());
+            let condition = match result {
+                Ok(()) => return Ok(()),
+                Err(_) if route.request_type().is_none() => return Ok(()),
+                Err(
+                    RouterError::Busy
+                    | RouterError::ResourceLimit
+                    | RouterError::DirectedPresenceLimit,
+                ) => StanzaErrorCondition::ResourceConstraint,
+                Err(RouterError::RemoteUnsupported | RouterError::RemoteNotFound) => {
+                    StanzaErrorCondition::RemoteServerNotFound
+                }
+                Err(RouterError::RemoteTimeout) => StanzaErrorCondition::RemoteServerTimeout,
+                Err(RouterError::InvalidTarget | RouterError::InvalidResource) => {
+                    StanzaErrorCondition::BadRequest
+                }
+                Err(RouterError::Stopped | RouterError::Unavailable) => {
+                    StanzaErrorCondition::InternalServerError
+                }
+                Err(RouterError::NotFound | RouterError::Offline) => {
+                    StanzaErrorCondition::ServiceUnavailable
+                }
+            };
+            let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
+            let request = stanza.resolve()?.clone_in(&mut arena)?;
+            let reply = iq::error_reply(&request, &mut arena, condition, None)?;
+            self.outbox.push(Output::Owned {
+                stanza: reply,
+                arena,
+            });
+            return Ok(());
         }
         if matches!(
             route.destination,

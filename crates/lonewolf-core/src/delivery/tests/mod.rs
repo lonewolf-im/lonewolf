@@ -490,3 +490,23 @@ fn panicked_work_wakes_its_drain_and_preserves_the_panic() {
         Poll::Ready(())
     ));
 }
+
+#[test]
+fn remote_delivery_requires_federation_and_default_delivery_refuses_it() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let config = Config::default();
+        let router = Router::new(
+            Hosts::new(&config.hosts, None)?,
+            LocalRouter::new(GlobalChunkAllocator),
+        );
+        let handle = router.handle();
+        let delivery = RouterDelivery::new(&handle, &GlobalChunkAllocator, None);
+        let stanza =
+            parsed("<message from='alice@localhost/desk' to='bob@remote.test' type='chat'/>")
+                .await?;
+        assert!(delivery.to_remote(stanza.clone()).await.is_err());
+        assert!(NoDelivery.to_remote(stanza).await.is_err());
+        router.shutdown().await?;
+        Ok(())
+    })
+}

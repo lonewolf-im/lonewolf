@@ -884,3 +884,92 @@ fn unselected_and_skipped_archives_remove_spoofed_ids_without_stamping() -> Test
         Ok(())
     })
 }
+
+#[test]
+fn remote_message_admission_preserves_error_and_headline_rules() -> TestResult {
+    use crate::router::Admitted;
+    use crate::s2s::outbound::RemoteFailure;
+    use crate::s2s::outbound::test_support::{AdmissionState, Fixture as RemoteFixture};
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        for target in ["bob@remote.test", "bob@remote.test/phone"] {
+            for kind in [MessageType::Chat, MessageType::Error, MessageType::Headline] {
+                for mode in ["success", "busy", "unsupported", "not_found", "timeout", "stopped", "disabled"] {
+                    let fixture = Fixture::new()?;
+                    let initial = match mode {
+                        "not_found" => AdmissionState::Backoff(RemoteFailure::NotFound),
+                        "timeout" => AdmissionState::Backoff(RemoteFailure::Timeout),
+                        _ => AdmissionState::Link,
+                    };
+                    let mut remote = RemoteFixture::new(initial)?;
+                    let router = Router::new(remote.hosts(), LocalRouter::new(GlobalChunkAllocator));
+                    let router = if mode == "disabled" { router } else { router.with_remote(remote.remote()) };
+                    let handle = router.handle();
+                    let stage = Stage { router: &handle, ..fixture.stage() };
+                    let sender = if mode == "unsupported" { "alice@localhost/laptop" } else { "alice@example.com/laptop" };
+                    let error = if kind == MessageType::Error { "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>" } else { "" };
+                    let xml = format!("<message from='{sender}' to='{target}' type='{}' id='remote'><body>Hello</body>{error}</message>", lonewolf_xmpp::stanza::StanzaType::Message(kind).as_str().ok_or("message type")?);
+                    let stanza = parsed(&xml).await?;
+                    let mut expected = String::new();
+                    stanza.resolve()?.write_xml(&mut expected)?;
+                    let filler = parsed("<message from='alice@example.com/laptop' to='bob@remote.test' id='filler'/>").await?;
+                    let mut filler_xml = String::new();
+                    filler.resolve()?.write_xml(&mut filler_xml)?;
+                    if mode == "busy" {
+                        handle.route_remote(filler)?;
+                        assert_eq!(remote.occupancy(), (1, filler_xml.len()));
+                    } else if mode == "stopped" {
+                        remote.remote().stop();
+                    }
+                    let before = remote.occupancy();
+                    if mode == "success" {
+                        let release = crate::router::StoredRelease {
+                            handler: Arc::new(lonewolf_extension::offline::Offline::new(Default::default())),
+                            sequence: lonewolf_storage::offline::OfflineSequence::new(7),
+                        };
+                        assert_eq!(handle.route_stored_message(stanza.clone(), release).await, Err(crate::router::RouterError::InvalidTarget));
+                        assert_eq!(remote.occupancy(), before);
+                    }
+                    let outcome = deliver(&stage, stanza, kind).await;
+                    if mode == "success" {
+                        assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { admitted: Admitted::None })), "{target} {kind:?} {mode}");
+                        assert_eq!(remote.occupancy(), (1, expected.len()));
+                        let snapshot = remote.snapshot();
+                        assert_eq!((snapshot.connecting, snapshot.ready, snapshot.queued_stanzas, snapshot.queued_bytes), (1, 0, 1, expected.len() as u64));
+                        let delivered = remote.receive()?.ok_or("missing remote message")?;
+                        let mut actual = String::new();
+                        delivered.resolve()?.write_xml(&mut actual)?;
+                        assert_eq!(actual, expected);
+                    } else if kind == MessageType::Error {
+                        assert!(matches!(outcome, Ok(DeliveryOutcome::Discarded)), "{target} {kind:?} {mode}");
+                        assert_eq!(remote.occupancy(), before);
+                    } else if mode == "stopped" {
+                        assert!(outcome.is_err());
+                    } else {
+                        let expected = match mode {
+                            "busy" => StanzaErrorCondition::ResourceConstraint,
+                            "timeout" => StanzaErrorCondition::RemoteServerTimeout,
+                            _ => StanzaErrorCondition::RemoteServerNotFound,
+                        };
+                        assert!(matches!(outcome, Ok(DeliveryOutcome::Rejected { condition, .. }) if condition == expected), "{target} {kind:?} {mode}");
+                        assert_eq!(remote.occupancy(), before);
+                    }
+                    if mode == "busy" {
+                        assert_eq!(remote.receive()?.ok_or("missing filler")?.resolve()?.id()?, Some("filler"));
+                    }
+                    if !matches!(mode, "not_found" | "timeout") {
+                        assert!(remote.receive()?.is_none());
+                    } else {
+                        assert_eq!(remote.snapshot().backoff, 1);
+                    }
+                    assert_eq!(remote.occupancy(), (0, 0));
+                    remote.finish(std::time::Instant::now() + Duration::from_secs(5)).await?;
+                    assert_eq!(remote.occupancy(), (0, 0));
+                    router.shutdown().await?;
+                    fixture.router.shutdown().await?;
+                }
+            }
+        }
+        Ok(())
+    }))?
+}

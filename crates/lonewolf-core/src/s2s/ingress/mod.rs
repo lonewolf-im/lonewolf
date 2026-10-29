@@ -6,7 +6,6 @@ use lonewolf_xmpp::stanza::{
     ApplicationCondition, IqType, MessageType, StanzaErrorCondition, StanzaErrorText, StanzaType,
 };
 
-use super::log_domain;
 use crate::delivery::WorkHandle;
 use crate::router::{RoutedStanza, RouterHandle};
 use crate::stages::StageFailure;
@@ -42,6 +41,7 @@ impl From<StageFailure> for IngressFailure {
 
 mod iq;
 mod message;
+mod presence;
 
 pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
     context: &IngressContext<A>,
@@ -82,10 +82,7 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
     match kind {
         StanzaType::Message(kind) => message::handle(context, peer, stanza, kind).await,
         StanzaType::Iq(kind) => iq::handle(context, peer, stanza, kind).await,
-        _ => {
-            tracing::debug!(stanza_kind = kind.kind().as_str(), remote_domain = %log_domain(&peer.remote), "s2s stanza discarded");
-            Ok(())
-        }
+        StanzaType::Presence(kind) => presence::handle(context, peer, stanza, kind).await,
     }
 }
 

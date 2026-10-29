@@ -787,6 +787,42 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         {
             return Err(RouterError::InvalidTarget);
         }
+        let deliveries =
+            self.probe_for(observer, request, subscribed, &requester.router.allocator())?;
+        let unavailable = deliveries
+            .iter()
+            .find(|stanza| {
+                stanza.resolve().is_ok_and(|view| {
+                    view.stanza_type() == StanzaType::Presence(PresenceType::Unavailable)
+                })
+            })
+            .cloned();
+        if !requester.liveness.is_alive() {
+            return Ok(None);
+        }
+        let Some(sender) = requester.mailbox.upgrade() else {
+            return Ok(None);
+        };
+        for stanza in deliveries {
+            match sender.try_send(MailboxEntry::new(stanza)) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => return Ok(None),
+            }
+        }
+        Ok(unavailable)
+    }
+
+    pub(super) fn probe_for(
+        &self,
+        observer: JidRef<'_>,
+        request: &RoutedStanza<A>,
+        subscribed: bool,
+        allocator: &A,
+    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+        let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        if view.stanza_type() != StanzaType::Presence(PresenceType::Probe) {
+            return Err(RouterError::InvalidTarget);
+        }
         let target = view
             .to()
             .map_err(|_| RouterError::InvalidTarget)?
@@ -799,11 +835,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 return source
                     .presence
                     .map(|presence| {
-                        crate::router::probe_current(
-                            request,
-                            presence,
-                            requester.router.allocator(),
-                        )
+                        crate::router::probe_current(request, presence, allocator.clone())
                     })
                     .transpose();
             }
@@ -828,7 +860,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 PresenceType::Available,
                 id,
                 None,
-                requester.router.allocator(),
+                allocator.clone(),
             )
             .map(Some)
         };
@@ -839,7 +871,6 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             subscribed,
             &mut build,
         )?;
-        let mut unavailable = None;
         if deliveries.is_empty() {
             let (from, kind, at) = if ordinary {
                 (
@@ -863,26 +894,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 kind,
                 view.id().map_err(|_| RouterError::InvalidTarget)?,
                 at,
-                requester.router.allocator(),
+                allocator.clone(),
             )?;
-            if kind == PresenceType::Unavailable {
-                unavailable = Some(stanza.clone());
-            }
             deliveries.push(stanza);
         }
-        if !requester.liveness.is_alive() {
-            return Ok(None);
-        }
-        let Some(sender) = requester.mailbox.upgrade() else {
-            return Ok(None);
-        };
-        for stanza in deliveries {
-            match sender.try_send(MailboxEntry::new(stanza)) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Closed(_)) => return Ok(None),
-            }
-        }
-        Ok(unavailable)
+        Ok(deliveries)
     }
 
     pub(super) fn prune_directed(

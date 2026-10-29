@@ -746,6 +746,15 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.probe(requester, request, subscribed).await
     }
 
+    /// The caller holds the target account ticket through the call.
+    pub(crate) async fn probe_remote(
+        &self,
+        request: &RoutedStanza<A>,
+        subscribed: bool,
+    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+        self.local.probe_remote(request, subscribed).await
+    }
+
     pub(crate) async fn current_presence(
         &self,
         source: &AccountKey,

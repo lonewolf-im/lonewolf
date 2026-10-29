@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::s2s::log_domain;
 use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
@@ -18,7 +19,7 @@ use lonewolf_storage::{RedbRead, RedbWrite, Storage, WriteTransaction};
 use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
-use lonewolf_xmpp::stanza::StanzaNamespace;
+use lonewolf_xmpp::stanza::{PresenceType, StanzaNamespace};
 use parking_lot::Mutex as PlMutex;
 
 use super::*;
@@ -539,6 +540,7 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for Iqs {
         }
         slots.policy(self.clone());
         slots.presence(PresenceRequestType::Available, self.clone())?;
+        slots.presence(PresenceRequestType::Probe, self.clone())?;
         for scope in [IqScope::Account, IqScope::Server] {
             for kind in [IqRequestType::Get, IqRequestType::Set] {
                 slots.iq(
@@ -1345,4 +1347,285 @@ fn assert_iq_commits(fixture: &Fixture, count: u64) -> TestResult {
         "{output}"
     );
     Ok(())
+}
+
+#[test]
+fn inbound_presence_routes_available_unavailable_full_offline_and_errors() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        let handler = Arc::new(Iqs::new(Verdict::Allow, false));
+        let mut extensions = Extensions::default();
+        extensions.register(handler.clone())?;
+        let mut fixture = Fixture::new(extensions, &["iqs"])?;
+        create_iq_account(&fixture).await?;
+        let owner = account()?;
+        let phone = fixture.context.router.register(&owner, Some("phone"), NonZeroUsize::new(8).ok_or("capacity")?).await?;
+        let desk = fixture.context.router.register(&owner, Some("desk"), NonZeroUsize::new(8).ok_or("capacity")?).await?;
+        for (registration, resource) in [(&phone, "phone"), (&desk, "desk")] {
+            registration.handle().set_presence(Some(0), parsed(&format!("<presence from='bob@example.com/{resource}'/>")).await?, None).await?;
+        }
+        let sibling = phone.recv().await.ok_or("setup sibling presence")?;
+        assert_eq!(sibling.stanza.resolve()?.from()?.ok_or("from")?.as_str(), "bob@example.com/desk");
+        for kind in ["", " type='unavailable'"] {
+            fixture.dispatch(&format!("<presence from='alice@remote.test/desk' to='bob@example.com'{kind}/>")).await?;
+            for registration in [&phone, &desk] {
+                let received = registration.recv().await.ok_or("presence")?;
+                let view = received.stanza.resolve()?;
+                assert_eq!(view.namespace(), StanzaNamespace::Client);
+                assert_eq!(view.from()?.ok_or("from")?.as_str(), "alice@remote.test/desk");
+                assert_eq!(view.to()?.ok_or("to")?.as_str(), "bob@example.com");
+                assert_eq!(view.stanza_type(), StanzaType::Presence(if kind.is_empty() { PresenceType::Available } else { PresenceType::Unavailable }));
+            }
+        }
+        fixture.dispatch("<presence from='alice@remote.test/desk' to='bob@example.com/phone'/>").await?;
+        assert_eq!(phone.recv().await.ok_or("full presence")?.stanza.resolve()?.to()?.ok_or("to")?.as_str(), "bob@example.com/phone");
+        assert!(desk.mailbox().take_queued().is_empty());
+        fixture.dispatch("<presence type='error' from='alice@remote.test/desk' to='bob@example.com/phone'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>").await?;
+        let error = phone.recv().await.ok_or("presence error")?;
+        assert_eq!(error.stanza.resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Error));
+        assert_eq!(error.stanza.resolve()?.to()?.ok_or("to")?.as_str(), "bob@example.com/phone");
+        for target in ["bob@example.com/missing", "example.com", "example.com/resource"] {
+            fixture.dispatch(&format!("<presence from='alice@remote.test/desk' to='{target}'/>")).await?;
+        }
+        phone.handle().set_presence(None, parsed("<presence type='unavailable' from='bob@example.com/phone'/>").await?, None).await?;
+        desk.handle().set_presence(None, parsed("<presence type='unavailable' from='bob@example.com/desk'/>").await?, None).await?;
+        fixture.dispatch("<presence from='alice@remote.test/desk' to='bob@example.com'/>").await?;
+        fixture.work.drain().await;
+        assert!(phone.mailbox().take_queued().is_empty());
+        assert!(desk.mailbox().take_queued().is_empty());
+        assert!(fixture.remote.receive()?.is_none());
+        assert_eq!(handler.policies.lock().len(), 5);
+        assert!(handler.visibility.lock().is_empty());
+        drop((phone, desk));
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn inbound_probes_preserve_authorization_availability_and_directed_privacy() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        let handler = Arc::new(Iqs::new(Verdict::Allow, true));
+        let mut extensions = Extensions::default();
+        extensions.register(handler.clone())?;
+        let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+        let remote = RemoteFixture::with_capacity(AdmissionState::Link, NonZeroUsize::new(8).ok_or("capacity")?)?;
+        let router = Router::new(remote.hosts(), LocalRouter::new(GlobalChunkAllocator)).with_remote(remote.remote()).with_extensions(BTreeMap::from([("example.com".into(), extensions.enable_host("example.com", ["iqs"])?) ]));
+        let work = WorkGroup::new();
+        let fixture = Fixture { _directory: directory, context: IngressContext { router: router.handle(), storage, allocator: GlobalChunkAllocator, work: work.handle() }, router, remote, work };
+        create_iq_account(&fixture).await?;
+        let owner = account()?;
+        fixture.dispatch("<presence type='probe' from='alice@remote.test/desk' to='bob@example.com' id='offline'/>").await?;
+        let unavailable = fixture.remote.receive()?.ok_or("offline reply")?;
+        let view = unavailable.resolve()?;
+        assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
+        assert_eq!(view.from()?.ok_or("from")?.as_str(), "bob@example.com");
+        assert!(view.children()?.next().is_none());
+        let phone = fixture.context.router.register(&owner, Some("phone"), NonZeroUsize::new(2).ok_or("resource limit")?).await?;
+        let desk = fixture.context.router.register(&owner, Some("desk"), NonZeroUsize::new(2).ok_or("resource limit")?).await?;
+        for (registration, resource) in [(&phone, "phone"), (&desk, "desk")] {
+            registration.handle().set_presence(Some(0), parsed(&format!("<presence from='bob@example.com/{resource}' id='{resource}'><show>away</show><status>private</status></presence>")).await?, None).await?;
+        }
+        fixture.dispatch("<presence type='probe' from='alice@remote.test/desk' to='bob@example.com' id='bare'/>").await?;
+        assert_eq!(fixture.remote.occupancy().0, 2);
+        let mut senders = Vec::new();
+        for _ in 0..2 {
+            let stanza = fixture.remote.receive()?.ok_or("available reply")?;
+            let view = stanza.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
+            senders.push(view.from()?.ok_or("from")?.as_str().to_owned());
+            assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@remote.test/desk");
+            assert_eq!(view.child("status", "jabber:client")?.ok_or("status")?.text()?, Some("private"));
+        }
+        senders.sort();
+        assert_eq!(senders, ["bob@example.com/desk", "bob@example.com/phone"]);
+        fixture.dispatch("<presence type='probe' from='alice@remote.test/desk' to='bob@example.com/phone' id='full'/>").await?;
+        let stanza = fixture.remote.receive()?.ok_or("full reply")?;
+        let view = stanza.resolve()?;
+        assert_eq!(view.from()?.ok_or("from")?.as_str(), "bob@example.com/phone");
+        assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
+        assert_eq!(view.id()?, Some("phone"));
+        assert!(view.children()?.next().is_none());
+        for registration in [&phone, &desk] {
+            registration.end_presence().await?;
+        }
+        drop((phone, desk));
+        fixture.dispatch("<presence type='probe' from='alice@remote.test/desk' to='bob@example.com'/>").await?;
+        let stanza = fixture.remote.receive()?.ok_or("last unavailable")?;
+        let view = stanza.resolve()?;
+        assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Unavailable));
+        assert_eq!(view.from()?.ok_or("from")?.as_str(), "bob@example.com");
+        assert!(view.child("delay", "urn:xmpp:delay")?.is_some());
+        assert_eq!(handler.visibility.lock().len(), 4);
+        fixture.finish().await?;
+
+        let mut fixture = Fixture::new(Extensions::default(), &[])?;
+        create_iq_account(&fixture).await?;
+        let phone = fixture.context.router.register(&account()?, Some("phone"), NonZeroUsize::MIN).await?;
+        phone.handle().set_presence(Some(0), parsed("<presence from='bob@example.com/phone'><status>secret</status></presence>").await?, None).await?;
+        for target in ["bob@example.com", "missing@example.com"] {
+            fixture.dispatch(&format!("<presence type='probe' from='alice@remote.test/desk' to='{target}'/>")).await?;
+            let stanza = fixture.remote.receive()?.ok_or("unsubscribed")?;
+            let view = stanza.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Unsubscribed));
+            assert_eq!(view.from()?.ok_or("from")?.as_str(), target);
+            assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@remote.test/desk");
+            assert!(view.children()?.next().is_none());
+        }
+        let directed = parsed("<presence from='alice@remote.test/desk'/>").await?;
+        phone.handle().record_service_presence(directed.resolve()?.from()?.ok_or("from")?, true).await?;
+        for target in ["bob@example.com", "bob@example.com/phone"] {
+            fixture.dispatch(&format!("<presence type='probe' from='alice@remote.test/desk' to='{target}'/>")).await?;
+            let stanza = fixture.remote.receive()?.ok_or("directed reply")?;
+            let view = stanza.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Available));
+            assert_eq!(view.from()?.ok_or("from")?.as_str(), "bob@example.com/phone");
+            assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@remote.test/desk");
+            assert!(view.children()?.next().is_none());
+        }
+        fixture.work.drain().await;
+        assert_eq!(fixture.remote.occupancy(), (0, 0));
+        drop(phone);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn inbound_presence_policy_drops_before_delivery_and_probe_admission() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        for verdict in [
+            Verdict::Drop,
+            Verdict::Reject {
+                condition: StanzaErrorCondition::Forbidden,
+                application: None,
+                text: None,
+            },
+        ] {
+            let handler = Arc::new(Iqs::new(verdict, true));
+            let mut extensions = Extensions::default();
+            extensions.register(handler.clone())?;
+            let mut fixture = Fixture::new(extensions, &["iqs"])?;
+            create_iq_account(&fixture).await?;
+            let phone = fixture
+                .context
+                .router
+                .register(&account()?, Some("phone"), NonZeroUsize::MIN)
+                .await?;
+            phone
+                .handle()
+                .set_presence(
+                    Some(0),
+                    parsed("<presence from='bob@example.com/phone'/>").await?,
+                    None,
+                )
+                .await?;
+            for target in ["bob@example.com", "bob@example.com/phone"] {
+                for kind in ["", " type='unavailable'", " type='probe'"] {
+                    fixture
+                        .dispatch(&format!(
+                            "<presence from='alice@remote.test/desk' to='{target}'{kind}/>"
+                        ))
+                        .await?;
+                }
+            }
+            fixture.work.drain().await;
+            assert!(phone.mailbox().take_queued().is_empty());
+            assert!(fixture.remote.receive()?.is_none());
+            assert_eq!(handler.policies.lock().len(), 6);
+            assert_eq!(handler.visibility.lock().len(), 2);
+            drop(phone);
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn inbound_probe_visibility_and_policy_share_ordered_snapshot() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(compio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            let handler = Arc::new(Iqs::new(Verdict::Allow, true));
+            let (entered, reached) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            *handler.policy_gate.lock() = Some((entered, resume));
+            let mut extensions = Extensions::default();
+            extensions.register(handler.clone())?;
+            let mut fixture = Fixture::new(extensions, &["iqs"])?;
+            create_iq_account(&fixture).await?;
+            let owner = account()?;
+            let ((), blocker) = fixture
+                .context
+                .router
+                .order()
+                .fix(vec![owner.clone()], async { Ok::<_, IngressFailure>(()) })
+                .await
+                .map_err(|_| "ticket")?;
+            let mut dispatch = Box::pin(fixture.dispatch(
+                "<presence type='probe' from='alice@remote.test/desk' to='bob@example.com'/>",
+            ));
+            match futures_util::future::select(reached, dispatch.as_mut()).await {
+                futures_util::future::Either::Left((entered, _)) => entered?,
+                futures_util::future::Either::Right(_) => {
+                    return Err("dispatch preceded policy".into());
+                }
+            }
+            assert_eq!(handler.visibility.lock().len(), 1);
+            assert_eq!(handler.policies.lock()[0].1, handler.visibility.lock()[0].0);
+            let mut transaction = fixture.context.storage.begin_write().await?;
+            transaction
+                .replace_vcard(&owner, "<vCard xmlns='vcard-temp'/>", VCardQuota::default())
+                .await?;
+            transaction.commit().await?;
+            release.send(()).map_err(|_| "policy cancelled")?;
+            assert!(poll!(&mut dispatch).is_pending());
+            assert!(fixture.remote.receive()?.is_none());
+            assert!(handler.visibility.lock()[0].1.is_none());
+            assert!(handler.policies.lock()[0].2.is_none());
+            drop(blocker);
+            dispatch.await?;
+            fixture.work.drain().await;
+            let stanza = fixture.remote.receive()?.ok_or("reply after turn")?;
+            assert_eq!(
+                stanza.resolve()?.stanza_type(),
+                StanzaType::Presence(PresenceType::Unavailable)
+            );
+            assert_eq!(fixture.remote.occupancy(), (0, 0));
+            fixture.finish().await
+        },
+    ))?
+}
+
+#[test]
+fn missing_probe_account_cannot_gain_visibility_and_subscriptions_are_dropped() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        let handler = Arc::new(Iqs::new(Verdict::Allow, true));
+        let mut extensions = Extensions::default();
+        extensions.register(handler.clone())?;
+        let mut fixture = Fixture::new(extensions, &["iqs"])?;
+        fixture
+            .dispatch("<presence type='probe' from='alice@remote.test/desk' to='bob@example.com'/>")
+            .await?;
+        let stanza = fixture.remote.receive()?.ok_or("missing-account reply")?;
+        let view = stanza.resolve()?;
+        assert_eq!(
+            view.stanza_type(),
+            StanzaType::Presence(PresenceType::Unsubscribed)
+        );
+        assert_eq!(view.from()?.ok_or("from")?.as_str(), "bob@example.com");
+        assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@remote.test/desk");
+        assert!(view.children()?.next().is_none());
+        assert!(handler.visibility.lock().is_empty());
+        assert_eq!(handler.policies.lock().len(), 1);
+        for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+            fixture
+                .dispatch(&format!(
+                    "<presence type='{kind}' from='alice@remote.test/desk' to='bob@example.com'/>"
+                ))
+                .await?;
+        }
+        fixture.work.drain().await;
+        assert_eq!(handler.policies.lock().len(), 1);
+        assert!(fixture.remote.receive()?.is_none());
+        fixture.finish().await
+    })
 }

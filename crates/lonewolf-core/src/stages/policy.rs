@@ -6,7 +6,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::{RedbRead, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
-use lonewolf_xmpp::stanza::StanzaType;
+use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
 
 use super::{Stage, StageFailure};
 use crate::delivery::{report_failure, report_handler_failure, storage_failure};
@@ -195,6 +195,33 @@ pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
         allowed.push(evaluate_in(router, transaction, kind, &checks).await? == Verdict::Allow);
     }
     retain_allowed(&mut audience.pending, allowed);
+    if router.federation_enabled() && !router.policies(owner.domain()).is_empty() {
+        let mut allowed = Vec::with_capacity(audience.probes.len());
+        for contact in &audience.probes {
+            let jid = Jid::parse_in(contact.as_str(), &mut scratch)?;
+            let peer = jid.resolve(&scratch)?.bare();
+            if router.is_local_host(peer.domainpart()) {
+                allowed.push(true);
+                continue;
+            }
+            let checks = [Check {
+                account: owner,
+                direction: Direction::Outbound,
+                peer,
+            }];
+            allowed.push(
+                evaluate_in(
+                    router,
+                    transaction,
+                    StanzaType::Presence(PresenceType::Probe),
+                    &checks,
+                )
+                .await?
+                    == Verdict::Allow,
+            );
+        }
+        retain_allowed(&mut audience.probes, allowed);
+    }
     Ok(())
 }
 

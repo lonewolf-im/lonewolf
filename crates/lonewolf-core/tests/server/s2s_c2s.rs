@@ -337,3 +337,76 @@ fn c2s_queued_error_messages_and_iq_responses_never_bounce() -> Result {
     server.stop(Signal::SIGTERM)?;
     Ok(())
 }
+
+fn remote_presence(peer: &mut impl Read, kind: Option<&str>, id: Option<&str>) -> Result {
+    let mut xml = until(peer, ">")?;
+    if !xml.ends_with("/>") {
+        xml.push_str(&until(peer, "</presence>")?);
+    }
+    let stanza = client::element(&xml)?;
+    assert_eq!(
+        (stanza.namespace.as_str(), stanza.name.as_str()),
+        ("jabber:server", "presence")
+    );
+    assert_eq!(
+        stanza.attributes.get("from").map(String::as_str),
+        Some("alice@local.test/desk")
+    );
+    assert_eq!(
+        stanza.attributes.get("to").map(String::as_str),
+        Some("bob@peer.test/phone")
+    );
+    assert_eq!(stanza.attributes.get("type").map(String::as_str), kind);
+    assert_eq!(stanza.attributes.get("id").map(String::as_str), id);
+    if kind == Some("error") {
+        stanza
+            .child("jabber:server", "error")?
+            .child("urn:ietf:params:xml:ns:xmpp-stanzas", "service-unavailable")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn c2s_directed_presence_probes_errors_and_withdrawals_reach_authenticated_peer() -> Result {
+    let fixture = Fixture::new()?;
+    let listener = out::listener()?;
+    let extra = format!("[s2s.routes]\n'peer.test'=['{}']\n", listener.local_addr()?);
+    let config = out::config(&fixture, "peer.test", false, false)?;
+    let (mut server, mut sender) = client::start(&fixture, &extra)?;
+    sender.write_all(b"<presence to='bob@peer.test/phone' from='mallory@third.test/spy' id='available'><status>Ready</status></presence>")?;
+    sender.flush()?;
+    let mut receiving = out::establish(&listener, config, &fixture)?;
+    remote_presence(&mut receiving, None, Some("available"))?;
+    for (kind, id, payload) in [
+        ("probe", "probe", ""),
+        (
+            "error",
+            "error",
+            "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>",
+        ),
+        ("unavailable", "explicit", ""),
+    ] {
+        write!(
+            sender,
+            "<presence type='{kind}' to='bob@peer.test/phone' from='mallory@third.test/spy' id='{id}'>{payload}</presence>"
+        )?;
+        sender.flush()?;
+        remote_presence(&mut receiving, Some(kind), Some(id))?;
+    }
+    sender.write_all(b"<presence to='bob@peer.test/phone' id='again'/>")?;
+    sender.flush()?;
+    remote_presence(&mut receiving, None, Some("again"))?;
+    client::barrier(&mut sender)?;
+    client::close(&mut sender)?;
+    remote_presence(&mut receiving, Some("unavailable"), None)?;
+    wait_sample(&server, &out::outbound_auth("success"), 1)?;
+    wait_sample(
+        &server,
+        "lonewolf_s2s_stanzas_sent_total{kind=\"presence\"}",
+        6,
+    )?;
+    out::close(&mut receiving)?;
+    out::wait_zero(&server)?;
+    server.stop(Signal::SIGTERM)?;
+    Ok(())
+}

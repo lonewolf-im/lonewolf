@@ -6,7 +6,7 @@
   <Project>
     <name>Lonewolf</name>
     <shortdesc xml:lang="en">A standalone XMPP server written in Rust</shortdesc>
-    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as one binary with embedded storage, so there is no separate database to set up. It is early, pre-1.0 software that hosts chat between accounts on the domains you run. Server connections use STARTTLS and SASL EXTERNAL. Local clients can send messages and IQs to remote domains. Inbound message and IQ delivery and federated presence remain unsupported.</description>
+    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as one binary with embedded storage, so there is no separate database to set up. It is early, pre-1.0 software that hosts chat between accounts on the domains you run. Server connections use STARTTLS and SASL EXTERNAL. Local clients can send messages, IQs and ordinary presence to remote domains, including directed withdrawals and initial roster probes. Inbound message, IQ and presence delivery and federated subscriptions remain unsupported. Outbound presence is not in a release yet.</description>
 
     <homepage rdf:resource="https://github.com/lonewolf-im/lonewolf"/>
     <download-page rdf:resource="https://github.com/lonewolf-im/lonewolf/releases"/>
@@ -84,7 +84,7 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0178.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
-        <xmpp:note xml:lang="en">Client certificate authentication and partial server STARTTLS and EXTERNAL support in both directions. Server peers require a valid certificate for their domain with explicit serverAuth EKU; authenticated streams close at certificate expiry. Validated inbound chat and IQ requests receive conservative errors over separate outbound streams. Local clients can send messages and IQs over authenticated outbound streams with sender policy and archive processing, sender Carbons, and eligible error bounces. Inbound message and IQ delivery and federated presence remain unsupported; server certificate revocation is not checked. Server support: Not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Client certificate authentication and partial server STARTTLS and EXTERNAL support in both directions. Server peers require a valid certificate for their domain with explicit serverAuth EKU; authenticated streams close at certificate expiry. Validated inbound chat and IQ requests receive conservative errors over separate outbound streams. Local clients can send messages and IQs over authenticated outbound streams with sender policy and archive processing, sender Carbons, and eligible error bounces. Outbound available, unavailable, probe and error presence includes broadcasts, directed withdrawals and initial roster probes. Inbound message, IQ and presence delivery and federated subscriptions remain unsupported; server certificate revocation is not checked. Server support: Not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

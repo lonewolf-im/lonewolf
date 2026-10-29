@@ -712,6 +712,10 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
             stanza: Box::from([]),
         };
         let mut audience = PresenceAudience {
+            probes: vec![
+                RosterJid::from(&subscriber),
+                RosterJid::from(&account("bob@remote.test")?),
+            ],
             subscribers: vec![RosterJid::from(&subscriber)],
             contacts: vec![contact.clone()],
             pending: vec![pending.clone()],
@@ -731,6 +735,13 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
         .await
         .map_err(|_| "audience filtering attempted allocation")?;
         assert_eq!(audience.subscribers, [RosterJid::from(&subscriber)]);
+        assert_eq!(
+            audience.probes,
+            [
+                RosterJid::from(&subscriber),
+                RosterJid::from(&account("bob@remote.test")?)
+            ]
+        );
         assert_eq!(audience.contacts, [contact]);
         assert_eq!(audience.pending, [pending]);
         router.shutdown().await?;

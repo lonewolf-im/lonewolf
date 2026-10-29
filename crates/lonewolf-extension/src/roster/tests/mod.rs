@@ -1206,7 +1206,7 @@ fn roster_read_and_mutation_failures_keep_storage_categories_and_operation() {
         let audience = block_on(super::granting_contacts(
             &reads,
             contact.clone(),
-            vec![contact],
+            &[contact],
         ))
         .expect_err("storage must fail");
         for (error, operation) in [
@@ -1999,5 +1999,60 @@ fn legacy_self_preapproval_transitions_twice_and_retires_once()
         Some("x".repeat(256).as_str())
     );
     assert_eq!(*delivery.retired.borrow(), vec![owner]);
+    Ok(())
+}
+
+#[test]
+fn initial_probes_include_watched_contacts_without_reciprocal_grants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, roster) = roster();
+    let owner = account("alice@example.com");
+    create_account(&roster, &owner);
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        for (jid, state) in [
+            ("none@remote.test", SubscriptionState::None),
+            ("from@remote.test", SubscriptionState::From),
+            ("to@remote.test", SubscriptionState::To),
+            ("pending@remote.test", SubscriptionState::To),
+            ("both@remote.test", SubscriptionState::Both),
+            ("alice@example.com", SubscriptionState::Both),
+        ] {
+            transaction
+                .put_roster_item(
+                    &owner,
+                    &subscribed(RosterJid::from(&account(jid)), state),
+                    RosterQuota::default(),
+                )
+                .await?;
+        }
+        transaction
+            .put_pending_request(
+                &owner,
+                PendingSubscription {
+                    sender: RosterJid::from(&account("pending@remote.test")),
+                    stanza: Box::from(b"stored".as_slice()),
+                },
+                std::num::NonZeroUsize::MAX,
+            )
+            .await?;
+        transaction.commit().await.map_err(RosterError::from)
+    })?;
+    for transition in [
+        PresenceTransition::Initial,
+        PresenceTransition::Update,
+        PresenceTransition::Unavailable,
+    ] {
+        let audience = audience(&roster, "alice@example.com/desk", transition);
+        let mut probes: Vec<_> = audience.probes.iter().map(RosterJid::as_str).collect();
+        probes.sort_unstable();
+        let expected = if transition == PresenceTransition::Initial {
+            vec!["both@remote.test", "pending@remote.test", "to@remote.test"]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(probes, expected, "{transition:?}");
+        assert!(audience.contacts.is_empty());
+    }
     Ok(())
 }

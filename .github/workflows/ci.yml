@@ -34,7 +34,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify diagnostic source checkout
+        env:
+          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          diagnostic_actual_commit="$(git rev-parse HEAD)"
+          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
+          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
+            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
@@ -60,7 +72,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify diagnostic source checkout
+        env:
+          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          diagnostic_actual_commit="$(git rev-parse HEAD)"
+          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
+          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
+            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
@@ -80,10 +104,22 @@ jobs:
         if: ${{ runner.os == 'macOS' }}
         env:
           S2S_DIAGNOSTICS: ${{ runner.temp }}/s2s-native-diagnostic
+          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DIAGNOSTIC_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           mkdir -p "$S2S_DIAGNOSTICS"
           {
-            printf 'head=%s\nrun_id=%s\nattempt=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'expected_head=%s\nchecked_out_commit=%s\nchecked_out_tree=%s\nevent_sha=%s\nevent_pr_base_sha=%s\nworkflow_sha=%s\nrun_id=%s\nattempt=%s\n' \
+              "$EXPECTED_DIAGNOSTIC_HEAD" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" \
+              "$GITHUB_SHA" "$EVENT_PR_BASE_SHA" "$DIAGNOSTIC_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            python3 - <<'PYTHON'
+          import hashlib
+          from pathlib import Path
+
+          for name in ("Cargo.toml", "Cargo.lock", ".config/nextest.toml"):
+              print(f"sha256[{name}]={hashlib.sha256(Path(name).read_bytes()).hexdigest()}")
+          PYTHON
             rustc -vV
             cargo -V
             cargo nextest --version
@@ -221,7 +257,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify diagnostic source checkout
+        env:
+          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          diagnostic_actual_commit="$(git rev-parse HEAD)"
+          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
+          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
+            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
+            exit 1
+          fi
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           arguments: --workspace --all-features --locked
@@ -234,7 +282,19 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+      - name: Verify diagnostic source checkout
+        env:
+          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          diagnostic_actual_commit="$(git rev-parse HEAD)"
+          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
+          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
+            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
+            exit 1
+          fi
       - name: Install actionlint
         env:
           GOBIN: ${{ runner.temp }}/actionlint

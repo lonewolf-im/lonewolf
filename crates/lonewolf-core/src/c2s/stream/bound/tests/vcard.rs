@@ -146,7 +146,7 @@ fn vcard_submitted_commit_finishes_after_the_pending_request_is_dropped() -> Tes
             delivery,
             None,
             EffectsDiagnostics {
-                account: owner.clone(),
+                identity: crate::delivery::EffectsIdentity::Account(owner.clone()),
                 commit_operation: "iq_set_commit",
                 delivery_operation: "iq_set_effects",
             },

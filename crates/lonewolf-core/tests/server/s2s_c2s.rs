@@ -615,3 +615,130 @@ fn c2s_directed_presence_probes_errors_and_withdrawals_reach_authenticated_peer(
     server.stop(Signal::SIGTERM)?;
     Ok(())
 }
+
+#[test]
+fn inbound_server_iq_ping_and_unknown_request_reply_on_separate_outbound_stream() -> Result {
+    let fixture = Fixture::new()?;
+    let listener = out::listener()?;
+    let extra = format!("[s2s.routes]\n'peer.test'=['{}']\n", listener.local_addr()?);
+    let (mut server, mut client, _, s2s) = client::start_inbound(&fixture, &extra)?;
+    let mut incoming = inbound_peer(&fixture, s2s)?;
+    incoming.write_all(b"<iq type='get' from='bob@peer.test/phone' to='local.test' id='ping'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+    incoming.flush()?;
+    let mut outgoing = out::establish(
+        &listener,
+        out::config(&fixture, "peer.test", false, false)?,
+        &fixture,
+    )?;
+    let ping = client::stanza(&mut outgoing, "iq")?;
+    for (key, value) in [
+        ("type", "result"),
+        ("from", "local.test"),
+        ("to", "bob@peer.test/phone"),
+        ("id", "ping"),
+    ] {
+        assert_eq!(ping.attributes.get(key).map(String::as_str), Some(value));
+    }
+    assert_eq!(ping.namespace, "jabber:server");
+    assert!(ping.children.is_empty());
+    incoming.write_all(b"<iq type='get' from='bob@peer.test/phone' to='local.test' id='unknown'><query xmlns='urn:test:unknown'/></iq>")?;
+    incoming.flush()?;
+    let error = client::stanza(&mut outgoing, "iq")?;
+    for (key, value) in [
+        ("type", "error"),
+        ("from", "local.test"),
+        ("to", "bob@peer.test/phone"),
+        ("id", "unknown"),
+    ] {
+        assert_eq!(error.attributes.get(key).map(String::as_str), Some(value));
+    }
+    assert_eq!(error.namespace, "jabber:server");
+    error.child("urn:test:unknown", "query")?;
+    error
+        .child("jabber:server", "error")?
+        .child("urn:ietf:params:xml:ns:xmpp-stanzas", "service-unavailable")?;
+    close(&mut incoming)?;
+    client::close(&mut client)?;
+    out::close(&mut outgoing)?;
+    out::wait_zero(&server)?;
+    iq_metrics(&server, 2)?;
+    server.stop(Signal::SIGTERM)?;
+    Ok(())
+}
+
+#[test]
+fn remote_iq_result_returns_through_authenticated_inbound_stream_to_c2s_resource() -> Result {
+    let fixture = Fixture::new()?;
+    let listener = out::listener()?;
+    let extra = format!("[s2s.routes]\n'peer.test'=['{}']\n", listener.local_addr()?);
+    let (mut server, mut client, _, s2s) = client::start_inbound(&fixture, &extra)?;
+    client.write_all(b"<iq type='get' to='bob@peer.test/phone' id='remote-ping'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+    client.flush()?;
+    let mut outgoing = out::establish(
+        &listener,
+        out::config(&fixture, "peer.test", false, false)?,
+        &fixture,
+    )?;
+    let request = client::stanza(&mut outgoing, "iq")?;
+    assert_eq!(request.namespace, "jabber:server");
+    for (key, value) in [
+        ("type", "get"),
+        ("from", "alice@local.test/desk"),
+        ("to", "bob@peer.test/phone"),
+        ("id", "remote-ping"),
+    ] {
+        assert_eq!(request.attributes.get(key).map(String::as_str), Some(value));
+    }
+    request.child("urn:xmpp:ping", "ping")?;
+    let mut incoming = inbound_peer(&fixture, s2s)?;
+    incoming.write_all(b"<iq type='result' from='bob@peer.test/phone' to='alice@local.test/desk' id='remote-ping'/>")?;
+    incoming.flush()?;
+    let result = client::stanza(&mut client, "iq")?;
+    assert_eq!(result.namespace, "jabber:client");
+    for (key, value) in [
+        ("type", "result"),
+        ("from", "bob@peer.test/phone"),
+        ("to", "alice@local.test/desk"),
+        ("id", "remote-ping"),
+    ] {
+        assert_eq!(result.attributes.get(key).map(String::as_str), Some(value));
+    }
+    assert!(result.children.is_empty());
+    close(&mut incoming)?;
+    client::close(&mut client)?;
+    out::close(&mut outgoing)?;
+    out::wait_zero(&server)?;
+    iq_metrics(&server, 1)?;
+    server.stop(Signal::SIGTERM)?;
+    Ok(())
+}
+
+fn iq_metrics(server: &super::process::Server, count: usize) -> Result {
+    for (sample, value) in [
+        ("lonewolf_s2s_stanzas_received_total{kind=\"iq\"}", count),
+        ("lonewolf_s2s_stanzas_sent_total{kind=\"iq\"}", count),
+        ("lonewolf_s2s_connections_accepted_total{listener=\"0\"}", 1),
+        (
+            "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"success\"}",
+            1,
+        ),
+        (
+            "lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"success\"}",
+            1,
+        ),
+        ("lonewolf_s2s_dns_resolutions_total{outcome=\"static\"}", 1),
+        (
+            "lonewolf_s2s_streams_closed_total{direction=\"inbound\",outcome=\"stream_end\"}",
+            1,
+        ),
+        (
+            "lonewolf_s2s_streams_closed_total{direction=\"outbound\",outcome=\"stream_end\"}",
+            1,
+        ),
+        ("lonewolf_s2s_connections{direction=\"inbound\"}", 0),
+        ("lonewolf_s2s_streams{direction=\"inbound\"}", 0),
+    ] {
+        wait_sample(server, sample, value)?;
+    }
+    Ok(())
+}

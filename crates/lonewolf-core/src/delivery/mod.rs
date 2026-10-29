@@ -222,8 +222,22 @@ pub(crate) fn report_handler_failure(error: &HandlerError, account: &AccountKey)
     }
 }
 
+pub(crate) enum EffectsIdentity {
+    Account(AccountKey),
+    Server(Box<str>),
+}
+
+pub(crate) fn report_server_failure(failure: Failure, domain: &str) {
+    tracing::error!(
+        failure_kind = failure.kind.as_str(),
+        operation = failure.operation,
+        local_domain = domain,
+        "internal operation failed"
+    );
+}
+
 pub(crate) struct EffectsDiagnostics {
-    pub(crate) account: AccountKey,
+    pub(crate) identity: EffectsIdentity,
     pub(crate) commit_operation: &'static str,
     pub(crate) delivery_operation: &'static str,
 }
@@ -377,7 +391,10 @@ where
         }
         .await;
         if let Err(error) = &result {
-            report_failure(error.failure(), &diagnostics.account);
+            match &diagnostics.identity {
+                EffectsIdentity::Account(account) => report_failure(error.failure(), account),
+                EffectsIdentity::Server(domain) => report_server_failure(error.failure(), domain),
+            }
         }
         let _ = report_done.send(result);
     }))

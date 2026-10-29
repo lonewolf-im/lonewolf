@@ -1,51 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::iq::IqRequestType;
-use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
-use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
+use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, BuildError, Element, IqType, Stanza, StanzaErrorCondition,
-    StanzaErrorText, StanzaRef, StanzaType, error_element_in,
+    ApplicationCondition, BuildError, IqType, Stanza, StanzaErrorCondition, StanzaType,
 };
 
 use super::stream::CloseOutcome;
-use crate::router::{Destination, Registration, RouterError, RouterHandle};
-
-pub(super) struct ReplyError;
+use crate::router::{Destination, Registration, RouterHandle};
+pub(super) use crate::stages::iq::{ReplyError, error_reply_omitting_payload, result_reply};
 
 impl From<ReplyError> for CloseOutcome {
     fn from(_: ReplyError) -> Self {
         Self::InternalError
-    }
-}
-
-impl From<BuildError> for ReplyError {
-    fn from(_: BuildError) -> Self {
-        Self
-    }
-}
-
-impl From<RouterError> for ReplyError {
-    fn from(_: RouterError) -> Self {
-        Self
-    }
-}
-
-impl From<ArenaError> for ReplyError {
-    fn from(_: ArenaError) -> Self {
-        Self
-    }
-}
-
-impl From<HandleError> for ReplyError {
-    fn from(_: HandleError) -> Self {
-        Self
-    }
-}
-
-impl From<JidError> for ReplyError {
-    fn from(_: JidError) -> Self {
-        Self
     }
 }
 
@@ -113,59 +81,4 @@ pub(super) fn error_reply_with<A: ChunkAllocator>(
         .error_reply_with_in(arena, condition, application)?
         .to(to)?
         .build()?)
-}
-
-pub(super) fn result_reply<A: ChunkAllocator>(
-    request: &StanzaRef<'_, Arena<A>>,
-    sender: JidRef<'_>,
-    payload: Option<Element>,
-    response: &mut Arena<A>,
-) -> Result<Stanza, ReplyError> {
-    let recipient = sender.clone_in(response)?;
-    let from = request
-        .to()?
-        .map(|from| from.clone_in(response))
-        .transpose()?;
-    let mut builder = Stanza::builder_in(
-        StanzaType::Iq(IqType::Result),
-        request.namespace(),
-        response,
-    )
-    .id(request.id()?)?
-    .from(from)?
-    .to(Some(recipient))?;
-    if let Some(payload) = payload {
-        builder = builder.child(payload)?;
-    }
-    Ok(builder.build()?)
-}
-
-pub(super) fn error_reply_omitting_payload<A: ChunkAllocator>(
-    request: &StanzaRef<'_, Arena<A>>,
-    sender: JidRef<'_>,
-    condition: StanzaErrorCondition,
-    text: StanzaErrorText,
-    response: &mut Arena<A>,
-) -> Result<Stanza, ReplyError> {
-    if !matches!(
-        request.stanza_type(),
-        StanzaType::Iq(IqType::Get | IqType::Set)
-    ) {
-        return Err(BuildError::NotIqRequest.into());
-    }
-    let recipient = sender.clone_in(response)?;
-    let from = request
-        .to()?
-        .map(|from| from.clone_in(response))
-        .transpose()?;
-    let error = error_element_in(request.namespace(), condition, None, text, response)?;
-    Ok(
-        Stanza::builder_in(StanzaType::Iq(IqType::Error), request.namespace(), response)
-            .id(request.id()?)?
-            .lang(request.lang()?)?
-            .from(from)?
-            .to(Some(recipient))?
-            .child(error)?
-            .build()?,
-    )
 }

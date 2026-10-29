@@ -10,6 +10,7 @@ use crate::delivery::WorkHandle;
 use crate::router::RouterHandle;
 
 pub(crate) mod archive;
+pub(crate) mod iq;
 pub(crate) mod message;
 pub(crate) mod observe;
 pub(crate) mod policy;

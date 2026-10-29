@@ -414,7 +414,7 @@ fn detached_commit_failures_keep_categories_and_log_after_requester_cancellation
                 NoDelivery,
                 None,
                 EffectsDiagnostics {
-                    account: owner,
+                    identity: crate::delivery::EffectsIdentity::Account(owner),
                     commit_operation: "iq_set_commit",
                     delivery_operation: "iq_set_effects",
                 },
@@ -453,7 +453,7 @@ fn detached_effect_failure_logs_after_requester_cancellation() -> TestResult {
             NoDelivery,
             None,
             EffectsDiagnostics {
-                account: owner,
+                identity: crate::delivery::EffectsIdentity::Account(owner),
                 commit_operation: "presence_subscription_commit",
                 delivery_operation: "presence_subscription_effects",
             },

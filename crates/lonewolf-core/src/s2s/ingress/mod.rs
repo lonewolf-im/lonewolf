@@ -40,6 +40,7 @@ impl From<StageFailure> for IngressFailure {
     }
 }
 
+mod iq;
 mod message;
 
 pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
@@ -80,10 +81,7 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
     let kind = stanza.resolve().map_err(|_| IngressFailure)?.stanza_type();
     match kind {
         StanzaType::Message(kind) => message::handle(context, peer, stanza, kind).await,
-        StanzaType::Iq(IqType::Get | IqType::Set) => {
-            let condition = StanzaErrorCondition::ServiceUnavailable;
-            reply_error(context, &stanza, condition, None, condition.default_text())
-        }
+        StanzaType::Iq(kind) => iq::handle(context, peer, stanza, kind).await,
         _ => {
             tracing::debug!(stanza_kind = kind.kind().as_str(), remote_domain = %log_domain(&peer.remote), "s2s stanza discarded");
             Ok(())

@@ -423,7 +423,7 @@ fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> Test
             NoDelivery,
             None,
             EffectsDiagnostics {
-                account: alice,
+                identity: crate::delivery::EffectsIdentity::Account(alice),
                 commit_operation: "iq_set_commit",
                 delivery_operation: "iq_set_effects",
             },

@@ -742,3 +742,104 @@ fn iq_metrics(server: &super::process::Server, count: usize) -> Result {
     }
     Ok(())
 }
+
+#[test]
+fn inbound_presence_reaches_client_and_private_probes_use_outbound_stream() -> Result {
+    let fixture = Fixture::new()?;
+    let listener = out::listener()?;
+    let extra = format!("[s2s.routes]\n'peer.test'=['{}']\n", listener.local_addr()?);
+    let (mut server, mut receiver, _, s2s) = client::start_inbound(&fixture, &extra)?;
+    receiver.write_all(b"<presence><status>Ready</status></presence>")?;
+    receiver.flush()?;
+    let presence = client::stanza(&mut receiver, "presence")?;
+    assert_eq!(
+        presence.attributes.get("from").map(String::as_str),
+        Some("alice@local.test/desk")
+    );
+    client::barrier(&mut receiver)?;
+    let mut incoming = inbound_peer(&fixture, s2s)?;
+    for kind in [None, Some("unavailable")] {
+        let attribute = kind.map_or(String::new(), |kind| format!(" type='{kind}'"));
+        write!(
+            incoming,
+            "<presence from='bob@peer.test/phone' to='alice@local.test'{attribute}/>"
+        )?;
+        incoming.flush()?;
+        let stanza = client::stanza(&mut receiver, "presence")?;
+        assert_eq!(
+            (stanza.namespace.as_str(), stanza.name.as_str()),
+            ("jabber:client", "presence")
+        );
+        for (key, value) in [("from", "bob@peer.test/phone"), ("to", "alice@local.test")] {
+            assert_eq!(
+                stanza.attributes.get(key).map(String::as_str),
+                Some(value),
+                "{stanza:?}"
+            );
+        }
+        assert_eq!(
+            stanza.attributes.get("type").map(String::as_str),
+            kind,
+            "{stanza:?}"
+        );
+    }
+    incoming.write_all(b"<presence type='probe' from='bob@peer.test' to='alice@local.test'/><presence type='probe' from='bob@peer.test' to='missing@local.test'/>")?;
+    incoming.flush()?;
+    let mut outgoing = out::establish(
+        &listener,
+        out::config(&fixture, "peer.test", false, false)?,
+        &fixture,
+    )?;
+    for target in ["alice@local.test", "missing@local.test"] {
+        let stanza = client::stanza(&mut outgoing, "presence")?;
+        assert_eq!(
+            (stanza.namespace.as_str(), stanza.name.as_str()),
+            ("jabber:server", "presence")
+        );
+        for (key, value) in [
+            ("from", target),
+            ("to", "bob@peer.test"),
+            ("type", "unsubscribed"),
+        ] {
+            assert_eq!(
+                stanza.attributes.get(key).map(String::as_str),
+                Some(value),
+                "{stanza:?}"
+            );
+        }
+        assert!(stanza.children.is_empty(), "{stanza:?}");
+        assert!(stanza.text.is_empty(), "{stanza:?}");
+    }
+    client::close(&mut receiver)?;
+    close(&mut incoming)?;
+    out::close(&mut outgoing)?;
+    out::wait_zero(&server)?;
+    for (sample, value) in [
+        ("lonewolf_s2s_stanzas_received_total{kind=\"presence\"}", 4),
+        ("lonewolf_s2s_stanzas_sent_total{kind=\"presence\"}", 2),
+        ("lonewolf_s2s_connections_accepted_total{listener=\"0\"}", 1),
+        (
+            "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"success\"}",
+            1,
+        ),
+        (
+            "lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"success\"}",
+            1,
+        ),
+        ("lonewolf_s2s_dns_resolutions_total{outcome=\"static\"}", 1),
+        (
+            "lonewolf_s2s_streams_closed_total{direction=\"inbound\",outcome=\"stream_end\"}",
+            1,
+        ),
+        (
+            "lonewolf_s2s_streams_closed_total{direction=\"outbound\",outcome=\"stream_end\"}",
+            1,
+        ),
+        ("lonewolf_s2s_connections{direction=\"inbound\"}", 0),
+        ("lonewolf_s2s_streams{direction=\"inbound\"}", 0),
+    ] {
+        wait_sample(&server, sample, value)?;
+    }
+    server.stop(Signal::SIGTERM)?;
+    Ok(())
+}

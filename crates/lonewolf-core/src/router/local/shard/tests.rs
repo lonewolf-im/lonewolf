@@ -2102,3 +2102,47 @@ fn last_mailbox_overflow_records_unavailable_until_account_deletion() -> Result<
         Ok(())
     })
 }
+
+#[test]
+fn probe_for_matches_local_mailbox_replies() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let alice = account()?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let bob = AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+        let router = test_router();
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+        let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+        let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
+        for available in [false, true] {
+            if available {
+                for (resource, token) in [("desk", desk.token), ("phone", phone.token)] {
+                    shard.presence(&alice, resource, token, Some(0), routed(&format!("<presence from='alice@localhost/{resource}' id='{resource}'><show>away</show><status>private</status></presence>")).await?, None)?;
+                }
+            }
+            for target in ["alice@localhost", "alice@localhost/desk", "alice@localhost/missing", "missing@localhost"] {
+                for subscribed in [false, true] {
+                    let request = routed(&format!("<presence from='bob@localhost/desk' to='{target}' type='probe' id='probe'/>")).await?;
+                    let observer_jid = request.resolve()?.from()?.ok_or("observer")?;
+                    let returned = shard.probe_for(observer_jid, &request, subscribed, &GlobalChunkAllocator)?;
+                    shard.probe(&observer.handle(), &request, subscribed)?;
+                    let queued = observer.take_queued();
+                    assert_eq!(returned.len(), queued.len());
+                    for stanza in returned {
+                        let view = stanza.resolve()?;
+                        let matching = queued.iter().find(|queued| queued.stanza.resolve().is_ok_and(|queued| queued.from().ok().flatten().map(|jid| jid.as_str()) == view.from().ok().flatten().map(|jid| jid.as_str()))).ok_or("same sender")?;
+                        let actual = matching.stanza.resolve()?;
+                        assert_eq!(view.stanza_type(), actual.stanza_type());
+                        assert_eq!(view.to()?.map(|jid| jid.as_str()), actual.to()?.map(|jid| jid.as_str()));
+                        assert_eq!(view.id()?, actual.id()?);
+                        for child in ["show", "status"] {
+                            assert_eq!(view.child(child, "jabber:client")?.map(|child| child.text()).transpose()?, actual.child(child, "jabber:client")?.map(|child| child.text()).transpose()?);
+                        }
+                        assert_eq!(view.child("delay", "urn:xmpp:delay")?.is_some(), actual.child("delay", "urn:xmpp:delay")?.is_some());
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}

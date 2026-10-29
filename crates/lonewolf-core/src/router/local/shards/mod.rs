@@ -474,6 +474,26 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         Ok(())
     }
 
+    pub(crate) async fn probe_remote(
+        &self,
+        request: &RoutedStanza<A>,
+        subscribed: bool,
+    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+        let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let observer = view
+            .from()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let target = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        self.with_shard(self.shard_index(target.bare().as_str()), |shard| {
+            shard.probe_for(observer, request, subscribed, &self.allocator())
+        })
+        .await?
+    }
+
     pub(crate) async fn retire_account(&self, account: &AccountKey) -> Result<(), RouterError> {
         self.with_shard(self.shard_index(account.as_str()), |shard| {
             shard.retire_account(account)

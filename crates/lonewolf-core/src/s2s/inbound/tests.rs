@@ -150,31 +150,56 @@ fn sample(metrics: &Arc<S2sMetrics>, key: &str, value: usize) -> TestResult {
 
 #[test]
 fn dispatch_is_sequential_and_rescoped_before_the_second_stanza_is_read() -> TestResult {
-    Runtime::new()?.block_on(async {
+    let runtime = Runtime::new()?;
+    runtime.block_on(async {
+        assert!(runtime.current_timeout().is_none());
         let fixture = Fixture::new()?;
         let peer = peer();
         let (_stop, shutdown) = signal();
         let mut reader = fixture.reader("<message from='a@peer.test' to='b@local.test' id='one'/><message from='a@peer.test' to='b@local.test' id='two'/></stream:stream>").await?;
         let output = Output::default();
         let mut writer = S2sWriter::new(output);
-        let (release, held) = oneshot::channel::<()>();
-        let mut held = Some(held);
+        let (release, held) = std::sync::mpsc::sync_channel(0);
+        let (started, entered) = std::sync::mpsc::sync_channel(0);
+        let mut held = Some((started, held));
+        let executor = lonewolf_util::blocking::BlockingExecutor::new(
+            std::num::NonZeroUsize::new(1).ok_or("zero capacity")?,
+        );
+        let timeout = fixture.settings.timeout;
         let ids = Rc::new(RefCell::new(Vec::new()));
         let recorded = Rc::clone(&ids);
+        let completed = Rc::new(std::cell::Cell::new(0));
+        let dispatch_completed = Rc::clone(&completed);
         let dispatch = async move |_: &IngressContext<GlobalChunkAllocator>, _: &InboundPeer, stanza: RoutedStanza<GlobalChunkAllocator>| {
             let view = stanza.resolve().map_err(|_| IngressFailure)?;
             assert_eq!(view.namespace(), StanzaNamespace::Client);
             recorded.borrow_mut().push(view.id().map_err(|_| IngressFailure)?.unwrap_or_default().to_owned());
-            if let Some(held) = held.take() { let _ = held.await; }
+            if let Some((started, held)) = held.take() {
+                let (receipt, released) = executor.run(move || {
+                    (started.send(()), held.recv_timeout(timeout))
+                }).await;
+                assert!(receipt.is_ok());
+                assert!(released.is_ok());
+            }
+            dispatch_completed.set(dispatch_completed.get() + 1);
             Ok(())
         };
-        let future = run(&mut reader, &mut writer, fixture.parameters(&peer, shutdown, SystemTime::now() + Duration::from_secs(60)), || {}, dispatch);
+        let expiry = rcgen::CertificateParams::default().not_after;
+        let valid_until = SystemTime::UNIX_EPOCH + Duration::from_secs(expiry.unix_timestamp().try_into()?);
+        let future = run(&mut reader, &mut writer, fixture.parameters(&peer, shutdown, valid_until), || {}, dispatch);
         let mut future = Box::pin(future);
         assert!(poll!(future.as_mut()).is_pending());
+        entered.recv_timeout(timeout)?;
         assert_eq!(*ids.borrow(), ["one"]);
+        assert_eq!(completed.get(), 0);
+        let driver_timeout = runtime.current_timeout().ok_or("missing expiry timer")?;
+        assert!(driver_timeout <= Duration::from_secs(i32::MAX as u64));
+        assert!(driver_timeout > fixture.settings.idle_timeout);
         release.send(()).map_err(|_| "dispatch dropped")?;
         assert!(matches!(future.await, StreamClose::StreamEnd));
         assert_eq!(*ids.borrow(), ["one", "two"]);
+        assert_eq!(completed.get(), 2);
+        assert!(runtime.current_timeout().is_none());
         Ok(())
     })
 }

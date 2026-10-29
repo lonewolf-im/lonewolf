@@ -217,9 +217,15 @@ struct Closed {
     abort: bool,
 }
 
-async fn serve<A: ChunkAllocator + Clone>(
+async fn serve<
+    A: ChunkAllocator + Clone,
+    R: AsyncBufRead + Unpin + 'static,
+    W: AsyncWrite + Unpin,
+>(
     inner: &Inner<A>,
-    stream: &mut OutboundStream<A>,
+    reader: &mut S2sReader<A, R>,
+    writer: &mut S2sWriter<W>,
+    valid_until: SystemTime,
     receiver: &Receiver<Queued<A>>,
     current: &mut Option<Queued<A>>,
 ) -> Closed {
@@ -227,23 +233,22 @@ async fn serve<A: ChunkAllocator + Clone>(
     let mut buffered = false;
     loop {
         let next = async {
-            if current.is_some() {
-                return Ok(Next::Queued);
-            }
-            match select(pin!(receiver.recv()), pin!(stream.reader.next_event())).await {
-                Either::Left((Ok(queued), _)) => {
-                    *current = Some(queued);
-                    Ok(Next::Queued)
+            let queued = async {
+                if current.is_none() {
+                    *current = Some(receiver.recv().await.map_err(|_| S2sError::Internal)?);
                 }
-                Either::Left((Err(_), _)) => Err(S2sError::Internal),
-                Either::Right((result, _)) => result.map(Next::Peer),
+                Ok(Next::Queued)
+            };
+            match select(pin!(reader.next_event()), pin!(queued)).await {
+                Either::Left((result, _)) => result.map(Next::Peer),
+                Either::Right((result, _)) => result,
             }
         };
         let idle = Duration::from_secs(inner.limits.idle_timeout_secs.get())
             .saturating_sub(last_written.elapsed());
         match watch(
             Some(inner.stopped.clone()),
-            Some(stream.valid_until),
+            Some(valid_until),
             idle,
             StreamClose::Idle,
             next,
@@ -258,10 +263,10 @@ async fn serve<A: ChunkAllocator + Clone>(
                     };
                 };
                 match write(
-                    &mut stream.writer,
+                    writer,
                     queued,
                     inner,
-                    stream.valid_until,
+                    valid_until,
                     receiver.is_empty(),
                     &mut buffered,
                 )
@@ -385,7 +390,15 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         };
         ready(&counters, &mut failures);
         let gauge = inner.metrics.stream_opened(Direction::Outbound);
-        let closed = serve(&inner, &mut stream, &receiver, &mut current).await;
+        let closed = serve(
+            &inner,
+            &mut stream.reader,
+            &mut stream.writer,
+            stream.valid_until,
+            &receiver,
+            &mut current,
+        )
+        .await;
         let reason = if closed.abort {
             closed.reason
         } else {
@@ -979,6 +992,96 @@ mod tests {
                 manager
                     .join(Instant::now() + Duration::from_secs(5))
                     .await?;
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ready_peer_termination_precedes_queued_output_and_a_retained_head()
+    -> Result<(), Box<dyn std::error::Error>> {
+        run(async {
+            for retained in [false, true] {
+                for (event, expected) in [
+                    ("</stream:stream>", StreamClose::StreamEnd),
+                    (
+                        "<stream:error><not-authorized xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>",
+                        StreamClose::PeerError,
+                    ),
+                    (
+                        "<message from='bob@remote.test' to='alice@localhost'/>",
+                        StreamClose::NotAuthorized,
+                    ),
+                ] {
+                    let manager = manager(S2sLimits::default())?;
+                    let task = manager
+                        .admit("localhost", "remote.test", message().await?)
+                        .map_err(|error| format!("{error:?}"))?
+                        .ok_or("launch")?;
+                    manager
+                        .admit("localhost", "remote.test", message().await?)
+                        .map_err(|error| format!("{error:?}"))?;
+                    let mut current = if retained {
+                        Some(task.receiver.recv().await?)
+                    } else {
+                        None
+                    };
+                    let queued_bytes = task.counters.bytes.load(Ordering::Relaxed);
+                    let xml = format!(
+                        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0'>{event}"
+                    );
+                    let limits = &manager.inner.limits;
+                    let mut reader = S2sReader::new(
+                        tokio::io::BufReader::new(std::io::Cursor::new(xml.into_bytes())),
+                        &S2sReaderLimits {
+                            max_stanza_bytes: limits.max_stanza_bytes,
+                            stanzas: limits.incoming_stanzas_per_connection.clone(),
+                            xml: limits.incoming_xml_per_connection.clone(),
+                        },
+                        GlobalChunkAllocator,
+                        None,
+                    );
+                    assert!(matches!(
+                        reader
+                            .next_event()
+                            .await
+                            .map_err(|error| format!("{error:?}"))?,
+                        Some(StreamEvent::StreamStart { .. })
+                    ));
+                    let calls = Arc::new(PlMutex::new(Calls {
+                        accepts: true,
+                        ..Default::default()
+                    }));
+                    let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                    let closed = serve(
+                        &manager.inner,
+                        &mut reader,
+                        &mut writer,
+                        SystemTime::now() + Duration::from_secs(60),
+                        &task.receiver,
+                        &mut current,
+                    )
+                    .await;
+                    assert_eq!(closed.reason.as_str(), expected.as_str());
+                    assert_eq!(calls.lock().writes, 0);
+                    assert_eq!(calls.lock().flushes, 0);
+                    assert_eq!(task.counters.count.load(Ordering::Relaxed), 2);
+                    assert_eq!(task.counters.bytes.load(Ordering::Relaxed), queued_bytes);
+                    assert_eq!(current.is_some(), retained);
+                    assert!(
+                        !render(&manager.inner.metrics)?
+                            .contains("s2s_stanzas_sent_total{kind=\"message\"} 1")
+                    );
+                    assert!(
+                        !render(&manager.inner.metrics)?
+                            .contains("s2s_stanzas_sent_total{kind=\"message\"} 2")
+                    );
+                    drop(current);
+                    drop(task);
+                    manager
+                        .join(Instant::now() + Duration::from_secs(5))
+                        .await?;
+                }
             }
             Ok(())
         })

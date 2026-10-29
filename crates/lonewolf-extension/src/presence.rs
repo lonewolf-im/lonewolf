@@ -77,6 +77,8 @@ pub struct PresenceAudience {
     pub pending: Vec<PendingSubscription>,
     /// Accounts whose current presence a newly available resource receives.
     pub contacts: Vec<AccountKey>,
+    /// Initial To/Both contacts; core probes those on non-local hosts.
+    pub probes: Vec<RosterJid>,
 }
 
 pub type PresenceFuture<'a, T> = ExtensionFuture<'a, Result<T, HandlerError>>;

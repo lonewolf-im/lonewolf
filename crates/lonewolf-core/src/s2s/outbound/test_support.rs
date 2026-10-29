@@ -25,11 +25,18 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub(crate) fn new(initial: AdmissionState) -> TestResult<Self> {
+        Self::with_capacity(initial, NonZeroUsize::MIN)
+    }
+
+    pub(crate) fn with_capacity(
+        initial: AdmissionState,
+        capacity: NonZeroUsize,
+    ) -> TestResult<Self> {
         let config = crate::config::Config::default();
         let hosts = crate::hosts::test_support::managed_hosts()?;
         let trust = PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?;
         let limits = S2sLimits {
-            max_queued_stanzas_per_link: NonZeroUsize::MIN,
+            max_queued_stanzas_per_link: capacity,
             ..Default::default()
         };
         let remote = RemoteRouter::new(

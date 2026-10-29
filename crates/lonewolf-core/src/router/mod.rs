@@ -706,14 +706,22 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         source: &AccountKey,
         target: &AccountKey,
     ) -> Result<(), RouterError> {
-        if !self.hosts.is_local_host(source.domain()) || !self.hosts.is_local_host(target.domain())
+        if !self.hosts.is_local_host(source.domain())
+            || (!self.hosts.is_local_host(target.domain()) && !self.federation_enabled())
         {
             return Err(RouterError::RemoteUnsupported);
         }
+        let remote = !self.hosts.is_local_host(target.domain());
         for stanza in self.current_presence(source, target).await? {
-            match self.local.deliver_presence(stanza).await {
-                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
-                Err(error) => return Err(error),
+            if remote {
+                if let Err(RouterError::Stopped) = self.route_remote_or_bounce(stanza) {
+                    return Err(RouterError::Stopped);
+                }
+            } else {
+                match self.local.deliver_presence(stanza).await {
+                    Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())
@@ -777,10 +785,12 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         source: &AccountKey,
         target: &AccountKey,
     ) -> Result<(), RouterError> {
-        if !self.hosts.is_local_host(source.domain()) || !self.hosts.is_local_host(target.domain())
+        if !self.hosts.is_local_host(source.domain())
+            || (!self.hosts.is_local_host(target.domain()) && !self.federation_enabled())
         {
             return Err(RouterError::RemoteUnsupported);
         }
+        let remote = !self.hosts.is_local_host(target.domain());
         for stanza in self.local.withdrawal_snapshot(source).await? {
             let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
                 .map_err(|_| RouterError::Unavailable)?;
@@ -805,11 +815,14 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .map_err(|_| RouterError::Unavailable)?
             .build()
             .map_err(|_| RouterError::Unavailable)?;
-            match self
-                .local
-                .deliver_presence(RoutedStanza::from_parts(stanza, arena))
-                .await
-            {
+            let stanza = RoutedStanza::from_parts(stanza, arena);
+            if remote {
+                if let Err(RouterError::Stopped) = self.route_remote_or_bounce(stanza) {
+                    return Err(RouterError::Stopped);
+                }
+                continue;
+            }
+            match self.local.deliver_presence(stanza).await {
                 Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
                 Err(error) => return Err(error),
             }
@@ -834,12 +847,13 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
                 .map_err(|_| RouterError::Unavailable)?;
             let target = Jid::parse_in(subscriber.as_str(), &mut arena)
                 .map_err(|_| RouterError::InvalidTarget)?;
-            if !self.hosts.is_local_host(
+            let remote = !self.hosts.is_local_host(
                 target
                     .resolve(&arena)
                     .map_err(|_| RouterError::Unavailable)?
                     .domainpart(),
-            ) {
+            );
+            if remote && !self.federation_enabled() {
                 continue;
             }
             let stanza = view
@@ -849,10 +863,14 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
                 .map_err(|_| RouterError::Unavailable)?
                 .build()
                 .map_err(|_| RouterError::Unavailable)?;
-            match self
-                .route_presence(RoutedStanza::from_parts(stanza, arena))
-                .await
-            {
+            let stanza = RoutedStanza::from_parts(stanza, arena);
+            if remote {
+                if let Err(RouterError::Stopped) = self.route_remote_or_bounce(stanza) {
+                    return Err(RouterError::Stopped);
+                }
+                continue;
+            }
+            match self.route_presence(stanza).await {
                 Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
                 Err(error) => return Err(error),
             }
@@ -860,7 +878,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         Ok(())
     }
 
-    /// Absent or busy recipients and nonlocal or domain-only targets are not errors.
+    /// Absent or busy recipients and local domain-only targets are not errors.
     pub(crate) async fn route_directed_presence(
         &self,
         stanza: RoutedStanza<A>,
@@ -877,6 +895,12 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             match self.destination(to) {
                 Destination::Resource => true,
                 Destination::Account => false,
+                Destination::Remote if self.federation_enabled() => {
+                    return match self.route_remote_or_bounce(stanza) {
+                        Err(RouterError::Stopped) => Err(RouterError::Stopped),
+                        _ => Ok(()),
+                    };
+                }
                 Destination::Server
                 | Destination::ServerResource
                 | Destination::Service

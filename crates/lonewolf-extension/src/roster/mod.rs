@@ -189,10 +189,10 @@ fn owner_of<A: ChunkAllocator>(
 async fn granting_contacts(
     transaction: &impl RosterReads,
     owner: RosterJid,
-    watched: Vec<RosterJid>,
+    watched: &[RosterJid],
 ) -> Result<Vec<AccountKey>, HandlerError> {
     let mut contacts = Vec::with_capacity(watched.len());
-    for contact in &watched {
+    for contact in watched {
         let Ok(account) = AccountKey::try_from(contact) else {
             continue;
         };
@@ -418,22 +418,23 @@ where
                 .await
                 .map_err(|error| roster_quota_error(error, "roster_read", self.quota(&owner)))?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
-            let (pending, contacts) = if update.transition == PresenceTransition::Initial {
+            let (pending, contacts, probes) = if update.transition == PresenceTransition::Initial {
                 let pending = transaction
                     .pending_requests(&owner)
                     .await
                     .map_err(|error| roster_error(error, "roster_read"))?;
                 let contacts =
-                    granting_contacts(transaction, RosterJid::from(update.sender.bare()), watched)
+                    granting_contacts(transaction, RosterJid::from(update.sender.bare()), &watched)
                         .await?;
-                (pending, contacts)
+                (pending, contacts, watched)
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
             Ok(Some(PresenceAudience {
                 subscribers,
                 pending,
                 contacts,
+                probes,
             }))
         })
     }

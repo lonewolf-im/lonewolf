@@ -1478,6 +1478,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 (None, PresenceType::Probe) => self.handle_probe(parsed).await,
                 (None, PresenceType::Error) => {
                     let routed = self.stamp(parsed)?;
+                    if self.router.federation_enabled()
+                        && self.router.destination(
+                            routed.resolve()?.to()?.ok_or(CloseOutcome::InternalError)?,
+                        ) == Destination::Remote
+                    {
+                        let _ = self.router.route_remote_or_bounce(routed);
+                        return Ok(());
+                    }
                     match self.router.route_presence_error(routed).await {
                         Ok(())
                         | Err(
@@ -1512,7 +1520,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             match self.router.destination(to) {
                 Destination::Account | Destination::Resource => {}
                 Destination::Remote => {
-                    return self.reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
+                    if !self.router.federation_enabled() {
+                        return self
+                            .reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
+                    }
+                    return self.handle_remote_probe(routed).await;
                 }
                 _ => return Ok(()),
             }
@@ -1601,6 +1613,58 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .map_err(|_| CloseOutcome::InternalError)
     }
 
+    async fn handle_remote_probe(&mut self, routed: RoutedStanza<A>) -> Result<(), CloseOutcome> {
+        let router = self.router.clone();
+        let storage = self.storage.clone();
+        let account = self.registration.account().clone();
+        let pending = Pending::spawn(self.outbox.work.start(), async move {
+            let (transaction, mut ticket) = router
+                .order()
+                .fix(vec![account.clone()], storage.begin_read())
+                .await
+                .map_err(|error| {
+                    report_failure(
+                        storage_failure(error, "presence_probe_begin_read"),
+                        &account,
+                    );
+                    RouterError::Unavailable
+                })?;
+            let peer = routed
+                .resolve()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            let checks = [policy::Check {
+                account: &account,
+                direction: Direction::Outbound,
+                peer,
+            }];
+            let verdict = policy::evaluate_in(
+                &router,
+                &transaction,
+                StanzaType::Presence(PresenceType::Probe),
+                &checks,
+            )
+            .await
+            .map_err(|_| RouterError::Unavailable)?;
+            drop(transaction);
+            if verdict != Verdict::Allow {
+                return Ok(());
+            }
+            ticket.turn().await;
+            match router.route_remote_or_bounce(routed) {
+                Err(RouterError::Stopped) => Err(RouterError::Stopped),
+                _ => Ok(()),
+            }
+        });
+        self.outbox
+            .drain_until(&self.registration, pending.finished())
+            .await?
+            .ok_or(CloseOutcome::InternalError)?
+            .map_err(|_| CloseOutcome::InternalError)
+    }
+
     async fn handle_directed(
         &mut self,
         parsed: Parsed<Stanza, A>,
@@ -1614,15 +1678,17 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
             match self.router.destination(to) {
-                Destination::Account | Destination::Resource => {}
+                Destination::Account | Destination::Resource => {
+                    Some(AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?)
+                }
+                Destination::Remote if self.router.federation_enabled() => None,
                 Destination::Remote => {
                     return self.reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
                 }
                 _ => return Ok(()),
             }
-            AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
         };
-        if &target != self.registration.account() {
+        if target.as_ref() != Some(self.registration.account()) {
             let stage = Stage {
                 router: &self.router,
                 storage: &self.storage,
@@ -1637,7 +1703,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     peer: view.to()?.ok_or(CloseOutcome::InternalError)?,
                 },
                 policy::Check {
-                    account: &target,
+                    account: target.as_ref().unwrap_or(self.registration.account()),
                     direction: Direction::Inbound,
                     peer: view.from()?.ok_or(CloseOutcome::InternalError)?,
                 },
@@ -1646,7 +1712,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .outbox
                 .drain_until(
                     &self.registration,
-                    policy::evaluate(&stage, view.stanza_type(), &checks),
+                    policy::evaluate(
+                        &stage,
+                        view.stanza_type(),
+                        &checks[..if target.is_some() { 2 } else { 1 }],
+                    ),
                 )
                 .await??
                 != Verdict::Allow
@@ -1659,8 +1729,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let account = self.registration.account().clone();
         let directed = routed.clone();
         let pending = Pending::spawn(self.outbox.work.start(), async move {
+            let remote = target.is_none();
             let mut accounts = vec![account];
-            if accounts[0] != target {
+            if let Some(target) = target
+                && accounts[0] != target
+            {
                 accounts.push(target);
             }
             let ((), mut ticket) = router
@@ -1668,7 +1741,21 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .fix(accounts, async { Ok::<_, RouterError>(()) })
                 .await?;
             ticket.turn().await;
-            session.directed_presence(directed, available).await
+            if !remote {
+                session.directed_presence(directed, available).await
+            } else {
+                let to = directed
+                    .resolve()
+                    .map_err(|_| RouterError::InvalidTarget)?
+                    .to()
+                    .map_err(|_| RouterError::InvalidTarget)?
+                    .ok_or(RouterError::InvalidTarget)?;
+                session.record_service_presence(to, available).await?;
+                match router.route_remote_or_bounce(directed) {
+                    Err(RouterError::Stopped) => Err(RouterError::Stopped),
+                    _ => Ok(()),
+                }
+            }
         });
         let result = self
             .outbox
@@ -3515,6 +3602,14 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
                 "initial presence prepared"
             );
         }
+        let probes = if change.became_available && router.federation_enabled() {
+            audience
+                .as_mut()
+                .map(|audience| mem::take(&mut audience.probes))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut covered = Vec::new();
         let broadcast = if let Some(audience) = audience
             && (available || change.became_unavailable)
@@ -3525,6 +3620,35 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
                 .await
                 .map(|()| covered = audience.subscribers)
                 .map_err(|_| CloseOutcome::InternalError)
+        } else {
+            Ok(())
+        };
+        let probing = if broadcast.is_ok() {
+            async {
+                for contact in probes {
+                    if router.is_local_host(domain_of(contact.as_str())) {
+                        continue;
+                    }
+                    let mut arena = Arena::try_new_in(Default::default(), allocator.clone())?;
+                    let to = Jid::parse_in(contact.as_str(), &mut arena)?;
+                    let from = Jid::parse_in(account.as_str(), &mut arena)?;
+                    let stanza = Stanza::builder_in(
+                        StanzaType::Presence(PresenceType::Probe),
+                        StanzaNamespace::Client,
+                        &mut arena,
+                    )
+                    .from(Some(from))?
+                    .to(Some(to))?
+                    .build()?;
+                    if let Err(RouterError::Stopped) =
+                        router.route_remote_or_bounce(RoutedStanza::from_parts(stanza, arena))
+                    {
+                        return Err(CloseOutcome::InternalError);
+                    }
+                }
+                Ok(())
+            }
+            .await
         } else {
             Ok(())
         };
@@ -3548,7 +3672,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
         change.directed.recipients.clear();
         drop(service_presence);
         drop(completion);
-        broadcast.and(local).and(services)?;
+        broadcast.and(probing).and(local).and(services)?;
         Ok(PresenceOutcome {
             change,
             echo: routed,

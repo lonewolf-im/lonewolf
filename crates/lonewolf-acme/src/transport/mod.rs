@@ -425,7 +425,10 @@ impl<In: Transport> Connector<In> for AcmeTlsConnector {
             inner: transport.boxed(),
             budget: budget.clone(),
         };
-        let mut socket = TransportAdapter::new(transport);
+        let mut socket = TransportAdapter::new(
+            transport,
+            Arc::new(ureq::unversioned::transport::time::Instant::now),
+        );
         socket.set_timeout(details.timeout);
         connection.complete_io(&mut socket)?;
         Ok(Some(AcmeTlsTransport {
@@ -465,6 +468,7 @@ impl DeadlineTransport {
         Ok(NextTimeout {
             after: UreqDuration::Exact(remaining.min(*timeout.after)),
             reason: budget.reason,
+            ..timeout
         })
     }
 }

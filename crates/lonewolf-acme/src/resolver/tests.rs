@@ -11,6 +11,7 @@ fn timeout(duration: Duration) -> NextTimeout {
     NextTimeout {
         after: UreqDuration::Exact(duration),
         reason: ureq::Timeout::Resolve,
+        ..NextTimeout::default()
     }
 }
 

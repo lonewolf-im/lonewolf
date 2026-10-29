@@ -151,6 +151,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
     } else {
         0
     };
+    tracing::info!(phase = "store.prepare.enter", "s2s diagnostic phase");
     let prepare = async {
         let mut transaction = stage.storage.begin_write().await.map_err(|error| {
             report_failure(
@@ -159,7 +160,9 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
             );
             StageFailure
         })?;
+        tracing::info!(phase = "store.write_open.complete", "s2s diagnostic phase");
         let mut scratch = Arena::try_new_in(ArenaConfig::default(), stage.allocator.clone())?;
+        tracing::info!(phase = "store.handler.enter", "s2s diagnostic phase");
         let outcome = handler
             .store(
                 UndeliverableMessage {
@@ -171,6 +174,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
                 &mut scratch,
             )
             .await;
+        tracing::info!(phase = "store.handler.complete", "s2s diagnostic phase");
         drop(scratch);
         Ok::<_, StageFailure>(match outcome {
             Err(error) => {
@@ -207,11 +211,13 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
         }),
         StorePreparation::Discarded => Ok(DeliveryOutcome::Discarded),
         StorePreparation::Committed(pending) => {
+            tracing::info!(phase = "store.pending.enter", "s2s diagnostic phase");
             let admitted = pending
                 .finished()
                 .await
                 .ok_or(StageFailure)?
                 .map_err(|_| StageFailure)?;
+            tracing::info!(phase = "store.pending.complete", "s2s diagnostic phase");
             Ok(DeliveryOutcome::Stored { admitted })
         }
     }

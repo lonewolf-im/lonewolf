@@ -250,10 +250,14 @@ where
         .await
     };
     terminal.outcome = closed.outcome;
+    tracing::info!(phase = "ingress.close.enter", "s2s diagnostic phase");
     close(reader, writer, closed, valid_until, shutdown).await;
+    tracing::info!(phase = "ingress.close.complete", "s2s diagnostic phase");
     abort();
     drop(context);
+    tracing::info!(phase = "ingress.drain.enter", "s2s diagnostic phase");
     group.drain().await;
+    tracing::info!(phase = "ingress.drain.complete", "s2s diagnostic phase");
     drop((permit, gauge));
     closed.outcome
 }
@@ -331,13 +335,16 @@ where
                     let stanza = view
                         .rescope_in(StanzaNamespace::Client, &mut arena)
                         .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                    interrupt(
+                    tracing::info!(phase = "dispatch.enter", "s2s diagnostic phase");
+                    let result = interrupt(
                         shutdown.clone(),
                         valid_until,
                         dispatch(context, peer, RoutedStanza::from_parts(stanza, arena)),
                     )
                     .await?
-                    .map_err(|_| StreamErrorCondition::InternalServerError)
+                    .map_err(|_| StreamErrorCondition::InternalServerError);
+                    tracing::info!(phase = "dispatch.complete", "s2s diagnostic phase");
+                    result
                 }
                 StreamEvent::RejectedStanza(parsed) => {
                     last_input = Instant::now();

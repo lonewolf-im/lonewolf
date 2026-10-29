@@ -144,6 +144,22 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(directory) = std::env::var_os("LONEWOLF_TEST_DIAGNOSTIC_DIR") {
+            let preserved = (|| {
+                let destination = tempfile::Builder::new()
+                    .prefix("server-")
+                    .tempdir_in(directory)?;
+                fs::copy(
+                    self.directory.path().join("server.log"),
+                    destination.path().join("server.log"),
+                )?;
+                let _ = destination.keep();
+                Ok::<_, std::io::Error>(())
+            })();
+            if let Err(error) = preserved {
+                eprintln!("server log preservation failed: {error}");
+            }
+        }
     }
 }
 

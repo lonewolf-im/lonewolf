@@ -210,7 +210,9 @@ pub fn trigger(peer: &mut Peer, id: &str) -> Result {
 }
 
 pub fn accept(listener: &TcpListener) -> Result<TcpStream> {
+    eprintln!("s2s.accept.enter");
     let (stream, _) = listener.accept()?;
+    eprintln!("s2s.accept.complete");
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     stream.set_nodelay(true)?;
@@ -276,10 +278,18 @@ pub fn establish(
     fixture: &Fixture,
 ) -> Result<ReceivingPeer> {
     let mut stream = accept(listener)?;
+    eprintln!("s2s.starttls.enter");
     starttls(&mut stream)?;
+    eprintln!("s2s.starttls.complete");
+    eprintln!("s2s.tls.enter");
     let mut peer = tls(stream, config, fixture)?;
+    eprintln!("s2s.tls.complete");
+    eprintln!("s2s.auth.enter");
     auth(&mut peer)?;
+    eprintln!("s2s.auth.complete");
+    eprintln!("s2s.restart.enter");
     ready(&mut peer)?;
+    eprintln!("s2s.restart.complete");
     Ok(peer)
 }
 

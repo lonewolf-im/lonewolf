@@ -231,23 +231,39 @@ fn inbound_chat_reaches_available_bare_and_full_clients_and_errors_use_outbound_
 
 #[test]
 fn inbound_offline_message_replays_after_same_stream_dispatch_barrier_and_availability() -> Result {
+    eprintln!("offline.fixture.enter");
     let fixture = Fixture::new()?;
+    eprintln!("offline.fixture.complete");
+    eprintln!("offline.listener.enter");
     let listener = out::listener()?;
+    eprintln!("offline.listener.complete");
     let extra = format!(
         "[s2s.routes]\n'peer.test'=['{}']\n[hosts.'local.test']\nextensions=['offline']\n",
         listener.local_addr()?
     );
+    eprintln!("offline.initial_client.enter");
     let (mut server, mut initial, c2s, s2s) = client::start_inbound(&fixture, &extra)?;
+    eprintln!("offline.initial_client.complete");
+    eprintln!("offline.initial_close.enter");
     client::close(&mut initial)?;
+    eprintln!("offline.initial_close.complete");
+    eprintln!("offline.inbound_auth.enter");
     let mut incoming = inbound_peer(&fixture, s2s)?;
+    eprintln!("offline.inbound_auth.complete");
+    eprintln!("offline.store_barrier_send.enter");
     incoming.write_all(b"<message type='chat' from='bob@peer.test/phone' to='alice@local.test' id='offline'><body>inbound payload</body></message><message type='groupchat' from='bob@peer.test/phone' to='alice@local.test' id='stored-barrier'><body>barrier</body></message>")?;
     incoming.flush()?;
+    eprintln!("offline.store_barrier_send.complete");
+    eprintln!("offline.outbound_establish.enter");
     let mut outgoing = out::establish(
         &listener,
         out::config(&fixture, "peer.test", false, false)?,
         &fixture,
     )?;
+    eprintln!("offline.outbound_establish.complete");
+    eprintln!("offline.barrier_read.enter");
     let barrier = client::element(&until(&mut outgoing, "</message>")?)?;
+    eprintln!("offline.barrier_read.complete");
     assert_eq!(barrier.namespace, "jabber:server");
     for (key, value) in [
         ("from", "alice@local.test"),
@@ -264,23 +280,43 @@ fn inbound_offline_message_replays_after_same_stream_dispatch_barrier_and_availa
     barrier
         .child("jabber:server", "error")?
         .child("urn:ietf:params:xml:ns:xmpp-stanzas", "service-unavailable")?;
+    eprintln!("offline.reconnect.enter");
     let mut receiver = client::client(&fixture, c2s)?;
+    eprintln!("offline.reconnect.complete");
+    eprintln!("offline.availability_send.enter");
     receiver.write_all(b"<presence><status>Ready</status></presence>")?;
     receiver.flush()?;
+    eprintln!("offline.availability_send.complete");
+    eprintln!("offline.presence_read.enter");
     let presence = client::stanza(&mut receiver, "presence")?;
+    eprintln!("offline.presence_read.complete");
     assert_eq!(
         presence.attributes.get("from").map(String::as_str),
         Some("alice@local.test/desk")
     );
+    eprintln!("offline.replay_read.enter");
     let replay = client::stanza(&mut receiver, "message")?;
+    eprintln!("offline.replay_read.complete");
     inbound_message(&replay, "jabber:client", "alice@local.test", "offline")?;
     replay.child("urn:xmpp:delay", "delay")?;
+    eprintln!("offline.client_barrier.enter");
     client::barrier(&mut receiver)?;
+    eprintln!("offline.client_barrier.complete");
+    eprintln!("offline.inbound_close.enter");
     close(&mut incoming)?;
+    eprintln!("offline.inbound_close.complete");
+    eprintln!("offline.client_close.enter");
     client::close(&mut receiver)?;
+    eprintln!("offline.client_close.complete");
+    eprintln!("offline.outbound_close.enter");
     out::close(&mut outgoing)?;
+    eprintln!("offline.outbound_close.complete");
+    eprintln!("offline.outbound_zero.enter");
     out::wait_zero(&server)?;
+    eprintln!("offline.outbound_zero.complete");
+    eprintln!("offline.server_stop.enter");
     server.stop(Signal::SIGTERM)?;
+    eprintln!("offline.server_stop.complete");
     Ok(())
 }
 

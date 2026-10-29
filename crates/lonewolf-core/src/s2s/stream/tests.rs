@@ -832,7 +832,7 @@ impl AsyncWrite for Output {
 }
 
 #[test]
-fn writer_buffers_stanzas_and_flushes_send_keepalive_and_one_footer() -> TestResult {
+fn writer_buffers_stanzas_and_flushes_send_and_one_footer() -> TestResult {
     Runtime::new()?.block_on(async {
         let output = Output::default();
         let mut writer = S2sWriter::new(output.clone());
@@ -857,9 +857,6 @@ fn writer_buffers_stanzas_and_flushes_send_keepalive_and_one_footer() -> TestRes
             output.0.borrow().as_slice(),
             br#"<stream:features/><message xmlns:stream="http://etherx.jabber.org/streams" xmlns="jabber:server" from="peer.test" to="local.test"><body>hello</body></message>"#
         );
-        let written = output.0.borrow().len();
-        success(writer.whitespace_keepalive().await)?;
-        assert_eq!(&output.0.borrow()[written..], b" ");
         for condition in [None, Some(StreamErrorCondition::HostUnknown)] {
             let output = Output::default();
             let mut writer = S2sWriter::new(output.clone());

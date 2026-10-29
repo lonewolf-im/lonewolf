@@ -150,10 +150,11 @@ pub(crate) enum StreamClose {
     StalledWrite,
     TransportError,
     InternalError,
+    ProtocolError,
 }
 
 impl StreamClose {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::StreamEnd,
         Self::Idle,
         Self::CertificateExpired,
@@ -169,6 +170,7 @@ impl StreamClose {
         Self::StalledWrite,
         Self::TransportError,
         Self::InternalError,
+        Self::ProtocolError,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -188,6 +190,7 @@ impl StreamClose {
             Self::StalledWrite => "stalled_write",
             Self::TransportError => "transport_error",
             Self::InternalError => "internal_error",
+            Self::ProtocolError => "protocol_error",
         }
     }
 }
@@ -465,7 +468,6 @@ impl S2sMetrics {
         self.streams_closed[direction as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stanza_received(&self, kind: StanzaKind) {
         self.stanzas_received[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }

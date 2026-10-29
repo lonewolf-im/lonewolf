@@ -580,11 +580,6 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
         self.output.flush().await.map_err(Into::into)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn whitespace_keepalive(&mut self) -> Result<(), S2sError> {
-        self.send(" ").await
-    }
-
     pub(crate) async fn shutdown(&mut self) -> Result<(), S2sError> {
         self.output.close().await.map_err(Into::into)
     }

@@ -321,8 +321,8 @@ fn run_internal(
                         &config.c2s,
                         &config.limits.c2s,
                         hosts.clone(),
-                        storage,
-                        router_handle,
+                        storage.clone(),
+                        router_handle.clone(),
                         &dispatcher.handle(),
                         Arc::clone(&stanza_pool),
                         server_metrics.registry(),
@@ -341,7 +341,11 @@ fn run_internal(
                             hosts,
                             trust,
                             &dispatcher.handle(),
-                            Arc::clone(&stanza_pool),
+                            s2s::ingress::IngressServices {
+                                router: router_handle,
+                                storage,
+                                allocator: Arc::clone(&stanza_pool),
+                            },
                             metrics,
                         )
                         .await

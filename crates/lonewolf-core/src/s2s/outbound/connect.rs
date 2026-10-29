@@ -596,7 +596,10 @@ pub(crate) async fn establish<A: ChunkAllocator + Clone>(
     context: &ConnectContext<'_>,
     allocator: A,
 ) -> Result<OutboundStream<A>, EstablishError> {
-    let result = establish_inner(local, remote, context, allocator).await;
+    let result = establish_inner(local, remote, context, allocator, |endpoint| {
+        TcpStream::connect(endpoint)
+    })
+    .await;
     match &result {
         Ok(stream) => {
             tracing::info!(connection_id = stream.connection_id, local_domain = %safe_domain(local), remote_domain = %safe_domain(remote), direction = "outbound", "s2s connection authenticated")
@@ -608,12 +611,18 @@ pub(crate) async fn establish<A: ChunkAllocator + Clone>(
     result
 }
 
-async fn establish_inner<A: ChunkAllocator + Clone>(
+async fn establish_inner<A, C, F>(
     local: &str,
     remote: &str,
     context: &ConnectContext<'_>,
     allocator: A,
-) -> Result<OutboundStream<A>, EstablishError> {
+    mut connect: C,
+) -> Result<OutboundStream<A>, EstablishError>
+where
+    A: ChunkAllocator + Clone,
+    C: FnMut(std::net::SocketAddr) -> F,
+    F: std::future::Future<Output = io::Result<TcpStream>>,
+{
     let (outcome, resolved) = dns_result(context.resolver.resolve(remote).await);
     context.metrics.dns(outcome);
     let resolved = resolved?;
@@ -631,7 +640,7 @@ async fn establish_inner<A: ChunkAllocator + Clone>(
     for (index, endpoint) in resolved.endpoints.iter().enumerate() {
         let Ok(Ok(tcp)) = compio::time::timeout_at(
             deadline(Instant::now(), context.limits.connect_timeout_secs),
-            TcpStream::connect(endpoint),
+            connect(*endpoint),
         )
         .await
         else {

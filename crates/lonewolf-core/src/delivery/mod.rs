@@ -301,6 +301,8 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                     let reason = match error {
                         RouterError::InvalidTarget => "invalid_target",
                         RouterError::RemoteUnsupported => "remote_unsupported",
+                        RouterError::RemoteNotFound => "remote_not_found",
+                        RouterError::RemoteTimeout => "remote_timeout",
                         RouterError::InvalidResource => "invalid_resource",
                         RouterError::ResourceLimit => "resource_limit",
                         RouterError::DirectedPresenceLimit => "directed_presence_limit",

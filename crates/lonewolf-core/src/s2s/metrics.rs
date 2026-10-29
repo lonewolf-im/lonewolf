@@ -326,16 +326,23 @@ pub(crate) enum DropReason {
     Shutdown,
     ConnectionLost,
     NotBounceable,
+    InternalError,
 }
 
 impl DropReason {
-    const ALL: [Self; 3] = [Self::Shutdown, Self::ConnectionLost, Self::NotBounceable];
+    const ALL: [Self; 4] = [
+        Self::Shutdown,
+        Self::ConnectionLost,
+        Self::NotBounceable,
+        Self::InternalError,
+    ];
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Shutdown => "shutdown",
             Self::ConnectionLost => "connection_lost",
             Self::NotBounceable => "not_bounceable",
+            Self::InternalError => "internal_error",
         }
     }
 }
@@ -445,7 +452,6 @@ impl S2sMetrics {
         self.negotiation_duration[direction as usize].observe(elapsed.as_secs_f64());
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stream_opened(self: &Arc<Self>, direction: Direction) -> ConnectionGauge {
         self.streams[direction as usize].fetch_add(1, Ordering::Relaxed);
         ConnectionGauge {
@@ -455,7 +461,6 @@ impl S2sMetrics {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stream_closed(&self, direction: Direction, outcome: StreamClose) {
         self.streams_closed[direction as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -465,7 +470,6 @@ impl S2sMetrics {
         self.stanzas_received[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stanza_sent(&self, kind: StanzaKind) {
         self.stanzas_sent[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }
@@ -483,22 +487,18 @@ impl S2sMetrics {
         self.dns[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn admission_rejected(&self, reason: AdmissionReason) {
         self.admission_rejected[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn bounced(&self, condition: BounceCondition) {
         self.bounces[condition as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn dropped(&self, reason: DropReason, count: u64) {
         self.dropped[reason as usize].fetch_add(count, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_link_source(&self, source: Weak<dyn LinkStats>) {
         *self.link_source.write() = Some(source);
     }

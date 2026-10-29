@@ -68,7 +68,6 @@ pub(crate) enum EstablishError {
 }
 
 impl EstablishError {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn condition(self) -> StanzaErrorCondition {
         match self {
             Self::NoService | Self::NotFound | Self::DnsUnavailable => {
@@ -591,7 +590,6 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     unexpired_validity(validity.valid_until, SystemTime::now())
 }
 
-#[allow(dead_code)]
 pub(crate) async fn establish<A: ChunkAllocator + Clone>(
     local: &str,
     remote: &str,

@@ -59,7 +59,6 @@ struct Answer {
 }
 
 impl Resolver {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(config: &crate::config::S2sConfig) -> io::Result<Self> {
         let nameservers = if config.dns.nameservers.is_empty() {
             parse_resolv_conf(&std::fs::read_to_string("/etc/resolv.conf")?)

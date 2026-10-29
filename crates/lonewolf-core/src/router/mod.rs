@@ -24,6 +24,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
+use lonewolf_xmpp::stanza::StanzaErrorCondition;
 use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, StanzaType};
 use prometheus_client::registry::Registry;
 
@@ -128,6 +129,7 @@ pub(crate) struct Router<A: ChunkAllocator> {
 
 pub(crate) struct RouterHandle<A: ChunkAllocator> {
     hosts: Hosts,
+    remote: Option<crate::s2s::outbound::RemoteRouter<A>>,
     local: LocalRouterHandle<A>,
     extensions: Arc<BTreeMap<String, ExtensionRegistry<A, RedbStorage>>>,
     services: Arc<BTreeMap<String, ServiceRoute<A>>>,
@@ -186,6 +188,8 @@ pub(crate) enum RouterState {
 pub(crate) enum RouterError {
     InvalidTarget,
     RemoteUnsupported,
+    RemoteNotFound,
+    RemoteTimeout,
     InvalidResource,
     ResourceLimit,
     DirectedPresenceLimit,
@@ -200,6 +204,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
     pub(crate) fn new(hosts: Hosts, local: LocalRouter<A>) -> Self {
         let handle = RouterHandle {
             hosts,
+            remote: None,
             local: local.handle(),
             extensions: Arc::default(),
             services: Arc::default(),
@@ -209,6 +214,11 @@ impl<A: ChunkAllocator + Clone> Router<A> {
             detached_work: DetachedWork::default(),
         };
         Self { local, handle }
+    }
+
+    pub(crate) fn with_remote(mut self, remote: crate::s2s::outbound::RemoteRouter<A>) -> Self {
+        self.handle.remote = Some(remote);
+        self
     }
 
     pub(crate) fn handle(&self) -> RouterHandle<A> {
@@ -257,6 +267,7 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
     fn clone(&self) -> Self {
         Self {
             hosts: self.hosts.clone(),
+            remote: self.remote.clone(),
             local: self.local.clone(),
             extensions: Arc::clone(&self.extensions),
             services: Arc::clone(&self.services),
@@ -269,6 +280,65 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
 }
 
 impl<A: ChunkAllocator + Clone> RouterHandle<A> {
+    pub(crate) fn remote_router(&self) -> Option<&crate::s2s::outbound::RemoteRouter<A>> {
+        self.remote.as_ref()
+    }
+
+    pub(crate) fn federation_enabled(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    pub(crate) fn federates_domain(&self, domain: &str) -> bool {
+        self.federation_enabled() && self.hosts.federates(domain)
+    }
+
+    pub(crate) fn route_remote(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+        use crate::s2s::outbound::{RemoteError, RemoteFailure};
+        let Some(remote) = &self.remote else {
+            return Err(RouterError::RemoteUnsupported);
+        };
+        let view = stanza.resolve().map_err(|_| {
+            remote.unsupported();
+            RouterError::RemoteUnsupported
+        })?;
+        let to = view.to().ok().flatten();
+        let from = view.from().ok().flatten();
+        let (Some(to), Some(from)) = (to, from) else {
+            remote.unsupported();
+            return Err(RouterError::RemoteUnsupported);
+        };
+        if self.destination(to) != Destination::Remote || !self.federates_domain(from.domainpart())
+        {
+            remote.unsupported();
+            return Err(RouterError::RemoteUnsupported);
+        }
+        remote
+            .route(self, from.domainpart(), to.domainpart(), stanza.clone())
+            .map_err(|error| match error {
+                RemoteError::Busy => RouterError::Busy,
+                RemoteError::Stopped => RouterError::Stopped,
+                RemoteError::Backoff(RemoteFailure::NotFound) => RouterError::RemoteNotFound,
+                RemoteError::Backoff(RemoteFailure::Timeout) => RouterError::RemoteTimeout,
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn route_remote_or_bounce(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let condition = match self.route_remote(stanza.clone()) {
+            Err(RouterError::Busy) => StanzaErrorCondition::ResourceConstraint,
+            Err(RouterError::RemoteNotFound) => StanzaErrorCondition::RemoteServerNotFound,
+            Err(RouterError::RemoteTimeout) => StanzaErrorCondition::RemoteServerTimeout,
+            result => return result,
+        };
+        let remote = self.remote.as_ref().ok_or(RouterError::RemoteUnsupported)?;
+        remote
+            .bounce(self, stanza, condition)
+            .map_err(|_| RouterError::Stopped)
+    }
+
     pub(crate) fn iq_requests(&self) -> &Arc<IqRequests<A>> {
         &self.iq_requests
     }
@@ -1014,6 +1084,8 @@ impl fmt::Display for RouterError {
         formatter.write_str(match self {
             Self::InvalidTarget => "destination JID is invalid",
             Self::RemoteUnsupported => "remote routing is unavailable",
+            Self::RemoteNotFound => "remote server was not found",
+            Self::RemoteTimeout => "remote server timed out",
             Self::InvalidResource => "resource identifier is invalid",
             Self::ResourceLimit => "account resource limit reached",
             Self::DirectedPresenceLimit => "resource directed-presence recipient limit reached",

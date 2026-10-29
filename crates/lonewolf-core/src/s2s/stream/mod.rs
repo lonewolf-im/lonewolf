@@ -563,7 +563,6 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
         self.flush().await
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn write_stanza<R: ArenaRead>(
         &mut self,
         stanza: &StanzaRef<'_, R>,

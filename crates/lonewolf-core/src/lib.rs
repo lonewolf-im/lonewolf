@@ -166,6 +166,7 @@ fn run_internal(
             let mut acme = None;
             let mut listeners = None;
             let mut s2s_listeners = None;
+            let mut remote = None;
             let mut router = None;
             let mut shutdown_deadline = None;
             let result = async {
@@ -275,6 +276,25 @@ fn run_internal(
                 } else {
                     None
                 };
+                let s2s_trust = if let Some(metrics) = &s2s_metrics {
+                    let trust = hosts::peer_identity::PeerTrust::load(
+                        &config.s2s.tls,
+                        hosts.crypto_provider(),
+                    )
+                    .map_err(|error| RunError::S2s(io::Error::other(error)))?;
+                    let resolver = s2s::dns::Resolver::new(&config.s2s).map_err(RunError::S2s)?;
+                    remote = Some(s2s::outbound::RemoteRouter::new(
+                        hosts.clone(),
+                        Arc::clone(&trust),
+                        Arc::new(resolver),
+                        &config.limits.s2s,
+                        Arc::clone(&stanza_pool),
+                        Arc::clone(metrics),
+                    ));
+                    Some(trust)
+                } else {
+                    None
+                };
                 let local = LocalRouter::with_options(
                     Arc::clone(&stanza_pool),
                     config
@@ -283,11 +303,15 @@ fn run_internal(
                         .max_directed_presence_recipients_per_resource,
                     worker_count,
                 );
-                let serving_router = router.insert(
-                    Router::new(hosts.clone(), local)
-                        .with_extensions(enabled_extensions)
-                        .with_services(services),
-                );
+                let serving_router = Router::new(hosts.clone(), local)
+                    .with_extensions(enabled_extensions)
+                    .with_services(services);
+                let serving_router = if let Some(remote) = &remote {
+                    serving_router.with_remote(remote.clone())
+                } else {
+                    serving_router
+                };
+                let serving_router = router.insert(serving_router);
                 serving_router.register_metrics(server_metrics.registry());
                 let router_handle = serving_router.handle();
                 let deletion_router = router_handle.clone();
@@ -309,12 +333,7 @@ fn run_internal(
                         RunError::C2s(failure.error)
                     })?,
                 );
-                if let Some(metrics) = s2s_metrics {
-                    let trust = hosts::peer_identity::PeerTrust::load(
-                        &config.s2s.tls,
-                        hosts.crypto_provider(),
-                    )
-                    .map_err(|error| RunError::S2s(io::Error::other(error)))?;
+                if let (Some(metrics), Some(trust)) = (s2s_metrics, s2s_trust) {
                     s2s_listeners = Some(
                         s2s::inbound::S2sListeners::start(
                             &config.s2s,
@@ -362,6 +381,9 @@ fn run_internal(
             if let Some(router) = &router {
                 router.stop();
             }
+            if let Some(remote) = &remote {
+                remote.stop();
+            }
             if let Some(listeners) = listeners.as_mut() {
                 listeners.stop(deadline);
             }
@@ -389,6 +411,10 @@ fn run_internal(
                 }
                 None => Ok(()),
             };
+            let remote_stopped = match &remote {
+                Some(remote) => remote.join(deadline).await.map_err(RunError::S2s),
+                None => Ok(()),
+            };
             let router_stopped = match router {
                 Some(router) => compio::time::timeout_at(deadline, router.shutdown())
                     .await
@@ -407,6 +433,7 @@ fn run_internal(
                 .and(stopped)
                 .and(listeners_stopped)
                 .and(s2s_stopped)
+                .and(remote_stopped)
                 .and(router_stopped)
                 .and(acme_stopped)
         })?;
@@ -446,6 +473,7 @@ async fn run_services<A: ChunkAllocator + Clone>(
     stop_signal: impl Future<Output = io::Result<()>>,
     deletions: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
+    let remote = router.handle().remote_router().cloned();
     let BackgroundServices {
         admin,
         metrics,
@@ -548,6 +576,9 @@ async fn run_services<A: ChunkAllocator + Clone>(
         _ => None,
     };
     router.stop();
+    if let Some(remote) = &remote {
+        remote.stop();
+    }
     let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
     *shutdown_deadline = Some(deadline);
     listeners.stop(deadline);
@@ -591,7 +622,12 @@ async fn run_services<A: ChunkAllocator + Clone>(
             s2s,
         )
         .await;
+        let remote = match &remote {
+            Some(remote) => remote.join(deadline).await.map_err(RunError::S2s),
+            None => Ok(()),
+        };
         services
+            .and(remote)
             .and(listeners.map_err(RunError::C2s))
             .and(s2s)
             .and(metrics)

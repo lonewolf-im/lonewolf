@@ -104,6 +104,8 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
                 RouterError::RemoteUnsupported if destination == Destination::Remote => {
                     StanzaErrorCondition::RemoteServerNotFound
                 }
+                RouterError::RemoteNotFound => StanzaErrorCondition::RemoteServerNotFound,
+                RouterError::RemoteTimeout => StanzaErrorCondition::RemoteServerTimeout,
                 RouterError::NotFound | RouterError::Offline | RouterError::RemoteUnsupported => {
                     StanzaErrorCondition::ServiceUnavailable
                 }

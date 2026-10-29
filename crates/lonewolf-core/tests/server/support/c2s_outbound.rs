@@ -237,8 +237,37 @@ pub fn start_inbound(
     Ok((server, client, clients[0], servers[0]))
 }
 
-pub fn stanza(peer: &mut Peer, name: &str) -> Result<Element> {
-    element(&support::until(peer, &format!("</{name}>"))?)
+pub fn stanza(peer: &mut impl Read, name: &str) -> Result<Element> {
+    let mut bytes = Vec::new();
+    let end = format!("</{name}>");
+    let mut root_start = true;
+    let mut quote = None;
+    loop {
+        let mut byte = [0];
+        peer.read_exact(&mut byte)?;
+        bytes.push(byte[0]);
+        if bytes.len() > 32_768 {
+            return Err("XML response exceeds limit".into());
+        }
+        if root_start {
+            match (quote, byte[0]) {
+                (None, b'\'' | b'"') => quote = Some(byte[0]),
+                (Some(open), close) if open == close => quote = None,
+                (None, b'>') => {
+                    root_start = false;
+                    if bytes.ends_with(b"/>") {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        } else if bytes.ends_with(end.as_bytes()) {
+            break;
+        }
+    }
+    let stanza = element(&String::from_utf8(bytes)?)?;
+    assert_eq!(stanza.name, name);
+    Ok(stanza)
 }
 
 pub fn barrier(client: &mut Peer) -> Result {

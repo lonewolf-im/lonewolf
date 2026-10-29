@@ -60,6 +60,7 @@ use crate::router::{
     RouterHandle, ServiceRoute, SessionHandle,
 };
 
+use crate::stages::iq::{IqTarget, iq_requester, iq_target, require_iq_account};
 use crate::stages::message::{self, DeliveryOutcome};
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
 use crate::stages::{Stage, archive, observe, policy};
@@ -1338,7 +1339,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         delivery,
                         Some(registration.mailbox()),
                         EffectsDiagnostics {
-                            account: registration.account().clone(),
+                            identity: crate::delivery::EffectsIdentity::Account(
+                                registration.account().clone(),
+                            ),
                             commit_operation: "iq_set_commit",
                             delivery_operation: "iq_set_effects",
                         },
@@ -2505,7 +2508,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     delivery,
                     Some(registration.mailbox()),
                     EffectsDiagnostics {
-                        account: registration.account().clone(),
+                        identity: crate::delivery::EffectsIdentity::Account(
+                            registration.account().clone(),
+                        ),
                         commit_operation: "presence_subscription_commit",
                         delivery_operation: "presence_subscription_effects",
                     },
@@ -3115,63 +3120,6 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
             return Ok(());
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum IqTarget {
-    Server,
-    Present,
-    Missing,
-}
-
-async fn iq_target(
-    transaction: &impl AccountReads,
-    target: Option<&AccountKey>,
-) -> Result<IqTarget, HandlerError> {
-    let Some(target) = target else {
-        return Ok(IqTarget::Server);
-    };
-    match transaction.account(target).await {
-        Ok(Some(_)) => Ok(IqTarget::Present),
-        Ok(None) => Ok(IqTarget::Missing),
-        Err(AccountError::Storage(error)) => Err(HandlerError::Internal {
-            condition: StanzaErrorCondition::InternalServerError,
-            failure: storage_failure(error, "iq_account_read"),
-        }),
-        Err(_) => Err(StanzaErrorCondition::InternalServerError.into()),
-    }
-}
-
-async fn require_iq_account(
-    transaction: &impl AccountReads,
-    target: Option<&AccountKey>,
-) -> Result<(), HandlerError> {
-    match iq_target(transaction, target).await? {
-        IqTarget::Missing => Err(StanzaErrorCondition::ServiceUnavailable.into()),
-        IqTarget::Server | IqTarget::Present => Ok(()),
-    }
-}
-
-async fn iq_requester<A: ChunkAllocator + Clone>(
-    router: &RouterHandle<A>,
-    account: &AccountKey,
-    sender: JidRef<'_>,
-    transaction: &RedbRead,
-) -> Result<Requester, HandlerError> {
-    if sender.bare().as_str() == account.as_str() {
-        return Ok(Requester::Owner);
-    }
-    let Some(handler) = router
-        .presence_handlers(account.domain())
-        .and_then(|handlers| handlers.find(PresenceRequestType::Available))
-    else {
-        return Ok(Requester::Other);
-    };
-    Ok(if handler.visibility(account, sender, transaction).await? {
-        Requester::PresenceAuthorized
-    } else {
-        Requester::Other
-    })
 }
 
 struct GetWork<A: ChunkAllocator> {

@@ -35,7 +35,7 @@
 # Choose whether this host accepts authenticated streams from other XMPP domains.
 # federation = true
 
-# Stored profiles are public to authenticated local C2S users.
+# Stored profiles are public to authenticated local users and users of federated domains.
 # extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.

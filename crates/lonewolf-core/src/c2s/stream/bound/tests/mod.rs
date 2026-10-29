@@ -2007,7 +2007,9 @@ fn subscription_admission_linearizes_at_lookup_before_or_after_replacement() -> 
                 delivery,
                 None,
                 EffectsDiagnostics {
-                    account: fixture.registration.account().clone(),
+                    identity: crate::delivery::EffectsIdentity::Account(
+                        fixture.registration.account().clone(),
+                    ),
                     commit_operation: "presence_subscription_commit",
                     delivery_operation: "presence_subscription_effects",
                 },
@@ -2182,7 +2184,9 @@ fn admitted_subscription_writer_and_detached_effects_precede_deletion_and_recrea
             delivery,
             None,
             EffectsDiagnostics {
-                account: fixture.registration.account().clone(),
+                identity: crate::delivery::EffectsIdentity::Account(
+                    fixture.registration.account().clone(),
+                ),
                 commit_operation: "presence_subscription_commit",
                 delivery_operation: "presence_subscription_effects",
             },
@@ -2342,7 +2346,9 @@ fn admitted_pending_withdrawal_keeps_healthy_effects_under_mailbox_pressure_and_
             delivery,
             None,
             EffectsDiagnostics {
-                account: fixture.registration.account().clone(),
+                identity: crate::delivery::EffectsIdentity::Account(
+                    fixture.registration.account().clone(),
+                ),
                 commit_operation: "presence_subscription_commit",
                 delivery_operation: "presence_subscription_effects",
             },

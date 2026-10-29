@@ -727,7 +727,7 @@ fn reference_configuration_explains_vcard_constraints() -> TestResult {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
     let reference = fs::read_to_string(path)?;
     for constraint in [
-        "public to authenticated local C2S users",
+        "public to authenticated local users and users of federated domains",
         "serialized UTF-8 XML",
         "namespace, language, and whitespace-context markup",
         "1 to 1048576 bytes",

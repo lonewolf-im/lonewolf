@@ -331,10 +331,10 @@ async fn run<A: ChunkAllocator + Clone>(
         plain.send(stream::TLS_FAILURE).await?;
         return Err(S2sError::Eof.into());
     };
-    plain.send(stream::PROCEED).await?;
-    let Some(Connection::Plain(mut reader, writer)) = connection.take() else {
+    let Some(Connection::Plain(mut reader, mut writer)) = connection.take() else {
         return Err(S2sError::Internal.into());
     };
+    writer.send(stream::PROCEED).await?;
     let (input, state) = reader.take_input().await?;
     drop(input);
     drop(reader);

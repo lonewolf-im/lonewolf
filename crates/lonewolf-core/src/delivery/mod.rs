@@ -261,21 +261,9 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
     let (report_done, done) = oneshot::channel();
     compio::runtime::spawn(guard.run(async move {
         let result: Result<Admitted, EffectsError> = async {
-            tracing::info!(phase = "store.commit.enter", "s2s diagnostic phase");
             let ((), mut ticket) = router
                 .order()
-                .fix(vec![stored.recipient.clone()], async move {
-                    tracing::info!(
-                        phase = "store.transaction_commit.enter",
-                        "s2s diagnostic phase"
-                    );
-                    let result = transaction.commit().await;
-                    tracing::info!(
-                        phase = "store.transaction_commit.complete",
-                        "s2s diagnostic phase"
-                    );
-                    result
-                })
+                .fix(vec![stored.recipient.clone()], transaction.commit())
                 .await
                 .map_err(|error| {
                     let failure = storage_failure(error, "offline_store_commit");
@@ -288,12 +276,8 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                 recipient_jid = ?stored.recipient.as_str(),
                 "offline message handled"
             );
-            tracing::info!(phase = "store.commit.complete", "s2s diagnostic phase");
-            tracing::info!(phase = "store.ticket.enter", "s2s diagnostic phase");
             ticket.turn().await;
-            tracing::info!(phase = "store.ticket.complete", "s2s diagnostic phase");
             let _ = report_turned.send(());
-            tracing::info!(phase = "store.reroute.enter", "s2s diagnostic phase");
             let admitted = match router
                 .route_stored_message(
                     stored.stanza,
@@ -338,16 +322,13 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                     Admitted::None
                 }
             };
-            tracing::info!(phase = "store.reroute.complete", "s2s diagnostic phase");
             Ok(admitted)
         }
         .await;
         if let Err(error) = &result {
             report_failure(error.failure(), &stored.recipient);
         }
-        tracing::info!(phase = "store.report.enter", "s2s diagnostic phase");
         let _ = report_done.send(result);
-        tracing::info!(phase = "store.report.complete", "s2s diagnostic phase");
     }))
     .detach();
     Pending { turned, done }

@@ -34,19 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Verify diagnostic source checkout
-        env:
-          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          diagnostic_actual_commit="$(git rev-parse HEAD)"
-          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
-          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
-          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
-            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
@@ -72,19 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Verify diagnostic source checkout
-        env:
-          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          diagnostic_actual_commit="$(git rev-parse HEAD)"
-          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
-          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
-          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
-            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
-            exit 1
-          fi
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
@@ -98,152 +74,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Test all targets and features
-        if: ${{ runner.os != 'macOS' }}
         run: cargo nextest run --workspace --all-targets --all-features --locked --profile ci
-      - name: Diagnose inbound Offline replay on macOS
-        if: ${{ runner.os == 'macOS' }}
-        env:
-          S2S_DIAGNOSTICS: ${{ runner.temp }}/s2s-native-diagnostic
-          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-          EVENT_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          DIAGNOSTIC_WORKFLOW_SHA: ${{ github.workflow_sha }}
-        run: |
-          mkdir -p "$S2S_DIAGNOSTICS"
-          {
-            printf 'expected_head=%s\nchecked_out_commit=%s\nchecked_out_tree=%s\nevent_sha=%s\nevent_pr_base_sha=%s\nworkflow_sha=%s\nrun_id=%s\nattempt=%s\n' \
-              "$EXPECTED_DIAGNOSTIC_HEAD" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" \
-              "$GITHUB_SHA" "$EVENT_PR_BASE_SHA" "$DIAGNOSTIC_WORKFLOW_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-            python3 - <<'PYTHON'
-          import hashlib
-          from pathlib import Path
-
-          for name in ("Cargo.toml", "Cargo.lock", ".config/nextest.toml"):
-              print(f"sha256[{name}]={hashlib.sha256(Path(name).read_bytes()).hexdigest()}")
-          PYTHON
-            rustc -vV
-            cargo -V
-            cargo nextest --version
-            sw_vers
-            uname -m
-          } 2>&1 | tee "$S2S_DIAGNOSTICS/native-phase-output.log"
-          run_diagnostic() {
-            local diagnostic_phase="$1"
-            shift
-            local diagnostic_directory="$S2S_DIAGNOSTICS/$diagnostic_phase"
-            local diagnostic_temporary
-            local diagnostic_record_status
-            local -a diagnostic_statuses
-            diagnostic_temporary="$(mktemp -d "$RUNNER_TEMP/s2s-$diagnostic_phase.XXXXXX")"
-            mkdir -p "$diagnostic_directory/servers"
-            printf '%s\n' "$diagnostic_temporary" > "$diagnostic_directory/tmpdir.path"
-            printf '%s\n' "$diagnostic_phase" > "$S2S_DIAGNOSTICS/active-phase"
-            rm -f target/nextest/nightly/junit.xml
-            printf 'command=' > "$diagnostic_directory/phase-output.log"
-            printf '%q ' "$@" >> "$diagnostic_directory/phase-output.log"
-            printf '\n' >> "$diagnostic_directory/phase-output.log"
-            set +e
-            TMPDIR="$diagnostic_temporary" LONEWOLF_TEST_DIAGNOSTIC_DIR="$diagnostic_directory/servers" \
-              "$@" 2>&1 | tee -a "$diagnostic_directory/phase-output.log"
-            diagnostic_statuses=("${PIPESTATUS[@]}")
-            printf 'nextest_exit_status=%s\ntee_exit_status=%s\n' \
-              "${diagnostic_statuses[0]}" "${diagnostic_statuses[1]}" >> "$diagnostic_directory/phase-output.log"
-            diagnostic_record_status=$?
-            set -e
-            if [[ "${diagnostic_statuses[0]}" -ne 0 ]]; then
-              return "${diagnostic_statuses[0]}"
-            fi
-            if [[ "${diagnostic_statuses[1]}" -ne 0 ]]; then
-              return "${diagnostic_statuses[1]}"
-            fi
-            if [[ "$diagnostic_record_status" -ne 0 ]]; then
-              return "$diagnostic_record_status"
-            fi
-            if [[ -f target/nextest/nightly/junit.xml ]]; then
-              cp target/nextest/nightly/junit.xml "$diagnostic_directory/junit.xml"
-            fi
-          }
-          run_diagnostic focused cargo nextest run -p lonewolf --test s2s --all-features --locked \
-            --profile nightly --no-capture --no-tests fail \
-            -E 'test(=s2s_c2s::inbound_offline_message_replays_after_same_stream_dispatch_barrier_and_availability)'
-          run_diagnostic concurrent cargo nextest run --workspace --all-targets --all-features --locked \
-            --profile nightly --failure-output immediate-final --success-output immediate
-      - name: Collect native diagnostic evidence
-        if: ${{ always() && runner.os == 'macOS' }}
-        env:
-          S2S_DIAGNOSTICS: ${{ runner.temp }}/s2s-native-diagnostic
-        run: |
-          python3 - <<'PYTHON'
-          import os
-          from pathlib import Path
-          import shutil
-          import sys
-
-          root = Path(os.environ["S2S_DIAGNOSTICS"])
-          output = root / "artifacts"
-          output.mkdir(parents=True, exist_ok=True)
-          errors = []
-
-          def copy(source, destination):
-              try:
-                  if source.is_symlink():
-                      raise ValueError("refusing a diagnostic symlink")
-                  destination.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copyfile(source, destination)
-              except (OSError, ValueError) as error:
-                  errors.append(str(error))
-
-          native = root / "native-phase-output.log"
-          if native.is_file():
-              copy(native, output / native.name)
-          active = root / "active-phase"
-          junit = Path("target/nextest/nightly/junit.xml")
-          if active.is_file() and junit.is_file():
-              phase = active.read_text().strip()
-              if phase in ("focused", "concurrent"):
-                  copy(junit, root / phase / "junit.xml")
-              else:
-                  errors.append("invalid diagnostic phase")
-          for phase in ("focused", "concurrent"):
-              directory = root / phase
-              if not directory.is_dir():
-                  continue
-              for name in ("phase-output.log", "junit.xml"):
-                  source = directory / name
-                  if source.is_file():
-                      copy(source, output / phase / name)
-              sources = [directory / "servers"]
-              temporary = directory / "tmpdir.path"
-              if temporary.is_file():
-                  try:
-                      path = Path(temporary.read_text().strip()).resolve(strict=True)
-                      runner = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
-                      if path.parent != runner or not path.name.startswith("s2s-" + phase + "."):
-                          raise ValueError("invalid diagnostic temporary directory")
-                      sources.append(path)
-                  except (OSError, ValueError) as error:
-                      errors.append(str(error))
-              candidates = []
-              for base in sources:
-                  for source in base.rglob("server.log"):
-                      try:
-                          source.resolve(strict=True).relative_to(base.resolve(strict=True))
-                          candidates.append(source)
-                      except (OSError, ValueError) as error:
-                          errors.append(str(error))
-              for index, source in enumerate(sorted(candidates)):
-                  copy(source, output / phase / "servers" / str(index) / "server.log")
-          if errors:
-              print("Diagnostic collection failed:", *errors, sep="\n", file=sys.stderr)
-              sys.exit(1)
-          PYTHON
-      - name: Upload native diagnostic evidence
-        if: ${{ always() && runner.os == 'macOS' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: s2s-native-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/s2s-native-diagnostic/artifacts/
-          if-no-files-found: error
-          retention-days: 14
       - name: Test documentation with all features
         run: cargo test --workspace --doc --all-features --locked
       - name: Build release binaries
@@ -257,19 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Verify diagnostic source checkout
-        env:
-          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          diagnostic_actual_commit="$(git rev-parse HEAD)"
-          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
-          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
-          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
-            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
-            exit 1
-          fi
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           arguments: --workspace --all-features --locked
@@ -282,19 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Verify diagnostic source checkout
-        env:
-          EXPECTED_DIAGNOSTIC_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          diagnostic_actual_commit="$(git rev-parse HEAD)"
-          diagnostic_actual_tree="$(git rev-parse 'HEAD^{tree}')"
-          printf 'checked_out_commit=%s\nchecked_out_tree=%s\n' "$diagnostic_actual_commit" "$diagnostic_actual_tree"
-          if [[ "$diagnostic_actual_commit" != "$EXPECTED_DIAGNOSTIC_HEAD" ]]; then
-            printf 'Checkout mismatch: expected %s, found %s\n' "$EXPECTED_DIAGNOSTIC_HEAD" "$diagnostic_actual_commit" >&2
-            exit 1
-          fi
       - name: Install actionlint
         env:
           GOBIN: ${{ runner.temp }}/actionlint

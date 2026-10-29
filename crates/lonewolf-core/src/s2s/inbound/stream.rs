@@ -130,14 +130,6 @@ fn rejection(peer: &InboundPeer, stanza_kind: &'static str, closed: Closed) -> C
     closed
 }
 
-async fn expired(until: SystemTime) {
-    if let Ok(delay) = until.duration_since(SystemTime::now())
-        && !delay.is_zero()
-    {
-        compio::time::sleep(delay).await;
-    }
-}
-
 async fn interrupt<T>(
     shutdown: ShutdownSignal,
     valid_until: SystemTime,
@@ -145,7 +137,10 @@ async fn interrupt<T>(
 ) -> Result<T, StreamErrorCondition> {
     match select(
         pin!(shutdown),
-        pin!(select(pin!(expired(valid_until)), pin!(operation))),
+        pin!(select(
+            pin!(crate::s2s::expiry::wait(valid_until)),
+            pin!(operation)
+        )),
     )
     .await
     {
@@ -250,14 +245,10 @@ where
         .await
     };
     terminal.outcome = closed.outcome;
-    tracing::info!(phase = "ingress.close.enter", "s2s diagnostic phase");
     close(reader, writer, closed, valid_until, shutdown).await;
-    tracing::info!(phase = "ingress.close.complete", "s2s diagnostic phase");
     abort();
     drop(context);
-    tracing::info!(phase = "ingress.drain.enter", "s2s diagnostic phase");
     group.drain().await;
-    tracing::info!(phase = "ingress.drain.complete", "s2s diagnostic phase");
     drop((permit, gauge));
     closed.outcome
 }
@@ -335,16 +326,13 @@ where
                     let stanza = view
                         .rescope_in(StanzaNamespace::Client, &mut arena)
                         .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                    tracing::info!(phase = "dispatch.enter", "s2s diagnostic phase");
-                    let result = interrupt(
+                    interrupt(
                         shutdown.clone(),
                         valid_until,
                         dispatch(context, peer, RoutedStanza::from_parts(stanza, arena)),
                     )
                     .await?
-                    .map_err(|_| StreamErrorCondition::InternalServerError);
-                    tracing::info!(phase = "dispatch.complete", "s2s diagnostic phase");
-                    result
+                    .map_err(|_| StreamErrorCondition::InternalServerError)
                 }
                 StreamEvent::RejectedStanza(parsed) => {
                     last_input = Instant::now();
@@ -472,7 +460,7 @@ async fn close<A, R, W>(
         if matches!(condition, Some(StreamErrorCondition::Reset)) {
             std::future::pending().await
         } else {
-            expired(valid_until).await
+            crate::s2s::expiry::wait(valid_until).await
         }
     };
     let mut expiry = pin!(controls);

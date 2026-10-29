@@ -2,6 +2,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -107,7 +108,6 @@ pub fn expiring_config(
 
 pub fn listener() -> Result<TcpListener> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
-    socket2::SockRef::from(&listener).set_read_timeout(Some(TIMEOUT))?;
     Ok(listener)
 }
 
@@ -127,7 +127,6 @@ pub fn refused() -> Result<RefusedEndpoint> {
     socket.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())?;
     socket.listen(1)?;
     let listener: TcpListener = socket.into();
-    socket2::SockRef::from(&listener).set_read_timeout(Some(TIMEOUT))?;
     let keeper = TcpStream::connect_timeout(&listener.local_addr()?, TIMEOUT)?;
     let accepted = accept(&listener)?;
     drop(listener);
@@ -210,13 +209,61 @@ pub fn trigger(peer: &mut Peer, id: &str) -> Result {
 }
 
 pub fn accept(listener: &TcpListener) -> Result<TcpStream> {
-    eprintln!("s2s.accept.enter");
-    let (stream, _) = listener.accept()?;
-    eprintln!("s2s.accept.complete");
-    stream.set_read_timeout(Some(TIMEOUT))?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
+    let deadline = Instant::now() + TIMEOUT;
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "accept timed out"))
+    };
+    listener.set_nonblocking(true)?;
+    loop {
+        remaining()?;
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(TIMEOUT))?;
+                stream.set_write_timeout(Some(TIMEOUT))?;
+                stream.set_nodelay(true)?;
+                remaining()?;
+                return Ok(stream);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        let budget = remaining()?;
+        let milliseconds = i32::try_from(
+            budget.as_millis() + u128::from(!budget.subsec_nanos().is_multiple_of(1_000_000)),
+        )?;
+        let mut readiness = nix::libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: The live listener and initialized stack descriptor outlive this one-entry poll.
+        let result = unsafe { nix::libc::poll(&mut readiness, 1, milliseconds) };
+        let error = (result < 0).then(io::Error::last_os_error);
+        remaining()?;
+        if let Some(error) = error {
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if readiness.revents & nix::libc::POLLNVAL != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid listener").into());
+        }
+        if readiness.revents & (nix::libc::POLLERR | nix::libc::POLLHUP) != 0 {
+            return Err(listener
+                .take_error()?
+                .unwrap_or_else(|| io::Error::other("listener readiness failed"))
+                .into());
+        }
+        if result > 0 && readiness.revents & nix::libc::POLLIN == 0 {
+            return Err(io::Error::other("unexpected listener readiness").into());
+        }
+    }
 }
 
 pub fn header(peer: &mut impl Read) -> Result<String> {
@@ -278,18 +325,10 @@ pub fn establish(
     fixture: &Fixture,
 ) -> Result<ReceivingPeer> {
     let mut stream = accept(listener)?;
-    eprintln!("s2s.starttls.enter");
     starttls(&mut stream)?;
-    eprintln!("s2s.starttls.complete");
-    eprintln!("s2s.tls.enter");
     let mut peer = tls(stream, config, fixture)?;
-    eprintln!("s2s.tls.complete");
-    eprintln!("s2s.auth.enter");
     auth(&mut peer)?;
-    eprintln!("s2s.auth.complete");
-    eprintln!("s2s.restart.enter");
     ready(&mut peer)?;
-    eprintln!("s2s.restart.complete");
     Ok(peer)
 }
 

@@ -35,13 +35,7 @@ async fn watch<T>(
     };
     let expiry = async {
         match validity {
-            Some(until) => {
-                if let Ok(delay) = until.duration_since(SystemTime::now())
-                    && !delay.is_zero()
-                {
-                    compio::time::sleep(delay).await;
-                }
-            }
+            Some(until) => crate::s2s::expiry::wait(until).await,
             None => std::future::pending().await,
         }
     };
@@ -544,7 +538,9 @@ mod tests {
             assert_eq!(task.counters.count.load(Ordering::Relaxed), 2);
             let calls = Arc::new(PlMutex::new(Calls::default()));
             let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
-            let valid = SystemTime::now() + Duration::from_secs(60);
+            let expiry = rcgen::CertificateParams::default().not_after;
+            let valid =
+                SystemTime::UNIX_EPOCH + Duration::from_secs(expiry.unix_timestamp().try_into()?);
             let mut buffered = false;
             {
                 let mut writing = pin!(write(
@@ -919,7 +915,9 @@ mod tests {
     fn stop_and_expiry_at_preparation_discard_assign_each_head_once()
     -> Result<(), Box<dyn std::error::Error>> {
         run(async {
-            for (stopped_first, expired) in [(false, false), (true, false), (false, true)] {
+            for (stopped_first, expired) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let allocator = ControlledAllocator::default();
                 let manager = super::super::manager_tests::manager_with_allocator(
                     S2sLimits::default(),

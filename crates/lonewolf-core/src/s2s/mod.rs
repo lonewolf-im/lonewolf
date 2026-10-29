@@ -7,6 +7,7 @@ use compio::net::TcpStream;
 use socket2::SockRef;
 
 pub(crate) mod dns;
+mod expiry;
 pub(crate) mod inbound;
 pub(crate) mod ingress;
 pub(crate) mod metrics;

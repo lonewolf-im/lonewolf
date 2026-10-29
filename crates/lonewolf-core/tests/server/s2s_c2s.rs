@@ -131,6 +131,159 @@ fn c2s_messages_and_all_iq_types_reach_authenticated_remote_peer() -> Result {
     Ok(())
 }
 
+fn inbound_peer(fixture: &Fixture, address: std::net::SocketAddr) -> Result<Peer> {
+    let (mut peer, _) = start_tls(address, fixture.client(Some("peer.test"), false)?)?;
+    external(&mut peer, HEADER)?;
+    success(&mut peer, AUTH)?;
+    Ok(peer)
+}
+
+fn inbound_message(stanza: &client::Element, namespace: &str, target: &str, id: &str) -> Result {
+    assert_eq!(
+        (stanza.namespace.as_str(), stanza.name.as_str()),
+        (namespace, "message")
+    );
+    for (key, value) in [
+        ("from", "bob@peer.test/phone"),
+        ("to", target),
+        ("id", id),
+        ("type", "chat"),
+    ] {
+        assert_eq!(
+            stanza.attributes.get(key).map(String::as_str),
+            Some(value),
+            "{stanza:?}"
+        );
+    }
+    assert_eq!(stanza.child(namespace, "body")?.text, "inbound payload");
+    Ok(())
+}
+
+#[test]
+fn inbound_chat_reaches_available_bare_and_full_clients_and_errors_use_outbound_stream() -> Result {
+    let fixture = Fixture::new()?;
+    let listener = out::listener()?;
+    let extra = format!("[s2s.routes]\n'peer.test'=['{}']\n", listener.local_addr()?);
+    let (mut server, mut receiver, _, s2s) = client::start_inbound(&fixture, &extra)?;
+    receiver.write_all(b"<presence><status>Ready</status></presence>")?;
+    receiver.flush()?;
+    let presence = client::stanza(&mut receiver, "presence")?;
+    assert_eq!(
+        presence.attributes.get("from").map(String::as_str),
+        Some("alice@local.test/desk")
+    );
+    client::barrier(&mut receiver)?;
+    let mut incoming = inbound_peer(&fixture, s2s)?;
+    for (target, id) in [
+        ("alice@local.test", "bare"),
+        ("alice@local.test/desk", "full"),
+    ] {
+        write!(
+            incoming,
+            "<message type='chat' from='bob@peer.test/phone' to='{target}' id='{id}'><body>inbound payload</body></message>"
+        )?;
+        incoming.flush()?;
+        inbound_message(
+            &client::stanza(&mut receiver, "message")?,
+            "jabber:client",
+            target,
+            id,
+        )?;
+    }
+    incoming.write_all(b"<message type='groupchat' from='bob@peer.test/phone' to='alice@local.test' id='groupchat'><body>inbound payload</body></message>")?;
+    incoming.flush()?;
+    let mut outgoing = out::establish(
+        &listener,
+        out::config(&fixture, "peer.test", false, false)?,
+        &fixture,
+    )?;
+    let reply = client::element(&until(&mut outgoing, "</message>")?)?;
+    assert_eq!(
+        (reply.namespace.as_str(), reply.name.as_str()),
+        ("jabber:server", "message")
+    );
+    for (key, value) in [
+        ("from", "alice@local.test"),
+        ("to", "bob@peer.test/phone"),
+        ("id", "groupchat"),
+        ("type", "error"),
+    ] {
+        assert_eq!(
+            reply.attributes.get(key).map(String::as_str),
+            Some(value),
+            "{reply:?}"
+        );
+    }
+    assert_eq!(
+        reply.child("jabber:server", "body")?.text,
+        "inbound payload"
+    );
+    reply
+        .child("jabber:server", "error")?
+        .child("urn:ietf:params:xml:ns:xmpp-stanzas", "service-unavailable")?;
+    close(&mut incoming)?;
+    client::close(&mut receiver)?;
+    out::close(&mut outgoing)?;
+    out::wait_zero(&server)?;
+    server.stop(Signal::SIGTERM)?;
+    Ok(())
+}
+
+#[test]
+fn inbound_offline_message_replays_after_same_stream_dispatch_barrier_and_availability() -> Result {
+    let fixture = Fixture::new()?;
+    let listener = out::listener()?;
+    let extra = format!(
+        "[s2s.routes]\n'peer.test'=['{}']\n[hosts.'local.test']\nextensions=['offline']\n",
+        listener.local_addr()?
+    );
+    let (mut server, mut initial, c2s, s2s) = client::start_inbound(&fixture, &extra)?;
+    client::close(&mut initial)?;
+    let mut incoming = inbound_peer(&fixture, s2s)?;
+    incoming.write_all(b"<message type='chat' from='bob@peer.test/phone' to='alice@local.test' id='offline'><body>inbound payload</body></message><message type='groupchat' from='bob@peer.test/phone' to='alice@local.test' id='stored-barrier'><body>barrier</body></message>")?;
+    incoming.flush()?;
+    let mut outgoing = out::establish(
+        &listener,
+        out::config(&fixture, "peer.test", false, false)?,
+        &fixture,
+    )?;
+    let barrier = client::element(&until(&mut outgoing, "</message>")?)?;
+    assert_eq!(barrier.namespace, "jabber:server");
+    for (key, value) in [
+        ("from", "alice@local.test"),
+        ("to", "bob@peer.test/phone"),
+        ("id", "stored-barrier"),
+        ("type", "error"),
+    ] {
+        assert_eq!(
+            barrier.attributes.get(key).map(String::as_str),
+            Some(value),
+            "{barrier:?}"
+        );
+    }
+    barrier
+        .child("jabber:server", "error")?
+        .child("urn:ietf:params:xml:ns:xmpp-stanzas", "service-unavailable")?;
+    let mut receiver = client::client(&fixture, c2s)?;
+    receiver.write_all(b"<presence><status>Ready</status></presence>")?;
+    receiver.flush()?;
+    let presence = client::stanza(&mut receiver, "presence")?;
+    assert_eq!(
+        presence.attributes.get("from").map(String::as_str),
+        Some("alice@local.test/desk")
+    );
+    let replay = client::stanza(&mut receiver, "message")?;
+    inbound_message(&replay, "jabber:client", "alice@local.test", "offline")?;
+    replay.child("urn:xmpp:delay", "delay")?;
+    client::barrier(&mut receiver)?;
+    close(&mut incoming)?;
+    client::close(&mut receiver)?;
+    out::close(&mut outgoing)?;
+    out::wait_zero(&server)?;
+    server.stop(Signal::SIGTERM)?;
+    Ok(())
+}
+
 fn dns_not_found(socket: &UdpSocket) -> std::io::Result<()> {
     for _ in 0..3 {
         let mut packet = [0; 4096];

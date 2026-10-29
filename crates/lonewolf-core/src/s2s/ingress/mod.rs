@@ -2,7 +2,9 @@
 
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
-use lonewolf_xmpp::stanza::{IqType, MessageType, StanzaErrorCondition, StanzaType};
+use lonewolf_xmpp::stanza::{
+    ApplicationCondition, IqType, MessageType, StanzaErrorCondition, StanzaErrorText, StanzaType,
+};
 
 use super::log_domain;
 use crate::delivery::WorkHandle;
@@ -24,10 +26,8 @@ pub(crate) struct IngressServices<A: ChunkAllocator> {
 
 pub(crate) struct IngressContext<A: ChunkAllocator> {
     pub(crate) router: RouterHandle<A>,
-    #[allow(dead_code)]
     pub(crate) storage: RedbStorage,
     pub(crate) allocator: A,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) work: WorkHandle,
 }
 
@@ -40,28 +40,36 @@ impl From<StageFailure> for IngressFailure {
     }
 }
 
-fn reply<A: ChunkAllocator + Clone>(
-    stanza: &RoutedStanza<A>,
-    allocator: A,
-) -> Result<Option<RoutedStanza<A>>, IngressFailure> {
-    let source = stanza.resolve().map_err(|_| IngressFailure)?;
+mod message;
+
+pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
+    context: &IngressContext<A>,
+    original: &RoutedStanza<A>,
+    condition: StanzaErrorCondition,
+    application: Option<ApplicationCondition>,
+    text: StanzaErrorText,
+) -> Result<(), IngressFailure> {
+    let source = original.resolve().map_err(|_| IngressFailure)?;
     if !matches!(source.stanza_type(), StanzaType::Message(kind) if kind != MessageType::Error)
         && !matches!(
             source.stanza_type(),
             StanzaType::Iq(IqType::Get | IqType::Set)
         )
     {
-        return Ok(None);
+        return Ok(());
     }
-    let mut arena = Arena::try_new_in(Default::default(), allocator).map_err(|_| IngressFailure)?;
+    let mut arena = Arena::try_new_in(Default::default(), context.allocator.clone())
+        .map_err(|_| IngressFailure)?;
     let source = source.clone_in(&mut arena).map_err(|_| IngressFailure)?;
-    let condition = StanzaErrorCondition::ServiceUnavailable;
     let reply = source
-        .error_reply_described_in(&mut arena, condition, None, condition.default_text())
+        .error_reply_described_in(&mut arena, condition, application, text)
         .map_err(|_| IngressFailure)?
         .build()
         .map_err(|_| IngressFailure)?;
-    Ok(Some(RoutedStanza::from_parts(reply, arena)))
+    let _ = context
+        .router
+        .route_remote(RoutedStanza::from_parts(reply, arena));
+    Ok(())
 }
 
 pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
@@ -69,13 +77,18 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
     peer: &InboundPeer,
     stanza: RoutedStanza<A>,
 ) -> Result<(), IngressFailure> {
-    if let Some(reply) = reply(&stanza, context.allocator.clone())? {
-        let _ = context.router.route_remote(reply);
-    } else {
-        let view = stanza.resolve().map_err(|_| IngressFailure)?;
-        tracing::debug!(stanza_kind = view.kind().as_str(), remote_domain = %log_domain(&peer.remote), "s2s stanza discarded");
+    let kind = stanza.resolve().map_err(|_| IngressFailure)?.stanza_type();
+    match kind {
+        StanzaType::Message(kind) => message::handle(context, peer, stanza, kind).await,
+        StanzaType::Iq(IqType::Get | IqType::Set) => {
+            let condition = StanzaErrorCondition::ServiceUnavailable;
+            reply_error(context, &stanza, condition, None, condition.default_text())
+        }
+        _ => {
+            tracing::debug!(stanza_kind = kind.kind().as_str(), remote_domain = %log_domain(&peer.remote), "s2s stanza discarded");
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]

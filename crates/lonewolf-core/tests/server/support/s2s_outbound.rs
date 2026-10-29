@@ -204,7 +204,7 @@ pub fn start(fixture: &Fixture, endpoints: &[SocketAddr], extra: &str) -> Result
 }
 
 pub fn trigger(peer: &mut Peer, id: &str) -> Result {
-    peer.write_all(format!("<message type='chat' from='a@peer.test/remote' to='b@local.test/local' id='{id}'><body>payload</body></message>").as_bytes())?;
+    peer.write_all(format!("<message type='chat' from='a@peer.test/remote' to='local.test' id='{id}'><body>payload</body></message>").as_bytes())?;
     peer.flush()?;
     Ok(())
 }
@@ -287,7 +287,7 @@ pub fn reply(peer: &mut impl Read, id: &str) -> Result<String> {
     let xml = support::until(peer, "</message>")?;
     assert!(xml.contains("xmlns=\"jabber:server\""), "{xml}");
     assert!(xml.contains("type=\"error\""), "{xml}");
-    assert!(xml.contains("from=\"b@local.test/local\""), "{xml}");
+    assert!(xml.contains("from=\"local.test\""), "{xml}");
     assert!(xml.contains("to=\"a@peer.test/remote\""), "{xml}");
     assert!(xml.contains(&format!("id=\"{id}\"")), "{xml}");
     assert!(xml.contains("service-unavailable"), "{xml}");

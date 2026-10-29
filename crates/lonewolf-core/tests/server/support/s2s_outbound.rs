@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,21 +111,78 @@ pub fn listener() -> Result<TcpListener> {
     Ok(listener)
 }
 
-pub fn refused() -> Result<socket2::Socket> {
+pub struct RefusedEndpoint {
+    accepted: TcpStream,
+    _keeper: TcpStream,
+}
+
+pub fn refused() -> Result<RefusedEndpoint> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )?;
+    socket.set_reuse_address(false)?;
+    socket.set_reuse_port(false)?;
     socket.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())?;
-    Ok(socket)
+    socket.listen(1)?;
+    let listener: TcpListener = socket.into();
+    socket2::SockRef::from(&listener).set_read_timeout(Some(TIMEOUT))?;
+    let keeper = TcpStream::connect_timeout(&listener.local_addr()?, TIMEOUT)?;
+    let accepted = accept(&listener)?;
+    drop(listener);
+    let endpoint = RefusedEndpoint {
+        accepted,
+        _keeper: keeper,
+    };
+    let address = address(&endpoint)?;
+    let deadline = Instant::now() + TIMEOUT;
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "listener teardown timed out"))
+    };
+    loop {
+        match TcpStream::connect_timeout(&address, remaining()?) {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return Ok(endpoint),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::NotConnected
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error.into()),
+            Ok(mut probe) => {
+                let mut byte = [0];
+                loop {
+                    probe.set_read_timeout(Some(remaining()?))?;
+                    match probe.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => return Err("refusal probe received application data".into()),
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::ConnectionAborted
+                                    | io::ErrorKind::NotConnected
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
 }
 
-pub fn address(socket: &socket2::Socket) -> Result<SocketAddr> {
-    socket
-        .local_addr()?
-        .as_socket()
-        .ok_or_else(|| "IP socket".into())
+pub fn address(endpoint: &RefusedEndpoint) -> Result<SocketAddr> {
+    Ok(endpoint.accepted.local_addr()?)
 }
 
 pub fn start(fixture: &Fixture, endpoints: &[SocketAddr], extra: &str) -> Result<(Server, Peer)> {

@@ -527,6 +527,7 @@ fn endpoint_attempts_are_ordered_and_only_the_final_establishment_records_authen
         out::wait_zero(&server)?;
         close(&mut initiator)?;
         server.stop(Signal::SIGTERM)?;
+        drop(refused);
     }
     Ok(())
 }
@@ -560,6 +561,7 @@ fn all_refusals_and_mixed_connected_failures_preserve_terminal_error_precedence(
         )?;
         close(&mut initiator)?;
         server.stop(Signal::SIGTERM)?;
+        drop((refused_first, refused_last));
     }
     Ok(())
 }

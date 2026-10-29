@@ -41,6 +41,9 @@
     </release>
 
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc6120"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc2782"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc5280"/>
+    <implements rdf:resource="https://www.rfc-editor.org/info/rfc9525"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc6121"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc7590"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc7622"/>
@@ -81,7 +84,7 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0178.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
-        <xmpp:note xml:lang="en">Client certificate authentication and partial inbound server STARTTLS and EXTERNAL negotiation. Server peers require a valid certificate for their domain with explicit serverAuth EKU. No outbound streams, server stanza dispatch, certificate revocation checks, or authenticated server stream certificate-expiry closure. Inbound server support: Not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Client certificate authentication and partial server STARTTLS and EXTERNAL support in both directions. Server peers require a valid certificate for their domain with explicit serverAuth EKU; authenticated streams close at certificate expiry. Validated inbound chat and IQ requests receive conservative errors over separate outbound streams. Local-client federation and federated message, IQ and presence delivery remain unsupported; server certificate revocation is not checked. Server support: Not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "support/s2s_outbound.rs"]
+mod outbound;
 #[path = "support/process.rs"]
 mod process;
+mod s2s_cases;
 #[path = "support/s2s.rs"]
 mod support;
 

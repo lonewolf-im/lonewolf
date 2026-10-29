@@ -75,6 +75,7 @@ pub struct Fixture {
     _directory: tempfile::TempDir,
     issuer: CertifiedIssuer<'static, Signer>,
     pub config: String,
+    pub local_certificate: CertificateDer<'static>,
 }
 
 impl Fixture {
@@ -98,12 +99,13 @@ impl Fixture {
         fs::write(&chain, pem("CERTIFICATE", cert.der()))?;
         fs::write(&key, pem("PRIVATE KEY", signer.private()?.secret_der()))?;
         let config = format!(
-            "[[c2s.listeners]]\naddress='127.0.0.1:0'\n[[s2s.listeners]]\naddress='127.0.0.1:0'\n[s2s.tls]\ntrust_anchors_path={roots:?}\n[hosts.'local.test'.tls]\ncertificate_chain_path={chain:?}\nprivate_key_path={key:?}\n[metrics]\nenabled=true\naddress='127.0.0.1:0'\n"
+            "default_host='local.test'\n[[c2s.listeners]]\naddress='127.0.0.1:0'\n[[s2s.listeners]]\naddress='127.0.0.1:0'\n[s2s.tls]\ntrust_anchors_path={roots:?}\n[hosts.'local.test'.tls]\ncertificate_chain_path={chain:?}\nprivate_key_path={key:?}\n[metrics]\nenabled=true\naddress='127.0.0.1:0'\n"
         );
         Ok(Self {
             _directory: directory,
             issuer,
             config,
+            local_certificate: cert.der().clone(),
         })
     }
 
@@ -128,13 +130,26 @@ impl Fixture {
         }))
     }
 
-    fn identity(
+    pub(super) fn identity(
         &self,
         domain: &str,
         client_only: bool,
     ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+        self.identity_until(domain, client_only, None)
+    }
+
+    pub(super) fn identity_until(
+        &self,
+        domain: &str,
+        client_only: bool,
+        expiry: Option<time::OffsetDateTime>,
+    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
         let signer = Signer::new()?;
         let mut params = CertificateParams::new(vec![domain.to_owned()])?;
+        if let Some(expiry) = expiry {
+            params.not_after = expiry;
+            params.not_before = expiry - time::Duration::days(1);
+        }
         params.serial_number = Some(3u64.into());
         params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![if client_only {
@@ -146,6 +161,26 @@ impl Fixture {
             params.signed_by(&signer, &self.issuer)?.der().clone(),
             signer.private()?,
         ))
+    }
+
+    pub fn client_until(&self, expiry: time::OffsetDateTime) -> Result<Arc<rustls::ClientConfig>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.issuer.der().clone())?;
+        let (cert, key) = self.identity_until("peer.test", false, Some(expiry))?;
+        Ok(Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls_graviola::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![cert], key)?,
+        ))
+    }
+
+    pub(super) fn roots(&self) -> Result<Arc<rustls::RootCertStore>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.issuer.der().clone())?;
+        Ok(Arc::new(roots))
     }
 
     pub fn server(&self, extra: &str) -> Result<(Server, SocketAddr)> {

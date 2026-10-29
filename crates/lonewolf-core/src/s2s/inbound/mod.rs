@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::pending;
+use std::future::{Future, pending};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use compio::net::{TcpListener, TcpSocket};
@@ -19,6 +20,7 @@ use nix::errno::Errno;
 use parking_lot::Mutex as PlMutex;
 use socket2::SockRef;
 
+use super::ingress::IngressServices;
 use super::metrics::{ConnectionRejection, Direction, S2sMetrics};
 use super::stream::S2sReaderLimits;
 use super::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
@@ -33,6 +35,8 @@ use crate::config::limits::S2sLimits;
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 
 mod negotiate;
+mod stream;
+mod streams;
 
 type Stop = Shared<BoxFuture<'static, Instant>>;
 type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;
@@ -43,7 +47,10 @@ struct Settings<A: ChunkAllocator> {
     trust: Arc<PeerTrust>,
     reader_limits: S2sReaderLimits,
     timeout: Duration,
-    allocator: A,
+    services: IngressServices<A>,
+    streams: Arc<streams::InboundStreams>,
+    max_streams: usize,
+    idle_timeout: Duration,
     metrics: Arc<S2sMetrics>,
 }
 
@@ -139,7 +146,7 @@ impl S2sListeners {
         hosts: Hosts,
         trust: Arc<PeerTrust>,
         dispatcher: &DispatchHandle,
-        allocator: A,
+        services: IngressServices<A>,
         metrics: Arc<S2sMetrics>,
     ) -> Result<Self, StartError> {
         let (stop, stopped) = oneshot::channel();
@@ -175,7 +182,10 @@ impl S2sListeners {
                 xml: limits.incoming_xml_per_connection.clone(),
             },
             timeout: Duration::from_secs(limits.negotiation_timeout_secs.get()),
-            allocator,
+            services,
+            streams: Arc::new(streams::InboundStreams::default()),
+            max_streams: limits.max_inbound_streams_per_domain.get(),
+            idle_timeout: Duration::from_secs(limits.idle_timeout_secs.get()),
             metrics,
         };
         let started: io::Result<()> = async {
@@ -289,6 +299,20 @@ async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(128).await
 }
 
+// Shut down the socket before dropping transport futures.
+struct ConnectionTask<F, S = ConnectionSocket> {
+    _socket: S,
+    future: Pin<Box<F>>,
+}
+
+impl<F: Future<Output = ()>, S: Unpin> Future for ConnectionTask<F, S> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().future.as_mut().poll(context)
+    }
+}
+
 async fn run_listener<A: ChunkAllocator + Clone>(
     listener: TcpListener,
     context: WorkerContext,
@@ -354,14 +378,14 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                 let gauge = settings.metrics.connection_opened(Direction::Inbound);
                 let settings = settings.clone();
                 let shutdown = shutdown.clone();
-                let tcp = ConnectionSocket(tcp);
-                active.push(async move {
+                let owner = ConnectionSocket(tcp.clone());
+                active.push(ConnectionTask { _socket: owner, future: Box::pin(async move {
                     let _permits = permits;
                     let _gauge = gauge;
                     let connection_id = NEXT_S2S_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
                     let started = Instant::now();
-                    let outcome = match negotiate::negotiate(&tcp.0, &settings, shutdown.clone(), connection_id).await {
-                        Ok(authenticated) => negotiate::serve(authenticated, &tcp.0, shutdown).await,
+                    let outcome = match negotiate::negotiate(&tcp, &settings, shutdown.clone(), connection_id).await {
+                        Ok(authenticated) => stream::serve(authenticated, &tcp, &settings, shutdown).await.as_str(),
                         Err(super::stream::S2sError::PeerError(condition)) => {
                             tracing::debug!(connection_id, condition = ?condition, "s2s peer stream error");
                             "peer_error"
@@ -369,7 +393,7 @@ async fn run_listener<A: ChunkAllocator + Clone>(
                         Err(_) => "negotiation_failed",
                     };
                     tracing::info!(connection_id, outcome, duration_ms = started.elapsed().as_millis() as u64, "s2s stream disconnected");
-                });
+                }) });
             }
             Err(error)
                 if matches!(
@@ -399,13 +423,16 @@ async fn run_listener<A: ChunkAllocator + Clone>(
         let _ = report_failure.try_send(io::Error::new(error.kind(), error.to_string()));
     }
     let deadline = shutdown.await;
-    let drained =
-        compio::time::timeout_at(deadline, async { while active.next().await.is_some() {} }).await;
-    result.and(
-        drained.map_err(|_| {
-            io::Error::new(io::ErrorKind::TimedOut, "s2s listener shutdown timed out")
-        }),
-    )
+    result.and(drain_connections(active, deadline).await)
+}
+
+async fn drain_connections<F: Future<Output = ()>, S: Unpin>(
+    mut active: FuturesUnordered<ConnectionTask<F, S>>,
+    deadline: Instant,
+) -> io::Result<()> {
+    compio::time::timeout_at(deadline, async { while active.next().await.is_some() {} })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "s2s listener shutdown timed out"))
 }
 
 fn listener_error(listener_id: usize, worker_id: usize, error: io::Error) -> io::Error {

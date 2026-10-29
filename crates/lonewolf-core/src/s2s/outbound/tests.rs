@@ -544,3 +544,127 @@ fn domain_context_is_bounded_and_hides_address_literals() {
         assert_eq!(safe_domain(literal), "<literal>");
     }
 }
+
+#[test]
+fn pending_tcp_connect_is_destroyed_by_production_stop_without_trying_the_next_endpoint()
+-> TestResult {
+    use crate::config::{Config, HostConfig, HostTlsConfig, HostTlsSource};
+    use crate::delivery::WorkGroup;
+    use futures_util::{FutureExt, poll};
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    struct PendingConnect {
+        entered: Rc<Cell<usize>>,
+        destroyed: Rc<Cell<usize>>,
+    }
+    impl Future for PendingConnect {
+        type Output = io::Result<TcpStream>;
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            self.entered.set(self.entered.get() + 1);
+            Poll::Pending
+        }
+    }
+    impl Drop for PendingConnect {
+        fn drop(&mut self) {
+            self.destroyed.set(self.destroyed.get() + 1);
+        }
+    }
+
+    compio::runtime::Runtime::new()?.block_on(async {
+        let directory = tempfile::tempdir()?;
+        let cert_path = directory.path().join("local.pem");
+        let key_path = directory.path().join("local.key");
+        let mut params = rcgen::CertificateParams::new(vec!["local.test".into()])?;
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let (cert, key) = crate::hosts::test_support::material(params)?;
+        use base64::Engine as _;
+        let encode = |label, bytes| {
+            format!(
+                "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        };
+        std::fs::write(&cert_path, encode("CERTIFICATE", cert.as_ref()))?;
+        std::fs::write(&key_path, encode("PRIVATE KEY", key.secret_der()))?;
+        let mut config = Config::default();
+        config.hosts.insert(
+            "local.test".into(),
+            HostConfig {
+                tls: Some(HostTlsConfig {
+                    source: HostTlsSource::Files {
+                        certificate_chain_path: cert_path,
+                        private_key_path: key_path,
+                    },
+                    client_auth: None,
+                }),
+                ..HostConfig::default()
+            },
+        );
+        config.s2s.routes.insert(
+            "peer.test".into(),
+            vec!["127.0.0.1:1".parse()?, "127.0.0.1:2".parse()?],
+        );
+        let hosts = Hosts::new(&config.hosts, Some("local.test"))?;
+        let trust = PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?;
+        let resolver = Resolver::new(&config.s2s)?;
+        let metrics = S2sMetrics::new(0);
+        let context = ConnectContext {
+            hosts: &hosts,
+            trust: &trust,
+            resolver: &resolver,
+            limits: &config.limits.s2s,
+            metrics: Arc::clone(&metrics),
+        };
+        let entered = Rc::new(Cell::new(0));
+        let destroyed = Rc::new(Cell::new(0));
+        let attempted = Rc::new(Cell::new(0));
+        let (stop, stopped) = futures_channel::oneshot::channel::<()>();
+        let stopped = async {
+            let _ = stopped.await;
+        }
+        .boxed()
+        .shared();
+        let mut group = WorkGroup::new();
+        let guard = group.start();
+        {
+            let polled = Rc::clone(&entered);
+            let dropped = Rc::clone(&destroyed);
+            let calls = Rc::clone(&attempted);
+            let connector = move |_| {
+                calls.set(calls.get() + 1);
+                PendingConnect {
+                    entered: Rc::clone(&polled),
+                    destroyed: Rc::clone(&dropped),
+                }
+            };
+            let future = super::super::stopping(
+                stopped,
+                establish_inner(
+                    "local.test",
+                    "peer.test",
+                    &context,
+                    GlobalChunkAllocator,
+                    connector,
+                ),
+            );
+            let mut future = Box::pin(guard.run(future));
+            assert!(poll!(future.as_mut()).is_pending());
+            assert_eq!(entered.get(), 1);
+            assert_eq!(destroyed.get(), 0);
+            stop.send(()).map_err(|_| "stop dropped")?;
+            assert!(future.await.is_none());
+        }
+        assert_eq!(attempted.get(), 1);
+        assert_eq!(destroyed.get(), 1);
+        assert!(poll!(std::pin::pin!(group.drain())).is_ready());
+        let output = render(&metrics)?;
+        sample(&output, "protocol", 1);
+        assert!(output.contains("lonewolf_s2s_dns_resolutions_total{outcome=\"static\"} 1"));
+        assert!(output.contains("lonewolf_s2s_connections{direction=\"outbound\"} 0"));
+        Ok(())
+    })
+}

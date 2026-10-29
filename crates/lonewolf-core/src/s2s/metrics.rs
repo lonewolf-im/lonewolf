@@ -465,7 +465,6 @@ impl S2sMetrics {
         self.streams_closed[direction as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stanza_received(&self, kind: StanzaKind) {
         self.stanzas_received[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }

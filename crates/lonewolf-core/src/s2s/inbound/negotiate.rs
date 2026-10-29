@@ -21,6 +21,7 @@ use tokio::io::BufReader;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::{Settings, ShutdownSignal};
+use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, Direction, S2sMetrics};
 use crate::s2s::stream::traffic::CountingIo;
 use crate::s2s::stream::{self, Auth, S2sError, S2sReader, S2sWriter, SaslFailure};
@@ -38,7 +39,6 @@ type TlsOutput = WriteHalf<TlsTransport>;
 pub(crate) struct Authenticated<A: ChunkAllocator> {
     pub(crate) local: Box<str>,
     pub(crate) remote: Box<str>,
-    #[allow(dead_code)]
     pub(crate) valid_until: SystemTime,
     pub(crate) reader: S2sReader<A, TlsInput>,
     pub(crate) writer: S2sWriter<TlsOutput>,
@@ -134,7 +134,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         S2sReader::plain(
             tcp.clone(),
             &settings.reader_limits,
-            settings.allocator.clone(),
+            settings.services.allocator.clone(),
             Some(Arc::clone(&settings.metrics)),
         ),
         S2sWriter::new(Box::pin(AsyncStream::new(tcp.clone()))),
@@ -363,7 +363,7 @@ async fn run<A: ChunkAllocator + Clone>(
         S2sReader::from_state(
             BufReader::new(input.compat()),
             state,
-            settings.allocator.clone(),
+            settings.services.allocator.clone(),
         ),
         S2sWriter::new(output),
     ));
@@ -488,7 +488,7 @@ fn verify_peer<A: ChunkAllocator>(
     let valid_until =
         validity.map_err(|_| reject(StreamErrorCondition::NotAuthorized, AuthOutcome::Protocol))?;
     if settings.trust.verify_identity(leaf, remote).is_err() {
-        tracing::warn!(outcome = "certificate_rejected", remote_domain = %safe_domain(remote), "s2s certificate rejected");
+        tracing::warn!(outcome = "certificate_rejected", remote_domain = %log_domain(remote), "s2s certificate rejected");
         return Err(reject(
             StreamErrorCondition::NotAuthorized,
             AuthOutcome::CertificateName,
@@ -555,90 +555,6 @@ fn authorize(bytes: &[u8], remote: &str) -> Result<(), SaslFailure> {
     }
 }
 
-pub(super) fn safe_domain(domain: &str) -> String {
-    domain
-        .chars()
-        .take(253)
-        .map(|ch| if ch.is_control() { '\u{fffd}' } else { ch })
-        .collect()
-}
-
-pub(super) async fn serve<A: ChunkAllocator + Clone>(
-    mut authenticated: Authenticated<A>,
-    tcp: &TcpStream,
-    shutdown: ShutdownSignal,
-) -> &'static str {
-    tracing::info!(connection_id = authenticated.connection_id, local_domain = %safe_domain(&authenticated.local), remote_domain = %safe_domain(&authenticated.remote), direction = "inbound", "s2s connection authenticated");
-    let (condition, peer_closed, deadline, outcome) = loop {
-        match select(
-            pin!(shutdown.clone()),
-            pin!(authenticated.reader.next_event()),
-        )
-        .await
-        {
-            Either::Left((deadline, _)) => {
-                break (
-                    Some(StreamErrorCondition::SystemShutdown),
-                    false,
-                    deadline,
-                    "shutdown",
-                );
-            }
-            Either::Right((Ok(Some(StreamEvent::StreamEnd)), _)) => {
-                break (None, true, Instant::now() + CLOSE_GRACE, "stream_end");
-            }
-            Either::Right((Ok(None), _)) => {
-                break (None, true, Instant::now() + CLOSE_GRACE, "eof");
-            }
-            Either::Right((Err(error), _)) => {
-                break (
-                    match error {
-                        S2sError::Stream(condition) => Some(condition),
-                        _ => None,
-                    },
-                    false,
-                    Instant::now() + CLOSE_GRACE + Duration::from_secs(1),
-                    "protocol",
-                );
-            }
-            Either::Right((
-                Ok(Some(StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_))),
-                _,
-            )) => {
-                tracing::debug!(
-                    connection_id = authenticated.connection_id,
-                    "s2s stanza discarded"
-                );
-            }
-            Either::Right((Ok(Some(_)), _)) => {
-                break (
-                    Some(StreamErrorCondition::NotAuthorized),
-                    false,
-                    Instant::now() + CLOSE_GRACE + Duration::from_secs(1),
-                    "protocol",
-                );
-            }
-        }
-    };
-    let _ = compio::time::timeout_at(deadline, async {
-        authenticated.writer.close(condition).await?;
-        if !peer_closed {
-            let _ = compio::time::timeout_at(deadline.min(Instant::now() + CLOSE_GRACE), async {
-                while let Ok(Some(event)) = authenticated.reader.next_event().await {
-                    if matches!(event, StreamEvent::StreamEnd) {
-                        break;
-                    }
-                }
-            })
-            .await;
-        }
-        authenticated.writer.shutdown().await
-    })
-    .await;
-    let _ = socket2::SockRef::from(tcp).shutdown(std::net::Shutdown::Both);
-    outcome
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,7 +576,7 @@ mod tests {
     #[test]
     fn log_domains_are_bounded_and_control_free() {
         let domain = format!("{}\n", "a".repeat(300));
-        assert_eq!(safe_domain(&domain).len(), 253);
-        assert_eq!(safe_domain("bad\nname"), "bad\u{fffd}name");
+        assert_eq!(log_domain(&domain).len(), 253);
+        assert_eq!(log_domain("bad\nname"), "bad?name");
     }
 }

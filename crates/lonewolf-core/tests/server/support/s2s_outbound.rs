@@ -144,7 +144,9 @@ pub fn refused() -> Result<RefusedEndpoint> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "listener teardown timed out"))
     };
     loop {
-        match TcpStream::connect_timeout(&address, remaining()?) {
+        let connection = TcpStream::connect_timeout(&address, remaining()?);
+        remaining()?;
+        match connection {
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return Ok(endpoint),
             Err(error)
                 if matches!(
@@ -159,7 +161,9 @@ pub fn refused() -> Result<RefusedEndpoint> {
                 let mut byte = [0];
                 loop {
                     probe.set_read_timeout(Some(remaining()?))?;
-                    match probe.read(&mut byte) {
+                    let received = probe.read(&mut byte);
+                    remaining()?;
+                    match received {
                         Ok(0) => break,
                         Ok(_) => return Err("refusal probe received application data".into()),
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

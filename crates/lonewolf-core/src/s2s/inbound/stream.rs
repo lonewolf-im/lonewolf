@@ -130,14 +130,6 @@ fn rejection(peer: &InboundPeer, stanza_kind: &'static str, closed: Closed) -> C
     closed
 }
 
-async fn expired(until: SystemTime) {
-    if let Ok(delay) = until.duration_since(SystemTime::now())
-        && !delay.is_zero()
-    {
-        compio::time::sleep(delay).await;
-    }
-}
-
 async fn interrupt<T>(
     shutdown: ShutdownSignal,
     valid_until: SystemTime,
@@ -145,7 +137,10 @@ async fn interrupt<T>(
 ) -> Result<T, StreamErrorCondition> {
     match select(
         pin!(shutdown),
-        pin!(select(pin!(expired(valid_until)), pin!(operation))),
+        pin!(select(
+            pin!(crate::s2s::expiry::wait(valid_until)),
+            pin!(operation)
+        )),
     )
     .await
     {
@@ -465,7 +460,7 @@ async fn close<A, R, W>(
         if matches!(condition, Some(StreamErrorCondition::Reset)) {
             std::future::pending().await
         } else {
-            expired(valid_until).await
+            crate::s2s::expiry::wait(valid_until).await
         }
     };
     let mut expiry = pin!(controls);

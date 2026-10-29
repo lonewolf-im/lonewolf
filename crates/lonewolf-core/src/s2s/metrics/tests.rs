@@ -53,7 +53,7 @@ const AUTH_OUTCOME_LABELS: [&str; 19] = [
     "protocol",
 ];
 
-const STREAM_CLOSE_LABELS: [&str; 15] = [
+const STREAM_CLOSE_LABELS: [&str; 16] = [
     "stream_end",
     "idle",
     "certificate_expired",
@@ -69,6 +69,7 @@ const STREAM_CLOSE_LABELS: [&str; 15] = [
     "stalled_write",
     "transport_error",
     "internal_error",
+    "protocol_error",
 ];
 
 const INBOUND_LIMIT_LABELS: [&str; 2] = [

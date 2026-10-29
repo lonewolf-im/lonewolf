@@ -509,3 +509,52 @@ fn shutdown_shortens_pending_close_without_restarting_output_or_releasing_buffer
         Ok(())
     })
 }
+
+#[test]
+fn reader_failures_preserve_each_wire_condition_and_use_bounded_metrics() {
+    for (condition, outcome) in [
+        (StreamErrorCondition::PolicyViolation, "protocol_error"),
+        (StreamErrorCondition::NotWellFormed, "protocol_error"),
+        (StreamErrorCondition::RestrictedXml, "protocol_error"),
+        (StreamErrorCondition::UnsupportedEncoding, "protocol_error"),
+        (StreamErrorCondition::BadNamespacePrefix, "protocol_error"),
+        (StreamErrorCondition::InvalidXml, "protocol_error"),
+        (StreamErrorCondition::BadFormat, "protocol_error"),
+        (StreamErrorCondition::InvalidNamespace, "invalid_namespace"),
+        (
+            StreamErrorCondition::UnsupportedStanzaType,
+            "unsupported_stanza_type",
+        ),
+    ] {
+        let closed = Closed::reader_error(S2sError::Stream(condition));
+        assert_eq!(closed.outcome.as_str(), outcome);
+        assert!(matches!(closed.wire, WireClose::Error(actual) if actual == condition));
+    }
+    let internal = Closed::reader_error(S2sError::Internal);
+    assert!(matches!(internal.outcome, StreamClose::InternalError));
+    assert!(matches!(
+        internal.wire,
+        WireClose::Error(StreamErrorCondition::InternalServerError)
+    ));
+    for (error, outcome) in [
+        (S2sError::Eof, "transport_error"),
+        (S2sError::Io, "transport_error"),
+        (S2sError::Timeout, "transport_error"),
+        (
+            S2sError::PeerError(StreamErrorCondition::PolicyViolation),
+            "peer_error",
+        ),
+    ] {
+        let closed = Closed::reader_error(error);
+        assert_eq!(closed.outcome.as_str(), outcome);
+        assert!(matches!(closed.wire, WireClose::Abort));
+    }
+    assert!(matches!(
+        Closed::footer(StreamClose::StreamEnd, true).wire,
+        WireClose::Footer { peer_closed: true }
+    ));
+    assert!(matches!(
+        Closed::footer(StreamClose::Idle, false).wire,
+        WireClose::Footer { peer_closed: false }
+    ));
+}

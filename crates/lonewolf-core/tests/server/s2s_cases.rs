@@ -744,3 +744,63 @@ fn outgoing_certificate_expiry_resets_the_stream_and_new_input_reestablishes() -
     server.stop(Signal::SIGTERM)?;
     Ok(())
 }
+
+#[test]
+fn authenticated_oversize_and_malformed_xml_keep_the_exact_wire_error_and_one_protocol_close()
+-> Result {
+    for (xml, condition) in [
+        (
+            format!(
+                "<message from='a@peer.test' to='b@local.test'><body>{}</body></message>",
+                "x".repeat(10_100)
+            ),
+            "policy-violation",
+        ),
+        (
+            "<message from='a@peer.test' to='b@local.test'><body></message>".to_owned(),
+            "not-well-formed",
+        ),
+    ] {
+        let fixture = Fixture::new()?;
+        let (mut server, address) = fixture.server("[limits.s2s]\nmax_stanza_bytes=10000\n")?;
+        let mut peer = authenticated(&fixture, address)?;
+        peer.write_all(xml.as_bytes())?;
+        peer.flush()?;
+        let response = until(&mut peer, FOOTER)?;
+        assert_eq!(
+            response,
+            format!(
+                "<stream:error><{condition} xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>{FOOTER}"
+            )
+        );
+        assert_eq!(peer.read(&mut [0; 1])?, 0);
+        wait_sample(
+            &server,
+            "lonewolf_s2s_streams_closed_total{direction=\"inbound\",outcome=\"protocol_error\"}",
+            1,
+        )?;
+        wait_sample(
+            &server,
+            "lonewolf_s2s_connections{direction=\"inbound\"}",
+            0,
+        )?;
+        wait_sample(&server, "lonewolf_s2s_streams{direction=\"inbound\"}", 0)?;
+        let body = metrics(&server)?;
+        let closes = body
+            .lines()
+            .filter(|line| {
+                line.starts_with("lonewolf_s2s_streams_closed_total{direction=\"inbound\"")
+            })
+            .try_fold(0usize, |total, line| -> Result<usize> {
+                Ok(total
+                    + line
+                        .rsplit_once(' ')
+                        .ok_or("close sample")?
+                        .1
+                        .parse::<usize>()?)
+            })?;
+        assert_eq!(closes, 1);
+        server.stop(Signal::SIGTERM)?;
+    }
+    Ok(())
+}

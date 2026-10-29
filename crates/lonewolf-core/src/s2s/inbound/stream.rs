@@ -37,19 +37,69 @@ impl Drop for Terminal<'_> {
     }
 }
 
-fn condition(outcome: StreamClose) -> Option<StreamErrorCondition> {
-    Some(match outcome {
-        StreamClose::CertificateExpired => StreamErrorCondition::Reset,
-        StreamClose::Shutdown => StreamErrorCondition::SystemShutdown,
-        StreamClose::Conflict => StreamErrorCondition::Conflict,
-        StreamClose::ImproperAddressing => StreamErrorCondition::ImproperAddressing,
-        StreamClose::HostUnknown => StreamErrorCondition::HostUnknown,
-        StreamClose::InvalidFrom => StreamErrorCondition::InvalidFrom,
-        StreamClose::InvalidNamespace => StreamErrorCondition::InvalidNamespace,
-        StreamClose::UnsupportedStanzaType => StreamErrorCondition::UnsupportedStanzaType,
-        StreamClose::InternalError => StreamErrorCondition::InternalServerError,
-        _ => return None,
-    })
+#[derive(Clone, Copy)]
+enum WireClose {
+    Footer { peer_closed: bool },
+    Error(StreamErrorCondition),
+    Abort,
+}
+
+#[derive(Clone, Copy)]
+struct Closed {
+    outcome: StreamClose,
+    wire: WireClose,
+}
+
+impl Closed {
+    fn error(condition: StreamErrorCondition) -> Self {
+        let outcome = match condition {
+            StreamErrorCondition::Reset => StreamClose::CertificateExpired,
+            StreamErrorCondition::SystemShutdown => StreamClose::Shutdown,
+            StreamErrorCondition::Conflict => StreamClose::Conflict,
+            StreamErrorCondition::ImproperAddressing => StreamClose::ImproperAddressing,
+            StreamErrorCondition::HostUnknown => StreamClose::HostUnknown,
+            StreamErrorCondition::InvalidFrom => StreamClose::InvalidFrom,
+            StreamErrorCondition::InvalidNamespace => StreamClose::InvalidNamespace,
+            StreamErrorCondition::UnsupportedStanzaType => StreamClose::UnsupportedStanzaType,
+            StreamErrorCondition::InternalServerError => StreamClose::InternalError,
+            _ => StreamClose::ProtocolError,
+        };
+        Self {
+            outcome,
+            wire: WireClose::Error(condition),
+        }
+    }
+
+    fn footer(outcome: StreamClose, peer_closed: bool) -> Self {
+        Self {
+            outcome,
+            wire: WireClose::Footer { peer_closed },
+        }
+    }
+
+    fn reader_error(error: S2sError) -> Self {
+        match error {
+            S2sError::Stream(condition) => Self {
+                outcome: match condition {
+                    StreamErrorCondition::InvalidNamespace => StreamClose::InvalidNamespace,
+                    StreamErrorCondition::UnsupportedStanzaType => {
+                        StreamClose::UnsupportedStanzaType
+                    }
+                    _ => StreamClose::ProtocolError,
+                },
+                wire: WireClose::Error(condition),
+            },
+            S2sError::Internal => Self::error(StreamErrorCondition::InternalServerError),
+            S2sError::PeerError(_) => Self {
+                outcome: StreamClose::PeerError,
+                wire: WireClose::Abort,
+            },
+            S2sError::Eof | S2sError::Io | S2sError::Timeout => Self {
+                outcome: StreamClose::TransportError,
+                wire: WireClose::Abort,
+            },
+        }
+    }
 }
 
 fn validate(
@@ -57,27 +107,27 @@ fn validate(
     from: Option<JidRef<'_>>,
     to: Option<JidRef<'_>>,
     peer: &InboundPeer,
-) -> Result<(), StreamClose> {
+) -> Result<(), StreamErrorCondition> {
     if namespace != StanzaNamespace::Server {
-        return Err(StreamClose::InvalidNamespace);
+        return Err(StreamErrorCondition::InvalidNamespace);
     }
     let (Some(from), Some(to)) = (from, to) else {
-        return Err(StreamClose::ImproperAddressing);
+        return Err(StreamErrorCondition::ImproperAddressing);
     };
     if to.domainpart() != peer.local.as_ref() {
-        return Err(StreamClose::HostUnknown);
+        return Err(StreamErrorCondition::HostUnknown);
     }
     if from.domainpart() != peer.remote.as_ref() {
-        return Err(StreamClose::InvalidFrom);
+        return Err(StreamErrorCondition::InvalidFrom);
     }
     Ok(())
 }
 
-fn rejection(peer: &InboundPeer, stanza_kind: &'static str, outcome: StreamClose) -> StreamClose {
-    if condition(outcome).is_some() {
-        tracing::debug!(remote_domain = %log_domain(&peer.remote), stanza_kind, outcome = outcome.as_str(), "s2s stanza rejected");
+fn rejection(peer: &InboundPeer, stanza_kind: &'static str, closed: Closed) -> Closed {
+    if matches!(closed.wire, WireClose::Error(_)) {
+        tracing::debug!(remote_domain = %log_domain(&peer.remote), stanza_kind, outcome = closed.outcome.as_str(), "s2s stanza rejected");
     }
-    outcome
+    closed
 }
 
 async fn expired(until: SystemTime) {
@@ -92,15 +142,15 @@ async fn interrupt<T>(
     shutdown: ShutdownSignal,
     valid_until: SystemTime,
     operation: impl Future<Output = T>,
-) -> Result<T, StreamClose> {
+) -> Result<T, StreamErrorCondition> {
     match select(
         pin!(shutdown),
         pin!(select(pin!(expired(valid_until)), pin!(operation))),
     )
     .await
     {
-        Either::Left(_) => Err(StreamClose::Shutdown),
-        Either::Right((Either::Left(_), _)) => Err(StreamClose::CertificateExpired),
+        Either::Left(_) => Err(StreamErrorCondition::SystemShutdown),
+        Either::Right((Either::Left(_), _)) => Err(StreamErrorCondition::Reset),
         Either::Right((Either::Right((result, _)), _)) => Ok(result),
     }
 }
@@ -181,8 +231,12 @@ where
         allocator: settings.services.allocator.clone(),
         work: group.handle(),
     };
-    let outcome = if permit.is_none() {
-        rejection(peer, "stream", StreamClose::Conflict)
+    let closed = if permit.is_none() {
+        rejection(
+            peer,
+            "stream",
+            Closed::error(StreamErrorCondition::Conflict),
+        )
     } else {
         receive(
             reader,
@@ -195,13 +249,13 @@ where
         )
         .await
     };
-    terminal.outcome = outcome;
-    close(reader, writer, outcome, valid_until, shutdown).await;
+    terminal.outcome = closed.outcome;
+    close(reader, writer, closed, valid_until, shutdown).await;
     abort();
     drop(context);
     group.drain().await;
     drop((permit, gauge));
-    outcome
+    closed.outcome
 }
 
 async fn receive<A, R, D>(
@@ -212,7 +266,7 @@ async fn receive<A, R, D>(
     shutdown: ShutdownSignal,
     context: &IngressContext<A>,
     dispatch: &mut D,
-) -> StreamClose
+) -> Closed
 where
     A: ChunkAllocator + Clone + 'static,
     R: AsyncBufRead + Unpin + 'static,
@@ -227,28 +281,22 @@ where
         let remaining = settings.idle_timeout.saturating_sub(last_input.elapsed());
         let event = interrupt(shutdown.clone(), valid_until, async {
             if remaining.is_zero() {
-                return Err(StreamClose::Idle);
+                return Err(Closed::footer(StreamClose::Idle, false));
             }
             compio::time::timeout(remaining, reader.next_event())
                 .await
-                .map_err(|_| StreamClose::Idle)?
-                .map_err(|error| match error {
-                    S2sError::PeerError(_) => StreamClose::PeerError,
-                    S2sError::Stream(StreamErrorCondition::InvalidNamespace) => {
-                        StreamClose::InvalidNamespace
-                    }
-                    S2sError::Stream(StreamErrorCondition::UnsupportedStanzaType) => {
-                        StreamClose::UnsupportedStanzaType
-                    }
-                    S2sError::Stream(_) => StreamClose::InternalError,
-                    _ => StreamClose::TransportError,
-                })
+                .map_err(|_| Closed::footer(StreamClose::Idle, false))?
+                .map_err(Closed::reader_error)
         })
         .await;
         let event = match event {
+            Ok(Ok(Some(StreamEvent::StreamEnd))) => {
+                return Closed::footer(StreamClose::StreamEnd, true);
+            }
             Ok(Ok(Some(event))) => event,
-            Ok(Ok(None)) => return StreamClose::TransportError,
-            Ok(Err(outcome)) | Err(outcome) => return rejection(peer, "stream", outcome),
+            Ok(Ok(None)) => return Closed::reader_error(S2sError::Eof),
+            Ok(Err(closed)) => return rejection(peer, "stream", closed),
+            Err(condition) => return rejection(peer, "stream", Closed::error(condition)),
         };
         let stanza_kind = match &event {
             StreamEvent::Stanza(parsed) => parsed
@@ -267,110 +315,111 @@ where
                     let view = parsed
                         .value()
                         .resolve(parsed.arena())
-                        .map_err(|_| StreamClose::InternalError)?;
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
                     validate(
                         view.namespace(),
-                        view.from().map_err(|_| StreamClose::InternalError)?,
-                        view.to().map_err(|_| StreamClose::InternalError)?,
+                        view.from()
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
+                        view.to()
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
                         peer,
                     )?;
                     settings.metrics.stanza_received(view.kind());
                     let mut arena =
                         Arena::try_new_in(Default::default(), context.allocator.clone())
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                     let stanza = view
                         .rescope_in(StanzaNamespace::Client, &mut arena)
-                        .map_err(|_| StreamClose::InternalError)?;
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
                     interrupt(
                         shutdown.clone(),
                         valid_until,
                         dispatch(context, peer, RoutedStanza::from_parts(stanza, arena)),
                     )
                     .await?
-                    .map_err(|_| StreamClose::InternalError)
+                    .map_err(|_| StreamErrorCondition::InternalServerError)
                 }
                 StreamEvent::RejectedStanza(parsed) => {
                     last_input = Instant::now();
                     let rejected = parsed.value();
                     if rejected.namespace() != StanzaNamespace::Server {
-                        return Err(StreamClose::InvalidNamespace);
+                        return Err(StreamErrorCondition::InvalidNamespace);
                     }
                     if rejected.invalid_from() || rejected.invalid_to() {
-                        return Err(StreamClose::ImproperAddressing);
+                        return Err(StreamErrorCondition::ImproperAddressing);
                     }
                     validate(
                         rejected.namespace(),
                         rejected
                             .from(parsed.arena())
-                            .map_err(|_| StreamClose::InternalError)?,
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
                         rejected
                             .to(parsed.arena())
-                            .map_err(|_| StreamClose::InternalError)?,
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
                         peer,
                     )?;
                     settings.metrics.stanza_received(rejected.kind());
                     if rejected.can_reply() {
                         let mut output =
                             Arena::try_new_in(Default::default(), context.allocator.clone())
-                                .map_err(|_| StreamClose::InternalError)?;
+                                .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let sender = rejected
                             .from(parsed.arena())
-                            .map_err(|_| StreamClose::InternalError)?
-                            .ok_or(StreamClose::ImproperAddressing)?
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?
+                            .ok_or(StreamErrorCondition::ImproperAddressing)?
                             .clone_in(&mut output)
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let target = rejected
                             .to(parsed.arena())
-                            .map_err(|_| StreamClose::InternalError)?
-                            .ok_or(StreamClose::ImproperAddressing)?
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?
+                            .ok_or(StreamErrorCondition::ImproperAddressing)?
                             .clone_in(&mut output)
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let (rejected, mut arena) = parsed.into_parts();
                         let sender = sender
                             .resolve(&output)
-                            .map_err(|_| StreamClose::InternalError)?
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?
                             .clone_in(&mut arena)
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let target = target
                             .resolve(&output)
-                            .map_err(|_| StreamClose::InternalError)?
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?
                             .clone_in(&mut arena)
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let reply = rejected
                             .error_in(sender, target, &mut arena)
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let reply = reply
                             .resolve(&arena)
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let reply = reply
                             .rescope_in(StanzaNamespace::Client, &mut output)
-                            .map_err(|_| StreamClose::InternalError)?;
+                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
                         let _ = context
                             .router
                             .route_remote(RoutedStanza::from_parts(reply, output));
                     }
                     Ok(())
                 }
-                StreamEvent::StreamEnd => Err(StreamClose::StreamEnd),
                 StreamEvent::Element(parsed) => {
                     let element = parsed
                         .value()
                         .resolve(parsed.arena())
-                        .map_err(|_| StreamClose::InternalError)?;
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
                     if matches!(element.name(), "message" | "iq" | "presence")
                         && element.namespace() != "jabber:server"
                     {
-                        Err(StreamClose::InvalidNamespace)
+                        Err(StreamErrorCondition::InvalidNamespace)
                     } else {
-                        Err(StreamClose::UnsupportedStanzaType)
+                        Err(StreamErrorCondition::UnsupportedStanzaType)
                     }
                 }
-                _ => Err(StreamClose::UnsupportedStanzaType),
+                _ => Err(StreamErrorCondition::UnsupportedStanzaType),
             }
         }
         .await;
-        if let Err(outcome) = result {
-            return rejection(peer, stanza_kind, outcome);
+        if let Err(condition) = result {
+            return rejection(peer, stanza_kind, Closed::error(condition));
         }
     }
 }
@@ -378,7 +427,7 @@ where
 async fn close<A, R, W>(
     reader: &mut S2sReader<A, R>,
     writer: &mut S2sWriter<W>,
-    outcome: StreamClose,
+    closed: Closed,
     valid_until: SystemTime,
     shutdown: ShutdownSignal,
 ) where
@@ -386,20 +435,19 @@ async fn close<A, R, W>(
     R: AsyncBufRead + Unpin + 'static,
     W: AsyncWrite + Unpin,
 {
-    if matches!(
-        outcome,
-        StreamClose::TransportError | StreamClose::PeerError
-    ) {
-        return;
-    }
+    let (condition, peer_closed) = match closed.wire {
+        WireClose::Footer { peer_closed } => (None, peer_closed),
+        WireClose::Error(condition) => (Some(condition), false),
+        WireClose::Abort => return,
+    };
     let mut deadline = Instant::now() + CLOSE_BUDGET;
     let known_shutdown = shutdown.peek().copied();
     if let Some(until) = known_shutdown {
         deadline = deadline.min(until);
     }
     let operation = async {
-        writer.close(condition(outcome)).await?;
-        if !matches!(outcome, StreamClose::StreamEnd) {
+        writer.close(condition).await?;
+        if !peer_closed {
             let _ = compio::time::timeout(FOOTER_GRACE, async {
                 while let Some(event) = reader.next_event().await? {
                     if matches!(event, StreamEvent::StreamEnd) {
@@ -414,7 +462,7 @@ async fn close<A, R, W>(
     };
     let mut operation = pin!(operation);
     let controls = async {
-        if matches!(outcome, StreamClose::CertificateExpired) {
+        if matches!(condition, Some(StreamErrorCondition::Reset)) {
             std::future::pending().await
         } else {
             expired(valid_until).await

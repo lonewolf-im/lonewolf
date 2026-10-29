@@ -658,7 +658,7 @@ fn genuine_network_shutdown_interrupts_tls_cleanup_backoff_and_established_outpu
             out::reply(&mut peer, "shutdown")?;
             let payload = "x".repeat(32_000);
             for index in 0..16 {
-                initiator.write_all(format!("<message from='a@peer.test' to='b@local.test' id='bulk{index}'><body>{payload}</body></message>").as_bytes())?;
+                initiator.write_all(format!("<message from='a@peer.test' to='local.test' id='bulk{index}'><body>{payload}</body></message>").as_bytes())?;
             }
             initiator.flush()?;
             wait_sample(

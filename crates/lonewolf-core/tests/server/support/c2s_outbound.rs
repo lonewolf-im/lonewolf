@@ -208,9 +208,19 @@ impl Element {
 }
 
 pub fn start(fixture: &Fixture, extra: &str) -> Result<(Server, Peer)> {
+    let (server, client, _, _) = start_inbound(fixture, extra)?;
+    Ok((server, client))
+}
+
+pub fn start_inbound(
+    fixture: &Fixture,
+    extra: &str,
+) -> Result<(Server, Peer, SocketAddr, SocketAddr)> {
     let mut server = Server::start(&format!("{}{extra}", fixture.config), 2)?;
-    let addresses = server.ready_with(|readiness| readiness.c2s)?;
-    assert_eq!(addresses.len(), 1);
+    let (clients, servers) = server.ready_with(|readiness| (readiness.c2s, readiness.s2s))?;
+    assert_eq!(clients.len(), 1);
+    let servers = servers.ok_or("missing S2S listeners")?;
+    assert_eq!(servers.len(), 1);
     let mut admin = UnixStream::connect(server.directory.path().join("run/lonewolf/admin.sock"))?;
     admin.set_read_timeout(Some(TIMEOUT))?;
     admin.set_write_timeout(Some(TIMEOUT))?;
@@ -223,8 +233,8 @@ pub fn start(fixture: &Fixture, extra: &str) -> Result<(Server, Peer)> {
     let mut response = String::new();
     admin.read_to_string(&mut response)?;
     assert!(response.starts_with("HTTP/1.1 201 "), "{response}");
-    let client = client(fixture, addresses[0])?;
-    Ok((server, client))
+    let client = client(fixture, clients[0])?;
+    Ok((server, client, clients[0], servers[0]))
 }
 
 pub fn stanza(peer: &mut Peer, name: &str) -> Result<Element> {

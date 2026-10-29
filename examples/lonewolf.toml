@@ -241,7 +241,8 @@
 # Use bytes_per_second for the sustained byte rate and burst_bytes for the bucket capacity.
 # incoming_xml_per_connection = { bytes_per_second = 1_048_576, burst_bytes = 4_194_304 }
 
-# Limit outbound links; new links at capacity fail with resource-constraint.
+# Limit retained outbound domain pairs, including cached failures.
+# At capacity, new pairs replace an expired cached failure or fail with resource-constraint.
 # max_outbound_links = 1_024
 
 # Limit queued stanzas per link; a full queue rejects new stanzas with resource-constraint.
@@ -256,10 +257,11 @@
 # Close a link when a write cannot make progress for this many seconds.
 # stalled_write_timeout_secs = 60
 
-# Delay new attempts after a failed link by this many seconds, doubling after failures.
+# Set the initial retry delay in seconds; repeated failures double it before random variation.
 # failure_backoff_initial_secs = 30
 
-# Cap failure backoff in seconds; keep this at least as large as the initial delay.
+# Cap the final retry delay in seconds, including random variation.
+# Keep this at least as large as the initial delay.
 # failure_backoff_max_secs = 900
 
 # Add one section per TCP endpoint. These sections replace the default endpoint.

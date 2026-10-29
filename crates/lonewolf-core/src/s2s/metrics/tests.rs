@@ -103,7 +103,12 @@ const BOUNCE_CONDITION_LABELS: [&str; 3] = [
     "resource_constraint",
 ];
 
-const DROP_REASON_LABELS: [&str; 3] = ["shutdown", "connection_lost", "not_bounceable"];
+const DROP_REASON_LABELS: [&str; 4] = [
+    "shutdown",
+    "connection_lost",
+    "not_bounceable",
+    "internal_error",
+];
 
 #[test]
 fn label_values_and_indexes_are_fixed() {

@@ -123,6 +123,7 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
         joined: PlMutex::new(BTreeSet::new()),
     }))?;
     extensions.register(Arc::new(TestHostService))?;
+    extensions.register(Arc::new(TestFederatedService))?;
     extensions.register(Arc::new(TestArchive {
         next: AtomicU64::new(1),
         entries: PlMutex::new(Vec::new()),
@@ -558,6 +559,27 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestHostService {
     ) -> Result<(), RegistrationError> {
         slots.service(
             host,
+            Arc::new(TestService {
+                joined: PlMutex::new(BTreeSet::new()),
+            }),
+        )
+    }
+}
+
+struct TestFederatedService;
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestFederatedService {
+    fn name(&self) -> &'static str {
+        "test-federated-service"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.service(
+            &format!("svc.{host}"),
             Arc::new(TestService {
                 joined: PlMutex::new(BTreeSet::new()),
             }),

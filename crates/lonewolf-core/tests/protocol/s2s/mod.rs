@@ -55,6 +55,8 @@ fn two_servers_exchange_a_chat_message() -> TestResult {
         "a.test",
         "b.test",
         PairOptions {
+            a_enabled: None,
+            b_enabled: None,
             a_extensions: "'roster'".into(),
             b_extensions: "'roster'".into(),
             ..PairOptions::default()
@@ -286,6 +288,51 @@ fn raw_peer_workflow() -> TestResult {
     alice.close()?;
     suite.delete_account("alice")?;
     suite.stop()?;
+    suite.stop()?;
+    drop(suite);
+    for (enabled, federation) in [
+        (Some(false), None),
+        (None, Some(false)),
+        (Some(true), Some(false)),
+    ] {
+        let mut suite = C2sSuite::federated(FederatedHost {
+            domain: "local.test".into(),
+            enabled,
+            federation,
+            extensions: String::new(),
+            extra_toml: String::new(),
+            ca: Arc::clone(&ca),
+            dns: dns.address(),
+            completion: None,
+        })?;
+        assert!(suite.s2s.is_none());
+        suite.create_account("alice", PASSWORD)?;
+        suite.create_account("bob", PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+        alice.send("<message type='chat' to='bob@local.test/phone'><body>local chat with federation disabled</body></message>")?;
+        let message = bob.receive()?;
+        message.assert_name("jabber:client", "message");
+        assert_eq!(message.attribute("from"), Some("alice@local.test/desk"));
+        assert_eq!(
+            message.child("jabber:client", "body")?.text,
+            "local chat with federation disabled"
+        );
+        alice.send("<message type='chat' to='bob@peer.test/phone' id='disabled-federation'><body>remote chat with federation disabled</body></message>")?;
+        let error = alice.receive()?;
+        error.assert_name("jabber:client", "message");
+        assert_eq!(error.attribute("type"), Some("error"));
+        assert_eq!(error.attribute("id"), Some("disabled-federation"));
+        assert_eq!(error.attribute("from"), Some("bob@peer.test/phone"));
+        error.child("jabber:client", "error")?.child(
+            "urn:ietf:params:xml:ns:xmpp-stanzas",
+            "remote-server-not-found",
+        )?;
+        alice.close()?;
+        bob.close()?;
+        suite.stop()?;
+        suite.stop()?;
+    }
     dns.stop()?;
     Ok(())
 }

@@ -411,7 +411,7 @@ timeout_secs = 1
                 .map(|enabled| format!("enabled = {enabled}"))
                 .unwrap_or_default(),
         );
-        let federation_enabled = host.enabled.unwrap_or(false);
+        let federation_enabled = host.enabled.unwrap_or(true) && host.federation.unwrap_or(true);
         fs::write(directory.path().join("lonewolf.toml"), config)?;
         let readiness = ReadinessSocket::bind()?;
         let child = spawn_process(directory.path(), &readiness)?;
@@ -525,6 +525,7 @@ timeout_secs = 1
     pub fn stop(&mut self) -> TestResult {
         if let Some(status) = self.child.try_wait()? {
             self.record_reaped(status);
+            assert!(status.success(), "{status}");
             return Ok(());
         }
         nix::sys::signal::kill(

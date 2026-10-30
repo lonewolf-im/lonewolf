@@ -171,10 +171,10 @@ fn reply_eligibility_preserves_addresses_ids_and_payload() -> TestResult {
             ("<iq type='set'><query xmlns='urn:test'/></iq>", true),
             ("<iq type='result'/>", false),
             ("<iq type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>", false),
-            ("<presence type='subscribe'/>", false),
-            ("<presence type='subscribed'/>", false),
-            ("<presence type='unsubscribe'/>", false),
-            ("<presence type='unsubscribed'/>", false),
+            ("<presence type='subscribe'/>", true),
+            ("<presence type='subscribed'/>", true),
+            ("<presence type='unsubscribe'/>", true),
+            ("<presence type='unsubscribed'/>", true),
             ("<presence type='probe'/>", false),
             ("<presence type='unavailable'/>", false),
             ("<presence/>", false),
@@ -202,14 +202,20 @@ fn reply_eligibility_preserves_addresses_ids_and_payload() -> TestResult {
 fn reply_admission_failures_do_not_fail_completed_ingress() -> TestResult {
     compio::runtime::Runtime::new()?.block_on(async {
         let mut fixture = Fixture::new(Extensions::default(), &[])?;
-        let stanza = parsed("<iq type='get' from='alice@remote.test/desk' to='example.com' id='admission'><query xmlns='urn:test'/></iq>").await?;
         let condition = StanzaErrorCondition::ServiceUnavailable;
-        for _ in 0..2 {
-            reply_error(&fixture.context, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed on full queue")?;
+        for xml in ["<iq type='get' from='alice@remote.test/desk' to='example.com' id='admission'><query xmlns='urn:test'/></iq>", "<presence type='subscribe' from='alice@remote.test/desk' to='example.com' id='admission'/>", "<presence type='subscribed' from='alice@remote.test/desk' to='example.com' id='admission'/>", "<presence type='unsubscribe' from='alice@remote.test/desk' to='example.com' id='admission'/>", "<presence type='unsubscribed' from='alice@remote.test/desk' to='example.com' id='admission'/>"] {
+            let stanza = parsed(xml).await?;
+            for _ in 0..2 {
+                reply_error(&fixture.context, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed on full queue")?;
+            }
+            error_reply(&fixture, "example.com", "admission", "service-unavailable", default_text(condition))?;
         }
-        error_reply(&fixture, "example.com", "admission", "service-unavailable", default_text(condition))?;
         fixture.remote.finish(Instant::now() + Duration::from_secs(5)).await?;
-        reply_error(&fixture.context, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed after stop")?;
+        for kind in ["iq", "subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+            let xml = if kind=="iq" { "<iq type='get' from='alice@remote.test/desk' to='example.com' id='admission'><query xmlns='urn:test'/></iq>".into() } else { format!("<presence type='{kind}' from='alice@remote.test/desk' to='example.com'/>") };
+            let stanza=parsed(&xml).await?;
+            reply_error(&fixture.context, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed after stop")?;
+        }
         assert_eq!(fixture.remote.occupancy(), (0, 0));
         fixture.finish().await
     })
@@ -566,7 +572,22 @@ impl PolicyHandler<RedbStorage> for Iqs {
     ) -> PolicyFuture<'a> {
         Box::pin(async move {
             assert_eq!(request.account.as_str(), "bob@example.com");
-            assert_eq!(request.peer.as_str(), "alice@remote.test/desk");
+            assert_eq!(
+                request.peer.as_str(),
+                if matches!(
+                    request.kind,
+                    StanzaType::Presence(
+                        PresenceType::Subscribe
+                            | PresenceType::Subscribed
+                            | PresenceType::Unsubscribe
+                            | PresenceType::Unsubscribed
+                    )
+                ) {
+                    "alice@remote.test"
+                } else {
+                    "alice@remote.test/desk"
+                }
+            );
             assert_eq!(request.direction, Direction::Inbound);
             let card = transaction
                 .vcard(request.account)
@@ -1596,7 +1617,8 @@ fn inbound_probe_visibility_and_policy_share_ordered_snapshot() -> TestResult {
 }
 
 #[test]
-fn missing_probe_account_cannot_gain_visibility_and_subscriptions_are_dropped() -> TestResult {
+fn missing_probe_account_cannot_gain_visibility_and_subscriptions_use_recipient_policy()
+-> TestResult {
     compio::runtime::Runtime::new()?.block_on(async {
         let handler = Arc::new(Iqs::new(Verdict::Allow, true));
         let mut extensions = Extensions::default();
@@ -1622,10 +1644,839 @@ fn missing_probe_account_cannot_gain_visibility_and_subscriptions_are_dropped() 
                     "<presence type='{kind}' from='alice@remote.test/desk' to='bob@example.com'/>"
                 ))
                 .await?;
+            subscription_error(
+                &fixture,
+                "alice@remote.test",
+                "bob@example.com",
+                "service-unavailable",
+                default_text(StanzaErrorCondition::ServiceUnavailable),
+            )?;
         }
         fixture.work.drain().await;
-        assert_eq!(handler.policies.lock().len(), 1);
+        assert_eq!(handler.policies.lock().len(), 5);
         assert!(fixture.remote.receive()?.is_none());
         fixture.finish().await
     })
+}
+
+fn subscription_error(
+    fixture: &Fixture,
+    sender: &str,
+    target: &str,
+    condition: &str,
+    text: &str,
+) -> TestResult {
+    let stanza = fixture.remote.receive()?.ok_or("subscription error")?;
+    let view = stanza.resolve()?;
+    assert_eq!(
+        view.stanza_type(),
+        StanzaType::Presence(PresenceType::Error)
+    );
+    assert_eq!(view.from()?.ok_or("from")?.as_str(), target);
+    assert_eq!(view.to()?.ok_or("to")?.as_str(), sender);
+    let error = view.child("error", "jabber:client")?.ok_or("error")?;
+    assert!(
+        error
+            .child(condition, "urn:ietf:params:xml:ns:xmpp-stanzas")?
+            .is_some()
+    );
+    assert_eq!(
+        error
+            .child("text", "urn:ietf:params:xml:ns:xmpp-stanzas")?
+            .ok_or("text")?
+            .text()?,
+        Some(text)
+    );
+    assert_eq!(error.children()?.count(), 2);
+    Ok(())
+}
+
+#[test]
+fn inbound_subscriptions_store_normalized_requests_and_deliver_subscribed_before_push() -> TestResult
+{
+    use lonewolf_extension::roster::Roster;
+    use lonewolf_storage::roster::{
+        RosterItem, RosterJid, RosterReads, RosterSubscription, RosterWrites, SubscriptionState,
+    };
+    let scenario = async {
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Roster::default()))?;
+        let mut fixture = Fixture::new(extensions, &["roster"])?;
+        create_iq_account(&fixture).await?;
+        let owner = account()?;
+        let phone = fixture
+            .context
+            .router
+            .register(
+                &owner,
+                Some("phone"),
+                NonZeroUsize::new(8).ok_or("capacity")?,
+            )
+            .await?;
+        let desk = fixture
+            .context
+            .router
+            .register(
+                &owner,
+                Some("desk"),
+                NonZeroUsize::new(8).ok_or("capacity")?,
+            )
+            .await?;
+        phone.handle().tag(SessionTag::Interested).await?;
+        desk.handle().tag(SessionTag::Interested).await?;
+        phone
+            .handle()
+            .set_presence(
+                Some(0),
+                parsed("<presence from='bob@example.com/phone'/>").await?,
+                None,
+            )
+            .await?;
+        let xml = "<presence type='subscribe' from='alice@remote.test/desk' to='bob@example.com/phone' id='subscription'><status>Please add me</status></presence>";
+        fixture.dispatch(xml).await?;
+        let request = phone.recv().await.ok_or("available request")?;
+        let view = request.stanza.resolve()?;
+        assert_eq!(view.from()?.ok_or("from")?.as_str(), "alice@remote.test");
+        assert_eq!(view.to()?.ok_or("to")?.as_str(), "bob@example.com");
+        assert_eq!(
+            view.stanza_type(),
+            StanzaType::Presence(PresenceType::Subscribe)
+        );
+        let contact = RosterJid::from(view.from()?.ok_or("from")?);
+        let before = {
+            let tx = fixture.context.storage.begin_read().await?;
+            assert!(
+                tx.roster_item(&owner, &contact, Default::default())
+                    .await?
+                    .is_none()
+            );
+            let requests = tx.pending_requests(&owner).await?;
+            assert_eq!(requests.len(), 1);
+            let stored = parsed(std::str::from_utf8(&requests[0].stanza)?).await?;
+            assert_eq!(stored.resolve()?.id()?, Some("subscription"));
+            assert_eq!(
+                stored.resolve()?.from()?.ok_or("from")?.as_str(),
+                "alice@remote.test"
+            );
+            assert_eq!(
+                stored.resolve()?.to()?.ok_or("to")?.as_str(),
+                "bob@example.com"
+            );
+            assert_eq!(
+                stored
+                    .resolve()?
+                    .child("status", "jabber:client")?
+                    .ok_or("status")?
+                    .text()?,
+                Some("Please add me")
+            );
+            requests
+        };
+        fixture.dispatch(xml).await?;
+        fixture.work.drain().await;
+        assert!(phone.mailbox().take_queued().is_empty());
+        assert!(desk.mailbox().take_queued().is_empty());
+        assert_eq!(
+            fixture
+                .context
+                .storage
+                .begin_read()
+                .await?
+                .pending_requests(&owner)
+                .await?,
+            before
+        );
+        let mut tx = fixture.context.storage.begin_write().await?;
+        tx.put_roster_item(
+            &owner,
+            &RosterItem {
+                jid: contact.clone(),
+                name: None,
+                groups: Vec::new(),
+                subscription: RosterSubscription {
+                    state: SubscriptionState::None,
+                    pending_out: true,
+                    approved: false,
+                },
+            },
+            Default::default(),
+        )
+        .await?;
+        tx.commit().await?;
+        fixture.dispatch("<presence type='subscribed' from='alice@remote.test/desk' to='bob@example.com/phone' id='approval'/>").await?;
+        for registration in [&phone, &desk] {
+            let approval = registration.recv().await.ok_or("approval")?;
+            assert_eq!(
+                approval.stanza.resolve()?.stanza_type(),
+                StanzaType::Presence(PresenceType::Subscribed)
+            );
+            assert_eq!(
+                approval.stanza.resolve()?.from()?.ok_or("from")?.as_str(),
+                "alice@remote.test"
+            );
+            let push = registration.recv().await.ok_or("push")?;
+            assert_eq!(
+                push.stanza.resolve()?.stanza_type(),
+                StanzaType::Iq(IqType::Set)
+            );
+            assert_eq!(
+                push.stanza
+                    .resolve()?
+                    .child("query", "jabber:iq:roster")?
+                    .ok_or("query")?
+                    .child("item", "jabber:iq:roster")?
+                    .ok_or("item")?
+                    .attribute("subscription", "")?,
+                Some("to")
+            );
+        }
+        let tx = fixture.context.storage.begin_read().await?;
+        assert_eq!(
+            tx.roster_subscription(&owner, &contact)
+                .await?
+                .ok_or("item")?
+                .state,
+            SubscriptionState::To
+        );
+        assert_eq!(tx.pending_requests(&owner).await?, before);
+        drop(tx);
+        fixture.work.drain().await;
+        assert!(fixture.remote.receive()?.is_none());
+        drop((phone, desk));
+        fixture.finish().await
+    };
+    compio::runtime::Runtime::new()?.block_on(scenario)
+}
+
+#[test]
+fn inbound_subscriptions_missing_owners_domain_senders_and_server_targets_remain_silent()
+-> TestResult {
+    use lonewolf_extension::roster::Roster;
+    use lonewolf_storage::account::AccountReads;
+    use lonewolf_storage::roster::{
+        PendingSubscription, RosterItem, RosterJid, RosterReads, RosterSubscription, RosterWrites,
+        SubscriptionState,
+    };
+    let scenario = async {
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Roster::default()))?;
+        let mut fixture = Fixture::new(extensions, &["roster"])?;
+        create_iq_account(&fixture).await?;
+        let owner = account()?;
+        let phone = fixture
+            .context
+            .router
+            .register(
+                &owner,
+                Some("phone"),
+                NonZeroUsize::new(16).ok_or("capacity")?,
+            )
+            .await?;
+        phone.handle().tag(SessionTag::Interested).await?;
+        phone
+            .handle()
+            .set_presence(
+                Some(0),
+                parsed("<presence from='bob@example.com/phone'/>").await?,
+                None,
+            )
+            .await?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let domain = RosterJid::from(Jid::parse_in("remote.test", &mut arena)?.resolve(&arena)?);
+        let mut tx = fixture.context.storage.begin_write().await?;
+        tx.put_roster_item(
+            &owner,
+            &RosterItem {
+                jid: domain.clone(),
+                name: None,
+                groups: Vec::new(),
+                subscription: RosterSubscription {
+                    state: SubscriptionState::Both,
+                    pending_out: true,
+                    approved: true,
+                },
+            },
+            Default::default(),
+        )
+        .await?;
+        tx.put_pending_request(
+            &owner,
+            PendingSubscription {
+                sender: domain,
+                stanza: b"seed".as_slice().into(),
+            },
+            NonZeroUsize::MIN,
+        )
+        .await?;
+        tx.commit().await?;
+        let (roster, pending) = {
+            let tx = fixture.context.storage.begin_read().await?;
+            (
+                tx.roster(&owner, Default::default()).await?,
+                tx.pending_requests(&owner).await?,
+            )
+        };
+        let mut completed = 0;
+        for sender in [
+            "remote.test",
+            "remote.test/resource",
+            "alice@remote.test/desk",
+        ] {
+            for target in [
+                "bob@example.com",
+                "bob@example.com/phone",
+                "missing@example.com",
+                "missing@example.com/phone",
+                "example.com",
+                "example.com/resource",
+            ] {
+                if sender.starts_with("alice@") && target.starts_with("bob@") {
+                    continue;
+                }
+                for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                    fixture
+                        .dispatch(&format!(
+                            "<presence type='{kind}' from='{sender}' to='{target}'/>"
+                        ))
+                        .await?;
+                    if target.contains('@') {
+                        completed += 1;
+                    }
+                }
+            }
+        }
+        fixture.work.drain().await;
+        assert_iq_commits(&fixture, 2 + completed)?;
+        assert!(phone.mailbox().take_queued().is_empty());
+        assert!(fixture.remote.receive()?.is_none());
+        let tx = fixture.context.storage.begin_read().await?;
+        assert!(tx.account(&owner).await?.is_some());
+        let missing = AccountKey::try_from(
+            Jid::parse_in("missing@example.com", &mut arena)?.resolve(&arena)?,
+        )?;
+        assert!(tx.account(&missing).await?.is_none());
+        assert!(
+            tx.roster(&missing, Default::default())
+                .await?
+                .items
+                .is_empty()
+        );
+        assert!(tx.pending_requests(&missing).await?.is_empty());
+        assert_eq!(tx.roster(&owner, Default::default()).await?, roster);
+        assert_eq!(tx.pending_requests(&owner).await?, pending);
+        drop(tx);
+        fixture
+            .dispatch("<presence from='remote.test/resource' to='bob@example.com'/>")
+            .await?;
+        assert_eq!(
+            phone
+                .recv()
+                .await
+                .ok_or("domain presence")?
+                .stanza
+                .resolve()?
+                .from()?
+                .ok_or("from")?
+                .as_str(),
+            "remote.test/resource"
+        );
+        fixture
+            .dispatch("<presence type='probe' from='remote.test/resource' to='bob@example.com'/>")
+            .await?;
+        let probe = fixture.remote.receive()?.ok_or("domain probe")?;
+        assert_eq!(
+            probe.resolve()?.stanza_type(),
+            StanzaType::Presence(PresenceType::Available)
+        );
+        assert_eq!(
+            probe.resolve()?.to()?.ok_or("to")?.as_str(),
+            "remote.test/resource"
+        );
+        assert_eq!(
+            probe.resolve()?.from()?.ok_or("from")?.as_str(),
+            "bob@example.com/phone"
+        );
+        drop(phone);
+        fixture.finish().await
+    };
+    compio::runtime::Runtime::new()?.block_on(scenario)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SubscriptionMode {
+    NoHandler,
+    Empty,
+    Error,
+    Effects,
+    FailEffects,
+}
+
+struct Subscriptions {
+    mode: SubscriptionMode,
+    verdict: Verdict,
+    policies: PlMutex<Vec<(String, String, StanzaType)>>,
+    calls: AtomicUsize,
+    effects: Arc<AtomicUsize>,
+    gate: PlMutex<Option<Gate>>,
+}
+
+impl Subscriptions {
+    fn new(mode: SubscriptionMode, verdict: Verdict) -> Self {
+        Self {
+            mode,
+            verdict,
+            policies: PlMutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+            effects: Arc::new(AtomicUsize::new(0)),
+            gate: PlMutex::new(None),
+        }
+    }
+}
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for Subscriptions {
+    fn name(&self) -> &'static str {
+        "subscriptions"
+    }
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self.clone());
+        if self.mode != SubscriptionMode::NoHandler {
+            for kind in [
+                PresenceRequestType::Subscribe,
+                PresenceRequestType::Subscribed,
+                PresenceRequestType::Unsubscribe,
+                PresenceRequestType::Unsubscribed,
+            ] {
+                slots.presence(kind, self.clone())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PolicyHandler<RedbStorage> for Subscriptions {
+    fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
+        assert_eq!(request.direction, Direction::Inbound);
+        self.policies.lock().push((
+            request.account.as_str().into(),
+            request.peer.as_str().into(),
+            request.kind,
+        ));
+        Box::pin(async { Ok(self.verdict) })
+    }
+}
+
+impl PresenceHandler<GlobalChunkAllocator, RedbStorage> for Subscriptions {
+    fn receive<'a>(
+        &'a self,
+        request: lonewolf_extension::presence::PresenceRequest<'a, GlobalChunkAllocator>,
+        transaction: &'a mut RedbWrite,
+        hosts: &'a dyn lonewolf_extension::delivery::HostLookup,
+    ) -> lonewolf_extension::presence::ReceiveFuture<'a, GlobalChunkAllocator> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(hosts.federates(request.target.domainpart()));
+            assert!(request.sender.resourcepart().is_none());
+            assert!(request.target.resourcepart().is_none());
+            let view = request
+                .stanza
+                .resolve()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            assert_eq!(
+                view.from()
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                    .ok_or(StanzaErrorCondition::InternalServerError)?
+                    .as_str(),
+                request.sender.as_str()
+            );
+            assert_eq!(
+                view.to()
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                    .ok_or(StanzaErrorCondition::InternalServerError)?
+                    .as_str(),
+                request.target.as_str()
+            );
+            let owner = AccountKey::try_from(request.target)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            transaction
+                .replace_vcard(
+                    &owner,
+                    "<vCard xmlns='vcard-temp'><FN>Subscription committed</FN></vCard>",
+                    VCardQuota::default(),
+                )
+                .await
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            if self.mode == SubscriptionMode::Error {
+                return Err(HandlerError::described(
+                    StanzaErrorCondition::Forbidden,
+                    StanzaErrorText::Static("Subscription denied."),
+                ));
+            }
+            if self.mode == SubscriptionMode::Empty {
+                return Ok(Effects::none());
+            }
+            let effects = Arc::clone(&self.effects);
+            let gate = self.gate.lock().take();
+            let fail = self.mode == SubscriptionMode::FailEffects;
+            Ok(Effects::new(vec![owner], move |_| {
+                Box::pin(async move {
+                    if let Some((entered, release)) = gate {
+                        let _ = entered.send(());
+                        release
+                            .await
+                            .map_err(|_| lonewolf_extension::delivery::DeliveryError)?;
+                    }
+                    effects.fetch_add(1, Ordering::SeqCst);
+                    if fail {
+                        Err(lonewolf_extension::delivery::DeliveryError)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }))
+        })
+    }
+}
+
+#[test]
+fn inbound_subscription_no_handler_errors_and_policies_apply_uniformly() -> TestResult {
+    let scenario = async {
+        for verdict in [
+            Verdict::Allow,
+            Verdict::Drop,
+            Verdict::Reject {
+                condition: StanzaErrorCondition::Forbidden,
+                application: None,
+                text: Some(StanzaErrorText::Static("Blocked.")),
+            },
+        ] {
+            let handler = Arc::new(Subscriptions::new(SubscriptionMode::NoHandler, verdict));
+            let mut extensions = Extensions::default();
+            extensions.register(handler.clone())?;
+            let mut fixture = Fixture::new(extensions, &["subscriptions"])?;
+            create_iq_account(&fixture).await?;
+            let owner = account()?;
+            let phone = fixture
+                .context
+                .router
+                .register(
+                    &owner,
+                    Some("phone"),
+                    NonZeroUsize::new(16).ok_or("capacity")?,
+                )
+                .await?;
+            phone.handle().tag(SessionTag::Interested).await?;
+            phone
+                .handle()
+                .set_presence(
+                    Some(0),
+                    parsed("<presence from='bob@example.com/phone'/>").await?,
+                    None,
+                )
+                .await?;
+            let mut checks = 0;
+            for sender in [
+                "alice@remote.test/desk",
+                "remote.test",
+                "remote.test/resource",
+            ] {
+                let bare = sender.split('/').next().ok_or("sender")?;
+                for target in [
+                    "bob@example.com",
+                    "bob@example.com/phone",
+                    "missing@example.com",
+                    "missing@example.com/phone",
+                ] {
+                    let account = target.split('/').next().ok_or("target")?;
+                    for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                        fixture.dispatch(&format!("<presence type='{kind}' from='{sender}' to='{target}' id='no-handler'><status>Request</status></presence>")).await?;
+                        checks += 1;
+                        assert_eq!(
+                            handler
+                                .policies
+                                .lock()
+                                .last()
+                                .map(|(a, p, _)| (a.as_str(), p.as_str())),
+                            Some((account, bare))
+                        );
+                        if verdict == Verdict::Allow {
+                            let stanza = fixture.remote.receive()?.ok_or("no-handler reply")?;
+                            let view = stanza.resolve()?;
+                            assert_eq!(
+                                view.stanza_type(),
+                                StanzaType::Presence(PresenceType::Error)
+                            );
+                            assert_eq!(view.from()?.ok_or("from")?.as_str(), account);
+                            assert_eq!(view.to()?.ok_or("to")?.as_str(), bare);
+                            assert_eq!(view.id()?, Some("no-handler"));
+                            assert_eq!(
+                                view.child("status", "jabber:client")?
+                                    .ok_or("status")?
+                                    .text()?,
+                                Some("Request")
+                            );
+                            let error = view.child("error", "jabber:client")?.ok_or("error")?;
+                            assert!(
+                                error
+                                    .child(
+                                        "service-unavailable",
+                                        "urn:ietf:params:xml:ns:xmpp-stanzas"
+                                    )?
+                                    .is_some()
+                            );
+                            assert_eq!(error.children()?.count(), 2);
+                        }
+                    }
+                }
+                for target in ["example.com", "example.com/resource"] {
+                    for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                        fixture
+                            .dispatch(&format!(
+                                "<presence type='{kind}' from='{sender}' to='{target}'/>"
+                            ))
+                            .await?;
+                    }
+                }
+            }
+            fixture.work.drain().await;
+            assert_eq!(handler.policies.lock().len(), checks);
+            assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+            assert_iq_commits(&fixture, 1)?;
+            assert!(phone.mailbox().take_queued().is_empty());
+            assert!(fixture.remote.receive()?.is_none());
+            drop(phone);
+            fixture.finish().await?;
+        }
+        Ok(())
+    };
+    compio::runtime::Runtime::new()?.block_on(scenario)
+}
+
+#[test]
+fn inbound_subscription_policy_drop_and_reject_do_not_call_provider() -> TestResult {
+    use lonewolf_extension::roster::Roster;
+    use lonewolf_storage::roster::RosterReads;
+    let scenario = async {
+        for roster_enabled in [false, true] {
+            for verdict in [
+                Verdict::Drop,
+                Verdict::Reject {
+                    condition: StanzaErrorCondition::Forbidden,
+                    application: None,
+                    text: None,
+                },
+            ] {
+                let handler = Arc::new(Subscriptions::new(
+                    if roster_enabled {
+                        SubscriptionMode::NoHandler
+                    } else {
+                        SubscriptionMode::Effects
+                    },
+                    verdict,
+                ));
+                let mut extensions = Extensions::default();
+                extensions.register(handler.clone())?;
+                if roster_enabled {
+                    extensions.register(Arc::new(Roster::default()))?;
+                }
+                let names = if roster_enabled {
+                    ["subscriptions", "roster"].as_slice()
+                } else {
+                    ["subscriptions"].as_slice()
+                };
+                let mut fixture = Fixture::new(extensions, names)?;
+                create_iq_account(&fixture).await?;
+                for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                    fixture.dispatch(&format!("<presence type='{kind}' from='alice@remote.test/desk' to='bob@example.com/phone'/>")).await?;
+                }
+                fixture.work.drain().await;
+                assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(handler.policies.lock().len(), 4);
+                assert_eq!(handler.effects.load(Ordering::SeqCst), 0);
+                let tx = fixture.context.storage.begin_read().await?;
+                assert!(tx.vcard(&account()?).await?.is_none());
+                assert!(
+                    tx.roster(&account()?, Default::default())
+                        .await?
+                        .items
+                        .is_empty()
+                );
+                assert!(tx.pending_requests(&account()?).await?.is_empty());
+                drop(tx);
+                assert_iq_commits(&fixture, 1)?;
+                assert!(fixture.remote.receive()?.is_none());
+                fixture.finish().await?;
+            }
+        }
+        Ok(())
+    };
+    compio::runtime::Runtime::new()?.block_on(scenario)
+}
+
+#[test]
+fn inbound_subscription_errors_abort_writes_and_empty_effects_still_commit() -> TestResult {
+    let scenario = async {
+        for mode in [SubscriptionMode::Error, SubscriptionMode::Empty] {
+            let handler = Arc::new(Subscriptions::new(mode, Verdict::Allow));
+            let mut extensions = Extensions::default();
+            extensions.register(handler.clone())?;
+            let mut fixture = Fixture::new(extensions, &["subscriptions"])?;
+            create_iq_account(&fixture).await?;
+            for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                fixture.dispatch(&format!("<presence type='{kind}' from='alice@remote.test/desk' to='bob@example.com/phone' id='handler'><status>Request</status></presence>")).await?;
+                let card = fixture
+                    .context
+                    .storage
+                    .begin_read()
+                    .await?
+                    .vcard(&account()?)
+                    .await?;
+                if mode == SubscriptionMode::Error {
+                    assert!(card.is_none());
+                    let stanza = fixture.remote.receive()?.ok_or("handler error")?;
+                    let view = stanza.resolve()?;
+                    assert_eq!(
+                        view.stanza_type(),
+                        StanzaType::Presence(PresenceType::Error)
+                    );
+                    assert_eq!(view.id()?, Some("handler"));
+                    assert_eq!(view.from()?.ok_or("from")?.as_str(), "bob@example.com");
+                    assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@remote.test");
+                    assert_eq!(
+                        view.child("status", "jabber:client")?
+                            .ok_or("status")?
+                            .text()?,
+                        Some("Request")
+                    );
+                    let error = view.child("error", "jabber:client")?.ok_or("error")?;
+                    assert!(
+                        error
+                            .child("forbidden", "urn:ietf:params:xml:ns:xmpp-stanzas")?
+                            .is_some()
+                    );
+                    assert_eq!(
+                        error
+                            .child("text", "urn:ietf:params:xml:ns:xmpp-stanzas")?
+                            .ok_or("text")?
+                            .text()?,
+                        Some("Subscription denied.")
+                    );
+                    assert_eq!(error.children()?.count(), 2);
+                } else {
+                    assert!(
+                        card.ok_or("empty-effects commit")?
+                            .xml
+                            .contains("Subscription committed")
+                    );
+                }
+            }
+            fixture.work.drain().await;
+            assert_iq_commits(
+                &fixture,
+                if mode == SubscriptionMode::Error {
+                    1
+                } else {
+                    5
+                },
+            )?;
+            assert_eq!(handler.calls.load(Ordering::SeqCst), 4);
+            assert_eq!(handler.effects.load(Ordering::SeqCst), 0);
+            assert!(fixture.remote.receive()?.is_none());
+            fixture.finish().await?;
+        }
+        Ok(())
+    };
+    compio::runtime::Runtime::new()?.block_on(scenario)
+}
+
+#[test]
+fn inbound_subscription_waits_for_ordered_effects_and_survives_cancellation() -> TestResult {
+    let scenario = async {
+        let xml =
+            "<presence type='subscribe' from='alice@remote.test/desk' to='bob@example.com/phone'/>";
+        for cancel in [false, true] {
+            let handler = Arc::new(Subscriptions::new(
+                SubscriptionMode::Effects,
+                Verdict::Allow,
+            ));
+            let (entered, reached) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            *handler.gate.lock() = Some((entered, resume));
+            let mut extensions = Extensions::default();
+            extensions.register(handler.clone())?;
+            let mut fixture = Fixture::new(extensions, &["subscriptions"])?;
+            create_iq_account(&fixture).await?;
+            let mut pending = Box::pin(fixture.dispatch(xml));
+            assert!(poll!(&mut pending).is_pending());
+            match futures_util::future::select(reached, pending.as_mut()).await {
+                futures_util::future::Either::Left((entered, _)) => entered?,
+                futures_util::future::Either::Right(_) => {
+                    return Err("dispatch preceded effects".into());
+                }
+            }
+            assert_eq!(handler.effects.load(Ordering::SeqCst), 0);
+            assert!(
+                fixture
+                    .context
+                    .storage
+                    .begin_read()
+                    .await?
+                    .vcard(&account()?)
+                    .await?
+                    .ok_or("commit before effects")?
+                    .xml
+                    .contains("Subscription committed")
+            );
+            let ((), mut next_ticket) = Arc::clone(fixture.context.router.order())
+                .fix(vec![account()?], async { Ok::<_, IngressFailure>(()) })
+                .await
+                .map_err(|_| "next ticket")?;
+            let mut next_turn = Box::pin(next_ticket.turn());
+            assert!(poll!(&mut next_turn).is_pending());
+            if cancel {
+                drop(pending);
+                release.send(()).map_err(|_| "cancelled effect")?;
+            } else {
+                release.send(()).map_err(|_| "cancelled effect")?;
+                pending.await?;
+            }
+            fixture.work.drain().await;
+            next_turn.await;
+            drop(next_ticket);
+            assert_iq_commits(&fixture, 2)?;
+            assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(handler.effects.load(Ordering::SeqCst), 1);
+            assert!(fixture.remote.receive()?.is_none());
+            fixture.finish().await?;
+        }
+        let handler = Arc::new(Subscriptions::new(
+            SubscriptionMode::FailEffects,
+            Verdict::Allow,
+        ));
+        let mut extensions = Extensions::default();
+        extensions.register(handler.clone())?;
+        let mut fixture = Fixture::new(extensions, &["subscriptions"])?;
+        create_iq_account(&fixture).await?;
+        assert!(fixture.dispatch(xml).await.is_err());
+        fixture.work.drain().await;
+        assert_iq_commits(&fixture, 2)?;
+        assert_eq!(handler.effects.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .context
+                .storage
+                .begin_read()
+                .await?
+                .vcard(&account()?)
+                .await?
+                .is_some()
+        );
+        assert!(fixture.remote.receive()?.is_none());
+        fixture.finish().await
+    };
+    compio::runtime::Runtime::new()?
+        .block_on(compio::time::timeout(Duration::from_secs(5), scenario))?
 }

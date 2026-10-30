@@ -3,7 +3,8 @@
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, IqType, MessageType, StanzaErrorCondition, StanzaErrorText, StanzaType,
+    ApplicationCondition, IqType, MessageType, PresenceType, StanzaErrorCondition, StanzaErrorText,
+    StanzaType,
 };
 
 use crate::delivery::WorkHandle;
@@ -55,6 +56,12 @@ pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
         && !matches!(
             source.stanza_type(),
             StanzaType::Iq(IqType::Get | IqType::Set)
+                | StanzaType::Presence(
+                    PresenceType::Subscribe
+                        | PresenceType::Subscribed
+                        | PresenceType::Unsubscribe
+                        | PresenceType::Unsubscribed
+                )
         )
     {
         return Ok(());

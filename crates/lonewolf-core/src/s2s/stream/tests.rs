@@ -11,7 +11,7 @@ use compio::time::timeout;
 use futures_util::poll;
 use lonewolf_util::arena::{AllocationError, GlobalChunkAllocator};
 use lonewolf_xmpp::parser::parse_element;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncWriteExt as _, BufReader};
 
 use super::*;
 

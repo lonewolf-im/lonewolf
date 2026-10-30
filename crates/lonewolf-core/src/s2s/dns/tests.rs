@@ -4,6 +4,7 @@ use std::net::{TcpListener, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use compio::runtime::Runtime;
 use hickory_proto::rr::Record;
@@ -119,6 +120,20 @@ fn address(query: &Message) -> Message {
 
 fn resolve(resolver: &Resolver, domain: &str) -> Result<Resolved, ResolveError> {
     Runtime::new().unwrap().block_on(resolver.resolve(domain))
+}
+
+fn bind_dns_sockets() -> io::Result<(TcpListener, StdUdpSocket)> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        // TCP and UDP allocate ports independently, so both reservations must succeed.
+        match StdUdpSocket::bind(listener.local_addr()?) {
+            Ok(udp) => return Ok((listener, udp)),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn assert_endpoints(result: Resolved, via: ResolvedVia, port: u16) {
@@ -438,9 +453,7 @@ fn mismatched_id_qr_name_type_and_class_are_ignored() -> TestResult {
 
 #[test]
 fn truncated_udp_retries_same_nameserver_over_tcp() -> TestResult {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let port = listener.local_addr()?.port();
-    let udp = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, port))?;
+    let (listener, udp) = bind_dns_sockets()?;
     udp.set_read_timeout(Some(Duration::from_secs(2)))?;
     let address = udp.local_addr()?;
     let worker = thread::spawn(move || -> io::Result<()> {
@@ -614,9 +627,7 @@ fn malformed_datagram_moves_to_next_nameserver() -> TestResult {
 
 #[test]
 fn tcp_partial_frame_is_bounded_by_whole_attempt_deadline() -> TestResult {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let port = listener.local_addr()?.port();
-    let udp = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, port))?;
+    let (listener, udp) = bind_dns_sockets()?;
     let address = udp.local_addr()?;
     let (release, wait) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || -> io::Result<()> {

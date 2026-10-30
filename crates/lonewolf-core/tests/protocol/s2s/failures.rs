@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use hickory_proto::rr::RecordType;
 
 use super::super::support::federation::{
-    FederatedPair, PairOptions,
+    FederatedPair, FederationCa, PairOptions,
     peer::{self, RawS2sListener},
 };
 use super::super::support::{PASSWORD, TestResult};
@@ -243,6 +243,55 @@ fn receiving_peer_with_wrong_certificate_bounces_remote_server_timeout() -> Test
     fixture
         .suite
         .wait_for_metric("lonewolf_s2s_connections{direction=\"outbound\"} 0")?;
+    alice.close()?;
+    fixture.stop()
+}
+
+#[test]
+fn receiving_peer_with_self_signed_ca_leaf_bounces_remote_server_timeout() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    let listener = RawS2sListener::bind()?;
+    fixture.dns.srv(
+        "b.test",
+        &[(0, 0, listener.address()?.port(), "server.b.test")],
+    );
+    fixture.dns.a("server.b.test", Ipv4Addr::LOCALHOST);
+    let config = peer::server_config(
+        &fixture.ca,
+        FederationCa::self_signed_ca("b.test")?,
+        "a.test",
+    )?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<message to='bob@b.test/phone' type='chat' id='ca-leaf'><body>trusted leaf required</body></message>")?;
+    let error = listener
+        .accept("b.test", "a.test", config, true)
+        .err()
+        .ok_or("CA certificate completed TLS and authenticated the peer")?;
+    let error = error
+        .downcast_ref::<std::io::Error>()
+        .ok_or("TLS failure did not return an I/O error")?;
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error}");
+    expect_bounce(&mut alice, "ca-leaf", "remote-server-timeout")?;
+    authentication(&fixture.suite, "outbound", "certificate_untrusted", 1)?;
+    let metrics = fixture.suite.scrape_metrics()?;
+    for outcome in ["tls_failure", "success"] {
+        assert!(
+            !metrics.contains(&format!(
+                "lonewolf_s2s_authentications_total{{direction=\"outbound\",outcome=\"{outcome}\"}}"
+            )),
+            "{metrics}"
+        );
+    }
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_connections{direction=\"outbound\"} 0")?;
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_outbound_queued_stanzas 0")?;
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_outbound_queued_bytes 0")?;
     alice.close()?;
     fixture.stop()
 }

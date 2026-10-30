@@ -199,8 +199,8 @@ fn tls_classification_uses_typed_errors_and_io_sources() -> TestResult {
             },
             "certificate_expired",
         ),
-        (CertificateError::BadEncoding, "handshake"),
-        (CertificateError::Revoked, "handshake"),
+        (CertificateError::BadEncoding, "certificate_untrusted"),
+        (CertificateError::Revoked, "certificate_untrusted"),
     ] {
         let error = rustls::Error::InvalidCertificate(error);
         assert_eq!(tls_reason(&error), expected);
@@ -216,6 +216,55 @@ fn tls_classification_uses_typed_errors_and_io_sources() -> TestResult {
     assert_eq!(
         tls_failure(io::Error::from(io::ErrorKind::ConnectionReset)).error,
         EstablishError::Tls("handshake")
+    );
+    Ok(())
+}
+
+#[test]
+fn ca_used_as_peer_leaf_is_an_untrusted_certificate_failure() -> TestResult {
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose,
+    };
+
+    let epoch = 2_000_000_000;
+    let now = time::OffsetDateTime::from_unix_timestamp(epoch)?;
+    let mut parameters = CertificateParams::new(vec!["remote.test".into()])?;
+    parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    parameters.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+    ];
+    parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    parameters.not_before = now - time::Duration::days(1);
+    parameters.not_after = now + time::Duration::days(1);
+    let (certificate, _) = crate::hosts::test_support::material(parameters)?;
+    let trust = PeerTrust::load(
+        &crate::config::S2sTlsConfig::default(),
+        Arc::new(rustls_graviola::default_provider()),
+    )?;
+    let error = trust
+        .verify_chain(
+            &[certificate],
+            UnixTime::since_unix_epoch(Duration::from_secs(epoch as u64)),
+        )
+        .err()
+        .ok_or("CA certificate was accepted as a peer leaf")?;
+    let rustls::Error::InvalidCertificate(CertificateError::Other(other)) = &error else {
+        return Err(format!("unexpected certificate error: {error:?}").into());
+    };
+    assert!(matches!(
+        other.0.downcast_ref::<webpki::Error>(),
+        Some(webpki::Error::CaUsedAsEndEntity)
+    ));
+    let failure = tls_failure(io::Error::new(io::ErrorKind::InvalidData, error));
+    assert_eq!(failure.error, EstablishError::Tls("certificate_untrusted"));
+    assert!(matches!(
+        failure.error.authentication(),
+        Some(AuthOutcome::CertificateUntrusted)
+    ));
+    assert_eq!(
+        failure.error.condition(),
+        StanzaErrorCondition::RemoteServerTimeout
     );
     Ok(())
 }

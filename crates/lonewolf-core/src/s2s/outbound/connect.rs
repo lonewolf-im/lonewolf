@@ -208,7 +208,7 @@ fn tls_reason(error: &rustls::Error) -> &'static str {
                 | CertificateError::ExpiredContext { .. }
                 | CertificateError::NotValidYet
                 | CertificateError::NotValidYetContext { .. } => "certificate_expired",
-                _ => "handshake",
+                _ => "certificate_untrusted",
             }
         }
         _ => "handshake",

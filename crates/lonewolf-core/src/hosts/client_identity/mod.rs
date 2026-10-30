@@ -5,7 +5,10 @@ use std::fmt;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::time::Duration;
 
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig};
@@ -14,10 +17,13 @@ use lonewolf_xmpp::jid::Jid;
 use rustls::RootCertStore;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::CryptoProvider;
+#[cfg(test)]
+use rustls::pki_types::CertificateRevocationListDer;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
+use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use x509_cert::Certificate;
+#[cfg(test)]
 use x509_cert::crl::CertificateList;
 use x509_cert::der::Decode;
 use x509_cert::der::asn1::{ObjectIdentifier, Utf8StringRef};
@@ -26,8 +32,9 @@ use x509_cert::ext::pkix::{KeyUsage, SubjectAltName};
 
 use crate::config::ClientCertificateConfig;
 
+use super::revocation::{CrlSet, RECHECK_INTERVAL};
+
 const XMPP_ADDR: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.8.5");
-const RECHECK_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug)]
 pub struct ClientIdentities {
@@ -397,34 +404,8 @@ fn load_verifier(
     path: &std::path::Path,
     now: SystemTime,
 ) -> Result<(Arc<KeyUsageVerifier>, SystemTime), ClientIdentityError> {
-    let file = File::open(path).map_err(|_| ClientIdentityError::RevocationMaterial)?;
-    let mut crls = Vec::new();
-    let mut valid_until = None;
-    for crl in CertificateRevocationListDer::pem_reader_iter(file) {
-        let crl = crl.map_err(|_| ClientIdentityError::RevocationMaterial)?;
-        let parsed: CertificateList = CertificateList::from_der(crl.as_ref())
-            .map_err(|_| ClientIdentityError::RevocationMaterial)?;
-        let this_update = UNIX_EPOCH
-            .checked_add(parsed.tbs_cert_list.this_update.to_unix_duration())
-            .ok_or(ClientIdentityError::InvalidTime)?;
-        let next_update = parsed
-            .tbs_cert_list
-            .next_update
-            .ok_or(ClientIdentityError::RevocationMaterial)?;
-        let expiration = UNIX_EPOCH
-            .checked_add(next_update.to_unix_duration())
-            .ok_or(ClientIdentityError::InvalidTime)?;
-        if this_update > now || expiration <= now || expiration <= this_update {
-            return Err(ClientIdentityError::RevocationMaterial);
-        }
-        valid_until =
-            Some(valid_until.map_or(expiration, |deadline: SystemTime| deadline.min(expiration)));
-        crls.push(webpki::CertRevocationList::Owned(
-            webpki::OwnedCertRevocationList::from_der(crl.as_ref())
-                .map_err(|_| ClientIdentityError::RevocationMaterial)?,
-        ));
-    }
-    let valid_until = valid_until.ok_or(ClientIdentityError::RevocationMaterial)?;
+    let crls = CrlSet::load(path, now).map_err(|_| ClientIdentityError::RevocationMaterial)?;
+    let valid_until = crls.next_update();
     Ok((
         Arc::new(KeyUsageVerifier {
             roots: Arc::clone(roots),
@@ -440,7 +421,7 @@ fn load_verifier(
 struct KeyUsageVerifier {
     roots: Arc<RootCertStore>,
     root_hint_subjects: Vec<rustls::DistinguishedName>,
-    crls: Vec<webpki::CertRevocationList<'static>>,
+    crls: CrlSet,
     supported_algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
@@ -451,24 +432,15 @@ impl KeyUsageVerifier {
         intermediates: &'p [CertificateDer<'p>],
         now: UnixTime,
     ) -> Result<webpki::VerifiedPath<'p>, rustls::Error> {
-        let crl_refs = self.crls.iter().collect::<Vec<_>>();
-        let revocation = webpki::RevocationOptionsBuilder::new(&crl_refs)
-            .map_err(|_| {
-                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownRevocationStatus)
-            })?
-            .with_depth(webpki::RevocationCheckDepth::Chain)
-            .with_status_policy(webpki::UnknownStatusPolicy::Deny)
-            .with_expiration_policy(webpki::ExpirationPolicy::Enforce)
-            .build();
-        let path = end_entity
-            .verify_for_usage(
-                self.supported_algorithms.all,
+        let path = self
+            .crls
+            .verify_path(
+                end_entity,
                 &self.roots.roots,
                 intermediates,
                 now,
+                self.supported_algorithms.all,
                 webpki::KeyUsage::client_auth(),
-                Some(revocation),
-                None,
             )
             .map_err(webpki_error)?;
         validate_key_usage(&end_entity.der(), intermediates)?;

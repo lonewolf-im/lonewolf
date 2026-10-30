@@ -31,6 +31,7 @@ use lonewolf_util::blocking::BlockingExecutor;
 
 pub mod client_identity;
 pub(crate) mod peer_identity;
+pub(crate) mod revocation;
 pub(crate) mod service_identity;
 
 use client_identity::{ClientCertificatePolicy, ClientIdentityError};

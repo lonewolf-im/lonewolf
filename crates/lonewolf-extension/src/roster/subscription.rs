@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::roster::{
-    RosterError, RosterJid, RosterMutation, RosterReads, RosterSubscription, RosterVersion,
-    SubscriptionState,
+    PendingSubscription, RosterError, RosterJid, RosterMutation, RosterReads, RosterSubscription,
+    RosterVersion, SubscriptionState,
 };
 use lonewolf_storage::{ReadTransaction, WriteTransaction};
 use lonewolf_util::arena::ChunkAllocator;
@@ -245,7 +245,6 @@ pub(super) struct Parties {
 }
 
 impl Parties {
-    /// A domain-only target cannot hold a roster, so it is reported as unavailable.
     pub(super) fn new<A: ChunkAllocator>(
         request: &PresenceRequest<'_, A>,
     ) -> Result<Self, StanzaErrorCondition> {
@@ -272,6 +271,187 @@ async fn check_parties(
 ) -> Result<bool, HandlerError> {
     require_account(transaction, &parties.sender).await?;
     account_exists(transaction, &parties.target, "roster_write").await
+}
+
+pub(super) async fn receive_remote<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
+    request: PresenceRequest<'_, A>,
+    transaction: &mut W,
+    _hosts: &dyn HostLookup,
+) -> Result<Effects<A>, HandlerError> {
+    if request.sender.bare().localpart().is_none() {
+        return Ok(Effects::none());
+    }
+    let owner = AccountKey::try_from(request.target)
+        .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
+    if !account_exists(transaction, &owner, "roster_write").await? {
+        return Ok(Effects::none());
+    }
+    let contact = RosterJid::from(request.sender.bare());
+    let current = transaction
+        .roster_subscription(&owner, &contact)
+        .await
+        .map_err(|error| roster_error(error, "roster_read"))?
+        .unwrap_or_default();
+    let granted = grants(current.state);
+    let mut deliver = false;
+    let mut approve = false;
+    let mut cancel = false;
+    let mut current_presence = false;
+    let mut unavailable_presence = false;
+    let mutation = match request.kind {
+        PresenceRequestType::Subscribe if granted => {
+            approve = true;
+            Ok(None)
+        }
+        PresenceRequestType::Subscribe if current.approved => {
+            approve = true;
+            current_presence = true;
+            state::update_existing_subscription(
+                roster,
+                transaction,
+                &owner,
+                &contact,
+                |subscription| {
+                    let mut subscription = state::grant(subscription)?;
+                    subscription.approved = false;
+                    Some(subscription)
+                },
+            )
+            .await
+            .map_err(|error| roster_error(error, "roster_write"))
+        }
+        PresenceRequestType::Subscribe => {
+            if !transaction
+                .pending_request_exists(&owner, &contact)
+                .await
+                .map_err(|error| roster_error(error, "roster_write"))?
+            {
+                let limits = roster
+                    .limits
+                    .get(owner.domain())
+                    .copied()
+                    .unwrap_or_default();
+                let mut stored = String::new();
+                request
+                    .stanza
+                    .resolve()
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                    .write_xml(&mut stored)
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                transaction
+                    .put_pending_request(
+                        &owner,
+                        PendingSubscription {
+                            sender: contact.clone(),
+                            stanza: stored.into_bytes().into_boxed_slice(),
+                        },
+                        limits.max_pending_subscription_requests,
+                    )
+                    .await
+                    .map_err(|error| roster_error(error, "roster_write"))?;
+                deliver = true;
+            }
+            Ok(None)
+        }
+        PresenceRequestType::Subscribed => {
+            let mutation = state::update_existing_subscription(
+                roster,
+                transaction,
+                &owner,
+                &contact,
+                state::approve_pending_out,
+            )
+            .await
+            .map_err(|error| roster_error(error, "roster_write"))?;
+            deliver = mutation.is_some();
+            Ok(mutation)
+        }
+        PresenceRequestType::Unsubscribe => {
+            let pending_removed = transaction
+                .remove_pending_request(&owner, &contact)
+                .await
+                .map_err(|error| roster_error(error, "roster_write"))?;
+            deliver = pending_removed || granted;
+            cancel = deliver;
+            unavailable_presence = granted;
+            if granted {
+                state::update_existing_subscription(
+                    roster,
+                    transaction,
+                    &owner,
+                    &contact,
+                    |mut subscription| {
+                        subscription.state = match subscription.state {
+                            SubscriptionState::From => SubscriptionState::None,
+                            SubscriptionState::Both => SubscriptionState::To,
+                            state => state,
+                        };
+                        Some(subscription)
+                    },
+                )
+                .await
+                .map_err(|error| roster_error(error, "roster_write"))
+            } else {
+                Ok(None)
+            }
+        }
+        PresenceRequestType::Unsubscribed => {
+            let mutation = state::update_existing_subscription(
+                roster,
+                transaction,
+                &owner,
+                &contact,
+                state::withdraw_outbound,
+            )
+            .await
+            .map_err(|error| roster_error(error, "roster_write"))?;
+            deliver = mutation.is_some();
+            Ok(mutation)
+        }
+        _ => return Err(StanzaErrorCondition::ServiceUnavailable.into()),
+    }?;
+    let kind = request.kind;
+    let stanza = request.stanza.clone();
+    Ok(Effects::new(vec![owner.clone()], move |delivery| {
+        Box::pin(async move {
+            let approval_request = if approve {
+                Some(stanza)
+            } else {
+                if deliver {
+                    if kind == PresenceRequestType::Subscribe {
+                        delivery.to_available(stanza).await?;
+                    } else {
+                        delivery.to_tagged(SessionTag::Interested, stanza).await?;
+                    }
+                }
+                None
+            };
+            if let Some(mutation) = mutation {
+                push_change(&owner, mutation, delivery).await?;
+            }
+            if let Some(request) = approval_request {
+                delivery
+                    .to_remote(xml::approval_reply(&request, delivery.arena()?)?)
+                    .await?;
+            }
+            if cancel || current_presence || unavailable_presence {
+                let contact = AccountKey::try_from(&contact).map_err(|_| DeliveryError)?;
+                if cancel {
+                    let (_, reply) =
+                        xml::subscription_withdrawals(&owner, &contact, delivery.arena()?)?;
+                    delivery.to_remote(reply).await?;
+                }
+                if current_presence {
+                    delivery.current_presence(&owner, &contact).await?;
+                }
+                if unavailable_presence {
+                    delivery.unavailable_presence(&owner, &contact).await?;
+                }
+            }
+            Ok(())
+        })
+    }))
 }
 
 pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>(

@@ -457,9 +457,21 @@ where
         &'a self,
         request: PresenceRequest<'a, A>,
         transaction: &'a mut S::Write,
-        _hosts: &'a dyn HostLookup,
+        hosts: &'a dyn HostLookup,
     ) -> ReceiveFuture<'a, A> {
         Box::pin(async move {
+            if hosts.federates(request.target.domainpart())
+                && !hosts.is_local_host(request.sender.domainpart())
+                && matches!(
+                    request.kind,
+                    PresenceRequestType::Subscribe
+                        | PresenceRequestType::Subscribed
+                        | PresenceRequestType::Unsubscribe
+                        | PresenceRequestType::Unsubscribed
+                )
+            {
+                return subscription::receive_remote(self, request, transaction, hosts).await;
+            }
             let parties = Parties::new(&request)?;
             match request.kind {
                 PresenceRequestType::Subscribe => {

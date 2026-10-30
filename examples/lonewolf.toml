@@ -310,6 +310,14 @@
 # This optional path has no default; the value below is an example.
 # trust_anchors_path = "./certs/federation-roots.pem"
 
+# Check peer certificates against the revocation lists their CAs publish. Lonewolf
+# downloads each list over plain HTTP from the address in the certificate, caches it
+# and refreshes it. A peer is rejected only when a list shows its certificate as
+# revoked; missing or unreachable lists do not block federation. With the bundled
+# public roots, lists on private or loopback addresses are not downloaded. Turn this
+# off if the server must not make outbound HTTP requests.
+# fetch_crls = true
+
 # [s2s.dns]
 
 # Override /etc/resolv.conf with numeric DNS server addresses and ports.

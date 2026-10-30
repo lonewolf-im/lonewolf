@@ -1171,6 +1171,7 @@ fn s2s_defaults_preserve_localhost_without_a_certificate() -> TestResult {
     assert_eq!(config.s2s.listeners.len(), 1);
     assert_eq!(config.s2s.listeners[0].address, "0.0.0.0:5269".parse()?);
     assert_eq!(config.s2s.tls.trust_anchors_path, None);
+    assert!(config.s2s.tls.fetch_crls);
     assert!(config.s2s.dns.nameservers.is_empty());
     assert_eq!(config.s2s.dns.timeout_secs.get(), 5);
     assert!(config.s2s.routes.is_empty());
@@ -1210,6 +1211,7 @@ enabled = false
 address = "[::]:5269"
 [s2s.tls]
 trust_anchors_path = "private.pem"
+fetch_crls = false
 [s2s.dns]
 nameservers = ["127.0.0.1:53", "[::1]:5353"]
 timeout_secs = 7
@@ -1229,6 +1231,7 @@ timeout_secs = 7
         config.s2s.tls.trust_anchors_path.as_deref(),
         Some(Path::new("private.pem"))
     );
+    assert!(!config.s2s.tls.fetch_crls);
     assert_eq!(
         config.s2s.dns.nameservers,
         vec!["127.0.0.1:53".parse()?, "[::1]:5353".parse()?]
@@ -1247,6 +1250,7 @@ fn s2s_rejects_unknown_fields_and_invalid_shapes() -> TestResult {
         "[s2s]\nunknown = true",
         "[[s2s.listeners]]\nunknown = true",
         "[s2s.tls]\nunknown = true",
+        "[s2s.tls]\nfetch_crls = 'yes'",
         "[s2s.dns]\nunknown = true",
         "[s2s.dns]\ntimeout_secs = 0",
         "[s2s.dns]\nnameservers = ['resolver.example:53']",

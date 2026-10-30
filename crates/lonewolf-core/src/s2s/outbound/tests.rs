@@ -314,6 +314,7 @@ fn configured_anchor_expiry_rejects_an_otherwise_valid_peer_at_completion() -> T
     let trust = PeerTrust::load(
         &crate::config::S2sTlsConfig {
             trust_anchors_path: Some(path),
+            ..crate::config::S2sTlsConfig::default()
         },
         Arc::new(rustls_graviola::default_provider()),
     )?;

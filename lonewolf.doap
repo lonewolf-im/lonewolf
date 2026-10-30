@@ -81,7 +81,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.3.0</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Does not validate vCard contents. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Public retrieval includes authenticated users of federated domains; remote SET is forbidden. Does not validate vCard contents. Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -98,7 +98,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
         <xmpp:since>0.1.0</xmpp:since>
-        <xmpp:note xml:lang="en">Does not check certificate revocation. Server-to-server support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Client certificate authentication and S2S EXTERNAL with an explicit serverAuth EKU in both directions. Missing EKU and clientAuth-only certificates are rejected for S2S. S2S certificate revocation is not checked. Server-to-server support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -124,7 +124,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0.1</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Group chat private messages get no special handling yet. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Eligible federated messages produce sender and recipient Carbons copies. Group chat private messages get no special handling yet. Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

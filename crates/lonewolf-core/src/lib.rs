@@ -91,7 +91,14 @@ pub fn run_with_extensions(
     build: BuildInfo,
     extensions: Extensions<Arc<PooledChunkAllocator>, RedbStorage>,
 ) -> Result<(), RunError> {
-    run_internal(config_path, build, extensions, acme::LoadOptions::default())
+    run_internal(
+        config_path,
+        build,
+        extensions,
+        acme::LoadOptions::default(),
+        #[cfg(feature = "test-support")]
+        None,
+    )
 }
 
 #[cfg(feature = "test-support")]
@@ -105,6 +112,7 @@ pub fn run_with_acme_clock(
         build,
         Extensions::default(),
         acme::LoadOptions { clock: Some(clock) },
+        None,
     )
 }
 
@@ -113,6 +121,9 @@ fn run_internal(
     build: BuildInfo,
     mut extensions: Extensions<Arc<PooledChunkAllocator>, RedbStorage>,
     acme_options: acme::LoadOptions,
+    #[cfg(feature = "test-support")] s2s_shutdown_state: Option<
+        &mut Option<test_support::S2sShutdownState>,
+    >,
 ) -> Result<(), RunError> {
     panic::init(&build);
 
@@ -168,6 +179,8 @@ fn run_internal(
             let mut s2s_listeners = None;
             let mut remote = None;
             let mut router = None;
+            #[cfg(feature = "test-support")]
+            let mut observed_s2s_metrics = None;
             let mut shutdown_deadline = None;
             let result = async {
                 match startup_until_signal(
@@ -254,6 +267,10 @@ fn run_internal(
                     );
                     None
                 };
+                #[cfg(feature = "test-support")]
+                if s2s_shutdown_state.is_some() {
+                    observed_s2s_metrics = s2s_metrics.as_ref().map(Arc::clone);
+                }
                 let metrics_server = if config.metrics.enabled {
                     Some(
                         lonewolf_metrics::MetricsServer::bind(config.metrics.address)
@@ -446,7 +463,12 @@ fn run_internal(
                 .and(s2s_stopped)
                 .and(remote_stopped)
                 .and(router_stopped)
-                .and(acme_stopped)
+                .and(acme_stopped)?;
+            #[cfg(feature = "test-support")]
+            if let Some(destination) = s2s_shutdown_state {
+                *destination = observed_s2s_metrics.map(|metrics| metrics.shutdown_state());
+            }
+            Ok(())
         })?;
     }
 

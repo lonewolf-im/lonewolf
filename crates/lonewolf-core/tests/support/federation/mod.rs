@@ -321,3 +321,46 @@ impl std::error::Error for PhaseError {
         Some(self.source.as_ref())
     }
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ShutdownReceipt {
+    pid: u32,
+    // A missing field must not be accepted as an inactive result.
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    state: Option<lonewolf_core::test_support::S2sShutdownState>,
+}
+
+pub fn remove_shutdown_receipt(directory: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(directory.join("s2s-shutdown.json")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn write_shutdown_receipt(
+    directory: &std::path::Path,
+    state: Option<lonewolf_core::test_support::S2sShutdownState>,
+) -> TestResult {
+    let receipt = ShutdownReceipt {
+        pid: std::process::id(),
+        state,
+    };
+    std::fs::write(
+        directory.join("s2s-shutdown.json"),
+        serde_json::to_vec(&receipt)?,
+    )?;
+    Ok(())
+}
+
+pub fn read_shutdown_receipt(
+    directory: &std::path::Path,
+    pid: u32,
+) -> TestResult<Option<lonewolf_core::test_support::S2sShutdownState>> {
+    let receipt: ShutdownReceipt =
+        serde_json::from_slice(&std::fs::read(directory.join("s2s-shutdown.json"))?)?;
+    if receipt.pid != pid {
+        return Err("S2S shutdown receipt belongs to another process".into());
+    }
+    Ok(receipt.state)
+}

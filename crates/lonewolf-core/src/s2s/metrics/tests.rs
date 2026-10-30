@@ -494,3 +494,55 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
     assert_eq!(families.len(), 21);
     Ok(())
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn shutdown_snapshot_uses_rendered_counter_and_link_sources() -> Result<(), fmt::Error> {
+    let metrics = S2sMetrics::new(1);
+    assert_eq!(
+        metrics.shutdown_state(),
+        crate::test_support::S2sShutdownState {
+            dropped_shutdown: 0,
+            dropped_connection_lost: 0,
+            queued_stanzas: 0,
+            queued_bytes: 0,
+        }
+    );
+    let source = Arc::new(FakeLinks::default());
+    let erased: Arc<dyn LinkStats> = source.clone();
+    metrics.set_link_source(Arc::downgrade(&erased));
+    for value in [0, 2, 5] {
+        source.value.store(value, Ordering::Relaxed);
+        metrics.dropped(DropReason::Shutdown, value);
+        metrics.dropped(DropReason::ConnectionLost, value + 1);
+        let state = metrics.shutdown_state();
+        let output = render(&metrics)?;
+        for (name, count) in [
+            (
+                "lonewolf_s2s_dropped_stanzas_total{reason=\"shutdown\"}",
+                state.dropped_shutdown,
+            ),
+            (
+                "lonewolf_s2s_dropped_stanzas_total{reason=\"connection_lost\"}",
+                state.dropped_connection_lost,
+            ),
+            ("lonewolf_s2s_outbound_queued_stanzas", state.queued_stanzas),
+            ("lonewolf_s2s_outbound_queued_bytes", state.queued_bytes),
+        ] {
+            if count > 0 || !name.contains("dropped") {
+                assert_sample(&output, &format!("{name} {count}"));
+            }
+        }
+        assert_eq!(state.queued_stanzas, value * 3);
+        assert_eq!(state.queued_bytes, value * 17);
+    }
+    drop(erased);
+    drop(source);
+    let state = metrics.shutdown_state();
+    assert_eq!(state.dropped_shutdown, 7);
+    assert_eq!(state.dropped_connection_lost, 10);
+    assert_eq!(state.queued_stanzas, 0);
+    assert_eq!(state.queued_bytes, 0);
+    assert_link_samples(&render(&metrics)?, 0);
+    Ok(())
+}

@@ -72,7 +72,7 @@
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>2.5.0</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Answers queries about the server, its accounts and hosted services. Users on other servers see the same resources as a local contact would. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -81,7 +81,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.3.0</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Each account keeps one vCard that only its owner can replace. Local users and users on other servers can read it, even while the owner is offline. The server does not validate vCard contents. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Does not validate vCard contents. Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -98,7 +98,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
         <xmpp:since>0.1.0</xmpp:since>
-        <xmpp:note xml:lang="en">Clients can log in with a TLS client certificate. Servers authenticate each other with certificates in both directions, require the serverAuth extended key usage and close the connection when a certificate expires. Certificate revocation is not checked. Server-to-server support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Does not check certificate revocation. Server-to-server support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -107,7 +107,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>2.0.1</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Answers pings from clients and other servers but never sends its own. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Answers pings but never sends its own. Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -124,7 +124,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0.1</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Copies sent and received messages to all of a user's sessions that enable it, including messages exchanged with other servers. Private group chat messages get no special handling because group chat is not supported yet. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Group chat private messages get no special handling yet. Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

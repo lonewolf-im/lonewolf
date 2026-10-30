@@ -41,6 +41,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "signal", "macros", "io-util"] }
 
 [dev-dependencies]
+hickory-proto.workspace = true
 async-lock.workspace = true
 tracing.workspace = true
 compio = { workspace = true, features = ["time"] }

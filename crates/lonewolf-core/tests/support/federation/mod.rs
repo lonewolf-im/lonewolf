@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::process::ExitStatus;
+use std::sync::{Arc, atomic::AtomicBool};
+use std::thread;
+
+use parking_lot::Mutex as PlMutex;
+
+use super::server::C2sSuitePermit;
+use super::{C2sSuite, Client, TestResult};
+pub mod dns;
+pub mod peer;
+pub mod pki;
+
+pub use dns::FakeDns;
+pub use pki::FederationCa;
+
+#[derive(Default, Debug)]
+pub struct ProcessCompletions {
+    pub spawned: Vec<u32>,
+    pub ready: Vec<u32>,
+    pub reaped: Vec<(u32, ExitStatus)>,
+}
+pub type ProcessReceipts = Arc<PlMutex<ProcessCompletions>>;
+
+pub struct FederatedHost {
+    pub domain: String,
+    pub enabled: Option<bool>,
+    pub federation: Option<bool>,
+    pub extensions: String,
+    pub extra_toml: String,
+    pub ca: Arc<FederationCa>,
+    pub dns: SocketAddr,
+    pub completion: Option<ProcessReceipts>,
+}
+
+pub struct PairOptions {
+    pub a_enabled: Option<bool>,
+    pub b_enabled: Option<bool>,
+    pub a_federation: Option<bool>,
+    pub b_federation: Option<bool>,
+    pub a_extensions: String,
+    pub b_extensions: String,
+    pub limits: String,
+    pub a_extra_toml: String,
+    pub b_extra_toml: String,
+    pub completion: Option<ProcessReceipts>,
+    pub dns_join: Option<Arc<PlMutex<Option<Arc<AtomicBool>>>>>,
+}
+
+impl Default for PairOptions {
+    fn default() -> Self {
+        Self {
+            a_enabled: Some(true),
+            b_enabled: Some(true),
+            a_federation: None,
+            b_federation: None,
+            a_extensions: String::new(),
+            b_extensions: String::new(),
+            limits: String::new(),
+            a_extra_toml: String::new(),
+            b_extra_toml: String::new(),
+            completion: None,
+            dns_join: None,
+        }
+    }
+}
+
+pub struct FederatedPair {
+    pub a: C2sSuite,
+    pub b: C2sSuite,
+    pub dns: FakeDns,
+    pub ca: Arc<FederationCa>,
+    _directory: tempfile::TempDir,
+}
+impl FederatedPair {
+    pub fn start(a: &str, b: &str, options: PairOptions) -> TestResult<Self> {
+        let [a_permit, b_permit] = C2sSuitePermit::pair();
+        let directory = tempfile::tempdir()?;
+        let ca = Arc::new(FederationCa::new(directory.path())?);
+        let dns = FakeDns::start()?;
+        if let Some(receipt) = options.dns_join {
+            *receipt.lock() = Some(dns.join_receipt());
+        }
+        let extra = if options.limits.is_empty() {
+            String::new()
+        } else {
+            format!("\n[limits.s2s]\n{}", options.limits)
+        };
+        let a_host = FederatedHost {
+            domain: a.into(),
+            enabled: options.a_enabled,
+            federation: options.a_federation,
+            extensions: options.a_extensions,
+            extra_toml: format!("{extra}\n{}", options.a_extra_toml),
+            ca: Arc::clone(&ca),
+            dns: dns.address(),
+            completion: options.completion.clone(),
+        };
+        let b_host = FederatedHost {
+            domain: b.into(),
+            enabled: options.b_enabled,
+            federation: options.b_federation,
+            extensions: options.b_extensions,
+            extra_toml: format!("{extra}\n{}", options.b_extra_toml),
+            ca: Arc::clone(&ca),
+            dns: dns.address(),
+            completion: options.completion,
+        };
+        let (a_result, b_result) = thread::scope(|scope| {
+            let a = scope.spawn(move || {
+                C2sSuite::federated_with_permit(a_host, a_permit).map_err(|error| error.to_string())
+            });
+            let b = scope.spawn(move || {
+                C2sSuite::federated_with_permit(b_host, b_permit).map_err(|error| error.to_string())
+            });
+            let a = a.join();
+            let b = b.join();
+            (a, b)
+        });
+        let a = a_result.map_err(|_| "first federation startup worker panicked")?;
+        let b = b_result.map_err(|_| "second federation startup worker panicked")?;
+        let a = a?;
+        let b = b?;
+        let pair = Self {
+            a,
+            b,
+            dns,
+            ca,
+            _directory: directory,
+        };
+        for (prefix, suite) in [("a", &pair.a), ("b", &pair.b)] {
+            let domain = &suite.domain;
+            let target = format!("{prefix}.{domain}");
+            if let Some(address) = suite.s2s.as_ref().and_then(|addresses| addresses.first()) {
+                pair.dns.srv(domain, &[(0, 0, address.port(), &target)]);
+            }
+            pair.dns.a(&target, Ipv4Addr::LOCALHOST);
+        }
+        Ok(pair)
+    }
+
+    pub fn stop(&mut self) -> TestResult {
+        let a = self.a.stop();
+        let b = self.b.stop();
+        a?;
+        b?;
+        self.dns.stop()
+    }
+}
+impl Drop for FederatedPair {
+    fn drop(&mut self) {
+        self.a.terminate_and_reap();
+        self.b.terminate_and_reap();
+        let _ = self.dns.stop();
+    }
+}
+
+pub fn subscribe_mutually(a: &mut Client, a_jid: &str, b: &mut Client, b_jid: &str) -> TestResult {
+    for client in [&mut *a, &mut *b] {
+        client.send("<iq type='get' id='initial-roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+        let roster = client.receive()?;
+        roster.assert_name("jabber:client", "iq");
+        assert_eq!(roster.attribute("type"), Some("result"));
+        assert_eq!(roster.attribute("id"), Some("initial-roster"));
+        roster.child("jabber:iq:roster", "query")?;
+        client.send("<presence/>")?;
+        let presence = client.receive()?;
+        presence.assert_name("jabber:client", "presence");
+        assert_eq!(presence.attribute("type"), None);
+    }
+    subscribe(a, a_jid, b, b_jid, "none", "to", "from")?;
+    subscribe(b, b_jid, a, a_jid, "from", "both", "both")?;
+    for (client, jid) in [(&mut *a, b_jid), (&mut *b, a_jid)] {
+        client.send("<iq type='get' id='mutual-roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+        let roster = client.receive()?;
+        assert_eq!(roster.attribute("id"), Some("mutual-roster"));
+        let item = roster
+            .child("jabber:iq:roster", "query")?
+            .child("jabber:iq:roster", "item")?;
+        assert_eq!(item.attribute("jid"), Some(jid));
+        assert_eq!(item.attribute("subscription"), Some("both"));
+    }
+    Ok(())
+}
+fn subscribe(
+    a: &mut Client,
+    a_jid: &str,
+    b: &mut Client,
+    b_jid: &str,
+    pending: &str,
+    approved: &str,
+    grantor: &str,
+) -> TestResult {
+    a.send(&format!("<presence type='subscribe' to='{b_jid}'/>"))?;
+    roster_push(a, b_jid, pending)?;
+    let request = b.receive()?;
+    request.assert_name("jabber:client", "presence");
+    assert_eq!(request.attribute("type"), Some("subscribe"));
+    assert_eq!(request.attribute("from"), Some(a_jid));
+    b.send(&format!("<presence type='subscribed' to='{a_jid}'/>"))?;
+    roster_push(b, a_jid, grantor)?;
+    let response = a.receive()?;
+    response.assert_name("jabber:client", "presence");
+    assert_eq!(response.attribute("type"), Some("subscribed"));
+    roster_push(a, b_jid, approved)?;
+    let presence = a.receive()?;
+    presence.assert_name("jabber:client", "presence");
+    assert_eq!(presence.attribute("type"), None);
+    assert!(
+        presence
+            .attribute("from")
+            .is_some_and(|from| from.split_once('/').is_some_and(|(bare, _)| bare == b_jid))
+    );
+    Ok(())
+}
+fn roster_push(client: &mut Client, jid: &str, subscription: &str) -> TestResult {
+    let push = client.receive()?;
+    push.assert_name("jabber:client", "iq");
+    assert_eq!(push.attribute("type"), Some("set"));
+    let item = push
+        .child("jabber:iq:roster", "query")?
+        .child("jabber:iq:roster", "item")?;
+    assert_eq!(item.attribute("jid"), Some(jid));
+    assert_eq!(item.attribute("subscription"), Some(subscription));
+    client.send(&format!(
+        "<iq type='result' id='{}'/>",
+        push.attribute("id").ok_or("missing roster push id")?
+    ))
+}

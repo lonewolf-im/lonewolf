@@ -10,33 +10,27 @@
 
 </div>
 
-Lonewolf is a self-hosted [XMPP](https://xmpp.org/) server with a simple goal:
-combine easy setup and operation with high performance and a path to clustering.
-Start small, grow when you need to, and keep your server easy to run.
+Lonewolf is a self-hosted [XMPP](https://xmpp.org/) server written in Rust. It's
+meant to be easy to set up, cheap to run, and able to grow into a cluster when you
+need one.
 
 > [!NOTE]
-> Lonewolf is early, pre-1.0 software. Today it can host chat between accounts on
-> domains you run. Federation with other XMPP servers is next on the
-> [roadmap](docs/ROADMAP.md); clustering comes later.
+> Lonewolf is early, pre-1.0 software. Today it hosts chat between accounts on
+> the domains you run. Federation with other XMPP servers is in progress, and
+> clustering comes later.
 >
 > Most of Lonewolf's code, tests and docs are written with AI coding agents. The
 > maintainer sets the design and scope and reviews the changes.
 
 ## Why Lonewolf?
 
-- **Easy to run.** One server binary with embedded storage, no database server
-  or runtime to install, and just two lines of config for local testing.
-- **Room to grow.** The goal is to keep operation simple as your deployment grows,
-  from a standalone server to a cluster. PostgreSQL storage and multi-node
-  operation are on the [roadmap](docs/ROADMAP.md).
-- **Light on resources.** It's a native Rust binary built to be frugal with
-  memory and CPU.
-- **Standards first.** Lonewolf follows the core XMPP RFCs
-  ([RFC 6120](https://www.rfc-editor.org/rfc/rfc6120.html) and friends) closely,
-  aiming for standards-compliant clients to behave the way you'd expect.
-- **Limits you can see.** Connections, stanzas, rates, and resources all have
-  explicit, configurable limits, so one misbehaving client can't quietly take
-  down your server.
+- **Easy to run.** One binary with embedded storage. There's no database server
+  to install, and a local test server needs two lines of config.
+- **Light on resources.** It's native Rust and frugal with memory and CPU.
+- **Standards first.** It follows the core XMPP RFCs closely, so standard
+  clients behave the way you'd expect.
+- **Limits you can see.** Connections, stanzas, rates and resources all have
+  configurable limits, so one misbehaving client can't take your server down.
 
 ## Quick start
 
@@ -73,10 +67,10 @@ Then start it:
 ./target/release/lonewolf --config ./lonewolf.toml
 ```
 
-That's all the config you need. With this configuration, Lonewolf listens on your
-loopback address only. It serves the built-in `localhost` domain, turns on contact
-lists and offline messages, and keeps everything in an embedded [redb](https://github.com/cberner/redb)
-database. Leave it running.
+That's all the config you need. Lonewolf listens on your loopback address only,
+serves the built-in `localhost` domain with its default features, and keeps
+everything in an embedded [redb](https://github.com/cberner/redb) database. Leave
+it running.
 
 ### 3. Create two accounts
 
@@ -105,9 +99,8 @@ these settings:
 | Connection security | STARTTLS, required |
 
 The server creates a self-signed certificate for `localhost` when it starts, so
-your client will ask whether to trust it. Say yes for this test. The certificate
-changes every time the server restarts, unless you point Lonewolf at your own
-certificate files.
+your client will ask whether to trust it. Say yes for this test. You'll get a new
+certificate each time the server restarts, unless you give Lonewolf your own.
 
 Now add `bob@localhost` as a contact from Alice's account, and accept the request
 on Bob's side. You should see each other come online and be able to chat.
@@ -120,57 +113,45 @@ undelivered messages are saved in `./data/lonewolf.dat`.
 
 ## What works today
 
-**Connections and security**
+- Chat between accounts on any domain you host, with several devices per account
+- Contact lists, presence subscriptions, and offline messages that keep their
+  original timestamps
+- Message copies across your devices (Carbons), service discovery, vCard
+  profiles and ping
+- STARTTLS, SCRAM login with channel binding, and optional client-certificate
+  login
+- TLS certificates from your own files or from Let's Encrypt
+- Account management with `lonewolfctl`, Prometheus metrics, structured logs and
+  graceful shutdown
 
-- TCP connections secured with STARTTLS
-- SCRAM authentication, plus optional client-certificate login
-- Automatic TLS certificates from Let's Encrypt, or your own certificate files
-
-**Messaging and presence**
-
-- Direct messaging between accounts on any domain you host, with multiple
-  devices (resources) per account
-- Contact lists (rosters), subscriptions, presence, and roster versioning
-- Offline messages that are stored, timestamped, and delivered when the
-  recipient comes back
-
-**Running it**
-
-- Host several domains, each with its own roster and offline settings
-- Embedded redb storage for accounts, credentials, rosters, and offline messages
-- Account management with `lonewolfctl`
-- Configurable limits for connections, stanzas, rates, and resources
-- Structured logs and graceful shutdown
+Lonewolf runs on Unix-like systems, and CI tests it on Linux and macOS. The
+[standards reference](docs/STANDARDS.md) lists every supported XEP and RFC, and
+its limits.
 
 ## What's next
 
-For now, Lonewolf only talks to clients. It can't exchange messages with other XMPP
-servers yet. It runs on Unix-like systems, and CI tests it on Linux and macOS.
+Federation with other XMPP servers is being built on `main` but isn't in a
+release yet. After that, the [roadmap to 1.0](docs/ROADMAP.md) covers, in order:
 
-The [roadmap to 1.0](docs/ROADMAP.md) lays out each milestone, the XEPs it needs,
-and what "done" means for it. In order:
-
-1. **Desktop Basic IM**, including federation with other servers and group chats (MUC)
-2. **Advanced IM**: message archives and Stream Management
-3. **PostgreSQL storage and clustering**
-4. **Mobile and web support**
+1. Group chats, file upload and the rest of basic desktop IM
+2. Message archives, Stream Management, blocking, avatars and bookmarks
+3. PostgreSQL storage and clustering
+4. Mobile and web support
 
 ## Configuration
 
-Lonewolf uses a TOML config file. By default it looks for `./lonewolf.toml` and
-falls back to built-in defaults if there isn't one. If you pass `--config`, that
-file has to exist.
+Lonewolf reads `./lonewolf.toml` if it exists and uses built-in defaults
+otherwise. If you pass `--config`, that file has to exist.
+
+[`examples/lonewolf.toml`](examples/lonewolf.toml) documents every setting and its
+default. Everything in it is commented out, so you only uncomment what you want
+to change.
 
 ### Hosting your own domain
 
-To serve a real domain instead of `localhost`, Lonewolf needs a certificate for
-it. You can hand it your own PEM files, or let it get one from Let's Encrypt.
-With files, it looks like this:
+To serve a real domain, give Lonewolf a certificate for it:
 
 ```toml
-[hosts."example.com"]
-extensions = ["roster", "offline"]
-
 [hosts."example.com".tls]
 certificate_chain_path = "./certs/example.com.crt"
 private_key_path = "./certs/example.com.key"
@@ -180,55 +161,38 @@ address = "0.0.0.0:5222"
 ```
 
 This replaces the default `localhost` host with `example.com` and listens on all
-IPv4 interfaces. The certificate files need to be in place before you start the
-server.
+IPv4 interfaces. Relative paths are resolved from the directory you start the
+server in.
 
-> [!TIP]
-> Relative paths, including the certificate, database, and admin socket paths,
-> are resolved from the directory you launch the server in.
+### Let's Encrypt
 
-### Let's Encrypt certificates
-
-Don't want to manage certificates yourself? Replace the file paths with a single
-line, and Lonewolf gets a certificate from Let's Encrypt and renews it before it
-expires:
+To have Lonewolf get and renew the certificate for you, replace the file paths
+with one line. You can choose this per host.
 
 ```toml
 [hosts."example.com".tls]
 provider = "letsencrypt"
 ```
 
-The choice is per host. You can switch a domain that already uses certificate
-files over to Let's Encrypt by changing just its `tls` table, and keep files for
-the rest.
-
-Choosing `letsencrypt` registers an ACME account and accepts Let's Encrypt's
-subscriber terms. To prove you control the domain, Let's Encrypt connects to
-public port 80 on every A and AAAA address the domain publishes, so that port has
-to reach Lonewolf. If something else already serves port 80, or you'd rather not
-let Lonewolf bind it, have your proxy forward it to a local port instead. The
-proxy must keep the original Host header and path:
+This accepts Let's Encrypt's subscriber terms. Let's Encrypt checks that you
+control the domain by connecting to port 80 on each of its public addresses, so
+that port has to reach Lonewolf. If a proxy already owns port 80, have it forward
+to a local port, keeping the original Host header and path:
 
 ```toml
 [letsencrypt]
 listen = ["127.0.0.1:8080"]
 ```
 
-Lonewolf keeps the ACME account and certificates in `./data/lonewolf/acme.redb`
-by default, so put that on durable storage. To try it out first, point
-`directory_url` at Let's Encrypt's staging server; the config reference shows
-how.
-
-Every setting, its default, and the certificate requirements are documented in
-[`examples/lonewolf.toml`](examples/lonewolf.toml). Everything there is commented
-out, so you only need to uncomment what you want to change.
+The certificates and ACME account live in `./data/lonewolf/acme.redb`, so keep it
+on durable storage. To test against Let's Encrypt's staging server first, see
+`directory_url` in the config reference.
 
 ## Managing accounts
 
 `lonewolfctl` talks to the running server over a local Unix socket, which is
-`./run/lonewolf/admin.sock` by default. Access is controlled by filesystem
-permissions, so anyone who can open the socket can manage accounts. Lock it down
-accordingly.
+`./run/lonewolf/admin.sock` by default. Anyone who can open that socket can
+manage accounts, so restrict its file permissions.
 
 ```sh
 ./target/release/lonewolfctl account list

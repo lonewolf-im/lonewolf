@@ -228,6 +228,7 @@ fn serve_tcp(
     answers: &PlMutex<Answers>,
     stopped: &AtomicBool,
 ) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
     stream.set_write_timeout(Some(Duration::from_millis(100)))?;
     let mut bytes = Vec::new();

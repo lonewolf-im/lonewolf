@@ -449,10 +449,17 @@ impl<A: ChunkAllocator + Clone> Connection<A> {
             Self::Tls(_, writer) => writer.close(condition).await,
         }
     }
-    async fn shutdown(&mut self) -> Result<(), S2sError> {
+    async fn shutdown(&mut self, peer_footer: bool) -> Result<(), S2sError> {
         match self {
             Self::Plain(_, writer) => writer.shutdown().await,
-            Self::Tls(_, writer) => writer.shutdown().await,
+            Self::Tls(reader, writer) => {
+                writer.shutdown().await?;
+                if peer_footer {
+                    reader.read_transport_end().await
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -520,13 +527,14 @@ impl<A: ChunkAllocator + Clone> Negotiation<A> {
                     compio::time::timeout_at(footer_deadline(deadline, Instant::now()), async {
                         while let Ok(Some(event)) = connection.next().await {
                             if matches!(event, StreamEvent::StreamEnd) {
+                                self.peer_footer = true;
                                 break;
                             }
                         }
                     })
                     .await;
             }
-            connection.shutdown().await
+            connection.shutdown(self.peer_footer).await
         })
         .await;
     }

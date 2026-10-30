@@ -29,7 +29,7 @@ use lonewolf_xmpp::stanza::{
 };
 use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamError, StreamErrorCondition};
 use oxilangtag::LanguageTag;
-use tokio::io::AsyncBufRead;
+use tokio::io::{AsyncBufRead, AsyncReadExt as _};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::metrics::{InboundLimit, S2sMetrics};
@@ -491,6 +491,17 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
         state.parser = parser;
         self.ready = Some(state);
         result
+    }
+
+    /// Call once after a TLS reader returns `StreamEvent::StreamEnd`.
+    /// Consumes input even if the read fails or is canceled.
+    pub(crate) async fn read_transport_end(&mut self) -> Result<(), S2sError> {
+        let (mut input, _) = self.take_input().await?;
+        let mut byte = [0];
+        match input.read(&mut byte).await? {
+            0 => Ok(()),
+            _ => Err(io::Error::from(io::ErrorKind::InvalidData).into()),
+        }
     }
 
     pub(crate) async fn take_input(&mut self) -> Result<(R, S2sReaderState), S2sError> {

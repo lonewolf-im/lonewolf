@@ -72,10 +72,17 @@ impl<A: ChunkAllocator + Clone> Connection<A> {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<(), S2sError> {
+    async fn shutdown(&mut self, peer_footer: bool) -> Result<(), S2sError> {
         match self {
             Self::Plain(_, writer) => writer.shutdown().await,
-            Self::Tls(_, writer) => writer.shutdown().await,
+            Self::Tls(reader, writer) => {
+                writer.shutdown().await?;
+                if peer_footer {
+                    reader.read_transport_end().await
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -215,6 +222,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                             async {
                                 while let Ok(Some(event)) = connection.next().await {
                                     if matches!(event, StreamEvent::StreamEnd) {
+                                        peer_footer = true;
                                         break;
                                     }
                                 }
@@ -222,7 +230,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                         )
                         .await;
                     }
-                    connection.shutdown().await
+                    connection.shutdown(peer_footer).await
                 })
                 .await;
             }

@@ -148,13 +148,54 @@ impl RawS2sPeer {
         self.stream.receive()
     }
     pub fn expect_stream_error(&mut self, condition: &str) -> TestResult {
-        self.stream.expect_stream_error(condition)
+        let error = super::phase("stream error reply", self.receive())?;
+        error.assert_name(super::super::xml::STREAM_NAMESPACE, "error");
+        assert_eq!(error.children.len(), 1);
+        error.child(super::super::STREAM_ERRORS, condition)?;
+        self.answer_close()
     }
     pub fn close(&mut self) -> TestResult {
-        self.stream.close()
+        super::phase("send XML footer", self.stream.send("</stream:stream>"))?;
+        super::phase("receive XML footer", self.stream.expect_footer())?;
+        self.complete_tls_close()
+    }
+    pub fn answer_close(&mut self) -> TestResult {
+        super::phase("receive XML footer", self.stream.expect_footer())?;
+        super::phase(
+            "send reciprocal XML footer",
+            self.stream.send("</stream:stream>"),
+        )?;
+        self.complete_tls_close()
+    }
+    fn complete_tls_close(&mut self) -> TestResult {
+        super::phase(
+            "send TLS close alert",
+            self.stream.transport().close_notify().map_err(Into::into),
+        )?;
+        self.expect_eof()
     }
     pub fn expect_eof(&mut self) -> TestResult {
-        self.stream.expect_eof()
+        assert!(
+            !self.stream.has_buffered_input(),
+            "input follows the peer footer"
+        );
+        let mut byte = [0];
+        let count = super::phase(
+            "receive TLS close alert and EOF",
+            self.stream.transport().read(&mut byte).map_err(Into::into),
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err("data follows the peer footer".into())
+        }
+    }
+    pub fn protocol_version(&mut self) -> Option<rustls::ProtocolVersion> {
+        match self.stream.transport() {
+            PeerTransport::Plain(_) => None,
+            PeerTransport::Client(stream) => stream.conn.protocol_version(),
+            PeerTransport::Server(stream) => stream.conn.protocol_version(),
+        }
     }
 }
 
@@ -252,8 +293,16 @@ pub fn client_config(
     ca: &super::FederationCa,
     key: Arc<rustls::sign::CertifiedKey>,
 ) -> TestResult<Arc<rustls::ClientConfig>> {
+    client_config_with_versions(ca, key, rustls::DEFAULT_VERSIONS)
+}
+
+pub fn client_config_with_versions(
+    ca: &super::FederationCa,
+    key: Arc<rustls::sign::CertifiedKey>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> TestResult<Arc<rustls::ClientConfig>> {
     Ok(super::super::tls::with_client_certificate(
-        &super::super::tls::client_config(ca.roots()?, rustls::DEFAULT_VERSIONS)?,
+        &super::super::tls::client_config(ca.roots()?, versions)?,
         key,
     ))
 }
@@ -263,6 +312,15 @@ pub fn server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     domain: &str,
 ) -> TestResult<Arc<rustls::ServerConfig>> {
+    server_config_with_versions(ca, key, domain, rustls::DEFAULT_VERSIONS)
+}
+
+pub fn server_config_with_versions(
+    ca: &super::FederationCa,
+    key: Arc<rustls::sign::CertifiedKey>,
+    domain: &str,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> TestResult<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls_graviola::default_provider());
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
         Arc::new(ca.roots()?),
@@ -271,7 +329,7 @@ pub fn server_config(
     .build()?;
     Ok(Arc::new(
         rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
+            .with_protocol_versions(versions)?
             .with_client_cert_verifier(Arc::new(PeerVerifier(
                 verifier,
                 ServerName::try_from(domain.to_owned())?,

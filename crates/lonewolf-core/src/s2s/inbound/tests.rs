@@ -480,6 +480,7 @@ fn shutdown_shortens_pending_close_without_restarting_output_or_releasing_buffer
 -> TestResult {
     struct PendingFlush {
         output: Output,
+        pending: bool,
         closes: Rc<std::cell::Cell<usize>>,
     }
     impl AsyncWrite for PendingFlush {
@@ -491,46 +492,112 @@ fn shutdown_shortens_pending_close_without_restarting_output_or_releasing_buffer
             std::pin::Pin::new(&mut self.output).poll_write(context, bytes)
         }
         fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Pending
+            if self.pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
         fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             self.closes.set(self.closes.get() + 1);
             Poll::Ready(Ok(()))
         }
     }
+    struct PendingInput {
+        bytes: io::Cursor<Vec<u8>>,
+        polls: Rc<std::cell::Cell<usize>>,
+        dropped: Rc<std::cell::Cell<bool>>,
+    }
+    impl tokio::io::AsyncRead for PendingInput {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut Context<'_>,
+            output: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let position = self.bytes.position() as usize;
+            if position < self.bytes.get_ref().len() {
+                let count = output
+                    .remaining()
+                    .min(self.bytes.get_ref().len() - position);
+                output.put_slice(&self.bytes.get_ref()[position..position + count]);
+                self.bytes.set_position((position + count) as u64);
+                Poll::Ready(Ok(()))
+            } else {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for PendingInput {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
     Runtime::new()?.block_on(async {
-        let fixture = Fixture::new()?;
-        let peer = peer();
-        let (stop, shutdown) = signal();
-        let mut reader = fixture.reader("</stream:stream>").await?;
-        let output = Output::default();
-        let closes = Rc::new(std::cell::Cell::new(0));
-        let mut writer = S2sWriter::new(PendingFlush {
-            output: output.clone(),
-            closes: Rc::clone(&closes),
-        });
-        let aborted = Rc::new(std::cell::Cell::new(false));
-        let abort = Rc::clone(&aborted);
-        let mut serving = Box::pin(run(
-            &mut reader,
-            &mut writer,
-            fixture.parameters(&peer, shutdown, SystemTime::now() + Duration::from_secs(60)),
-            move || abort.set(true),
-            ingress::dispatch,
-        ));
-        assert!(poll!(serving.as_mut()).is_pending());
-        assert_eq!(output.0.borrow().as_slice(), b"</stream:stream>");
-        stop.send(Instant::now())
-            .map_err(|_| "close stopped observing shutdown")?;
-        assert!(matches!(serving.await, StreamClose::StreamEnd));
-        assert!(aborted.get());
-        assert_eq!(closes.get(), 0);
-        assert_eq!(output.0.borrow().as_slice(), b"</stream:stream>");
-        sample(
-            &fixture.settings.metrics,
-            "s2s_streams_closed_total{direction=\"inbound\",outcome=\"stream_end\"}",
-            1,
-        )?;
+        for (pending_flush, expiry) in [(true, false), (false, false), (false, true)] {
+            let fixture = Fixture::new()?;
+            let peer = peer();
+            let (stop, shutdown) = signal();
+            let polls = Rc::new(std::cell::Cell::new(0));
+            let dropped = Rc::new(std::cell::Cell::new(false));
+            let mut reader = S2sReader::new(
+                tokio::io::BufReader::new(PendingInput {
+                    bytes: io::Cursor::new(format!("{HEADER}</stream:stream>").into_bytes()),
+                    polls: Rc::clone(&polls),
+                    dropped: Rc::clone(&dropped),
+                }),
+                &fixture.settings.reader_limits,
+                GlobalChunkAllocator,
+                None,
+            );
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::StreamStart { .. }))
+            ));
+            let output = Output::default();
+            let closes = Rc::new(std::cell::Cell::new(0));
+            let mut writer = S2sWriter::new(PendingFlush {
+                output: output.clone(),
+                pending: pending_flush,
+                closes: Rc::clone(&closes),
+            });
+            let aborted = Rc::new(std::cell::Cell::new(false));
+            let abort = Rc::clone(&aborted);
+            let validity = SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 });
+            let mut serving = Box::pin(run(
+                &mut reader,
+                &mut writer,
+                fixture.parameters(&peer, shutdown, validity),
+                move || abort.set(true),
+                ingress::dispatch,
+            ));
+            assert!(poll!(serving.as_mut()).is_pending());
+            assert_eq!(output.0.borrow().as_slice(), b"</stream:stream>");
+            assert_eq!(closes.get(), usize::from(!pending_flush));
+            assert_eq!(polls.get(), usize::from(!pending_flush));
+            assert!(!dropped.get());
+            assert!(!aborted.get());
+            sample(
+                &fixture.settings.metrics,
+                "s2s_streams{direction=\"inbound\"}",
+                1,
+            )?;
+            if !expiry {
+                stop.send(Instant::now())
+                    .map_err(|_| "close stopped observing shutdown")?;
+            }
+            assert!(matches!(serving.await, StreamClose::StreamEnd));
+            assert!(aborted.get());
+            assert_eq!(closes.get(), usize::from(!pending_flush));
+            assert_eq!(dropped.get(), !pending_flush);
+            assert_eq!(output.0.borrow().as_slice(), b"</stream:stream>");
+            sample(
+                &fixture.settings.metrics,
+                "s2s_streams_closed_total{direction=\"inbound\",outcome=\"stream_end\"}",
+                1,
+            )?;
+        }
         Ok(())
     })
 }

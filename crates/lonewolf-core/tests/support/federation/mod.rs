@@ -229,3 +229,95 @@ fn roster_push(client: &mut Client, jid: &str, subscription: &str) -> TestResult
         push.attribute("id").ok_or("missing roster push id")?
     ))
 }
+
+pub fn phase<T>(name: &'static str, result: TestResult<T>) -> TestResult<T> {
+    result.map_err(|source| Box::new(PhaseError { name, source }) as Box<dyn std::error::Error>)
+}
+
+pub fn thread_result<T>(result: TestResult<T>) -> Result<T, Box<PhaseReport>> {
+    result.map_err(|error| Box::new(PhaseReport::capture(error.as_ref())))
+}
+
+pub struct PhaseReport {
+    phases: [&'static str; 8],
+    count: usize,
+    io_kind: Option<std::io::ErrorKind>,
+    os_code: Option<i32>,
+}
+impl PhaseReport {
+    fn capture(mut error: &(dyn std::error::Error + 'static)) -> Self {
+        let mut report = Self {
+            phases: [""; 8],
+            count: 0,
+            io_kind: None,
+            os_code: None,
+        };
+        for _ in 0..8 {
+            if let Some(phase) = error.downcast_ref::<PhaseError>() {
+                report.phases[report.count] = phase.name;
+                report.count += 1;
+            }
+            if let Some(previous) = error
+                .downcast_ref::<Self>()
+                .or_else(|| error.downcast_ref::<Box<Self>>().map(AsRef::as_ref))
+            {
+                for name in &previous.phases[..previous.count] {
+                    if report.count == report.phases.len() {
+                        break;
+                    }
+                    report.phases[report.count] = name;
+                    report.count += 1;
+                }
+                report.io_kind = previous.io_kind;
+                report.os_code = previous.os_code;
+                break;
+            }
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                report.io_kind = Some(io.kind());
+                report.os_code = io.raw_os_error();
+                break;
+            }
+            match error.source() {
+                Some(source) => error = source,
+                None => break,
+            }
+        }
+        report
+    }
+}
+impl std::fmt::Debug for PhaseReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FederationPhase")
+            .field("phases", &(&self.phases[..self.count]))
+            .field("io_kind", &self.io_kind)
+            .field("os_code", &self.os_code)
+            .finish()
+    }
+}
+impl std::fmt::Display for PhaseReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, formatter)
+    }
+}
+impl std::error::Error for PhaseReport {}
+
+struct PhaseError {
+    name: &'static str,
+    source: Box<dyn std::error::Error>,
+}
+impl std::fmt::Debug for PhaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&PhaseReport::capture(self), formatter)
+    }
+}
+impl std::fmt::Display for PhaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, formatter)
+    }
+}
+impl std::error::Error for PhaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}

@@ -945,7 +945,24 @@ fn occupied_automatic_endpoint_retries_once_without_ca_or_cache_effects_then_aut
 fn automatic_setup_does_not_retry_port_zero_or_corrupt_locked_insecure_cache() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
     let ca = FakeAcmeCa::start()?;
-    for mode in ["port-zero", "corrupt", "locked", "insecure"] {
+    for (mode, expected_error) in [
+        (
+            "port-zero",
+            "invalid configuration file 'lonewolf.toml': letsencrypt.listen[0] must not use port zero",
+        ),
+        (
+            "corrupt",
+            "ACME load failed: ACME manager State(Unavailable)",
+        ),
+        (
+            "locked",
+            "ACME load failed: ACME manager State(Unavailable)",
+        ),
+        (
+            "insecure",
+            "ACME load failed: ACME manager State(UnsafePath)",
+        ),
+    ] {
         let mut server = C2sSuite::managed(&ca)?;
         let path = server.path().join("acme/state.redb");
         let held = if mode == "locked" {
@@ -967,12 +984,42 @@ fn automatic_setup_does_not_retry_port_zero_or_corrupt_locked_insecure_cache() -
             )?;
         }
         assert!(server.start(&ca).is_err(), "{mode}");
-        assert_eq!(server.launch_count, 1);
-        assert_eq!(server.setup_retries, 0);
-        assert_eq!(server.setup_failures.len(), 1);
-        assert!(server.setup_failures[0].ca_unchanged);
-        assert!(server.setup_failures[0].state_unchanged);
-        assert!(!server.path().join("startup-failure-2.log").exists());
+        assert!((1..=3).contains(&server.launch_count), "{mode}");
+        assert_eq!(server.launch_count, server.setup_retries + 1, "{mode}");
+        assert_eq!(server.setup_failures.len(), server.launch_count, "{mode}");
+        if mode == "port-zero" {
+            assert_eq!(server.setup_retries, 0, "{mode}");
+        }
+        for failed in &server.setup_failures {
+            assert!(failed.ca_unchanged, "{mode}");
+            assert!(failed.state_unchanged, "{mode}");
+            for event in [
+                "ACME listener bound",
+                "c2s TCP listener started",
+                "waiting for stop signal",
+            ] {
+                assert!(!failed.logs.contains(event), "{mode}: {}", failed.logs);
+            }
+        }
+        let (terminal, retried) = server
+            .setup_failures
+            .split_last()
+            .ok_or("missing startup failure")?;
+        for failed in retried {
+            assert_eq!(
+                failed.logs.lines().last(),
+                Some("ACME HTTP bind failed: ACME listener operation failed"),
+                "{mode}"
+            );
+        }
+        assert_eq!(terminal.logs.lines().last(), Some(expected_error), "{mode}");
+        assert!(
+            !server
+                .path()
+                .join(format!("startup-failure-{}.log", server.launch_count + 1))
+                .exists(),
+            "{mode}"
+        );
         drop(held);
     }
     assert_eq!(ca.counts().at(AcmeStage::NewOrder), 0);

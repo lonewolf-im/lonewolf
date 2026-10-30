@@ -32,6 +32,33 @@ need one.
 - **Limits you can see.** Connections, stanzas, rates and resources all have
   configurable limits, so one misbehaving client can't take your server down.
 
+## What works today
+
+- Chat between accounts on any domain you host, with several devices per account
+- Contact lists, presence subscriptions, and offline messages that keep their
+  original timestamps
+- Message copies across your devices (Carbons), service discovery, vCard
+  profiles and ping
+- STARTTLS, SCRAM login with channel binding, and optional client-certificate
+  login
+- TLS certificates from your own files or from Let's Encrypt
+- Account management with `lonewolfctl`, Prometheus metrics, structured logs and
+  graceful shutdown
+
+Lonewolf runs on Unix-like systems, and CI tests it on Linux and macOS. The
+[standards reference](docs/STANDARDS.md) lists every supported XEP and RFC, and
+its limits.
+
+## What's next
+
+Federation with other XMPP servers is being built on `main` but isn't in a
+release yet. After that, the [roadmap to 1.0](docs/ROADMAP.md) covers, in order:
+
+1. Group chats, file upload and the rest of basic desktop IM
+2. Message archives, Stream Management, blocking, avatars and bookmarks
+3. PostgreSQL storage and clustering
+4. Mobile and web support
+
 ## Quick start
 
 Let's get a server running on your machine and send a message between two
@@ -110,33 +137,6 @@ with its original timestamp, the next time he signs in.
 
 When you're done, press `Ctrl+C` to stop the server. Your accounts and any
 undelivered messages are saved in `./data/lonewolf.dat`.
-
-## What works today
-
-- Chat between accounts on any domain you host, with several devices per account
-- Contact lists, presence subscriptions, and offline messages that keep their
-  original timestamps
-- Message copies across your devices (Carbons), service discovery, vCard
-  profiles and ping
-- STARTTLS, SCRAM login with channel binding, and optional client-certificate
-  login
-- TLS certificates from your own files or from Let's Encrypt
-- Account management with `lonewolfctl`, Prometheus metrics, structured logs and
-  graceful shutdown
-
-Lonewolf runs on Unix-like systems, and CI tests it on Linux and macOS. The
-[standards reference](docs/STANDARDS.md) lists every supported XEP and RFC, and
-its limits.
-
-## What's next
-
-Federation with other XMPP servers is being built on `main` but isn't in a
-release yet. After that, the [roadmap to 1.0](docs/ROADMAP.md) covers, in order:
-
-1. Group chats, file upload and the rest of basic desktop IM
-2. Message archives, Stream Management, blocking, avatars and bookmarks
-3. PostgreSQL storage and clustering
-4. Mobile and web support
 
 ## Configuration
 

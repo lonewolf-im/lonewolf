@@ -59,7 +59,7 @@ fn context_with_events(
     Ok((context, signal, observed))
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_setup_returns_private_partial_report_without_invented_metadata_or_window()
 -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -90,8 +90,17 @@ async fn failed_setup_returns_private_partial_report_without_invented_metadata_o
             .all(|phase| phase.end_offset_ns.is_some() && phase.status != PhaseStatus::Running)
     );
     assert_eq!(report.phases[0].name, PhaseName::Preflight);
+    assert_eq!(report.phases[0].status, PhaseStatus::Completed);
     assert_eq!(report.phases[1].name, PhaseName::TargetSetup);
     assert_eq!(report.phases[1].status, PhaseStatus::Failed);
+    assert_eq!(
+        report
+            .reasons
+            .iter()
+            .find(|reason| reason.code == ReasonCode::SetupFailure)
+            .and_then(|reason| reason.context.as_deref()),
+        Some("fixture_server_binary")
+    );
     let saved: RunReport = serde_json::from_slice(&fs::read(output.join("result.json"))?)?;
     assert_eq!(saved, report);
     assert!(output.join("summary.md").is_file());

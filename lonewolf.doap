@@ -6,8 +6,8 @@
          xmlns="http://usefulinc.com/ns/doap#">
   <Project>
     <name>Lonewolf</name>
-    <shortdesc xml:lang="en">A self-hosted XMPP server in Rust that is easy to run and light on resources</shortdesc>
-    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as a single binary with embedded storage, so there is no database server to install, and a local test server needs only two lines of configuration. Connections, stanzas, rates and resources all have explicit, configurable limits, so one misbehaving client cannot take the server down. Today Lonewolf hosts chat between accounts on the domains you run: contact lists and presence, offline messages that keep their original timestamps, message copies across your devices, service discovery, vCard profiles and ping. Clients log in with SCRAM and channel binding or with a TLS client certificate, and the server can load certificates from files or obtain them from Let's Encrypt. Operators get an account administration tool, Prometheus metrics and structured logs. Federation with other XMPP servers is in development and authenticates servers by certificate only. Group chat, file upload, message archives, stream management and clustering are on the roadmap. Lonewolf is early, pre-1.0 software, and its configuration and storage formats may still change.</description>
+    <shortdesc xml:lang="en">A standalone XMPP server written in Rust</shortdesc>
+    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as a single binary with embedded storage, so there's no database to set up. It's still early: today it handles chat between accounts on the domains you run, and federation with other servers is on the way.</description>
     <created>2026-09-17</created>
 
     <homepage rdf:resource="https://github.com/lonewolf-im/lonewolf"/>

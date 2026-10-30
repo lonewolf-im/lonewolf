@@ -43,7 +43,20 @@ impl PlainClient {
     }
 
     pub fn start_tls(self, server: &C2sSuite) -> TestResult<Client> {
-        self.start_tls_with_config(Arc::clone(&server.tls))
+        self.start_tls_for_domain(Arc::clone(&server.tls), server.client_domain_override())
+    }
+
+    fn start_tls_for_domain(
+        self,
+        config: Arc<ClientConfig>,
+        domain: Option<&str>,
+    ) -> TestResult<Client> {
+        match domain {
+            Some(domain) => {
+                self.start_tls_with_identity(config, ServerName::try_from(domain)?.to_owned())
+            }
+            None => self.start_tls_with_config(config),
+        }
     }
 
     pub fn start_tls_with_config(self, config: Arc<ClientConfig>) -> TestResult<Client> {
@@ -74,7 +87,7 @@ impl Client {
 
     fn encrypted_at(server: &C2sSuite, address: SocketAddr) -> TestResult<Self> {
         let mut plain = PlainClient::tcp_at(address)?;
-        let features = plain.open()?;
+        let features = open_domain(&mut plain, server.client_domain_override())?;
         features
             .child(TLS_NAMESPACE, "starttls")?
             .child(TLS_NAMESPACE, "required")?;
@@ -91,15 +104,21 @@ impl Client {
         versions: &[&'static SupportedProtocolVersion],
     ) -> TestResult<Self> {
         let mut plain = PlainClient::tcp(server)?;
-        plain.open()?.child(TLS_NAMESPACE, "starttls")?;
-        let mut client = plain.start_tls_with_config(server.tls_with_versions(versions)?)?;
-        client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
+        open_domain(&mut plain, server.client_domain_override())?
+            .child(TLS_NAMESPACE, "starttls")?;
+        let mut client = plain.start_tls_for_domain(
+            server.tls_with_versions(versions)?,
+            server.client_domain_override(),
+        )?;
+        open_domain(&mut client, server.client_domain_override())?
+            .child(SASL_NAMESPACE, "mechanisms")?;
         Ok(client)
     }
 
     fn secure_at(server: &C2sSuite, address: SocketAddr) -> TestResult<Self> {
         let mut client = Self::encrypted_at(server, address)?;
-        client.open()?.child(SASL_NAMESPACE, "mechanisms")?;
+        open_domain(&mut client, server.client_domain_override())?
+            .child(SASL_NAMESPACE, "mechanisms")?;
         Ok(client)
     }
 
@@ -124,7 +143,7 @@ impl Client {
         let mut client = Self::secure_at(server, address)?;
         client.authenticate(username, password)?;
         let mut client = client.restart();
-        let features = client.open()?;
+        let features = open_domain(&mut client, server.client_domain_override())?;
         features.child(BIND_NAMESPACE, "bind")?;
         for feature in &features.children {
             assert!(
@@ -161,7 +180,13 @@ impl Client {
         let mut client =
             Self::authenticated_with_features_at(server, address, username, password)?.0;
         let jid = client.bind(Some(resource))?;
-        assert_eq!(jid, format!("{username}@localhost/{resource}"));
+        assert_eq!(
+            jid,
+            format!(
+                "{username}@{}/{resource}",
+                server.client_domain_override().unwrap_or("localhost")
+            )
+        );
         Ok(client)
     }
 
@@ -446,4 +471,15 @@ fn scram_attribute<'a>(message: &'a str, prefix: &str) -> TestResult<&'a str> {
         .split(',')
         .find_map(|part| part.strip_prefix(prefix))
         .ok_or_else(|| format!("missing SCRAM attribute {prefix}").into())
+}
+
+fn open_domain<R: Read + Write>(
+    client: &mut XmlStream<R>,
+    domain: Option<&str>,
+) -> TestResult<Element> {
+    let Some(domain) = domain else {
+        return client.open();
+    };
+    client.open_with(&format!("<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='{domain}' version='1.0'>"))?;
+    client.features()
 }

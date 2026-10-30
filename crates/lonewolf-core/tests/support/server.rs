@@ -19,14 +19,21 @@ use super::{Client, PlainClient, Signal, TIMEOUT, TestResult, tls};
 static ACTIVE_SERVERS: PlMutex<usize> = PlMutex::new(0);
 static SERVER_SLOT: PlCondvar = PlCondvar::new();
 
-struct C2sSuitePermit;
+pub(super) struct C2sSuitePermit;
 
 impl C2sSuitePermit {
-    fn acquire() -> Self {
+    pub(super) fn acquire() -> Self {
         let mut active = ACTIVE_SERVERS.lock();
         SERVER_SLOT.wait_while(&mut active, |count| *count >= 4);
         *active += 1;
         Self
+    }
+
+    pub(super) fn pair() -> [Self; 2] {
+        let mut active = ACTIVE_SERVERS.lock();
+        SERVER_SLOT.wait_while(&mut active, |count| *count > 2);
+        *active += 2;
+        [Self, Self]
     }
 }
 
@@ -51,12 +58,15 @@ impl Drop for C2sSuitePermit {
     fn drop(&mut self) {
         let mut active = ACTIVE_SERVERS.lock();
         *active -= 1;
-        SERVER_SLOT.notify_one();
+        SERVER_SLOT.notify_all();
     }
 }
 
 pub struct C2sSuite {
-    _permit: C2sSuitePermit,
+    permit: Option<C2sSuitePermit>,
+    pub domain: String,
+    completion: Option<super::federation::ProcessReceipts>,
+    reaped: bool,
     child: Child,
     directory: tempfile::TempDir,
     readiness: ReadinessSocket,
@@ -70,6 +80,10 @@ pub struct C2sSuite {
 }
 
 impl C2sSuite {
+    pub(super) fn client_domain_override(&self) -> Option<&str> {
+        Some(&self.domain)
+    }
+
     pub fn fixture_path(&self) -> &Path {
         self.directory.path()
     }
@@ -326,7 +340,10 @@ max_resources_per_account = {resources}
         let readiness = ReadinessSocket::bind()?;
         let child = spawn_process(directory.path(), &readiness)?;
         let mut server = Self {
-            _permit: permit,
+            permit: Some(permit),
+            domain: "localhost".into(),
+            completion: None,
+            reaped: false,
             child,
             directory,
             readiness,
@@ -342,9 +359,107 @@ max_resources_per_account = {resources}
         Ok(server)
     }
 
+    pub fn federated(host: super::federation::FederatedHost) -> TestResult<Self> {
+        Self::federated_with_permit(host, C2sSuitePermit::acquire())
+    }
+
+    pub(super) fn federated_with_permit(
+        host: super::federation::FederatedHost,
+        permit: C2sSuitePermit,
+    ) -> TestResult<Self> {
+        let directory = tempfile::tempdir()?;
+        host.ca.server(directory.path(), "host", &[&host.domain])?;
+        let tls_roots = host.ca.roots()?;
+        let tls = tls::client_config(tls_roots.clone(), rustls::DEFAULT_VERSIONS)?;
+        let config = format!(
+            r#"
+[xmpp]
+stanza_pool_size_mib = 8
+default_host = {domain:?}
+[metrics]
+enabled = true
+address = "127.0.0.1:0"
+[[c2s.listeners]]
+address = "127.0.0.1:0"
+[hosts.{domain:?}]
+{host_federation}
+extensions = [{extensions}]
+[hosts.{domain:?}.tls]
+certificate_chain_path = "certificate-host.pem"
+private_key_path = "private-key-host.pem"
+[s2s]
+{enabled}
+listeners = [{{ address = "127.0.0.1:0" }}]
+[s2s.tls]
+trust_anchors_path = {anchors:?}
+[s2s.dns]
+nameservers = [{dns:?}]
+timeout_secs = 1
+{extra}
+"#,
+            domain = host.domain,
+            extensions = host.extensions,
+            anchors = host.ca.trust_anchors_path(),
+            dns = host.dns.to_string(),
+            extra = host.extra_toml,
+            host_federation = host
+                .federation
+                .map(|enabled| format!("federation = {enabled}"))
+                .unwrap_or_default(),
+            enabled = host
+                .enabled
+                .map(|enabled| format!("enabled = {enabled}"))
+                .unwrap_or_default(),
+        );
+        let federation_enabled = host.enabled.unwrap_or(false);
+        fs::write(directory.path().join("lonewolf.toml"), config)?;
+        let readiness = ReadinessSocket::bind()?;
+        let child = spawn_process(directory.path(), &readiness)?;
+        if let Some(receipts) = &host.completion {
+            receipts.lock().spawned.push(child.id());
+        }
+        let mut server = Self {
+            permit: Some(permit),
+            domain: host.domain,
+            completion: host.completion,
+            reaped: false,
+            child,
+            directory,
+            readiness,
+            address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            s2s: None,
+            federation_enabled,
+            listeners: Vec::new(),
+            metrics: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            tls: Arc::new(tls),
+            tls_roots,
+        };
+        server.wait_until_ready()?;
+        Ok(server)
+    }
+
+    pub fn s2s_addresses(&self) -> TestResult<&[SocketAddr]> {
+        self.s2s
+            .as_deref()
+            .ok_or_else(|| "missing S2S listeners".into())
+    }
+
+    fn record_reaped(&mut self, status: std::process::ExitStatus) {
+        if !self.reaped {
+            if let Some(receipts) = &self.completion {
+                receipts.lock().reaped.push((self.child.id(), status));
+            }
+            self.reaped = true;
+        }
+    }
+
     pub fn restart(&mut self) -> TestResult {
         self.stop()?;
         self.child = spawn_process(self.directory.path(), &self.readiness)?;
+        self.reaped = false;
+        if let Some(receipts) = &self.completion {
+            receipts.lock().spawned.push(self.child.id());
+        }
         self.wait_until_ready()
     }
 
@@ -361,7 +476,8 @@ max_resources_per_account = {resources}
     fn wait_until_ready(&mut self) -> TestResult {
         let deadline = Instant::now() + TIMEOUT;
         loop {
-            if self.child.try_wait()?.is_some() {
+            if let Some(status) = self.child.try_wait()? {
+                self.record_reaped(status);
                 let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 return Err(format!("server exited before readiness: {logs}").into());
             }
@@ -371,6 +487,9 @@ max_resources_per_account = {resources}
                 self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
                 self.metrics = readiness.metrics.ok_or("metrics service is not ready")?;
                 self.listeners = readiness.c2s;
+                if let Some(receipts) = &self.completion {
+                    receipts.lock().ready.push(self.child.id());
+                }
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -391,6 +510,7 @@ max_resources_per_account = {resources}
         let deadline = Instant::now() + TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait()? {
+                self.record_reaped(status);
                 let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 assert_eq!(status.code(), Some(101), "status={status} logs={logs}");
                 return Ok(logs);
@@ -403,6 +523,10 @@ max_resources_per_account = {resources}
     }
 
     pub fn stop(&mut self) -> TestResult {
+        if let Some(status) = self.child.try_wait()? {
+            self.record_reaped(status);
+            return Ok(());
+        }
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(self.child.id().try_into()?),
             nix::sys::signal::Signal::SIGINT,
@@ -410,6 +534,7 @@ max_resources_per_account = {resources}
         let deadline = Instant::now() + TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait()? {
+                self.record_reaped(status);
                 assert!(status.success(), "{status}");
                 return Ok(());
             }
@@ -441,7 +566,7 @@ max_resources_per_account = {resources}
     }
 
     pub fn create_account(&self, username: &str, password: &str) -> TestResult {
-        self.create_account_jid(&format!("{username}@localhost"), password)
+        self.create_account_jid(&format!("{username}@{}", self.domain), password)
     }
 
     pub fn create_account_jid(&self, jid: &str, password: &str) -> TestResult {
@@ -492,8 +617,9 @@ max_resources_per_account = {resources}
         let body = serde_json::json!({ "password": password }).to_string();
         write!(
             stream,
-            "PUT /v1/accounts/{username}%40localhost/password HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "PUT /v1/accounts/{username}%40{domain}/password HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len(),
+            domain = self.domain,
         )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
@@ -506,7 +632,8 @@ max_resources_per_account = {resources}
         stream.set_write_timeout(Some(TIMEOUT))?;
         write!(
             stream,
-            "DELETE /v1/accounts/{username}%40localhost HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            "DELETE /v1/accounts/{username}%40{domain} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            domain = self.domain,
         )?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
@@ -515,10 +642,23 @@ max_resources_per_account = {resources}
     }
 }
 
+impl C2sSuite {
+    pub(super) fn terminate_and_reap(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            if let Ok(status) = self.child.wait() {
+                self.record_reaped(status);
+            }
+        }
+        if self.reaped {
+            self.permit.take();
+        }
+    }
+}
+
 impl Drop for C2sSuite {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate_and_reap();
     }
 }
 

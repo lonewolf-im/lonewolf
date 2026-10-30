@@ -33,6 +33,12 @@ pub const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/st
 
 pub const STREAM_ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-streams";
 
+impl process::AcmeServer {
+    pub(super) fn client_domain_override(&self) -> Option<&str> {
+        None
+    }
+}
+
 fn prepare_blocking_stream(socket: &std::net::TcpStream) -> std::io::Result<()> {
     socket.set_nonblocking(false)?;
     socket.set_read_timeout(Some(TIMEOUT))?;

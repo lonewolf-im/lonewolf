@@ -52,6 +52,7 @@ zeroize.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
+hickory-proto.workspace = true
 lonewolf-core = { path = ".", features = ["test-support"] }
 hmac.workspace = true
 pbkdf2.workspace = true

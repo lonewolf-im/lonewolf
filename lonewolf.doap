@@ -81,7 +81,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.3.0</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Does not validate vCard contents. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Public vCards for local and federated users. Only owners can edit them; contents are not validated. Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -98,7 +98,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
         <xmpp:since>0.1.0</xmpp:since>
-        <xmpp:note xml:lang="en">Does not check certificate revocation. Server-to-server support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Certificate login for clients and servers. S2S requires serverAuth certificates and does not check revocation. Server-to-server support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -124,7 +124,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0.1</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Group chat private messages get no special handling yet. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Copies local and federated messages across sessions that enable Carbons. Private group-chat messages receive no special handling. Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

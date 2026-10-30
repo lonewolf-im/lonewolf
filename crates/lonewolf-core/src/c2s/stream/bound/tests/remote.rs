@@ -1081,3 +1081,283 @@ fn stopped_initial_broadcast_or_probe_releases_ticket_and_completion() -> TestRe
         fixture.finish().await
     }))?
 }
+
+#[derive(Default)]
+struct SubscriptionSender {
+    calls: PlMutex<Vec<&'static str>>,
+}
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for SubscriptionSender {
+    fn name(&self) -> &'static str {
+        "subscription-sender"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for kind in [
+            PresenceRequestType::Subscribe,
+            PresenceRequestType::Subscribed,
+            PresenceRequestType::Unsubscribe,
+            PresenceRequestType::Unsubscribed,
+        ] {
+            slots.presence(kind, self.clone())?;
+        }
+        Ok(())
+    }
+}
+
+impl lonewolf_extension::presence::PresenceHandler<GlobalChunkAllocator, RedbStorage>
+    for SubscriptionSender
+{
+    fn authorize<'a>(
+        &'a self,
+        request: PresenceRequest<'a, GlobalChunkAllocator>,
+    ) -> lonewolf_extension::presence::PresenceFuture<'a, ()> {
+        assert_eq!(request.sender.as_str(), "alice@example.com/desk");
+        assert_eq!(request.target.as_str(), "bob@remote.test/phone");
+        self.calls.lock().push("authorize");
+        Box::pin(async { Ok(()) })
+    }
+
+    fn send<'a>(
+        &'a self,
+        _: PresenceRequest<'a, GlobalChunkAllocator>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn lonewolf_extension::delivery::HostLookup,
+    ) -> lonewolf_extension::presence::SendFuture<'a, GlobalChunkAllocator> {
+        self.calls.lock().push("send");
+        Box::pin(async { Ok(PresenceSend::Continue) })
+    }
+}
+
+async fn subscription_session<'a>(
+    fixture: &'a Fixture,
+    remote: &RemoteFixture,
+    enabled: bool,
+    mode: &str,
+    policy: Arc<Policy>,
+    sender: Arc<SubscriptionSender>,
+) -> TestResult<(
+    Router<GlobalChunkAllocator>,
+    BoundSession<'a, GlobalChunkAllocator, ControlledWriter>,
+)> {
+    use lonewolf_extension::delivery::SessionTag;
+    let mut extensions = Extensions::default();
+    extensions.register(policy)?;
+    extensions.register(sender)?;
+    extensions.register(Arc::new(lonewolf_extension::roster::Roster::default()))?;
+    let mut names = vec!["remote-policy"];
+    if mode == "continue" {
+        names.push("subscription-sender");
+    }
+    if mode == "roster" {
+        names.push("roster");
+    }
+    let mut router = Router::new(remote.hosts(), LocalRouter::new(GlobalChunkAllocator))
+        .with_extensions(BTreeMap::from([(
+            "example.com".into(),
+            extensions.enable_host("example.com", names)?,
+        )]));
+    if enabled {
+        router = router.with_remote(remote.remote());
+    }
+    let mut arena = Arena::try_new(Default::default())?;
+    let owner =
+        AccountKey::try_from(Jid::parse_in("alice@example.com", &mut arena)?.resolve(&arena)?)?;
+    let registration = router
+        .handle()
+        .register(
+            &owner,
+            Some("desk"),
+            NonZeroUsize::new(8).ok_or("capacity")?,
+        )
+        .await?;
+    registration.handle().tag(SessionTag::Interested).await?;
+    let (_, incoming) = async_channel::bounded(1);
+    let mut session = fixture.bound_session(
+        GlobalChunkAllocator,
+        registration,
+        router.handle(),
+        incoming,
+    )?;
+    session.outbox.account = owner;
+    Ok((router, session))
+}
+
+#[test]
+fn remote_subscription_direct_branches_keep_policy_and_admission_errors() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(15), async {
+        let fixture = Fixture::new(&[]).await?;
+        for branch in ["none", "continue"] {
+            for mode in ["allow", "reject", "drop", "busy", "not_found", "timeout", "stopped", "disabled"] {
+                let mut remote = RemoteFixture::new(match mode {
+                    "not_found" => AdmissionState::Backoff(RemoteFailure::NotFound),
+                    "timeout" => AdmissionState::Backoff(RemoteFailure::Timeout),
+                    _ => AdmissionState::Link,
+                })?;
+                let policy = Arc::new(Policy { verdict: match mode { "reject" => rejection(true, true), "drop" => Verdict::Drop, _ => Verdict::Allow }, fail: false, checks: PlMutex::new(Vec::new()) });
+                let sender = Arc::new(SubscriptionSender::default());
+                let (router, mut session) = subscription_session(&fixture, &remote, mode != "disabled", branch, policy.clone(), sender.clone()).await?;
+                if mode == "busy" {
+                    router.handle().route_remote(RoutedStanza::from_parsed(parsed("<message from='alice@example.com/desk' to='bob@remote.test' id='filler'/>").await?))?;
+                }
+                if mode == "stopped" { remote.remote().stop(); }
+                let before = remote.occupancy();
+                let result = session.handle_subscription(parsed("<presence type='subscribe' from='mallory@elsewhere/spy' to='bob@remote.test/phone' id='subscription'><status>Request</status></presence>").await?, PresenceRequestType::Subscribe).await;
+                assert_eq!(result, if mode == "stopped" { Err(CloseOutcome::InternalError) } else { Ok(()) }, "{branch} {mode}");
+                session.outbox.flush().await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(*policy.checks.lock(), [Check { account: "alice@example.com".into(), peer: "bob@remote.test".into(), direction: Direction::Outbound, kind: StanzaType::Presence(PresenceType::Subscribe) }]);
+                assert_eq!(*sender.calls.lock(), if branch == "continue" && !matches!(mode, "reject" | "drop") { vec!["authorize", "send"] } else { Vec::new() });
+                if mode == "allow" {
+                    let queued = remote.receive()?.ok_or("subscription not queued")?;
+                    let view = queued.resolve()?;
+                    assert_eq!(view.from()?.ok_or("from")?.as_str(), "alice@example.com");
+                    assert_eq!(view.to()?.ok_or("to")?.as_str(), "bob@remote.test");
+                    assert_eq!(view.id()?, Some("subscription"));
+                    assert!(view.child("status", "jabber:client")?.is_some());
+                    assert!(session.outbox.writer.written.is_empty());
+                } else if matches!(mode, "stopped" | "drop" | "reject") {
+                    assert!(session.outbox.writer.written.is_empty());
+                    assert_eq!(remote.occupancy(), before);
+                } else {
+                    assert_eq!(session.outbox.writer.written.len(), 1, "{branch} {mode}");
+                    let reply = RoutedStanza::from_parsed(parsed(&session.outbox.writer.written[0]).await?);
+                    let view = reply.resolve()?;
+                    assert_eq!(view.stanza_type(), StanzaType::Presence(PresenceType::Error));
+                    assert_eq!(view.to()?.ok_or("reply to")?.as_str(), "alice@example.com/desk");
+                    assert_eq!(view.from()?.ok_or("reply from")?.as_str(), "bob@remote.test/phone");
+                    assert_eq!(view.id()?, Some("subscription"));
+                    assert!(view.child("status", "jabber:client")?.is_some());
+                    let error = view.child("error", "jabber:client")?.ok_or("error")?;
+                    let condition = match mode { "busy" => StanzaErrorCondition::ResourceConstraint, "timeout" => StanzaErrorCondition::RemoteServerTimeout, _ => StanzaErrorCondition::RemoteServerNotFound };
+                    assert!(error.child(condition.as_str(), "urn:ietf:params:xml:ns:xmpp-stanzas")?.is_some());
+                    assert_eq!(error.attribute("type", "")?, Some(condition.error_type()));
+                    let lonewolf_xmpp::stanza::StanzaErrorText::Static(expected_text) = condition.default_text() else { return Err("non-static default error text".into()); };
+                    let text = error.child("text", "urn:ietf:params:xml:ns:xmpp-stanzas")?.ok_or("text")?;
+                    assert_eq!(text.text()?, Some(expected_text));
+                    assert_eq!(text.attribute("lang", "http://www.w3.org/XML/1998/namespace")?, Some("en"));
+                    assert_eq!(remote.occupancy(), before);
+                }
+                if mode == "busy" { assert_eq!(remote.receive()?.ok_or("filler")?.resolve()?.id()?, Some("filler")); }
+                assert_eq!(remote.occupancy(), (0, 0));
+                drop(session);
+                remote.finish(Instant::now() + Duration::from_secs(5)).await?;
+                router.shutdown().await?;
+            }
+        }
+        fixture.finish().await
+    }))?
+}
+
+#[test]
+fn remote_subscription_commits_pending_out_and_pushes_after_queue_admission() -> TestResult {
+    use lonewolf_storage::roster::{RosterReads, SubscriptionState};
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(10), async {
+        for enabled in [true, false] {
+            let fixture = Fixture::new(&[]).await?;
+            let mut remote = RemoteFixture::new(AdmissionState::Link)?;
+            let policy = Arc::new(Policy {
+                verdict: Verdict::Allow,
+                fail: false,
+                checks: PlMutex::new(Vec::new()),
+            });
+            let (router, mut session) = subscription_session(
+                &fixture,
+                &remote,
+                enabled,
+                "roster",
+                policy,
+                Arc::new(SubscriptionSender::default()),
+            )
+            .await?;
+            let owner = session.registration.account().clone();
+            let mut tx = fixture.storage.begin_write().await?;
+            tx.create_account(NewAccount {
+                key: owner.clone(),
+                credentials: credentials(),
+            })
+            .await?;
+            tx.commit().await?;
+            session
+                .handle_subscription(
+                    parsed(
+                        "<presence type='subscribe' to='bob@remote.test/phone' id='pending-out'/>",
+                    )
+                    .await?,
+                    PresenceRequestType::Subscribe,
+                )
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            if enabled {
+                let push = session
+                    .registration
+                    .recv()
+                    .await
+                    .ok_or("roster push mailbox")?;
+                session
+                    .outbox
+                    .drain_mailbox(&session.registration, push)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+            session.outbox.flush().await.map_err(|e| format!("{e:?}"))?;
+            let snapshot = fixture
+                .storage
+                .begin_read()
+                .await?
+                .roster(&owner, Default::default())
+                .await?;
+            assert_eq!(session.outbox.writer.written.len(), 1);
+            if enabled {
+                assert_eq!(snapshot.version.get(), 1);
+                assert_eq!(snapshot.items.len(), 1);
+                assert_eq!(snapshot.items[0].jid.as_str(), "bob@remote.test");
+                assert_eq!(
+                    snapshot.items[0].subscription.state,
+                    SubscriptionState::None
+                );
+                assert!(snapshot.items[0].subscription.pending_out);
+                assert!(!snapshot.items[0].subscription.approved);
+                let stanza = remote.receive()?.ok_or("subscription admission")?;
+                let view = stanza.resolve()?;
+                assert_eq!(
+                    view.stanza_type(),
+                    StanzaType::Presence(PresenceType::Subscribe)
+                );
+                assert_eq!(view.from()?.ok_or("from")?.as_str(), "alice@example.com");
+                assert_eq!(view.to()?.ok_or("to")?.as_str(), "bob@remote.test");
+                assert_eq!(view.id()?, Some("pending-out"));
+                let push =
+                    RoutedStanza::from_parsed(parsed(&session.outbox.writer.written[0]).await?);
+                let view = push.resolve()?;
+                assert_eq!(
+                    view.to()?.ok_or("push to")?.as_str(),
+                    "alice@example.com/desk"
+                );
+                let item = view
+                    .child("query", "jabber:iq:roster")?
+                    .ok_or("query")?
+                    .child("item", "jabber:iq:roster")?
+                    .ok_or("item")?;
+                assert_eq!(item.attribute("jid", "")?, Some("bob@remote.test"));
+                assert_eq!(item.attribute("subscription", "")?, Some("none"));
+                assert_eq!(item.attribute("ask", "")?, Some("subscribe"));
+            } else {
+                assert_eq!(snapshot.version.get(), 0);
+                assert!(snapshot.items.is_empty());
+                assert!(session.outbox.writer.written[0].contains("remote-server-not-found"));
+            }
+            assert_eq!(remote.occupancy(), (0, 0));
+            drop(session);
+            remote
+                .finish(Instant::now() + Duration::from_secs(5))
+                .await?;
+            router.shutdown().await?;
+            fixture.finish().await?;
+        }
+        Ok(())
+    }))?
+}

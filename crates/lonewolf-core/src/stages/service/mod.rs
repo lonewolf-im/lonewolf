@@ -86,6 +86,10 @@ impl<A: ChunkAllocator + Clone> HostLookup for Outbound<'_, A> {
     fn is_local_host(&self, domain: &str) -> bool {
         self.router.is_local_host(domain)
     }
+
+    fn federates(&self, local_domain: &str) -> bool {
+        self.router.federates_domain(local_domain)
+    }
 }
 
 impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A> {

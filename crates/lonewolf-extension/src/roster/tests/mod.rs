@@ -59,6 +59,9 @@ struct TestRoster {
 
 #[derive(Default)]
 struct RecordingDelivery {
+    federated: bool,
+    remote: RefCell<Vec<String>>,
+    events: RefCell<Vec<&'static str>>,
     tags: RefCell<Vec<SessionTag>>,
     retired: RefCell<Vec<AccountKey>>,
     retirement_unavailable: RefCell<Vec<usize>>,
@@ -73,9 +76,26 @@ impl HostLookup for RecordingDelivery {
     fn is_local_host(&self, domain: &str) -> bool {
         domain == "example.com" || domain == "other.example"
     }
+
+    fn federates(&self, local_domain: &str) -> bool {
+        self.federated && local_domain == "example.com"
+    }
 }
 
 impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
+    fn to_remote<'a>(&'a self, stanza: RoutedStanza<GlobalChunkAllocator>) -> DeliveryFuture<'a> {
+        self.events.borrow_mut().push("remote");
+        let result = (|| {
+            let mut xml = String::new();
+            stanza
+                .resolve()?
+                .write_xml(&mut xml)
+                .map_err(|_| DeliveryError)?;
+            self.remote.borrow_mut().push(xml);
+            Ok(())
+        })();
+        Box::pin(async move { result })
+    }
     fn arena(&self) -> Result<Arena<GlobalChunkAllocator>, DeliveryError> {
         Arena::try_new(ArenaConfig::default()).map_err(|_| DeliveryError)
     }
@@ -118,6 +138,7 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         _: SessionTag,
         build: StanzaFactory<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
+        self.events.borrow_mut().push("push");
         let result = self.record_push(&format!("{}/desk", account.as_str()), build);
         Box::pin(async { result })
     }
@@ -131,6 +152,7 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
     }
 
     fn current_presence<'a>(&'a self, _: &'a AccountKey, _: &'a AccountKey) -> DeliveryFuture<'a> {
+        self.events.borrow_mut().push("current");
         self.current.set(self.current.get() + 1);
         Box::pin(async { Ok(()) })
     }
@@ -140,6 +162,7 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         _: &'a AccountKey,
         _: &'a AccountKey,
     ) -> DeliveryFuture<'a> {
+        self.events.borrow_mut().push("unavailable");
         self.unavailable.set(self.unavailable.get() + 1);
         Box::pin(async { Ok(()) })
     }
@@ -2053,6 +2076,428 @@ fn initial_probes_include_watched_contacts_without_reciprocal_grants()
         };
         assert_eq!(probes, expected, "{transition:?}");
         assert!(audience.contacts.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn remote_outbound_subscription_table_and_disabled_behavior()
+-> Result<(), Box<dyn std::error::Error>> {
+    use PresenceRequestType::{Subscribe, Subscribed, Unsubscribe, Unsubscribed};
+    use SubscriptionState::{Both, From, None as NoSubscription, To};
+    let rows = [
+        (
+            NoSubscription,
+            false,
+            false,
+            [
+                (NoSubscription, true, false, true),
+                (NoSubscription, false, false, true),
+                (NoSubscription, false, false, false),
+                (NoSubscription, false, false, false),
+            ],
+        ),
+        (
+            NoSubscription,
+            true,
+            false,
+            [
+                (NoSubscription, true, false, true),
+                (NoSubscription, false, false, true),
+                (NoSubscription, true, false, false),
+                (NoSubscription, true, false, false),
+            ],
+        ),
+        (
+            NoSubscription,
+            false,
+            true,
+            [
+                (NoSubscription, true, true, true),
+                (NoSubscription, false, true, true),
+                (From, false, false, true),
+                (NoSubscription, false, false, true),
+            ],
+        ),
+        (
+            NoSubscription,
+            true,
+            true,
+            [
+                (NoSubscription, true, true, true),
+                (NoSubscription, false, true, true),
+                (From, true, false, true),
+                (NoSubscription, true, false, true),
+            ],
+        ),
+        (
+            To,
+            false,
+            false,
+            [
+                (To, false, false, true),
+                (NoSubscription, false, false, true),
+                (To, false, false, false),
+                (To, false, false, false),
+            ],
+        ),
+        (
+            To,
+            false,
+            true,
+            [
+                (To, false, true, true),
+                (NoSubscription, false, true, true),
+                (Both, false, false, true),
+                (To, false, false, true),
+            ],
+        ),
+        (
+            From,
+            false,
+            false,
+            [
+                (From, true, false, true),
+                (From, false, false, true),
+                (From, false, false, false),
+                (NoSubscription, false, false, true),
+            ],
+        ),
+        (
+            From,
+            true,
+            false,
+            [
+                (From, true, false, true),
+                (From, false, false, true),
+                (From, true, false, false),
+                (NoSubscription, true, false, true),
+            ],
+        ),
+        (
+            Both,
+            false,
+            false,
+            [
+                (Both, false, false, true),
+                (From, false, false, true),
+                (Both, false, false, false),
+                (To, false, false, true),
+            ],
+        ),
+    ];
+    for federated in [true, false] {
+        for (state, pending_out, pending_in, expected) in rows {
+            for (index, kind) in [Subscribe, Unsubscribe, Subscribed, Unsubscribed]
+                .into_iter()
+                .enumerate()
+            {
+                let (_directory, fixture) = roster();
+                let owner = account("alice@example.com");
+                let contact = account("bob@remote.invalid");
+                create_account(&fixture, &owner);
+                let approved = kind == Unsubscribed || (kind == Subscribed && pending_in);
+                let original = RosterSubscription {
+                    state,
+                    pending_out,
+                    approved,
+                };
+                block_on(async {
+                    let mut tx = fixture.storage.begin_write().await?;
+                    tx.put_roster_item(
+                        &owner,
+                        &RosterItem {
+                            subscription: original,
+                            ..subscribed(RosterJid::from(&contact), state)
+                        },
+                        Default::default(),
+                    )
+                    .await?;
+                    if pending_in {
+                        tx.put_pending_request(
+                            &owner,
+                            PendingSubscription {
+                                sender: RosterJid::from(&contact),
+                                stanza: b"pending request".as_slice().into(),
+                            },
+                            std::num::NonZeroUsize::MIN,
+                        )
+                        .await?;
+                    }
+                    tx.commit().await?;
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })?;
+                let before = snapshot(&fixture, &owner);
+                let stored_request = pending(&fixture, &owner);
+                let delivery = RecordingDelivery {
+                    federated,
+                    ..Default::default()
+                };
+                let mut call = SubscribeCall::new("alice@example.com/desk", "bob@remote.invalid");
+                let mut arena = delivery.arena()?;
+                let stanza = call
+                    .stanza
+                    .resolve()?
+                    .clone_in(&mut arena)?
+                    .derive_in(&mut arena)?
+                    .stanza_type(StanzaType::Presence(match kind {
+                        Subscribe => PresenceType::Subscribe,
+                        Unsubscribe => PresenceType::Unsubscribe,
+                        Subscribed => PresenceType::Subscribed,
+                        Unsubscribed => PresenceType::Unsubscribed,
+                        _ => return Err("unexpected kind".into()),
+                    }))
+                    .build()?;
+                call.stanza = RoutedStanza::from_parts(stanza, arena);
+                let handled = block_on(async {
+                    let mut tx = fixture.storage.begin_write().await?;
+                    let result = sender_hook(&call, kind, &mut tx, &delivery)
+                        .await
+                        .map_err(|e| format!("{e:?}"))?;
+                    tx.commit().await?;
+                    match result {
+                        PresenceSend::Handled(effects) => {
+                            assert_eq!(effects.accounts.as_slice(), std::slice::from_ref(&owner));
+                            (effects.deliver)(&delivery).await?;
+                            Ok::<_, Box<dyn std::error::Error>>(true)
+                        }
+                        PresenceSend::Continue => Ok(false),
+                    }
+                })?;
+                let granted = matches!(state, From | Both);
+                let (expected_subscription, expected_pending, route, current, unavailable) =
+                    if federated {
+                        let (state, pending_out, pending, route) = expected[index];
+                        let approved = match kind {
+                            Subscribed if !route && !granted => true,
+                            Subscribed if route => false,
+                            Unsubscribed => false,
+                            _ => approved,
+                        };
+                        (
+                            RosterSubscription {
+                                state,
+                                pending_out,
+                                approved,
+                            },
+                            pending,
+                            route,
+                            kind == Subscribed && route,
+                            kind == Unsubscribed && granted,
+                        )
+                    } else {
+                        let mut next = original;
+                        if kind == Subscribed && !granted && !pending_in {
+                            next.approved = true;
+                        }
+                        if kind == Unsubscribed && !granted && !pending_in {
+                            next.approved = false;
+                        }
+                        (next, pending_in, false, false, false)
+                    };
+                assert_eq!(
+                    handled,
+                    federated
+                        || ((kind == Subscribed || kind == Unsubscribed)
+                            && !pending_in
+                            && !granted)
+                        || (kind == Subscribed && granted),
+                    "{federated} {state:?} {pending_out} {pending_in} {kind:?}"
+                );
+                assert_eq!(
+                    item(&fixture, &owner, &RosterJid::from(&contact))
+                        .ok_or("missing item")?
+                        .subscription,
+                    expected_subscription,
+                    "{federated} {state:?} {kind:?}"
+                );
+                let changed = expected_subscription != original;
+                assert_eq!(
+                    snapshot(&fixture, &owner).version.get(),
+                    before.version.get() + u64::from(changed)
+                );
+                assert_eq!(
+                    pending(&fixture, &owner),
+                    if expected_pending {
+                        stored_request
+                    } else {
+                        Vec::new()
+                    }
+                );
+                assert_eq!(delivery.remote.borrow().len(), usize::from(route));
+                for xml in delivery.remote.borrow().iter() {
+                    assert!(
+                        xml.contains("from='alice@example.com'")
+                            || xml.contains("from=\"alice@example.com\""),
+                        "{xml}"
+                    );
+                    assert!(
+                        xml.contains("to='bob@remote.invalid'")
+                            || xml.contains("to=\"bob@remote.invalid\""),
+                        "{xml}"
+                    );
+                    assert!(!xml.contains("/desk"), "{xml}");
+                }
+                assert_eq!(delivery.pushes.borrow().len(), usize::from(changed));
+                assert_eq!(delivery.current.get(), usize::from(current));
+                assert_eq!(delivery.unavailable.get(), usize::from(unavailable));
+                let mut events = Vec::new();
+                if route {
+                    events.push("remote");
+                }
+                if changed {
+                    events.push("push");
+                }
+                if current {
+                    events.push("current");
+                }
+                if unavailable {
+                    events.push("unavailable");
+                }
+                assert_eq!(*delivery.events.borrow(), events);
+                assert!(snapshot(&fixture, &contact).items.is_empty());
+                assert!(pending(&fixture, &contact).is_empty());
+                assert!(delivery.controls.borrow().is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn remote_removal_and_account_deletion_notify_only_the_remote_contact()
+-> Result<(), Box<dyn std::error::Error>> {
+    for deleting in [false, true] {
+        for (state, pending_out, pending_in, kinds) in [
+            (
+                SubscriptionState::Both,
+                false,
+                false,
+                vec![PresenceType::Unsubscribe, PresenceType::Unsubscribed],
+            ),
+            (
+                SubscriptionState::From,
+                false,
+                false,
+                vec![PresenceType::Unsubscribed],
+            ),
+            (
+                SubscriptionState::None,
+                true,
+                false,
+                vec![PresenceType::Unsubscribe],
+            ),
+            (
+                SubscriptionState::None,
+                false,
+                true,
+                vec![PresenceType::Unsubscribed],
+            ),
+        ] {
+            let (_directory, fixture) = roster();
+            let owner = account("alice@example.com");
+            let contact = account("bob@remote.invalid");
+            create_account(&fixture, &owner);
+            block_on(async {
+                let mut tx = fixture.storage.begin_write().await?;
+                tx.put_roster_item(
+                    &owner,
+                    &RosterItem {
+                        subscription: RosterSubscription {
+                            state,
+                            pending_out,
+                            approved: true,
+                        },
+                        ..subscribed(RosterJid::from(&contact), state)
+                    },
+                    Default::default(),
+                )
+                .await?;
+                if pending_in {
+                    tx.put_pending_request(
+                        &owner,
+                        PendingSubscription {
+                            sender: RosterJid::from(&contact),
+                            stanza: b"pending".as_slice().into(),
+                        },
+                        std::num::NonZeroUsize::MIN,
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+            let delivery = RecordingDelivery {
+                federated: true,
+                ..Default::default()
+            };
+            block_on(async {
+                let mut tx = fixture.storage.begin_write().await?;
+                let deliver = if deleting {
+                    let before = Arc::new(fixture.storage.begin_read().await?);
+                    tx.delete_account(&owner).await?;
+                    TestAccountHandler::forget_account(
+                        &Roster::default(),
+                        &mut tx,
+                        &owner,
+                        before,
+                        &delivery,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:?}"))?
+                } else {
+                    let effects = super::subscription::remove_item(
+                        &Roster::default(),
+                        &mut tx,
+                        owner.clone(),
+                        RosterJid::from(&contact),
+                        RosterJid::from(&owner),
+                        &delivery,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                    assert_eq!(effects.accounts.as_slice(), std::slice::from_ref(&owner));
+                    effects.deliver
+                };
+                tx.commit().await?;
+                deliver(&delivery).await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+            let controls = delivery.remote.borrow();
+            assert_eq!(controls.len(), kinds.len());
+            for (xml, kind) in controls.iter().zip(kinds) {
+                let kind = StanzaType::Presence(kind).as_str().ok_or("kind")?;
+                assert!(
+                    xml.contains(&format!("type=\"{kind}\""))
+                        || xml.contains(&format!("type='{kind}'")),
+                    "{xml}"
+                );
+                assert!(
+                    xml.contains("from=\"alice@example.com\"")
+                        || xml.contains("from='alice@example.com'"),
+                    "{xml}"
+                );
+                assert!(
+                    xml.contains("to=\"bob@remote.invalid\"")
+                        || xml.contains("to='bob@remote.invalid'"),
+                    "{xml}"
+                );
+                assert!(!xml.contains("/desk"), "{xml}");
+            }
+            assert_eq!(
+                delivery.unavailable.get(),
+                usize::from(matches!(
+                    state,
+                    SubscriptionState::From | SubscriptionState::Both
+                ))
+            );
+            assert_eq!(delivery.pushes.borrow().len(), usize::from(!deleting));
+            assert!(snapshot(&fixture, &owner).items.is_empty());
+            assert!(pending(&fixture, &owner).is_empty());
+            assert!(snapshot(&fixture, &contact).items.is_empty());
+            assert!(pending(&fixture, &contact).is_empty());
+            assert!(delivery.controls.borrow().is_empty());
+        }
     }
     Ok(())
 }

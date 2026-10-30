@@ -60,7 +60,13 @@ pub(super) async fn send_subscription<A: ChunkAllocator, W: WriteTransaction>(
     roster: &super::Roster,
     transaction: &mut W,
     request: PresenceRequest<'_, A>,
+    hosts: &dyn HostLookup,
 ) -> Result<PresenceSend<A>, HandlerError> {
+    if hosts.federates(request.sender.domainpart())
+        && !hosts.is_local_host(request.target.domainpart())
+    {
+        return send_remote_subscription(roster, transaction, request).await;
+    }
     if !matches!(
         request.kind,
         PresenceRequestType::Subscribed | PresenceRequestType::Unsubscribed
@@ -118,6 +124,109 @@ pub(super) async fn send_subscription<A: ChunkAllocator, W: WriteTransaction>(
                 let result = async {
                     if let Some(mutation) = mutation {
                         push_change(&owner, mutation, delivery).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                retirements.finish(result, delivery).await
+            })
+        },
+    )))
+}
+
+async fn send_remote_subscription<A: ChunkAllocator, W: WriteTransaction>(
+    roster: &super::Roster,
+    transaction: &mut W,
+    request: PresenceRequest<'_, A>,
+) -> Result<PresenceSend<A>, HandlerError> {
+    let owner = AccountKey::try_from(request.sender.bare())
+        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+    let contact = AccountKey::try_from(request.target.bare())
+        .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
+    let jid = RosterJid::from(&contact);
+    require_account(transaction, &owner).await?;
+    let current = transaction
+        .roster_subscription(&owner, &jid)
+        .await
+        .map_err(|error| roster_error(error, "roster_read"))?
+        .unwrap_or_default();
+    let pending = transaction
+        .pending_request_exists(&owner, &jid)
+        .await
+        .map_err(|error| roster_error(error, "roster_read"))?;
+    let granted = grants(current.state);
+    let route = match request.kind {
+        PresenceRequestType::Subscribe | PresenceRequestType::Unsubscribe => true,
+        PresenceRequestType::Subscribed => pending && !granted,
+        PresenceRequestType::Unsubscribed => pending || granted,
+        _ => return Ok(PresenceSend::Continue),
+    };
+    let grant = request.kind == PresenceRequestType::Subscribed && route;
+    let revoke = request.kind == PresenceRequestType::Unsubscribed && granted;
+    let mutation = match request.kind {
+        PresenceRequestType::Subscribe => {
+            state::update_subscription(roster, transaction, &owner, &jid, state::set_pending_out)
+                .await
+        }
+        PresenceRequestType::Unsubscribe => {
+            state::update_existing_subscription(
+                roster,
+                transaction,
+                &owner,
+                &jid,
+                state::withdraw_outbound,
+            )
+            .await
+        }
+        PresenceRequestType::Subscribed if grant => {
+            state::resolve_pending(roster, transaction, &owner, &jid, |subscription| {
+                let mut subscription = state::grant(subscription)?;
+                subscription.approved = false;
+                Some(subscription)
+            })
+            .await
+        }
+        PresenceRequestType::Subscribed => {
+            state::update_subscription(roster, transaction, &owner, &jid, state::pre_approve).await
+        }
+        PresenceRequestType::Unsubscribed => {
+            let outcome = state::cancel_subscription(roster, transaction, &owner, &jid, None).await;
+            outcome.map(|outcome| outcome.grantor)
+        }
+        _ => return Ok(PresenceSend::Continue),
+    }
+    .map_err(|error| roster_error(error, "roster_write"))?;
+    let source = request.stanza.clone();
+    Ok(PresenceSend::Handled(Effects::new(
+        vec![owner.clone()],
+        move |delivery| {
+            Box::pin(async move {
+                let mut retirements = Retirements::default();
+                let mut mutation = mutation;
+                retirements.extract(&owner, &mut mutation);
+                let result = async {
+                    if route {
+                        let mut arena = delivery.arena()?;
+                        let sender = lonewolf_xmpp::jid::Jid::parse_in(owner.as_str(), &mut arena)?;
+                        let stanza = source
+                            .resolve()?
+                            .clone_in(&mut arena)?
+                            .derive_in(&mut arena)?
+                            .from(Some(sender))?
+                            .bare_to()
+                            .build()?;
+                        delivery
+                            .to_remote(RoutedStanza::from_parts(stanza, arena))
+                            .await?;
+                    }
+                    if let Some(mutation) = mutation {
+                        push_change(&owner, mutation, delivery).await?;
+                    }
+                    if grant {
+                        delivery.current_presence(&owner, &contact).await?;
+                    }
+                    if revoke {
+                        delivery.unavailable_presence(&owner, &contact).await?;
                     }
                     Ok(())
                 }
@@ -547,6 +656,7 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
     .ok_or(StanzaErrorCondition::ItemNotFound)?;
     let mut accounts = vec![owner.clone()];
     accounts.extend(contact_account.clone());
+    let remote_contact = federated_contact(&owner, &contact, hosts);
     Ok(Effects::new(accounts, move |delivery| {
         tracing::info!(
             operation = "remove",
@@ -563,6 +673,16 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
                 retirements.extract(contact, &mut removal.contact);
             }
             let result = async {
+                if let Some(remote_contact) = &remote_contact {
+                    notify_removed_remote_contact(
+                        &owner,
+                        remote_contact,
+                        removal.subscription,
+                        removal.pending_request,
+                        delivery,
+                    )
+                    .await?;
+                }
                 push_removal(&owner, contact, removal.version, delivery).await?;
                 if let Some(contact_account) = contact_account {
                     let contact_granted =
@@ -764,6 +884,7 @@ pub(super) async fn forget_account<
         .await
         .map_err(|e| roster_error(e, "roster_cleanup"))?;
     let owner = account.clone();
+    let federated = hosts.federates(account.domain());
     let quotas = super::Roster::new(roster.limits.clone());
     Ok(Box::new(move |delivery| {
         Box::pin(async move {
@@ -809,6 +930,24 @@ pub(super) async fn forget_account<
                         &counterpart,
                         &owner_jid,
                         projection.changed,
+                        delivery,
+                    )
+                    .await
+                    {
+                        failure.get_or_insert(error);
+                    }
+                } else if federated
+                    && let Some(remote) = federated_contact(&owner, &contact, delivery)
+                {
+                    let pending = before
+                        .pending_request_exists(&owner, &contact)
+                        .await
+                        .map_err(|_| DeliveryError)?;
+                    if let Err(error) = notify_removed_remote_contact(
+                        &owner,
+                        &remote,
+                        subscription,
+                        pending,
                         delivery,
                     )
                     .await
@@ -866,6 +1005,18 @@ pub(super) async fn forget_account<
                         {
                             failure.get_or_insert(error);
                         }
+                    } else if federated
+                        && let Some(remote) = federated_contact(&owner, &sender, delivery)
+                        && let Err(error) = notify_removed_remote_contact(
+                            &owner,
+                            &remote,
+                            RosterSubscription::default(),
+                            true,
+                            delivery,
+                        )
+                        .await
+                    {
+                        failure.get_or_insert(error);
                     }
                 }
                 after = Some(sender);
@@ -986,4 +1137,47 @@ fn local_candidate(jid: &RosterJid, hosts: &dyn HostLookup) -> Option<AccountKey
     AccountKey::try_from(jid)
         .ok()
         .filter(|account| hosts.is_local_host(account.domain()))
+}
+
+fn federated_contact(
+    owner: &AccountKey,
+    jid: &RosterJid,
+    hosts: &dyn HostLookup,
+) -> Option<AccountKey> {
+    if !hosts.federates(owner.domain()) {
+        return None;
+    }
+    let (_, domain) = jid.as_str().split_once('@')?;
+    if hosts.is_local_host(domain) {
+        return None;
+    }
+    AccountKey::try_from(jid).ok()
+}
+
+async fn notify_removed_remote_contact<A: ChunkAllocator>(
+    owner: &AccountKey,
+    contact: &AccountKey,
+    subscription: RosterSubscription,
+    pending: bool,
+    delivery: &dyn Delivery<A>,
+) -> Result<(), DeliveryError> {
+    let withdraw = matches!(
+        subscription.state,
+        SubscriptionState::To | SubscriptionState::Both
+    ) || subscription.pending_out;
+    let cancel = grants(subscription.state) || pending;
+    if grants(subscription.state) {
+        delivery.unavailable_presence(owner, contact).await?;
+    }
+    if withdraw || cancel {
+        let (withdrawal, cancellation) =
+            xml::subscription_withdrawals(owner, contact, delivery.arena()?)?;
+        if withdraw {
+            delivery.to_remote(withdrawal).await?;
+        }
+        if cancel {
+            delivery.to_remote(cancellation).await?;
+        }
+    }
+    Ok(())
 }

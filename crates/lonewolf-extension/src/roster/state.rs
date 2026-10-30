@@ -118,6 +118,23 @@ pub(super) fn pre_approve(mut subscription: RosterSubscription) -> Option<Roster
     Some(subscription)
 }
 
+pub(super) fn set_pending_out(mut subscription: RosterSubscription) -> Option<RosterSubscription> {
+    if subscription.pending_out || subscribed_to(subscription.state) {
+        return None;
+    }
+    subscription.pending_out = true;
+    Some(subscription)
+}
+
+pub(super) fn withdraw_outbound(
+    mut subscription: RosterSubscription,
+) -> Option<RosterSubscription> {
+    let old = subscription;
+    subscription.state = without_to(subscription.state);
+    subscription.pending_out = false;
+    (subscription != old).then_some(subscription)
+}
+
 pub(super) fn grant(mut subscription: RosterSubscription) -> Option<RosterSubscription> {
     subscription.state = match subscription.state {
         SubscriptionState::None => SubscriptionState::From,

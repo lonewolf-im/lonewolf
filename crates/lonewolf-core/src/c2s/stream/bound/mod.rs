@@ -2304,6 +2304,10 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             let target = stanza.to()?.ok_or(CloseOutcome::InternalError)?;
             self.router.destination(target) == Destination::Remote
         };
+        let federated = remote
+            && self
+                .router
+                .federates_domain(self.registration.account().domain());
         let (source, mut arena) = parsed.into_parts();
         let (source, sender, _) = self.stamp_in(source, &mut arena, false)?;
         let routed = source
@@ -2396,6 +2400,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         }
         if sender_host.is_none() {
             drop(policy_snapshot);
+            if federated {
+                return match Self::subscription_admission(self.router.route_remote(routed))? {
+                    Some(condition) => self.reply_error(&source, condition),
+                    None => Ok(()),
+                };
+            }
             return self.reply_error(&source, StanzaErrorCondition::RemoteServerNotFound);
         }
         let registration = &self.registration;
@@ -2457,6 +2467,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     }
                     drop(policy_snapshot);
                     if remote {
+                        if federated {
+                            return Ok(Self::subscription_admission(
+                                router.route_remote(routed.clone()),
+                            )?
+                            .map(|condition| Err(HandlerError::Stanza(condition))));
+                        }
                         return Ok(Some(Err(HandlerError::Stanza(
                             StanzaErrorCondition::RemoteServerNotFound,
                         ))));
@@ -2540,6 +2556,21 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 self.reply_rejection_with_text(&source, error.condition(), None, error.text())
             }
         }
+    }
+
+    fn subscription_admission(
+        result: Result<(), RouterError>,
+    ) -> Result<Option<StanzaErrorCondition>, CloseOutcome> {
+        Ok(match result {
+            Ok(()) => None,
+            Err(RouterError::Busy) => Some(StanzaErrorCondition::ResourceConstraint),
+            Err(RouterError::RemoteNotFound | RouterError::RemoteUnsupported) => {
+                Some(StanzaErrorCondition::RemoteServerNotFound)
+            }
+            Err(RouterError::RemoteTimeout) => Some(StanzaErrorCondition::RemoteServerTimeout),
+            Err(RouterError::Stopped) => return Err(CloseOutcome::InternalError),
+            Err(_) => return Err(CloseOutcome::InternalError),
+        })
     }
 
     fn reply_error(

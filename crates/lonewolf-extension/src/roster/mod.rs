@@ -443,9 +443,14 @@ where
         &'a self,
         request: PresenceRequest<'a, A>,
         transaction: &'a mut S::Write,
-        _hosts: &'a dyn HostLookup,
+        hosts: &'a dyn HostLookup,
     ) -> SendFuture<'a, A> {
-        Box::pin(subscription::send_subscription(self, transaction, request))
+        Box::pin(subscription::send_subscription(
+            self,
+            transaction,
+            request,
+            hosts,
+        ))
     }
 
     fn receive<'a>(

@@ -194,6 +194,11 @@ pub type CopyFactory<'a, A> =
 
 pub trait HostLookup {
     fn is_local_host(&self, domain: &str) -> bool;
+
+    /// Whether this local domain exchanges stanzas with non-local domains.
+    fn federates(&self, _local_domain: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

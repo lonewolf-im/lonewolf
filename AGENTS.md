@@ -133,5 +133,6 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Keep `docs/STANDARDS.md` as the reference for every supported XEP and RFC. Keep `lonewolf.doap` as its [XEP-0453](https://xmpp.org/extensions/xep-0453.html) summary for software directories such as xmpp.org.
 - When a change adds, removes, or changes support for a XEP or RFC, update both files in the same change. This covers the reviewed XEP version, the support status, and the documented limits.
 - In `lonewolf.doap`, mark a XEP `partial` when `docs/STANDARDS.md` lists a limit within that XEP's own scope. Otherwise mark it `complete`.
-- For support that is not in a release yet, omit `since` and end the XEP's note with "Not in a release yet."
-- When preparing a release, add a `<release>` entry to `lonewolf.doap` with the version and date. Set `since` to that version for every XEP the release ships for the first time, and remove "Not in a release yet." from their notes.
+- When no part of a XEP is in a release yet, omit `since` and end the XEP's note with "Not in a release yet."
+- When a released XEP gains support that is not in a release yet, keep its `since`. End its note with a sentence that names the unreleased scope, such as "Federation support is not in a release yet."
+- When preparing a release, add a `<release>` entry to `lonewolf.doap` with the version and date. Set `since` to that version for every XEP the release ships for the first time. Remove the unreleased-support sentence from the note of every XEP the release ships.

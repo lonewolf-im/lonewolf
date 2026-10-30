@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod failures;
+mod iq;
 mod lifecycle;
+mod messages;
 mod negotiation;
+mod presence;
+mod subscriptions;
 
 use std::sync::{Arc, atomic::Ordering};
 use std::thread;
@@ -674,4 +678,135 @@ fn dns_query(
         response
     };
     Ok(Message::from_vec(&response)?)
+}
+
+const DIRECTIONS: [(&str, &str, &str, &str); 2] = [
+    ("a.test", "alice", "b.test", "bob"),
+    ("b.test", "bob", "a.test", "alice"),
+];
+
+fn workflow_options() -> PairOptions {
+    let extensions = "'roster', 'offline', 'carbons', 'disco', 'ping', 'vcard'";
+    PairOptions {
+        a_extensions: extensions.into(),
+        b_extensions: extensions.into(),
+        ..PairOptions::default()
+    }
+}
+
+fn roster(client: &mut super::support::Client) -> TestResult<super::support::xml::Element> {
+    client.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+    let reply = client.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("id"), Some("roster"));
+    assert_eq!(reply.attribute("type"), Some("result"));
+    reply.child("jabber:iq:roster", "query")?;
+    Ok(reply)
+}
+
+fn push(
+    client: &mut super::support::Client,
+    jid: &str,
+    subscription: &str,
+    ask: Option<&str>,
+) -> TestResult {
+    let reply = client.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("type"), Some("set"));
+    let query = reply.child("jabber:iq:roster", "query")?;
+    assert_eq!(query.children.len(), 1);
+    let item = query.child("jabber:iq:roster", "item")?;
+    assert_eq!(item.attribute("jid"), Some(jid));
+    assert_eq!(item.attribute("subscription"), Some(subscription));
+    assert_eq!(item.attribute("ask"), ask);
+    client.send(&format!(
+        "<iq type='result' id='{}'/>",
+        reply.attribute("id").ok_or("missing push ID")?
+    ))
+}
+
+fn presence(
+    client: &mut super::support::Client,
+    from: &str,
+    to: &str,
+    kind: Option<&str>,
+) -> TestResult<super::support::xml::Element> {
+    let reply = client.receive()?;
+    reply.assert_name("jabber:client", "presence");
+    assert_eq!(reply.attribute("from"), Some(from));
+    assert_eq!(reply.attribute("to"), Some(to));
+    assert_eq!(reply.attribute("type"), kind);
+    Ok(reply)
+}
+
+fn available(client: &mut super::support::Client, bare: &str, resource: &str) -> TestResult {
+    client.send("<presence/>")?;
+    presence(client, &format!("{bare}/{resource}"), bare, None)?;
+    Ok(())
+}
+
+fn iq_reply(
+    client: &mut super::support::Client,
+    id: &str,
+    kind: &str,
+    from: &str,
+    to: &str,
+) -> TestResult<super::support::xml::Element> {
+    let reply = client.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("id"), Some(id));
+    assert_eq!(reply.attribute("type"), Some(kind));
+    assert_eq!(reply.attribute("from"), Some(from));
+    assert_eq!(reply.attribute("to"), Some(to));
+    Ok(reply)
+}
+
+fn stanza_error(reply: &super::support::xml::Element, condition: &str) -> TestResult {
+    assert_eq!(reply.attribute("type"), Some("error"));
+    reply
+        .child("jabber:client", "error")?
+        .child("urn:ietf:params:xml:ns:xmpp-stanzas", condition)?;
+    Ok(())
+}
+
+fn traffic(pair: &FederatedPair, name: &str, a_to_b: [u64; 3], b_to_a: [u64; 3]) -> TestResult {
+    for (sender, receiver, counts) in [(&pair.a, &pair.b, a_to_b), (&pair.b, &pair.a, b_to_a)] {
+        for (kind, count) in ["message", "iq", "presence"].into_iter().zip(counts) {
+            for (suite, event) in [(sender, "sent"), (receiver, "received")] {
+                let name = format!("lonewolf_s2s_stanzas_{event}_total{{kind=\"{kind}\"}}");
+                suite.wait_for_metrics(&name, |body| {
+                    let value = body
+                        .lines()
+                        .find_map(|line| line.strip_prefix(&name)?.strip_prefix(' '));
+                    match value {
+                        Some(value) => value.parse::<u64>() == Ok(count),
+                        None => count == 0,
+                    }
+                })?;
+            }
+        }
+        if counts.iter().sum::<u64>() > 0 {
+            sender.wait_for_metric(
+                "lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"success\"} 1",
+            )?;
+            receiver.wait_for_metric(
+                "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"success\"} 1",
+            )?;
+            receiver
+                .wait_for_metric("lonewolf_s2s_connections_accepted_total{listener=\"0\"} 1")?;
+            sender.wait_for_metric("lonewolf_s2s_dns_resolutions_total{outcome=\"srv\"} 1")?;
+        }
+    }
+    for suite in [&pair.a, &pair.b] {
+        suite.wait_for_metric("lonewolf_s2s_outbound_queued_stanzas 0")?;
+        suite.wait_for_metric("lonewolf_s2s_outbound_queued_bytes 0")?;
+        let body = suite.scrape_metrics()?;
+        for line in body
+            .lines()
+            .filter(|line| line.starts_with("lonewolf_s2s_"))
+        {
+            eprintln!("METRIC_LEDGER {name} {} {line}", suite.domain);
+        }
+    }
+    Ok(())
 }

@@ -633,10 +633,20 @@ impl Default for S2sListenerConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct S2sTlsConfig {
     pub trust_anchors_path: Option<PathBuf>,
+    pub fetch_crls: bool,
+}
+
+impl Default for S2sTlsConfig {
+    fn default() -> Self {
+        Self {
+            trust_anchors_path: None,
+            fetch_crls: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

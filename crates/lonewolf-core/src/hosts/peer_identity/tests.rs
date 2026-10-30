@@ -76,6 +76,7 @@ impl Fixture {
             now,
             config: S2sTlsConfig {
                 trust_anchors_path: Some(path),
+                ..S2sTlsConfig::default()
             },
         })
     }

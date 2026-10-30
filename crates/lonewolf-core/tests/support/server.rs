@@ -38,6 +38,7 @@ impl C2sSuitePermit {
 }
 
 fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> std::io::Result<Child> {
+    super::federation::remove_shutdown_receipt(directory)?;
     readiness
         .configure(&mut Command::new(std::env::current_exe()?))
         .args([
@@ -185,6 +186,17 @@ impl C2sSuite {
         Ok(fs::read_to_string(
             self.directory.path().join("server.log"),
         )?)
+    }
+
+    pub fn stop_with_s2s_state(
+        &mut self,
+    ) -> TestResult<Option<lonewolf_core::test_support::S2sShutdownState>> {
+        self.stop()?;
+        let status = self.child.try_wait()?.ok_or("server has not been reaped")?;
+        if !self.reaped || !status.success() {
+            return Err("server did not complete successfully".into());
+        }
+        super::federation::read_shutdown_receipt(self.directory.path(), self.child.id())
     }
 
     pub fn with_extensions(extensions: &str) -> TestResult<Self> {
@@ -669,7 +681,7 @@ fn server_process() -> TestResult {
     if std::env::var_os("LONEWOLF_PROTOCOL_TEST_SERVER").is_none() {
         return Ok(());
     }
-    lonewolf_core::run_with_extensions(
+    let state = lonewolf_core::test_support::run_with_extensions_and_s2s_shutdown_state(
         None,
         lonewolf_core::BuildInfo {
             version: "integration-test",
@@ -679,5 +691,5 @@ fn server_process() -> TestResult {
         super::extensions::catalog()?,
     )
     .map_err(|error| error.to_string())?;
-    Ok(())
+    super::federation::write_shutdown_receipt(&std::env::current_dir()?, state)
 }

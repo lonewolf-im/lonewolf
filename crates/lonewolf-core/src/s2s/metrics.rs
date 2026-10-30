@@ -501,6 +501,19 @@ impl S2sMetrics {
         self.dropped[reason as usize].fetch_add(count, Ordering::Relaxed);
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) fn shutdown_state(&self) -> crate::test_support::S2sShutdownState {
+        let source = self.link_source.read().as_ref().and_then(Weak::upgrade);
+        let snapshot = source.map_or_else(LinkSnapshot::default, |source| source.snapshot());
+        crate::test_support::S2sShutdownState {
+            dropped_shutdown: self.dropped[DropReason::Shutdown as usize].load(Ordering::Relaxed),
+            dropped_connection_lost: self.dropped[DropReason::ConnectionLost as usize]
+                .load(Ordering::Relaxed),
+            queued_stanzas: snapshot.queued_stanzas,
+            queued_bytes: snapshot.queued_bytes,
+        }
+    }
+
     pub(crate) fn set_link_source(&self, source: Weak<dyn LinkStats>) {
         *self.link_source.write() = Some(source);
     }

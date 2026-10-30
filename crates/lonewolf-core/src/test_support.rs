@@ -13,6 +13,33 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use parking_lot::Mutex as PlMutex;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct S2sShutdownState {
+    pub dropped_shutdown: u64,
+    pub dropped_connection_lost: u64,
+    pub queued_stanzas: u64,
+    pub queued_bytes: u64,
+}
+
+pub fn run_with_extensions_and_s2s_shutdown_state(
+    config_path: Option<&std::path::Path>,
+    build: crate::BuildInfo,
+    extensions: lonewolf_extension::Extensions<
+        Arc<lonewolf_util::pool::PooledChunkAllocator>,
+        lonewolf_storage::RedbStorage,
+    >,
+) -> Result<Option<S2sShutdownState>, crate::RunError> {
+    let mut state = None;
+    crate::run_internal(
+        config_path,
+        build,
+        extensions,
+        crate::acme::LoadOptions::default(),
+        Some(&mut state),
+    )?;
+    Ok(state)
+}
+
 static PROBES: LazyLock<PlMutex<BTreeMap<String, Weak<State>>>> =
     LazyLock::new(|| PlMutex::new(BTreeMap::new()));
 

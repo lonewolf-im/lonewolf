@@ -65,6 +65,14 @@ pub struct RawS2sPeer {
 }
 impl RawS2sPeer {
     pub fn connect(address: SocketAddr, from: &str, to: &str) -> TestResult<Self> {
+        Self::connect_with_response_from(address, from, to, to)
+    }
+    pub fn connect_with_response_from(
+        address: SocketAddr,
+        from: &str,
+        to: &str,
+        response_from: &str,
+    ) -> TestResult<Self> {
         let socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
         configure(&socket)?;
         let mut peer = Self {
@@ -72,17 +80,30 @@ impl RawS2sPeer {
             from: from.into(),
             to: to.into(),
         };
-        assert_header(&peer.stream.open_with(&opening(from, to))?, to, from);
+        assert_header(
+            &peer.stream.open_with(&opening(from, to))?,
+            response_from,
+            from,
+        );
         Ok(peer)
     }
     pub fn expect_starttls_features(&mut self) -> TestResult {
-        self.stream
-            .features()?
-            .child(TLS_NAMESPACE, "starttls")?
-            .child(TLS_NAMESPACE, "required")?;
+        self.stream.features()?.assert_xml(&format!(
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><starttls xmlns='{TLS_NAMESPACE}'><required/></starttls></stream:features>"
+        ))?;
         Ok(())
     }
-    pub fn start_tls(mut self, config: Arc<rustls::ClientConfig>) -> TestResult<Self> {
+    pub fn start_tls(self, config: Arc<rustls::ClientConfig>) -> TestResult<Self> {
+        let header = opening(&self.from, &self.to);
+        let expected_to = self.from.clone();
+        self.start_tls_with_header(config, &header, Some(&expected_to))
+    }
+    pub fn start_tls_with_header(
+        mut self,
+        config: Arc<rustls::ClientConfig>,
+        header: &str,
+        expected_to: Option<&str>,
+    ) -> TestResult<Self> {
         self.stream
             .send(&format!("<starttls xmlns='{TLS_NAMESPACE}'/>"))?;
         self.stream.receive()?.assert_name(TLS_NAMESPACE, "proceed");
@@ -95,23 +116,21 @@ impl RawS2sPeer {
         self.stream = XmlStream::new(PeerTransport::Client(Box::new(rustls::StreamOwned::new(
             connection, socket,
         ))));
-        assert_header(
-            &self.stream.open_with(&opening(&self.from, &self.to))?,
-            &self.to,
-            &self.from,
+        let response = self.stream.open_with(header)?;
+        assert_eq!(
+            response.attribute("from"),
+            Some(self.to.as_str()),
+            "{response:?}"
         );
+        assert_eq!(response.attribute("to"), expected_to, "{response:?}");
+        assert_eq!(response.attribute("version"), Some("1.0"), "{response:?}");
         Ok(self)
     }
     pub fn expect_external_offered(&mut self) -> TestResult {
         let features = self.stream.features()?;
-        let mechanisms = features.child(SASL_NAMESPACE, "mechanisms")?;
-        assert!(
-            mechanisms
-                .children
-                .iter()
-                .any(|mechanism| mechanism.name == "mechanism" && mechanism.text == "EXTERNAL"),
-            "{features:?}"
-        );
+        features.assert_xml(&format!(
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>"
+        ))?;
         Ok(())
     }
     pub fn auth_external(&mut self, authzid: Option<&str>) -> TestResult {
@@ -211,13 +230,11 @@ impl RawS2sListener {
     pub fn address(&self) -> TestResult<SocketAddr> {
         Ok(self.listener.local_addr()?)
     }
-    pub fn accept(
-        &self,
-        from: &str,
-        to: &str,
-        config: Arc<rustls::ServerConfig>,
-        external: bool,
-    ) -> TestResult<RawS2sPeer> {
+    pub fn set_receive_buffer_size(&self, size: usize) -> TestResult {
+        socket2::SockRef::from(&self.listener).set_recv_buffer_size(size)?;
+        Ok(())
+    }
+    pub fn accept_until_proceed(&self, from: &str, to: &str) -> TestResult<RawS2sPeer> {
         let deadline = Instant::now() + TIMEOUT;
         let socket = loop {
             let remaining = deadline
@@ -251,7 +268,21 @@ impl RawS2sListener {
         stream.receive()?.assert_name(TLS_NAMESPACE, "starttls");
         stream.send(&format!("<proceed xmlns='{TLS_NAMESPACE}'/>"))?;
         assert!(!stream.has_buffered_input());
-        let PeerTransport::Plain(socket) = stream.into_inner().into_inner() else {
+        Ok(RawS2sPeer {
+            stream,
+            from: from.into(),
+            to: to.into(),
+        })
+    }
+    pub fn accept(
+        &self,
+        from: &str,
+        to: &str,
+        config: Arc<rustls::ServerConfig>,
+        external: bool,
+    ) -> TestResult<RawS2sPeer> {
+        let peer = self.accept_until_proceed(from, to)?;
+        let PeerTransport::Plain(socket) = peer.stream.into_inner().into_inner() else {
             return Err("expected plain peer transport".into());
         };
         let mut stream = XmlStream::new(PeerTransport::Server(Box::new(rustls::StreamOwned::new(

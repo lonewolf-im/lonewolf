@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod failures;
+mod lifecycle;
+mod negotiation;
+
 use std::sync::{Arc, atomic::Ordering};
 use std::thread;
 

@@ -295,6 +295,13 @@ fn run_internal(
                 } else {
                     None
                 };
+                for domain in services.keys() {
+                    if remote.is_some() && hosts.certificate_host_for(domain).is_some() {
+                        tracing::info!(service_domain = %domain, "s2s service domain federates");
+                    } else {
+                        tracing::info!(service_domain = %domain, "s2s service domain cannot federate");
+                    }
+                }
                 let local = LocalRouter::with_options(
                     Arc::clone(&stanza_pool),
                     config

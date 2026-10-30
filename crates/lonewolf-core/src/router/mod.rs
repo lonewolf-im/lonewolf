@@ -289,7 +289,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     }
 
     pub(crate) fn federates_domain(&self, domain: &str) -> bool {
-        self.federation_enabled() && self.hosts.federates(domain)
+        self.federation_enabled()
+            && (self.hosts.federates(domain)
+                || (self.service(domain).is_some()
+                    && self.hosts.certificate_host_for(domain).is_some()))
     }
 
     pub(crate) fn route_remote(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {

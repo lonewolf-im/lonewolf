@@ -281,7 +281,7 @@ async fn run<A: ChunkAllocator + Clone>(
 ) -> Result<(Box<str>, Box<str>, SystemTime), Failure> {
     let plain = connection.as_mut().ok_or(S2sError::Internal)?;
     let initial = header(expected(plain, peer_footer).await?)?;
-    if !settings.hosts.federates(&initial.to) {
+    if !settings.services.router.federates_domain(&initial.to) {
         plain
             .send(&stream::response_header_xml(
                 settings.hosts.default_host_name(),

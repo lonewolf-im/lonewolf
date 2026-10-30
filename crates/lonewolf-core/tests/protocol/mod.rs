@@ -48,3 +48,5 @@ mod sessions;
 mod metrics;
 
 mod vcard;
+
+mod s2s_services;

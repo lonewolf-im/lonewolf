@@ -4,7 +4,7 @@ use lonewolf_extension::observer::{MessageEvent, MessageOutcome, MessageRole};
 use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
-use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition};
+use lonewolf_xmpp::stanza::MessageType;
 
 use super::{InboundPeer, IngressContext, IngressFailure, reply_error};
 use crate::delivery::RouterDelivery;
@@ -87,11 +87,7 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
             }
         }
         Destination::Server | Destination::ServerResource => routed,
-        Destination::Service => {
-            let condition = StanzaErrorCondition::ServiceUnavailable;
-            return reply_error(context, &routed, condition, None, condition.default_text());
-        }
-        Destination::Remote => return Err(IngressFailure),
+        Destination::Service | Destination::Remote => return Err(IngressFailure),
     };
     let observed = observers.then(|| routed.clone());
     let outcome = message::deliver(&stage, routed, kind).await?;

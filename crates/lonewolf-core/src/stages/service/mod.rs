@@ -225,10 +225,10 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                         }
                     }
                 },
-                Destination::Service
-                | Destination::Server
-                | Destination::ServerResource
-                | Destination::Remote => Err(DeliveryError),
+                Destination::Remote => self.router.route_remote(stanza).map_err(|_| DeliveryError),
+                Destination::Service | Destination::Server | Destination::ServerResource => {
+                    Err(DeliveryError)
+                }
             }
         })
     }

@@ -32,8 +32,21 @@ impl Fixture {
         initial: AdmissionState,
         capacity: NonZeroUsize,
     ) -> TestResult<Self> {
+        Self::with_hosts_and_pair(
+            initial,
+            capacity,
+            crate::hosts::test_support::managed_hosts()?,
+            ("example.com".into(), "remote.test".into()),
+        )
+    }
+
+    pub(crate) fn with_hosts_and_pair(
+        initial: AdmissionState,
+        capacity: NonZeroUsize,
+        hosts: Hosts,
+        pair: Pair,
+    ) -> TestResult<Self> {
         let config = crate::config::Config::default();
-        let hosts = crate::hosts::test_support::managed_hosts()?;
         let trust = PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?;
         let limits = S2sLimits {
             max_queued_stanzas_per_link: capacity,
@@ -47,7 +60,6 @@ impl Fixture {
             GlobalChunkAllocator,
             S2sMetrics::new(0),
         );
-        let pair: Pair = ("example.com".into(), "remote.test".into());
         let counters = Arc::new(QueueCounters::default());
         let (receiver, guard) = {
             let mut state = remote.inner.state.lock();
@@ -89,6 +101,10 @@ impl Fixture {
             receiver,
             guard,
         })
+    }
+
+    pub(crate) fn metrics(&self) -> Arc<S2sMetrics> {
+        Arc::clone(&self.remote.inner.metrics)
     }
 
     pub(crate) fn hosts(&self) -> Hosts {

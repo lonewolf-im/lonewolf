@@ -9,7 +9,10 @@ use lonewolf_xmpp::stanza::{
 
 use crate::delivery::WorkHandle;
 use crate::router::{RoutedStanza, RouterHandle};
-use crate::stages::StageFailure;
+use crate::stages::{
+    Stage, StageFailure,
+    service::{self, ServiceOutcome},
+};
 
 pub(crate) struct InboundPeer {
     pub(crate) local: Box<str>,
@@ -85,7 +88,29 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
     peer: &InboundPeer,
     stanza: RoutedStanza<A>,
 ) -> Result<(), IngressFailure> {
-    let kind = stanza.resolve().map_err(|_| IngressFailure)?.stanza_type();
+    let view = stanza.resolve().map_err(|_| IngressFailure)?;
+    if let Some(route) = view
+        .to()
+        .map_err(|_| IngressFailure)?
+        .and_then(|to| context.router.service(to.domainpart()))
+    {
+        let stage = Stage {
+            router: &context.router,
+            storage: &context.storage,
+            allocator: &context.allocator,
+            work: &context.work,
+        };
+        if let ServiceOutcome::Rejected {
+            stanza,
+            condition,
+            text,
+        } = service::dispatch(&stage, route, stanza).await?
+        {
+            reply_error(context, &stanza, condition, None, text)?;
+        }
+        return Ok(());
+    }
+    let kind = view.stanza_type();
     match kind {
         StanzaType::Message(kind) => message::handle(context, peer, stanza, kind).await,
         StanzaType::Iq(kind) => iq::handle(context, peer, stanza, kind).await,

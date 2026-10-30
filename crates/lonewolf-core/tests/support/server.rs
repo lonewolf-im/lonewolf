@@ -61,6 +61,8 @@ pub struct C2sSuite {
     directory: tempfile::TempDir,
     readiness: ReadinessSocket,
     pub address: SocketAddr,
+    pub s2s: Option<Vec<SocketAddr>>,
+    federation_enabled: bool,
     listeners: Vec<SocketAddr>,
     metrics: SocketAddr,
     pub tls: Arc<ClientConfig>,
@@ -267,6 +269,28 @@ impl C2sSuite {
         default: Option<&str>,
         setup: impl FnOnce(&Path) -> TestResult,
     ) -> TestResult<Self> {
+        Self::settings_with_federation(listener, limits, resources, hosts, default, None, setup)
+    }
+
+    pub fn with_federation_and_setup(
+        hosts: &str,
+        federation: &str,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
+        Self::settings_with_federation("", "", 10, hosts, None, Some(federation), setup)
+    }
+
+    fn settings_with_federation(
+        listener: &str,
+        limits: &str,
+        resources: usize,
+        hosts: &str,
+        default: Option<&str>,
+        federation: Option<&str>,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
+        let federation_enabled = federation.is_some();
+        let federation = federation.unwrap_or("[s2s]\nenabled = false");
         let permit = C2sSuitePermit::acquire();
         let directory = tempfile::tempdir()?;
         let tls_roots = tls::configure(directory.path())?;
@@ -286,8 +310,7 @@ address = "127.0.0.1:0"
 address = "127.0.0.1:0"
 {listener}
 {hosts}
-[s2s]
-enabled = false
+{federation}
 [hosts.localhost.tls]
 certificate_chain_path = "certificate.pem"
 private_key_path = "private-key.pem"
@@ -309,6 +332,8 @@ max_resources_per_account = {resources}
             readiness,
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             listeners: Vec::new(),
+            s2s: None,
+            federation_enabled,
             metrics: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             tls: Arc::new(tls),
             tls_roots,
@@ -341,7 +366,8 @@ max_resources_per_account = {resources}
                 return Err(format!("server exited before readiness: {logs}").into());
             }
             if let Some(readiness) = self.readiness.receive(Duration::from_millis(10))? {
-                assert!(readiness.s2s.is_none());
+                assert_eq!(readiness.s2s.is_some(), self.federation_enabled);
+                self.s2s = readiness.s2s;
                 self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
                 self.metrics = readiness.metrics.ok_or("metrics service is not ready")?;
                 self.listeners = readiness.c2s;

@@ -161,6 +161,53 @@ impl rustls::client::ResolvesClientCert for HostClientCertResolver {
     }
 }
 
+#[derive(Debug)]
+struct ServiceCertResolver {
+    identity: ServerName<'static>,
+    snapshot: Arc<TlsSnapshot>,
+}
+
+impl ResolvesServerCert for ServiceCertResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        if !self.snapshot.is_current() {
+            return None;
+        }
+        match (hello.server_name(), &self.identity) {
+            (None, _) => Some(Arc::clone(&self.snapshot.certified_key)),
+            (Some(name), ServerName::DnsName(identity))
+                if name.eq_ignore_ascii_case(identity.as_ref()) =>
+            {
+                Some(Arc::clone(&self.snapshot.certified_key))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl rustls::client::ResolvesClientCert for ServiceCertResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        if !self.snapshot.is_current()
+            || self
+                .snapshot
+                .certified_key
+                .key
+                .choose_scheme(sigschemes)
+                .is_none()
+        {
+            return None;
+        }
+        Some(Arc::clone(&self.snapshot.certified_key))
+    }
+
+    fn has_certs(&self) -> bool {
+        self.snapshot.is_current()
+    }
+}
+
 impl TlsSnapshot {
     fn is_current(&self) -> bool {
         self.validity.is_none_or(|(start, end)| {
@@ -317,21 +364,59 @@ impl Hosts {
         })
     }
 
+    pub(crate) fn certificate_host_for(&self, domain: &str) -> Option<&str> {
+        self.certificate_snapshot_for(domain)
+            .map(|(host, _)| host.domain.as_str())
+    }
+
+    fn certificate_snapshot_for(&self, domain: &str) -> Option<(&Host, Arc<TlsSnapshot>)> {
+        let identity = tls_identity(domain).ok()?;
+        for host in self
+            .hosts
+            .iter()
+            .filter(|host| self.federates(&host.domain))
+        {
+            let Some(snapshot) = host.tls.read().clone() else {
+                continue;
+            };
+            if snapshot.is_current()
+                && snapshot.certified_key.cert.first().is_some_and(|leaf| {
+                    verify_service_identity(leaf, &identity, XmppService::Server).is_ok()
+                })
+            {
+                return Some((host, snapshot));
+            }
+        }
+        None
+    }
+
     pub(crate) fn s2s_server_config(
         &self,
         domain: &str,
         trust: &Arc<PeerTrust>,
     ) -> Option<Arc<rustls::ServerConfig>> {
-        let host = self.find_host(domain)?;
-        let snapshot = self.snapshot(domain)?;
-        if !snapshot.is_current() {
-            return None;
-        }
+        let (host, resolver): (_, Arc<dyn ResolvesServerCert>) =
+            if let Some(host) = self.find_host(domain) {
+                let snapshot = self.snapshot(domain)?;
+                if !snapshot.is_current() {
+                    return None;
+                }
+                (host, snapshot.resolver.clone())
+            } else {
+                let (host, snapshot) = self.certificate_snapshot_for(domain)?;
+                (
+                    host,
+                    Arc::new(ServiceCertResolver {
+                        identity: tls_identity(domain).ok()?,
+                        snapshot,
+                    }),
+                )
+            };
         Some(Arc::new(
             host.tls_builder
                 .clone()
                 .with_client_cert_verifier(trust.client_verifier())
-                .with_cert_resolver(snapshot.resolver.clone()),
+                .with_cert_resolver(resolver),
         ))
     }
 
@@ -340,15 +425,24 @@ impl Hosts {
         domain: &str,
         trust: &Arc<PeerTrust>,
     ) -> Option<Arc<rustls::ClientConfig>> {
-        let host = self.find_host(domain)?;
+        let resolver: Arc<dyn rustls::client::ResolvesClientCert> =
+            if let Some(host) = self.find_host(domain) {
+                Arc::new(HostClientCertResolver {
+                    tls: Arc::clone(&host.tls),
+                })
+            } else {
+                let (_, snapshot) = self.certificate_snapshot_for(domain)?;
+                Arc::new(ServiceCertResolver {
+                    identity: tls_identity(domain).ok()?,
+                    snapshot,
+                })
+            };
         let config = rustls::ClientConfig::builder_with_provider(self.crypto_provider())
             .with_safe_default_protocol_versions()
             .ok()?
             .dangerous()
             .with_custom_certificate_verifier(trust.server_verifier())
-            .with_client_cert_resolver(Arc::new(HostClientCertResolver {
-                tls: Arc::clone(&host.tls),
-            }));
+            .with_client_cert_resolver(resolver);
         Some(Arc::new(config))
     }
 

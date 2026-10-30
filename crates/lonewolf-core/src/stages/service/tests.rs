@@ -196,3 +196,134 @@ fn outbound_requires_the_service_sender_domain_and_a_supported_destination() -> 
         Ok(())
     }))?
 }
+
+fn federating_service_hosts(directory: &std::path::Path) -> TestResult<Hosts> {
+    use crate::config::{HostConfig, HostTlsConfig, HostTlsSource};
+    use base64::Engine as _;
+    let parameters = rcgen::CertificateParams::new(vec![
+        "example.com".into(),
+        "echo.example.com".into(),
+        "covered.example.com".into(),
+        "optout.test".into(),
+    ])?;
+    let (certificate, key) = crate::hosts::test_support::material(parameters)?;
+    let certificate_chain_path = directory.join("certificate.pem");
+    let private_key_path = directory.join("key.pem");
+    for (label, bytes, path) in [
+        ("CERTIFICATE", certificate.as_ref(), &certificate_chain_path),
+        ("PRIVATE KEY", key.secret_der(), &private_key_path),
+    ] {
+        std::fs::write(
+            path,
+            format!(
+                "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ),
+        )?;
+    }
+    let host = HostConfig {
+        tls: Some(HostTlsConfig {
+            source: HostTlsSource::Files {
+                certificate_chain_path,
+                private_key_path,
+            },
+            client_auth: None,
+        }),
+        ..Default::default()
+    };
+    let mut optout = host.clone();
+    optout.federation = false;
+    Ok(Hosts::new(
+        &BTreeMap::from([("example.com".into(), host), ("optout.test".into(), optout)]),
+        Some("example.com"),
+    )?)
+}
+
+#[test]
+fn registered_service_federation_requires_the_global_gate_and_certificate_coverage() -> TestResult {
+    use crate::s2s::outbound::test_support::{AdmissionState, Fixture as RemoteFixture};
+    let directory = tempfile::tempdir()?;
+    let hosts = federating_service_hosts(directory.path())?;
+    let remote = RemoteFixture::with_hosts_and_pair(
+        AdmissionState::Link,
+        NonZeroUsize::MIN,
+        hosts.clone(),
+        ("echo.example.com".into(), "remote.test".into()),
+    )?;
+    for enabled in [false, true] {
+        let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator))
+            .with_services(
+                ["echo.example.com", "uncovered.example.com"]
+                    .into_iter()
+                    .map(|domain| {
+                        (
+                            domain.into(),
+                            ServiceRoute {
+                                domain: Arc::from(domain),
+                                handler: Arc::new(RejectingService) as _,
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+        let router = if enabled {
+            router.with_remote(remote.remote())
+        } else {
+            router
+        };
+        let handle = router.handle();
+        assert_eq!(handle.federates_domain("example.com"), enabled);
+        assert_eq!(handle.federates_domain("echo.example.com"), enabled);
+        for domain in [
+            "covered.example.com",
+            "uncovered.example.com",
+            "optout.test",
+            "unknown.test",
+        ] {
+            assert!(!handle.federates_domain(domain), "{domain}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn service_remote_outbound_uses_real_admission_and_maps_each_failure() -> TestResult {
+    use crate::s2s::outbound::{
+        RemoteFailure,
+        test_support::{AdmissionState, Fixture as RemoteFixture},
+    };
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let directory = tempfile::tempdir()?;
+        let hosts = federating_service_hosts(directory.path())?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+        for initial in [AdmissionState::Link, AdmissionState::Backoff(RemoteFailure::NotFound), AdmissionState::Backoff(RemoteFailure::Timeout)] {
+            let link = matches!(initial, AdmissionState::Link);
+            let mut remote = RemoteFixture::with_hosts_and_pair(initial, NonZeroUsize::MIN, hosts.clone(), ("echo.example.com".into(), "remote.test".into()))?;
+            let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator)).with_remote(remote.remote()).with_services(BTreeMap::from([("echo.example.com".into(), ServiceRoute { domain: Arc::from("echo.example.com"), handler: Arc::new(RejectingService) })]));
+            let handle = router.handle();
+            let mut work = WorkGroup::new();
+            let outbound = Outbound { router: &handle, storage: &storage, allocator: &GlobalChunkAllocator, work: &work.handle(), domain: "echo.example.com" };
+            let xml = "<message type='chat' id='service-remote' from='room@echo.example.com/nick' to='alice@remote.test/desk'/>";
+            assert_eq!(outbound.route(parsed(xml).await?).await.is_ok(), link);
+            if link {
+                assert!(outbound.route(parsed(xml).await?).await.is_err());
+                let received = remote.receive()?.ok_or("service stanza not admitted")?;
+                assert_eq!(received.resolve()?.from()?.ok_or("no sender")?.as_str(), "room@echo.example.com/nick");
+                assert_eq!(received.resolve()?.id()?, Some("service-remote"));
+            }
+            let unsupported = Outbound { domain: "covered.example.com", ..outbound };
+            assert!(unsupported.route(parsed("<message from='covered.example.com' to='alice@remote.test'/>").await?).await.is_err());
+            let mut registry = prometheus_client::registry::Registry::default();
+            remote.metrics().register(registry.sub_registry_with_prefix("lonewolf"));
+            let mut metrics = String::new();
+            prometheus_client::encoding::text::encode(&mut metrics, &registry)?;
+            assert!(metrics.lines().any(|line| line == "lonewolf_s2s_admission_rejections_total{reason=\"unsupported\"} 1"), "{metrics}");
+            remote.remote().stop();
+            assert!(outbound.route(parsed(xml).await?).await.is_err());
+            work.drain().await;
+            remote.finish(std::time::Instant::now() + Duration::from_secs(5)).await?;
+            router.shutdown().await?;
+        }
+        Ok(())
+    }))?
+}

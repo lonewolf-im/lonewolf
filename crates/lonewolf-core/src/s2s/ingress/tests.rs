@@ -2480,3 +2480,91 @@ fn inbound_subscription_waits_for_ordered_effects_and_survives_cancellation() ->
     compio::runtime::Runtime::new()?
         .block_on(compio::time::timeout(Duration::from_secs(5), scenario))?
 }
+
+struct HostedService {
+    calls: PlMutex<Vec<StanzaType>>,
+}
+
+impl lonewolf_extension::service::ServiceHandler<GlobalChunkAllocator, RedbStorage>
+    for HostedService
+{
+    fn route<'a>(
+        &'a self,
+        stanza: RoutedStanza<GlobalChunkAllocator>,
+        _: lonewolf_extension::service::ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> lonewolf_extension::ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async move {
+            self.calls.lock().push(
+                stanza
+                    .resolve()
+                    .map_err(|_| HandlerError::from(StanzaErrorCondition::InternalServerError))?
+                    .stanza_type(),
+            );
+            Err(HandlerError::described(
+                StanzaErrorCondition::BadRequest,
+                StanzaErrorText::Static("Unsupported service request."),
+            ))
+        })
+    }
+}
+
+#[test]
+fn registered_service_dispatch_bypasses_account_stages_for_all_kinds_and_replies_only_when_eligible()
+-> TestResult {
+    compio::runtime::Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let messages = Arc::new(Messages { verdict: Verdict::Drop, archive_reject: true, steps: PlMutex::new(Vec::new()) });
+        let mut fixture = Fixture::new(Extensions::default(), &[])?;
+        let service = Arc::new(HostedService { calls: PlMutex::new(Vec::new()) });
+        let mut config = crate::config::Config::default();
+        let directory = tempfile::tempdir()?;
+        use base64::Engine as _;
+        let (cert, key) = crate::hosts::test_support::material(rcgen::CertificateParams::new(vec!["example.com".into(), "svc.example.com".into()])?)?;
+        let chain_path = directory.path().join("chain.pem");
+        let key_path = directory.path().join("key.pem");
+        for (label, bytes, path) in [("CERTIFICATE", cert.as_ref(), &chain_path), ("PRIVATE KEY", key.secret_der(), &key_path)] {
+            std::fs::write(path, format!("-----BEGIN {label}-----\n{}\n-----END {label}-----\n", base64::engine::general_purpose::STANDARD.encode(bytes)))?;
+        }
+        config.hosts.insert("example.com".into(), crate::config::HostConfig { tls: Some(crate::config::HostTlsConfig { source: crate::config::HostTlsSource::Files { certificate_chain_path: chain_path, private_key_path: key_path }, client_auth: None }), ..Default::default() });
+        let hosts = crate::hosts::Hosts::new(&config.hosts, Some("localhost"))?;
+        fixture.remote = RemoteFixture::with_hosts_and_pair(AdmissionState::Link, NonZeroUsize::MIN, hosts.clone(), ("svc.example.com".into(), "remote.test".into()))?;
+        let route = crate::router::ServiceRoute { domain: Arc::from("svc.example.com"), handler: service.clone() };
+        fixture.router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator)).with_remote(fixture.remote.remote()).with_extensions(BTreeMap::from([("svc.example.com".into(), {
+            let mut extensions = Extensions::default();
+            extensions.register(messages.clone())?;
+            extensions.enable_host("svc.example.com", ["messages"])?
+        })])).with_services(BTreeMap::from([("svc.example.com".into(), route)]));
+        fixture.context.router = fixture.router.handle();
+        let cases = [
+            ("<message type='chat'", "<body>service</body>", "message", true),
+            ("<message type='error'", "<error type='cancel'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>", "message", false),
+            ("<iq type='get'", "<query xmlns='urn:test'/>", "iq", true),
+            ("<iq type='set'", "<query xmlns='urn:test'/>", "iq", true),
+            ("<iq type='result'", "", "iq", false),
+            ("<iq type='error'", "<error type='cancel'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>", "iq", false),
+            ("<presence", "", "presence", false),
+            ("<presence type='unavailable'", "", "presence", false),
+            ("<presence type='subscribe'", "", "presence", false),
+            ("<presence type='probe'", "", "presence", false),
+            ("<presence type='subscribed'", "", "presence", false),
+            ("<presence type='unsubscribe'", "", "presence", false),
+            ("<presence type='unsubscribed'", "", "presence", false),
+            ("<presence type='error'", "<error type='cancel'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>", "presence", false),
+        ];
+        for (index, (start, payload, name, rejected)) in cases.into_iter().enumerate() {
+            fixture.dispatch(&format!("{start} id='service-{index}' from='alice@remote.test/desk' to='room@svc.example.com/nick'>{payload}</{name}>")).await?;
+            assert_eq!(service.calls.lock().len(), index + 1);
+            assert!(messages.steps.lock().is_empty());
+            if rejected {
+                let reply = fixture.remote.receive()?.ok_or("missing service rejection")?;
+                let view = reply.resolve()?;
+                assert_eq!(view.from()?.ok_or("missing from")?.as_str(), "room@svc.example.com/nick");
+                assert_eq!(view.to()?.ok_or("missing to")?.as_str(), "alice@remote.test/desk");
+                assert_eq!(view.id()?, Some(format!("service-{index}").as_str()));
+                assert!(view.child("error", "jabber:client")?.is_some());
+            } else {
+                assert!(fixture.remote.receive()?.is_none());
+            }
+        }
+        fixture.finish().await
+    }))?
+}

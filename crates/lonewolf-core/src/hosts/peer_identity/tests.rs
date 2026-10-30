@@ -746,3 +746,256 @@ fn equivalent_anchor_renewals_use_the_latest_expiry_and_wrong_keys_do_not_extend
     );
     Ok(())
 }
+
+fn service_hosts(fixture: &Fixture, service_name: GeneralName) -> TestResult<Hosts> {
+    let mut configs = BTreeMap::new();
+    for domain in ["a.test", "b.test", "example.test"] {
+        let signer = TestSigner::new()?;
+        let parameters =
+            leaf_parameters(vec![dns_name(domain)?, service_name.clone()], fixture.now)?;
+        let leaf = parameters.signed_by(&signer, &fixture.root)?;
+        let certificate_chain_path = fixture
+            .directory
+            .path()
+            .join(format!("service-{domain}.pem"));
+        let private_key_path = fixture
+            .directory
+            .path()
+            .join(format!("service-{domain}.key"));
+        fs::write(&certificate_chain_path, pem("CERTIFICATE", leaf.der())?)?;
+        let mut buffer = zeroize::Zeroizing::new([0; 512]);
+        fs::write(
+            &private_key_path,
+            pem("PRIVATE KEY", signer.key.to_pkcs8_der(&mut buffer[..])?)?,
+        )?;
+        configs.insert(
+            domain.into(),
+            HostConfig {
+                tls: Some(HostTlsConfig {
+                    source: HostTlsSource::Files {
+                        certificate_chain_path,
+                        private_key_path,
+                    },
+                    client_auth: None,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    Ok(Hosts::new(&configs, Some("example.test"))?)
+}
+
+fn replace_service_snapshot(
+    fixture: &Fixture,
+    hosts: &Hosts,
+    domain: &str,
+    covers_service: bool,
+    validity: Option<(u64, u64)>,
+) -> TestResult<Arc<crate::hosts::TlsSnapshot>> {
+    let signer = TestSigner::new()?;
+    let mut names = vec![dns_name(domain)?];
+    if covers_service {
+        names.push(dns_name("svc.example.test")?);
+    }
+    let leaf = leaf_parameters(names, fixture.now)?.signed_by(&signer, &fixture.root)?;
+    let mut buffer = zeroize::Zeroizing::new([0; 512]);
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
+        signer.key.to_pkcs8_der(&mut buffer[..])?.to_vec(),
+    )
+    .into();
+    let host = hosts.find_host(domain).ok_or("missing host")?;
+    let snapshot = Arc::new(crate::hosts::make_snapshot(
+        domain,
+        crate::hosts::tls_identity(domain)?,
+        crate::hosts::certified_key(
+            domain,
+            vec![leaf.der().clone()],
+            key,
+            host.tls_builder.crypto_provider(),
+        )?,
+        &host.tls_builder,
+        host.client_certificate_policy.as_ref(),
+        validity,
+    )?);
+    *host.tls.write() = Some(Arc::clone(&snapshot));
+    Ok(snapshot)
+}
+
+#[test]
+fn service_certificate_selection_uses_d3_names_and_sorted_current_federating_hosts() -> TestResult {
+    let fixture = Fixture::new(30)?;
+    for service_name in [
+        dns_name("svc.example.test")?,
+        dns_name("*.example.test")?,
+        srv_name("_xmpp-server.svc.example.test")?,
+        GeneralName::OtherName(OtherName {
+            type_id: ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.8.5"),
+            value: Utf8StringRef::new("svc.example.test")?.into(),
+        }),
+    ] {
+        let mut hosts = service_hosts(&fixture, service_name)?;
+        assert_eq!(
+            hosts.certificate_host_for("svc.example.test"),
+            Some("a.test")
+        );
+        assert_eq!(hosts.certificate_host_for("unknown.test"), None);
+        assert_eq!(hosts.certificate_host_for("bad@@domain"), None);
+        let entries = Arc::get_mut(&mut hosts.hosts).ok_or("shared hosts")?;
+        entries[0].config.federation = false;
+        assert_eq!(
+            hosts.certificate_host_for("svc.example.test"),
+            Some("b.test")
+        );
+        *hosts.find_host("b.test").ok_or("no b host")?.tls.write() = None;
+        assert_eq!(
+            hosts.certificate_host_for("svc.example.test"),
+            Some("example.test")
+        );
+        let now = UnixTime::now().as_secs();
+        for validity in [(0, now), (now + 3600, now + 7200)] {
+            replace_service_snapshot(&fixture, &hosts, "example.test", true, Some(validity))?;
+            assert_eq!(hosts.certificate_host_for("svc.example.test"), None);
+        }
+        replace_service_snapshot(&fixture, &hosts, "example.test", false, None)?;
+        assert_eq!(hosts.certificate_host_for("svc.example.test"), None);
+    }
+    assert_eq!(
+        fixture
+            .hosts(false)?
+            .certificate_host_for("svc.example.test"),
+        None
+    );
+    assert_eq!(
+        crate::hosts::test_support::managed_hosts()?.certificate_host_for("svc.example.test"),
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage() -> TestResult {
+    let fixture = Fixture::new(30)?;
+    let trust = fixture.trust()?;
+    let hosts = service_hosts(&fixture, dns_name("svc.example.test")?)?;
+    let peers = fixture.hosts(false)?;
+    let old = hosts.certified_key("a.test").ok_or("no old key")?;
+    let captured_client = hosts
+        .s2s_client_config("svc.example.test", &trust)
+        .ok_or("no client")?;
+    let captured_server = hosts
+        .s2s_server_config("svc.example.test", &trust)
+        .ok_or("no server")?;
+    let schemes = trust.client_verifier().supported_verify_schemes();
+    assert!(captured_client.client_auth_cert_resolver.has_certs());
+    for incompatible in [&[][..], &[rustls::SignatureScheme::RSA_PSS_SHA256][..]] {
+        assert!(
+            captured_client
+                .client_auth_cert_resolver
+                .resolve(&[], incompatible)
+                .is_none()
+        );
+    }
+    let replacement = replace_service_snapshot(&fixture, &hosts, "a.test", true, None)?;
+    assert_ne!(old.cert, replacement.certified_key.cert);
+    for (client_config, server_config, expected) in [
+        (
+            Arc::clone(&captured_client),
+            Arc::clone(&captured_server),
+            &old.cert,
+        ),
+        (
+            hosts
+                .s2s_client_config("svc.example.test", &trust)
+                .ok_or("no fresh client")?,
+            hosts
+                .s2s_server_config("svc.example.test", &trust)
+                .ok_or("no fresh server")?,
+            &replacement.certified_key.cert,
+        ),
+    ] {
+        assert_eq!(
+            client_config
+                .client_auth_cert_resolver
+                .resolve(&[], &schemes)
+                .ok_or("no selected client key")?
+                .cert,
+            *expected
+        );
+        let (_, server) = handshake_named(
+            client_config,
+            peers
+                .s2s_server_config("a.test", &trust)
+                .ok_or("no peer server")?,
+            "a.test",
+        )?;
+        assert_eq!(server.peer_certificates(), Some(expected.as_slice()));
+        for send_sni in [true, false] {
+            let mut client = (*peers
+                .s2s_client_config("b.test", &trust)
+                .ok_or("no peer client")?)
+            .clone();
+            client.enable_sni = send_sni;
+            let (client, _) = handshake_named(
+                Arc::new(client),
+                Arc::clone(&server_config),
+                "SvC.Example.Test",
+            )?;
+            assert_eq!(client.peer_certificates(), Some(expected.as_slice()));
+        }
+        for wrong in ["a.test", "sibling.example.test", "unrelated.test"] {
+            let client = peers
+                .s2s_client_config("b.test", &trust)
+                .ok_or("no peer client")?;
+            assert!(handshake_named(client, Arc::clone(&server_config), wrong).is_err());
+        }
+    }
+    replace_service_snapshot(&fixture, &hosts, "a.test", false, None)?;
+    assert_eq!(
+        hosts.certificate_host_for("svc.example.test"),
+        Some("b.test")
+    );
+    let fallback = hosts.certified_key("b.test").ok_or("no fallback key")?;
+    let fresh_client = hosts
+        .s2s_client_config("svc.example.test", &trust)
+        .ok_or("no fallback client")?;
+    let (_, server) = handshake_named(
+        fresh_client,
+        peers.s2s_server_config("a.test", &trust).ok_or("no peer")?,
+        "a.test",
+    )?;
+    assert_eq!(server.peer_certificates(), Some(fallback.cert.as_slice()));
+    let (client, _) = handshake_named(
+        peers.s2s_client_config("b.test", &trust).ok_or("no peer")?,
+        hosts
+            .s2s_server_config("svc.example.test", &trust)
+            .ok_or("no fallback server")?,
+        "svc.example.test",
+    )?;
+    assert_eq!(client.peer_certificates(), Some(fallback.cert.as_slice()));
+    for domain in ["b.test", "example.test"] {
+        replace_service_snapshot(&fixture, &hosts, domain, false, None)?;
+    }
+    assert!(
+        hosts
+            .s2s_client_config("svc.example.test", &trust)
+            .is_none()
+    );
+    assert!(
+        hosts
+            .s2s_server_config("svc.example.test", &trust)
+            .is_none()
+    );
+    let (client, _) = handshake_named(
+        peers.s2s_client_config("b.test", &trust).ok_or("no peer")?,
+        captured_server,
+        "svc.example.test",
+    )?;
+    assert_eq!(client.peer_certificates(), Some(old.cert.as_slice()));
+    let (_, server) = handshake_named(
+        captured_client,
+        peers.s2s_server_config("a.test", &trust).ok_or("no peer")?,
+        "a.test",
+    )?;
+    assert_eq!(server.peer_certificates(), Some(old.cert.as_slice()));
+    Ok(())
+}

@@ -93,6 +93,27 @@ impl FederationCa {
         self.server(directory, "wrong-name", &[&format!("wrong.{domain}")])
     }
 
+    pub fn self_signed_ca(domain: &str) -> TestResult<Arc<CertifiedKey>> {
+        let mut parameters = parameters(&[domain])?;
+        parameters.serial_number = Some(1u64.into());
+        parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        parameters
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::KeyCertSign);
+        let signer = TestSigner::new()?;
+        let certificate = parameters.self_signed(&signer)?;
+        let mut bytes = zeroize::Zeroizing::new([0; 512]);
+        let key = signer.key.to_pkcs8_der(&mut bytes[..])?;
+        let provider = rustls_graviola::default_provider();
+        let key = provider
+            .key_provider
+            .load_private_key(PrivatePkcs8KeyDer::from(key.to_vec()).into())?;
+        Ok(Arc::new(CertifiedKey::new(
+            vec![certificate.der().clone()],
+            key,
+        )))
+    }
+
     pub fn expired(&self, directory: &Path, domain: &str) -> TestResult<Arc<CertifiedKey>> {
         self.server_until(
             directory,

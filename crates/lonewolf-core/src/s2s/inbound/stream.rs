@@ -430,7 +430,7 @@ async fn close<A, R, W>(
     R: AsyncBufRead + Unpin + 'static,
     W: AsyncWrite + Unpin,
 {
-    let (condition, peer_closed) = match closed.wire {
+    let (condition, mut peer_closed) = match closed.wire {
         WireClose::Footer { peer_closed } => (None, peer_closed),
         WireClose::Error(condition) => (Some(condition), false),
         WireClose::Abort => return,
@@ -446,6 +446,7 @@ async fn close<A, R, W>(
             let _ = compio::time::timeout(FOOTER_GRACE, async {
                 while let Some(event) = reader.next_event().await? {
                     if matches!(event, StreamEvent::StreamEnd) {
+                        peer_closed = true;
                         break;
                     }
                 }
@@ -453,7 +454,12 @@ async fn close<A, R, W>(
             })
             .await;
         }
-        writer.shutdown().await
+        writer.shutdown().await?;
+        if peer_closed {
+            reader.read_transport_end().await
+        } else {
+            Ok(())
+        }
     };
     let mut operation = pin!(operation);
     let controls = async {

@@ -185,17 +185,24 @@ async fn graceful<
             compio::time::timeout(write_timeout, writer.close(condition))
                 .await
                 .map_err(|_| S2sError::Timeout)??;
-            if !matches!(reason, StreamClose::StreamEnd) {
+            let mut peer_footer = matches!(reason, StreamClose::StreamEnd);
+            if !peer_footer {
                 let _ = compio::time::timeout(FOOTER_GRACE, async {
                     while let Ok(Some(event)) = reader.next_event().await {
                         if matches!(event, StreamEvent::StreamEnd) {
+                            peer_footer = true;
                             break;
                         }
                     }
                 })
                 .await;
             }
-            writer.shutdown().await
+            writer.shutdown().await?;
+            if peer_footer {
+                reader.read_transport_end().await
+            } else {
+                Ok(())
+            }
         },
     )
     .await
@@ -1088,42 +1095,99 @@ mod tests {
     #[test]
     fn interrupted_graceful_close_does_not_restart_or_emit_another_footer()
     -> Result<(), Box<dyn std::error::Error>> {
-        run(async {
-            let manager = manager(S2sLimits::default())?;
-            let limits = &manager.inner.limits;
-            let mut reader = S2sReader::new(
-                tokio::io::BufReader::new(&b""[..]),
-                &S2sReaderLimits {
-                    max_stanza_bytes: limits.max_stanza_bytes,
-                    stanzas: limits.incoming_stanzas_per_connection.clone(),
-                    xml: limits.incoming_xml_per_connection.clone(),
-                },
-                GlobalChunkAllocator,
-                None,
-            );
-            let calls = Arc::new(PlMutex::new(Calls::default()));
-            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
-            {
-                let mut closing = pin!(graceful(
-                    &mut reader,
-                    &mut writer,
-                    StreamClose::Idle,
-                    manager.inner.stopped.clone(),
-                    SystemTime::now() + Duration::from_secs(60),
-                    Duration::from_secs(60)
-                ));
-                assert!(poll!(closing.as_mut()).is_pending());
-                assert!(calls.lock().writes > 0);
-                manager.stop();
-                assert!(matches!(closing.await, Err(StreamClose::Shutdown)));
+        struct PendingInput {
+            bytes: std::io::Cursor<Vec<u8>>,
+            polls: Arc<PlMutex<usize>>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl tokio::io::AsyncRead for PendingInput {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                output: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let position = self.bytes.position() as usize;
+                if position < self.bytes.get_ref().len() {
+                    let count = output
+                        .remaining()
+                        .min(self.bytes.get_ref().len() - position);
+                    output.put_slice(&self.bytes.get_ref()[position..position + count]);
+                    self.bytes.set_position((position + count) as u64);
+                    Poll::Ready(Ok(()))
+                } else {
+                    *self.polls.lock() += 1;
+                    Poll::Pending
+                }
             }
-            let writes = calls.lock().writes;
-            drop(writer);
-            assert_eq!(calls.lock().writes, writes);
-            assert_eq!(calls.lock().closes, 0);
-            manager
-                .join(Instant::now() + Duration::from_secs(5))
-                .await?;
+        }
+        impl Drop for PendingInput {
+            fn drop(&mut self) {
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        run(async {
+            for (accepts, expiry) in [(false, false), (true, false), (true, true)] {
+                let manager = manager(S2sLimits::default())?;
+                let limits = &manager.inner.limits;
+                let polls = Arc::new(PlMutex::new(0));
+                let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut reader = S2sReader::new(tokio::io::BufReader::new(PendingInput {
+                    bytes: std::io::Cursor::new(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server'></stream:stream>".to_vec()),
+                    polls: Arc::clone(&polls), dropped: Arc::clone(&dropped),
+                }), &S2sReaderLimits { max_stanza_bytes: limits.max_stanza_bytes, stanzas: limits.incoming_stanzas_per_connection.clone(), xml: limits.incoming_xml_per_connection.clone() }, GlobalChunkAllocator, None);
+                assert!(matches!(
+                    reader.next_event().await,
+                    Ok(Some(StreamEvent::StreamStart { .. }))
+                ));
+                assert!(matches!(
+                    reader.next_event().await,
+                    Ok(Some(StreamEvent::StreamEnd))
+                ));
+                let calls = Arc::new(PlMutex::new(Calls {
+                    accepts,
+                    ..Calls::default()
+                }));
+                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                {
+                    let validity =
+                        SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 });
+                    let mut closing = pin!(graceful(
+                        &mut reader,
+                        &mut writer,
+                        StreamClose::StreamEnd,
+                        manager.inner.stopped.clone(),
+                        validity,
+                        Duration::from_secs(60)
+                    ));
+                    assert!(poll!(closing.as_mut()).is_pending());
+                    assert!(calls.lock().writes > 0);
+                    assert_eq!(calls.lock().closes, usize::from(accepts));
+                    assert_eq!(*polls.lock(), usize::from(accepts));
+                    assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+                    if !expiry {
+                        manager.stop();
+                    }
+                    let result = closing.await;
+                    assert!(matches!(
+                        (expiry, result),
+                        (false, Err(StreamClose::Shutdown))
+                            | (true, Err(StreamClose::CertificateExpired))
+                    ));
+                }
+                let writes = calls.lock().writes;
+                drop(writer);
+                assert_eq!(calls.lock().writes, writes);
+                assert_eq!(calls.lock().closes, usize::from(accepts));
+                assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), accepts);
+                if accepts {
+                    assert_eq!(calls.lock().output.as_slice(), b"</stream:stream>");
+                }
+                manager.stop();
+                manager
+                    .join(Instant::now() + Duration::from_secs(5))
+                    .await?;
+            }
             Ok(())
         })
     }

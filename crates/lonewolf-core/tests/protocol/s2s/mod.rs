@@ -5,142 +5,174 @@ use std::thread;
 
 use parking_lot::Mutex as PlMutex;
 
-use super::support::federation::{FederatedPair, PairOptions, ProcessCompletions};
+use super::support::federation::{
+    FederatedPair, PairOptions, ProcessCompletions, phase, thread_result,
+};
 use super::support::{C2sSuite, PASSWORD, TestResult};
 
 #[test]
 fn two_servers_exchange_a_chat_message() -> TestResult {
-    let completion = Arc::new(PlMutex::new(ProcessCompletions::default()));
-    let dns_join = Arc::new(PlMutex::new(None));
-    let failure = FederatedPair::start(
-        "a.test",
-        "b.test",
-        PairOptions {
-            b_extra_toml: "[invalid-configuration]\nvalue=true".into(),
-            completion: Some(Arc::clone(&completion)),
-            dns_join: Some(Arc::clone(&dns_join)),
-            ..PairOptions::default()
-        },
-    );
-    failure
-        .err()
-        .ok_or("partial startup unexpectedly succeeded")?;
-    {
-        let receipt = completion.lock();
-        assert_eq!(receipt.spawned.len(), 2, "{receipt:?}");
-        assert_eq!(receipt.reaped.len(), 2, "{receipt:?}");
-        assert_eq!(receipt.ready.len(), 1, "{receipt:?}");
-        assert!(
-            receipt
-                .reaped
-                .iter()
-                .any(|(_, status)| status.code() == Some(101)),
-            "{receipt:?}"
-        );
-        for pid in &receipt.spawned {
-            assert!(
-                receipt.reaped.iter().any(|(reaped, _)| reaped == pid),
-                "{receipt:?}"
+    phase(
+        "initial federated pair workflow",
+        (|| -> TestResult {
+            let completion = Arc::new(PlMutex::new(ProcessCompletions::default()));
+            let dns_join = Arc::new(PlMutex::new(None));
+            let failure = FederatedPair::start(
+                "a.test",
+                "b.test",
+                PairOptions {
+                    b_extra_toml: "[invalid-configuration]\nvalue=true".into(),
+                    completion: Some(Arc::clone(&completion)),
+                    dns_join: Some(Arc::clone(&dns_join)),
+                    ..PairOptions::default()
+                },
             );
-        }
-    }
-    assert!(
-        dns_join
-            .lock()
-            .as_ref()
-            .ok_or("missing DNS receipt")?
-            .load(Ordering::Acquire)
-    );
-    let mut pair = FederatedPair::start(
-        "a.test",
-        "b.test",
-        PairOptions {
-            a_enabled: None,
-            b_enabled: None,
-            a_extensions: "'roster'".into(),
-            b_extensions: "'roster'".into(),
-            ..PairOptions::default()
-        },
-    )?;
-    pair.a.create_account("alice", PASSWORD)?;
-    pair.b.create_account("bob", PASSWORD)?;
-    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
-    let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
-    alice
-        .send("<message type='chat' to='bob@b.test/phone'><body>federated chat</body></message>")?;
-    let message = bob.receive()?;
-    message.assert_name("jabber:client", "message");
-    assert_eq!(message.attribute("from"), Some("alice@a.test/desk"));
-    assert_eq!(message.attribute("to"), Some("bob@b.test/phone"));
-    assert_eq!(
-        message.child("jabber:client", "body")?.text,
-        "federated chat"
-    );
-    pair.a.wait_for_metric(
-        "lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"success\"} 1",
-    )?;
-    pair.b.wait_for_metric(
-        "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"success\"} 1",
-    )?;
-    pair.a
-        .wait_for_metric("lonewolf_s2s_dns_resolutions_total{outcome=\"srv\"} 1")?;
-    pair.b
-        .wait_for_metric("lonewolf_s2s_connections_accepted_total{listener=\"0\"} 1")?;
-    pair.a
-        .wait_for_metric("lonewolf_s2s_stanzas_sent_total{kind=\"message\"} 1")?;
-    pair.b
-        .wait_for_metric("lonewolf_s2s_stanzas_received_total{kind=\"message\"} 1")?;
-    pair.a
-        .wait_for_metric("lonewolf_s2s_outbound_queued_stanzas 0")?;
-    pair.a
-        .wait_for_metric("lonewolf_s2s_outbound_queued_bytes 0")?;
-    pair.a
-        .wait_for_metric("lonewolf_s2s_outbound_links{state=\"ready\"} 1")?;
-    for (suite, direction) in [(&pair.a, "outbound"), (&pair.b, "inbound")] {
-        for metric in ["received_bytes_total", "sent_bytes_total"] {
-            let name = format!("lonewolf_s2s_{metric}{{direction=\"{direction}\"}}");
-            suite.wait_for_metrics(&name, |body| {
-                sample(body, &name).is_ok_and(|value| value > 0)
-            })?;
-        }
-    }
-    assert_eq!(
-        pair.dns.query_count(
-            "_xmpp-server._tcp.b.test",
-            hickory_proto::rr::RecordType::SRV
-        ),
-        1
-    );
-    validate_fixture_material(&pair.ca, &mut pair.dns, pair.a.fixture_path())?;
-    super::support::federation::subscribe_mutually(
-        &mut alice,
-        "alice@a.test",
-        &mut bob,
-        "bob@b.test",
-    )?;
-    alice.send("<presence type='unavailable'/>")?;
-    alice.expect_xml("<presence xmlns='jabber:client' from='alice@a.test/desk' to='alice@a.test' type='unavailable'/>")?;
-    bob.expect_xml("<presence xmlns='jabber:client' from='alice@a.test/desk' to='bob@b.test' type='unavailable' xml:lang='en'/>")?;
-    alice.close()?;
-    bob.close()?;
-    pair.a.stop()?;
-    pair.b
-        .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
-    pair.b
-        .wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 0")?;
-    pair.b
-        .wait_for_metrics("closed authenticated inbound stream", |body| {
-            body.lines()
-                .filter(|line| {
-                    line.starts_with("lonewolf_s2s_streams_closed_total{direction=\"inbound\",")
-                })
-                .filter_map(|line| line.rsplit_once(' ')?.1.parse::<u64>().ok())
-                .sum::<u64>()
-                == 1
-        })?;
-    pair.stop()?;
+            failure
+                .err()
+                .ok_or("partial startup unexpectedly succeeded")?;
+            {
+                let receipt = completion.lock();
+                assert_eq!(receipt.spawned.len(), 2, "{receipt:?}");
+                assert_eq!(receipt.reaped.len(), 2, "{receipt:?}");
+                assert_eq!(receipt.ready.len(), 1, "{receipt:?}");
+                assert!(
+                    receipt
+                        .reaped
+                        .iter()
+                        .any(|(_, status)| status.code() == Some(101)),
+                    "{receipt:?}"
+                );
+                for pid in &receipt.spawned {
+                    assert!(
+                        receipt.reaped.iter().any(|(reaped, _)| reaped == pid),
+                        "{receipt:?}"
+                    );
+                }
+            }
+            assert!(
+                dns_join
+                    .lock()
+                    .as_ref()
+                    .ok_or("missing DNS receipt")?
+                    .load(Ordering::Acquire)
+            );
+            let mut pair = phase(
+                "initial pair startup",
+                FederatedPair::start(
+                    "a.test",
+                    "b.test",
+                    PairOptions {
+                        a_enabled: None,
+                        b_enabled: None,
+                        a_extensions: "'roster'".into(),
+                        b_extensions: "'roster'".into(),
+                        ..PairOptions::default()
+                    },
+                ),
+            )?;
+            phase(
+                "initial Alice account",
+                pair.a.create_account("alice", PASSWORD),
+            )?;
+            phase(
+                "initial Bob account",
+                pair.b.create_account("bob", PASSWORD),
+            )?;
+            let mut alice = phase(
+                "initial Alice C2S authentication",
+                pair.a.connect("alice", PASSWORD, "desk"),
+            )?;
+            let mut bob = phase(
+                "initial Bob C2S authentication",
+                pair.b.connect("bob", PASSWORD, "phone"),
+            )?;
+            phase("initial federated chat send", alice.send(
+                "<message type='chat' to='bob@b.test/phone'><body>federated chat</body></message>",
+            ))?;
+            let message = phase("initial federated chat receipt", bob.receive())?;
+            message.assert_name("jabber:client", "message");
+            assert_eq!(message.attribute("from"), Some("alice@a.test/desk"));
+            assert_eq!(message.attribute("to"), Some("bob@b.test/phone"));
+            assert_eq!(
+                message.child("jabber:client", "body")?.text,
+                "federated chat"
+            );
+            pair.a.wait_for_metric(
+                "lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"success\"} 1",
+            )?;
+            pair.b.wait_for_metric(
+                "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"success\"} 1",
+            )?;
+            pair.a
+                .wait_for_metric("lonewolf_s2s_dns_resolutions_total{outcome=\"srv\"} 1")?;
+            pair.b
+                .wait_for_metric("lonewolf_s2s_connections_accepted_total{listener=\"0\"} 1")?;
+            pair.a
+                .wait_for_metric("lonewolf_s2s_stanzas_sent_total{kind=\"message\"} 1")?;
+            pair.b
+                .wait_for_metric("lonewolf_s2s_stanzas_received_total{kind=\"message\"} 1")?;
+            pair.a
+                .wait_for_metric("lonewolf_s2s_outbound_queued_stanzas 0")?;
+            pair.a
+                .wait_for_metric("lonewolf_s2s_outbound_queued_bytes 0")?;
+            pair.a
+                .wait_for_metric("lonewolf_s2s_outbound_links{state=\"ready\"} 1")?;
+            for (suite, direction) in [(&pair.a, "outbound"), (&pair.b, "inbound")] {
+                for metric in ["received_bytes_total", "sent_bytes_total"] {
+                    let name = format!("lonewolf_s2s_{metric}{{direction=\"{direction}\"}}");
+                    suite.wait_for_metrics(&name, |body| {
+                        sample(body, &name).is_ok_and(|value| value > 0)
+                    })?;
+                }
+            }
+            assert_eq!(
+                pair.dns.query_count(
+                    "_xmpp-server._tcp.b.test",
+                    hickory_proto::rr::RecordType::SRV
+                ),
+                1
+            );
+            phase(
+                "certificate and DNS fixtures",
+                validate_fixture_material(&pair.ca, &mut pair.dns, pair.a.fixture_path()),
+            )?;
+            phase(
+                "mutual roster subscription",
+                super::support::federation::subscribe_mutually(
+                    &mut alice,
+                    "alice@a.test",
+                    &mut bob,
+                    "bob@b.test",
+                ),
+            )?;
+            alice.send("<presence type='unavailable'/>")?;
+            alice.expect_xml("<presence xmlns='jabber:client' from='alice@a.test/desk' to='alice@a.test' type='unavailable'/>")?;
+            bob.expect_xml("<presence xmlns='jabber:client' from='alice@a.test/desk' to='bob@b.test' type='unavailable' xml:lang='en'/>")?;
+            phase("Alice C2S close", alice.close())?;
+            phase("Bob C2S close", bob.close())?;
+            phase("initial first server stop", pair.a.stop())?;
+            pair.b
+                .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
+            pair.b
+                .wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 0")?;
+            pair.b
+                .wait_for_metrics("closed authenticated inbound stream", |body| {
+                    body.lines()
+                        .filter(|line| {
+                            line.starts_with(
+                                "lonewolf_s2s_streams_closed_total{direction=\"inbound\",",
+                            )
+                        })
+                        .filter_map(|line| line.rsplit_once(' ')?.1.parse::<u64>().ok())
+                        .sum::<u64>()
+                        == 1
+                })?;
+            phase("initial pair stop", pair.stop())?;
 
-    drop(pair);
+            drop(pair);
+            Ok(())
+        })(),
+    )?;
 
     let outcomes = thread::scope(|scope| {
         let (start, ready) = async_channel::bounded::<()>(1);
@@ -149,7 +181,7 @@ fn two_servers_exchange_a_chat_message() -> TestResult {
             let ready = ready.clone();
             workers.push(scope.spawn(move || {
                 let _ = ready.recv_blocking();
-                (|| -> TestResult {
+                let result = (|| -> TestResult {
                     if index % 2 == 0 {
                         let completion = Arc::new(PlMutex::new(ProcessCompletions::default()));
                         let dns_join = Arc::new(PlMutex::new(None));
@@ -167,8 +199,8 @@ fn two_servers_exchange_a_chat_message() -> TestResult {
                         message.assert_name("jabber:client", "message");
                         assert_eq!(message.attribute("from"), Some("alice@a.test/desk"));
                         assert_eq!(message.child("jabber:client", "body")?.text, "concurrent pair");
-                        alice.close()?;
-                        bob.close()?;
+                        phase("Alice C2S close", alice.close())?;
+                        phase("Bob C2S close", bob.close())?;
                         pair.stop()?;
                         drop(pair);
                         let receipt = completion.lock();
@@ -187,12 +219,13 @@ fn two_servers_exchange_a_chat_message() -> TestResult {
                         message.assert_name("jabber:client", "message");
                         assert_eq!(message.attribute("from"), Some("alice@localhost/desk"));
                         assert_eq!(message.child("jabber:client", "body")?.text, "concurrent singleton");
-                        alice.close()?;
-                        bob.close()?;
+                        phase("Alice C2S close", alice.close())?;
+                        phase("Bob C2S close", bob.close())?;
                         suite.stop()?;
                     }
                     Ok(())
-                })().map_err(|error|error.to_string())
+                })();
+                thread_result(phase(if index % 2 == 0 { "concurrent pair workflow" } else { "concurrent singleton workflow" }, result))
             }));
         }
         drop(start);
@@ -204,7 +237,7 @@ fn two_servers_exchange_a_chat_message() -> TestResult {
     for outcome in outcomes {
         outcome.map_err(|_| "concurrent federation workflow panicked")??;
     }
-    raw_peer_workflow()?;
+    phase("raw federation workflows", raw_peer_workflow())?;
     Ok(())
 }
 
@@ -217,85 +250,38 @@ fn sample(body: &str, name: &str) -> TestResult<u64> {
 }
 
 fn raw_peer_workflow() -> TestResult {
-    use super::support::federation::{
-        FakeDns, FederatedHost, FederationCa,
-        peer::{self, RawS2sListener, RawS2sPeer},
-    };
+    use super::support::federation::{FakeDns, FederationCa};
     let directory = tempfile::tempdir()?;
     let ca = Arc::new(FederationCa::new(directory.path())?);
     let mut dns = FakeDns::start()?;
-    let listener = RawS2sListener::bind()?;
-    dns.srv(
-        "peer.test",
-        &[(0, 0, listener.address()?.port(), "server.peer.test")],
-    );
-    dns.a("server.peer.test", std::net::Ipv4Addr::LOCALHOST);
-    dns.aaaa("server.peer.test", std::net::Ipv6Addr::LOCALHOST);
-    let key = ca.server(directory.path(), "peer", &["peer.test"])?;
-    let client_config = peer::client_config(&ca, Arc::clone(&key))?;
-    let server_config = peer::server_config(&ca, key, "local.test")?;
-    let mut suite = C2sSuite::federated(FederatedHost {
-        domain: "local.test".into(),
-        enabled: Some(true),
-        federation: None,
-        extensions: String::new(),
-        extra_toml: String::new(),
-        ca: Arc::clone(&ca),
-        dns: dns.address(),
-        completion: None,
-    })?;
-    suite.create_account("alice", PASSWORD)?;
-    suite.change_password("alice", super::support::NEW_PASSWORD)?;
-    let mut alice = suite.connect("alice", super::support::NEW_PASSWORD, "desk")?;
-    let mut raw = RawS2sPeer::connect(suite.s2s_addresses()?[0], "peer.test", "local.test")?;
-    raw.expect_starttls_features()?;
-    let mut raw = raw.start_tls(Arc::clone(&client_config))?;
-    raw.expect_external_offered()?;
-    raw.auth_external(Some("peer.test"))?;
-    raw.expect_sasl_success()?;
-    let mut raw = raw.restart("peer.test", "local.test")?;
-    raw.send("<message type='chat' from='bob@peer.test/phone' to='alice@local.test/desk'><body>scripted inbound</body></message>")?;
-    let message = alice.receive()?;
-    message.assert_name("jabber:client", "message");
-    assert_eq!(message.attribute("from"), Some("bob@peer.test/phone"));
-    assert_eq!(
-        message.child("jabber:client", "body")?.text,
-        "scripted inbound"
-    );
-    alice.send(
-        "<message type='chat' to='bob@peer.test/phone'><body>scripted outbound</body></message>",
-    )?;
-    let mut receiving = listener.accept("peer.test", "local.test", server_config, true)?;
-    let message = receiving.receive()?;
-    message.assert_name("jabber:server", "message");
-    assert_eq!(message.attribute("from"), Some("alice@local.test/desk"));
-    assert_eq!(
-        message.child("jabber:server", "body")?.text,
-        "scripted outbound"
-    );
-    raw.close()?;
-    raw.expect_eof()?;
-    receiving.close()?;
-    suite.wait_for_metric(
-        "lonewolf_s2s_streams_closed_total{direction=\"inbound\",outcome=\"stream_end\"} 1",
-    )?;
-    suite.wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
-    suite.wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 0")?;
-    let mut raw = RawS2sPeer::connect(suite.s2s_addresses()?[0], "peer.test", "local.test")?;
-    raw.expect_starttls_features()?;
-    raw.send("<message from='bob@peer.test' to='alice@local.test'/>")?;
-    raw.expect_stream_error("not-authorized")?;
-    alice.close()?;
-    suite.delete_account("alice")?;
-    suite.stop()?;
-    suite.stop()?;
-    drop(suite);
+    for (versions, expected, name) in [
+        (
+            rustls::DEFAULT_VERSIONS,
+            rustls::ProtocolVersion::TLSv1_3,
+            "default TLS raw workflows",
+        ),
+        (
+            &[&rustls::version::TLS12][..],
+            rustls::ProtocolVersion::TLSv1_2,
+            "TLS1.2 raw workflows",
+        ),
+        (
+            &[&rustls::version::TLS13][..],
+            rustls::ProtocolVersion::TLSv1_3,
+            "TLS1.3 raw workflows",
+        ),
+    ] {
+        super::support::federation::phase(
+            name,
+            raw_version_workflow(&ca, &dns, directory.path(), versions, expected),
+        )?;
+    }
     for (enabled, federation) in [
         (Some(false), None),
         (None, Some(false)),
         (Some(true), Some(false)),
     ] {
-        let mut suite = C2sSuite::federated(FederatedHost {
+        let mut suite = C2sSuite::federated(super::support::federation::FederatedHost {
             domain: "local.test".into(),
             enabled,
             federation,
@@ -328,12 +314,244 @@ fn raw_peer_workflow() -> TestResult {
             "urn:ietf:params:xml:ns:xmpp-stanzas",
             "remote-server-not-found",
         )?;
-        alice.close()?;
-        bob.close()?;
+        phase("Alice C2S close", alice.close())?;
+        phase("Bob C2S close", bob.close())?;
         suite.stop()?;
         suite.stop()?;
     }
     dns.stop()?;
+    Ok(())
+}
+
+fn raw_version_workflow(
+    ca: &Arc<super::support::federation::FederationCa>,
+    dns: &super::support::federation::FakeDns,
+    directory: &std::path::Path,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    expected: rustls::ProtocolVersion,
+) -> TestResult {
+    use super::support::federation::{
+        FederatedHost,
+        peer::{self, RawS2sListener, RawS2sPeer},
+        phase, thread_result,
+    };
+    let listener = RawS2sListener::bind()?;
+    for domain in ["peer.test", "reject.test"] {
+        dns.srv(
+            domain,
+            &[(0, 0, listener.address()?.port(), "server.peer.test")],
+        );
+    }
+    dns.a("server.peer.test", std::net::Ipv4Addr::LOCALHOST);
+    dns.aaaa("server.peer.test", std::net::Ipv6Addr::LOCALHOST);
+    let key = ca.server(directory, "peer", &["peer.test", "reject.test"])?;
+    let (client_config, server_config) = if versions.len() == rustls::DEFAULT_VERSIONS.len() {
+        (
+            peer::client_config(ca, Arc::clone(&key))?,
+            peer::server_config(ca, key, "local.test")?,
+        )
+    } else {
+        (
+            peer::client_config_with_versions(ca, Arc::clone(&key), versions)?,
+            peer::server_config_with_versions(ca, key, "local.test", versions)?,
+        )
+    };
+    let completion = Arc::new(PlMutex::new(ProcessCompletions::default()));
+    let mut suite = C2sSuite::federated(FederatedHost {
+        domain: "local.test".into(),
+        enabled: Some(true),
+        federation: None,
+        extensions: String::new(),
+        extra_toml: String::new(),
+        ca: Arc::clone(ca),
+        dns: dns.address(),
+        completion: Some(Arc::clone(&completion)),
+    })?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.change_password("alice", super::support::NEW_PASSWORD)?;
+    let mut alice = suite.connect("alice", super::support::NEW_PASSWORD, "desk")?;
+    let mut raw = phase(
+        "inbound stream header",
+        RawS2sPeer::connect(suite.s2s_addresses()?[0], "peer.test", "local.test"),
+    )?;
+    phase("inbound STARTTLS feature", raw.expect_starttls_features())?;
+    let mut raw = phase(
+        "inbound TLS handshake",
+        raw.start_tls(Arc::clone(&client_config)),
+    )?;
+    assert_eq!(raw.protocol_version(), Some(expected));
+    phase("inbound EXTERNAL feature", raw.expect_external_offered())?;
+    phase(
+        "inbound EXTERNAL auth",
+        raw.auth_external(Some("peer.test")),
+    )?;
+    phase("inbound EXTERNAL success", raw.expect_sasl_success())?;
+    let mut raw = phase(
+        "inbound authenticated restart",
+        raw.restart("peer.test", "local.test"),
+    )?;
+    raw.send("<message type='chat' from='bob@peer.test/phone' to='alice@local.test/desk'><body>scripted inbound</body></message>")?;
+    let message = phase("inbound delivered chat", alice.receive())?;
+    message.assert_name("jabber:client", "message");
+    assert_eq!(message.attribute("from"), Some("bob@peer.test/phone"));
+    assert_eq!(message.attribute("to"), Some("alice@local.test/desk"));
+    assert_eq!(
+        message.child("jabber:client", "body")?.text,
+        "scripted inbound"
+    );
+    alice.send(
+        "<message type='chat' to='bob@peer.test/phone'><body>scripted outbound</body></message>",
+    )?;
+    let mut receiving = phase(
+        "outbound TLS and EXTERNAL negotiation",
+        listener.accept("peer.test", "local.test", Arc::clone(&server_config), true),
+    )?;
+    assert_eq!(receiving.protocol_version(), Some(expected));
+    let message = phase("outbound written chat", receiving.receive())?;
+    message.assert_name("jabber:server", "message");
+    assert_eq!(message.attribute("from"), Some("alice@local.test/desk"));
+    assert_eq!(message.attribute("to"), Some("bob@peer.test/phone"));
+    assert_eq!(
+        message.child("jabber:server", "body")?.text,
+        "scripted outbound"
+    );
+    phase("inbound peer-initiated close", raw.close())?;
+    phase("inbound repeated TLS EOF", raw.expect_eof())?;
+    phase("outbound peer-initiated close", receiving.close())?;
+    suite.wait_for_metric(
+        "lonewolf_s2s_streams_closed_total{direction=\"inbound\",outcome=\"stream_end\"} 1",
+    )?;
+    suite.wait_for_metric(
+        "lonewolf_s2s_streams_closed_total{direction=\"outbound\",outcome=\"stream_end\"} 1",
+    )?;
+    suite.wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
+    suite.wait_for_metric("lonewolf_s2s_connections{direction=\"outbound\"} 0")?;
+    suite.wait_for_metrics("released successful outbound link", |body| {
+        sample(body, "lonewolf_s2s_outbound_links{state=\"ready\"}").is_ok_and(|value| value == 0)
+            && sample(body, "lonewolf_s2s_outbound_links{state=\"connecting\"}")
+                .is_ok_and(|value| value == 0)
+    })?;
+
+    suite.wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 0")?;
+    suite.wait_for_metric("lonewolf_s2s_streams{direction=\"outbound\"} 0")?;
+    if versions.len() == rustls::DEFAULT_VERSIONS.len() {
+        let mut plain = RawS2sPeer::connect(suite.s2s_addresses()?[0], "peer.test", "local.test")?;
+        plain.expect_starttls_features()?;
+        plain.send("<message from='bob@peer.test' to='alice@local.test'/>")?;
+        phase(
+            "plaintext rejection completion",
+            plain.expect_stream_error("not-authorized"),
+        )?;
+    }
+    let mut rejected = RawS2sPeer::connect(suite.s2s_addresses()?[0], "peer.test", "local.test")?;
+    rejected.expect_starttls_features()?;
+    let mut rejected = phase(
+        "rejected inbound TLS handshake",
+        rejected.start_tls(Arc::clone(&client_config)),
+    )?;
+    assert_eq!(rejected.protocol_version(), Some(expected));
+    rejected.expect_external_offered()?;
+    for _ in 0..2 {
+        rejected.auth_external(Some("other.test"))?;
+        phase("inbound exact invalid-authzid failure", rejected.receive())?.assert_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-authzid/></failure>",
+        )?;
+    }
+    phase(
+        "inbound rejected negotiation close",
+        rejected.answer_close(),
+    )?;
+    suite.wait_for_metric(
+        "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"invalid_authzid\"} 1",
+    )?;
+    alice.send("<message type='chat' id='no-external' to='bob@reject.test/phone'><body>rejected outbound</body></message>")?;
+    let mut rejected = phase(
+        "outbound missing EXTERNAL negotiation",
+        listener.accept(
+            "reject.test",
+            "local.test",
+            Arc::clone(&server_config),
+            false,
+        ),
+    )?;
+    assert_eq!(rejected.protocol_version(), Some(expected));
+    phase(
+        "outbound rejected negotiation close",
+        rejected.answer_close(),
+    )?;
+    let error = phase("outbound client failure reply", alice.receive())?;
+    error.assert_name("jabber:client", "message");
+    assert_eq!(error.attribute("type"), Some("error"));
+    assert_eq!(error.attribute("id"), Some("no-external"));
+    assert_eq!(error.attribute("from"), Some("bob@reject.test/phone"));
+    error.child("jabber:client", "error")?.child(
+        "urn:ietf:params:xml:ns:xmpp-stanzas",
+        "remote-server-timeout",
+    )?;
+    suite.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"external_not_offered\"} 1")?;
+
+    let mut raw = RawS2sPeer::connect(suite.s2s_addresses()?[0], "peer.test", "local.test")?;
+    raw.expect_starttls_features()?;
+    let mut raw = raw.start_tls(client_config)?;
+    assert_eq!(raw.protocol_version(), Some(expected));
+    raw.expect_external_offered()?;
+    raw.auth_external(Some("peer.test"))?;
+    raw.expect_sasl_success()?;
+    let mut raw = raw.restart("peer.test", "local.test")?;
+    raw.send("<message type='chat' from='bob@peer.test/phone' to='alice@local.test/desk'><body>re-established inbound</body></message>")?;
+    let message = alice.receive()?;
+    message.assert_name("jabber:client", "message");
+    assert_eq!(message.attribute("from"), Some("bob@peer.test/phone"));
+    assert_eq!(message.attribute("to"), Some("alice@local.test/desk"));
+    assert_eq!(
+        message.child("jabber:client", "body")?.text,
+        "re-established inbound"
+    );
+    alice.send("<message type='chat' to='bob@peer.test/phone'><body>re-established outbound</body></message>")?;
+    let mut receiving = listener.accept("peer.test", "local.test", server_config, true)?;
+    assert_eq!(receiving.protocol_version(), Some(expected));
+    let message = receiving.receive()?;
+    message.assert_name("jabber:server", "message");
+    assert_eq!(message.attribute("from"), Some("alice@local.test/desk"));
+    assert_eq!(message.attribute("to"), Some("bob@peer.test/phone"));
+    assert_eq!(
+        message.child("jabber:server", "body")?.text,
+        "re-established outbound"
+    );
+    suite.wait_for_metric(
+        "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"success\"} 2",
+    )?;
+    suite.wait_for_metric(
+        "lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"success\"} 2",
+    )?;
+    phase("Alice C2S close", alice.close())?;
+    suite.delete_account("alice")?;
+    let (inbound, outbound, stopped) = thread::scope(|scope| {
+        let inbound = scope.spawn(move || {
+            thread_result(phase(
+                "inbound product shutdown",
+                raw.expect_stream_error("system-shutdown"),
+            ))
+        });
+        let outbound = scope.spawn(move || {
+            thread_result(phase("outbound product shutdown", receiving.answer_close()))
+        });
+        let stopped =
+            scope.spawn(|| thread_result(phase("product shutdown and process reap", suite.stop())));
+        let inbound = inbound.join();
+        let outbound = outbound.join();
+        let stopped = stopped.join();
+        (inbound, outbound, stopped)
+    });
+    inbound.map_err(|_| "inbound shutdown worker panicked")??;
+    outbound.map_err(|_| "outbound shutdown worker panicked")??;
+    stopped.map_err(|_| "server stop worker panicked")??;
+    suite.stop()?;
+    drop(suite);
+    let receipts = completion.lock();
+    assert_eq!(receipts.spawned.len(), 1, "{receipts:?}");
+    assert_eq!(receipts.reaped.len(), 1, "{receipts:?}");
+    assert!(receipts.reaped[0].1.success(), "{receipts:?}");
     Ok(())
 }
 
@@ -388,7 +606,14 @@ fn validate_fixture_material(
                 hickory_proto::op::ResponseCode::NoError,
             ),
         ] {
-            let answer = dns_query(dns.address(), name, kind, tcp)?;
+            let answer = phase(
+                if tcp {
+                    "fixture TCP DNS query"
+                } else {
+                    "fixture UDP DNS query"
+                },
+                dns_query(dns.address(), name, kind, tcp),
+            )?;
             assert_eq!(answer.metadata.response_code, code);
             if name.starts_with("_xmpp") {
                 assert!(answer.answers.iter().any(|record|matches!(&record.data,hickory_proto::rr::RData::SRV(srv) if srv.target.is_root())));
@@ -397,11 +622,14 @@ fn validate_fixture_material(
         }
     }
     dns.a("mutable.test", std::net::Ipv4Addr::new(127, 0, 0, 2));
-    let answer = dns_query(
-        dns.address(),
-        "mutable.test",
-        hickory_proto::rr::RecordType::A,
-        false,
+    let answer = phase(
+        "mutable fixture UDP DNS query",
+        dns_query(
+            dns.address(),
+            "mutable.test",
+            hickory_proto::rr::RecordType::A,
+            false,
+        ),
     )?;
     assert!(answer.answers.iter().any(|record|matches!(&record.data,hickory_proto::rr::RData::A(address) if address.0==std::net::Ipv4Addr::new(127,0,0,2))));
     Ok(())

@@ -11,7 +11,7 @@ use compio::time::timeout;
 use futures_util::poll;
 use lonewolf_util::arena::{AllocationError, GlobalChunkAllocator};
 use lonewolf_xmpp::parser::parse_element;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncWriteExt as _, BufReader};
 
 use super::*;
 
@@ -1006,6 +1006,102 @@ fn restart_preserves_xml_budget_and_transport_pending_does_not_count() -> TestRe
             ),
             "{body}"
         );
+        Ok(())
+    })
+}
+
+#[test]
+fn transport_end_preserves_buffered_bytes_rejects_io_errors_and_is_terminal_on_cancellation()
+-> TestResult {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct Input {
+        bytes: io::Cursor<Vec<u8>>,
+        tail: Option<io::ErrorKind>,
+        pending: bool,
+        polls: Rc<Cell<usize>>,
+        dropped: Rc<Cell<bool>>,
+    }
+    impl AsyncRead for Input {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let position = self.bytes.position() as usize;
+            if position < self.bytes.get_ref().len() {
+                let count = buffer
+                    .remaining()
+                    .min(self.bytes.get_ref().len() - position);
+                buffer.put_slice(&self.bytes.get_ref()[position..position + count]);
+                self.bytes.set_position((position + count) as u64);
+                return Poll::Ready(Ok(()));
+            }
+            assert!(buffer.remaining() > 0);
+            self.polls.set(self.polls.get() + 1);
+            if self.pending {
+                Poll::Pending
+            } else if let Some(kind) = self.tail {
+                Poll::Ready(Err(io::Error::from(kind)))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+    impl Drop for Input {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    Runtime::new()?.block_on(async {
+        for (suffix, error, pending) in [
+            ("", None, false),
+            ("x", None, false),
+            ("", Some(io::ErrorKind::ConnectionReset), false),
+            ("", Some(io::ErrorKind::UnexpectedEof), false),
+            ("", Some(io::ErrorKind::BrokenPipe), false),
+            ("", None, true),
+        ] {
+            let polls = Rc::new(Cell::new(0));
+            let dropped = Rc::new(Cell::new(false));
+            let input = Input {
+                bytes: io::Cursor::new(format!("{HEADER}</stream:stream>{suffix}").into_bytes()),
+                tail: error,
+                pending,
+                polls: Rc::clone(&polls),
+                dropped: Rc::clone(&dropped),
+            };
+            let mut reader =
+                S2sReader::new(BufReader::new(input), &limits(), GlobalChunkAllocator, None);
+            assert!(matches!(
+                success(reader.next_event().await)?,
+                Some(StreamEvent::StreamStart { .. })
+            ));
+            assert!(matches!(
+                success(reader.next_event().await)?,
+                Some(StreamEvent::StreamEnd)
+            ));
+            if pending {
+                {
+                    let mut ending = pin!(reader.read_transport_end());
+                    assert!(poll!(ending.as_mut()).is_pending());
+                    assert!(!dropped.get());
+                }
+            } else if error.is_some() || !suffix.is_empty() {
+                assert!(matches!(
+                    reader.read_transport_end().await,
+                    Err(S2sError::Io)
+                ));
+            } else {
+                success(reader.read_transport_end().await)?;
+            }
+            assert_eq!(polls.get(), usize::from(suffix.is_empty()));
+            assert!(dropped.get());
+            assert!(matches!(reader.next_event().await, Err(S2sError::Internal)));
+        }
         Ok(())
     })
 }

@@ -4,17 +4,25 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitStatus;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
+use std::time::Instant;
 
 use parking_lot::Mutex as PlMutex;
 
 use super::server::C2sSuitePermit;
-use super::{C2sSuite, Client, TestResult};
+use super::{C2sSuite, Client, TIMEOUT, TestResult};
 pub mod dns;
 pub mod peer;
 pub mod pki;
+#[path = "../tcp.rs"]
+mod tcp;
 
 pub use dns::FakeDns;
 pub use pki::FederationCa;
+pub use tcp::RefusedEndpoint;
+
+pub fn refused_endpoint() -> TestResult<RefusedEndpoint> {
+    Ok(RefusedEndpoint::reserve(Instant::now() + TIMEOUT)?)
+}
 
 #[derive(Default, Debug)]
 pub struct ProcessCompletions {

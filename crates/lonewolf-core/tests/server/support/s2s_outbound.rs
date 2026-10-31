@@ -2,7 +2,6 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +12,11 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use crate::process::{Server, TIMEOUT};
 use crate::support::{self, FOOTER, Fixture, Peer, Result};
+
+#[path = "../../support/tcp.rs"]
+mod tcp;
+
+pub use tcp::RefusedEndpoint;
 
 pub const RESPONSE: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' from='peer.test' to='local.test'>";
 pub const FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
@@ -111,81 +115,12 @@ pub fn listener() -> Result<TcpListener> {
     Ok(listener)
 }
 
-pub struct RefusedEndpoint {
-    accepted: TcpStream,
-    _keeper: TcpStream,
-}
-
 pub fn refused() -> Result<RefusedEndpoint> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    socket.set_reuse_address(false)?;
-    socket.set_reuse_port(false)?;
-    socket.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())?;
-    socket.listen(1)?;
-    let listener: TcpListener = socket.into();
-    let keeper = TcpStream::connect_timeout(&listener.local_addr()?, TIMEOUT)?;
-    let accepted = accept(&listener)?;
-    drop(listener);
-    let endpoint = RefusedEndpoint {
-        accepted,
-        _keeper: keeper,
-    };
-    let address = address(&endpoint)?;
-    let deadline = Instant::now() + TIMEOUT;
-    let remaining = || {
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "listener teardown timed out"))
-    };
-    loop {
-        let connection = TcpStream::connect_timeout(&address, remaining()?);
-        remaining()?;
-        match connection {
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return Ok(endpoint),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::ConnectionAborted
-                        | io::ErrorKind::NotConnected
-                        | io::ErrorKind::Interrupted
-                ) => {}
-            Err(error) => return Err(error.into()),
-            Ok(mut probe) => {
-                let mut byte = [0];
-                loop {
-                    probe.set_read_timeout(Some(remaining()?))?;
-                    let received = probe.read(&mut byte);
-                    remaining()?;
-                    match received {
-                        Ok(0) => break,
-                        Ok(_) => return Err("refusal probe received application data".into()),
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                io::ErrorKind::ConnectionReset
-                                    | io::ErrorKind::ConnectionAborted
-                                    | io::ErrorKind::NotConnected
-                            ) =>
-                        {
-                            break;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-            }
-        }
-    }
+    Ok(RefusedEndpoint::reserve(Instant::now() + TIMEOUT)?)
 }
 
 pub fn address(endpoint: &RefusedEndpoint) -> Result<SocketAddr> {
-    Ok(endpoint.accepted.local_addr()?)
+    Ok(endpoint.address())
 }
 
 pub fn start(fixture: &Fixture, endpoints: &[SocketAddr], extra: &str) -> Result<(Server, Peer)> {
@@ -210,60 +145,14 @@ pub fn trigger(peer: &mut Peer, id: &str) -> Result {
 
 pub fn accept(listener: &TcpListener) -> Result<TcpStream> {
     let deadline = Instant::now() + TIMEOUT;
-    let remaining = || {
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "accept timed out"))
-    };
-    listener.set_nonblocking(true)?;
-    loop {
-        remaining()?;
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(TIMEOUT))?;
-                stream.set_write_timeout(Some(TIMEOUT))?;
-                stream.set_nodelay(true)?;
-                remaining()?;
-                return Ok(stream);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error.into()),
-        }
-        let budget = remaining()?;
-        let milliseconds = i32::try_from(
-            budget.as_millis() + u128::from(!budget.subsec_nanos().is_multiple_of(1_000_000)),
-        )?;
-        let mut readiness = nix::libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: nix::libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: The live listener and initialized stack descriptor outlive this one-entry poll.
-        let result = unsafe { nix::libc::poll(&mut readiness, 1, milliseconds) };
-        let error = (result < 0).then(io::Error::last_os_error);
-        remaining()?;
-        if let Some(error) = error {
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error.into());
-        }
-        if readiness.revents & nix::libc::POLLNVAL != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid listener").into());
-        }
-        if readiness.revents & (nix::libc::POLLERR | nix::libc::POLLHUP) != 0 {
-            return Err(listener
-                .take_error()?
-                .unwrap_or_else(|| io::Error::other("listener readiness failed"))
-                .into());
-        }
-        if result > 0 && readiness.revents & nix::libc::POLLIN == 0 {
-            return Err(io::Error::other("unexpected listener readiness").into());
-        }
+    let stream = tcp::accept_until(listener, deadline)?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_write_timeout(Some(TIMEOUT))?;
+    stream.set_nodelay(true)?;
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "accept timed out").into());
     }
+    Ok(stream)
 }
 
 pub fn header(peer: &mut impl Read) -> Result<String> {

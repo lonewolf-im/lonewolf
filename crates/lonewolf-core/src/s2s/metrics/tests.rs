@@ -31,7 +31,7 @@ const CONNECTION_REJECTION_LABELS: [&str; 5] = [
     "connection_tracking_full",
 ];
 
-const AUTH_OUTCOME_LABELS: [&str; 19] = [
+const AUTH_OUTCOME_LABELS: [&str; 23] = [
     "success",
     "host_unknown",
     "missing_from",
@@ -41,6 +41,10 @@ const AUTH_OUTCOME_LABELS: [&str; 19] = [
     "certificate_name",
     "certificate_purpose",
     "certificate_expired",
+    "certificate_revoked",
+    "revocation_unknown",
+    "revocation_stale",
+    "revocation_unavailable",
     "tls_failure",
     "no_tls",
     "tls_refused",
@@ -53,10 +57,14 @@ const AUTH_OUTCOME_LABELS: [&str; 19] = [
     "protocol",
 ];
 
-const STREAM_CLOSE_LABELS: [&str; 16] = [
+const STREAM_CLOSE_LABELS: [&str; 20] = [
     "stream_end",
     "idle",
     "certificate_expired",
+    "certificate_revoked",
+    "revocation_unknown",
+    "revocation_stale",
+    "revocation_unavailable",
     "shutdown",
     "conflict",
     "improper_addressing",
@@ -170,6 +178,20 @@ fn record_all(metrics: &Arc<S2sMetrics>) -> Vec<ConnectionGauge> {
         for outcome in StreamClose::ALL {
             metrics.stream_closed(direction, outcome);
         }
+        for source in RevocationSource::ALL {
+            let verdict = RevocationVerdict {
+                source,
+                status: RevocationStatus::Good,
+                next_update: None,
+                refresh_at: None,
+                pending: Vec::new(),
+                leases: Vec::new(),
+                recheckable: false,
+            };
+            for phase in CheckPhase::ALL {
+                metrics.revocation_checked(direction, phase, &verdict);
+            }
+        }
         metrics.bytes(direction, 17, 23);
     }
     for listener in 0..2 {
@@ -212,6 +234,16 @@ fn every_recorder_encodes_exact_samples() -> Result<(), fmt::Error> {
                 &format!("lonewolf_s2s_{name}{{direction=\"{direction}\"}} 1"),
             );
         }
+        for source in ["file", "fetched"] {
+            for phase in ["handshake", "recheck"] {
+                assert_sample(
+                    &output,
+                    &format!(
+                        "lonewolf_s2s_revocation_checks_total{{direction=\"{direction}\",source=\"{source}\",phase=\"{phase}\",status=\"good\",reason=\"none\"}} 1"
+                    ),
+                );
+            }
+        }
         for outcome in AUTH_OUTCOME_LABELS {
             assert_sample(
                 &output,
@@ -239,13 +271,13 @@ fn every_recorder_encodes_exact_samples() -> Result<(), fmt::Error> {
         assert_sample(
             &output,
             &format!(
-                "lonewolf_s2s_negotiation_duration_seconds_count{{direction=\"{direction}\"}} 19"
+                "lonewolf_s2s_negotiation_duration_seconds_count{{direction=\"{direction}\"}} 23"
             ),
         );
         assert_sample(
             &output,
             &format!(
-                "lonewolf_s2s_negotiation_duration_seconds_sum{{direction=\"{direction}\"}} 9.5"
+                "lonewolf_s2s_negotiation_duration_seconds_sum{{direction=\"{direction}\"}} 11.5"
             ),
         );
         for boundary in PHASE_BUCKETS.into_iter().chain([f64::INFINITY]) {
@@ -254,7 +286,7 @@ fn every_recorder_encodes_exact_samples() -> Result<(), fmt::Error> {
             } else {
                 format!("{boundary:?}")
             };
-            let count = if boundary < 0.5 { 0 } else { 19 };
+            let count = if boundary < 0.5 { 0 } else { 23 };
             assert_sample(
                 &output,
                 &format!(
@@ -471,6 +503,9 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             "lonewolf_s2s_authentications_total" | "lonewolf_s2s_streams_closed_total" => {
                 &["direction", "outcome"]
             }
+            "lonewolf_s2s_revocation_checks_total" => {
+                &["direction", "source", "phase", "status", "reason"]
+            }
             "lonewolf_s2s_negotiation_duration_seconds_bucket" => &["le", "direction"],
             "lonewolf_s2s_stanzas_received_total" | "lonewolf_s2s_stanzas_sent_total" => &["kind"],
             "lonewolf_s2s_rate_limited_total" => &["limit"],
@@ -491,7 +526,7 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             .collect::<Result<_, _>>()?;
         assert_eq!(actual, expected, "{line}");
     }
-    assert_eq!(families.len(), 21);
+    assert_eq!(families.len(), 22);
     Ok(())
 }
 
@@ -544,5 +579,44 @@ fn shutdown_snapshot_uses_rendered_counter_and_link_sources() -> Result<(), fmt:
     assert_eq!(state.queued_stanzas, 0);
     assert_eq!(state.queued_bytes, 0);
     assert_link_samples(&render(&metrics)?, 0);
+    Ok(())
+}
+
+#[test]
+fn revocation_checks_render_only_recorded_source_phase_and_status() -> Result<(), fmt::Error> {
+    use crate::s2s::revocation::UnknownReason;
+
+    let metrics = S2sMetrics::new(0);
+    assert!(!render(&metrics)?.contains("s2s_revocation_checks"));
+    let mut verdict = RevocationVerdict {
+        source: RevocationSource::Fetched,
+        status: RevocationStatus::Unknown(UnknownReason::BlockedAddress),
+        next_update: None,
+        refresh_at: None,
+        pending: Vec::new(),
+        leases: Vec::new(),
+        recheckable: false,
+    };
+    metrics.revocation_checked(Direction::Outbound, CheckPhase::Recheck, &verdict);
+    let output = render(&metrics)?;
+    assert_sample(
+        &output,
+        "lonewolf_s2s_revocation_checks_total{direction=\"outbound\",source=\"fetched\",phase=\"recheck\",status=\"unknown\",reason=\"blocked_address\"} 1",
+    );
+    verdict.source = RevocationSource::File;
+    verdict.status = RevocationStatus::Good;
+    metrics.revocation_checked(Direction::Inbound, CheckPhase::Handshake, &verdict);
+    let output = render(&metrics)?;
+    assert_sample(
+        &output,
+        "lonewolf_s2s_revocation_checks_total{direction=\"inbound\",source=\"file\",phase=\"handshake\",status=\"good\",reason=\"none\"} 1",
+    );
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("lonewolf_s2s_revocation_checks_total{"))
+            .count(),
+        2
+    );
     Ok(())
 }

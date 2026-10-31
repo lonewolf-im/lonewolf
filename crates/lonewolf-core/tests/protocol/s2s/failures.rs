@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use hickory_proto::rr::RecordType;
@@ -8,33 +8,20 @@ use hickory_proto::rr::RecordType;
 use super::super::support::federation::{
     FederatedPair, FederationCa, PairOptions,
     peer::{self, RawS2sListener},
+    refused_endpoint,
 };
 use super::super::support::{PASSWORD, TestResult};
 use super::negotiation::{SingleServer, authentication, closed, expect_bounce};
 
-pub(super) fn refused_endpoint() -> TestResult<(socket2::Socket, SocketAddr)> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    socket.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())?;
-    let address = socket
-        .local_addr()?
-        .as_socket()
-        .ok_or("refused endpoint has no IP address")?;
-    Ok((socket, address))
-}
-
 #[test]
 fn srv_records_are_followed_in_priority_order() -> TestResult {
     let mut fixture = SingleServer::start("")?;
-    let (_refused, refused) = refused_endpoint()?;
+    let refused = refused_endpoint()?;
     let listener = RawS2sListener::bind()?;
     fixture.dns.srv(
         "b.test",
         &[
-            (0, 0, refused.port(), "first.b.test"),
+            (0, 0, refused.address().port(), "first.b.test"),
             (10, 0, listener.address()?.port(), "second.b.test"),
         ],
     );
@@ -140,7 +127,8 @@ fn srv_target_dot_bounces_remote_server_not_found() -> TestResult {
 
 #[test]
 fn unreachable_endpoint_bounces_remote_server_timeout() -> TestResult {
-    let (_refused, address) = refused_endpoint()?;
+    let refused = refused_endpoint()?;
+    let address = refused.address();
     let mut fixture =
         SingleServer::start("[limits.s2s]\nconnect_timeout_secs=1\nnegotiation_timeout_secs=2")?;
     fixture
@@ -298,7 +286,8 @@ fn receiving_peer_with_self_signed_ca_leaf_bounces_remote_server_timeout() -> Te
 
 #[test]
 fn backoff_answers_without_new_attempts() -> TestResult {
-    let (_refused, address) = refused_endpoint()?;
+    let refused = refused_endpoint()?;
+    let address = refused.address();
     let mut fixture = SingleServer::start(
         "[limits.s2s]\nfailure_backoff_initial_secs=1\nfailure_backoff_max_secs=1\nconnect_timeout_secs=1",
     )?;

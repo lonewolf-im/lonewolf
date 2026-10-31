@@ -279,3 +279,113 @@ fn verification_uses_the_requested_key_usage() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn crl_metadata_preserves_numeric_order_and_accounts_for_serials() -> TestResult {
+    let root = issuer("Root")?;
+    let now = now();
+    let this_update = now - Duration::from_secs(60);
+    let next_update = now + Duration::from_secs(3600);
+    let mut numbers = Vec::new();
+    for number in [1u64, 255, 256] {
+        let crl = CertificateRevocationListParams {
+            this_update: this_update.into(),
+            next_update: next_update.into(),
+            crl_number: number.into(),
+            issuing_distribution_point: None,
+            revoked_certs: [1u64, 255, 256]
+                .into_iter()
+                .map(|serial| RevokedCertParams {
+                    serial_number: serial.into(),
+                    revocation_time: this_update.into(),
+                    reason_code: None,
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: KeyIdMethod::PreSpecified(vec![1]),
+        }
+        .signed_by(&root)?;
+        let parsed = parse_crl(crl.der(), now).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(parsed.this_update, this_update);
+        assert_eq!(parsed.next_update, next_update);
+        let decoded: CertificateList = CertificateList::from_der(crl.der())?;
+        let serial_cost: usize = decoded
+            .tbs_cert_list
+            .revoked_certificates
+            .iter()
+            .flatten()
+            .map(|entry| 2 * entry.serial_number.as_bytes().len() + 128)
+            .sum();
+        assert_eq!(parsed.cost, crl.der().len() + 512 + serial_cost);
+        numbers.push(parsed.crl_number.ok_or("missing CRL number")?);
+    }
+    assert!(numbers[0] < numbers[1]);
+    assert!(numbers[1] < numbers[2]);
+    assert_eq!(CrlNumber::new(&[0, 0, 1]), CrlNumber::new(&[1]));
+    assert_eq!(CrlNumber::new(&[0]), CrlNumber::new(&[]));
+    let crl = crl(&root, this_update, next_update, false)?;
+    let mut parsed: CertificateList = CertificateList::from_der(crl.der())?;
+    let extensions = parsed
+        .tbs_cert_list
+        .crl_extensions
+        .as_mut()
+        .ok_or("no extensions")?;
+    extensions.retain(|extension| extension.extn_id != X509CrlNumber::OID);
+    assert!(
+        parse_crl(&parsed.to_der()?, now)
+            .map_err(|error| format!("{error:?}"))?
+            .crl_number
+            .is_none()
+    );
+    parsed
+        .tbs_cert_list
+        .crl_extensions
+        .as_mut()
+        .ok_or("no extensions")?
+        .push(x509_cert::ext::Extension {
+            extn_id: X509CrlNumber::OID,
+            critical: false,
+            extn_value: x509_cert::der::asn1::OctetString::new(&b"invalid"[..])?,
+        });
+    assert!(matches!(
+        parse_crl(&parsed.to_der()?, now),
+        Err(CrlLoadError::Invalid)
+    ));
+    Ok(())
+}
+
+#[test]
+fn cost_limit_precedes_webpki_owned_parsing_and_accepts_exact_cost() -> TestResult {
+    let root = issuer("Root")?;
+    let now = now();
+    let der = crl(
+        &root,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(3600),
+        false,
+    )?;
+    let parsed = parse_crl(der.der(), now).map_err(|error| format!("{error:?}"))?;
+    assert!(
+        parse_crl_with_cost_limit(der.der(), now, parsed.cost)
+            .map_err(|error| format!("{error:?}"))?
+            .is_some()
+    );
+    assert!(
+        parse_crl_with_cost_limit(der.der(), now, parsed.cost - 1)
+            .map_err(|error| format!("{error:?}"))?
+            .is_none()
+    );
+    let mut unsupported: CertificateList = CertificateList::from_der(der.der())?;
+    unsupported.tbs_cert_list.version = x509_cert::Version::V1;
+    let unsupported = unsupported.to_der()?;
+    assert!(
+        parse_crl_with_cost_limit(&unsupported, now, 0)
+            .map_err(|error| format!("{error:?}"))?
+            .is_none()
+    );
+    assert!(matches!(
+        parse_crl(&unsupported, now),
+        Err(CrlLoadError::Invalid)
+    ));
+    Ok(())
+}

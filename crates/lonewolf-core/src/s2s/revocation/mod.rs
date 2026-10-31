@@ -7,6 +7,9 @@ use futures_util::future::{BoxFuture, Shared};
 
 use super::metrics::{AuthOutcome, StreamClose};
 
+pub(crate) mod address;
+pub(crate) mod fetch;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RevocationSource {
     File,

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cmp::Ordering;
 use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,7 +11,8 @@ use rustls::pki_types::{
     UnixTime,
 };
 use x509_cert::crl::CertificateList;
-use x509_cert::der::Decode;
+use x509_cert::der::{Decode, oid::AssociatedOid};
+use x509_cert::ext::pkix::CrlNumber as X509CrlNumber;
 
 pub(crate) const RECHECK_INTERVAL: Duration = Duration::from_secs(3600);
 
@@ -21,12 +23,53 @@ pub(crate) enum CrlLoadError {
     Stale,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CrlNumber(Box<[u8]>);
+
+impl CrlNumber {
+    fn new(bytes: &[u8]) -> Self {
+        let start = bytes
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(bytes.len());
+        Self(bytes[start..].into())
+    }
+}
+
+impl Ord for CrlNumber {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .len()
+            .cmp(&other.0.len())
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+impl PartialOrd for CrlNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub(crate) struct ParsedCrl {
     pub(crate) crl: webpki::CertRevocationList<'static>,
+    pub(crate) this_update: SystemTime,
+    pub(crate) crl_number: Option<CrlNumber>,
+    /// Estimated bytes retained by the owned CRL.
+    pub(crate) cost: usize,
     pub(crate) next_update: SystemTime,
 }
 
 pub(crate) fn parse_crl(der: &[u8], now: SystemTime) -> Result<ParsedCrl, CrlLoadError> {
+    parse_crl_with_cost_limit(der, now, usize::MAX)?.ok_or(CrlLoadError::Invalid)
+}
+
+/// Returns None when the estimated retained CRL cost exceeds max_cost.
+pub(crate) fn parse_crl_with_cost_limit(
+    der: &[u8],
+    now: SystemTime,
+    max_cost: usize,
+) -> Result<Option<ParsedCrl>, CrlLoadError> {
     let parsed: CertificateList =
         CertificateList::from_der(der).map_err(|_| CrlLoadError::Invalid)?;
     let this_update = UNIX_EPOCH
@@ -45,11 +88,44 @@ pub(crate) fn parse_crl(der: &[u8], now: SystemTime) -> Result<ParsedCrl, CrlLoa
     if this_update > now || next_update <= now {
         return Err(CrlLoadError::Stale);
     }
+    let mut crl_number = None;
+    for extension in parsed.tbs_cert_list.crl_extensions.iter().flatten() {
+        if extension.extn_id == X509CrlNumber::OID {
+            let number = X509CrlNumber::from_der(extension.extn_value.as_bytes())
+                .map_err(|_| CrlLoadError::Invalid)?;
+            crl_number = Some(CrlNumber::new(number.0.as_bytes()));
+        }
+    }
+    let cost = parsed
+        .tbs_cert_list
+        .revoked_certificates
+        .iter()
+        .flatten()
+        .try_fold(
+            der.len().checked_add(512).ok_or(CrlLoadError::Invalid)?,
+            |cost, entry| {
+                entry
+                    .serial_number
+                    .as_bytes()
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|size| size.checked_add(128))
+                    .and_then(|size| cost.checked_add(size))
+                    .ok_or(CrlLoadError::Invalid)
+            },
+        )?;
+    if cost > max_cost {
+        return Ok(None);
+    }
+    drop(parsed);
     let crl = webpki::OwnedCertRevocationList::from_der(der).map_err(|_| CrlLoadError::Invalid)?;
-    Ok(ParsedCrl {
+    Ok(Some(ParsedCrl {
         crl: webpki::CertRevocationList::Owned(crl),
+        this_update,
+        crl_number,
+        cost,
         next_update,
-    })
+    }))
 }
 
 #[derive(Debug)]

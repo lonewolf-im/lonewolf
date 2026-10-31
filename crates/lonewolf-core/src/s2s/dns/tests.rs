@@ -684,3 +684,59 @@ fn unrelated_and_wrong_class_answers_are_excluded() {
             .is_empty()
     );
 }
+
+#[test]
+fn host_resolution_bypasses_routes_and_srv_and_keeps_address_order() -> TestResult {
+    let server = Server::start(|query| vec![address(query)])?;
+    let mut resolver = server.resolver()?;
+    resolver
+        .routes
+        .insert("ca.example".into(), vec!["192.0.2.1:99".parse()?]);
+    let runtime = Runtime::new()?;
+    for text in ["127.0.0.1", "::1", "[::1]"] {
+        let result = runtime
+            .block_on(resolver.resolve_host(text))
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            result,
+            vec![text.trim_matches(['[', ']']).parse::<IpAddr>()?]
+        );
+    }
+    assert!(server.queries().is_empty());
+    assert_eq!(
+        runtime
+            .block_on(resolver.resolve_host("ca.example"))
+            .map_err(|error| format!("{error:?}"))?,
+        vec![
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        ]
+    );
+    let queries = server.queries();
+    assert_eq!(queries.len(), 2);
+    assert!(
+        queries.iter().all(|(name, kind)| name == "ca.example."
+            && matches!(kind, RecordType::A | RecordType::AAAA))
+    );
+    Ok(())
+}
+
+#[test]
+fn host_resolution_distinguishes_empty_answers_failures_and_invalid_names() -> TestResult {
+    for (code, expected) in [
+        (ResponseCode::NXDomain, ResolveError::NotFound),
+        (ResponseCode::ServFail, ResolveError::Unavailable),
+    ] {
+        let server = Server::start(move |query| vec![response(query, code, Vec::new())])?;
+        let resolver = server.resolver()?;
+        assert_eq!(
+            Runtime::new()?.block_on(resolver.resolve_host("ca.example")),
+            Err(expected)
+        );
+        assert_eq!(
+            Runtime::new()?.block_on(resolver.resolve_host("bad name")),
+            Err(ResolveError::InvalidDomain)
+        );
+    }
+    Ok(())
+}

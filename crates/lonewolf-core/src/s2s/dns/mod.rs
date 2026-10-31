@@ -72,6 +72,36 @@ impl Resolver {
         })
     }
 
+    pub(crate) async fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, ResolveError> {
+        let literal = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(address) = literal.parse::<IpAddr>() {
+            return Ok(vec![address]);
+        }
+        let ascii = idna::domain_to_ascii_strict(host).map_err(|_| ResolveError::InvalidDomain)?;
+        let mut name = Name::from_ascii(&ascii).map_err(|_| ResolveError::InvalidDomain)?;
+        name.set_fqdn(true);
+        let (aaaa, a) = self.addresses(&name).await;
+        let negative = aaaa.is_ok() && a.is_ok();
+        let mut endpoints = Vec::with_capacity(ENDPOINT_LIMIT);
+        append_addresses(&mut endpoints, aaaa, 0);
+        append_addresses(&mut endpoints, a, 0);
+        if endpoints.is_empty() {
+            Err(if negative {
+                ResolveError::NotFound
+            } else {
+                ResolveError::Unavailable
+            })
+        } else {
+            Ok(endpoints
+                .into_iter()
+                .map(|endpoint| endpoint.ip())
+                .collect())
+        }
+    }
+
     pub(crate) async fn resolve(&self, domain: &str) -> Result<Resolved, ResolveError> {
         let result = self.resolve_inner(domain).await;
         let outcome = match &result {

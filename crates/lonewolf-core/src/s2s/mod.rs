@@ -12,6 +12,7 @@ pub(crate) mod inbound;
 pub(crate) mod ingress;
 pub(crate) mod metrics;
 pub(crate) mod outbound;
+pub(crate) mod revocation;
 pub(crate) mod stream;
 
 fn log_domain(domain: &str) -> Cow<'_, str> {

@@ -16,6 +16,8 @@ use prometheus_client::registry::{Registry, Unit};
 
 use crate::c2s::PHASE_BUCKETS;
 
+use super::revocation::{CheckPhase, RevocationSource, RevocationStatus, RevocationVerdict};
+
 #[derive(Clone, Copy)]
 pub(crate) enum Direction {
     Inbound,
@@ -73,6 +75,10 @@ pub(crate) enum AuthOutcome {
     CertificateName,
     CertificatePurpose,
     CertificateExpired,
+    CertificateRevoked,
+    RevocationUnknown,
+    RevocationStale,
+    RevocationUnavailable,
     TlsFailure,
     NoTls,
     TlsRefused,
@@ -86,7 +92,7 @@ pub(crate) enum AuthOutcome {
 }
 
 impl AuthOutcome {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 23] = [
         Self::Success,
         Self::HostUnknown,
         Self::MissingFrom,
@@ -96,6 +102,10 @@ impl AuthOutcome {
         Self::CertificateName,
         Self::CertificatePurpose,
         Self::CertificateExpired,
+        Self::CertificateRevoked,
+        Self::RevocationUnknown,
+        Self::RevocationStale,
+        Self::RevocationUnavailable,
         Self::TlsFailure,
         Self::NoTls,
         Self::TlsRefused,
@@ -119,6 +129,10 @@ impl AuthOutcome {
             Self::CertificateName => "certificate_name",
             Self::CertificatePurpose => "certificate_purpose",
             Self::CertificateExpired => "certificate_expired",
+            Self::CertificateRevoked => "certificate_revoked",
+            Self::RevocationUnknown => "revocation_unknown",
+            Self::RevocationStale => "revocation_stale",
+            Self::RevocationUnavailable => "revocation_unavailable",
             Self::TlsFailure => "tls_failure",
             Self::NoTls => "no_tls",
             Self::TlsRefused => "tls_refused",
@@ -138,6 +152,10 @@ pub(crate) enum StreamClose {
     StreamEnd,
     Idle,
     CertificateExpired,
+    CertificateRevoked,
+    RevocationUnknown,
+    RevocationStale,
+    RevocationUnavailable,
     Shutdown,
     Conflict,
     ImproperAddressing,
@@ -154,10 +172,14 @@ pub(crate) enum StreamClose {
 }
 
 impl StreamClose {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 20] = [
         Self::StreamEnd,
         Self::Idle,
         Self::CertificateExpired,
+        Self::CertificateRevoked,
+        Self::RevocationUnknown,
+        Self::RevocationStale,
+        Self::RevocationUnavailable,
         Self::Shutdown,
         Self::Conflict,
         Self::ImproperAddressing,
@@ -178,6 +200,10 @@ impl StreamClose {
             Self::StreamEnd => "stream_end",
             Self::Idle => "idle",
             Self::CertificateExpired => "certificate_expired",
+            Self::CertificateRevoked => "certificate_revoked",
+            Self::RevocationUnknown => "revocation_unknown",
+            Self::RevocationStale => "revocation_stale",
+            Self::RevocationUnavailable => "revocation_unavailable",
             Self::Shutdown => "shutdown",
             Self::Conflict => "conflict",
             Self::ImproperAddressing => "improper_addressing",
@@ -383,6 +409,7 @@ pub(crate) struct S2sMetrics {
     connections: [AtomicU64; Direction::ALL.len()],
     listeners: Box<[ListenerCounters]>,
     authentications: [[AtomicU64; AuthOutcome::ALL.len()]; Direction::ALL.len()],
+    revocation_checks: [[[[AtomicU64; 15]; 2]; 2]; 2],
     negotiation_duration: [Histogram; Direction::ALL.len()],
     streams: [AtomicU64; Direction::ALL.len()],
     streams_closed: [[AtomicU64; StreamClose::ALL.len()]; Direction::ALL.len()],
@@ -406,6 +433,7 @@ impl S2sMetrics {
                 .map(|_| ListenerCounters::default())
                 .collect(),
             authentications: Default::default(),
+            revocation_checks: Default::default(),
             negotiation_duration: std::array::from_fn(|_| Histogram::new(PHASE_BUCKETS)),
             streams: Default::default(),
             streams_closed: Default::default(),
@@ -453,6 +481,18 @@ impl S2sMetrics {
     ) {
         self.authentications[direction as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
         self.negotiation_duration[direction as usize].observe(elapsed.as_secs_f64());
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn revocation_checked(
+        &self,
+        direction: Direction,
+        phase: CheckPhase,
+        verdict: &RevocationVerdict,
+    ) {
+        self.revocation_checks[direction as usize][verdict.source as usize][phase as usize]
+            [verdict.status.index()]
+        .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn stream_opened(self: &Arc<Self>, direction: Direction) -> ConnectionGauge {
@@ -641,6 +681,31 @@ impl Collector for S2sCollector {
                         metrics.authentications[direction as usize][outcome as usize]
                             .load(Ordering::Relaxed),
                     )
+                })
+            }),
+        )?;
+        encode_counter(
+            &mut encoder,
+            "s2s_revocation_checks",
+            "S2S peer certificate revocation checks.",
+            Direction::ALL.into_iter().flat_map(|direction| {
+                RevocationSource::ALL.into_iter().flat_map(move |source| {
+                    CheckPhase::ALL.into_iter().flat_map(move |phase| {
+                        RevocationStatus::ALL.map(|status| {
+                            (
+                                [
+                                    ("direction", direction.as_str()),
+                                    ("source", source.as_str()),
+                                    ("phase", phase.as_str()),
+                                    ("status", status.as_str()),
+                                    ("reason", status.reason()),
+                                ],
+                                metrics.revocation_checks[direction as usize][source as usize]
+                                    [phase as usize][status.index()]
+                                .load(Ordering::Relaxed),
+                            )
+                        })
+                    })
                 })
             }),
         )?;

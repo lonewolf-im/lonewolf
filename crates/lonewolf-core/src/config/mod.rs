@@ -550,6 +550,14 @@ impl S2sConfig {
         {
             return Err("s2s.tls.trust_anchors_path must not be empty".into());
         }
+        if let Some(path) = &self.tls.crls_path {
+            if path.as_os_str().is_empty() {
+                return Err("s2s.tls.crls_path must not be empty".into());
+            }
+            if self.tls.trust_anchors_path.is_none() {
+                return Err("s2s.tls.crls_path requires s2s.tls.trust_anchors_path".into());
+            }
+        }
         if Instant::now()
             .checked_add(Duration::from_secs(self.dns.timeout_secs.get()))
             .is_none()
@@ -638,6 +646,7 @@ impl Default for S2sListenerConfig {
 pub struct S2sTlsConfig {
     pub trust_anchors_path: Option<PathBuf>,
     pub fetch_crls: bool,
+    pub crls_path: Option<PathBuf>,
 }
 
 impl Default for S2sTlsConfig {
@@ -645,6 +654,7 @@ impl Default for S2sTlsConfig {
         Self {
             trust_anchors_path: None,
             fetch_crls: true,
+            crls_path: None,
         }
     }
 }

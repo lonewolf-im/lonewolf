@@ -864,6 +864,7 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
         },
     );
     expected.s2s.tls.trust_anchors_path = Some("./certs/federation-roots.pem".into());
+    expected.s2s.tls.crls_path = Some("./certs/federation-crls.pem".into());
     expected
         .s2s
         .routes
@@ -1172,6 +1173,7 @@ fn s2s_defaults_preserve_localhost_without_a_certificate() -> TestResult {
     assert_eq!(config.s2s.listeners[0].address, "0.0.0.0:5269".parse()?);
     assert_eq!(config.s2s.tls.trust_anchors_path, None);
     assert!(config.s2s.tls.fetch_crls);
+    assert!(config.s2s.tls.crls_path.is_none());
     assert!(config.s2s.dns.nameservers.is_empty());
     assert_eq!(config.s2s.dns.timeout_secs.get(), 5);
     assert!(config.s2s.routes.is_empty());
@@ -1212,6 +1214,7 @@ address = "[::]:5269"
 [s2s.tls]
 trust_anchors_path = "private.pem"
 fetch_crls = false
+crls_path = "private-crls.pem"
 [s2s.dns]
 nameservers = ["127.0.0.1:53", "[::1]:5353"]
 timeout_secs = 7
@@ -1233,6 +1236,10 @@ timeout_secs = 7
     );
     assert!(!config.s2s.tls.fetch_crls);
     assert_eq!(
+        config.s2s.tls.crls_path.as_deref(),
+        Some(Path::new("private-crls.pem"))
+    );
+    assert_eq!(
         config.s2s.dns.nameservers,
         vec!["127.0.0.1:53".parse()?, "[::1]:5353".parse()?]
     );
@@ -1251,6 +1258,7 @@ fn s2s_rejects_unknown_fields_and_invalid_shapes() -> TestResult {
         "[[s2s.listeners]]\nunknown = true",
         "[s2s.tls]\nunknown = true",
         "[s2s.tls]\nfetch_crls = 'yes'",
+        "[s2s.tls]\ntrust_anchors_path = 'roots.pem'\ncrls_path = 'crls.pem'\nunknown = true",
         "[s2s.dns]\nunknown = true",
         "[s2s.dns]\ntimeout_secs = 0",
         "[s2s.dns]\nnameservers = ['resolver.example:53']",
@@ -1274,6 +1282,14 @@ fn s2s_unconditional_validation_applies_when_disabled() -> TestResult {
             (
                 "[s2s.tls]\ntrust_anchors_path = ''",
                 "s2s.tls.trust_anchors_path must not be empty",
+            ),
+            (
+                "[s2s.tls]\ntrust_anchors_path = 'roots.pem'\ncrls_path = ''",
+                "s2s.tls.crls_path must not be empty",
+            ),
+            (
+                "[s2s.tls]\ncrls_path = 'crls.pem'",
+                "s2s.tls.crls_path requires s2s.tls.trust_anchors_path",
             ),
             (
                 "[s2s.routes]\n'localhost' = ['127.0.0.1:5269']",

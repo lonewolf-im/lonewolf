@@ -172,6 +172,10 @@ pub(crate) enum StreamClose {
 }
 
 impl StreamClose {
+    pub(crate) fn certificate_invalid(self) -> bool {
+        matches!(self, Self::CertificateExpired)
+    }
+
     const ALL: [Self; 20] = [
         Self::StreamEnd,
         Self::Idle,

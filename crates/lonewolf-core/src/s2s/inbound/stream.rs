@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::pin::pin;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
 use futures_util::future::{Either, select};
@@ -22,6 +22,7 @@ use crate::s2s::ingress::{self, InboundPeer, IngressContext, IngressFailure};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{Direction, S2sMetrics, StreamClose};
 use crate::s2s::stream::{S2sError, S2sReader, S2sWriter};
+use crate::s2s::validity::LinkValidity;
 
 const CLOSE_BUDGET: Duration = Duration::from_secs(6);
 const FOOTER_GRACE: Duration = Duration::from_secs(5);
@@ -51,6 +52,17 @@ struct Closed {
 }
 
 impl Closed {
+    fn interrupted(condition: StreamErrorCondition, validity: &LinkValidity) -> Self {
+        if matches!(condition, StreamErrorCondition::Reset) {
+            Self {
+                outcome: validity.reason().unwrap_or(StreamClose::CertificateExpired),
+                wire: WireClose::Error(StreamErrorCondition::Reset),
+            }
+        } else {
+            Self::error(condition)
+        }
+    }
+
     fn error(condition: StreamErrorCondition) -> Self {
         let outcome = match condition {
             StreamErrorCondition::Reset => StreamClose::CertificateExpired,
@@ -132,15 +144,12 @@ fn rejection(peer: &InboundPeer, stanza_kind: &'static str, closed: Closed) -> C
 
 async fn interrupt<T>(
     shutdown: ShutdownSignal,
-    valid_until: SystemTime,
+    validity: &LinkValidity,
     operation: impl Future<Output = T>,
 ) -> Result<T, StreamErrorCondition> {
     match select(
         pin!(shutdown),
-        pin!(select(
-            pin!(crate::s2s::expiry::wait(valid_until)),
-            pin!(operation)
-        )),
+        pin!(select(pin!(validity.wait()), pin!(operation))),
     )
     .await
     {
@@ -162,12 +171,13 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
         connection_id: authenticated.connection_id,
     };
     tracing::info!(connection_id = peer.connection_id, local_domain = %log_domain(&peer.local), remote_domain = %log_domain(&peer.remote), direction = "inbound", "s2s connection authenticated");
+    let validity = LinkValidity::fixed(authenticated.valid_until);
     run(
         &mut authenticated.reader,
         &mut authenticated.writer,
         Parameters {
             peer: &peer,
-            valid_until: authenticated.valid_until,
+            validity: &validity,
             settings,
             shutdown,
         },
@@ -181,7 +191,7 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
 
 struct Parameters<'a, A: ChunkAllocator> {
     peer: &'a InboundPeer,
-    valid_until: SystemTime,
+    validity: &'a LinkValidity,
     settings: &'a Settings<A>,
     shutdown: ShutdownSignal,
 }
@@ -205,7 +215,7 @@ where
 {
     let Parameters {
         peer,
-        valid_until,
+        validity,
         settings,
         shutdown,
     } = parameters;
@@ -236,7 +246,7 @@ where
         receive(
             reader,
             peer,
-            valid_until,
+            validity,
             settings,
             shutdown.clone(),
             &context,
@@ -245,7 +255,7 @@ where
         .await
     };
     terminal.outcome = closed.outcome;
-    close(reader, writer, closed, valid_until, shutdown).await;
+    close(reader, writer, closed, validity, shutdown).await;
     abort();
     drop(context);
     group.drain().await;
@@ -256,7 +266,7 @@ where
 async fn receive<A, R, D>(
     reader: &mut S2sReader<A, R>,
     peer: &InboundPeer,
-    valid_until: SystemTime,
+    validity: &LinkValidity,
     settings: &Settings<A>,
     shutdown: ShutdownSignal,
     context: &IngressContext<A>,
@@ -274,7 +284,7 @@ where
     let mut last_input = Instant::now();
     loop {
         let remaining = settings.idle_timeout.saturating_sub(last_input.elapsed());
-        let event = interrupt(shutdown.clone(), valid_until, async {
+        let event = interrupt(shutdown.clone(), validity, async {
             if remaining.is_zero() {
                 return Err(Closed::footer(StreamClose::Idle, false));
             }
@@ -291,7 +301,9 @@ where
             Ok(Ok(Some(event))) => event,
             Ok(Ok(None)) => return Closed::reader_error(S2sError::Eof),
             Ok(Err(closed)) => return rejection(peer, "stream", closed),
-            Err(condition) => return rejection(peer, "stream", Closed::error(condition)),
+            Err(condition) => {
+                return rejection(peer, "stream", Closed::interrupted(condition, validity));
+            }
         };
         let stanza_kind = match &event {
             StreamEvent::Stanza(parsed) => parsed
@@ -328,7 +340,7 @@ where
                         .map_err(|_| StreamErrorCondition::InternalServerError)?;
                     interrupt(
                         shutdown.clone(),
-                        valid_until,
+                        validity,
                         dispatch(context, peer, RoutedStanza::from_parts(stanza, arena)),
                     )
                     .await?
@@ -414,7 +426,7 @@ where
         }
         .await;
         if let Err(condition) = result {
-            return rejection(peer, stanza_kind, Closed::error(condition));
+            return rejection(peer, stanza_kind, Closed::interrupted(condition, validity));
         }
     }
 }
@@ -423,7 +435,7 @@ async fn close<A, R, W>(
     reader: &mut S2sReader<A, R>,
     writer: &mut S2sWriter<W>,
     closed: Closed,
-    valid_until: SystemTime,
+    validity: &LinkValidity,
     shutdown: ShutdownSignal,
 ) where
     A: ChunkAllocator + Clone + 'static,
@@ -466,7 +478,7 @@ async fn close<A, R, W>(
         if matches!(condition, Some(StreamErrorCondition::Reset)) {
             std::future::pending().await
         } else {
-            crate::s2s::expiry::wait(valid_until).await
+            validity.wait().await;
         }
     };
     let mut expiry = pin!(controls);

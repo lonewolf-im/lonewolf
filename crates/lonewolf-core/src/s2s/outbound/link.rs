@@ -16,13 +16,14 @@ use tokio::io::AsyncBufRead;
 use super::*;
 use crate::s2s::metrics::{Direction, StreamClose};
 use crate::s2s::stream::S2sError;
+use crate::s2s::validity::LinkValidity;
 
 const CLOSE_BUDGET: Duration = Duration::from_secs(6);
 const FOOTER_GRACE: Duration = Duration::from_secs(5);
 
 async fn watch<T>(
     stop: Option<Stop>,
-    validity: Option<SystemTime>,
+    validity: Option<&LinkValidity>,
     timeout: Duration,
     timeout_reason: StreamClose,
     work: impl Future<Output = Result<T, S2sError>>,
@@ -35,7 +36,7 @@ async fn watch<T>(
     };
     let expiry = async {
         match validity {
-            Some(until) => crate::s2s::expiry::wait(until).await,
+            Some(validity) => validity.wait().await,
             None => std::future::pending().await,
         }
     };
@@ -51,7 +52,7 @@ async fn watch<T>(
     };
     match select(pin!(stop), pin!(select(pin!(expiry), pin!(work)))).await {
         Either::Left(_) => Err(StreamClose::Shutdown),
-        Either::Right((Either::Left(_), _)) => Err(StreamClose::CertificateExpired),
+        Either::Right((Either::Left((reason, _)), _)) => Err(reason),
         Either::Right((Either::Right((result, _)), _)) => result,
     }
 }
@@ -64,15 +65,13 @@ enum WriteOutcome {
 fn discard<A: ChunkAllocator>(
     inner: &Inner<A>,
     queued: &mut Queued<A>,
-    valid_until: SystemTime,
+    validity: &LinkValidity,
 ) -> Result<WriteOutcome, StreamClose> {
     let state = inner.state.lock();
     if state.stopped {
         return Err(StreamClose::Shutdown);
     }
-    if SystemTime::now() >= valid_until {
-        return Err(StreamClose::CertificateExpired);
-    }
+    validity.check(SystemTime::now())?;
     drop(queued.reservation.take());
     inner.metrics.dropped(DropReason::InternalError, 1);
     Ok(WriteOutcome::Discarded)
@@ -82,7 +81,7 @@ async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     writer: &mut S2sWriter<W>,
     queued: &mut Queued<A>,
     inner: &Inner<A>,
-    valid_until: SystemTime,
+    validity: &LinkValidity,
     flush: bool,
     buffered: &mut bool,
 ) -> Result<WriteOutcome, StreamClose> {
@@ -100,11 +99,11 @@ async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
         .as_ref()
         .and_then(|(arena, copy)| copy.resolve(arena).ok());
     let Some(view) = view else {
-        let outcome = discard(inner, queued, valid_until)?;
+        let outcome = discard(inner, queued, validity)?;
         if flush && *buffered {
             watch(
                 Some(inner.stopped.clone()),
-                Some(valid_until),
+                Some(validity),
                 Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
                 StreamClose::StalledWrite,
                 writer.flush(),
@@ -120,7 +119,7 @@ async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
         let mut operation = pin!(writer.write_stanza(&view));
         watch(
             Some(inner.stopped.clone()),
-            Some(valid_until),
+            Some(validity),
             timeout,
             StreamClose::StalledWrite,
             poll_fn(|cx| {
@@ -146,7 +145,7 @@ async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     if flush {
         watch(
             Some(inner.stopped.clone()),
-            Some(valid_until),
+            Some(validity),
             timeout,
             StreamClose::StalledWrite,
             writer.flush(),
@@ -166,16 +165,16 @@ async fn graceful<
     writer: &mut S2sWriter<W>,
     reason: StreamClose,
     stop: Stop,
-    valid_until: SystemTime,
+    validity: &LinkValidity,
     write_timeout: Duration,
 ) -> Result<(), StreamClose> {
     let condition = match reason {
-        StreamClose::CertificateExpired => Some(StreamErrorCondition::Reset),
+        reason if reason.certificate_invalid() => Some(StreamErrorCondition::Reset),
         StreamClose::NotAuthorized => Some(StreamErrorCondition::NotAuthorized),
         _ => None,
     };
     let stopped = (!matches!(reason, StreamClose::Shutdown)).then_some(stop);
-    let validity = (!matches!(reason, StreamClose::CertificateExpired)).then_some(valid_until);
+    let validity = (!reason.certificate_invalid()).then_some(validity);
     watch(
         stopped,
         validity,
@@ -226,7 +225,7 @@ async fn serve<
     inner: &Inner<A>,
     reader: &mut S2sReader<A, R>,
     writer: &mut S2sWriter<W>,
-    valid_until: SystemTime,
+    validity: &LinkValidity,
     receiver: &Receiver<Queued<A>>,
     current: &mut Option<Queued<A>>,
 ) -> Closed {
@@ -249,7 +248,7 @@ async fn serve<
             .saturating_sub(last_written.elapsed());
         match watch(
             Some(inner.stopped.clone()),
-            Some(valid_until),
+            Some(validity),
             idle,
             StreamClose::Idle,
             next,
@@ -267,7 +266,7 @@ async fn serve<
                     writer,
                     queued,
                     inner,
-                    valid_until,
+                    validity,
                     receiver.is_empty(),
                     &mut buffered,
                 )
@@ -288,10 +287,8 @@ async fn serve<
                         return Closed {
                             reason,
                             abort: started
-                                || !matches!(
-                                    reason,
-                                    StreamClose::Shutdown | StreamClose::CertificateExpired
-                                ),
+                                || !(matches!(reason, StreamClose::Shutdown)
+                                    || reason.certificate_invalid()),
                         };
                     }
                 }
@@ -390,13 +387,14 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
             }
             Some(Ok(stream)) => stream,
         };
+        let validity = LinkValidity::fixed(stream.valid_until);
         ready(&counters, &mut failures);
         let gauge = inner.metrics.stream_opened(Direction::Outbound);
         let closed = serve(
             &inner,
             &mut stream.reader,
             &mut stream.writer,
-            stream.valid_until,
+            &validity,
             &receiver,
             &mut current,
         )
@@ -409,7 +407,7 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
                 &mut stream.writer,
                 closed.reason,
                 inner.stopped.clone(),
-                stream.valid_until,
+                &validity,
                 Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
             )
             .await
@@ -547,15 +545,16 @@ mod tests {
             let calls = Arc::new(PlMutex::new(Calls::default()));
             let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
             let expiry = rcgen::CertificateParams::default().not_after;
-            let valid =
-                SystemTime::UNIX_EPOCH + Duration::from_secs(expiry.unix_timestamp().try_into()?);
+            let valid = LinkValidity::fixed(
+                SystemTime::UNIX_EPOCH + Duration::from_secs(expiry.unix_timestamp().try_into()?),
+            );
             let mut buffered = false;
             {
                 let mut writing = pin!(write(
                     &mut writer,
                     &mut current,
                     &manager.inner,
-                    valid,
+                    &valid,
                     true,
                     &mut buffered
                 ));
@@ -602,11 +601,12 @@ mod tests {
             let mut source = task.receiver.recv().await?;
             let mut buffered = false;
             {
+                let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
                 let mut writing = pin!(write(
                     &mut writer,
                     &mut source,
                     &manager.inner,
-                    SystemTime::now() + Duration::from_secs(60),
+                    &validity,
                     true,
                     &mut buffered
                 ));
@@ -661,7 +661,7 @@ mod tests {
                     &mut writer,
                     current.as_mut().ok_or("head")?,
                     &manager.inner,
-                    SystemTime::UNIX_EPOCH,
+                    &LinkValidity::fixed(SystemTime::UNIX_EPOCH),
                     true,
                     &mut buffered,
                 )
@@ -769,7 +769,7 @@ mod tests {
             }));
             let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
             let mut buffered = false;
-            let valid = SystemTime::now() + Duration::from_secs(60);
+            let valid = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
             let mut head = task.receiver.recv().await?;
             allocator.exhausted.store(true, Ordering::Relaxed);
             assert!(matches!(
@@ -777,7 +777,7 @@ mod tests {
                     &mut writer,
                     &mut head,
                     &manager.inner,
-                    valid,
+                    &valid,
                     false,
                     &mut buffered
                 )
@@ -797,7 +797,7 @@ mod tests {
                         &mut writer,
                         &mut queued,
                         &manager.inner,
-                        valid,
+                        &valid,
                         task.receiver.is_empty(),
                         &mut buffered
                     )
@@ -865,14 +865,14 @@ mod tests {
             }));
             let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
             let mut buffered = false;
-            let valid = SystemTime::now() + Duration::from_secs(60);
+            let valid = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
             let mut first = task.receiver.recv().await?;
             assert!(matches!(
                 write(
                     &mut writer,
                     &mut first,
                     &manager.inner,
-                    valid,
+                    &valid,
                     false,
                     &mut buffered
                 )
@@ -889,7 +889,7 @@ mod tests {
                     &mut writer,
                     &mut last,
                     &manager.inner,
-                    valid,
+                    &valid,
                     true,
                     &mut buffered
                 )
@@ -958,11 +958,11 @@ mod tests {
                     &mut writer,
                     current.as_mut().ok_or("head")?,
                     &manager.inner,
-                    if expired {
+                    &LinkValidity::fixed(if expired {
                         SystemTime::UNIX_EPOCH
                     } else {
                         SystemTime::now() + Duration::from_secs(60)
-                    },
+                    }),
                     false,
                     &mut buffered,
                 )
@@ -1063,7 +1063,7 @@ mod tests {
                         &manager.inner,
                         &mut reader,
                         &mut writer,
-                        SystemTime::now() + Duration::from_secs(60),
+                        &LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60)),
                         &task.receiver,
                         &mut current,
                     )
@@ -1151,14 +1151,15 @@ mod tests {
                 }));
                 let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
                 {
-                    let validity =
-                        SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 });
+                    let validity = LinkValidity::fixed(
+                        SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 }),
+                    );
                     let mut closing = pin!(graceful(
                         &mut reader,
                         &mut writer,
                         StreamClose::StreamEnd,
                         manager.inner.stopped.clone(),
-                        validity,
+                        &validity,
                         Duration::from_secs(60)
                     ));
                     assert!(poll!(closing.as_mut()).is_pending());

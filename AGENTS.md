@@ -127,6 +127,8 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Write named integration scenarios with visible setup, actions, and expected replies. Share transport and setup helpers without hiding the interaction being tested.
 - When a workflow tests an executable, declare its Cargo test target in the executable's package with a `path` under `crates/lonewolf-core/tests/`, so Cargo supplies the executable path.
 - Run `cargo test --workspace` to cover the central integration suite and each crate's implementation tests.
+- Do not assert on or synchronize tests through emitted logs or tracing events. Do not capture, parse, match, count, or wait for them.
+- Use protocol replies, typed results, observable state, metrics, or explicit completion signals to verify behavior.
 
 ## 14. Standards Reference Rule
 

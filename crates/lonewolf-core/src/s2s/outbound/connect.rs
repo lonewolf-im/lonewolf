@@ -15,7 +15,7 @@ use lonewolf_util::arena::{ChunkAllocator, HandleError};
 use lonewolf_xmpp::parser::{Parsed, StreamEvent};
 use lonewolf_xmpp::stanza::{Element, NodeRef, StanzaErrorCondition};
 use lonewolf_xmpp::stream::StreamErrorCondition;
-use rustls::pki_types::{ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, ClientConfig};
 use tokio::io::BufReader;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
@@ -26,7 +26,7 @@ use crate::hosts::{Hosts, peer_identity::PeerTrust, tls_identity};
 use crate::s2s::dns::{ResolveError, Resolved, ResolvedVia, Resolver};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, Direction, DnsOutcome, S2sMetrics};
-use crate::s2s::revocation::{CheckPhase, PeerRevocation, RevocationStatus};
+use crate::s2s::revocation::{CheckPhase, PeerRevocation, RevocationStatus, RevocationVerdict};
 use crate::s2s::stream::traffic::CountingIo;
 use crate::s2s::stream::{self, Features, S2sError, S2sReader, S2sReaderLimits, S2sWriter};
 use crate::s2s::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
@@ -547,6 +547,12 @@ impl<A: ChunkAllocator + Clone> Negotiation<A> {
     }
 }
 
+struct VerifiedPeer {
+    valid_until: SystemTime,
+    chain: Arc<[CertificateDer<'static>]>,
+    revocation: Option<RevocationVerdict>,
+}
+
 async fn negotiate<A: ChunkAllocator + Clone>(
     flow: &mut Negotiation<A>,
     socket: &ConnectionSocket,
@@ -555,7 +561,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     context: &ConnectContext<'_>,
     setup: &TlsSetup,
     allocator: A,
-) -> Result<SystemTime, Failure> {
+) -> Result<VerifiedPeer, Failure> {
     let header = stream::initial_header_xml(local, remote);
     flow.send(&header).await?;
     flow.header(remote).await?;
@@ -603,12 +609,16 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         .verify_chain(certificates.as_deref().unwrap_or(&[]), UnixTime::now())
         .map_err(|error| Failure::from(EstablishError::Tls(tls_reason(&error))))?;
     let valid_until = unexpired_validity(validity.valid_until, SystemTime::now())?;
-    let chain = Arc::from(certificates.ok_or_else(protocol)?);
-    if let Some(verdict) = context
+    let chain: Arc<[CertificateDer<'static>]> = Arc::from(certificates.ok_or_else(protocol)?);
+    let revocation = context
         .revocation
-        .check(chain, Direction::Outbound, CheckPhase::Handshake)
-        .await
-    {
+        .check(
+            Arc::clone(&chain),
+            Direction::Outbound,
+            CheckPhase::Handshake,
+        )
+        .await;
+    if let Some(verdict) = &revocation {
         if let Some(outcome) = verdict.auth_outcome() {
             tracing::warn!(outcome = outcome.as_str(), direction = "outbound", local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s certificate rejected");
             return Err(EstablishError::Tls(outcome.as_str()).into());
@@ -617,7 +627,11 @@ async fn negotiate<A: ChunkAllocator + Clone>(
             tracing::debug!(reason = reason.as_str(), direction = "outbound", local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s revocation status unknown");
         }
     }
-    Ok(valid_until)
+    Ok(VerifiedPeer {
+        valid_until,
+        chain,
+        revocation,
+    })
 }
 
 pub(crate) async fn establish<A: ChunkAllocator + Clone>(
@@ -723,7 +737,11 @@ where
         };
         let (result, selected_at) = negotiated;
         match result {
-            Ok(valid_until) => {
+            Ok(VerifiedPeer {
+                valid_until,
+                chain,
+                revocation,
+            }) => {
                 let Some(Connection::Tls(reader, writer)) = flow.connection.take() else {
                     return Err(protocol().error);
                 };
@@ -734,6 +752,8 @@ where
                     reader,
                     writer,
                     valid_until,
+                    chain,
+                    revocation,
                     connection_id,
                     _connection_gauge: gauge,
                 });

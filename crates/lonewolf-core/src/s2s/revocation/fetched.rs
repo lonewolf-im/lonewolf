@@ -132,11 +132,13 @@ fn lookups(
                 reason = lookup.unknown;
             }
             if let Some(crl) = lookup.crl {
-                batch.refresh_at = Some(
-                    batch
-                        .refresh_at
-                        .map_or(crl.refresh_at, |old| old.min(crl.refresh_at)),
-                );
+                if crl.refresh_at > now {
+                    batch.refresh_at = Some(
+                        batch
+                            .refresh_at
+                            .map_or(crl.refresh_at, |old| old.min(crl.refresh_at)),
+                    );
+                }
                 if now < crl.next_update {
                     if candidate
                         .fresh
@@ -455,6 +457,80 @@ mod tests {
                 assert_eq!(updated.status, RevocationStatus::Revoked);
                 assert!(updated.pending.is_empty());
                 Ok::<(), Box<dyn Error>>(())
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overdue_pending_or_backoff_urls_do_not_hide_future_refreshes() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = FetchedFixture::new(&[LEAF_CRL, ROOT_CRL])?;
+        for held in [false, true] {
+            let script = Arc::new(Script::default());
+            script.ready(LEAF_CRL, Ok(fixture.crl(false, None, false, 10000)?));
+            script.ready(ROOT_CRL, Ok(fixture.crl(true, None, false, 10000)?));
+            let gate = if held {
+                Some(script.held(LEAF_CRL, Ok(fixture.crl(false, None, false, 10000)?)))
+            } else {
+                script.ready(LEAF_CRL, Err(super::super::fetch::FetchFailure::HttpStatus));
+                None
+            };
+            let peer = fixture.peer(&script, Duration::ZERO, CacheLimits::DEFAULT);
+            Runtime::new()?.block_on(async {
+                let Source::Fetched { cache, .. } = &peer.source else {
+                    return Err("missing cache".into());
+                };
+                let a = CrlUrl::parse(LEAF_CRL).map_err(|_| "bad URL")?;
+                let b = CrlUrl::parse(ROOT_CRL).map_err(|_| "bad URL")?;
+                cache
+                    .lookup(&a, fixture_time(), CheckPhase::Handshake)
+                    .pending
+                    .ok_or("missing fetch")?
+                    .await;
+                let b_time = fixture_time() + Duration::from_secs(1000);
+                cache
+                    .lookup(&b, b_time, CheckPhase::Handshake)
+                    .pending
+                    .ok_or("missing fetch")?
+                    .await;
+                let future_refresh = cache
+                    .lookup(&b, b_time, CheckPhase::Recheck)
+                    .crl
+                    .ok_or("missing cached CRL")?
+                    .refresh_at;
+                let now = fixture_time() + Duration::from_secs(3601);
+                let pending = cache
+                    .lookup(&a, now, CheckPhase::Recheck)
+                    .pending
+                    .ok_or("missing refresh")?;
+                if !held {
+                    pending.clone().await;
+                }
+                let mut prepared = Prepared {
+                    path: Vec::new(),
+                    certificates: vec![CertificateUrls {
+                        urls: vec![a, b],
+                        missing: UnknownReason::NoDistributionPoint,
+                        issuer: Vec::new(),
+                        serial: Vec::new(),
+                    }],
+                };
+                let batch = lookups(cache, &prepared, now, CheckPhase::Recheck);
+                assert_eq!(batch.refresh_at, Some(future_refresh));
+                assert!(future_refresh > now);
+                assert_eq!(batch.pending.len(), usize::from(held));
+                prepared.certificates[0].urls.pop();
+                let overdue = lookups(cache, &prepared, now, CheckPhase::Recheck);
+                assert!(overdue.refresh_at.is_none());
+                assert_eq!(overdue.pending.len(), usize::from(held));
+                if let Some((release, entered)) = gate {
+                    entered.await?;
+                    assert!(batch.pending[0].ptr_eq(&pending));
+                    assert!(release.send(()).is_ok());
+                    pending.await;
+                }
+                Ok::<_, Box<dyn Error>>(())
             })?;
         }
         Ok(())

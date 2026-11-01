@@ -687,3 +687,20 @@ fn crl_metrics_have_fixed_labels_and_activate_cache_gauges_on_use() -> Result<()
     }
     Ok(())
 }
+
+#[test]
+fn only_certificate_invalidations_use_the_reset_close_path() {
+    for outcome in StreamClose::ALL {
+        assert_eq!(
+            outcome.certificate_invalid(),
+            matches!(
+                outcome,
+                StreamClose::CertificateExpired
+                    | StreamClose::CertificateRevoked
+                    | StreamClose::RevocationUnknown
+                    | StreamClose::RevocationStale
+                    | StreamClose::RevocationUnavailable
+            )
+        );
+    }
+}

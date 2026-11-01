@@ -5,6 +5,7 @@ use std::pin::pin;
 use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
+use futures_util::FutureExt;
 use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -21,8 +22,9 @@ use crate::router::RoutedStanza;
 use crate::s2s::ingress::{self, InboundPeer, IngressContext, IngressFailure};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{Direction, S2sMetrics, StreamClose};
+use crate::s2s::revocation::CheckPhase;
 use crate::s2s::stream::{S2sError, S2sReader, S2sWriter};
-use crate::s2s::validity::LinkValidity;
+use crate::s2s::validity::{LinkValidity, MonitorLog, supervise};
 
 const CLOSE_BUDGET: Duration = Duration::from_secs(6);
 const FOOTER_GRACE: Duration = Duration::from_secs(5);
@@ -171,8 +173,31 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
         connection_id: authenticated.connection_id,
     };
     tracing::info!(connection_id = peer.connection_id, local_domain = %log_domain(&peer.local), remote_domain = %log_domain(&peer.remote), direction = "inbound", "s2s connection authenticated");
-    let validity = LinkValidity::fixed(authenticated.valid_until);
-    run(
+    let (validity, monitor) = match authenticated.revocation {
+        Some(verdict) if verdict.needs_rechecks() => {
+            let revocation = std::sync::Arc::clone(&settings.revocation);
+            let chain = authenticated.chain;
+            let revalidate = Box::new(move || {
+                let revocation = std::sync::Arc::clone(&revocation);
+                let chain = std::sync::Arc::clone(&chain);
+                async move {
+                    revocation
+                        .check(chain, Direction::Inbound, CheckPhase::Recheck)
+                        .await
+                }
+                .boxed_local()
+            });
+            let (validity, monitor) = LinkValidity::monitored(
+                authenticated.valid_until,
+                verdict,
+                settings.revocation.recheck_interval(),
+                revalidate,
+            );
+            (validity, Some(monitor))
+        }
+        _ => (LinkValidity::fixed(authenticated.valid_until), None),
+    };
+    let work = run(
         &mut authenticated.reader,
         &mut authenticated.writer,
         Parameters {
@@ -185,6 +210,17 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
             let _ = socket2::SockRef::from(tcp).shutdown(std::net::Shutdown::Both);
         },
         ingress::dispatch,
+    );
+    supervise(
+        monitor,
+        MonitorLog {
+            direction: Direction::Inbound,
+            connection_id: peer.connection_id,
+            local: &peer.local,
+            remote: &peer.remote,
+        },
+        settings.timeout,
+        work,
     )
     .await
 }

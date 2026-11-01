@@ -106,7 +106,6 @@ impl PeerRevocation {
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn recheck_interval(&self) -> Duration {
         self.recheck_interval
     }
@@ -285,13 +284,10 @@ pub(crate) struct RevocationVerdict {
     pub(crate) source: RevocationSource,
     pub(crate) status: RevocationStatus,
     /// The earliest static-file nextUpdate caps the link lifetime.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) next_update: Option<SystemTime>,
-    /// Downloaded CRLs must refresh at the earliest time of any used CRL.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// The earliest future cached refresh schedules a live-link recheck.
     pub(crate) refresh_at: Option<SystemTime>,
     /// A ready signal still requires a recheck of the lookup snapshot.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) pending: Vec<FetchSignal>,
     #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) leases: Vec<CrlLease>,
@@ -322,7 +318,6 @@ impl RevocationVerdict {
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn close_reason(&self) -> Option<StreamClose> {
         if self.accepts() {
             return None;
@@ -338,7 +333,6 @@ impl RevocationVerdict {
         })
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn needs_rechecks(&self) -> bool {
         self.recheckable
     }

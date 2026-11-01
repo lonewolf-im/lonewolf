@@ -36,7 +36,10 @@ pub(super) fn manager_with_allocator<A: ChunkAllocator + Clone>(
     let trust = PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?;
     Ok(RemoteRouter::new(
         hosts,
-        trust,
+        PeerVerification {
+            trust,
+            revocation: PeerRevocation::disabled(),
+        },
         Arc::new(Resolver::new(&config.s2s)?),
         &limits,
         allocator,

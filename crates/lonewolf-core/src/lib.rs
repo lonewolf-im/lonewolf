@@ -293,22 +293,29 @@ fn run_internal(
                 } else {
                     None
                 };
-                let s2s_trust = if let Some(metrics) = &s2s_metrics {
+                let s2s_peers = if let Some(metrics) = &s2s_metrics {
                     let trust = hosts::peer_identity::PeerTrust::load(
                         &config.s2s.tls,
                         hosts.crypto_provider(),
                     )
                     .map_err(|error| RunError::S2s(io::Error::other(error)))?;
-                    let resolver = s2s::dns::Resolver::new(&config.s2s).map_err(RunError::S2s)?;
+                    let resolver = Arc::new(s2s::dns::Resolver::new(&config.s2s).map_err(RunError::S2s)?);
+                    let recheck_interval = hosts::revocation::RECHECK_INTERVAL;
+                    #[cfg(feature = "test-support")]
+                    let recheck_interval = test_support::s2s_revalidation_interval().unwrap_or(recheck_interval);
+                    let peers = s2s::revocation::PeerVerification {
+                        trust: Arc::clone(&trust),
+                        revocation: s2s::revocation::PeerRevocation::new(&config.s2s, &config.limits.s2s, trust, Arc::clone(&resolver), Arc::clone(metrics), recheck_interval),
+                    };
                     remote = Some(s2s::outbound::RemoteRouter::new(
                         hosts.clone(),
-                        Arc::clone(&trust),
-                        Arc::new(resolver),
+                        peers.clone(),
+                        resolver,
                         &config.limits.s2s,
                         Arc::clone(&stanza_pool),
                         Arc::clone(metrics),
                     ));
-                    Some(trust)
+                    Some(peers)
                 } else {
                     None
                 };
@@ -357,13 +364,13 @@ fn run_internal(
                         RunError::C2s(failure.error)
                     })?,
                 );
-                if let (Some(metrics), Some(trust)) = (s2s_metrics, s2s_trust) {
+                if let (Some(metrics), Some(peers)) = (s2s_metrics, s2s_peers) {
                     s2s_listeners = Some(
                         s2s::inbound::S2sListeners::start(
                             &config.s2s,
                             &config.limits.s2s,
                             hosts,
-                            trust,
+                            peers,
                             &dispatcher.handle(),
                             s2s::ingress::IngressServices {
                                 router: router_handle,

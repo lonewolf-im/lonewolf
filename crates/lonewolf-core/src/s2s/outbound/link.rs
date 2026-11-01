@@ -343,6 +343,7 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         let context = connect::ConnectContext {
             hosts: &inner.hosts,
             trust: &inner.trust,
+            revocation: &inner.revocation,
             resolver: &inner.resolver,
             limits: &inner.limits,
             metrics: Arc::clone(&inner.metrics),

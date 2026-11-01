@@ -54,7 +54,10 @@ impl Fixture {
         };
         let remote = RemoteRouter::new(
             hosts.clone(),
-            trust,
+            PeerVerification {
+                trust,
+                revocation: PeerRevocation::disabled(),
+            },
             Arc::new(Resolver::new(&config.s2s)?),
             &limits,
             GlobalChunkAllocator,

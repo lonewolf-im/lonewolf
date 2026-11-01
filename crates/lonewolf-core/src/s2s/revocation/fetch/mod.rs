@@ -26,7 +26,6 @@ pub(crate) struct CrlUrl {
 pub(crate) struct UnsupportedUrl;
 
 impl CrlUrl {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn parse(text: &str) -> Result<Self, UnsupportedUrl> {
         if text.len() > 2048 || text.contains('#') {
             return Err(UnsupportedUrl);
@@ -94,7 +93,6 @@ pub(crate) struct FetchLimits {
 }
 
 impl FetchLimits {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const DEFAULT: Self = Self {
         connect_timeout: Duration::from_secs(3),
         total_timeout: Duration::from_secs(10),
@@ -131,7 +129,6 @@ pub(crate) struct CrlFetcher {
 }
 
 impl CrlFetcher {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn new(resolver: Arc<Resolver>, policy: AddressPolicy, limits: FetchLimits) -> Self {
         Self {
             resolver,
@@ -141,7 +138,6 @@ impl CrlFetcher {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) async fn fetch(
         &self,
         url: &CrlUrl,

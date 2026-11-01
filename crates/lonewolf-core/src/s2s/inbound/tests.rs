@@ -20,6 +20,7 @@ use crate::config::Config;
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 use crate::router::{Router, local::LocalRouter};
 use crate::s2s::ingress::IngressServices;
+use crate::s2s::revocation::PeerRevocation;
 use crate::s2s::stream::S2sReaderLimits;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -39,6 +40,7 @@ impl Fixture {
         Ok(Self {
             settings: Settings {
                 trust: PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?,
+                revocation: PeerRevocation::disabled(),
                 hosts,
                 timeout: Duration::from_secs(5),
                 reader_limits: S2sReaderLimits {

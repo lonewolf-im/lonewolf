@@ -571,7 +571,6 @@ impl S2sMetrics {
         self.negotiation_duration[direction as usize].observe(elapsed.as_secs_f64());
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn revocation_checked(
         &self,
         direction: Direction,

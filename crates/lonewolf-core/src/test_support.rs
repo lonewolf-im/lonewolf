@@ -4,14 +4,41 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::task::Poll;
+use std::time::Duration;
 
 use futures_util::task::AtomicWaker;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use parking_lot::Mutex as PlMutex;
+
+static S2S_REVALIDATION_MILLIS: AtomicU64 = AtomicU64::new(0);
+static S2S_CRL_PUBLIC_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Uses whole milliseconds; zero restores the default interval.
+pub fn set_s2s_revalidation_interval(interval: Duration) {
+    S2S_REVALIDATION_MILLIS.store(
+        interval.as_millis().min(u128::from(u64::MAX)) as u64,
+        Ordering::Release,
+    );
+}
+
+pub fn set_s2s_crl_public_destinations_only(enabled: bool) {
+    S2S_CRL_PUBLIC_ONLY.store(enabled, Ordering::Release);
+}
+
+pub(crate) fn s2s_revalidation_interval() -> Option<Duration> {
+    match S2S_REVALIDATION_MILLIS.load(Ordering::Acquire) {
+        0 => None,
+        millis => Some(Duration::from_millis(millis)),
+    }
+}
+
+pub(crate) fn s2s_crl_public_destinations_only() -> bool {
+    S2S_CRL_PUBLIC_ONLY.load(Ordering::Acquire)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct S2sShutdownState {

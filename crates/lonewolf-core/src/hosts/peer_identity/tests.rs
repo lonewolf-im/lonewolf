@@ -1000,3 +1000,183 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
     assert_eq!(server.peer_certificates(), Some(old.cert.as_slice()));
     Ok(())
 }
+
+#[test]
+fn verified_path_excludes_unrelated_certificates_and_presented_anchor() -> TestResult {
+    let fixture = Fixture::new(30)?;
+    let upper = CertifiedIssuer::signed_by(
+        ca_parameters("Upper", fixture.now, 20)?,
+        TestSigner::new()?,
+        &fixture.root,
+    )?;
+    let lower = CertifiedIssuer::signed_by(
+        ca_parameters("Lower", fixture.now, 15)?,
+        TestSigner::new()?,
+        &upper,
+    )?;
+    let leaf = fixture
+        .parameters()?
+        .signed_by(&TestSigner::new()?, &lower)?;
+    let unrelated = CertifiedIssuer::self_signed(
+        ca_parameters("Unrelated", fixture.now, 30)?,
+        TestSigner::new()?,
+    )?;
+    let trust = fixture.trust()?;
+    for candidates in [
+        vec![
+            leaf.der().clone(),
+            lower.der().clone(),
+            upper.der().clone(),
+            unrelated.der().clone(),
+            fixture.root.der().clone(),
+        ],
+        vec![
+            leaf.der().clone(),
+            fixture.root.der().clone(),
+            upper.der().clone(),
+            unrelated.der().clone(),
+            lower.der().clone(),
+        ],
+    ] {
+        assert_eq!(
+            trust.path_certificates(&candidates, fixture.time())?,
+            vec![leaf.der().clone(), lower.der().clone(), upper.der().clone()]
+        );
+        assert_eq!(
+            trust.verify_chain(&candidates, fixture.time())?,
+            trust.with_verified_path(&candidates, fixture.time(), |_, _, validity| validity)?
+        );
+    }
+    assert!(matches!(
+        trust.path_certificates(&[], fixture.time()),
+        Err(rustls::Error::NoCertificatesPresented)
+    ));
+    for case in 0..6 {
+        let mut params = fixture.parameters()?;
+        match case {
+            0 => params.extended_key_usages.clear(),
+            1 => params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth],
+            2 => params.extended_key_usages = vec![ExtendedKeyUsagePurpose::Any],
+            3 => params.key_usages = vec![KeyUsagePurpose::KeyEncipherment],
+            4 => params.not_after = fixture.now - time::Duration::seconds(1),
+            _ => params.not_before = fixture.now + time::Duration::days(1),
+        }
+        let leaf = fixture.leaf(params)?;
+        assert_eq!(
+            trust
+                .path_certificates(std::slice::from_ref(&leaf), fixture.time())
+                .err(),
+            trust
+                .verify_chain(std::slice::from_ref(&leaf), fixture.time())
+                .err(),
+            "case {case}"
+        );
+        assert!(
+            trust.path_certificates(&[leaf], fixture.time()).is_err(),
+            "case {case}"
+        );
+    }
+    let untrusted = fixture
+        .parameters()?
+        .signed_by(&TestSigner::new()?, &unrelated)?;
+    assert_eq!(
+        trust
+            .path_certificates(std::slice::from_ref(untrusted.der()), fixture.time())
+            .err(),
+        trust
+            .verify_chain(std::slice::from_ref(untrusted.der()), fixture.time())
+            .err()
+    );
+    assert!(
+        trust
+            .path_certificates(std::slice::from_ref(untrusted.der()), fixture.time())
+            .is_err()
+    );
+    let mut invalid = ca_parameters("Invalid intermediate", fixture.now, 15)?;
+    invalid.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    let invalid = CertifiedIssuer::signed_by(invalid, TestSigner::new()?, &fixture.root)?;
+    let invalid_leaf = fixture
+        .parameters()?
+        .signed_by(&TestSigner::new()?, &invalid)?;
+    let invalid_chain = [invalid_leaf.der().clone(), invalid.der().clone()];
+    assert_eq!(
+        trust
+            .path_certificates(&invalid_chain, fixture.time())
+            .err(),
+        trust.verify_chain(&invalid_chain, fixture.time()).err()
+    );
+    assert!(
+        trust
+            .path_certificates(&invalid_chain, fixture.time())
+            .is_err()
+    );
+    let malformed = [CertificateDer::from(vec![0, 1, 2])];
+    assert_eq!(
+        trust.path_certificates(&malformed, fixture.time()).err(),
+        trust.verify_chain(&malformed, fixture.time()).err()
+    );
+    Ok(())
+}
+
+#[test]
+fn crl_checks_use_server_auth_and_allow_uncovered_certificates() -> TestResult {
+    let mut fixture = Fixture::new(30)?;
+    let mut params = ca_parameters("Root", fixture.now, 30)?;
+    params.key_usages.push(KeyUsagePurpose::CrlSign);
+    params.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(vec![1]);
+    fixture.root = CertifiedIssuer::self_signed(params, TestSigner::new()?)?;
+    fs::write(
+        fixture
+            .config
+            .trust_anchors_path
+            .as_ref()
+            .ok_or("no root path")?,
+        pem("CERTIFICATE", fixture.root.der())?,
+    )?;
+    let leaf = fixture.leaf(fixture.parameters()?)?;
+    let mut unrelated_params = ca_parameters("Unrelated", fixture.now, 30)?;
+    unrelated_params.key_usages.push(KeyUsagePurpose::CrlSign);
+    let unrelated = CertifiedIssuer::self_signed(unrelated_params, TestSigner::new()?)?;
+    let trust = fixture.trust()?;
+    for (issuer, revoked) in [(&unrelated, false), (&fixture.root, true)] {
+        let crl = rcgen::CertificateRevocationListParams {
+            this_update: fixture.now - time::Duration::minutes(1),
+            next_update: fixture.now + time::Duration::hours(1),
+            crl_number: 1u64.into(),
+            issuing_distribution_point: None,
+            revoked_certs: if revoked {
+                vec![rcgen::RevokedCertParams {
+                    serial_number: 2u64.into(),
+                    revocation_time: fixture.now,
+                    reason_code: None,
+                    invalidity_date: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            key_identifier_method: rcgen::KeyIdMethod::PreSpecified(vec![1]),
+        }
+        .signed_by(issuer)?;
+        let crl = webpki::CertRevocationList::Owned(webpki::OwnedCertRevocationList::from_der(
+            crl.der(),
+        )?);
+        let result = trust.check_crls(
+            std::slice::from_ref(&leaf),
+            fixture.time(),
+            RevocationRules {
+                crls: &[&crl],
+                unknown: webpki::UnknownStatusPolicy::Allow,
+                expiration: webpki::ExpirationPolicy::Ignore,
+            },
+        );
+        assert_eq!(
+            result,
+            if revoked {
+                Err(webpki::Error::CertRevoked)
+            } else {
+                Ok(())
+            }
+        );
+    }
+    Ok(())
+}

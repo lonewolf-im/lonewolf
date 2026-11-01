@@ -24,7 +24,9 @@ use super::{ClientTlsInput, ClientTlsOutput, OutboundStream};
 use crate::config::limits::S2sLimits;
 use crate::hosts::{Hosts, peer_identity::PeerTrust, tls_identity};
 use crate::s2s::dns::{ResolveError, Resolved, ResolvedVia, Resolver};
+use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, Direction, DnsOutcome, S2sMetrics};
+use crate::s2s::revocation::{CheckPhase, PeerRevocation, RevocationStatus};
 use crate::s2s::stream::traffic::CountingIo;
 use crate::s2s::stream::{self, Features, S2sError, S2sReader, S2sReaderLimits, S2sWriter};
 use crate::s2s::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
@@ -42,6 +44,7 @@ type PlainOutput = Pin<Box<AsyncStream<TcpStream>>>;
 pub(crate) struct ConnectContext<'a> {
     pub(crate) hosts: &'a Hosts,
     pub(crate) trust: &'a Arc<PeerTrust>,
+    pub(crate) revocation: &'a Arc<PeerRevocation>,
     pub(crate) resolver: &'a Resolver,
     pub(crate) limits: &'a S2sLimits,
     pub(crate) metrics: Arc<S2sMetrics>,
@@ -98,6 +101,10 @@ impl EstablishError {
             Self::NoService | Self::NotFound | Self::DnsUnavailable => return None,
             Self::Unreachable => AuthOutcome::Unreachable,
             Self::Tls("certificate_untrusted") => AuthOutcome::CertificateUntrusted,
+            Self::Tls("certificate_revoked") => AuthOutcome::CertificateRevoked,
+            Self::Tls("revocation_unknown") => AuthOutcome::RevocationUnknown,
+            Self::Tls("revocation_stale") => AuthOutcome::RevocationStale,
+            Self::Tls("revocation_unavailable") => AuthOutcome::RevocationUnavailable,
             Self::Tls("certificate_name") => AuthOutcome::CertificateName,
             Self::Tls("certificate_purpose") => AuthOutcome::CertificatePurpose,
             Self::Tls("certificate_expired") => AuthOutcome::CertificateExpired,
@@ -595,7 +602,22 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         .trust
         .verify_chain(certificates.as_deref().unwrap_or(&[]), UnixTime::now())
         .map_err(|error| Failure::from(EstablishError::Tls(tls_reason(&error))))?;
-    unexpired_validity(validity.valid_until, SystemTime::now())
+    let valid_until = unexpired_validity(validity.valid_until, SystemTime::now())?;
+    let chain = Arc::from(certificates.ok_or_else(protocol)?);
+    if let Some(verdict) = context
+        .revocation
+        .check(chain, Direction::Outbound, CheckPhase::Handshake)
+        .await
+    {
+        if let Some(outcome) = verdict.auth_outcome() {
+            tracing::warn!(outcome = outcome.as_str(), direction = "outbound", local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s certificate rejected");
+            return Err(EstablishError::Tls(outcome.as_str()).into());
+        }
+        if let RevocationStatus::Unknown(reason) = verdict.status {
+            tracing::debug!(reason = reason.as_str(), direction = "outbound", local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s revocation status unknown");
+        }
+    }
+    Ok(valid_until)
 }
 
 pub(crate) async fn establish<A: ChunkAllocator + Clone>(

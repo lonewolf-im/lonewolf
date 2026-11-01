@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -115,6 +116,22 @@ impl FederationCa {
         .signed_by(&self.issuer)?
         .der()
         .to_vec())
+    }
+
+    pub fn write_crl(
+        &self,
+        path: &Path,
+        revoked: &[(CertificateDer<'_>, Option<rcgen::RevocationReason>)],
+        this_update: OffsetDateTime,
+        next_update: OffsetDateTime,
+        number: u64,
+    ) -> TestResult {
+        let contents = self.crl(revoked, this_update, next_update, number)?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(path.parent().ok_or("CRL path has no parent")?)?;
+        temporary.write_all(pem("X509 CRL", &contents).as_bytes())?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
     }
 
     pub fn server_until(

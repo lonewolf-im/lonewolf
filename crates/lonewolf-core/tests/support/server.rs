@@ -431,6 +431,7 @@ listeners = [{{ address = "127.0.0.1:0" }}]
 [s2s.tls]
 trust_anchors_path = {anchors:?}
 {fetch_crls}
+{crls_path}
 [s2s.dns]
 nameservers = [{dns:?}]
 timeout_secs = 1
@@ -439,6 +440,12 @@ timeout_secs = 1
             domain = host.domain,
             extensions = host.extensions,
             anchors = host.ca.trust_anchors_path(),
+            crls_path = host
+                .revocation
+                .crls_path
+                .as_ref()
+                .map(|path| format!("crls_path = {path:?}"))
+                .unwrap_or_default(),
             fetch_crls = host
                 .revocation
                 .fetch_crls

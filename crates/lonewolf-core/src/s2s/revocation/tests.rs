@@ -818,3 +818,365 @@ fn cancelling_a_handshake_check_keeps_downloads_running_without_a_check_sample()
         Ok::<(), Box<dyn Error>>(())
     })
 }
+
+fn file_crl(
+    issuer: &CertifiedIssuer<'_, Signer>,
+    this_update: SystemTime,
+    next_update: SystemTime,
+    revoked: Option<u64>,
+) -> TestResult<Vec<u8>> {
+    Ok(CertificateRevocationListParams {
+        this_update: this_update.into(),
+        next_update: next_update.into(),
+        crl_number: 1u64.into(),
+        issuing_distribution_point: None,
+        revoked_certs: revoked
+            .into_iter()
+            .map(|serial| RevokedCertParams {
+                serial_number: serial.into(),
+                revocation_time: this_update.into(),
+                reason_code: None,
+                invalidity_date: None,
+            })
+            .collect(),
+        key_identifier_method: KeyIdMethod::PreSpecified(vec![1]),
+    }
+    .signed_by(issuer)?
+    .der()
+    .to_vec())
+}
+
+fn write_file_crls(path: &Path, lists: &[Vec<u8>]) -> TestResult {
+    use base64::Engine as _;
+    let mut material = String::new();
+    for der in lists {
+        material.push_str("-----BEGIN X509 CRL-----\n");
+        material.push_str(&base64::engine::general_purpose::STANDARD.encode(der));
+        material.push_str("\n-----END X509 CRL-----\n");
+    }
+    fs::write(path, material)?;
+    Ok(())
+}
+
+struct FileFixture {
+    full: FetchedFixture,
+    chain: Arc<[CertificateDer<'static>]>,
+    path: std::path::PathBuf,
+    before: SystemTime,
+    next: SystemTime,
+}
+impl FileFixture {
+    fn new() -> TestResult<Self> {
+        let full = FetchedFixture::new(&[])?;
+        let leaf = parameters("file-peer", 42, false)?.signed_by(&Signer::new()?, &full.root)?;
+        let path = full._directory.path().join("file-crls.pem");
+        let before = fixture_time().min(SystemTime::now()) - Duration::from_secs(60);
+        let next = UNIX_EPOCH
+            + Duration::from_secs(
+                fixture_time()
+                    .max(SystemTime::now())
+                    .duration_since(UNIX_EPOCH)?
+                    .as_secs()
+                    + 600,
+            );
+        let fixture = Self {
+            full,
+            chain: Arc::from([leaf.der().clone()]),
+            path,
+            before,
+            next,
+        };
+        fixture.write(None, fixture.next)?;
+        Ok(fixture)
+    }
+    fn write(&self, revoked: Option<u64>, next: SystemTime) -> TestResult {
+        write_file_crls(
+            &self.path,
+            &[file_crl(&self.full.root, self.before, next, revoked)?],
+        )
+    }
+    fn config(&self) -> S2sConfig {
+        S2sConfig {
+            tls: crate::config::S2sTlsConfig {
+                trust_anchors_path: Some(self.full._directory.path().join("roots.pem")),
+                fetch_crls: true,
+                crls_path: Some(self.path.clone()),
+            },
+            ..Default::default()
+        }
+    }
+    fn peer(&self, metrics: Arc<S2sMetrics>) -> TestResult<Arc<PeerRevocation>> {
+        let config = self.config();
+        Ok(PeerRevocation::new(
+            &config,
+            &S2sLimits::default(),
+            Arc::clone(&self.full.trust),
+            Arc::new(Resolver::new(&config)?),
+            metrics,
+            Duration::from_secs(3600),
+        )?)
+    }
+}
+
+#[test]
+fn file_source_enforces_full_chain_coverage_and_applies_replacements() -> TestResult {
+    let fixture = FileFixture::new()?;
+    write_file_crls(
+        &fixture.path,
+        &[
+            file_crl(
+                &fixture.full.root,
+                fixture.before,
+                fixture.next + Duration::from_secs(600),
+                None,
+            )?,
+            file_crl(&fixture.full.root, fixture.before, fixture.next, None)?,
+        ],
+    )?;
+    let metrics = S2sMetrics::new(0);
+    let peer = fixture.peer(Arc::clone(&metrics))?;
+    assert!(matches!(peer.source, Source::File { .. }));
+    Runtime::new()?.block_on(async {
+        let good = checked(&peer, Arc::clone(&fixture.chain), fixture_time(), CheckPhase::Handshake).await?;
+        assert_eq!(good.status, RevocationStatus::Good); assert_eq!(good.next_update, Some(fixture.next));
+        assert!(good.accepts()); assert!(good.needs_rechecks()); assert_eq!(good.source, RevocationSource::File);
+        assert!(good.refresh_at.is_none()); assert!(good.pending.is_empty()); assert!(good.leases.is_empty());
+        let uncovered = checked(&peer, Arc::clone(&fixture.full.chain), fixture_time(), CheckPhase::Recheck).await?;
+        assert_eq!(uncovered.status, RevocationStatus::Unknown(UnknownReason::NotAuthoritative));
+        assert!(!uncovered.accepts()); assert!(matches!(uncovered.auth_outcome(), Some(AuthOutcome::RevocationUnknown)));
+        fixture.write(Some(42), fixture.next)?;
+        let revoked = checked(&peer, Arc::clone(&fixture.chain), fixture_time(), CheckPhase::Recheck).await?;
+        assert_eq!(revoked.status, RevocationStatus::Revoked); assert!(!revoked.accepts()); assert!(matches!(revoked.auth_outcome(), Some(AuthOutcome::CertificateRevoked)));
+        assert_metric(&metric_text(&metrics)?, "lonewolf_s2s_revocation_checks_total{direction=\"inbound\",source=\"file\",phase=\"handshake\",status=\"good\",reason=\"none\"} 1");
+        Ok(())
+    })
+}
+
+#[test]
+fn file_load_and_signature_failures_reject_with_source_specific_outcomes() -> TestResult {
+    let fixture = FileFixture::new()?;
+    let peer = fixture.peer(S2sMetrics::new(0))?;
+    let wrong_key = CertifiedIssuer::self_signed(parameters("root", 1, true)?, Signer::new()?)?;
+    let stale = file_crl(
+        &fixture.full.root,
+        fixture_time() - Duration::from_secs(120),
+        fixture_time() - Duration::from_secs(60),
+        None,
+    )?;
+    let wrong = file_crl(&wrong_key, fixture.before, fixture.next, None)?;
+    Runtime::new()?.block_on(async {
+        for (material, reason, outcome) in [
+            (
+                Some(stale),
+                UnknownReason::Stale,
+                AuthOutcome::RevocationStale,
+            ),
+            (
+                None,
+                UnknownReason::Unavailable,
+                AuthOutcome::RevocationUnavailable,
+            ),
+            (
+                Some(b"invalid".to_vec()),
+                UnknownReason::Invalid,
+                AuthOutcome::RevocationUnavailable,
+            ),
+            (
+                Some(wrong),
+                UnknownReason::BadSignature,
+                AuthOutcome::RevocationUnavailable,
+            ),
+        ] {
+            match material {
+                None => fs::remove_file(&fixture.path)?,
+                Some(material) if material == b"invalid" => fs::write(&fixture.path, material)?,
+                Some(material) => write_file_crls(&fixture.path, &[material])?,
+            }
+            let verdict = checked(
+                &peer,
+                Arc::clone(&fixture.chain),
+                fixture_time(),
+                CheckPhase::Handshake,
+            )
+            .await?;
+            assert_eq!(verdict.status, RevocationStatus::Unknown(reason));
+            assert!(!verdict.accepts());
+            assert_eq!(
+                verdict.auth_outcome().map(AuthOutcome::as_str),
+                Some(outcome.as_str())
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn startup_rejects_unreadable_invalid_files_but_accepts_stale_files() -> TestResult {
+    let fixture = FileFixture::new()?;
+    let config = fixture.config();
+    for error in [
+        CrlLoadError::Unreadable,
+        CrlLoadError::Invalid,
+        CrlLoadError::Stale,
+    ] {
+        match error {
+            CrlLoadError::Unreadable => fs::remove_file(&fixture.path)?,
+            CrlLoadError::Invalid => fs::write(&fixture.path, b"invalid")?,
+            CrlLoadError::Stale => {
+                let now = SystemTime::now();
+                write_file_crls(
+                    &fixture.path,
+                    &[file_crl(
+                        &fixture.full.root,
+                        now - Duration::from_secs(120),
+                        now - Duration::from_secs(60),
+                        None,
+                    )?],
+                )?;
+            }
+        }
+        let metrics = S2sMetrics::new(0);
+        let result = PeerRevocation::new(
+            &config,
+            &S2sLimits::default(),
+            Arc::clone(&fixture.full.trust),
+            Arc::new(Resolver::new(&config)?),
+            Arc::clone(&metrics),
+            Duration::from_secs(3600),
+        );
+        if error == CrlLoadError::Stale {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                matches!(result, Err(RevocationStartupError::CrlFile(actual)) if actual == error)
+            );
+        }
+        assert_metric(
+            &metric_text(&metrics)?,
+            &format!(
+                "lonewolf_s2s_crl_file_load_failures_total{{reason=\"{}\"}} 1",
+                error.as_str()
+            ),
+        );
+        assert!(!metric_text(&metrics)?.contains("s2s_crl_file_next_update_seconds"));
+    }
+    for (error, text) in [
+        (CrlLoadError::Unreadable, "cannot read s2s.tls.crls_path"),
+        (
+            CrlLoadError::Invalid,
+            "s2s.tls.crls_path holds invalid CRLs",
+        ),
+        (CrlLoadError::Stale, "s2s.tls.crls_path holds stale CRLs"),
+    ] {
+        assert_eq!(RevocationStartupError::CrlFile(error).to_string(), text);
+    }
+    Ok(())
+}
+
+#[test]
+fn cancelled_submitted_file_loads_report_without_the_waiter_or_peer_owner() -> TestResult {
+    for failure in [false, true] {
+        let fixture = FileFixture::new()?;
+        let metrics = S2sMetrics::new(0);
+        let mut peer = fixture.peer(Arc::clone(&metrics))?;
+        Arc::get_mut(&mut peer).ok_or("shared peer")?.verifier =
+            BlockingExecutor::new(NonZeroUsize::MIN);
+        let executor = peer.verifier.clone();
+        let next = fixture.next + Duration::from_secs(600);
+        if failure {
+            fs::write(&fixture.path, b"invalid")?;
+        } else {
+            fixture.write(None, next)?;
+        }
+        Runtime::new()?.block_on(async {
+            let (entered, started) = oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let mut check = Box::pin(peer.check_at_with_loader(
+                Arc::clone(&fixture.chain),
+                Direction::Inbound,
+                CheckPhase::Recheck,
+                fixture_time(),
+                move |path, now| {
+                    let _ = entered.send(());
+                    assert!(held.recv_timeout(Duration::from_secs(5)).is_ok());
+                    CrlSet::load(path, now)
+                },
+            ));
+            assert!(futures_util::poll!(check.as_mut()).is_pending());
+            compio::time::timeout(Duration::from_secs(5), started).await??;
+            drop(check);
+            drop(peer);
+            release.send(())?;
+            executor.run(|| ()).await;
+            let output = metric_text(&metrics)?;
+            if failure {
+                assert_metric(
+                    &output,
+                    "lonewolf_s2s_crl_file_load_failures_total{reason=\"invalid\"} 1",
+                );
+            } else {
+                assert_metric(
+                    &output,
+                    &format!(
+                        "lonewolf_s2s_crl_file_next_update_seconds {}",
+                        next.duration_since(UNIX_EPOCH)?.as_secs()
+                    ),
+                );
+            }
+            assert!(!output.contains("s2s_revocation_checks_total"));
+            Ok::<_, Box<dyn Error>>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cancelled_file_checks_waiting_for_executor_admission_do_not_load() -> TestResult {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fixture = FileFixture::new()?;
+    let metrics = S2sMetrics::new(0);
+    let mut peer = fixture.peer(Arc::clone(&metrics))?;
+    Arc::get_mut(&mut peer).ok_or("shared peer")?.verifier =
+        BlockingExecutor::new(NonZeroUsize::MIN);
+    let executor = peer.verifier.clone();
+    Runtime::new()?.block_on(async {
+        let (entered, started) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let mut occupied = Box::pin(executor.run(move || {
+            let _ = entered.send(());
+            held.recv_timeout(Duration::from_secs(5))
+        }));
+        assert!(futures_util::poll!(occupied.as_mut()).is_pending());
+        compio::time::timeout(Duration::from_secs(5), started).await??;
+        let loaded = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&loaded);
+        let mut check = Box::pin(peer.check_at_with_loader(
+            Arc::clone(&fixture.chain),
+            Direction::Inbound,
+            CheckPhase::Recheck,
+            fixture_time(),
+            move |path, now| {
+                observed.store(true, Ordering::Relaxed);
+                CrlSet::load(path, now)
+            },
+        ));
+        assert!(futures_util::poll!(check.as_mut()).is_pending());
+        drop(check);
+        drop(peer);
+        release.send(())?;
+        occupied.await?;
+        executor.run(|| ()).await;
+        assert!(!loaded.load(Ordering::Relaxed));
+        let output = metric_text(&metrics)?;
+        assert!(!output.contains("s2s_crl_file_load_failures"));
+        assert!(!output.contains("s2s_revocation_checks_total"));
+        assert_metric(
+            &output,
+            &format!(
+                "lonewolf_s2s_crl_file_next_update_seconds {}",
+                fixture.next.duration_since(UNIX_EPOCH)?.as_secs()
+            ),
+        );
+        Ok::<_, Box<dyn Error>>(())
+    })
+}

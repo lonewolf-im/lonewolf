@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use lonewolf_xmpp::stanza::StanzaKind;
 use parking_lot::RwLock as PlRwLock;
@@ -15,6 +15,7 @@ use prometheus_client::metrics::{
 use prometheus_client::registry::{Registry, Unit};
 
 use crate::c2s::PHASE_BUCKETS;
+use crate::hosts::revocation::CrlLoadError;
 
 use super::revocation::{CheckPhase, RevocationSource, RevocationStatus, RevocationVerdict};
 
@@ -493,6 +494,8 @@ pub(crate) struct S2sMetrics {
     admission_rejected: [AtomicU64; AdmissionReason::ALL.len()],
     bounces: [AtomicU64; BounceCondition::ALL.len()],
     dropped: [AtomicU64; DropReason::ALL.len()],
+    crl_file_load_failures: [AtomicU64; 3],
+    crl_file_next_update: AtomicU64,
     crl_fetches: [AtomicU64; CrlFetchOutcome::ALL.len()],
     crl_fetch_duration: Histogram,
     crl_cache_active: AtomicBool,
@@ -523,6 +526,8 @@ impl S2sMetrics {
             admission_rejected: Default::default(),
             bounces: Default::default(),
             dropped: Default::default(),
+            crl_file_load_failures: Default::default(),
+            crl_file_next_update: AtomicU64::new(0),
             crl_fetches: Default::default(),
             crl_fetch_duration: Histogram::new(PHASE_BUCKETS),
             crl_cache_active: AtomicBool::new(false),
@@ -535,6 +540,19 @@ impl S2sMetrics {
 
     pub(crate) fn register(self: &Arc<Self>, registry: &mut Registry) {
         registry.register_collector(Box::new(S2sCollector(Arc::clone(self))));
+    }
+
+    pub(crate) fn crl_file_loaded(&self, next_update: SystemTime) {
+        self.crl_file_next_update.store(
+            next_update
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn crl_file_load_failed(&self, error: CrlLoadError) {
+        self.crl_file_load_failures[error as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn crl_fetched(&self, outcome: CrlFetchOutcome, elapsed: Duration) {
@@ -712,6 +730,26 @@ fn encode_counter<L: EncodeLabelSet>(
 impl Collector for S2sCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
         let metrics = &self.0;
+        encode_counter(
+            &mut encoder,
+            "s2s_crl_file_load_failures",
+            "S2S CRL file loads that failed.",
+            CrlLoadError::ALL.map(|reason| {
+                (
+                    [("reason", reason.as_str())],
+                    metrics.crl_file_load_failures[reason as usize].load(Ordering::Relaxed),
+                )
+            }),
+        )?;
+        let next_update = metrics.crl_file_next_update.load(Ordering::Relaxed);
+        if next_update != 0 {
+            ConstGauge::new(next_update).encode(encoder.encode_descriptor(
+                "s2s_crl_file_next_update_seconds",
+                "Earliest nextUpdate of the last loaded S2S CRL file in Unix seconds.",
+                None,
+                MetricType::Gauge,
+            )?)?;
+        }
         encode_counter(
             &mut encoder,
             "s2s_crl_fetches",

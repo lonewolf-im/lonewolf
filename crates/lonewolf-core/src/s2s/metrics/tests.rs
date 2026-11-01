@@ -704,3 +704,33 @@ fn only_certificate_invalidations_use_the_reset_close_path() {
         );
     }
 }
+
+#[test]
+fn crl_file_metrics_appear_only_after_loads_and_keep_the_last_success() -> Result<(), fmt::Error> {
+    let metrics = S2sMetrics::new(0);
+    let fresh = render(&metrics)?;
+    assert!(!fresh.contains("s2s_crl_file_"));
+    for error in CrlLoadError::ALL {
+        metrics.crl_file_load_failed(error);
+    }
+    let failures = render(&metrics)?;
+    for reason in ["unreadable", "invalid", "stale"] {
+        assert_sample(
+            &failures,
+            &format!("lonewolf_s2s_crl_file_load_failures_total{{reason=\"{reason}\"}} 1"),
+        );
+    }
+    assert!(!failures.contains("s2s_crl_file_next_update_seconds"));
+    metrics.crl_file_loaded(std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    metrics.crl_file_load_failed(CrlLoadError::Stale);
+    let output = render(&metrics)?;
+    assert_sample(
+        &output,
+        "lonewolf_s2s_crl_file_next_update_seconds 1800000000",
+    );
+    assert_sample(
+        &output,
+        "lonewolf_s2s_crl_file_load_failures_total{reason=\"stale\"} 2",
+    );
+    Ok(())
+}

@@ -23,6 +23,18 @@ pub(crate) enum CrlLoadError {
     Stale,
 }
 
+impl CrlLoadError {
+    pub(crate) const ALL: [Self; 3] = [Self::Unreadable, Self::Invalid, Self::Stale];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable",
+            Self::Invalid => "invalid",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CrlNumber(Box<[u8]>);
 
@@ -70,6 +82,15 @@ pub(crate) fn parse_crl_with_cost_limit(
     now: SystemTime,
     max_cost: usize,
 ) -> Result<Option<ParsedCrl>, CrlLoadError> {
+    parse_crl_inner(der, now, max_cost, true)
+}
+
+fn parse_crl_inner(
+    der: &[u8],
+    now: SystemTime,
+    max_cost: usize,
+    enforce_freshness: bool,
+) -> Result<Option<ParsedCrl>, CrlLoadError> {
     let parsed: CertificateList =
         CertificateList::from_der(der).map_err(|_| CrlLoadError::Invalid)?;
     let this_update = UNIX_EPOCH
@@ -85,7 +106,7 @@ pub(crate) fn parse_crl_with_cost_limit(
     if next_update <= this_update {
         return Err(CrlLoadError::Invalid);
     }
-    if this_update > now || next_update <= now {
+    if enforce_freshness && (this_update > now || next_update <= now) {
         return Err(CrlLoadError::Stale);
     }
     let mut crl_number = None;
@@ -137,12 +158,28 @@ pub(crate) struct CrlSet {
 impl CrlSet {
     /// Performs blocking file I/O.
     pub(crate) fn load(path: &Path, now: SystemTime) -> Result<Self, CrlLoadError> {
+        Self::load_with(path, now, false)
+    }
+
+    /// Rejects invalid material before stale material and performs blocking file I/O.
+    pub(crate) fn load_for_startup(path: &Path, now: SystemTime) -> Result<Self, CrlLoadError> {
+        Self::load_with(path, now, true)
+    }
+
+    fn load_with(path: &Path, now: SystemTime, validate_all: bool) -> Result<Self, CrlLoadError> {
         let file = File::open(path).map_err(|_| CrlLoadError::Unreadable)?;
         let mut crls = Vec::new();
         let mut next_update = None;
+        let mut stale = false;
         for der in CertificateRevocationListDer::pem_reader_iter(file) {
             let der = der.map_err(|_| CrlLoadError::Invalid)?;
-            let parsed = parse_crl(der.as_ref(), now)?;
+            let parsed = if validate_all {
+                parse_crl_inner(der.as_ref(), now, usize::MAX, false)?
+                    .ok_or(CrlLoadError::Invalid)?
+            } else {
+                parse_crl(der.as_ref(), now)?
+            };
+            stale |= parsed.this_update > now || parsed.next_update <= now;
             next_update = Some(
                 next_update.map_or(parsed.next_update, |deadline: SystemTime| {
                     deadline.min(parsed.next_update)
@@ -150,10 +187,15 @@ impl CrlSet {
             );
             crls.push(parsed.crl);
         }
-        Ok(Self {
-            crls,
-            next_update: next_update.ok_or(CrlLoadError::Invalid)?,
-        })
+        let next_update = next_update.ok_or(CrlLoadError::Invalid)?;
+        if stale {
+            return Err(CrlLoadError::Stale);
+        }
+        Ok(Self { crls, next_update })
+    }
+
+    pub(crate) fn lists(&self) -> &[webpki::CertRevocationList<'static>] {
+        &self.crls
     }
 
     pub(crate) fn next_update(&self) -> SystemTime {

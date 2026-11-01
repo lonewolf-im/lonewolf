@@ -389,3 +389,61 @@ fn cost_limit_precedes_webpki_owned_parsing_and_accepts_exact_cost() -> TestResu
     ));
     Ok(())
 }
+
+#[test]
+fn startup_validates_all_material_before_reporting_staleness() -> TestResult {
+    let root = issuer("Root")?;
+    let now = now();
+    let stale = crl(
+        &root,
+        now - Duration::from_secs(120),
+        now - Duration::from_secs(60),
+        false,
+    )?;
+    let fresh = crl(
+        &root,
+        now - Duration::from_secs(60),
+        now + Duration::from_secs(600),
+        false,
+    )?;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("startup.pem");
+    fs::write(&path, pem("X509 CRL", stale.der())?)?;
+    assert!(matches!(
+        CrlSet::load_for_startup(&path, now),
+        Err(CrlLoadError::Stale)
+    ));
+    let invalid = pem("X509 CRL", b"invalid DER")?;
+    for material in [
+        format!("{}{invalid}", pem("X509 CRL", stale.der())?),
+        format!("{invalid}{}", pem("X509 CRL", stale.der())?),
+    ] {
+        fs::write(&path, material)?;
+        assert!(matches!(
+            CrlSet::load_for_startup(&path, now),
+            Err(CrlLoadError::Invalid)
+        ));
+    }
+    let mut unsupported: CertificateList = CertificateList::from_der(stale.der())?;
+    unsupported.tbs_cert_list.version = x509_cert::Version::V1;
+    fs::write(&path, pem("X509 CRL", &unsupported.to_der()?)?)?;
+    assert!(matches!(
+        CrlSet::load_for_startup(&path, now),
+        Err(CrlLoadError::Invalid)
+    ));
+    assert!(matches!(CrlSet::load(&path, now), Err(CrlLoadError::Stale)));
+    fs::write(
+        &path,
+        format!("{}{}", pem("X509 CRL", stale.der())?, invalid),
+    )?;
+    assert!(matches!(CrlSet::load(&path, now), Err(CrlLoadError::Stale)));
+    fs::write(&path, pem("X509 CRL", fresh.der())?)?;
+    let set = CrlSet::load_for_startup(&path, now).map_err(|error| format!("{error:?}"))?;
+    assert_eq!(set.lists().len(), 1);
+    assert_eq!(set.next_update(), now + Duration::from_secs(600));
+    assert_eq!(
+        CrlLoadError::ALL.map(CrlLoadError::as_str),
+        ["unreadable", "invalid", "stale"]
+    );
+    Ok(())
+}

@@ -311,12 +311,23 @@
 # trust_anchors_path = "./certs/federation-roots.pem"
 
 # Check peer certificates against the revocation lists their CAs publish. Lonewolf
-# downloads each list over plain HTTP from the address in the certificate, caches it
-# and refreshes it. A peer is rejected only when a list shows its certificate as
-# revoked; missing or unreachable lists do not block federation. With the bundled
-# public roots, lists on private or loopback addresses are not downloaded. Turn this
-# off if the server must not make outbound HTTP requests.
+# downloads each list over plain HTTP from the address in the certificate, using
+# port 80 unless that URL specifies another port. It caches and refreshes each list.
+# A peer is rejected only when a list shows its certificate as revoked; missing or
+# unreachable lists do not block federation. With the bundled public roots, lists
+# on private or loopback addresses are not downloaded. Turn this off if the server
+# must not make outbound HTTP requests.
 # fetch_crls = true
+
+# Check peer certificates in a private federation against revocation lists in one
+# PEM file instead of downloading them. It works only with trust_anchors_path, and
+# fetch_crls has no effect while it is set. The file needs a current CRL from every
+# CA that issues peer or intermediate certificates. Startup fails if the file is
+# missing or invalid. While the file is unusable or past the earliest nextUpdate of
+# its CRLs, federation rejects all peers and closes open links. Replace the file
+# atomically, at least an hour before that time.
+# This optional path has no default; the value below is an example.
+# crls_path = "./certs/federation-crls.pem"
 
 # [s2s.dns]
 

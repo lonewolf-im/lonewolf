@@ -15,8 +15,9 @@ use tokio::io::AsyncBufRead;
 
 use super::*;
 use crate::s2s::metrics::{Direction, StreamClose};
+use crate::s2s::revocation::CheckPhase;
 use crate::s2s::stream::S2sError;
-use crate::s2s::validity::LinkValidity;
+use crate::s2s::validity::{LinkValidity, MonitorLog, ValidityMonitor, supervise};
 
 const CLOSE_BUDGET: Duration = Duration::from_secs(6);
 const FOOTER_GRACE: Duration = Duration::from_secs(5);
@@ -71,7 +72,9 @@ fn discard<A: ChunkAllocator>(
     if state.stopped {
         return Err(StreamClose::Shutdown);
     }
-    validity.check(SystemTime::now())?;
+    if let Err(reason) = validity.check(SystemTime::now()) {
+        return Err(validity.record_invalidation(reason));
+    }
     drop(queued.reservation.take());
     inner.metrics.dropped(DropReason::InternalError, 1);
     Ok(WriteOutcome::Discarded)
@@ -324,6 +327,61 @@ async fn serve<
     }
 }
 
+struct LiveValidity<'a> {
+    validity: &'a LinkValidity,
+    monitor: Option<ValidityMonitor>,
+    log: MonitorLog<'a>,
+}
+
+async fn connected<A, R, W>(
+    inner: &Inner<A>,
+    reader: &mut S2sReader<A, R>,
+    writer: &mut S2sWriter<W>,
+    live: LiveValidity<'_>,
+    receiver: &Receiver<Queued<A>>,
+    current: &mut Option<Queued<A>>,
+) -> StreamClose
+where
+    A: ChunkAllocator + Clone,
+    R: AsyncBufRead + Unpin + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let LiveValidity {
+        validity,
+        monitor,
+        log,
+    } = live;
+    let work = async {
+        let closed = serve(inner, reader, writer, validity, receiver, current).await;
+        if closed.abort {
+            closed.reason
+        } else {
+            match graceful(
+                reader,
+                writer,
+                closed.reason,
+                inner.stopped.clone(),
+                validity,
+                Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
+            )
+            .await
+            {
+                Ok(()) => closed.reason,
+                Err(reason) => reason,
+            }
+        }
+    };
+    let reason = supervise(
+        monitor,
+        log,
+        Duration::from_secs(inner.limits.negotiation_timeout_secs.get()),
+        work,
+    )
+    .await;
+    inner.metrics.stream_closed(Direction::Outbound, reason);
+    reason
+}
+
 pub(super) async fn run<A: ChunkAllocator + Clone>(
     inner: Arc<Inner<A>>,
     router: RouterHandle<A>,
@@ -387,36 +445,50 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
             }
             Some(Ok(stream)) => stream,
         };
-        let validity = LinkValidity::fixed(stream.valid_until);
+        let (validity, monitor) = match stream.revocation.take() {
+            Some(verdict) if verdict.needs_rechecks() => {
+                let revocation = Arc::clone(&inner.revocation);
+                let chain = Arc::clone(&stream.chain);
+                let revalidate = Box::new(move || {
+                    let revocation = Arc::clone(&revocation);
+                    let chain = Arc::clone(&chain);
+                    async move {
+                        revocation
+                            .check(chain, Direction::Outbound, CheckPhase::Recheck)
+                            .await
+                    }
+                    .boxed_local()
+                });
+                let (validity, monitor) = LinkValidity::monitored(
+                    stream.valid_until,
+                    verdict,
+                    inner.revocation.recheck_interval(),
+                    revalidate,
+                );
+                (validity, Some(monitor))
+            }
+            _ => (LinkValidity::fixed(stream.valid_until), None),
+        };
         ready(&counters, &mut failures);
         let gauge = inner.metrics.stream_opened(Direction::Outbound);
-        let closed = serve(
+        connected(
             &inner,
             &mut stream.reader,
             &mut stream.writer,
-            &validity,
+            LiveValidity {
+                validity: &validity,
+                monitor,
+                log: MonitorLog {
+                    direction: Direction::Outbound,
+                    connection_id: stream.connection_id,
+                    local: &pair.0,
+                    remote: &pair.1,
+                },
+            },
             &receiver,
             &mut current,
         )
         .await;
-        let reason = if closed.abort {
-            closed.reason
-        } else {
-            match graceful(
-                &mut stream.reader,
-                &mut stream.writer,
-                closed.reason,
-                inner.stopped.clone(),
-                &validity,
-                Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
-            )
-            .await
-            {
-                Ok(()) => closed.reason,
-                Err(reason) => reason,
-            }
-        };
-        inner.metrics.stream_closed(Direction::Outbound, reason);
         drop(stream);
         drop(gauge);
         counters.ready.store(false, Ordering::Relaxed);
@@ -1186,6 +1258,259 @@ mod tests {
                     assert_eq!(calls.lock().output.as_slice(), b"</stream:stream>");
                 }
                 manager.stop();
+                manager
+                    .join(Instant::now() + Duration::from_secs(5))
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn monitored_revocation_resets_the_link_and_keeps_unstarted_output_queued()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::s2s::revocation::{RevocationSource, RevocationStatus, RevocationVerdict};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        const HEADER: &[u8] = b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server'>";
+        struct PeerInput {
+            position: usize,
+            ready: Rc<Cell<bool>>,
+        }
+        impl tokio::io::AsyncRead for PeerInput {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                output: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let bytes = if self.position < HEADER.len() {
+                    &HEADER[self.position..]
+                } else if !self.ready.get() {
+                    return Poll::Pending;
+                } else {
+                    &b"</stream:stream>"[self.position - HEADER.len()..]
+                };
+                let count = bytes.len().min(output.remaining());
+                output.put_slice(&bytes[..count]);
+                self.position += count;
+                Poll::Ready(Ok(()))
+            }
+        }
+        run(async {
+            let manager = manager(S2sLimits::default())?;
+            let task = manager
+                .admit("localhost", "remote.test", message().await?)
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or("launch")?;
+            drop(task.receiver.recv().await?);
+            let peer_ready = Rc::new(Cell::new(false));
+            let mut reader = S2sReader::new(
+                tokio::io::BufReader::new(PeerInput {
+                    position: 0,
+                    ready: Rc::clone(&peer_ready),
+                }),
+                &S2sReaderLimits {
+                    max_stanza_bytes: manager.inner.limits.max_stanza_bytes,
+                    stanzas: manager.inner.limits.incoming_stanzas_per_connection.clone(),
+                    xml: manager.inner.limits.incoming_xml_per_connection.clone(),
+                },
+                GlobalChunkAllocator,
+                None,
+            );
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::StreamStart { .. }))
+            ));
+            let calls = Arc::new(PlMutex::new(Calls {
+                accepts: true,
+                ..Default::default()
+            }));
+            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            let initial = RevocationVerdict {
+                source: RevocationSource::Fetched,
+                status: RevocationStatus::Good,
+                next_update: None,
+                refresh_at: None,
+                pending: vec![async {}.boxed().shared()],
+                leases: Vec::new(),
+                recheckable: true,
+            };
+            let revalidate = Box::new(move || {
+                peer_ready.set(true);
+                async {
+                    Some(RevocationVerdict {
+                        source: RevocationSource::Fetched,
+                        status: RevocationStatus::Revoked,
+                        next_update: None,
+                        refresh_at: None,
+                        pending: Vec::new(),
+                        leases: Vec::new(),
+                        recheckable: true,
+                    })
+                }
+                .boxed_local()
+            });
+            let (validity, monitor) = LinkValidity::monitored(
+                SystemTime::now() + Duration::from_secs(60),
+                initial,
+                Duration::from_secs(60),
+                revalidate,
+            );
+            let mut current = None;
+            let mut serving = Box::pin(connected(
+                &manager.inner,
+                &mut reader,
+                &mut writer,
+                LiveValidity {
+                    validity: &validity,
+                    monitor: Some(monitor),
+                    log: MonitorLog {
+                        direction: Direction::Outbound,
+                        connection_id: 1,
+                        local: "localhost",
+                        remote: "remote.test",
+                    },
+                },
+                &task.receiver,
+                &mut current,
+            ));
+            assert!(poll!(serving.as_mut()).is_pending());
+            assert!(matches!(
+                validity.reason(),
+                Some(StreamClose::CertificateRevoked)
+            ));
+            assert!(
+                manager
+                    .admit("localhost", "remote.test", message().await?)
+                    .map_err(|error| format!("{error:?}"))?
+                    .is_none()
+            );
+            assert!(matches!(serving.await, StreamClose::CertificateRevoked));
+            assert!(current.is_none());
+            assert_eq!(task.receiver.len(), 1);
+            assert_eq!(task.counters.count.load(Ordering::Relaxed), 1);
+            let xml = std::str::from_utf8(&calls.lock().output)?.to_owned();
+            assert!(xml.contains("reset"));
+            assert_eq!(xml.matches("</stream:stream>").count(), 1);
+            assert!(!xml.contains("<message"));
+            let mut registry = prometheus_client::registry::Registry::default();
+            manager
+                .inner
+                .metrics
+                .register(registry.sub_registry_with_prefix("lonewolf"));
+            let mut metrics = String::new();
+            prometheus_client::encoding::text::encode(&mut metrics, &registry)?;
+            assert!(metrics.lines().any(|line| line == "lonewolf_s2s_streams_closed_total{direction=\"outbound\",outcome=\"certificate_revoked\"} 1"));
+            assert!(!metrics.contains("s2s_dropped_stanzas_total{reason=\"connection_lost\"}"));
+            manager.stop();
+            shutdown_queue(&manager.inner, &task.receiver, &task.pair, &mut current);
+            drop(task);
+            manager
+                .join(Instant::now() + Duration::from_secs(5))
+                .await?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preparation_expiry_records_the_first_reason_before_supervisor_completion_or_cancellation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::s2s::revocation::{
+            CrlLease, RevocationSource, RevocationStatus, RevocationVerdict,
+        };
+        run(async {
+            for complete in [false, true] {
+                let allocator = ControlledAllocator::default();
+                let manager = super::super::manager_tests::manager_with_allocator(
+                    S2sLimits::default(),
+                    allocator.clone(),
+                )?;
+                let task = manager
+                    .admit(
+                        "localhost",
+                        "remote.test",
+                        controlled_stanza("retained-head", allocator.clone()).await?,
+                    )
+                    .map_err(|error| format!("{error:?}"))?
+                    .ok_or("launch")?;
+                let mut head = task.receiver.recv().await?;
+                let token = Arc::new(());
+                let initial = RevocationVerdict {
+                    source: RevocationSource::File,
+                    status: RevocationStatus::Good,
+                    next_update: Some(SystemTime::now() - Duration::from_secs(1)),
+                    refresh_at: None,
+                    pending: Vec::new(),
+                    leases: vec![CrlLease(Arc::clone(&token))],
+                    recheckable: true,
+                };
+                let (validity, monitor) = LinkValidity::monitored(
+                    SystemTime::now() + Duration::from_secs(60),
+                    initial,
+                    Duration::from_secs(60),
+                    Box::new(|| {
+                        async { panic!("expired links must not revalidate") }.boxed_local()
+                    }),
+                );
+                let signal = validity.invalidated();
+                let calls = Arc::new(PlMutex::new(Calls::default()));
+                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                let mut buffered = false;
+                allocator.exhausted.store(true, Ordering::Relaxed);
+                let work = async {
+                    let outcome = write(
+                        &mut writer,
+                        &mut head,
+                        &manager.inner,
+                        &validity,
+                        false,
+                        &mut buffered,
+                    )
+                    .await;
+                    assert!(matches!(outcome, Err(StreamClose::RevocationStale)));
+                    assert!(matches!(
+                        validity.reason(),
+                        Some(StreamClose::RevocationStale)
+                    ));
+                    if complete {
+                        StreamClose::RevocationStale
+                    } else {
+                        std::future::pending().await
+                    }
+                };
+                let mut supervised = Box::pin(supervise(
+                    Some(monitor),
+                    MonitorLog {
+                        direction: Direction::Outbound,
+                        connection_id: 1,
+                        local: "localhost",
+                        remote: "remote.test",
+                    },
+                    Duration::from_secs(5),
+                    work,
+                ));
+                if complete {
+                    assert!(matches!(supervised.await, StreamClose::RevocationStale));
+                } else {
+                    assert!(poll!(supervised.as_mut()).is_pending());
+                    assert_eq!(Arc::strong_count(&token), 2);
+                    drop(supervised);
+                }
+                assert!(matches!(signal.await, StreamClose::RevocationStale));
+                assert!(matches!(
+                    validity.check(SystemTime::UNIX_EPOCH),
+                    Err(StreamClose::RevocationStale)
+                ));
+                assert_eq!(Arc::strong_count(&token), 1);
+                assert!(head.reservation.is_some());
+                assert_eq!(task.counters.count.load(Ordering::Relaxed), 1);
+                assert_eq!(calls.lock().writes, 0);
+                let metrics = render(&manager.inner.metrics)?;
+                assert!(!metrics.contains("s2s_dropped_stanzas_total{reason=\"connection_lost\"}"));
+                assert!(!metrics.contains("s2s_dropped_stanzas_total{reason=\"internal_error\"}"));
+                manager.stop();
+                shutdown_queue(&manager.inner, &task.receiver, &task.pair, &mut Some(head));
+                drop(task);
                 manager
                     .join(Instant::now() + Duration::from_secs(5))
                     .await?;

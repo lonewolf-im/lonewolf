@@ -661,3 +661,79 @@ fn reader_failures_preserve_each_wire_condition_and_use_bounded_metrics() {
         WireClose::Footer { peer_closed: false }
     ));
 }
+
+#[test]
+fn monitored_revocation_resets_the_stream_and_records_the_close() -> TestResult {
+    use crate::s2s::revocation::{RevocationSource, RevocationStatus, RevocationVerdict};
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new()?;
+        let peer = peer();
+        let (_stop, shutdown) = signal();
+        let mut reader = fixture
+            .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
+            .await?;
+        let output = Output::default();
+        let mut writer = S2sWriter::new(output.clone());
+        let initial = RevocationVerdict {
+            source: RevocationSource::Fetched,
+            status: RevocationStatus::Good,
+            next_update: None,
+            refresh_at: None,
+            pending: vec![async {}.boxed().shared()],
+            leases: Vec::new(),
+            recheckable: true,
+        };
+        let revalidate = Box::new(move || {
+            async {
+                Some(RevocationVerdict {
+                    source: RevocationSource::Fetched,
+                    status: RevocationStatus::Revoked,
+                    next_update: None,
+                    refresh_at: None,
+                    pending: Vec::new(),
+                    leases: Vec::new(),
+                    recheckable: true,
+                })
+            }
+            .boxed_local()
+        });
+        let (validity, monitor) = LinkValidity::monitored(
+            SystemTime::now() + Duration::from_secs(60),
+            initial,
+            Duration::from_secs(60),
+            revalidate,
+        );
+        let outcome = supervise(
+            Some(monitor),
+            MonitorLog {
+                direction: Direction::Inbound,
+                connection_id: peer.connection_id,
+                local: &peer.local,
+                remote: &peer.remote,
+            },
+            fixture.settings.timeout,
+            run(
+                &mut reader,
+                &mut writer,
+                fixture.parameters(&peer, shutdown, &validity),
+                || {},
+                async |_: &IngressContext<GlobalChunkAllocator>,
+                       _: &InboundPeer,
+                       _: RoutedStanza<GlobalChunkAllocator>| {
+                    std::future::pending::<Result<(), IngressFailure>>().await
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(outcome, StreamClose::CertificateRevoked));
+        let xml = String::from_utf8(output.0.borrow().clone())?;
+        assert!(xml.contains("reset"));
+        assert_eq!(xml.matches("</stream:stream>").count(), 1);
+        let mut registry = Registry::default();
+        fixture.settings.metrics.register(registry.sub_registry_with_prefix("lonewolf"));
+        let mut metrics = String::new();
+        prometheus_client::encoding::text::encode(&mut metrics, &registry)?;
+        assert!(metrics.lines().any(|line| line == "lonewolf_s2s_streams_closed_total{direction=\"inbound\",outcome=\"certificate_revoked\"} 1"));
+        Ok(())
+    })
+}

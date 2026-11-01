@@ -173,7 +173,14 @@ pub(crate) enum StreamClose {
 
 impl StreamClose {
     pub(crate) fn certificate_invalid(self) -> bool {
-        matches!(self, Self::CertificateExpired)
+        matches!(
+            self,
+            Self::CertificateExpired
+                | Self::CertificateRevoked
+                | Self::RevocationUnknown
+                | Self::RevocationStale
+                | Self::RevocationUnavailable
+        )
     }
 
     const ALL: [Self; 20] = [

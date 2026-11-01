@@ -17,6 +17,7 @@ use futures_util::io::{ReadHalf, WriteHalf};
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::RoutedStanza;
 use parking_lot::Mutex as PlMutex;
+use rustls::pki_types::CertificateDer;
 use tokio::io::BufReader;
 use tokio_util::compat::Compat;
 
@@ -25,7 +26,7 @@ use super::dns::Resolver;
 use super::metrics::{
     AdmissionReason, ConnectionGauge, DropReason, LinkSnapshot, LinkStats, S2sMetrics,
 };
-use super::revocation::{PeerRevocation, PeerVerification};
+use super::revocation::{PeerRevocation, PeerVerification, RevocationVerdict};
 use super::stream::traffic::CountingIo;
 use super::stream::{S2sReader, S2sWriter};
 use crate::config::limits::S2sLimits;
@@ -45,6 +46,8 @@ pub(crate) struct OutboundStream<A: ChunkAllocator> {
     pub(crate) reader: S2sReader<A, ClientTlsInput>,
     pub(crate) writer: S2sWriter<ClientTlsOutput>,
     pub(crate) valid_until: SystemTime,
+    pub(crate) chain: Arc<[CertificateDer<'static>]>,
+    pub(crate) revocation: Option<RevocationVerdict>,
     pub(crate) connection_id: u64,
     _connection_gauge: ConnectionGauge,
 }

@@ -10,7 +10,7 @@ pub(super) async fn wait(until: SystemTime) {
     wait_with(until, SystemTime::now, compio::time::sleep).await;
 }
 
-async fn wait_with<N, S, F>(until: SystemTime, mut now: N, mut sleep: S)
+pub(super) async fn wait_with<N, S, F>(until: SystemTime, mut now: N, mut sleep: S)
 where
     N: FnMut() -> SystemTime,
     S: FnMut(Duration) -> F,

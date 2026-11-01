@@ -23,7 +23,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 use super::{Settings, ShutdownSignal};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, Direction, S2sMetrics};
-use crate::s2s::revocation::{CheckPhase, RevocationStatus};
+use crate::s2s::revocation::{CheckPhase, RevocationStatus, RevocationVerdict};
 use crate::s2s::stream::traffic::CountingIo;
 use crate::s2s::stream::{self, Auth, S2sError, S2sReader, S2sWriter, SaslFailure};
 
@@ -41,9 +41,19 @@ pub(crate) struct Authenticated<A: ChunkAllocator> {
     pub(crate) local: Box<str>,
     pub(crate) remote: Box<str>,
     pub(crate) valid_until: SystemTime,
+    pub(crate) chain: Arc<[CertificateDer<'static>]>,
+    pub(crate) revocation: Option<RevocationVerdict>,
     pub(crate) reader: S2sReader<A, TlsInput>,
     pub(crate) writer: S2sWriter<TlsOutput>,
     pub(crate) connection_id: u64,
+}
+
+struct VerifiedPeer {
+    local: Box<str>,
+    remote: Box<str>,
+    valid_until: SystemTime,
+    chain: Arc<[CertificateDer<'static>]>,
+    revocation: Option<RevocationVerdict>,
 }
 
 enum Connection<A: ChunkAllocator> {
@@ -185,7 +195,13 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     };
     accounting.elapsed = Some(accounting.started.elapsed());
     match result {
-        Ok((local, remote, valid_until)) => {
+        Ok(VerifiedPeer {
+            local,
+            remote,
+            valid_until,
+            chain,
+            revocation,
+        }) => {
             accounting.outcome = AuthOutcome::Success;
             let Some(Connection::Tls(reader, writer)) = connection.take() else {
                 return Err(S2sError::Internal);
@@ -194,6 +210,8 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                 local,
                 remote,
                 valid_until,
+                chain,
+                revocation,
                 reader,
                 writer,
                 connection_id,
@@ -287,7 +305,7 @@ async fn run<A: ChunkAllocator + Clone>(
     peer_footer: &mut bool,
     footer_sent: &mut bool,
     response_from: &mut Box<str>,
-) -> Result<(Box<str>, Box<str>, SystemTime), Failure> {
+) -> Result<VerifiedPeer, Failure> {
     let plain = connection.as_mut().ok_or(S2sError::Internal)?;
     let initial = header(expected(plain, peer_footer).await?)?;
     if !settings.services.router.federates_domain(&initial.to) {
@@ -407,15 +425,15 @@ async fn run<A: ChunkAllocator + Clone>(
         )
     })?;
     let valid_until = verify_peer(settings, &chain[0], validity, &remote)?;
-    if let Some(verdict) = settings
+    let revocation = settings
         .revocation
         .check(
             Arc::clone(&chain),
             Direction::Inbound,
             CheckPhase::Handshake,
         )
-        .await
-    {
+        .await;
+    if let Some(verdict) = &revocation {
         if let Some(outcome) = verdict.auth_outcome() {
             tracing::warn!(outcome = outcome.as_str(), direction = "inbound", local_domain = %log_domain(&initial.to), remote_domain = %log_domain(&remote), "s2s certificate rejected");
             return Err(reject(StreamErrorCondition::NotAuthorized, outcome));
@@ -505,7 +523,13 @@ async fn run<A: ChunkAllocator + Clone>(
         .await?;
     *header_sent = true;
     tls.send(stream::EMPTY_FEATURES).await?;
-    Ok((initial.to, remote, valid_until))
+    Ok(VerifiedPeer {
+        local: initial.to,
+        remote,
+        valid_until,
+        chain,
+        revocation,
+    })
 }
 
 fn verify_peer<A: ChunkAllocator>(

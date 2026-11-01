@@ -14,6 +14,7 @@ pub(crate) mod metrics;
 pub(crate) mod outbound;
 pub(crate) mod revocation;
 pub(crate) mod stream;
+mod validity;
 
 fn log_domain(domain: &str) -> Cow<'_, str> {
     if domain

@@ -6,6 +6,7 @@ use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
@@ -86,11 +87,11 @@ impl Fixture {
         &'a self,
         peer: &'a InboundPeer,
         shutdown: ShutdownSignal,
-        valid_until: SystemTime,
+        validity: &'a LinkValidity,
     ) -> Parameters<'a, GlobalChunkAllocator> {
         Parameters {
             peer,
-            valid_until,
+            validity,
             settings: &self.settings,
             shutdown,
         }
@@ -187,8 +188,8 @@ fn dispatch_is_sequential_and_rescoped_before_the_second_stanza_is_read() -> Tes
             Ok(())
         };
         let expiry = rcgen::CertificateParams::default().not_after;
-        let valid_until = SystemTime::UNIX_EPOCH + Duration::from_secs(expiry.unix_timestamp().try_into()?);
-        let future = run(&mut reader, &mut writer, fixture.parameters(&peer, shutdown, valid_until), || {}, dispatch);
+        let validity = LinkValidity::fixed(SystemTime::UNIX_EPOCH + Duration::from_secs(expiry.unix_timestamp().try_into()?));
+        let future = run(&mut reader, &mut writer, fixture.parameters(&peer, shutdown, &validity), || {}, dispatch);
         let mut future = Box::pin(future);
         assert!(poll!(future.as_mut()).is_pending());
         entered.recv_timeout(timeout)?;
@@ -201,6 +202,7 @@ fn dispatch_is_sequential_and_rescoped_before_the_second_stanza_is_read() -> Tes
         assert!(matches!(future.await, StreamClose::StreamEnd));
         assert_eq!(*ids.borrow(), ["one", "two"]);
         assert_eq!(completed.get(), 2);
+        drop(validity);
         assert!(runtime.current_timeout().is_none());
         Ok(())
     })
@@ -223,10 +225,11 @@ fn shutdown_closes_wire_then_drains_admitted_children_with_permit_and_gauges_hel
         let mut done = Some(done);
         let aborted = Rc::new(std::cell::Cell::new(false));
         let abort = Rc::clone(&aborted);
+        let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
         let future = run(
             &mut reader,
             &mut writer,
-            fixture.parameters(&peer, shutdown, SystemTime::now() + Duration::from_secs(60)),
+            fixture.parameters(&peer, shutdown, &validity),
             move || abort.set(true),
             async move |context: &IngressContext<GlobalChunkAllocator>,
                         _: &InboundPeer,
@@ -300,16 +303,18 @@ fn expiry_interrupts_dispatch_and_idle_waits_for_its_completion() -> TestResult 
             let mut writer = S2sWriter::new(output.clone());
             let (release, held) = oneshot::channel::<()>();
             let mut held = Some(held);
-            let validity = SystemTime::now()
-                + if expiry {
-                    fixture.settings.idle_timeout
-                } else {
-                    Duration::from_secs(60)
-                };
+            let validity = LinkValidity::fixed(
+                SystemTime::now()
+                    + if expiry {
+                        fixture.settings.idle_timeout
+                    } else {
+                        Duration::from_secs(60)
+                    },
+            );
             let future = run(
                 &mut reader,
                 &mut writer,
-                fixture.parameters(&peer, shutdown, validity),
+                fixture.parameters(&peer, shutdown, &validity),
                 || {},
                 async move |_: &IngressContext<GlobalChunkAllocator>,
                             _: &InboundPeer,
@@ -377,10 +382,11 @@ fn hard_listener_deadline_aborts_socket_before_adapters_and_keeps_child_guard_al
             socket: Rc::clone(&socket),
             dropped: Rc::clone(&adapters),
         };
+        let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
         let future = run(
             &mut reader,
             &mut writer,
-            fixture.parameters(&peer, shutdown, SystemTime::now() + Duration::from_secs(60)),
+            fixture.parameters(&peer, shutdown, &validity),
             || {},
             async move |context: &IngressContext<GlobalChunkAllocator>,
                         _: &InboundPeer,
@@ -454,10 +460,11 @@ fn ingress_failure_closes_with_one_internal_error_outcome() -> TestResult {
             .await?;
         let output = Output::default();
         let mut writer = S2sWriter::new(output.clone());
+        let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
         let outcome = run(
             &mut reader,
             &mut writer,
-            fixture.parameters(&peer, shutdown, SystemTime::now() + Duration::from_secs(60)),
+            fixture.parameters(&peer, shutdown, &validity),
             || {},
             async |_: &IngressContext<GlobalChunkAllocator>,
                    _: &InboundPeer,
@@ -566,11 +573,13 @@ fn shutdown_shortens_pending_close_without_restarting_output_or_releasing_buffer
             });
             let aborted = Rc::new(std::cell::Cell::new(false));
             let abort = Rc::clone(&aborted);
-            let validity = SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 });
+            let validity = LinkValidity::fixed(
+                SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 }),
+            );
             let mut serving = Box::pin(run(
                 &mut reader,
                 &mut writer,
-                fixture.parameters(&peer, shutdown, validity),
+                fixture.parameters(&peer, shutdown, &validity),
                 move || abort.set(true),
                 ingress::dispatch,
             ));

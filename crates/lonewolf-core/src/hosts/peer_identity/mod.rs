@@ -16,6 +16,7 @@ use x509_cert::der::{Decode, asn1::ObjectIdentifier};
 use x509_cert::ext::pkix::ExtendedKeyUsage;
 
 use super::client_identity::{certificate_expiration, validate_key_usage_iter, webpki_error};
+use super::revocation::{RevocationRules, verify_with_crls};
 use super::service_identity::{XmppService, verify_service_identity};
 use super::tls_identity;
 use crate::config::S2sTlsConfig;
@@ -93,6 +94,51 @@ impl PeerTrust {
         chain: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<PeerValidity, rustls::Error> {
+        self.with_verified_path(chain, now, |_, _, validity| validity)
+    }
+
+    /// Verifies the first certificate as the leaf and returns the selected non-anchor path.
+    pub(crate) fn path_certificates(
+        &self,
+        chain: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<Vec<CertificateDer<'static>>, rustls::Error> {
+        self.with_verified_path(chain, now, |leaf, path, _| {
+            std::iter::once(leaf.clone().into_owned())
+                .chain(
+                    path.intermediate_certificates()
+                        .map(|certificate| certificate.der().into_owned()),
+                )
+                .collect()
+        })
+    }
+
+    pub(crate) fn check_crls(
+        &self,
+        chain: &[CertificateDer<'_>],
+        now: UnixTime,
+        rules: RevocationRules<'_>,
+    ) -> Result<(), webpki::Error> {
+        let (leaf, intermediates) = chain.split_first().ok_or(webpki::Error::BadDer)?;
+        let end_entity = webpki::EndEntityCert::try_from(leaf)?;
+        verify_with_crls(
+            &end_entity,
+            &self.roots.roots,
+            intermediates,
+            now,
+            self.provider.signature_verification_algorithms.all,
+            webpki::KeyUsage::server_auth(),
+            rules,
+        )
+        .map(|_| ())
+    }
+
+    fn with_verified_path<T>(
+        &self,
+        chain: &[CertificateDer<'_>],
+        now: UnixTime,
+        apply: impl FnOnce(&CertificateDer<'_>, &webpki::VerifiedPath<'_>, PeerValidity) -> T,
+    ) -> Result<T, rustls::Error> {
         let (leaf, intermediates) = chain
             .split_first()
             .ok_or(rustls::Error::NoCertificatesPresented)?;
@@ -145,7 +191,7 @@ impl PeerTrust {
                 ))?;
             valid_until = valid_until.min(expirations[index]);
         }
-        Ok(PeerValidity { valid_until })
+        Ok(apply(leaf, &path, PeerValidity { valid_until }))
     }
 
     fn verify_parts(

@@ -54,14 +54,12 @@ pub(crate) struct CacheLimits {
 }
 
 impl CacheLimits {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const DEFAULT: Self = Self {
         max_entries: 256,
         max_bytes: 64 * 1024 * 1024,
     };
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) struct CachedCrl {
     pub(crate) crl: webpki::CertRevocationList<'static>,
     pub(crate) this_update: SystemTime,
@@ -71,7 +69,6 @@ pub(crate) struct CachedCrl {
     pub(crate) refresh_at: SystemTime,
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) struct Lookup {
     pub(crate) crl: Option<Arc<CachedCrl>>,
     pub(crate) unknown: Option<UnknownReason>,
@@ -282,7 +279,6 @@ pub(crate) struct CrlCache {
 }
 
 impl CrlCache {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn new(
         fetch: FetchFn,
         metrics: Arc<S2sMetrics>,
@@ -300,7 +296,6 @@ impl CrlCache {
     }
 
     /// Must run on a Compio runtime; starts at most one detached download per URL.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn lookup(
         self: &Arc<Self>,
         url: &CrlUrl,

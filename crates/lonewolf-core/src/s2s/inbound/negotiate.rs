@@ -23,6 +23,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 use super::{Settings, ShutdownSignal};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, Direction, S2sMetrics};
+use crate::s2s::revocation::{CheckPhase, RevocationStatus};
 use crate::s2s::stream::traffic::CountingIo;
 use crate::s2s::stream::{self, Auth, S2sError, S2sReader, S2sWriter, SaslFailure};
 
@@ -355,9 +356,12 @@ async fn run<A: ChunkAllocator + Clone>(
             outcome: AuthOutcome::TlsFailure,
         })?;
     let certificate = tls.get_ref().1.peer_certificates().and_then(|chain| {
-        chain.first().map(|leaf| {
+        chain.first().map(|_| {
             (
-                leaf.clone().into_owned(),
+                chain
+                    .iter()
+                    .map(|certificate| certificate.clone().into_owned())
+                    .collect::<Arc<[_]>>(),
                 settings
                     .trust
                     .verify_chain(chain, UnixTime::now())
@@ -396,13 +400,30 @@ async fn run<A: ChunkAllocator + Clone>(
             AuthOutcome::InvalidFrom,
         ));
     }
-    let (leaf, validity) = certificate.ok_or_else(|| {
+    let (chain, validity) = certificate.ok_or_else(|| {
         reject(
             StreamErrorCondition::NotAuthorized,
             AuthOutcome::NoCertificate,
         )
     })?;
-    let valid_until = verify_peer(settings, &leaf, validity, &remote)?;
+    let valid_until = verify_peer(settings, &chain[0], validity, &remote)?;
+    if let Some(verdict) = settings
+        .revocation
+        .check(
+            Arc::clone(&chain),
+            Direction::Inbound,
+            CheckPhase::Handshake,
+        )
+        .await
+    {
+        if let Some(outcome) = verdict.auth_outcome() {
+            tracing::warn!(outcome = outcome.as_str(), direction = "inbound", local_domain = %log_domain(&initial.to), remote_domain = %log_domain(&remote), "s2s certificate rejected");
+            return Err(reject(StreamErrorCondition::NotAuthorized, outcome));
+        }
+        if let RevocationStatus::Unknown(reason) = verdict.status {
+            tracing::debug!(reason = reason.as_str(), direction = "inbound", local_domain = %log_domain(&initial.to), remote_domain = %log_domain(&remote), "s2s revocation status unknown");
+        }
+    }
     tls.send(&stream::response_header_xml(&initial.to, Some(&remote))?)
         .await?;
     *header_sent = true;

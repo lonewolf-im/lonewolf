@@ -3,7 +3,6 @@
 use std::net::IpAddr;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) enum AddressPolicy {
     PublicOnly,
     Any,

@@ -6,6 +6,7 @@ mod lifecycle;
 mod messages;
 mod negotiation;
 mod presence;
+mod revocation_fetch;
 mod subscriptions;
 
 use std::sync::{Arc, atomic::Ordering};

@@ -22,6 +22,7 @@ use socket2::SockRef;
 
 use super::ingress::IngressServices;
 use super::metrics::{ConnectionRejection, Direction, S2sMetrics};
+use super::revocation::{PeerRevocation, PeerVerification};
 use super::stream::S2sReaderLimits;
 use super::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
 use crate::admission::attempt_limit::{Admission, AttemptLimiter};
@@ -45,6 +46,7 @@ type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;
 struct Settings<A: ChunkAllocator> {
     hosts: Hosts,
     trust: Arc<PeerTrust>,
+    revocation: Arc<PeerRevocation>,
     reader_limits: S2sReaderLimits,
     timeout: Duration,
     services: IngressServices<A>,
@@ -144,7 +146,7 @@ impl S2sListeners {
         config: &S2sConfig,
         limits: &S2sLimits,
         hosts: Hosts,
-        trust: Arc<PeerTrust>,
+        peers: PeerVerification,
         dispatcher: &DispatchHandle,
         services: IngressServices<A>,
         metrics: Arc<S2sMetrics>,
@@ -175,7 +177,8 @@ impl S2sListeners {
         });
         let settings = Settings {
             hosts,
-            trust,
+            trust: peers.trust,
+            revocation: peers.revocation,
             reader_limits: S2sReaderLimits {
                 max_stanza_bytes: limits.max_stanza_bytes,
                 stanzas: limits.incoming_stanzas_per_connection.clone(),
@@ -299,7 +302,7 @@ async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(128).await
 }
 
-// Shut down the socket before dropping transport futures.
+// Retained transport clones must not keep cancelled connections open.
 struct ConnectionTask<F, S = ConnectionSocket> {
     _socket: S,
     future: Pin<Box<F>>,

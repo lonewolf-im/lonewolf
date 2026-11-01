@@ -25,6 +25,7 @@ use super::dns::Resolver;
 use super::metrics::{
     AdmissionReason, ConnectionGauge, DropReason, LinkSnapshot, LinkStats, S2sMetrics,
 };
+use super::revocation::{PeerRevocation, PeerVerification};
 use super::stream::traffic::CountingIo;
 use super::stream::{S2sReader, S2sWriter};
 use crate::config::limits::S2sLimits;
@@ -87,6 +88,7 @@ impl<A: ChunkAllocator> Clone for RemoteRouter<A> {
 struct Inner<A: ChunkAllocator> {
     hosts: Hosts,
     trust: Arc<PeerTrust>,
+    revocation: Arc<PeerRevocation>,
     resolver: Arc<Resolver>,
     limits: S2sLimits,
     allocator: A,
@@ -280,7 +282,7 @@ impl<A: ChunkAllocator> State<A> {
 impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
     pub(crate) fn new(
         hosts: Hosts,
-        trust: Arc<PeerTrust>,
+        peers: PeerVerification,
         resolver: Arc<Resolver>,
         limits: &S2sLimits,
         allocator: A,
@@ -291,7 +293,8 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         let (stop, stopped) = oneshot::channel();
         let inner = Arc::new(Inner {
             hosts,
-            trust,
+            trust: peers.trust,
+            revocation: peers.revocation,
             resolver,
             limits: limits.clone(),
             allocator,

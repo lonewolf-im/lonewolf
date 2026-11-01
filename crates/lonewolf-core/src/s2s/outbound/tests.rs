@@ -74,6 +74,26 @@ fn establishment_errors_have_bounded_reasons_conditions_and_outcomes() {
             "certificate_expired",
             Some("certificate_expired"),
         ),
+        (
+            Tls("certificate_revoked"),
+            "certificate_revoked",
+            Some("certificate_revoked"),
+        ),
+        (
+            Tls("revocation_unknown"),
+            "revocation_unknown",
+            Some("revocation_unknown"),
+        ),
+        (
+            Tls("revocation_stale"),
+            "revocation_stale",
+            Some("revocation_stale"),
+        ),
+        (
+            Tls("revocation_unavailable"),
+            "revocation_unavailable",
+            Some("revocation_unavailable"),
+        ),
         (Tls("handshake"), "handshake", Some("tls_failure")),
         (Negotiation(NoTls), "no_tls", Some("no_tls")),
         (Negotiation(TlsRefused), "tls_refused", Some("tls_refused")),
@@ -665,6 +685,7 @@ fn pending_tcp_connect_is_destroyed_by_production_stop_without_trying_the_next_e
         let context = ConnectContext {
             hosts: &hosts,
             trust: &trust,
+            revocation: &PeerRevocation::disabled(),
             resolver: &resolver,
             limits: &config.limits.s2s,
             metrics: Arc::clone(&metrics),

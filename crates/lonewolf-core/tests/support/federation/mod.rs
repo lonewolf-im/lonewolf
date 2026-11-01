@@ -10,6 +10,7 @@ use parking_lot::Mutex as PlMutex;
 
 use super::server::C2sSuitePermit;
 use super::{C2sSuite, Client, TIMEOUT, TestResult};
+pub mod crl_server;
 pub mod dns;
 pub mod peer;
 pub mod pki;

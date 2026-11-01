@@ -9,7 +9,7 @@ use graviola::hashing::Sha256;
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, CertifiedIssuer, PublicKeyData};
-use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use time::{Duration, OffsetDateTime};
 
@@ -26,7 +26,11 @@ impl FederationCa {
         let mut parameters = CertificateParams::new(Vec::<String>::new())?;
         parameters.serial_number = Some(1u64.into());
         parameters.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        parameters.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        parameters.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        parameters.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(vec![1]);
         let issuer = CertifiedIssuer::self_signed(parameters, TestSigner::new()?)?;
         let trust_anchors = directory.join("trust-anchors.pem");
         fs::write(&trust_anchors, pem("CERTIFICATE", issuer.der()))?;
@@ -59,6 +63,58 @@ impl FederationCa {
             domains,
             OffsetDateTime::now_utc() + Duration::days(30),
         )
+    }
+
+    pub fn server_with_crl_urls(
+        &self,
+        directory: &Path,
+        name: &str,
+        domains: &[&str],
+        urls: &[String],
+    ) -> TestResult<Arc<CertifiedKey>> {
+        let mut parameters = parameters(domains)?;
+        if !urls.is_empty() {
+            parameters
+                .crl_distribution_points
+                .push(rcgen::CrlDistributionPoint { uris: urls.into() });
+        }
+        self.issue(directory, name, parameters)
+    }
+
+    pub fn crl(
+        &self,
+        revoked: &[(CertificateDer<'_>, Option<rcgen::RevocationReason>)],
+        this_update: OffsetDateTime,
+        next_update: OffsetDateTime,
+        number: u64,
+    ) -> TestResult<Vec<u8>> {
+        use x509_cert::der::Decode;
+        let revoked_certs = revoked
+            .iter()
+            .map(|(der, reason)| {
+                let parsed: x509_cert::Certificate =
+                    x509_cert::Certificate::from_der(der.as_ref())?;
+                Ok(rcgen::RevokedCertParams {
+                    serial_number: rcgen::SerialNumber::from_slice(
+                        parsed.tbs_certificate().serial_number().as_bytes(),
+                    ),
+                    revocation_time: this_update,
+                    reason_code: *reason,
+                    invalidity_date: None,
+                })
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        Ok(rcgen::CertificateRevocationListParams {
+            this_update,
+            next_update,
+            crl_number: number.into(),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: rcgen::KeyIdMethod::PreSpecified(vec![1]),
+        }
+        .signed_by(&self.issuer)?
+        .der()
+        .to_vec())
     }
 
     pub fn server_until(

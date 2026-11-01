@@ -292,6 +292,7 @@ fn raw_peer_workflow() -> TestResult {
     ] {
         let mut suite = C2sSuite::federated(super::support::federation::FederatedHost {
             domain: "local.test".into(),
+            revocation: Default::default(),
             enabled,
             federation,
             extensions: String::new(),
@@ -368,6 +369,7 @@ fn raw_version_workflow(
     let completion = Arc::new(PlMutex::new(ProcessCompletions::default()));
     let mut suite = C2sSuite::federated(FederatedHost {
         domain: "local.test".into(),
+        revocation: Default::default(),
         enabled: Some(true),
         federation: None,
         extensions: String::new(),

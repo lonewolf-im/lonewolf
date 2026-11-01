@@ -17,11 +17,19 @@ pub(super) struct SingleServer {
 
 impl SingleServer {
     pub fn start(extra: &str) -> TestResult<Self> {
+        Self::start_with_revocation(extra, Default::default())
+    }
+
+    pub fn start_with_revocation(
+        extra: &str,
+        revocation: super::super::support::federation::HostRevocation,
+    ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let ca = Arc::new(FederationCa::new(directory.path())?);
         let dns = FakeDns::start()?;
         let suite = C2sSuite::federated(FederatedHost {
             domain: "a.test".into(),
+            revocation,
             enabled: None,
             federation: None,
             extensions: String::new(),
@@ -158,6 +166,7 @@ fn disabled_federation_opens_no_listener() -> TestResult {
     let mut dns = FakeDns::start()?;
     let mut suite = C2sSuite::federated(FederatedHost {
         domain: "a.test".into(),
+        revocation: Default::default(),
         enabled: Some(false),
         federation: None,
         extensions: String::new(),

@@ -9,7 +9,7 @@ use graviola::hashing::Sha256;
 use graviola::key_agreement::p256::StaticPrivateKey;
 use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, CertifiedIssuer, PublicKeyData};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use rustls::sign::CertifiedKey;
 use time::{Duration, OffsetDateTime};
 
@@ -259,6 +259,11 @@ impl FederationCa {
             key,
         )))
     }
+}
+
+/// Returns the first PEM certificate in `path`.
+pub fn certificate(path: &Path) -> TestResult<CertificateDer<'static>> {
+    Ok(CertificateDer::from_pem_file(path)?)
 }
 
 fn parameters(domains: &[&str]) -> TestResult<CertificateParams> {

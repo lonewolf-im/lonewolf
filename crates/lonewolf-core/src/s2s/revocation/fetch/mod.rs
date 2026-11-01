@@ -115,7 +115,6 @@ pub(crate) enum FetchFailure {
     Stale,
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) struct FetchedCrl {
     pub(crate) crl: webpki::CertRevocationList<'static>,
     pub(crate) this_update: SystemTime,

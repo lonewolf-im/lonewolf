@@ -219,6 +219,13 @@ fn record_all(metrics: &Arc<S2sMetrics>) -> Vec<ConnectionGauge> {
     for reason in DropReason::ALL {
         metrics.dropped(reason, 7);
     }
+    for outcome in CrlFetchOutcome::ALL {
+        metrics.crl_fetched(outcome, Duration::from_millis(100));
+    }
+    for reason in CrlEviction::ALL {
+        metrics.crl_cache_evicted(reason);
+    }
+    metrics.crl_cache_size(1, 1234);
     guards
 }
 
@@ -498,6 +505,13 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             | "lonewolf_s2s_sent_bytes_total"
             | "lonewolf_s2s_negotiation_duration_seconds_count"
             | "lonewolf_s2s_negotiation_duration_seconds_sum" => &["direction"],
+            "lonewolf_s2s_crl_fetches_total" => &["outcome"],
+            "lonewolf_s2s_crl_cache_evictions_total" => &["reason"],
+            "lonewolf_s2s_crl_fetch_duration_seconds_bucket" => &["le"],
+            "lonewolf_s2s_crl_fetch_duration_seconds_count"
+            | "lonewolf_s2s_crl_fetch_duration_seconds_sum"
+            | "lonewolf_s2s_crl_cache_entries"
+            | "lonewolf_s2s_crl_cache_bytes" => &[],
             "lonewolf_s2s_connections_accepted_total" => &["listener"],
             "lonewolf_s2s_connections_rejected_total" => &["listener", "reason"],
             "lonewolf_s2s_authentications_total" | "lonewolf_s2s_streams_closed_total" => {
@@ -526,7 +540,7 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             .collect::<Result<_, _>>()?;
         assert_eq!(actual, expected, "{line}");
     }
-    assert_eq!(families.len(), 22);
+    assert_eq!(families.len(), 29);
     Ok(())
 }
 
@@ -618,5 +632,58 @@ fn revocation_checks_render_only_recorded_source_phase_and_status() -> Result<()
             .count(),
         2
     );
+    Ok(())
+}
+
+#[test]
+fn crl_metrics_have_fixed_labels_and_activate_cache_gauges_on_use() -> Result<(), fmt::Error> {
+    for (index, (value, label)) in CrlFetchOutcome::ALL
+        .into_iter()
+        .zip([
+            "success",
+            "dns_failed",
+            "blocked_address",
+            "connect_failed",
+            "timeout",
+            "http_status",
+            "too_large",
+            "invalid",
+            "stale",
+            "rollback",
+        ])
+        .enumerate()
+    {
+        assert_eq!(value as usize, index);
+        assert_eq!(value.as_str(), label);
+    }
+    for (index, (value, label)) in CrlEviction::ALL
+        .into_iter()
+        .zip(["unused", "capacity", "stale_expired"])
+        .enumerate()
+    {
+        assert_eq!(value as usize, index);
+        assert_eq!(value.as_str(), label);
+    }
+    let metrics = S2sMetrics::new(0);
+    assert!(!render(&metrics)?.contains("lonewolf_s2s_crl_"));
+    metrics.crl_fetched(CrlFetchOutcome::Rollback, Duration::from_millis(50));
+    metrics.crl_cache_size(1, 1234);
+    for reason in CrlEviction::ALL {
+        metrics.crl_cache_evicted(reason);
+    }
+    let output = render(&metrics)?;
+    assert_sample(
+        &output,
+        "lonewolf_s2s_crl_fetches_total{outcome=\"rollback\"} 1",
+    );
+    assert_sample(&output, "lonewolf_s2s_crl_fetch_duration_seconds_count 1");
+    assert_sample(&output, "lonewolf_s2s_crl_cache_entries 1");
+    assert_sample(&output, "lonewolf_s2s_crl_cache_bytes 1234");
+    for reason in ["unused", "capacity", "stale_expired"] {
+        assert_sample(
+            &output,
+            &format!("lonewolf_s2s_crl_cache_evictions_total{{reason=\"{reason}\"}} 1"),
+        );
+    }
     Ok(())
 }

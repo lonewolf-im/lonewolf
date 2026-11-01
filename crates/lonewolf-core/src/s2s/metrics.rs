@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -376,6 +376,66 @@ impl DropReason {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CrlFetchOutcome {
+    Success,
+    DnsFailed,
+    BlockedAddress,
+    ConnectFailed,
+    Timeout,
+    HttpStatus,
+    TooLarge,
+    Invalid,
+    Stale,
+    Rollback,
+}
+
+impl CrlFetchOutcome {
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Success,
+        Self::DnsFailed,
+        Self::BlockedAddress,
+        Self::ConnectFailed,
+        Self::Timeout,
+        Self::HttpStatus,
+        Self::TooLarge,
+        Self::Invalid,
+        Self::Stale,
+        Self::Rollback,
+    ];
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::DnsFailed => "dns_failed",
+            Self::BlockedAddress => "blocked_address",
+            Self::ConnectFailed => "connect_failed",
+            Self::Timeout => "timeout",
+            Self::HttpStatus => "http_status",
+            Self::TooLarge => "too_large",
+            Self::Invalid => "invalid",
+            Self::Stale => "stale",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CrlEviction {
+    Unused,
+    Capacity,
+    StaleExpired,
+}
+impl CrlEviction {
+    pub(crate) const ALL: [Self; 3] = [Self::Unused, Self::Capacity, Self::StaleExpired];
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unused => "unused",
+            Self::Capacity => "capacity",
+            Self::StaleExpired => "stale_expired",
+        }
+    }
+}
+
 const KINDS: [StanzaKind; 3] = [StanzaKind::Message, StanzaKind::Presence, StanzaKind::Iq];
 
 fn kind_index(kind: StanzaKind) -> usize {
@@ -422,6 +482,12 @@ pub(crate) struct S2sMetrics {
     admission_rejected: [AtomicU64; AdmissionReason::ALL.len()],
     bounces: [AtomicU64; BounceCondition::ALL.len()],
     dropped: [AtomicU64; DropReason::ALL.len()],
+    crl_fetches: [AtomicU64; CrlFetchOutcome::ALL.len()],
+    crl_fetch_duration: Histogram,
+    crl_cache_active: AtomicBool,
+    crl_cache_entries: AtomicU64,
+    crl_cache_bytes: AtomicU64,
+    crl_cache_evictions: [AtomicU64; CrlEviction::ALL.len()],
     link_source: PlRwLock<Option<Weak<dyn LinkStats>>>,
 }
 
@@ -446,12 +512,34 @@ impl S2sMetrics {
             admission_rejected: Default::default(),
             bounces: Default::default(),
             dropped: Default::default(),
+            crl_fetches: Default::default(),
+            crl_fetch_duration: Histogram::new(PHASE_BUCKETS),
+            crl_cache_active: AtomicBool::new(false),
+            crl_cache_entries: AtomicU64::new(0),
+            crl_cache_bytes: AtomicU64::new(0),
+            crl_cache_evictions: Default::default(),
             link_source: PlRwLock::new(None),
         })
     }
 
     pub(crate) fn register(self: &Arc<Self>, registry: &mut Registry) {
         registry.register_collector(Box::new(S2sCollector(Arc::clone(self))));
+    }
+
+    pub(crate) fn crl_fetched(&self, outcome: CrlFetchOutcome, elapsed: Duration) {
+        self.crl_fetches[outcome as usize].fetch_add(1, Ordering::Relaxed);
+        self.crl_fetch_duration.observe(elapsed.as_secs_f64());
+    }
+
+    pub(crate) fn crl_cache_size(&self, entries: usize, bytes: usize) {
+        self.crl_cache_entries
+            .store(entries as u64, Ordering::Relaxed);
+        self.crl_cache_bytes.store(bytes as u64, Ordering::Relaxed);
+        self.crl_cache_active.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn crl_cache_evicted(&self, reason: CrlEviction) {
+        self.crl_cache_evictions[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn connection_opened(self: &Arc<Self>, direction: Direction) -> ConnectionGauge {
@@ -614,6 +702,59 @@ fn encode_counter<L: EncodeLabelSet>(
 impl Collector for S2sCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
         let metrics = &self.0;
+        encode_counter(
+            &mut encoder,
+            "s2s_crl_fetches",
+            "S2S CRL download attempts by result.",
+            CrlFetchOutcome::ALL.map(|outcome| {
+                (
+                    [("outcome", outcome.as_str())],
+                    metrics.crl_fetches[outcome as usize].load(Ordering::Relaxed),
+                )
+            }),
+        )?;
+        if metrics
+            .crl_fetches
+            .iter()
+            .any(|count| count.load(Ordering::Relaxed) != 0)
+        {
+            metrics
+                .crl_fetch_duration
+                .encode(encoder.encode_descriptor(
+                    "s2s_crl_fetch_duration",
+                    "S2S CRL download time.",
+                    Some(&Unit::Seconds),
+                    MetricType::Histogram,
+                )?)?;
+        }
+        if metrics.crl_cache_active.load(Ordering::Acquire) {
+            for (name, help, counter) in [
+                (
+                    "s2s_crl_cache_entries",
+                    "URLs tracked by the S2S CRL cache.",
+                    &metrics.crl_cache_entries,
+                ),
+                (
+                    "s2s_crl_cache_bytes",
+                    "Estimated memory of CRLs held by the S2S CRL cache.",
+                    &metrics.crl_cache_bytes,
+                ),
+            ] {
+                ConstGauge::new(counter.load(Ordering::Relaxed))
+                    .encode(encoder.encode_descriptor(name, help, None, MetricType::Gauge)?)?;
+            }
+        }
+        encode_counter(
+            &mut encoder,
+            "s2s_crl_cache_evictions",
+            "S2S CRL cache entries removed, by reason.",
+            CrlEviction::ALL.map(|reason| {
+                (
+                    [("reason", reason.as_str())],
+                    metrics.crl_cache_evictions[reason as usize].load(Ordering::Relaxed),
+                )
+            }),
+        )?;
         for (name, help, counters) in [
             (
                 "s2s_connections",

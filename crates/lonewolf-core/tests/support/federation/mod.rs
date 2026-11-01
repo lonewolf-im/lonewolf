@@ -56,6 +56,7 @@ pub struct FederatedHost {
 }
 
 pub struct PairOptions {
+    pub crl_files: bool,
     pub a_revocation: HostRevocation,
     pub b_revocation: HostRevocation,
     pub a_enabled: Option<bool>,
@@ -74,6 +75,7 @@ pub struct PairOptions {
 impl Default for PairOptions {
     fn default() -> Self {
         Self {
+            crl_files: false,
             a_revocation: HostRevocation::default(),
             b_revocation: HostRevocation::default(),
             a_enabled: Some(true),
@@ -96,14 +98,35 @@ pub struct FederatedPair {
     pub b: C2sSuite,
     pub dns: FakeDns,
     pub ca: Arc<FederationCa>,
+    pub a_crls: Option<PathBuf>,
+    pub b_crls: Option<PathBuf>,
     _directory: tempfile::TempDir,
 }
 impl FederatedPair {
-    pub fn start(a: &str, b: &str, options: PairOptions) -> TestResult<Self> {
+    pub fn start(a: &str, b: &str, mut options: PairOptions) -> TestResult<Self> {
         let [a_permit, b_permit] = C2sSuitePermit::pair();
         let directory = tempfile::tempdir()?;
         let ca = Arc::new(FederationCa::new(directory.path())?);
         let dns = FakeDns::start()?;
+        let (a_crls, b_crls) = if options.crl_files {
+            let a_crls = directory.path().join("a-crls.pem");
+            let b_crls = directory.path().join("b-crls.pem");
+            let now = time::OffsetDateTime::now_utc();
+            for path in [&a_crls, &b_crls] {
+                ca.write_crl(
+                    path,
+                    &[],
+                    now - time::Duration::minutes(1),
+                    now + time::Duration::days(1),
+                    1,
+                )?;
+            }
+            options.a_revocation.crls_path = Some(a_crls.clone());
+            options.b_revocation.crls_path = Some(b_crls.clone());
+            (Some(a_crls), Some(b_crls))
+        } else {
+            (None, None)
+        };
         if let Some(receipt) = options.dns_join {
             *receipt.lock() = Some(dns.join_receipt());
         }
@@ -154,6 +177,8 @@ impl FederatedPair {
             b,
             dns,
             ca,
+            a_crls,
+            b_crls,
             _directory: directory,
         };
         for (prefix, suite) in [("a", &pair.a), ("b", &pair.b)] {

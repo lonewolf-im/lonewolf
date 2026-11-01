@@ -98,7 +98,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
         <xmpp:since>0.1.0</xmpp:since>
-        <xmpp:note xml:lang="en">Certificate login for clients and servers. S2S requires serverAuth certificates and checks downloaded CRLs during connection establishment and while connections are open; unknown revocation status does not block peers. Server-to-server support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Certificate login for clients and servers. S2S requires serverAuth certificates and checks revocation with CRLs downloaded from peer certificates or read from a configured file; unknown revocation status with downloaded CRLs does not block peers. Server-to-server support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

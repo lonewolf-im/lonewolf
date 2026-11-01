@@ -305,7 +305,7 @@ fn run_internal(
                     let recheck_interval = test_support::s2s_revalidation_interval().unwrap_or(recheck_interval);
                     let peers = s2s::revocation::PeerVerification {
                         trust: Arc::clone(&trust),
-                        revocation: s2s::revocation::PeerRevocation::new(&config.s2s, &config.limits.s2s, trust, Arc::clone(&resolver), Arc::clone(metrics), recheck_interval),
+                        revocation: s2s::revocation::PeerRevocation::new(&config.s2s, &config.limits.s2s, trust, Arc::clone(&resolver), Arc::clone(metrics), recheck_interval).map_err(|error| RunError::S2s(io::Error::other(error)))?,
                     };
                     remote = Some(s2s::outbound::RemoteRouter::new(
                         hosts.clone(),

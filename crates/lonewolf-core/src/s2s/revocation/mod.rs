@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
 use lonewolf_util::blocking::BlockingExecutor;
-use rustls::pki_types::CertificateDer;
+use parking_lot::Mutex as PlMutex;
+use rustls::pki_types::{CertificateDer, UnixTime};
 
 use crate::config::{S2sConfig, limits::S2sLimits};
 use crate::hosts::peer_identity::PeerTrust;
+use crate::hosts::revocation::{CrlLoadError, CrlSet, RevocationRules};
 use crate::s2s::dns::Resolver;
 use crate::s2s::metrics::{Direction, S2sMetrics};
 
@@ -29,6 +33,11 @@ pub(crate) struct PeerVerification {
 
 enum Source {
     Disabled,
+    File {
+        trust: Arc<PeerTrust>,
+        path: Arc<Path>,
+        last: Arc<PlMutex<Option<Result<u64, CrlLoadError>>>>,
+    },
     Fetched {
         trust: Arc<PeerTrust>,
         cache: Arc<cache::CrlCache>,
@@ -51,8 +60,27 @@ impl PeerRevocation {
         resolver: Arc<Resolver>,
         metrics: Arc<S2sMetrics>,
         recheck_interval: Duration,
-    ) -> Arc<Self> {
-        let source = if config.tls.fetch_crls {
+    ) -> Result<Arc<Self>, RevocationStartupError> {
+        let source = if let Some(path) = &config.tls.crls_path {
+            let last = Arc::new(PlMutex::new(None));
+            let loaded = CrlSet::load_for_startup(path, SystemTime::now());
+            report_file_load(
+                &metrics,
+                &last,
+                loaded
+                    .as_ref()
+                    .map(CrlSet::next_update)
+                    .map_err(|error| *error),
+            );
+            if let Err(error @ (CrlLoadError::Unreadable | CrlLoadError::Invalid)) = loaded {
+                return Err(RevocationStartupError::CrlFile(error));
+            }
+            Source::File {
+                trust,
+                path: Arc::from(path.as_path()),
+                last,
+            }
+        } else if config.tls.fetch_crls {
             let policy = if config.tls.trust_anchors_path.is_some() {
                 address::AddressPolicy::Any
             } else {
@@ -85,14 +113,14 @@ impl PeerRevocation {
         } else {
             Source::Disabled
         };
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             source,
             verifier: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
             metrics,
             wait: Duration::from_secs(2)
                 .min(Duration::from_secs(limits.negotiation_timeout_secs.get()) / 4),
             recheck_interval,
-        })
+        }))
     }
 
     #[cfg_attr(not(test), expect(dead_code))]
@@ -127,13 +155,137 @@ impl PeerRevocation {
         phase: CheckPhase,
         now: SystemTime,
     ) -> Option<RevocationVerdict> {
-        let Source::Fetched { trust, cache } = &self.source else {
-            return None;
+        self.check_at_with_loader(chain, direction, phase, now, CrlSet::load)
+            .await
+    }
+
+    async fn check_at_with_loader<L>(
+        &self,
+        chain: Arc<[CertificateDer<'static>]>,
+        direction: Direction,
+        phase: CheckPhase,
+        now: SystemTime,
+        load: L,
+    ) -> Option<RevocationVerdict>
+    where
+        L: FnOnce(&Path, SystemTime) -> Result<CrlSet, CrlLoadError> + Send + 'static,
+    {
+        let verdict = match &self.source {
+            Source::Disabled => return None,
+            Source::Fetched { trust, cache } => {
+                fetched::check(trust, cache, &self.verifier, chain, now, phase, self.wait).await
+            }
+            Source::File { trust, path, last } => {
+                let trust = Arc::clone(trust);
+                let path = Arc::clone(path);
+                let last = Arc::clone(last);
+                let metrics = Arc::clone(&self.metrics);
+                self.verifier
+                    .run(move || {
+                        let loaded = load(&path, now);
+                        report_file_load(
+                            &metrics,
+                            &last,
+                            loaded
+                                .as_ref()
+                                .map(CrlSet::next_update)
+                                .map_err(|error| *error),
+                        );
+                        let mut verdict = RevocationVerdict {
+                            source: RevocationSource::File,
+                            status: RevocationStatus::Unknown(UnknownReason::Unavailable),
+                            next_update: None,
+                            refresh_at: None,
+                            pending: Vec::new(),
+                            leases: Vec::new(),
+                            recheckable: true,
+                        };
+                        let set = match loaded {
+                            Ok(set) => set,
+                            Err(error) => {
+                                verdict.status = RevocationStatus::Unknown(match error {
+                                    CrlLoadError::Stale => UnknownReason::Stale,
+                                    CrlLoadError::Unreadable => UnknownReason::Unavailable,
+                                    CrlLoadError::Invalid => UnknownReason::Invalid,
+                                });
+                                return verdict;
+                            }
+                        };
+                        let Ok(elapsed) = now.duration_since(UNIX_EPOCH) else {
+                            return verdict;
+                        };
+                        let crls: Vec<_> = set.lists().iter().collect();
+                        verdict.status = match trust.check_crls(
+                            &chain,
+                            UnixTime::since_unix_epoch(elapsed),
+                            RevocationRules {
+                                crls: &crls,
+                                unknown: webpki::UnknownStatusPolicy::Deny,
+                                expiration: webpki::ExpirationPolicy::Enforce,
+                            },
+                        ) {
+                            Ok(()) => {
+                                verdict.next_update = Some(set.next_update());
+                                RevocationStatus::Good
+                            }
+                            Err(webpki::Error::CertRevoked) => RevocationStatus::Revoked,
+                            Err(webpki::Error::UnknownRevocationStatus) => {
+                                RevocationStatus::Unknown(UnknownReason::NotAuthoritative)
+                            }
+                            Err(webpki::Error::CrlExpired { .. }) => {
+                                RevocationStatus::Unknown(UnknownReason::Stale)
+                            }
+                            Err(error) if fetched::signature_error(&error) => {
+                                RevocationStatus::Unknown(UnknownReason::BadSignature)
+                            }
+                            Err(_) => RevocationStatus::Unknown(UnknownReason::Unavailable),
+                        };
+                        verdict
+                    })
+                    .await
+            }
         };
-        let verdict =
-            fetched::check(trust, cache, &self.verifier, chain, now, phase, self.wait).await;
         self.metrics.revocation_checked(direction, phase, &verdict);
         Some(verdict)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RevocationStartupError {
+    CrlFile(CrlLoadError),
+}
+
+impl fmt::Display for RevocationStartupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::CrlFile(CrlLoadError::Unreadable) => "cannot read s2s.tls.crls_path",
+            Self::CrlFile(CrlLoadError::Invalid) => "s2s.tls.crls_path holds invalid CRLs",
+            Self::CrlFile(CrlLoadError::Stale) => "s2s.tls.crls_path holds stale CRLs",
+        })
+    }
+}
+impl std::error::Error for RevocationStartupError {}
+
+fn report_file_load(
+    metrics: &S2sMetrics,
+    last: &PlMutex<Option<Result<u64, CrlLoadError>>>,
+    outcome: Result<SystemTime, CrlLoadError>,
+) {
+    match outcome {
+        Ok(next_update) => metrics.crl_file_loaded(next_update),
+        Err(error) => metrics.crl_file_load_failed(error),
+    }
+    let outcome = outcome.map(|next_update| {
+        next_update
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+    });
+    let changed = last.lock().replace(outcome) != Some(outcome);
+    if changed {
+        match outcome {
+            Ok(secs) => tracing::info!(next_update_unix = secs, "s2s revocation lists loaded"),
+            Err(error) => tracing::error!(reason = error.as_str(), "s2s revocation lists unusable"),
+        }
     }
 }
 

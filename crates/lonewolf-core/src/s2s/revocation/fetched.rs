@@ -167,7 +167,7 @@ fn unknown(reason: UnknownReason) -> RevocationStatus {
 }
 
 #[allow(deprecated)]
-fn signature_error(error: &webpki::Error) -> bool {
+pub(super) fn signature_error(error: &webpki::Error) -> bool {
     matches!(
         error,
         webpki::Error::InvalidCrlSignatureForPublicKey

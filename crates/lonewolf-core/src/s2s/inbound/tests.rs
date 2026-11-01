@@ -737,3 +737,64 @@ fn monitored_revocation_resets_the_stream_and_records_the_close() -> TestResult 
         Ok(())
     })
 }
+
+#[test]
+fn monitored_file_deadline_resets_the_stream_and_records_staleness() -> TestResult {
+    use crate::s2s::revocation::{RevocationSource, RevocationStatus, RevocationVerdict};
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new()?;
+        let peer = peer();
+        let (_stop, shutdown) = signal();
+        let mut reader = fixture
+            .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
+            .await?;
+        let output = Output::default();
+        let mut writer = S2sWriter::new(output.clone());
+        let now = SystemTime::now();
+        let verdict = RevocationVerdict {
+            source: RevocationSource::File,
+            status: RevocationStatus::Good,
+            next_update: Some(now + Duration::from_millis(100)),
+            refresh_at: None,
+            pending: Vec::new(),
+            leases: Vec::new(),
+            recheckable: true,
+        };
+        let (validity, monitor) = LinkValidity::monitored(
+            now + Duration::from_secs(60),
+            verdict,
+            Duration::from_secs(60),
+            Box::new(|| async { panic!("file deadline precedes rechecks") }.boxed_local()),
+        );
+        let outcome = supervise(
+            Some(monitor),
+            MonitorLog {
+                direction: Direction::Inbound,
+                connection_id: peer.connection_id,
+                local: &peer.local,
+                remote: &peer.remote,
+            },
+            fixture.settings.timeout,
+            run(
+                &mut reader,
+                &mut writer,
+                fixture.parameters(&peer, shutdown, &validity),
+                || {},
+                async |_: &IngressContext<GlobalChunkAllocator>,
+                       _: &InboundPeer,
+                       _: RoutedStanza<GlobalChunkAllocator>| {
+                    std::future::pending::<Result<(), IngressFailure>>().await
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(outcome, StreamClose::RevocationStale));
+        assert!(String::from_utf8(output.0.borrow().clone())?.contains("reset"));
+        sample(
+            &fixture.settings.metrics,
+            "s2s_streams_closed_total{direction=\"inbound\",outcome=\"revocation_stale\"}",
+            1,
+        )?;
+        Ok(())
+    })
+}

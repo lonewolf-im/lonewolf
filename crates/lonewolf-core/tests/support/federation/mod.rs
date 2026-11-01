@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
@@ -35,6 +36,7 @@ pub type ProcessReceipts = Arc<PlMutex<ProcessCompletions>>;
 
 #[derive(Clone, Default)]
 pub struct HostRevocation {
+    pub crls_path: Option<PathBuf>,
     pub crl_url: Option<String>,
     pub fetch_crls: Option<bool>,
     pub public_destinations_only: bool,

@@ -33,8 +33,17 @@ pub struct ProcessCompletions {
 }
 pub type ProcessReceipts = Arc<PlMutex<ProcessCompletions>>;
 
+#[derive(Clone, Default)]
+pub struct HostRevocation {
+    pub crl_url: Option<String>,
+    pub fetch_crls: Option<bool>,
+    pub public_destinations_only: bool,
+    pub revalidation_interval: Option<std::time::Duration>,
+}
+
 pub struct FederatedHost {
     pub domain: String,
+    pub revocation: HostRevocation,
     pub enabled: Option<bool>,
     pub federation: Option<bool>,
     pub extensions: String,
@@ -45,6 +54,8 @@ pub struct FederatedHost {
 }
 
 pub struct PairOptions {
+    pub a_revocation: HostRevocation,
+    pub b_revocation: HostRevocation,
     pub a_enabled: Option<bool>,
     pub b_enabled: Option<bool>,
     pub a_federation: Option<bool>,
@@ -61,6 +72,8 @@ pub struct PairOptions {
 impl Default for PairOptions {
     fn default() -> Self {
         Self {
+            a_revocation: HostRevocation::default(),
+            b_revocation: HostRevocation::default(),
             a_enabled: Some(true),
             b_enabled: Some(true),
             a_federation: None,
@@ -99,6 +112,7 @@ impl FederatedPair {
         };
         let a_host = FederatedHost {
             domain: a.into(),
+            revocation: options.a_revocation,
             enabled: options.a_enabled,
             federation: options.a_federation,
             extensions: options.a_extensions,
@@ -109,6 +123,7 @@ impl FederatedPair {
         };
         let b_host = FederatedHost {
             domain: b.into(),
+            revocation: options.b_revocation,
             enabled: options.b_enabled,
             federation: options.b_federation,
             extensions: options.b_extensions,

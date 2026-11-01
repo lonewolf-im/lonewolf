@@ -380,7 +380,33 @@ max_resources_per_account = {resources}
         permit: C2sSuitePermit,
     ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
-        host.ca.server(directory.path(), "host", &[&host.domain])?;
+        if let Some(url) = &host.revocation.crl_url {
+            host.ca.server_with_crl_urls(
+                directory.path(),
+                "host",
+                &[&host.domain],
+                std::slice::from_ref(url),
+            )?;
+        } else {
+            host.ca.server(directory.path(), "host", &[&host.domain])?;
+        }
+        if host.revocation.public_destinations_only {
+            fs::write(directory.path().join("crl-public-destinations-only"), [])?;
+        }
+        if let Some(interval) = host.revocation.revalidation_interval {
+            let millis = interval.as_millis();
+            let value = u64::try_from(millis)
+                .map_err(|_| "revalidation interval exceeds u64 milliseconds")?;
+            if value == 0 || std::time::Duration::from_millis(value) != interval {
+                return Err(
+                    "revalidation interval must contain positive whole milliseconds".into(),
+                );
+            }
+            fs::write(
+                directory.path().join("s2s-revalidation-interval-ms"),
+                value.to_string(),
+            )?;
+        }
         let tls_roots = host.ca.roots()?;
         let tls = tls::client_config(tls_roots.clone(), rustls::DEFAULT_VERSIONS)?;
         let config = format!(
@@ -404,6 +430,7 @@ private_key_path = "private-key-host.pem"
 listeners = [{{ address = "127.0.0.1:0" }}]
 [s2s.tls]
 trust_anchors_path = {anchors:?}
+{fetch_crls}
 [s2s.dns]
 nameservers = [{dns:?}]
 timeout_secs = 1
@@ -412,6 +439,11 @@ timeout_secs = 1
             domain = host.domain,
             extensions = host.extensions,
             anchors = host.ca.trust_anchors_path(),
+            fetch_crls = host
+                .revocation
+                .fetch_crls
+                .map(|value| format!("fetch_crls = {value}"))
+                .unwrap_or_default(),
             dns = host.dns.to_string(),
             extra = host.extra_toml,
             host_federation = host
@@ -680,6 +712,27 @@ impl Drop for C2sSuite {
 fn server_process() -> TestResult {
     if std::env::var_os("LONEWOLF_PROTOCOL_TEST_SERVER").is_none() {
         return Ok(());
+    }
+    match fs::read_to_string("s2s-revalidation-interval-ms") {
+        Ok(marker) => {
+            if marker.is_empty() || !marker.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("invalid revalidation interval marker".into());
+            }
+            let value: u64 = marker.parse()?;
+            if value == 0 {
+                return Err("revalidation interval marker must be positive".into());
+            }
+            lonewolf_core::test_support::set_s2s_revalidation_interval(Duration::from_millis(
+                value,
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::metadata("crl-public-destinations-only") {
+        Ok(_) => lonewolf_core::test_support::set_s2s_crl_public_destinations_only(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let state = lonewolf_core::test_support::run_with_extensions_and_s2s_shutdown_state(
         None,

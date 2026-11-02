@@ -775,7 +775,7 @@ fn documented_settings_and_examples() -> Result<(String, Vec<String>), Box<dyn E
 #[test]
 fn reference_configuration_fenced_examples_load() -> TestResult {
     let (_, examples) = documented_settings_and_examples()?;
-    assert_eq!(examples.len(), 5);
+    assert_eq!(examples.len(), 6);
     for example in examples {
         let contents = if example.starts_with("[letsencrypt]") {
             format!("[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n{example}")
@@ -994,6 +994,7 @@ fn letsencrypt_defaults_and_partial_settings_preserve_exact_directory_identity()
         "https://acme-v02.api.letsencrypt.org/directory"
     );
     assert_eq!(defaults.ca_certificates_path, None);
+    assert_eq!(defaults.certificate_profile, None);
     for url in [
         "https://acme-v02.api.letsencrypt.org/directory",
         "https://acme-staging-v02.api.letsencrypt.org/directory",
@@ -1017,6 +1018,47 @@ fn letsencrypt_defaults_and_partial_settings_preserve_exact_directory_identity()
                 ..defaults.clone()
             }
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn letsencrypt_certificate_profile_accepts_valid_names_and_rejects_others() -> TestResult {
+    let longest_valid = "a".repeat(64);
+    let too_long = "a".repeat(65);
+    for hosts in ["", "[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n"] {
+        for name in [
+            "shortlived",
+            "tlsserver",
+            "classic",
+            "A-b_c.9",
+            &longest_valid,
+        ] {
+            let file = config_file(&format!(
+                "{hosts}[letsencrypt]\ncertificate_profile = '{name}'"
+            ))?;
+            let config = Config::load(Some(file.path()))?;
+            assert_eq!(
+                config.letsencrypt.certificate_profile.as_deref(),
+                Some(name)
+            );
+        }
+        for name in ["", &too_long, "short lived", "café", "a/b"] {
+            let file = config_file(&format!(
+                "{hosts}[letsencrypt]\ncertificate_profile = '{name}'"
+            ))?;
+            assert!(
+                matches!(Config::load(Some(file.path())), Err(ConfigError::Invalid { reason, .. })
+                    if reason == "letsencrypt.certificate_profile must be 1 to 64 ASCII letters, digits, '.', '-' or '_'"),
+                "accepted {name:?}"
+            );
+        }
+        for value in ["6", "[]"] {
+            let file = config_file(&format!(
+                "{hosts}[letsencrypt]\ncertificate_profile = {value}"
+            ))?;
+            assert!(Config::load(Some(file.path())).is_err(), "accepted {value}");
+        }
     }
     Ok(())
 }
@@ -1077,6 +1119,8 @@ fn letsencrypt_rejects_invalid_shapes_paths_and_overlapping_listeners_while_inac
         "listen = ['[::1]']",
         "state_path = ''",
         "ca_certificates_path = ''",
+        "certificate_profile = ''",
+        "profile = 'shortlived'",
         "enabled = false",
         "email = 'a@example.com'",
         "terms = true",

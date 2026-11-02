@@ -317,6 +317,7 @@ pub struct LetsEncryptConfig {
     /// The exact URL identifies a separate account and certificate cache.
     pub directory_url: String,
     pub ca_certificates_path: Option<PathBuf>,
+    pub certificate_profile: Option<String>,
 }
 
 impl Default for LetsEncryptConfig {
@@ -326,6 +327,7 @@ impl Default for LetsEncryptConfig {
             state_path: PathBuf::from("./data/lonewolf/acme.redb"),
             directory_url: "https://acme-v02.api.letsencrypt.org/directory".into(),
             ca_certificates_path: None,
+            certificate_profile: None,
         }
     }
 }
@@ -346,6 +348,16 @@ impl LetsEncryptConfig {
             }
         }
         validate_directory_url(&self.directory_url)?;
+        if self
+            .certificate_profile
+            .as_deref()
+            .is_some_and(|name| !lonewolf_acme::is_valid_profile_name(name))
+        {
+            return Err(
+                "letsencrypt.certificate_profile must be 1 to 64 ASCII letters, digits, '.', '-' or '_'"
+                    .into(),
+            );
+        }
         let managed = |host: &HostConfig| {
             host.tls
                 .as_ref()

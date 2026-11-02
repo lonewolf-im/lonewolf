@@ -391,8 +391,7 @@ impl<R: Read> XmlStream<R> {
 
     pub fn expect_eof(&mut self) -> TestResult {
         let mut byte = [0];
-        match self.reader.get_mut().read(&mut byte) {
-            Ok(0) => Ok(()),
+        match self.reader.get_mut().read_exact(&mut byte) {
             Err(error)
                 if matches!(
                     error.kind(),

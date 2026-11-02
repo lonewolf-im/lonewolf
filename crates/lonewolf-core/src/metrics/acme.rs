@@ -64,6 +64,21 @@ pub(super) fn encode_hosts(
                 .encode(family.encode_family(&[("host", host.as_str())])?)?;
         }
     }
+    {
+        let mut family = encoder.encode_descriptor(
+            "acme_certificate_profile_info",
+            "Profile requested for the stored managed certificate.",
+            None,
+            MetricType::Gauge,
+        )?;
+        for (host, status) in hosts {
+            if let Some(profile) = status.profile.as_deref() {
+                ConstGauge::new(1).encode(
+                    family.encode_family(&[("host", host.as_str()), ("profile", profile)])?,
+                )?;
+            }
+        }
+    }
     for (name, help, expiry) in [
         (
             "acme_certificate_not_after_seconds",

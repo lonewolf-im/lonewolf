@@ -88,6 +88,7 @@ fn snapshots(hosts: &[StoredHost]) -> StatusHandle {
                         host.host.xmpp_domain.clone(),
                         HostStatus {
                             state: HostState::Pending,
+                            profile: None,
                             not_after_unix: None,
                             next_attempt_unix: None,
                             attempts: 0,
@@ -270,6 +271,7 @@ struct Script {
     commit: RefCell<Option<futures_channel::oneshot::Receiver<()>>>,
     committed: Cell<bool>,
     issued_installs: Cell<usize>,
+    profile: Option<&'static str>,
 }
 struct Lease(Rc<Cell<usize>>);
 impl Drop for Lease {
@@ -334,6 +336,11 @@ impl Script {
                     .ok_or(StateError::CorruptData)?
                     .material
                     .chain = vec![vec![2]];
+                record
+                    .certificate
+                    .as_mut()
+                    .ok_or(StateError::CorruptData)?
+                    .profile = self.profile.map(str::to_owned);
                 record.retry = RetryState {
                     failures: 0,
                     not_before_unix: 0,
@@ -472,12 +479,27 @@ fn make_script(hosts: &[StoredHost], steps: Vec<Step>, limit: usize) -> Script {
         commit: RefCell::new(None),
         committed: Cell::new(false),
         issued_installs: Cell::new(0),
+        profile: None,
     }
 }
 fn run(script: &Script, hosts: Vec<StoredHost>) -> Result<StatusHandle, ManagerError> {
+    run_with_profile(script, hosts, None)
+}
+fn run_with_profile(
+    script: &Script,
+    hosts: Vec<StoredHost>,
+    profile: Option<&str>,
+) -> Result<StatusHandle, ManagerError> {
     let status = snapshots(&hosts);
     block_on(async {
-        let driver = pin!(drive(&script.store, script, &script.clock, hosts, &status));
+        let driver = pin!(drive(
+            &script.store,
+            script,
+            &script.clock,
+            hosts,
+            &status,
+            profile,
+        ));
         let stop = pin!(poll_fn(|cx| {
             if script.clock.stop.get() {
                 Poll::Ready(())
@@ -506,6 +528,185 @@ fn two_slots_serialize_each_host_and_allow_progress_while_another_is_pending() -
     );
     assert_eq!(script.peak.get(), 2);
     assert_eq!(script.active.get(), 0);
+    Ok(())
+}
+
+fn assert_profile_due(recorded: Option<&str>, configured: Option<&str>, due: u64) -> TestResult {
+    let mut record = host("example.com");
+    let mut certificate = cert(NOW - 100, NOW + 100_000);
+    certificate.profile = recorded.map(str::to_owned);
+    certificate.renew_at_unix = NOW + 50_000;
+    certificate.ari_check_at_unix = NOW + 60_000;
+    record.certificate = Some(certificate);
+    record.retry.not_before_unix = if due < NOW + 50_000 { due } else { NOW };
+    let script = make_script(std::slice::from_ref(&record), vec![Step::Hold], usize::MAX);
+    script.clock.manual.set(true);
+    let status = snapshots(std::slice::from_ref(&record));
+    let mut driver = Box::pin(drive(
+        &script.store,
+        &script,
+        &script.clock,
+        vec![record],
+        &status,
+        configured,
+    ));
+    assert!(driver.as_mut().now_or_never().is_none());
+    assert_eq!(status.snapshot()[0].1.next_attempt_unix, Some(due));
+    if due > NOW {
+        assert!(script.calls.borrow().is_empty());
+        script.clock.time.set(due - 1);
+        script.clock.tick.set(true);
+        assert!(driver.as_mut().now_or_never().is_none());
+        assert!(script.calls.borrow().is_empty());
+        script.clock.time.set(due);
+        script.clock.tick.set(true);
+        assert!(driver.as_mut().now_or_never().is_none());
+    }
+    assert_eq!(*script.calls.borrow(), [("example.com".into(), false, due)]);
+    assert_eq!(status.snapshot()[0].1.state, HostState::Ready);
+    Ok(())
+}
+
+#[test]
+fn profile_change_makes_a_valid_certificate_due_at_its_retry_floor() -> TestResult {
+    for due in [NOW, NOW + 600] {
+        assert_profile_due(None, Some("shortlived"), due)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn matching_profile_keeps_the_renewal_schedule() -> TestResult {
+    assert_profile_due(Some("shortlived"), Some("shortlived"), NOW + 50_000)
+}
+
+#[test]
+fn removing_the_profile_renews_early() -> TestResult {
+    for due in [NOW, NOW + 600] {
+        assert_profile_due(Some("shortlived"), None, due)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn unrecorded_certificates_keep_the_baseline_schedule_when_unset() -> TestResult {
+    assert_profile_due(None, None, NOW + 50_000)
+}
+
+#[test]
+fn status_reports_the_recorded_profile_at_load_and_after_issuance() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        for (recorded, configured) in [
+            (Some("classic"), Some("shortlived")),
+            (Some("shortlived"), None),
+            (None, Some("shortlived")),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("state.redb");
+            let now = schedule::now()?;
+            let mut record = host("example.com");
+            let mut certificate = cert(now - 100, now + 100_000);
+            certificate.profile = recorded.map(str::to_owned);
+            certificate.ari_check_at_unix = now + 60_000;
+            record.certificate = Some(certificate);
+            record.retry.not_before_unix = now;
+            let store =
+                StateStore::open(path.clone(), "https://unreachable.invalid/directory".into())
+                    .await?;
+            store.save_host(record.clone()).await?;
+            store.drain(Instant::now() + Duration::from_secs(1)).await?;
+            drop(store);
+            let mut manager = Manager::load(
+                ManagerOptions {
+                    directory_url: "https://unreachable.invalid/directory".into(),
+                    state_path: path,
+                    ca_certificates_path: None,
+                    certificate_profile: configured.map(str::to_owned),
+                    hosts: vec![record.host.clone()],
+                },
+                Challenges::new(std::slice::from_ref(&record.host))?,
+                install(now - 100, now + 100_000),
+            )
+            .await?;
+            let status = manager.status();
+            assert_eq!(status.snapshot()[0].1.profile.as_deref(), recorded);
+            assert_eq!(status.snapshot()[0].1.next_attempt_unix, Some(now));
+            let mut script = make_script(
+                std::slice::from_ref(&record),
+                vec![Step::Success, Step::Hold],
+                usize::MAX,
+            );
+            script.profile = configured;
+            script.clock.time.set(now);
+            script.clock.manual.set(true);
+            let mut driver = Box::pin(drive(
+                &script.store,
+                &script,
+                &script.clock,
+                std::mem::take(&mut manager.hosts),
+                &status,
+                configured,
+            ));
+            assert!(driver.as_mut().now_or_never().is_none());
+            let snapshot = &status.snapshot()[0].1;
+            assert_eq!(snapshot.profile.as_deref(), configured);
+            assert_eq!(snapshot.successes, 1);
+            assert_eq!(snapshot.generation, 2);
+            assert_eq!(snapshot.state, HostState::Ready);
+            {
+                let records = script.store.records.borrow();
+                let certificate = records["example.com"]
+                    .certificate
+                    .as_ref()
+                    .ok_or("certificate")?;
+                assert_eq!(certificate.profile.as_deref(), configured);
+                assert_eq!(snapshot.next_attempt_unix, Some(certificate.renew_at_unix));
+            }
+            drop(driver);
+            manager
+                .drain(Instant::now() + Duration::from_secs(1))
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn profile_not_offered_failure_counts_and_respects_the_floor() -> TestResult {
+    let mut record = host("example.com");
+    let mut certificate = cert(NOW - 100, NOW + 100_000);
+    certificate.ari_check_at_unix = NOW + 60_000;
+    record.certificate = Some(certificate);
+    record.retry.not_before_unix = NOW;
+    let script = make_script(
+        std::slice::from_ref(&record),
+        vec![Step::Failure(FailureKind::ProfileNotOffered), Step::Hold],
+        2,
+    );
+    let status = run_with_profile(&script, vec![record], Some("shortlived"))?;
+    assert_eq!(
+        *script.calls.borrow(),
+        [
+            ("example.com".into(), false, NOW),
+            ("example.com".into(), false, NOW + 600),
+        ]
+    );
+    let snapshot = &status.snapshot()[0].1;
+    assert_eq!(
+        snapshot.failures[FailureKind::ProfileNotOffered as usize],
+        1
+    );
+    assert_eq!(snapshot.events[HostEvent::NextRetry as usize], 1);
+    assert_eq!(snapshot.next_attempt_unix, Some(NOW + 600));
+    assert_eq!(snapshot.state, HostState::Ready);
+    let records = script.store.records.borrow();
+    let record = &records["example.com"];
+    assert_eq!(record.retry.failures, 1);
+    assert_eq!(record.retry.not_before_unix, NOW + 600);
+    assert_eq!(
+        record.certificate.as_ref().ok_or("certificate")?.profile,
+        None
+    );
     Ok(())
 }
 
@@ -933,7 +1134,7 @@ fn shutdown_wins_when_commit_notification_and_stop_are_both_ready() -> TestResul
     let deadline = Instant::now() + Duration::from_secs(1);
     let status = snapshots(&hosts);
     let future = until_shutdown(
-        drive(&script.store, &script, &script.clock, hosts, &status),
+        drive(&script.store, &script, &script.clock, hosts, &status, None),
         async { stop_rx.await.unwrap_or(deadline) },
     );
     let mut future = Box::pin(future);
@@ -970,6 +1171,7 @@ fn co_ready_stop_blocks_local_publication_and_clock_jumps_preserve_publication_i
             &script.clock,
             vec![record.clone()],
             &status,
+            None,
         ),
         async { stop_rx.await.unwrap_or(deadline) },
     );
@@ -983,7 +1185,14 @@ fn co_ready_stop_blocks_local_publication_and_clock_jumps_preserve_publication_i
     let script = make_script(std::slice::from_ref(&record), vec![Step::Hold], 1);
     *script.clock.jumps.borrow_mut() = VecDeque::from([NOW + 200, NOW + 130, NOW + 110, NOW + 140]);
     let status = snapshots(std::slice::from_ref(&record));
-    let driver = drive(&script.store, &script, &script.clock, vec![record], &status);
+    let driver = drive(
+        &script.store,
+        &script,
+        &script.clock,
+        vec![record],
+        &status,
+        None,
+    );
     let mut driver = Box::pin(driver);
     script.clock.manual.set(true);
     assert!(driver.as_mut().now_or_never().is_none());
@@ -1172,7 +1381,14 @@ fn submitted_ari_schedule_save_retains_host_ownership_until_commit_completes() -
     let (release_tx, release_rx) = futures_channel::oneshot::channel();
     *script.store.release_schedule.borrow_mut() = Some(release_rx);
     let status = snapshots(&hosts);
-    let mut driver = Box::pin(drive(&script.store, &script, &script.clock, hosts, &status));
+    let mut driver = Box::pin(drive(
+        &script.store,
+        &script,
+        &script.clock,
+        hosts,
+        &status,
+        None,
+    ));
     assert!(driver.as_mut().now_or_never().is_none());
     assert!(script.store.schedule_submitted.get());
     assert_eq!(script.calls.borrow().len(), 1);
@@ -1238,6 +1454,7 @@ fn failed_renewal_preserves_published_material_through_expiry_and_eventual_recov
         &script.clock,
         vec![record],
         &status,
+        None,
     ));
     assert!(driver.as_mut().now_or_never().is_none());
     assert_eq!(status.snapshot()[0].1.state, HostState::Ready);
@@ -1305,7 +1522,14 @@ fn success_suppresses_old_pending_cache_while_reload_and_other_host_validity_wai
     let (release_tx, release_rx) = futures_channel::oneshot::channel();
     *script.store.release_reload.borrow_mut() = Some(release_rx);
     let status = snapshots(&hosts);
-    let mut driver = Box::pin(drive(&script.store, &script, &script.clock, hosts, &status));
+    let mut driver = Box::pin(drive(
+        &script.store,
+        &script,
+        &script.clock,
+        hosts,
+        &status,
+        None,
+    ));
     assert!(driver.as_mut().now_or_never().is_none());
     assert!(script.store.reload_submitted.get());
     assert_eq!(status.snapshot()[0].1.state, HostState::Ready);
@@ -1354,7 +1578,7 @@ fn held_account_read_preserves_local_validity_wakes_and_stop_priority() -> TestR
         let deadline = Instant::now() + Duration::from_secs(1);
         let status = snapshots(&hosts);
         let mut future = Box::pin(until_shutdown(
-            drive(&script.store, &script, &script.clock, hosts, &status),
+            drive(&script.store, &script, &script.clock, hosts, &status, None),
             async { stop_rx.await.unwrap_or(deadline) },
         ));
         assert!(future.as_mut().now_or_never().is_none());

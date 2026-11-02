@@ -48,6 +48,7 @@ pub enum HostEvent {
 #[derive(Clone, Debug)]
 pub struct HostStatus {
     pub state: HostState,
+    pub profile: Option<Arc<str>>,
     pub not_after_unix: Option<u64>,
     pub next_attempt_unix: Option<u64>,
     pub attempts: u64,
@@ -99,6 +100,7 @@ pub struct Manager<I: Installer> {
     status: StatusHandle,
     started: bool,
     time: Time,
+    profile: Option<Arc<str>>,
 }
 
 impl<I: Installer> Manager<I> {
@@ -132,6 +134,7 @@ impl<I: Installer> Manager<I> {
         })
         .await
         .map_err(ManagerError::Transport)?;
+        let profile = options.certificate_profile.as_deref().map(Arc::from);
         let issuer = Arc::new(
             Issuer::with_time(
                 store.clone(),
@@ -139,7 +142,7 @@ impl<I: Installer> Manager<I> {
                 transport.clone(),
                 options.directory_url,
                 time.clone(),
-                options.certificate_profile.as_deref().map(Arc::from),
+                profile.clone(),
             )
             .map_err(fatal)?,
         );
@@ -178,8 +181,13 @@ impl<I: Installer> Manager<I> {
             }
             let mut status = HostStatus {
                 state: initial_state,
+                profile: record
+                    .certificate
+                    .as_ref()
+                    .and_then(|cert| cert.profile.as_deref())
+                    .map(Arc::from),
                 not_after_unix: record.certificate.as_ref().map(|cert| cert.not_after_unix),
-                next_attempt_unix: Some(issue_due(&record, now)),
+                next_attempt_unix: Some(issue_due(&record, now, profile.as_deref())),
                 attempts: 0,
                 successes: 0,
                 failures: [0; FAILURE_KIND_COUNT],
@@ -191,7 +199,14 @@ impl<I: Installer> Manager<I> {
             if installed {
                 event(&mut status, HostEvent::Installed);
             }
-            tracing::info!(host = %host.xmpp_domain, phase = "load", outcome = if installed { "ready" } else { "unavailable" }, not_after = status.not_after_unix, "ACME certificate loaded");
+            tracing::info!(host = %host.xmpp_domain, phase = "load", outcome = if installed { "ready" } else { "unavailable" }, not_after = status.not_after_unix, profile = status.profile.as_deref(), "ACME certificate loaded");
+            if record
+                .certificate
+                .as_ref()
+                .is_some_and(|cert| cert.profile.as_deref() != profile.as_deref())
+            {
+                tracing::info!(host = %host.xmpp_domain, phase = "schedule", outcome = "profile_changed", profile = profile.as_deref(), "ACME certificate profile changed");
+            }
             snapshots.push((host.xmpp_domain, status));
             hosts.push(record);
         }
@@ -208,6 +223,7 @@ impl<I: Installer> Manager<I> {
             status,
             started: false,
             time,
+            profile,
         })
     }
 
@@ -237,6 +253,7 @@ impl<I: Installer> Manager<I> {
                 &self.time,
                 std::mem::take(&mut self.hosts),
                 &self.status,
+                self.profile.as_deref(),
             ),
             shutdown,
         )
@@ -327,12 +344,12 @@ fn state(record: &StoredHost, now: u64) -> HostState {
         _ => HostState::Pending,
     }
 }
-fn issue_due(record: &StoredHost, now: u64) -> u64 {
+fn issue_due(record: &StoredHost, now: u64, profile: Option<&str>) -> u64 {
     record.retry.not_before_unix.max(
         record
             .certificate
             .as_ref()
-            .filter(|cert| now < cert.not_after_unix)
+            .filter(|cert| now < cert.not_after_unix && cert.profile.as_deref() == profile)
             .map_or(0, |cert| cert.renew_at_unix),
     )
 }
@@ -457,7 +474,7 @@ fn housekeeping(
                 && engine.publish_cache(host, clock.now()?)?
             {
                 published[index].1 = true;
-                tracing::info!(host = %host.host.xmpp_domain, phase = "cache", outcome = "ready", not_after = host.certificate.as_ref().map(|cert| cert.not_after_unix), "ACME certificate installed");
+                tracing::info!(host = %host.host.xmpp_domain, phase = "cache", outcome = "ready", not_after = host.certificate.as_ref().map(|cert| cert.not_after_unix), profile = host.certificate.as_ref().and_then(|cert| cert.profile.as_deref()), "ACME certificate installed");
                 let mut snapshots = status.inner.lock();
                 snapshots[index].1.generation = snapshots[index].1.generation.saturating_add(1);
                 event(&mut snapshots[index].1, HostEvent::Installed);
@@ -530,6 +547,7 @@ async fn drive(
     clock: &impl Clock,
     mut hosts: Vec<StoredHost>,
     status: &StatusHandle,
+    profile: Option<&str>,
 ) -> Result<(), ManagerError> {
     let mut jobs: FuturesUnordered<LocalBoxFuture<'_, Completed>> = FuturesUnordered::new();
     let mut busy = vec![false; hosts.len()];
@@ -568,7 +586,7 @@ async fn drive(
             let mut snapshots = status.inner.lock();
             for (index, host) in hosts.iter().enumerate() {
                 let snapshot = &mut snapshots[index].1;
-                let next_attempt = issue_due(host, now).max(account_floor);
+                let next_attempt = issue_due(host, now, profile).max(account_floor);
                 if snapshot.next_attempt_unix != Some(next_attempt) {
                     tracing::debug!(host = %host.host.xmpp_domain, phase = "schedule", retry_seconds = next_attempt.saturating_sub(now), "ACME attempt scheduled");
                 }
@@ -586,7 +604,7 @@ async fn drive(
             {
                 next = next.min(cert.not_before_unix);
             }
-            let issuance = issue_due(host, now).max(account_floor);
+            let issuance = issue_due(host, now, profile).max(account_floor);
             if let Some(abort) = &ari_aborts[index] {
                 next = next.min(issuance.max(now));
                 if issuance <= now {
@@ -709,7 +727,7 @@ async fn drive(
             published[index] = (None, true);
             let mut snapshots = status.inner.lock();
             let snapshot = &mut snapshots[index].1;
-            tracing::info!(host = %hosts[index].host.xmpp_domain, phase = "issuance", outcome = if snapshot.generation == 0 { "issued" } else { "rotated" }, not_after = success.validity.not_after_unix, "ACME certificate installed");
+            tracing::info!(host = %hosts[index].host.xmpp_domain, phase = "issuance", outcome = if snapshot.generation == 0 { "issued" } else { "rotated" }, not_after = success.validity.not_after_unix, profile, "ACME certificate installed");
             snapshot.successes = snapshot.successes.saturating_add(1);
             snapshot.generation = snapshot.generation.saturating_add(1);
             snapshot.not_after_unix = Some(success.validity.not_after_unix);
@@ -734,6 +752,7 @@ async fn drive(
                 return Err(StateError::CorruptData.into());
             }
             hosts[index] = host.clone();
+            status.inner.lock()[index].1.profile = certificate.profile.as_deref().map(Arc::from);
             published[index] = (Some(certificate.material.chain.clone()), true);
             overrides[index] = None;
         }
@@ -774,7 +793,9 @@ async fn drive(
                         }
                     }
                     Err(error) => {
-                        if error.kind != FailureKind::Deferred {
+                        if error.kind == FailureKind::ProfileNotOffered {
+                            tracing::error!(host = %host.host.xmpp_domain, phase = "issuance", outcome = "profile_not_offered", profile, retry_seconds = host.retry.not_before_unix.saturating_sub(now), "ACME certificate profile not offered");
+                        } else if error.kind != FailureKind::Deferred {
                             tracing::warn!(host = %host.host.xmpp_domain, phase = "issuance", outcome = ?error.kind, retry_seconds = host.retry.not_before_unix.saturating_sub(now), "ACME certificate will retry");
                         }
                         if error.state_error.is_some() {

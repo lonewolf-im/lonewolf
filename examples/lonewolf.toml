@@ -124,6 +124,17 @@
 # directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
 # ```
 
+# Choose the certificate profile that Lonewolf requests from the certificate authority.
+# A short-lived profile, such as Let's Encrypt's "shortlived", limits how long a stolen private key stays usable.
+# Short-lived certificates need reliable renewal: if the authority is unreachable for more than a few days, they expire and new client and federation connections fail.
+# Issuance fails if the directory does not offer the profile, and the current certificate stays in use until it expires.
+# Changing the profile renews each managed certificate early.
+# Without this setting, the authority's default profile applies; the value below is an example.
+# ```toml
+# [letsencrypt]
+# certificate_profile = "shortlived"
+# ```
+
 # Add a PEM CA bundle when a private HTTPS directory needs extra trust.
 # This optional path has no default; the value below is an example.
 # ```toml

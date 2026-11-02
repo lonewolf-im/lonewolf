@@ -145,7 +145,7 @@ impl AcmeServices {
             state_path: config.letsencrypt.state_path.clone(),
             ca_certificates_path: config.letsencrypt.ca_certificates_path.clone(),
             hosts: managed,
-            certificate_profile: None,
+            certificate_profile: config.letsencrypt.certificate_profile.clone(),
         };
         let installer = HostInstaller { hosts };
         #[cfg(feature = "test-support")]

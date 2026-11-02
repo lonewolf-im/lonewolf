@@ -243,6 +243,7 @@ pub enum FailureKind {
     Account,
     State,
     Deferred,
+    ProfileNotOffered,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

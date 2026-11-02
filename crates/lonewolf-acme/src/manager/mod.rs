@@ -18,7 +18,7 @@ use crate::time::Time;
 use crate::types::*;
 use crate::{AcmeHttpClient, Challenges, Issuer, StateStore, TransportOptions};
 
-pub const FAILURE_KIND_COUNT: usize = 9;
+pub const FAILURE_KIND_COUNT: usize = 10;
 const EVENT_COUNT: usize = 5;
 
 pub struct ManagerOptions {
@@ -26,6 +26,7 @@ pub struct ManagerOptions {
     pub state_path: PathBuf,
     pub ca_certificates_path: Option<PathBuf>,
     pub hosts: Vec<ManagedHost>,
+    pub certificate_profile: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +139,7 @@ impl<I: Installer> Manager<I> {
                 transport.clone(),
                 options.directory_url,
                 time.clone(),
+                options.certificate_profile.as_deref().map(Arc::from),
             )
             .map_err(fatal)?,
         );

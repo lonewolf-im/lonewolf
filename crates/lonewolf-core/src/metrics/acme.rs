@@ -25,7 +25,7 @@ impl fmt::Debug for AcmeCollector {
     }
 }
 
-const OUTCOMES: [&str; 10] = [
+const OUTCOMES: [&str; 11] = [
     "success",
     "network",
     "timeout",
@@ -36,6 +36,7 @@ const OUTCOMES: [&str; 10] = [
     "account",
     "state",
     "deferred",
+    "profile_not_offered",
 ];
 
 impl Collector for AcmeCollector {

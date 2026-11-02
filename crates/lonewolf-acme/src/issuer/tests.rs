@@ -168,6 +168,8 @@ struct Script {
     missing_challenge: bool,
     wrong_name: bool,
     ari: bool,
+    profile: Option<&'static str>,
+    offered_profiles: Vec<&'static str>,
     replaced: Option<CertificateIdentifier<'static>>,
     hint: Cell<Option<SystemTime>>,
     next_hint: Option<SystemTime>,
@@ -225,6 +227,8 @@ impl Script {
             missing_challenge: false,
             wrong_name: false,
             ari: false,
+            profile: None,
+            offered_profiles: Vec::new(),
             replaced: None,
             hint: Cell::new(None),
             next_hint: None,
@@ -286,6 +290,12 @@ impl Engine for Script {
     fn directory(&self) -> &str {
         DIRECTORY
     }
+    fn profile(&self) -> Option<&str> {
+        self.profile
+    }
+    fn offers_profile(&self, name: &str) -> bool {
+        self.offered_profiles.contains(&name)
+    }
     fn reset_hint(&self) {
         self.hint.set(None);
     }
@@ -341,6 +351,7 @@ impl Engine for Script {
             let pending = records.host.as_ref().unwrap().order.as_ref().unwrap();
             assert_ne!(pending.key_pkcs8.as_slice(), account.key_pkcs8.as_slice());
             assert!(!pending.csr_der.is_empty());
+            assert_eq!(pending.profile.as_deref(), self.profile);
         }
         self.new_orders += 1;
         self.replaced = replaces;
@@ -490,6 +501,262 @@ fn setup() -> (Memory, Challenges, FakeClock, Script, TestInstaller) {
         invalid: None,
     };
     (memory, challenges, FakeClock::default(), script, installer)
+}
+
+#[test]
+fn configured_profile_is_stored_on_the_pending_order_and_the_certificate() {
+    let (memory, challenges, clock, mut engine, installer) = setup();
+    engine.profile = Some("shortlived");
+    engine.offered_profiles.push("shortlived");
+    engine.error = Some(("new order", failure(FailureKind::Network)));
+    let error = block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut engine,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind, FailureKind::Network);
+    assert_eq!(
+        memory
+            .records
+            .lock()
+            .host
+            .as_ref()
+            .unwrap()
+            .order
+            .as_ref()
+            .unwrap()
+            .profile
+            .as_deref(),
+        Some("shortlived")
+    );
+    clock.elapsed.set(Duration::from_secs(60));
+    block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut engine,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap();
+    let records = memory.records.lock();
+    let stored = records.host.as_ref().unwrap();
+    assert!(stored.order.is_none());
+    assert_eq!(
+        stored.certificate.as_ref().unwrap().profile.as_deref(),
+        Some("shortlived")
+    );
+}
+
+#[test]
+fn unoffered_profile_fails_before_key_generation_and_persists_the_retry_floor() {
+    let (memory, challenges, clock, mut engine, installer) = setup();
+    block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut engine,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap();
+    let previous = encode(
+        memory
+            .records
+            .lock()
+            .host
+            .as_ref()
+            .unwrap()
+            .certificate
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let installed = installer.active.lock().clone();
+    engine.profile = Some("shortlived");
+    engine.offered_profiles.push("classic");
+    engine.new_orders = 0;
+    let started = unix(clock.now()).unwrap();
+    let error = block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut engine,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind, FailureKind::ProfileNotOffered);
+    assert_eq!(engine.new_orders, 0);
+    assert_eq!(*installer.active.lock(), installed);
+    let records = memory.records.lock();
+    let stored = records.host.as_ref().unwrap();
+    assert!(stored.order.is_none());
+    assert_eq!(stored.retry.failures, 1);
+    assert_eq!(stored.retry.not_before_unix, started + 60);
+    assert_eq!(
+        encode(stored.certificate.as_ref().unwrap()).unwrap(),
+        previous
+    );
+}
+
+#[test]
+fn pending_order_from_another_profile_is_discarded() {
+    for (previous, configured) in [
+        (Some("classic"), Some("shortlived")),
+        (None, Some("shortlived")),
+        (Some("shortlived"), None),
+    ] {
+        let (memory, challenges, clock, mut engine, installer) = setup();
+        engine.profile = previous;
+        engine.offered_profiles.extend(previous);
+        engine.error = Some(("ready", failure(FailureKind::Network)));
+        block_on(attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut engine,
+            host(),
+            &installer,
+            None,
+        ))
+        .unwrap_err();
+        let pending = memory
+            .records
+            .lock()
+            .host
+            .as_ref()
+            .unwrap()
+            .order
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(pending.url.as_deref(), Some(ORDER));
+        clock.elapsed.set(Duration::from_secs(60));
+        let mut resumed = Script::new(memory.clone(), challenges.clone());
+        resumed.profile = configured;
+        resumed.offered_profiles.extend(configured);
+        block_on(attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut resumed,
+            host(),
+            &installer,
+            None,
+        ))
+        .unwrap();
+        assert_eq!((resumed.resumes, resumed.new_orders), (0, 1));
+        let records = memory.records.lock();
+        let certificate = records.host.as_ref().unwrap().certificate.as_ref().unwrap();
+        assert_ne!(certificate.material.private_key_pkcs8, pending.key_pkcs8);
+        assert_ne!(resumed.csr, pending.csr_der);
+        assert_eq!(certificate.profile.as_deref(), configured);
+    }
+}
+
+#[test]
+fn matching_pending_order_with_url_resumes_without_an_offer_check() {
+    let (memory, challenges, clock, mut engine, installer) = setup();
+    engine.profile = Some("shortlived");
+    engine.offered_profiles.push("shortlived");
+    engine.error = Some(("ready", failure(FailureKind::Network)));
+    block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut engine,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap_err();
+    let pending = memory
+        .records
+        .lock()
+        .host
+        .as_ref()
+        .unwrap()
+        .order
+        .as_ref()
+        .unwrap()
+        .clone();
+    clock.elapsed.set(Duration::from_secs(60));
+    let mut resumed = Script::new(memory.clone(), challenges.clone());
+    resumed.profile = Some("shortlived");
+    block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut resumed,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap();
+    assert_eq!((resumed.resumes, resumed.new_orders), (1, 0));
+    assert_eq!(resumed.csr, pending.csr_der);
+    let records = memory.records.lock();
+    let certificate = records.host.as_ref().unwrap().certificate.as_ref().unwrap();
+    assert_eq!(certificate.material.private_key_pkcs8, pending.key_pkcs8);
+    assert_eq!(certificate.profile.as_deref(), Some("shortlived"));
+}
+
+#[test]
+fn matching_pending_order_without_url_rechecks_offers() {
+    let (memory, challenges, clock, mut engine, installer) = setup();
+    engine.profile = Some("shortlived");
+    engine.offered_profiles.push("shortlived");
+    engine.error = Some(("new order", failure(FailureKind::Network)));
+    block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut engine,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap_err();
+    let pending = memory
+        .records
+        .lock()
+        .host
+        .as_ref()
+        .unwrap()
+        .order
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(pending.url.is_none());
+    clock.elapsed.set(Duration::from_secs(60));
+    let mut resumed = Script::new(memory.clone(), challenges.clone());
+    resumed.profile = Some("shortlived");
+    let error = block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut resumed,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind, FailureKind::ProfileNotOffered);
+    assert_eq!((resumed.resumes, resumed.new_orders), (0, 0));
+    let records = memory.records.lock();
+    let stored = records.host.as_ref().unwrap().order.as_ref().unwrap();
+    assert_eq!(stored.key_pkcs8, pending.key_pkcs8);
+    assert_eq!(stored.csr_der, pending.csr_der);
+    assert_eq!(stored.profile, pending.profile);
 }
 
 #[test]
@@ -1322,6 +1589,206 @@ impl HttpClient for Responses {
     }
 }
 
+struct RecordedRequest {
+    method: http::Method,
+    uri: http::Uri,
+    body: Bytes,
+}
+
+#[derive(Clone)]
+struct Recording {
+    responses: Responses,
+    requests: Arc<PlMutex<Vec<RecordedRequest>>>,
+}
+
+impl Recording {
+    fn new(responses: VecDeque<http::Response<Full<Bytes>>>) -> Self {
+        Self {
+            responses: Responses(Arc::new(PlMutex::new(responses))),
+            requests: Arc::new(PlMutex::new(Vec::new())),
+        }
+    }
+}
+
+impl AttemptTransport for Recording {
+    fn reset_retry_hint(&self) {}
+    fn retry_not_before(&self) -> Option<SystemTime> {
+        None
+    }
+}
+
+impl HttpClient for Recording {
+    fn request(
+        &self,
+        request: http::Request<instant_acme::BodyWrapper<Bytes>>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<instant_acme::BytesResponse, instant_acme::Error>> + Send>,
+    > {
+        use http_body_util::BodyExt;
+
+        let requests = self.requests.clone();
+        let response = self.responses.0.lock().pop_front();
+        Box::pin(async move {
+            let (parts, body) = request.into_parts();
+            let body = body
+                .collect()
+                .await
+                .map_err(|_| {
+                    instant_acme::Error::Other(Box::new(AcmeError::new(AcmeErrorKind::Other)))
+                })?
+                .to_bytes();
+            requests.lock().push(RecordedRequest {
+                method: parts.method,
+                uri: parts.uri,
+                body,
+            });
+            response.map(Into::into).ok_or_else(|| {
+                instant_acme::Error::Other(Box::new(AcmeError::new(AcmeErrorKind::Timeout)))
+            })
+        })
+    }
+}
+
+#[test]
+fn upstream_serializes_only_the_requested_profile_in_signed_new_orders() {
+    block_on(async {
+        for profile in [Some("shortlived"), None] {
+            let (memory, challenges, clock, _, installer) = setup();
+            let directory = json!({"newNonce":"https://ca.example/nonce","newAccount":"https://ca.example/account","newOrder":"https://ca.example/new-order","meta":{"profiles":{"shortlived":"https://ca.example/profiles/shortlived"}}});
+            let order = |status: &str| json!({"status":status,"profile":"shortlived","authorizations":[],"identifiers":[{"type":"dns","value":DNS}],"expires":"2027-01-15T10:46:40Z","finalize":"https://ca.example/finalize","certificate":"https://ca.example/certificate"});
+            let mut created = response(201, order("ready").to_string());
+            created
+                .headers_mut()
+                .insert(http::header::LOCATION, ORDER.parse().unwrap());
+            let transport = Recording::new(VecDeque::from([
+                response(200, directory.to_string()),
+                response(200, ""),
+                created,
+                response(200, order("valid").to_string()),
+                response(200, pem(&certificate())),
+            ]));
+            let mut engine =
+                Upstream::new(transport.clone(), DIRECTORY).with_profile(profile.map(Arc::from));
+            attempt(
+                &memory,
+                &challenges,
+                &clock,
+                &mut engine,
+                host(),
+                &installer,
+                None,
+            )
+            .await
+            .unwrap();
+            let requests = transport.requests.lock();
+            let request = requests
+                .iter()
+                .find(|request| request.uri == "https://ca.example/new-order")
+                .unwrap();
+            assert_eq!(request.method, http::Method::POST);
+            let jws: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let payload = URL_SAFE_NO_PAD
+                .decode(jws["payload"].as_str().unwrap())
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                payload.get("profile"),
+                profile.map(|name| json!(name)).as_ref()
+            );
+            let records = memory.records.lock();
+            assert_eq!(
+                records
+                    .host
+                    .as_ref()
+                    .unwrap()
+                    .certificate
+                    .as_ref()
+                    .unwrap()
+                    .profile
+                    .as_deref(),
+                profile
+            );
+            assert!(transport.responses.0.lock().is_empty());
+        }
+    });
+}
+
+#[test]
+fn upstream_unoffered_profile_stops_after_the_directory_request() {
+    block_on(async {
+        for profiles in [
+            None,
+            Some(json!({"classic":"https://ca.example/profiles/classic"})),
+        ] {
+            let (memory, challenges, clock, _, installer) = setup();
+            let mut directory = json!({"newNonce":"https://ca.example/nonce","newAccount":"https://ca.example/account","newOrder":"https://ca.example/new-order"});
+            if let Some(profiles) = profiles {
+                directory["meta"] = json!({"profiles":profiles});
+            }
+            let transport = Recording::new(VecDeque::from([response(200, directory.to_string())]));
+            let mut engine = Upstream::new(transport.clone(), DIRECTORY)
+                .with_profile(Some(Arc::from("shortlived")));
+            let error = attempt(
+                &memory,
+                &challenges,
+                &clock,
+                &mut engine,
+                host(),
+                &installer,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, FailureKind::ProfileNotOffered);
+            let requests = transport.requests.lock();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, http::Method::GET);
+            assert_eq!(requests[0].uri, DIRECTORY);
+            assert!(memory.records.lock().host.as_ref().unwrap().order.is_none());
+            assert!(installer.active.lock().is_empty());
+            assert!(transport.responses.0.lock().is_empty());
+        }
+    });
+}
+
+#[test]
+fn upstream_invalid_profile_rejection_keeps_pending_intent_and_redacts_details() {
+    block_on(async {
+        let (memory, challenges, clock, _, installer) = setup();
+        let directory = json!({"newNonce":"https://ca.example/nonce","newAccount":"https://ca.example/account","newOrder":"https://ca.example/new-order","meta":{"profiles":{"shortlived":"https://ca.example/profiles/shortlived"}}});
+        let transport = Recording::new(VecDeque::from([
+            response(200, directory.to_string()),
+            response(200, ""),
+            response(400, json!({"type":"urn:ietf:params:acme:error:invalidProfile","status":400,"detail":"PRIVATE-CA-DETAIL"}).to_string()),
+        ]));
+        let mut engine =
+            Upstream::new(transport.clone(), DIRECTORY).with_profile(Some(Arc::from("shortlived")));
+        let error = attempt(
+            &memory,
+            &challenges,
+            &clock,
+            &mut engine,
+            host(),
+            &installer,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, FailureKind::ProfileNotOffered);
+        assert_eq!(error.status, Some(400));
+        assert!(!format!("{error} {error:?}").contains("PRIVATE-CA-DETAIL"));
+        let records = memory.records.lock();
+        let pending = records.host.as_ref().unwrap().order.as_ref().unwrap();
+        assert!(pending.url.is_none());
+        assert_eq!(pending.profile.as_deref(), Some("shortlived"));
+        assert!(!pending.key_pkcs8.is_empty());
+        assert!(!pending.csr_der.is_empty());
+        assert!(installer.active.lock().is_empty());
+        assert_eq!(transport.requests.lock().len(), 3);
+        assert!(transport.responses.0.lock().is_empty());
+    });
+}
+
 fn response(status: u16, bytes: impl Into<Bytes>) -> http::Response<Full<Bytes>> {
     http::Response::builder()
         .status(status)
@@ -1427,6 +1894,7 @@ fn error_classification_retains_no_remote_details() {
         ("rateLimited", FailureKind::RateLimited),
         ("accountDoesNotExist", FailureKind::Account),
         ("unauthorized", FailureKind::Authorization),
+        ("invalidProfile", FailureKind::ProfileNotOffered),
         ("unknown", FailureKind::Protocol),
     ] {
         let error: instant_acme::Problem = serde_json::from_value(json!({"type":format!("urn:ietf:params:acme:error:{kind}"),"detail":"secret remote response","status":400})).unwrap();
@@ -1632,6 +2100,29 @@ fn directory_observer_uses_parsed_uri_and_rejects_null_or_unsafe_ari() {
                 );
             }
         }
+    });
+}
+
+#[test]
+fn constructor_rejects_invalid_profile_before_network() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("state.redb"), DIRECTORY.into())
+            .await
+            .unwrap();
+        let transport = AcmeHttpClient::new(Default::default()).await.unwrap();
+        let issuer = Issuer::with_time(
+            store,
+            Challenges::new(&[host()]).unwrap(),
+            transport,
+            DIRECTORY.into(),
+            Time::default(),
+            Some(Arc::from("short lived")),
+        );
+        assert_eq!(
+            issuer.err().unwrap().state_error,
+            Some(StateError::InvalidData)
+        );
     });
 }
 

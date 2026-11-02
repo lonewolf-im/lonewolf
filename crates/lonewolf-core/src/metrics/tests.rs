@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use parking_lot::Mutex as PlMutex;
 
 #[test]
 fn server_metrics_encode_build_logging_and_process_metrics() -> Result<(), fmt::Error> {
@@ -29,11 +30,11 @@ fn server_metrics_encode_build_logging_and_process_metrics() -> Result<(), fmt::
 }
 
 #[derive(Debug)]
-struct AcmeSnapshot(Vec<(String, lonewolf_acme::HostStatus)>);
+struct AcmeSnapshot(Arc<PlMutex<Vec<(String, lonewolf_acme::HostStatus)>>>);
 
 impl Collector for AcmeSnapshot {
     fn encode(&self, encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
-        super::acme::encode_hosts(&self.0, encoder)
+        super::acme::encode_hosts(&self.0.lock(), encoder)
     }
 }
 
@@ -42,6 +43,7 @@ fn acme_metrics_use_exact_names_fixed_outcomes_and_omit_unknown_dates() -> Resul
     use lonewolf_acme::{HostEvent, HostState, HostStatus};
     let mut ready = HostStatus {
         state: HostState::Ready,
+        profile: None,
         not_after_unix: Some(1_800_001_000),
         next_attempt_unix: Some(1_800_000_500),
         attempts: 46,
@@ -59,30 +61,40 @@ fn acme_metrics_use_exact_names_fixed_outcomes_and_omit_unknown_dates() -> Resul
         ..ready.clone()
     };
     ready.state = HostState::Expired;
+    let hosts = Arc::new(PlMutex::new(vec![
+        (
+            "configured.example".into(),
+            HostStatus {
+                state: HostState::Ready,
+                profile: Some("shortlived".into()),
+                ..ready.clone()
+            },
+        ),
+        ("pending.example".into(), pending),
+        ("expired.example".into(), ready),
+    ]));
     registry
         .sub_registry_with_prefix("lonewolf")
-        .register_collector(Box::new(AcmeSnapshot(vec![
-            (
-                "configured.example".into(),
-                HostStatus {
-                    state: HostState::Ready,
-                    ..ready.clone()
-                },
-            ),
-            ("pending.example".into(), pending),
-            ("expired.example".into(), ready),
-        ])));
+        .register_collector(Box::new(AcmeSnapshot(hosts.clone())));
     let mut output = String::new();
     prometheus_client::encoding::text::encode(&mut output, &registry)?;
     for sample in [
         "lonewolf_acme_certificate_ready{host=\"configured.example\"} 1",
         "lonewolf_acme_certificate_ready{host=\"pending.example\"} 0",
         "lonewolf_acme_certificate_ready{host=\"expired.example\"} 0",
+        "lonewolf_acme_certificate_profile_info{host=\"configured.example\",profile=\"shortlived\"} 1",
         "lonewolf_acme_certificate_not_after_seconds{host=\"configured.example\"} 1800001000.0",
         "lonewolf_acme_next_attempt_seconds{host=\"configured.example\"} 1800000500.0",
     ] {
         assert!(output.lines().any(|line| line == sample), "{output}");
     }
+    assert!(
+        !output.lines().any(
+            |line| line.starts_with("lonewolf_acme_certificate_profile_info{")
+                && (line.contains("pending.example") || line.contains("expired.example"))
+        ),
+        "{output}"
+    );
     assert!(
         !output.lines().any(|line| (line
             .starts_with("lonewolf_acme_certificate_not_after_seconds{")
@@ -119,13 +131,33 @@ fn acme_metrics_use_exact_names_fixed_outcomes_and_omit_unknown_dates() -> Resul
             .count(),
         33
     );
+    for profile in [Some("classic"), None] {
+        hosts.lock()[0].1.profile = profile.map(Arc::from);
+        output.clear();
+        prometheus_client::encoding::text::encode(&mut output, &registry)?;
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("lonewolf_acme_certificate_profile_info{"))
+                .count(),
+            usize::from(profile.is_some()),
+            "{output}"
+        );
+        assert!(!output.contains("profile=\"shortlived\""), "{output}");
+        if let Some(profile) = profile {
+            let sample = format!(
+                "lonewolf_acme_certificate_profile_info{{host=\"configured.example\",profile=\"{profile}\"}} 1"
+            );
+            assert!(output.lines().any(|line| line == sample), "{output}");
+        }
+    }
     Ok(())
 }
 
 #[test]
 fn acme_without_managed_hosts_emits_no_series_or_descriptors() -> Result<(), fmt::Error> {
     let mut registry = Registry::default();
-    registry.register_collector(Box::new(AcmeSnapshot(Vec::new())));
+    registry.register_collector(Box::new(AcmeSnapshot(Arc::new(PlMutex::new(Vec::new())))));
     let mut output = String::new();
     prometheus_client::encoding::text::encode(&mut output, &registry)?;
     assert_eq!(output, "# EOF\n");

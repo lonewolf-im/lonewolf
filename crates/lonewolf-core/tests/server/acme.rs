@@ -164,7 +164,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, description: &str) -> TestRes
     }
 }
 
-fn wait_for_failed_attempt(server: &C2sSuite, outcome: Option<&str>) -> TestResult {
+fn wait_for_failed_attempt(server: &C2sSuite, outcome: Option<&str>, count: u64) -> TestResult {
     wait_until(
         || {
             server.metrics().is_ok_and(|metrics| {
@@ -181,11 +181,253 @@ fn wait_for_failed_attempt(server: &C2sSuite, outcome: Option<&str>) -> TestResu
                     .filter_map(|line| line.rsplit_once(' '))
                     .filter_map(|(_, value)| value.parse::<u64>().ok())
                     .sum::<u64>()
-                    == 1
+                    == count
             })
         },
         "failed attempt metric",
     )
+}
+
+fn certificate_validity(bytes: &[u8]) -> TestResult<(u64, u64)> {
+    use x509_cert::der::Decode;
+    let certificate = x509_cert::Certificate::from_der(bytes)?;
+    let validity = certificate.tbs_certificate().validity();
+    Ok((
+        validity.not_before.to_unix_duration().as_secs(),
+        validity.not_after.to_unix_duration().as_secs(),
+    ))
+}
+
+fn next_attempt(server: &C2sSuite) -> TestResult<f64> {
+    Ok(server
+        .metrics()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("lonewolf_acme_next_attempt_seconds{host=\"xmpp.example.test\"} ")
+        })
+        .ok_or("next attempt metric")?
+        .parse()?)
+}
+
+#[test]
+fn configured_profile_is_requested_and_recorded_with_its_lifetime_and_schedule() -> TestResult {
+    let ca = FakeAcmeCa::start()?;
+    ca.profiles(&[("classic", 86_400), ("shortlived", 576_000)]);
+    ca.set_fault(AcmeStage::Ari, AcmeFault::Hold);
+    let mut server = C2sSuite::configure(
+        &ca,
+        "[hosts.\"xmpp.example.test\".tls]\nprovider='letsencrypt'",
+        "[metrics]\nenabled=true\naddress='127.0.0.1:0'",
+    )?;
+    server.replace_config(&server.config()?.replacen(
+        "[letsencrypt]\n",
+        "[letsencrypt]\ncertificate_profile = 'shortlived'\n",
+        1,
+    ))?;
+    server.start(&ca)?;
+    let certificate = server.wait_certificate(None)?;
+    let (not_before, not_after) = certificate_validity(&certificate)?;
+    let lifetime = not_after - not_before;
+    assert!(lifetime >= 576_000);
+    assert_eq!(ca.counts().profiles, [Some("shortlived".into())]);
+    let renewal = not_before + lifetime / 2;
+    let window = (renewal - lifetime / 20) as f64..=renewal as f64;
+    wait_until(
+        || next_attempt(&server).is_ok_and(|next| window.contains(&next)),
+        "profile fallback schedule",
+    )?;
+    let next = next_attempt(&server)?;
+    assert!(window.contains(&next));
+    assert!(server.metrics()?.lines().any(|line| {
+        line == "lonewolf_acme_certificate_profile_info{host=\"xmpp.example.test\",profile=\"shortlived\"} 1"
+    }));
+    assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
+    let (_, record) = server.records()?;
+    let record = record.ok_or("record")?;
+    let stored = record.certificate.ok_or("certificate")?;
+    assert_eq!(stored.profile.as_deref(), Some("shortlived"));
+    assert_eq!(stored.material.chain[0], certificate);
+    assert_eq!(stored.renew_at_unix as f64, next);
+    assert_eq!(stored.fallback_at_unix as f64, next);
+    assert!(stored.ari_window.is_none());
+    assert!(record.order.is_none());
+    assert!(ca.counts().errors.is_empty(), "{:?}", ca.counts());
+    Ok(())
+}
+
+#[test]
+fn unoffered_profile_sends_no_order_and_keeps_serving_the_current_certificate() -> TestResult {
+    let ca = FakeAcmeCa::start()?;
+    ca.profiles(&[("tlsserver", 86_400)]);
+    ca.set_fault(AcmeStage::Ari, AcmeFault::Hold);
+    let mut server = C2sSuite::configure(
+        &ca,
+        "[hosts.\"xmpp.example.test\".tls]\nprovider='letsencrypt'",
+        "[metrics]\nenabled=true\naddress='127.0.0.1:0'",
+    )?;
+    server.start(&ca)?;
+    let a = server.wait_certificate(None)?;
+    assert_eq!(ca.counts().profiles, [None]);
+    assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
+    assert!(
+        server
+            .records()?
+            .1
+            .ok_or("record")?
+            .certificate
+            .ok_or("certificate")?
+            .profile
+            .is_none()
+    );
+    server.replace_config(&server.config()?.replacen(
+        "[letsencrypt]\n",
+        "[letsencrypt]\ncertificate_profile = 'shortlived'\n",
+        1,
+    ))?;
+    server.start(&ca)?;
+    assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
+    wait_for_failed_attempt(&server, Some("profile_not_offered"), 1)?;
+    assert!(
+        server.metrics()?.lines().any(|line| {
+            line == "lonewolf_acme_certificate_ready{host=\"xmpp.example.test\"} 1"
+        })
+    );
+    assert_eq!(ca.counts().at(AcmeStage::NewOrder), 1);
+    assert_eq!(ca.counts().profiles, [None]);
+    assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
+    let (_, record) = server.records()?;
+    let record = record.ok_or("record")?;
+    let stored = record.certificate.ok_or("certificate")?;
+    assert_eq!(stored.material.chain[0], a);
+    assert!(stored.profile.is_none());
+    assert!(record.order.is_none());
+    assert!(
+        record.retry.not_before_unix
+            > std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs()
+    );
+    assert!(ca.counts().errors.is_empty(), "{:?}", ca.counts());
+    Ok(())
+}
+
+#[test]
+fn profile_change_renews_early_then_follows_the_new_certificate_schedule() -> TestResult {
+    let ca = FakeAcmeCa::start()?;
+    ca.profiles(&[("shortlived", 576_000)]);
+    ca.set_fault(AcmeStage::Ari, AcmeFault::Hold);
+    let mut server = C2sSuite::configure(
+        &ca,
+        "[hosts.\"xmpp.example.test\".tls]\nprovider='letsencrypt'",
+        "[metrics]\nenabled=true\naddress='127.0.0.1:0'",
+    )?;
+    server.start(&ca)?;
+    let a = server.wait_certificate(None)?;
+    assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
+    server.replace_config(&server.config()?.replacen(
+        "[letsencrypt]\n",
+        "[letsencrypt]\ncertificate_profile = 'shortlived'\n",
+        1,
+    ))?;
+    ca.set_fault(AcmeStage::Certificate, AcmeFault::Hold);
+    server.start(&ca)?;
+    ca.wait_count(AcmeStage::Certificate, 2)?;
+    assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
+    ca.release(AcmeStage::Certificate);
+    let b = server.wait_certificate(Some(&a))?;
+    assert_ne!(a, b);
+    let (not_before, not_after) = certificate_validity(&b)?;
+    let lifetime = not_after - not_before;
+    assert!(lifetime >= 576_000);
+    assert_eq!(ca.counts().profiles, [None, Some("shortlived".into())]);
+    let renewal = not_before + lifetime / 2;
+    let window = (renewal - lifetime / 20) as f64..=renewal as f64;
+    wait_until(
+        || next_attempt(&server).is_ok_and(|next| window.contains(&next)),
+        "replacement profile fallback schedule",
+    )?;
+    let next = next_attempt(&server)?;
+    assert!(window.contains(&next));
+    assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
+    server.start(&ca)?;
+    assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, b);
+    assert_eq!(next_attempt(&server)?, next);
+    assert_eq!(ca.counts().at(AcmeStage::NewOrder), 2);
+    assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
+    let record = server.records()?.1.ok_or("record")?;
+    let stored = record.certificate.ok_or("certificate")?;
+    assert_eq!(stored.material.chain[0], b);
+    assert_eq!(stored.profile.as_deref(), Some("shortlived"));
+    assert_eq!(stored.renew_at_unix as f64, next);
+    assert_eq!(stored.fallback_at_unix as f64, next);
+    assert!(stored.ari_window.is_none());
+    assert!(record.order.is_none());
+    assert!(ca.counts().errors.is_empty(), "{:?}", ca.counts());
+    Ok(())
+}
+
+#[test]
+fn short_lifetime_renewal_retries_stay_within_the_lifetime_cap() -> TestResult {
+    let ca = FakeAcmeCa::start()?;
+    ca.profiles(&[("shortlived", 576_000 - 60)]);
+    ca.set_fault(AcmeStage::Ari, AcmeFault::Hold);
+    let mut server = C2sSuite::configure(
+        &ca,
+        "[hosts.\"xmpp.example.test\".tls]\nprovider='letsencrypt'",
+        "[metrics]\nenabled=true\naddress='127.0.0.1:0'",
+    )?;
+    server.replace_config(&server.config()?.replacen(
+        "[letsencrypt]\n",
+        "[letsencrypt]\ncertificate_profile = 'shortlived'\n",
+        1,
+    ))?;
+    server.enable_clock();
+    server.start(&ca)?;
+    let a = server.wait_certificate(None)?;
+    let (not_before, not_after) = certificate_validity(&a)?;
+    let lifetime = not_after - not_before;
+    assert_eq!(lifetime, 576_000);
+    let renewal = not_before + lifetime / 2;
+    let window = (renewal - lifetime / 20) as f64..=renewal as f64;
+    wait_until(
+        || next_attempt(&server).is_ok_and(|next| window.contains(&next)),
+        "initial short-lifetime schedule",
+    )?;
+    let frozen = server.freeze_clock()?;
+    assert_eq!(server.parked_clock(frozen.generation)?.now, frozen.now);
+    ca.set_fault(AcmeStage::NewOrder, AcmeFault::Status(503, 1));
+    for (count, minimum, maximum) in [
+        (1, 60.0, 66.0),
+        (2, 600.0, 660.0),
+        (3, 6_000.0, 6_600.0),
+        (4, 24_000.0, 26_400.0),
+    ] {
+        let due = next_attempt(&server)?;
+        assert_eq!(due.fract(), 0.0);
+        let until = std::time::UNIX_EPOCH + std::time::Duration::from_secs(due as u64);
+        let generation = server.advance_clock(until)?;
+        wait_for_failed_attempt(&server, Some("network"), count)?;
+        assert_eq!(server.parked_clock(generation)?.now, until);
+        let delay = next_attempt(&server)? - due;
+        assert!(
+            (minimum..=maximum).contains(&delay),
+            "failure {count}: retry delay {delay}"
+        );
+    }
+    let retry_floor = next_attempt(&server)?;
+    assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
+    assert_eq!(ca.counts().at(AcmeStage::NewOrder), 5);
+    assert_eq!(ca.counts().profiles, vec![Some("shortlived".into()); 5]);
+    server.resume_clock()?;
+    assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
+    let record = server.records()?.1.ok_or("record")?;
+    assert_eq!(record.retry.failures, 4);
+    assert_eq!(record.retry.not_before_unix as f64, retry_floor);
+    let stored = record.certificate.ok_or("certificate")?;
+    assert_eq!(stored.material.chain[0], a);
+    assert_eq!(stored.profile.as_deref(), Some("shortlived"));
+    assert!(ca.counts().errors.is_empty(), "{:?}", ca.counts());
+    Ok(())
 }
 
 fn rotation(versions: &[&'static rustls::SupportedProtocolVersion], binding: &str) -> TestResult {
@@ -444,7 +686,7 @@ fn failure_preserves(stage: AcmeStage, fault: AcmeFault, expected: &str) -> Test
     ca.set_fault(stage, fault);
     ca.release(AcmeStage::Ari);
     ca.wait_count(stage, before + 1)?;
-    wait_for_failed_attempt(&server, Some(expected))?;
+    wait_for_failed_attempt(&server, Some(expected), 1)?;
     assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
     bound.send("<iq type='get' id='survived'><query xmlns='jabber:iq:roster'/></iq>")?;
     assert_eq!(bound.receive()?.attribute("type"), Some("result"));
@@ -531,7 +773,7 @@ fn slow_https_ca_times_out_preserving_old_material_and_shutdown_deadline() -> Te
     ca.set_fault(AcmeStage::Certificate, AcmeFault::Hold);
     ca.release(AcmeStage::Ari);
     ca.wait_count(AcmeStage::Certificate, 2)?;
-    wait_for_failed_attempt(&server, None)?;
+    wait_for_failed_attempt(&server, None, 1)?;
     assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
     let start = std::time::Instant::now();
     assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());

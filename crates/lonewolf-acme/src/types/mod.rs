@@ -19,6 +19,7 @@ const MAX_CHAIN: usize = 1024 * 1024;
 const MAX_KEY: usize = 16 * 1024;
 const MAX_CREDENTIALS: usize = 64 * 1024;
 const MAX_URL: usize = 8 * 1024;
+const MAX_PROFILE: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcmeErrorKind {
@@ -148,6 +149,12 @@ pub struct PendingOrder {
     pub csr_der: Vec<u8>,
     pub started_unix: u64,
     pub expires_unix: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_profile"
+    )]
+    pub profile: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -171,6 +178,12 @@ pub struct StoredCertificate {
     pub fallback_at_unix: u64,
     pub ari_window: Option<AriWindow>,
     pub ari_failures: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_profile"
+    )]
+    pub profile: Option<String>,
 }
 
 impl StoredCertificate {
@@ -368,6 +381,13 @@ impl StoredHost {
         }
         timestamp(self.retry.not_before_unix)?;
         if let Some(certificate) = &self.certificate {
+            if certificate
+                .profile
+                .as_deref()
+                .is_some_and(|name| !is_valid_profile_name(name))
+            {
+                return Err(StateError::InvalidData);
+            }
             if let Some(replaces) = &certificate.replaces {
                 validate_replacement(replaces)?;
             }
@@ -404,6 +424,13 @@ impl StoredHost {
             }
         }
         if let Some(order) = &self.order {
+            if order
+                .profile
+                .as_deref()
+                .is_some_and(|name| !is_valid_profile_name(name))
+            {
+                return Err(StateError::InvalidData);
+            }
             if let Some(replaces) = &order.replaces {
                 validate_replacement(replaces)?;
                 let certificate = self.certificate.as_ref().ok_or(StateError::InvalidData)?;
@@ -489,6 +516,14 @@ fn dns_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Err
     bounded_string::<D, 253>(deserializer)
 }
 
+pub fn is_valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PROFILE
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
 mod optional_url {
     use super::*;
 
@@ -505,6 +540,32 @@ mod optional_url {
         #[derive(Deserialize)]
         struct Url(#[serde(deserialize_with = "url_string")] String);
         Option::<Url>::deserialize(deserializer).map(|value| value.map(|url| url.0))
+    }
+}
+
+mod optional_profile {
+    use super::*;
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        fn profile<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+            let value = bounded_string::<D, MAX_PROFILE>(deserializer)?;
+            if !is_valid_profile_name(&value) {
+                return Err(D::Error::custom("invalid certificate profile"));
+            }
+            Ok(value)
+        }
+        #[derive(Deserialize)]
+        struct Profile(#[serde(deserialize_with = "profile")] String);
+        Option::<Profile>::deserialize(deserializer).map(|value| value.map(|profile| profile.0))
     }
 }
 

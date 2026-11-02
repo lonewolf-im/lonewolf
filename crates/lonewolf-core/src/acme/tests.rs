@@ -142,6 +142,7 @@ fn cache_installs_before_service_poll_and_shares_one_owner_across_host_clones() 
                     fallback_at_unix: (now + 500) as u64,
                     ari_window: None,
                     ari_failures: 0,
+                    profile: None,
                 }),
                 order: None,
                 retry: RetryState {

@@ -625,6 +625,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                 csr_der,
                 started_unix: unix(self.clock.now())?,
                 expires_unix: None,
+                profile: None,
             });
         }
         let pending = self.host.order.as_ref().ok_or(StateError::CorruptData)?;
@@ -758,6 +759,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                         fallback_at_unix: renew_at_unix,
                         ari_window: None,
                         ari_failures: 0,
+                        profile: None,
                     });
                     self.host.order = None;
                     self.host.retry = RetryState {

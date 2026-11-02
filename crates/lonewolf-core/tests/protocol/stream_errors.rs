@@ -63,10 +63,8 @@ fn plaintext_parser_failure_half_closes_and_holds_capacity_until_peer_eof() -> T
     assert_eq!(client.transport().read(&mut [0; 1])?, 0);
 
     let mut rejected = suite.tcp_client()?;
-    rejected
-        .transport()
-        .set_read_timeout(Some(Duration::from_millis(200)))?;
     rejected.expect_eof()?;
+    suite.wait_for_metric("lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"max_connections_per_ip\"} 1")?;
     client.transport().shutdown(Shutdown::Write)?;
     suite.wait_for_closed("not_well_formed", 1)?;
     let mut replacement = suite.tcp_client()?;
@@ -88,10 +86,8 @@ fn silent_plaintext_drain_peer_releases_capacity_at_the_original_deadline() -> T
     assert!(!client.has_buffered_input());
     assert_eq!(client.transport().read(&mut [0; 1])?, 0);
     let mut rejected = suite.tcp_client()?;
-    rejected
-        .transport()
-        .set_read_timeout(Some(Duration::from_millis(200)))?;
     rejected.expect_eof()?;
+    suite.wait_for_metric("lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"max_connections_per_ip\"} 1")?;
     suite.wait_for_closed("not_well_formed", 1)?;
     assert!((Duration::from_secs(5)..Duration::from_secs(7)).contains(&started.elapsed()));
     let mut replacement = suite.tcp_client()?;
@@ -110,27 +106,22 @@ fn healthy_plaintext_close_waits_for_footer_then_holds_capacity_until_peer_eof()
         .child(super::support::STREAM_ERRORS, "not-authorized")?;
     client.expect_footer()?;
     assert!(!client.has_buffered_input());
+    let timeout = client.transport().read_timeout()?;
     client
         .transport()
         .set_read_timeout(Some(Duration::from_millis(100)))?;
-    let error = client
-        .transport()
-        .read(&mut [0; 1])
-        .expect_err("FIN preceded the reciprocal footer");
+    let result = client.transport().read_exact(&mut [0; 1]);
+    client.transport().set_read_timeout(timeout)?;
+    let error = result.expect_err("FIN preceded the reciprocal footer");
     assert!(matches!(
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     ));
-    client
-        .transport()
-        .set_read_timeout(Some(Duration::from_secs(2)))?;
     client.send("</stream:stream>")?;
     assert_eq!(client.transport().read(&mut [0; 1])?, 0);
     let mut rejected = suite.tcp_client()?;
-    rejected
-        .transport()
-        .set_read_timeout(Some(Duration::from_millis(200)))?;
     rejected.expect_eof()?;
+    suite.wait_for_metric("lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"max_connections_per_ip\"} 1")?;
     client.transport().shutdown(Shutdown::Write)?;
     suite.wait_for_closed("unsupported_input", 1)?;
     let mut replacement = suite.tcp_client()?;

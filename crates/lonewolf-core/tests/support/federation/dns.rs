@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{
@@ -18,7 +18,9 @@ use hickory_proto::rr::{
 };
 use parking_lot::Mutex as PlMutex;
 
-use super::super::TestResult;
+use super::super::{TIMEOUT, TestResult};
+
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct Answers {
@@ -190,6 +192,46 @@ fn serve(
     answers: &PlMutex<Answers>,
     stopped: &AtomicBool,
 ) -> io::Result<()> {
+    thread::scope(|scope| {
+        let mut workers = Vec::new();
+        let result = serve_queries(udp, tcp, answers, stopped, |stream| {
+            let mut index = 0;
+            while index < workers.len() {
+                let worker: &thread::ScopedJoinHandle<'_, io::Result<()>> = &workers[index];
+                if worker.is_finished() {
+                    workers
+                        .swap_remove(index)
+                        .join()
+                        .map_err(|_| io::Error::other("fake DNS TCP worker panicked"))??;
+                } else {
+                    index += 1;
+                }
+            }
+            workers.push(scope.spawn(move || serve_tcp(stream, answers, stopped)));
+            Ok(())
+        });
+        stopped.store(true, Ordering::Release);
+        let mut outcome = result;
+        for worker in workers {
+            let result = worker
+                .join()
+                .map_err(|_| io::Error::other("fake DNS TCP worker panicked"))
+                .and_then(std::convert::identity);
+            if outcome.is_ok() {
+                outcome = result;
+            }
+        }
+        outcome
+    })
+}
+
+fn serve_queries(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    answers: &PlMutex<Answers>,
+    stopped: &AtomicBool,
+    mut accept: impl FnMut(TcpStream) -> io::Result<()>,
+) -> io::Result<()> {
     let mut bytes = [0; 65535];
     while !stopped.load(Ordering::Acquire) {
         let mut descriptors = [udp.as_raw_fd(), tcp.as_raw_fd()].map(|fd| nix::libc::pollfd {
@@ -214,8 +256,12 @@ fn serve(
         }
         if descriptors[1].revents & nix::libc::POLLIN != 0 {
             match tcp.accept() {
-                Ok((stream, _)) => serve_tcp(stream, answers, stopped)?,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Ok((stream, _)) => accept(stream)?,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -229,40 +275,56 @@ fn serve_tcp(
     stopped: &AtomicBool,
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(100)))?;
     let mut bytes = Vec::new();
     while !stopped.load(Ordering::Acquire) {
+        let deadline = Instant::now() + TIMEOUT;
         let mut length = [0; 2];
-        match stream.read_exact(&mut length) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
+        if !read_exact_until(&mut stream, &mut length, stopped, deadline)? {
+            return Ok(());
         }
         bytes.resize(usize::from(u16::from_be_bytes(length)), 0);
-        if let Err(error) = stream.read_exact(&mut bytes) {
-            if matches!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) {
-                return Ok(());
-            }
-            return Err(error);
+        if !read_exact_until(&mut stream, &mut bytes, stopped, deadline)? {
+            return Ok(());
         }
         if let Some(response) = answer(&bytes, answers)? {
+            stream.set_write_timeout(Some(TIMEOUT))?;
             stream.write_all(&(response.len() as u16).to_be_bytes())?;
             stream.write_all(&response)?;
         }
     }
     Ok(())
+}
+
+fn read_exact_until(
+    stream: &mut TcpStream,
+    mut bytes: &mut [u8],
+    stopped: &AtomicBool,
+    deadline: Instant,
+) -> io::Result<bool> {
+    while !bytes.is_empty() {
+        if stopped.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        stream.set_read_timeout(Some(remaining.min(STOP_POLL_INTERVAL)))?;
+        match stream.read(bytes) {
+            Ok(0) => return Ok(false),
+            Ok(amount) => bytes = &mut bytes[amount..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
 }

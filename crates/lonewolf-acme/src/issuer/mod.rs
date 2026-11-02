@@ -37,6 +37,7 @@ pub struct Issuer {
     transport: AcmeHttpClient,
     directory_url: String,
     time: Time,
+    profile: Option<Arc<str>>,
 }
 
 impl Issuer {
@@ -46,7 +47,14 @@ impl Issuer {
         transport: AcmeHttpClient,
         directory_url: String,
     ) -> Result<Self, AttemptFailure> {
-        Self::with_time(store, challenges, transport, directory_url, Time::default())
+        Self::with_time(
+            store,
+            challenges,
+            transport,
+            directory_url,
+            Time::default(),
+            None,
+        )
     }
 
     pub(crate) fn with_time(
@@ -55,9 +63,14 @@ impl Issuer {
         transport: AcmeHttpClient,
         directory_url: String,
         time: Time,
+        profile: Option<Arc<str>>,
     ) -> Result<Self, AttemptFailure> {
         validate_url(&directory_url)?;
-        if store.directory_url() != directory_url {
+        if store.directory_url() != directory_url
+            || profile
+                .as_deref()
+                .is_some_and(|name| !is_valid_profile_name(name))
+        {
             return Err(StateError::InvalidData.into());
         }
         Ok(Self {
@@ -66,6 +79,7 @@ impl Issuer {
             transport,
             directory_url,
             time,
+            profile,
         })
     }
 
@@ -123,7 +137,8 @@ impl Issuer {
         installer: &I,
         replaces: Option<CertificateIdentifier<'static>>,
     ) -> Result<AttemptSuccess, AttemptFailure> {
-        let mut engine = Upstream::new(self.transport.for_attempt(), &self.directory_url);
+        let mut engine = Upstream::new(self.transport.for_attempt(), &self.directory_url)
+            .with_profile(self.profile.clone());
         let outcome = {
             let work = pin!(attempt(
                 &self.store,
@@ -220,6 +235,8 @@ struct HttpChallenge {
 
 trait Engine {
     fn directory(&self) -> &str;
+    fn profile(&self) -> Option<&str>;
+    fn offers_profile(&self, name: &str) -> bool;
     fn reset_hint(&self);
     fn hint(&self) -> Option<SystemTime>;
     fn supports_ari(&self) -> bool;
@@ -582,6 +599,14 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                 return Err(failure(FailureKind::Material));
             }
         }
+        if self
+            .host
+            .order
+            .as_ref()
+            .is_some_and(|order| order.profile.as_deref() != self.engine.profile())
+        {
+            self.host.order = None;
+        }
         let persisted = self
             .host
             .order
@@ -604,6 +629,16 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
         };
         self.before().await?;
         self.engine.restore(credentials).await?;
+        if self
+            .host
+            .order
+            .as_ref()
+            .is_none_or(|order| order.url.is_none())
+            && let Some(profile) = self.engine.profile()
+            && !self.engine.offers_profile(profile)
+        {
+            return Err(failure(FailureKind::ProfileNotOffered));
+        }
         let replacement = if self.host.order.is_some() {
             original
         } else if self.engine.supports_ari() {
@@ -625,7 +660,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                 csr_der,
                 started_unix: unix(self.clock.now())?,
                 expires_unix: None,
-                profile: None,
+                profile: self.engine.profile().map(str::to_owned),
             });
         }
         let pending = self.host.order.as_ref().ok_or(StateError::CorruptData)?;
@@ -759,7 +794,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                         fallback_at_unix: renew_at_unix,
                         ari_window: None,
                         ari_failures: 0,
-                        profile: None,
+                        profile: pending.profile.take(),
                     });
                     self.host.order = None;
                     self.host.retry = RetryState {
@@ -1081,6 +1116,7 @@ struct Upstream<T> {
     observations: Arc<PlMutex<Observations>>,
     account: Option<Account>,
     order: Option<Order>,
+    profile: Option<Arc<str>>,
 }
 
 impl<T: AttemptTransport> Upstream<T> {
@@ -1091,7 +1127,12 @@ impl<T: AttemptTransport> Upstream<T> {
             observations: Arc::new(PlMutex::new(Observations::default())),
             account: None,
             order: None,
+            profile: None,
         }
+    }
+    fn with_profile(mut self, profile: Option<Arc<str>>) -> Self {
+        self.profile = profile;
+        self
     }
     fn builder(&self) -> Result<instant_acme::AccountBuilder, AttemptFailure> {
         Account::builder(
@@ -1155,6 +1196,14 @@ impl<T: AttemptTransport> Upstream<T> {
 impl<T: AttemptTransport> Engine for Upstream<T> {
     fn directory(&self) -> &str {
         &self.directory
+    }
+    fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+    fn offers_profile(&self, name: &str) -> bool {
+        self.account
+            .as_ref()
+            .is_some_and(|account| account.profiles().any(|meta| meta.name == name))
     }
     fn reset_hint(&self) {
         self.transport.reset_retry_hint();
@@ -1229,6 +1278,9 @@ impl<T: AttemptTransport> Engine for Upstream<T> {
         let mut order = NewOrder::new(&identifiers);
         if let Some(replaces) = replaces {
             order = order.replaces(replaces);
+        }
+        if let Some(profile) = self.profile.as_deref() {
+            order = order.profile(profile);
         }
         self.order = Some(
             self.account
@@ -1357,6 +1409,7 @@ fn classify(error: instant_acme::Error) -> AttemptFailure {
                     | "urn:ietf:params:acme:error:userActionRequired",
                 ) => FailureKind::Account,
                 Some("urn:ietf:params:acme:error:unauthorized") => FailureKind::Authorization,
+                Some("urn:ietf:params:acme:error:invalidProfile") => FailureKind::ProfileNotOffered,
                 _ if problem.status == Some(429) => FailureKind::RateLimited,
                 _ if problem.status.is_some_and(|status| status >= 500) => FailureKind::Network,
                 _ => FailureKind::Protocol,

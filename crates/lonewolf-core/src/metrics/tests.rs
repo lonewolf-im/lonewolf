@@ -46,7 +46,7 @@ fn acme_metrics_use_exact_names_fixed_outcomes_and_omit_unknown_dates() -> Resul
         next_attempt_unix: Some(1_800_000_500),
         attempts: 46,
         successes: 1,
-        failures: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+        failures: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         generation: 2,
         last_event: HostEvent::Installed,
         events: [0; 5],
@@ -101,6 +101,7 @@ fn acme_metrics_use_exact_names_fixed_outcomes_and_omit_unknown_dates() -> Resul
         "account",
         "state",
         "deferred",
+        "profile_not_offered",
     ]
     .iter()
     .enumerate()
@@ -116,7 +117,7 @@ fn acme_metrics_use_exact_names_fixed_outcomes_and_omit_unknown_dates() -> Resul
             .lines()
             .filter(|line| line.starts_with("lonewolf_acme_attempts_total{"))
             .count(),
-        30
+        33
     );
     Ok(())
 }

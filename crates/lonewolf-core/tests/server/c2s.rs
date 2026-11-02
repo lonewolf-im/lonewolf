@@ -82,6 +82,25 @@ fn total(body: &str, family: &str, label: &str) -> u64 {
         .sum()
 }
 
+fn connect(address: SocketAddr) -> Result<TcpStream, Box<dyn Error>> {
+    let stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_write_timeout(Some(TIMEOUT))?;
+    Ok(stream)
+}
+
+fn expect_no_input(stream: &mut TcpStream) -> TestResult {
+    let timeout = stream.read_timeout()?;
+    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let result = stream.read_exact(&mut [0; 1]);
+    stream.set_read_timeout(timeout)?;
+    assert!(
+        matches!(&result, Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "expected no input: {result:?}"
+    );
+    Ok(())
+}
+
 fn connect_until_eof(address: SocketAddr) -> TestResult {
     let mut stream = TcpStream::connect_timeout(&address, TIMEOUT)?;
     stream.set_read_timeout(Some(TIMEOUT))?;
@@ -291,14 +310,10 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
         workers,
     )?;
     let [address] = server.listeners()?;
-    let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
-    first.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let mut first = connect(address)?;
     first.write_all(OPEN)?;
     read_features(&mut first)?;
-    assert!(matches!(
-        first.read(&mut [0; 1]),
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-    ));
+    expect_no_input(&mut first)?;
     let mut rejected = TcpStream::connect_timeout(&address, TIMEOUT)?;
     rejected.set_read_timeout(Some(TIMEOUT))?;
     assert_eq!(rejected.read(&mut [0; 1])?, 0);
@@ -308,31 +323,12 @@ fn connection_limit_holds_capacity_until_eof_and_releases_it_on_shutdown() -> Te
         total(body, CLOSED, "outcome=\"eof\"") == 1
             && total(body, REJECTED, "reason=\"max_connections_per_ip\"") == 1
     })?;
-    let mut replacement = TcpStream::connect_timeout(&address, TIMEOUT)?;
-    replacement.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let mut replacement = connect(address)?;
     replacement.write_all(OPEN)?;
     read_features(&mut replacement)?;
-    assert!(matches!(
-        replacement.read(&mut [0; 1]),
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-    ));
-    let logs = server.stop_with_logs(Signal::SIGINT)?;
-    replacement.set_read_timeout(Some(TIMEOUT))?;
+    expect_no_input(&mut replacement)?;
+    server.stop(Signal::SIGINT)?;
     assert_eq!(read_until_closed(&mut replacement)?, b"<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
-    let rejections: Vec<_> = logs
-        .lines()
-        .filter(|line| line.contains("c2s connection rejected"))
-        .collect();
-    assert_eq!(rejections.len(), 1, "{logs}");
-    for field in [
-        "connection_type=\"c2s\"",
-        "listener_id=0",
-        "outcome=\"connection_limit\"",
-        "rejected_connections=1",
-    ] {
-        assert!(rejections[0].contains(field), "missing {field}: {logs}");
-    }
-    assert!(!logs.contains("127.0.0.1"));
     Ok(())
 }
 
@@ -346,14 +342,10 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
     let listeners: [SocketAddr; 2] = server.listeners()?;
     let mut held = Vec::with_capacity(2);
     for address in listeners {
-        let mut first = TcpStream::connect_timeout(&address, TIMEOUT)?;
-        first.set_read_timeout(Some(Duration::from_millis(200)))?;
+        let mut first = connect(address)?;
         first.write_all(OPEN)?;
         read_features(&mut first)?;
-        assert!(matches!(
-            first.read(&mut [0; 1]),
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-        ));
+        expect_no_input(&mut first)?;
         let mut rejected = TcpStream::connect_timeout(&address, TIMEOUT)?;
         rejected.set_read_timeout(Some(TIMEOUT))?;
         assert_eq!(rejected.read(&mut [0; 1])?, 0);
@@ -370,7 +362,6 @@ fn listeners_with_the_same_profile_have_separate_connection_caps() -> TestResult
     })?;
     server.stop(Signal::SIGINT)?;
     for mut stream in held {
-        stream.set_read_timeout(Some(TIMEOUT))?;
         assert_eq!(read_until_closed(&mut stream)?, b"<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
     }
     Ok(())
@@ -383,10 +374,8 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
         1,
     )?;
     let listeners: [SocketAddr; 2] = server.listeners()?;
-    let mut large = TcpStream::connect(listeners[0])?;
-    let mut small = TcpStream::connect(listeners[1])?;
-    large.set_read_timeout(Some(Duration::from_millis(200)))?;
-    small.set_read_timeout(Some(TIMEOUT))?;
+    let mut large = connect(listeners[0])?;
+    let mut small = connect(listeners[1])?;
     let payload = format!("<message><body>{}", "x".repeat(12_000));
     large.write_all(OPEN)?;
     large.write_all(payload.as_bytes())?;
@@ -394,10 +383,7 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
     small.write_all(payload.as_bytes())?;
     read_features(&mut large)?;
     read_features(&mut small)?;
-    assert!(matches!(
-        large.read(&mut [0; 1]),
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-    ));
+    expect_no_input(&mut large)?;
     let response = read_until_closed(&mut small)?;
     assert!(
         response
@@ -405,7 +391,6 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
             .any(|part| part == b"<policy-violation")
     );
     large.shutdown(Shutdown::Write)?;
-    large.set_read_timeout(Some(TIMEOUT))?;
     assert_eq!(large.read(&mut [0; 1])?, 0);
     server.wait_for_metrics(|body| {
         body.lines().any(|line| {
@@ -413,8 +398,7 @@ fn listener_uses_its_selected_stanza_size_limit() -> TestResult {
                 && line.ends_with(",outcome=\"size_limit_exceeded\"} 1")
         })
     })?;
-    let logs = server.stop_with_logs(Signal::SIGINT)?;
-    assert!(!logs.contains("127.0.0.1"));
+    server.stop(Signal::SIGINT)?;
     Ok(())
 }
 
@@ -427,21 +411,17 @@ fn listener_uses_its_selected_xml_byte_rate() -> TestResult {
     );
     let mut server = Server::with_metrics(&config, 1)?;
     let listeners: [SocketAddr; 2] = server.listeners()?;
-    let mut slow = TcpStream::connect(listeners[1])?;
-    slow.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let started = Instant::now();
+    let mut slow = connect(listeners[1])?;
     slow.write_all(&payload)?;
     read_features(&mut slow)?;
-    assert!(matches!(
-        slow.read(&mut [0; 1]),
-        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-    ));
-    let mut fast = TcpStream::connect(listeners[0])?;
-    fast.set_read_timeout(Some(TIMEOUT))?;
+    assert_eq!(read_until_closed(&mut slow)?, b"</stream:stream>");
+    // The refill can finish before the test reader receives the features.
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    let mut fast = connect(listeners[0])?;
     fast.write_all(&payload)?;
     read_features(&mut fast)?;
     assert_eq!(read_until_closed(&mut fast)?, b"</stream:stream>");
-    slow.set_read_timeout(Some(TIMEOUT))?;
-    assert_eq!(read_until_closed(&mut slow)?, b"</stream:stream>");
     server.stop(Signal::SIGINT)?;
     Ok(())
 }

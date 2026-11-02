@@ -52,6 +52,7 @@ pub struct RequestCounts {
     pub stages: BTreeMap<AcmeStage, usize>,
     pub accounts: Vec<Value>,
     pub orders: Vec<(String, String)>,
+    pub profiles: Vec<Option<String>>,
     pub csrs: Vec<Vec<u8>>,
     pub callbacks: Vec<(String, String, String)>,
     pub errors: Vec<String>,
@@ -64,6 +65,7 @@ impl RequestCounts {
 
 struct Order {
     replaces: Value,
+    profile: Option<String>,
     dns: String,
     account: usize,
     ready: bool,
@@ -79,6 +81,7 @@ struct State {
     callback: SocketAddr,
     renewal: bool,
     lifetime: i64,
+    profiles: BTreeMap<String, i64>,
     closed: bool,
 }
 struct Shared {
@@ -142,6 +145,7 @@ impl FakeAcmeCa {
                 callback: "127.0.0.1:1".parse()?,
                 renewal: false,
                 lifetime: 86_400,
+                profiles: BTreeMap::new(),
                 closed: false,
             }),
             changed: PlCondvar::new(),
@@ -246,6 +250,15 @@ impl FakeAcmeCa {
     }
     pub fn lifetime(&self, seconds: i64) {
         self.shared.state.lock().lifetime = seconds;
+    }
+    pub fn profiles(&self, profiles: &[(&str, i64)]) {
+        let mut state = self.shared.state.lock();
+        state.profiles.clear();
+        state.profiles.extend(
+            profiles
+                .iter()
+                .map(|&(name, lifetime)| (name.into(), lifetime)),
+        );
     }
     pub fn counts(&self) -> RequestCounts {
         self.shared.state.lock().counts.clone()
@@ -470,9 +483,16 @@ fn respond(
     state: &mut State,
 ) -> TestResult<Response> {
     if stage == AcmeStage::Directory {
-        return Ok(Response::json(
-            json!({"newNonce":format!("{base}/nonce"),"newAccount":format!("{base}/account"),"newOrder":format!("{base}/new-order"),"renewalInfo":format!("{base}/ari")}),
-        ));
+        let mut directory = json!({"newNonce":format!("{base}/nonce"),"newAccount":format!("{base}/account"),"newOrder":format!("{base}/new-order"),"renewalInfo":format!("{base}/ari")});
+        if !state.profiles.is_empty() {
+            let profiles: BTreeMap<_, _> = state
+                .profiles
+                .keys()
+                .map(|name| (name, format!("{base}/profiles/{name}")))
+                .collect();
+            directory["meta"] = json!({"profiles": profiles});
+        }
+        return Ok(Response::json(directory));
     }
     if stage == AcmeStage::Nonce {
         return Ok(Response::body(String::new()));
@@ -491,6 +511,16 @@ fn respond(
         });
     }
     let (payload, jwk) = signed_payload(request, base, state)?;
+    let profile = if stage == AcmeStage::NewOrder {
+        let profile = payload
+            .get("profile")
+            .map(|value| value.as_str().map(str::to_owned).ok_or("order profile"))
+            .transpose()?;
+        state.counts.profiles.push(profile.clone());
+        profile
+    } else {
+        None
+    };
     if let Some(AcmeFault::Status(status, delay)) = state.faults.get(&stage) {
         return Ok(Response {
             status: *status,
@@ -515,6 +545,17 @@ fn respond(
         ));
     }
     if stage == AcmeStage::NewOrder {
+        if profile
+            .as_ref()
+            .is_some_and(|name| !state.profiles.contains_key(name))
+        {
+            return Ok(Response {
+                status: 400,
+                ..Response::json(
+                    json!({"type":"urn:ietf:params:acme:error:invalidProfile","detail":"PRIVATE-CA-DETAIL"}),
+                )
+            });
+        }
         let dns = payload["identifiers"][0]["value"]
             .as_str()
             .ok_or("DNS identifier")?
@@ -534,6 +575,7 @@ fn respond(
         let index = state.orders.len();
         state.orders.push(Order {
             replaces: payload["replaces"].clone(),
+            profile,
             dns: dns.clone(),
             account,
             ready: false,
@@ -591,8 +633,11 @@ fn respond(
                 return Err("unauthorized finalize".into());
             }
             let csr = URL_SAFE_NO_PAD.decode(payload["csr"].as_str().ok_or("CSR payload")?)?;
-            let certificate =
-                sign_csr(&csr, &order.dns, index as u64 + 100, state.lifetime, issuer)?;
+            let lifetime = match &order.profile {
+                Some(profile) => *state.profiles.get(profile).ok_or("order profile")?,
+                None => state.lifetime,
+            };
+            let certificate = sign_csr(&csr, &order.dns, index as u64 + 100, lifetime, issuer)?;
             state.counts.csrs.push(csr);
             order.certificate = Some(format!("{certificate}{root_pem}"));
             Response::json(order_json(index, base, order))
@@ -607,7 +652,11 @@ fn respond(
     })
 }
 fn order_json(index: usize, base: &str, order: &Order) -> Value {
-    json!({"expires":"2099-01-01T00:00:00Z","replaces":order.replaces,"status":if order.certificate.is_some(){"valid"}else if order.ready{"ready"}else{"pending"},"identifiers":[{"type":"dns","value":order.dns}],"authorizations":[format!("{base}/authz/{index}")],"finalize":format!("{base}/finalize/{index}"),"certificate":order.certificate.as_ref().map(|_|format!("{base}/certificate/{index}"))})
+    let mut order_json = json!({"expires":"2099-01-01T00:00:00Z","replaces":order.replaces,"status":if order.certificate.is_some(){"valid"}else if order.ready{"ready"}else{"pending"},"identifiers":[{"type":"dns","value":order.dns}],"authorizations":[format!("{base}/authz/{index}")],"finalize":format!("{base}/finalize/{index}"),"certificate":order.certificate.as_ref().map(|_|format!("{base}/certificate/{index}"))});
+    if let Some(profile) = &order.profile {
+        order_json["profile"] = json!(profile);
+    }
+    order_json
 }
 fn sign_csr(
     bytes: &[u8],

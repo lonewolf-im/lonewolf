@@ -278,7 +278,11 @@ fn wall(seconds: u64) -> Result<SystemTime, AttemptFailure> {
         .ok_or(StateError::InvalidData.into())
 }
 
-fn reserve(retry: &mut RetryState, clock: &impl Clock) -> Result<u64, AttemptFailure> {
+fn reserve(
+    retry: &mut RetryState,
+    clock: &impl Clock,
+    lifetime: Option<u64>,
+) -> Result<u64, AttemptFailure> {
     if wall(retry.not_before_unix)? > clock.now() {
         return Err(AttemptFailure {
             retry_not_before: Some(wall(retry.not_before_unix)?),
@@ -286,12 +290,7 @@ fn reserve(retry: &mut RetryState, clock: &impl Clock) -> Result<u64, AttemptFai
         });
     }
     retry.failures = retry.failures.saturating_add(1);
-    let base = match retry.failures {
-        1 => 60,
-        2 => 600,
-        3 => 6000,
-        _ => 86400,
-    };
+    let base = crate::schedule::retry_base(retry.failures, lifetime);
     let delay = base + clock.uniform(base / 10)?;
     refresh_retry(retry, clock, delay, None)?;
     Ok(delay)
@@ -407,7 +406,7 @@ async fn ensure_account(
         crypto_provider(),
     )
     .map_err(|_| AttemptFailure::from(StateError::CorruptData))?;
-    let delay = reserve(&mut account.retry, clock)?;
+    let delay = reserve(&mut account.retry, clock, None)?;
     store.save_account(&account).await?;
     engine.reset_hint();
     match engine.register(&account.key_pkcs8).await {
@@ -476,7 +475,11 @@ async fn attempt<I: Installer>(
             error
         }
     })?;
-    let delay = reserve(&mut record.retry, clock)?;
+    let delay = reserve(
+        &mut record.retry,
+        clock,
+        record.certificate.as_ref().map(StoredCertificate::lifetime),
+    )?;
     store.save_host(&record).await?;
     let mut driver = Driver {
         store,

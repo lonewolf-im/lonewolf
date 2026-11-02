@@ -25,7 +25,7 @@ fn certificate() -> StoredCertificate {
 
 #[test]
 fn fallback_uses_actual_lifetime_and_earlier_bounded_jitter() -> TestResult {
-    for lifetime in [90 * 86400, 45 * 86400, 6 * 86400, 120, 1] {
+    for lifetime in [90 * 86400, 45 * 86400, 6 * 86400, 576_000, 120, 1] {
         let validity = CertificateValidity {
             not_before_unix: 100,
             not_after_unix: 100 + lifetime,
@@ -92,11 +92,51 @@ fn retry_and_ari_backoff_have_distinct_caps_and_checked_jitter() -> TestResult {
         (4, 86400, 43200),
         (u32::MAX, 86400, 43200),
     ] {
-        assert_eq!(retry_delay(count, |_| Ok(0))?, base);
-        assert_eq!(retry_delay(count, Ok)?, base + base / 10);
-        assert!(retry_delay(count, |max| Ok(max + 1)).is_err());
+        assert_eq!(retry_delay(count, None, |_| Ok(0))?, base);
+        assert_eq!(retry_delay(count, None, Ok)?, base + base / 10);
+        assert!(retry_delay(count, None, |max| Ok(max + 1)).is_err());
         assert_eq!(ari_delay(count, true), ari);
         assert_eq!(ari_delay(count, false), 43200);
+    }
+    assert_eq!(retry_delay(4, Some(576_000), Ok)?, 26_400);
+    assert!(retry_delay(4, Some(576_000), |max| Ok(max + 1)).is_err());
+    Ok(())
+}
+
+#[test]
+fn retry_base_caps_later_tiers_by_certificate_lifetime() {
+    for (failures, lifetime, expected) in [
+        (1, None, 60),
+        (2, None, 600),
+        (3, Some(576_000), 6_000),
+        (0, None, 86_400),
+        (4, None, 86_400),
+        (4, Some(100_000), 6_000),
+        (4, Some(576_000), 24_000),
+        (4, Some(864_000), 36_000),
+        (4, Some(2_073_600), 86_400),
+        (4, Some(7_776_000), 86_400),
+        (u32::MAX, Some(576_000), 24_000),
+    ] {
+        assert_eq!(retry_base(failures, lifetime), expected);
+    }
+}
+
+#[test]
+fn short_lifetime_retries_fit_in_the_last_half_of_the_lifetime() -> TestResult {
+    const LIFETIME: u64 = 576_000;
+    for (lifetime, expected_attempts, maximum_delay) in
+        [(Some(LIFETIME), 14, 26_400), (None, 6, 95_040)]
+    {
+        let mut time = LIFETIME / 2;
+        let mut attempts = 0;
+        while time < LIFETIME {
+            attempts += 1;
+            let delay = retry_delay(attempts, lifetime, Ok)?;
+            assert!(delay <= maximum_delay);
+            time += delay;
+        }
+        assert_eq!(attempts, expected_attempts);
     }
     Ok(())
 }

@@ -173,6 +173,12 @@ pub struct StoredCertificate {
     pub ari_failures: u32,
 }
 
+impl StoredCertificate {
+    pub(crate) fn lifetime(&self) -> u64 {
+        self.not_after_unix.saturating_sub(self.not_before_unix)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredHost {

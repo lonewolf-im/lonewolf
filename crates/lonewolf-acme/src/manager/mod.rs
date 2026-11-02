@@ -802,9 +802,16 @@ async fn drive(
                             .await?
                             .ok_or(StateError::CorruptData)?;
                             account.retry.failures = account.retry.failures.saturating_add(1);
-                            let delay = schedule::retry_delay(account.retry.failures, |maximum| {
-                                clock.uniform(maximum)
-                            })?;
+                            let lifetime = hosts
+                                .iter()
+                                .filter_map(|host| host.certificate.as_ref())
+                                .map(StoredCertificate::lifetime)
+                                .min();
+                            let delay = schedule::retry_delay(
+                                account.retry.failures,
+                                lifetime,
+                                |maximum| clock.uniform(maximum),
+                            )?;
                             account.retry.not_before_unix = account
                                 .retry
                                 .not_before_unix

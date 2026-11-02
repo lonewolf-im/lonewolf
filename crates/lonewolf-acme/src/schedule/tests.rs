@@ -20,6 +20,7 @@ fn certificate() -> StoredCertificate {
         fallback_at_unix: 5000,
         ari_window: None,
         ari_failures: 0,
+        profile: None,
     }
 }
 

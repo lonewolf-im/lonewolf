@@ -813,6 +813,7 @@ fn material_and_commit_failures_never_activate() {
                 fallback_at_unix: 0,
                 ari_window: None,
                 ari_failures: 0,
+                profile: None,
             }),
         });
         installer.active.lock().push(old);
@@ -1537,6 +1538,7 @@ fn optional_expiry_never_erases_the_durable_expiry() {
                     url: None,
                     started_unix: NOW,
                     expires_unix: Some(EXPIRY),
+                    profile: None,
                 }),
                 retry: RetryState {
                     failures: 1,
@@ -1673,6 +1675,7 @@ fn ari_replacement_is_derived_from_current_material_and_forgery_is_rejected() {
                 fallback_at_unix: 0,
                 ari_window: None,
                 ari_failures: 0,
+                profile: None,
             }),
             retry: RetryState {
                 failures: 0,
@@ -1956,6 +1959,7 @@ fn install_pending(memory: &Memory, replaces: bool, url: Option<&str>) -> Pendin
         csr_der,
         started_unix: NOW,
         expires_unix: Some(EXPIRY),
+        profile: None,
     };
     memory.records.lock().host = Some(StoredHost {
         host: host(),
@@ -1970,6 +1974,7 @@ fn install_pending(memory: &Memory, replaces: bool, url: Option<&str>) -> Pendin
             fallback_at_unix: 0,
             ari_window: None,
             ari_failures: 0,
+            profile: None,
         }),
         retry: RetryState {
             failures: 0,
@@ -2278,6 +2283,7 @@ fn ari_rechecks_expiry_and_generation_after_account_restoration_before_get() {
                 fallback_at_unix: NOW + 500,
                 ari_window: None,
                 ari_failures: 0,
+                profile: None,
             }),
             order: None,
             retry: RetryState {
@@ -2434,6 +2440,7 @@ fn pinned_order_refresh_rejects_unsafe_retry_after_and_preserves_resumable_order
             csr_der,
             started_unix: NOW,
             expires_unix: Some(EXPIRY),
+            profile: None,
         };
         let record = StoredHost {
             host: host(),

@@ -57,6 +57,7 @@ fn host(byte: u8) -> StoredHost {
             fallback_at_unix: 0,
             ari_window: None,
             ari_failures: 0,
+            profile: None,
         }),
         order: Some(PendingOrder {
             replaces: None,
@@ -65,6 +66,7 @@ fn host(byte: u8) -> StoredHost {
             csr_der: vec![byte + 2; 8],
             started_unix: 50,
             expires_unix: Some(40),
+            profile: None,
         }),
         retry: RetryState {
             failures: 3,
@@ -75,6 +77,44 @@ fn host(byte: u8) -> StoredHost {
 
 fn restored_host(store: &StateStore) -> Result<StoredHost, Box<dyn Error>> {
     block_on(store.host("example.com".into()))?.ok_or_else(|| "missing host".into())
+}
+
+#[test]
+fn profiles_round_trip_and_invalid_saves_preserve_the_stored_record() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.redb");
+    let store = open(&path)?;
+    let mut record = host(2);
+    record.order.as_mut().ok_or("missing order")?.profile = Some("shortlived".into());
+    record
+        .certificate
+        .as_mut()
+        .ok_or("missing certificate")?
+        .profile = Some("classic".into());
+    let expected = serde_json::to_value(&record)?;
+    block_on(store.save_host(record.clone()))?;
+    drop(store);
+
+    let store = open(&path)?;
+    assert_eq!(serde_json::to_value(restored_host(&store)?)?, expected);
+    for field in ["order", "certificate"] {
+        let mut invalid = record.clone();
+        if field == "order" {
+            invalid.order.as_mut().ok_or("missing order")?.profile = Some("short lived".into());
+        } else {
+            invalid
+                .certificate
+                .as_mut()
+                .ok_or("missing certificate")?
+                .profile = Some("short lived".into());
+        }
+        assert_eq!(
+            block_on(store.save_host(invalid)),
+            Err(StateError::InvalidData)
+        );
+        assert_eq!(serde_json::to_value(restored_host(&store)?)?, expected);
+    }
+    Ok(())
 }
 
 fn assert_material(record: &StoredHost, byte: u8, pending: bool) -> TestResult {

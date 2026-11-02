@@ -65,6 +65,7 @@ fn cert(start: u64, end: u64) -> StoredCertificate {
         fallback_at_unix: start + (end - start) / 2,
         ari_window: None,
         ari_failures: 0,
+        profile: None,
     }
 }
 fn install(start: u64, end: u64) -> Install {
@@ -839,6 +840,7 @@ fn future_cache_publishes_locally_once_without_bypassing_or_changing_durable_wor
         csr_der: vec![4],
         started_unix: NOW,
         expires_unix: None,
+        profile: None,
     });
     let original = serde_json::to_value(&record)?;
     let script = make_script(std::slice::from_ref(&record), vec![], usize::MAX);
@@ -1402,6 +1404,7 @@ fn ari_error_classes_persist_backoff_without_resampling_schedule_or_changing_ord
                 csr_der: vec![4],
                 started_unix: NOW,
                 expires_unix: None,
+                profile: None,
             });
             let original_order = serde_json::to_value(&record.order)?;
             let script = make_script(

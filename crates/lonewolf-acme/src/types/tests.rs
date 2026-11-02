@@ -71,6 +71,7 @@ fn host() -> StoredHost {
             fallback_at_unix: 0,
             ari_window: None,
             ari_failures: 0,
+            profile: None,
         }),
         order: Some(PendingOrder {
             replaces: None,
@@ -79,12 +80,132 @@ fn host() -> StoredHost {
             csr_der: vec![10, 11, 12],
             started_unix: 30,
             expires_unix: Some(25),
+            profile: None,
         }),
         retry: RetryState {
             failures: 2,
             not_before_unix: 100,
         },
     }
+}
+
+#[test]
+fn profile_fields_are_optional_omitted_when_unset_and_round_trip() -> TestResult {
+    let mut original = host();
+    let mut value = serde_json::to_value(&original)?;
+    for field in ["order", "certificate"] {
+        assert!(value[field].get("profile").is_none());
+        value[field]["profile"] = serde_json::Value::Null;
+    }
+    let restored: StoredHost = decode(&serde_json::to_vec(&value)?)?;
+    assert_eq!(restored.order.ok_or("missing order")?.profile, None);
+    assert_eq!(
+        restored.certificate.ok_or("missing certificate")?.profile,
+        None
+    );
+
+    original.order.as_mut().ok_or("missing order")?.profile = Some("shortlived".into());
+    original
+        .certificate
+        .as_mut()
+        .ok_or("missing certificate")?
+        .profile = Some("shortlived".into());
+    let restored: StoredHost = decode(&encode(&original)?)?;
+    restored.validate()?;
+    assert_eq!(
+        restored.order.ok_or("missing order")?.profile.as_deref(),
+        Some("shortlived")
+    );
+    assert_eq!(
+        restored
+            .certificate
+            .ok_or("missing certificate")?
+            .profile
+            .as_deref(),
+        Some("shortlived")
+    );
+    Ok(())
+}
+
+#[test]
+fn records_without_profile_fields_load_and_validate() -> TestResult {
+    let original = host();
+    let value = serde_json::to_value(&original)?;
+    assert!(value["order"].get("profile").is_none());
+    assert!(value["certificate"].get("profile").is_none());
+    let restored: StoredHost = decode(&encode(&original)?)?;
+    restored.validate()?;
+    assert_eq!(serde_json::to_value(&restored)?, value);
+    Ok(())
+}
+
+#[test]
+fn invalid_profiles_fail_decode_and_validation() -> TestResult {
+    let too_long = "a".repeat(MAX_PROFILE + 1);
+    for name in [
+        "",
+        too_long.as_str(),
+        "short lived",
+        "café",
+        "a/b",
+        "x\n",
+        "\"",
+    ] {
+        assert!(!is_valid_profile_name(name));
+        for field in ["order", "certificate"] {
+            let mut value = serde_json::to_value(host())?;
+            value[field]["profile"] = serde_json::json!(name);
+            assert!(matches!(
+                decode::<StoredHost>(&serde_json::to_vec(&value)?),
+                Err(StateError::CorruptData)
+            ));
+
+            let mut record = host();
+            if field == "order" {
+                record.order.as_mut().ok_or("missing order")?.profile = Some(name.into());
+            } else {
+                record
+                    .certificate
+                    .as_mut()
+                    .ok_or("missing certificate")?
+                    .profile = Some(name.into());
+            }
+            assert_eq!(record.validate(), Err(StateError::InvalidData));
+        }
+    }
+    let maximum = "a".repeat(MAX_PROFILE);
+    for name in [
+        "classic",
+        "tlsserver",
+        "shortlived",
+        "A-b_c.9",
+        maximum.as_str(),
+    ] {
+        assert!(is_valid_profile_name(name));
+        let mut record = host();
+        record.order.as_mut().ok_or("missing order")?.profile = Some(name.into());
+        record
+            .certificate
+            .as_mut()
+            .ok_or("missing certificate")?
+            .profile = Some(name.into());
+        record.validate()?;
+        let restored: StoredHost = decode(&encode(&record)?)?;
+        restored.validate()?;
+        assert_eq!(
+            restored.order.ok_or("missing order")?.profile.as_deref(),
+            Some(name)
+        );
+        assert_eq!(
+            restored
+                .certificate
+                .ok_or("missing certificate")?
+                .profile
+                .as_deref(),
+            Some(name)
+        );
+    }
+    Ok(())
 }
 
 #[test]

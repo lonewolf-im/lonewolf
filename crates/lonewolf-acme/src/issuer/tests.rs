@@ -1053,12 +1053,19 @@ fn account_cancellation_at_every_boundary_reuses_durable_key() {
 fn retry_backoff_and_jitter_are_sampled_once_and_rounded_up() {
     let clock = FakeClock::default();
     clock.jitter.set(u64::MAX);
-    for (failures, delay) in [(0, 66), (1, 660), (2, 6600), (3, 95040), (u32::MAX, 95040)] {
+    for (failures, lifetime, delay) in [
+        (0, None, 66),
+        (1, None, 660),
+        (2, None, 6600),
+        (3, None, 95040),
+        (u32::MAX, None, 95040),
+        (3, Some(576_000), 26_400),
+    ] {
         let mut retry = RetryState {
             failures,
             not_before_unix: 0,
         };
-        assert_eq!(reserve(&mut retry, &clock).unwrap(), delay);
+        assert_eq!(reserve(&mut retry, &clock, lifetime).unwrap(), delay);
         assert_eq!(retry.failures, failures.saturating_add(1));
         assert_eq!(retry.not_before_unix, NOW + delay);
         refresh_retry(
@@ -1070,6 +1077,37 @@ fn retry_backoff_and_jitter_are_sampled_once_and_rounded_up() {
         .unwrap();
         assert_eq!(retry.not_before_unix, NOW + delay + 1);
     }
+}
+
+#[test]
+fn failed_attempt_persists_retry_capped_by_stored_certificate_lifetime() {
+    let (memory, challenges, clock, mut engine, installer) = setup();
+    install_pending(&memory, false, None);
+    {
+        let mut records = memory.records.lock();
+        let record = records.host.as_mut().unwrap();
+        record.order = None;
+        record.retry.failures = 3;
+        let certificate = record.certificate.as_mut().unwrap();
+        certificate.not_after_unix = certificate.not_before_unix + 576_000;
+    }
+    clock.jitter.set(u64::MAX);
+    engine.error = Some(("restore", failure(FailureKind::Network)));
+    let error = block_on(attempt(
+        &memory,
+        &challenges,
+        &clock,
+        &mut engine,
+        host(),
+        &installer,
+        None,
+    ))
+    .unwrap_err();
+    assert_eq!(error.kind, FailureKind::Network);
+    let records = memory.records.lock();
+    let retry = records.host.as_ref().unwrap().retry;
+    assert_eq!(retry.failures, 4);
+    assert_eq!(retry.not_before_unix, NOW + 26_400);
 }
 
 #[test]

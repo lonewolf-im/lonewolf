@@ -640,6 +640,42 @@ fn account_failure_blocks_all_hosts_and_old_success_cannot_reset_floor() -> Test
 }
 
 #[test]
+fn account_failure_uses_the_shortest_stored_certificate_lifetime() -> TestResult {
+    for certificates in [true, false] {
+        let mut hosts = vec![host("a.example"), host("b.example")];
+        if certificates {
+            for (record, lifetime) in hosts.iter_mut().zip([7_776_000, 576_000]) {
+                let mut certificate = cert(NOW - 100, NOW - 100 + lifetime);
+                certificate.renew_at_unix = NOW;
+                certificate.ari_check_at_unix = NOW + lifetime;
+                record.certificate = Some(certificate);
+            }
+        }
+        let script = make_script(
+            &hosts,
+            vec![Step::Failure(FailureKind::Account), Step::Hold, Step::Hold],
+            3,
+        );
+        script
+            .store
+            .account
+            .borrow_mut()
+            .as_mut()
+            .ok_or("account")?
+            .retry
+            .failures = 3;
+        run(&script, hosts)?;
+        let account = script.store.account.borrow();
+        let retry = account.as_ref().ok_or("account")?.retry;
+        let delay = if certificates { 24_000 } else { 86_400 };
+        assert_eq!(retry.failures, 4);
+        assert_eq!(retry.not_before_unix, NOW + delay);
+        assert_eq!(script.calls.borrow()[2].2, NOW + delay);
+    }
+    Ok(())
+}
+
+#[test]
 fn load_activates_valid_cache_without_network_and_shutdown_ready_never_dispatches() -> TestResult {
     compio::runtime::Runtime::new()?.block_on(async {
         let directory = tempfile::tempdir()?;

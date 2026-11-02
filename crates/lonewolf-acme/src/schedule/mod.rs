@@ -65,16 +65,21 @@ pub(crate) fn fallback(
     )
 }
 
-pub(crate) fn retry_delay(
-    failures: u32,
-    random: impl FnOnce(u64) -> Result<u64, StateError>,
-) -> Result<u64, StateError> {
-    let base = match failures {
+pub(crate) fn retry_base(failures: u32, lifetime: Option<u64>) -> u64 {
+    match failures {
         1 => 60,
         2 => 600,
-        3 => 6000,
-        _ => 86400,
-    };
+        3 => 6_000,
+        _ => lifetime.map_or(86_400, |lifetime| (lifetime / 24).clamp(6_000, 86_400)),
+    }
+}
+
+pub(crate) fn retry_delay(
+    failures: u32,
+    lifetime: Option<u64>,
+    random: impl FnOnce(u64) -> Result<u64, StateError>,
+) -> Result<u64, StateError> {
+    let base = retry_base(failures, lifetime);
     let jitter = random(base / 10)?;
     if jitter > base / 10 {
         return Err(StateError::InvalidData);

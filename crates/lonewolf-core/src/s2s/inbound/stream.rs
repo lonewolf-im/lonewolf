@@ -8,9 +8,9 @@ use compio::net::TcpStream;
 use futures_util::FutureExt;
 use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
-use lonewolf_util::arena::{Arena, ChunkAllocator};
-use lonewolf_xmpp::jid::JidRef;
+use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::parser::StreamEvent;
+#[cfg(test)]
 use lonewolf_xmpp::stanza::StanzaNamespace;
 use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::AsyncBufRead;
@@ -114,27 +114,6 @@ impl Closed {
             },
         }
     }
-}
-
-fn validate(
-    namespace: StanzaNamespace,
-    from: Option<JidRef<'_>>,
-    to: Option<JidRef<'_>>,
-    peer: &InboundPeer,
-) -> Result<(), StreamErrorCondition> {
-    if namespace != StanzaNamespace::Server {
-        return Err(StreamErrorCondition::InvalidNamespace);
-    }
-    let (Some(from), Some(to)) = (from, to) else {
-        return Err(StreamErrorCondition::ImproperAddressing);
-    };
-    if to.domainpart() != peer.local.as_ref() {
-        return Err(StreamErrorCondition::HostUnknown);
-    }
-    if from.domainpart() != peer.remote.as_ref() {
-        return Err(StreamErrorCondition::InvalidFrom);
-    }
-    Ok(())
 }
 
 fn rejection(peer: &InboundPeer, stanza_kind: &'static str, closed: Closed) -> Closed {
@@ -341,126 +320,20 @@ where
                 return rejection(peer, "stream", Closed::interrupted(condition, validity));
             }
         };
-        let stanza_kind = match &event {
-            StreamEvent::Stanza(parsed) => parsed
-                .value()
-                .resolve(parsed.arena())
-                .map(|view| view.kind().as_str())
-                .unwrap_or("stanza"),
-            StreamEvent::RejectedStanza(parsed) => parsed.value().kind().as_str(),
-            StreamEvent::Element(_) => "element",
-            _ => "stream",
-        };
-        let result = async {
-            match event {
-                StreamEvent::Stanza(parsed) => {
-                    last_input = Instant::now();
-                    let view = parsed
-                        .value()
-                        .resolve(parsed.arena())
-                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                    validate(
-                        view.namespace(),
-                        view.from()
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
-                        view.to()
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
-                        peer,
-                    )?;
-                    settings.metrics.stanza_received(view.kind());
-                    let mut arena =
-                        Arena::try_new_in(Default::default(), context.allocator.clone())
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                    let stanza = view
-                        .rescope_in(StanzaNamespace::Client, &mut arena)
-                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                    interrupt(
-                        shutdown.clone(),
-                        validity,
-                        dispatch(context, peer, RoutedStanza::from_parts(stanza, arena)),
-                    )
+        let stanza_kind = ingress::receive::stanza_kind(&event);
+        if matches!(
+            event,
+            StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_)
+        ) {
+            last_input = Instant::now();
+        }
+        let result =
+            ingress::receive::process(event, peer, &settings.metrics, context, async |stanza| {
+                interrupt(shutdown.clone(), validity, dispatch(context, peer, stanza))
                     .await?
                     .map_err(|_| StreamErrorCondition::InternalServerError)
-                }
-                StreamEvent::RejectedStanza(parsed) => {
-                    last_input = Instant::now();
-                    let rejected = parsed.value();
-                    if rejected.namespace() != StanzaNamespace::Server {
-                        return Err(StreamErrorCondition::InvalidNamespace);
-                    }
-                    if rejected.invalid_from() || rejected.invalid_to() {
-                        return Err(StreamErrorCondition::ImproperAddressing);
-                    }
-                    validate(
-                        rejected.namespace(),
-                        rejected
-                            .from(parsed.arena())
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
-                        rejected
-                            .to(parsed.arena())
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?,
-                        peer,
-                    )?;
-                    settings.metrics.stanza_received(rejected.kind());
-                    if rejected.can_reply() {
-                        let mut output =
-                            Arena::try_new_in(Default::default(), context.allocator.clone())
-                                .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let sender = rejected
-                            .from(parsed.arena())
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?
-                            .ok_or(StreamErrorCondition::ImproperAddressing)?
-                            .clone_in(&mut output)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let target = rejected
-                            .to(parsed.arena())
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?
-                            .ok_or(StreamErrorCondition::ImproperAddressing)?
-                            .clone_in(&mut output)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let (rejected, mut arena) = parsed.into_parts();
-                        let sender = sender
-                            .resolve(&output)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?
-                            .clone_in(&mut arena)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let target = target
-                            .resolve(&output)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?
-                            .clone_in(&mut arena)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let reply = rejected
-                            .error_in(sender, target, &mut arena)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let reply = reply
-                            .resolve(&arena)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let reply = reply
-                            .rescope_in(StanzaNamespace::Client, &mut output)
-                            .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                        let _ = context
-                            .router
-                            .route_remote(RoutedStanza::from_parts(reply, output));
-                    }
-                    Ok(())
-                }
-                StreamEvent::Element(parsed) => {
-                    let element = parsed
-                        .value()
-                        .resolve(parsed.arena())
-                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
-                    if matches!(element.name(), "message" | "iq" | "presence")
-                        && element.namespace() != "jabber:server"
-                    {
-                        Err(StreamErrorCondition::InvalidNamespace)
-                    } else {
-                        Err(StreamErrorCondition::UnsupportedStanzaType)
-                    }
-                }
-                _ => Err(StreamErrorCondition::UnsupportedStanzaType),
-            }
-        }
-        .await;
+            })
+            .await;
         if let Err(condition) = result {
             return rejection(peer, stanza_kind, Closed::interrupted(condition, validity));
         }

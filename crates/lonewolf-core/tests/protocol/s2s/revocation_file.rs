@@ -55,6 +55,7 @@ fn revoked_peers_are_rejected_with_a_crl_file_in_both_directions() -> TestResult
             ..Default::default()
         },
         enabled: None,
+        bidirectional: Some(false),
         federation: None,
         extensions: String::new(),
         extra_toml: String::new(),
@@ -115,6 +116,7 @@ fn crl_file_state_at_startup() -> TestResult {
             ..Default::default()
         },
         enabled: None,
+        bidirectional: Some(false),
         federation: None,
         extensions: String::new(),
         extra_toml: String::new(),
@@ -483,6 +485,7 @@ fn shutdown_with_crl_file_checks_is_clean() -> TestResult {
             ..Default::default()
         },
         enabled: None,
+        bidirectional: Some(false),
         federation: None,
         extensions: String::new(),
         extra_toml: "[limits.s2s]\nnegotiation_timeout_secs=60".into(),

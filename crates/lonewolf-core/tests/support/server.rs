@@ -427,6 +427,7 @@ certificate_chain_path = "certificate-host.pem"
 private_key_path = "private-key-host.pem"
 [s2s]
 {enabled}
+{bidirectional}
 listeners = [{{ address = "127.0.0.1:0" }}]
 [s2s.tls]
 trust_anchors_path = {anchors:?}
@@ -460,6 +461,10 @@ timeout_secs = 1
             enabled = host
                 .enabled
                 .map(|enabled| format!("enabled = {enabled}"))
+                .unwrap_or_default(),
+            bidirectional = host
+                .bidirectional
+                .map(|value| format!("bidirectional = {value}"))
                 .unwrap_or_default(),
         );
         let federation_enabled = host.enabled.unwrap_or(true) && host.federation.unwrap_or(true);

@@ -533,6 +533,7 @@ impl C2sConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct S2sConfig {
     pub enabled: bool,
+    pub bidirectional: bool,
     pub listeners: Vec<S2sListenerConfig>,
     pub tls: S2sTlsConfig,
     pub dns: S2sDnsConfig,
@@ -544,6 +545,7 @@ impl Default for S2sConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            bidirectional: true,
             listeners: vec![S2sListenerConfig::default()],
             tls: S2sTlsConfig::default(),
             dns: S2sDnsConfig::default(),

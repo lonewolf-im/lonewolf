@@ -1213,6 +1213,7 @@ fn inactive_letsencrypt_configuration_does_not_bind_or_create_state() -> TestRes
 fn s2s_defaults_preserve_localhost_without_a_certificate() -> TestResult {
     let config = Config::load(Some(config_file("")?.path()))?;
     assert!(config.s2s.enabled);
+    assert!(config.s2s.bidirectional);
     assert_eq!(config.s2s.listeners.len(), 1);
     assert_eq!(config.s2s.listeners[0].address, "0.0.0.0:5269".parse()?);
     assert_eq!(config.s2s.tls.trust_anchors_path, None);
@@ -1253,6 +1254,7 @@ fn s2s_explicit_settings_replace_defaults() -> TestResult {
         r#"
 [s2s]
 enabled = false
+bidirectional = false
 [[s2s.listeners]]
 address = "[::]:5269"
 [s2s.tls]
@@ -1268,6 +1270,7 @@ timeout_secs = 7
     )?;
     let config = Config::load(Some(file.path()))?;
     assert!(!config.s2s.enabled);
+    assert!(!config.s2s.bidirectional);
     assert_eq!(
         config.s2s.listeners,
         vec![super::S2sListenerConfig {
@@ -1299,6 +1302,7 @@ timeout_secs = 7
 fn s2s_rejects_unknown_fields_and_invalid_shapes() -> TestResult {
     for contents in [
         "[s2s]\nunknown = true",
+        "[s2s]\nbidirectional = 'yes'",
         "[[s2s.listeners]]\nunknown = true",
         "[s2s.tls]\nunknown = true",
         "[s2s.tls]\nfetch_crls = 'yes'",

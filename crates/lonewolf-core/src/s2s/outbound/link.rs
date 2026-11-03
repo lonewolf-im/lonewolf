@@ -392,6 +392,10 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         if inner.state.lock().stopped {
             break;
         }
+        queue = match inner.offer_standby(queue) {
+            Ok(()) => return,
+            Err(queue) => queue,
+        };
         let context = connect::ConnectContext {
             hosts: &inner.hosts,
             trust: &inner.trust,
@@ -419,16 +423,14 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
                     }
                     _ => RemoteFailure::Timeout,
                 };
-                if !inner.failed(
-                    &queue.pair,
-                    &queue.counters,
-                    failures,
-                    condition,
-                    Instant::now(),
-                    jitter(),
-                ) {
-                    break;
-                }
+                queue = match inner.failed(queue, failures, condition, Instant::now(), jitter()) {
+                    FailureDisposition::HandedOff => return,
+                    FailureDisposition::Bounce(queue) => queue,
+                    FailureDisposition::Shutdown(returned) => {
+                        queue = returned;
+                        break;
+                    }
+                };
                 queue.receiver.close();
                 while let Some(queued) = queue
                     .current
@@ -512,7 +514,7 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
     inner.remove(&queue.pair, &queue.counters);
 }
 
-fn shutdown_queue<A: ChunkAllocator>(
+pub(super) fn shutdown_queue<A: ChunkAllocator>(
     inner: &Inner<A>,
     receiver: &Receiver<Queued<A>>,
     pair: &Pair,

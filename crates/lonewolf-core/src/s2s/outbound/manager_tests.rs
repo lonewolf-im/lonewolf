@@ -44,6 +44,7 @@ pub(super) fn manager_with_allocator<A: ChunkAllocator + Clone>(
         &limits,
         allocator,
         S2sMetrics::new(0),
+        None,
     ))
 }
 
@@ -268,21 +269,20 @@ fn failure_retention_identity_and_expired_retry_use_one_slot() -> TestResult {
             .map_err(|error| format!("{error:?}"))?
             .ok_or("launch")?;
         let now = Instant::now();
-        assert!(manager.inner.failed(
-            &first.queue.pair,
-            &first.queue.counters,
-            u32::MAX,
-            RemoteFailure::Timeout,
-            now,
-            1000
-        ));
+        let FailureDisposition::Bounce(first_queue) =
+            manager
+                .inner
+                .failed(first.queue, u32::MAX, RemoteFailure::Timeout, now, 1000)
+        else {
+            return Err("first failure did not retain backoff".into());
+        };
         assert!(matches!(
             manager.admit("localhost", "remote.test", message().await?),
             Err(RemoteError::Backoff(RemoteFailure::Timeout))
         ));
         {
             let mut state = manager.inner.state.lock();
-            if let Some(Entry::Backoff { delay, .. }) = state.entries.get_mut(&first.queue.pair) {
+            if let Some(Entry::Backoff { delay, .. }) = state.entries.get_mut(&first_queue.pair) {
                 *delay = Duration::ZERO;
             }
         }
@@ -294,15 +294,14 @@ fn failure_retention_identity_and_expired_retry_use_one_slot() -> TestResult {
         assert_eq!(manager.inner.state.lock().entries.len(), 1);
         manager
             .inner
-            .remove(&first.queue.pair, &first.queue.counters);
-        assert!(!manager.inner.failed(
-            &first.queue.pair,
-            &first.queue.counters,
-            0,
-            RemoteFailure::NotFound,
-            now,
-            1000
-        ));
+            .remove(&first_queue.pair, &first_queue.counters);
+        let FailureDisposition::Shutdown(first_queue) =
+            manager
+                .inner
+                .failed(first_queue, 0, RemoteFailure::NotFound, now, 1000)
+        else {
+            return Err("stale failure did not preserve the replacement".into());
+        };
         assert!(
             manager
                 .inner
@@ -310,20 +309,52 @@ fn failure_retention_identity_and_expired_retry_use_one_slot() -> TestResult {
                 .lock()
                 .owns(&second.queue.pair, &second.queue.counters)
         );
-        assert!(manager.inner.failed(
-            &second.queue.pair,
-            &second.queue.counters,
-            0,
-            RemoteFailure::NotFound,
-            now,
-            1000
-        ));
+        let FailureDisposition::Bounce(second_queue) =
+            manager
+                .inner
+                .failed(second.queue, 0, RemoteFailure::NotFound, now, 1000)
+        else {
+            return Err("replacement failure did not retain backoff".into());
+        };
         assert!(matches!(
-            manager.inner.state.lock().entries.get(&second.queue.pair),
+            manager.inner.state.lock().entries.get(&second_queue.pair),
             Some(Entry::Backoff { failures: 1, .. })
         ));
-        drop(first);
-        drop(second);
+        let stopped = manager
+            .admit(
+                "localhost",
+                "stopped.test",
+                stanza("<message from='alice@localhost/desk' to='bob@stopped.test'/>").await?,
+            )
+            .map_err(|error| format!("{error:?}"))?
+            .ok_or("stopped launch")?;
+        manager.stop();
+        let FailureDisposition::Shutdown(mut stopped_queue) =
+            manager
+                .inner
+                .failed(stopped.queue, 0, RemoteFailure::Timeout, now, 1000)
+        else {
+            return Err("stopped failure did not retain the queue for shutdown".into());
+        };
+        assert!(manager.inner.state.lock().entries.is_empty());
+        stopped_queue.receiver.close();
+        link::shutdown_queue(
+            &manager.inner,
+            &stopped_queue.receiver,
+            &stopped_queue.pair,
+            &mut stopped_queue.current,
+        );
+        manager
+            .inner
+            .remove(&stopped_queue.pair, &stopped_queue.counters);
+        assert_eq!(stopped_queue.counters.count.load(Ordering::Relaxed), 0);
+        assert_eq!(stopped_queue.counters.bytes.load(Ordering::Relaxed), 0);
+        assert!(
+            render(&manager.inner.metrics)?
+                .contains("s2s_dropped_stanzas_total{reason=\"shutdown\"} 1")
+        );
+        drop((first_queue, second_queue, stopped_queue));
+        drop((first.guard, second.guard, stopped.guard));
         manager.join(Instant::now() + TIMEOUT).await?;
         assert!(manager.inner.state.lock().entries.is_empty());
         assert!(manager.register().is_none());
@@ -429,17 +460,17 @@ fn registered_catalog_observes_persistent_queue_link_and_failure_state() -> Test
         ready(&task.queue.counters, &mut failures);
         assert_eq!(failures, 0);
         assert!(render(&clone.inner.metrics)?.contains("s2s_outbound_links{state=\"ready\"} 1"));
-        assert!(clone.inner.failed(
-            &task.queue.pair,
-            &task.queue.counters,
-            0,
-            RemoteFailure::Timeout,
-            Instant::now(),
-            1000
-        ));
+        let FailureDisposition::Bounce(queue) =
+            clone
+                .inner
+                .failed(task.queue, 0, RemoteFailure::Timeout, Instant::now(), 1000)
+        else {
+            return Err("catalog failure did not retain backoff".into());
+        };
         assert!(render(&clone.inner.metrics)?.contains("s2s_outbound_links{state=\"backoff\"} 1"));
         clone.stop();
-        drop(task);
+        drop(queue);
+        drop(task.guard);
         clone.join(Instant::now() + TIMEOUT).await?;
         assert!(render(&clone.inner.metrics)?.contains("s2s_outbound_links{state=\"backoff\"} 0"));
         Ok(())

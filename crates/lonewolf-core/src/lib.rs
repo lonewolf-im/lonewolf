@@ -314,6 +314,9 @@ fn run_internal(
                         &config.limits.s2s,
                         Arc::clone(&stanza_pool),
                         Arc::clone(metrics),
+                        config.s2s.bidirectional.then(|| s2s::outbound::BidiIngress {
+                            storage: storage.clone(),
+                        }),
                     ));
                     Some(peers)
                 } else {

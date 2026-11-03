@@ -62,6 +62,7 @@ impl Fixture {
             &limits,
             GlobalChunkAllocator,
             S2sMetrics::new(0),
+            None,
         );
         let counters = Arc::new(QueueCounters::default());
         let (receiver, guard) = {

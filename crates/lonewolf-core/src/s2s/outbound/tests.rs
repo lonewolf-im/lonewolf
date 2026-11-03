@@ -683,6 +683,7 @@ fn pending_tcp_connect_is_destroyed_by_production_stop_without_trying_the_next_e
         let resolver = Resolver::new(&config.s2s)?;
         let metrics = S2sMetrics::new(0);
         let context = ConnectContext {
+            bidirectional: config.s2s.bidirectional,
             hosts: &hosts,
             trust: &trust,
             revocation: &PeerRevocation::disabled(),

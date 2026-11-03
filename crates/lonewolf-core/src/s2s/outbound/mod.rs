@@ -46,6 +46,7 @@ type ClientTlsInput = BufReader<Compat<ReadHalf<ClientTlsTransport>>>;
 type ClientTlsOutput = WriteHalf<ClientTlsTransport>;
 
 pub(crate) struct OutboundStream<A: ChunkAllocator> {
+    pub(crate) bidi: bool,
     _socket: ConnectionSocket,
     pub(crate) reader: S2sReader<A, ClientTlsInput>,
     pub(crate) writer: S2sWriter<ClientTlsOutput>,
@@ -88,7 +89,6 @@ pub(crate) struct RemoteRouter<A: ChunkAllocator> {
 
 #[derive(Clone)]
 pub(crate) struct BidiIngress {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) storage: RedbStorage,
 }
 

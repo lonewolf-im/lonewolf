@@ -22,6 +22,7 @@ use crate::router::RoutedStanza;
 use crate::s2s::ingress::{self, InboundPeer, IngressContext, IngressFailure};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{Direction, S2sMetrics, StreamClose};
+use crate::s2s::outbound::duplex::{self, DuplexEnd, DuplexParameters};
 use crate::s2s::revocation::CheckPhase;
 use crate::s2s::stream::{S2sError, S2sReader, S2sWriter};
 use crate::s2s::validity::{LinkValidity, MonitorLog, supervise};
@@ -54,6 +55,26 @@ struct Closed {
 }
 
 impl Closed {
+    fn duplex(end: DuplexEnd) -> Self {
+        let wire = if end.abort {
+            WireClose::Abort
+        } else if let Some(condition) = end.violation {
+            WireClose::Error(condition)
+        } else if end.reason.certificate_invalid() {
+            WireClose::Error(StreamErrorCondition::Reset)
+        } else if matches!(end.reason, StreamClose::Shutdown) {
+            WireClose::Error(StreamErrorCondition::SystemShutdown)
+        } else {
+            WireClose::Footer {
+                peer_closed: end.peer_closed,
+            }
+        };
+        Self {
+            outcome: end.reason,
+            wire,
+        }
+    }
+
     fn interrupted(condition: StreamErrorCondition, validity: &LinkValidity) -> Self {
         if matches!(condition, StreamErrorCondition::Reset) {
             Self {
@@ -134,7 +155,7 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
         remote: authenticated.remote,
         connection_id: authenticated.connection_id,
     };
-    tracing::info!(connection_id = peer.connection_id, local_domain = %log_domain(&peer.local), remote_domain = %log_domain(&peer.remote), direction = "inbound", "s2s connection authenticated");
+    tracing::info!(connection_id = peer.connection_id, local_domain = %log_domain(&peer.local), remote_domain = %log_domain(&peer.remote), direction = "inbound", bidi = authenticated.bidi, "s2s connection authenticated");
     let (validity, monitor) = match authenticated.revocation {
         Some(verdict) if verdict.needs_rechecks() => {
             let revocation = std::sync::Arc::clone(&settings.revocation);
@@ -167,6 +188,7 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
             validity: &validity,
             settings,
             shutdown,
+            bidi: authenticated.bidi,
         },
         || {
             let _ = socket2::SockRef::from(tcp).shutdown(std::net::Shutdown::Both);
@@ -192,6 +214,7 @@ struct Parameters<'a, A: ChunkAllocator> {
     validity: &'a LinkValidity,
     settings: &'a Settings<A>,
     shutdown: ShutdownSignal,
+    bidi: bool,
 }
 
 async fn run<A, R, W, D>(
@@ -216,6 +239,7 @@ where
         validity,
         settings,
         shutdown,
+        bidi,
     } = parameters;
     let mut terminal = Terminal {
         metrics: &settings.metrics,
@@ -234,12 +258,40 @@ where
         allocator: settings.services.allocator.clone(),
         work: group.handle(),
     };
+    let mut registration = if permit.is_some() && bidi {
+        settings.services.router.remote_router().and_then(|remote| {
+            remote.register_bidi(&settings.services.router, &peer.local, &peer.remote)
+        })
+    } else {
+        None
+    };
+    let bidi_gauge = registration
+        .as_ref()
+        .map(|_| settings.metrics.bidi_stream_opened(Direction::Inbound));
+    let mut queue = None;
     let closed = if permit.is_none() {
         rejection(
             peer,
             "stream",
             Closed::error(StreamErrorCondition::Conflict),
         )
+    } else if let Some(registration) = &registration {
+        let end = duplex::run_inbound(
+            registration,
+            &mut queue,
+            reader,
+            writer,
+            DuplexParameters {
+                peer,
+                context: &context,
+                validity,
+                idle_timeout: settings.idle_timeout,
+            },
+            shutdown.clone().map(|_| ()),
+            &mut dispatch,
+        )
+        .await;
+        rejection(peer, "stream", Closed::duplex(end))
     } else {
         receive(
             reader,
@@ -253,11 +305,24 @@ where
         .await
     };
     terminal.outcome = closed.outcome;
-    close(reader, writer, closed, validity, shutdown).await;
-    abort();
+    let mut release = || {
+        if let Some(registration) = registration.take() {
+            registration.release(queue.take());
+        }
+    };
+    finish(
+        reader,
+        writer,
+        closed,
+        validity,
+        shutdown,
+        abort,
+        &mut release,
+    )
+    .await;
     drop(context);
     group.drain().await;
-    drop((permit, gauge));
+    drop((permit, gauge, bidi_gauge));
     closed.outcome
 }
 
@@ -329,12 +394,31 @@ where
     }
 }
 
+async fn finish<A, R, W>(
+    reader: &mut S2sReader<A, R>,
+    writer: &mut S2sWriter<W>,
+    closed: Closed,
+    validity: &LinkValidity,
+    shutdown: ShutdownSignal,
+    abort: impl FnOnce(),
+    mut release: impl FnMut(),
+) where
+    A: ChunkAllocator + Clone + 'static,
+    R: AsyncBufRead + Unpin + 'static,
+    W: AsyncWrite + Unpin,
+{
+    close(reader, writer, closed, validity, shutdown, &mut release).await;
+    abort();
+    release();
+}
+
 async fn close<A, R, W>(
     reader: &mut S2sReader<A, R>,
     writer: &mut S2sWriter<W>,
     closed: Closed,
     validity: &LinkValidity,
     shutdown: ShutdownSignal,
+    flushed: impl FnOnce(),
 ) where
     A: ChunkAllocator + Clone + 'static,
     R: AsyncBufRead + Unpin + 'static,
@@ -352,6 +436,7 @@ async fn close<A, R, W>(
     }
     let operation = async {
         writer.close(condition).await?;
+        flushed();
         if !peer_closed {
             let _ = compio::time::timeout(FOOTER_GRACE, async {
                 while let Some(event) = reader.next_event().await? {

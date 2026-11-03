@@ -703,13 +703,11 @@ impl S2sMetrics {
         self.dropped[reason as usize].fetch_add(count, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn bidi_negotiated(&self, direction: Direction, outcome: BidiOutcome) {
         self.bidi_negotiations[direction as usize][outcome as usize]
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn bidi_stream_opened(self: &Arc<Self>, direction: Direction) -> ConnectionGauge {
         self.bidi_streams[direction as usize].fetch_add(1, Ordering::Relaxed);
         ConnectionGauge {
@@ -1026,12 +1024,12 @@ impl Collector for S2sCollector {
         for (name, help, counters) in [
             (
                 "s2s_stanzas_received",
-                "Stanzas accepted from inbound streams after address validation.",
+                "Stanzas accepted from remote servers after address validation.",
                 &metrics.stanzas_received,
             ),
             (
                 "s2s_stanzas_sent",
-                "Stanzas written to outbound streams.",
+                "Stanzas written to remote servers.",
                 &metrics.stanzas_sent,
             ),
             (

@@ -28,6 +28,7 @@ const STARTTLS: &str = "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 const PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 const TLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
 const EXTERNAL_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>";
+const EXTERNAL_BIDI_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>";
 type SendingPeer = XmlStream<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
 struct Signer {
@@ -207,10 +208,11 @@ fn authenticate(
         peer.transport().conn.peer_certificates(),
         Some(std::slice::from_ref(certificate))
     );
-    peer.features()?.assert_xml(&EXTERNAL_FEATURES.replace(
-        "<stream:features>",
-        "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>",
-    ))?;
+    peer.features()?
+        .assert_xml(&EXTERNAL_BIDI_FEATURES.replace(
+            "<stream:features>",
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>",
+        ))?;
     peer.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='EXTERNAL'>=</auth>")?;
     peer.receive()?.assert_name(SASL_NAMESPACE, "success");
     let mut peer = peer.restart();

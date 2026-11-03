@@ -255,7 +255,7 @@ pub fn external(peer: &mut Peer, header: &str) -> Result<String> {
     let header = response_header(peer)?;
     assert_eq!(
         until(peer, "</stream:features>")?,
-        "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>"
+        "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>"
     );
     Ok(header)
 }

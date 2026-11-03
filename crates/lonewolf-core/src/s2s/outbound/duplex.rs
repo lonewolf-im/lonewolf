@@ -20,11 +20,8 @@ use crate::s2s::stream::S2sError;
 use crate::s2s::validity::LinkValidity;
 
 pub(in crate::s2s) struct DuplexEnd {
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(in crate::s2s) reason: StreamClose,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(in crate::s2s) violation: Option<StreamErrorCondition>,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(in crate::s2s) peer_closed: bool,
     /// A failed transport cannot carry a closing tag.
     pub(in crate::s2s) abort: bool,
@@ -140,7 +137,6 @@ enum SendEnd {
     Failed { reason: StreamClose, abort: bool },
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(in crate::s2s) async fn run_inbound<A, R, W, D>(
     registration: &BidiRegistration<A>,
     queue: &mut Option<LinkQueue<A>>,

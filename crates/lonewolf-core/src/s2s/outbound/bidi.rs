@@ -17,7 +17,6 @@ pub(crate) struct BidiRegistration<A: ChunkAllocator + Clone + 'static> {
 
 impl<A: ChunkAllocator + Clone + 'static> RemoteRouter<A> {
     /// Call this only after the peer authenticates for this domain pair.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn register_bidi(
         &self,
         router: &RouterHandle<A>,
@@ -99,7 +98,6 @@ impl<A: ChunkAllocator + Clone + 'static> BidiRegistration<A> {
         self.assigned.recv().await.ok()
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     /// Pass the assigned queue to preserve queued stanzas when this stream ends.
     pub(crate) fn release(mut self, queue: Option<LinkQueue<A>>) {
         self.release_inner(queue);

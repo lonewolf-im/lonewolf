@@ -133,6 +133,14 @@ impl RawS2sPeer {
         ))?;
         Ok(())
     }
+    pub fn expect_external_and_bidi_offered(&mut self) -> TestResult {
+        self.stream.features()?.assert_xml(&format!(
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>"
+        ))
+    }
+    pub fn request_bidi(&mut self) -> TestResult {
+        self.send("<bidi xmlns='urn:xmpp:bidi'/>")
+    }
     pub fn auth_external(&mut self, authzid: Option<&str>) -> TestResult {
         let text = authzid
             .map(|identity| {

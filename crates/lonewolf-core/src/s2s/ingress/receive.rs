@@ -8,7 +8,30 @@ use lonewolf_xmpp::stream::StreamErrorCondition;
 
 use super::{InboundPeer, IngressContext};
 use crate::router::RoutedStanza;
-use crate::s2s::metrics::S2sMetrics;
+use crate::s2s::metrics::{S2sMetrics, StreamClose};
+
+pub(crate) fn violation_close(condition: StreamErrorCondition) -> StreamClose {
+    match condition {
+        StreamErrorCondition::Reset => StreamClose::CertificateExpired,
+        StreamErrorCondition::SystemShutdown => StreamClose::Shutdown,
+        StreamErrorCondition::Conflict => StreamClose::Conflict,
+        StreamErrorCondition::ImproperAddressing => StreamClose::ImproperAddressing,
+        StreamErrorCondition::HostUnknown => StreamClose::HostUnknown,
+        StreamErrorCondition::InvalidFrom => StreamClose::InvalidFrom,
+        StreamErrorCondition::InvalidNamespace => StreamClose::InvalidNamespace,
+        StreamErrorCondition::UnsupportedStanzaType => StreamClose::UnsupportedStanzaType,
+        StreamErrorCondition::InternalServerError => StreamClose::InternalError,
+        _ => StreamClose::ProtocolError,
+    }
+}
+
+pub(crate) fn reader_violation_close(condition: StreamErrorCondition) -> StreamClose {
+    match condition {
+        StreamErrorCondition::InvalidNamespace => StreamClose::InvalidNamespace,
+        StreamErrorCondition::UnsupportedStanzaType => StreamClose::UnsupportedStanzaType,
+        _ => StreamClose::ProtocolError,
+    }
+}
 
 pub(crate) fn validate(
     namespace: StanzaNamespace,
@@ -49,6 +72,7 @@ pub(crate) async fn process<A, F>(
     peer: &InboundPeer,
     metrics: &S2sMetrics,
     context: &IngressContext<A>,
+    count_bidi: bool,
     deliver: F,
 ) -> Result<(), StreamErrorCondition>
 where
@@ -70,6 +94,9 @@ where
                 peer,
             )?;
             metrics.stanza_received(view.kind());
+            if count_bidi {
+                metrics.bidi_stanza_received(view.kind());
+            }
             let mut arena = Arena::try_new_in(Default::default(), context.allocator.clone())
                 .map_err(|_| StreamErrorCondition::InternalServerError)?;
             let stanza = view
@@ -96,6 +123,9 @@ where
                 peer,
             )?;
             metrics.stanza_received(rejected.kind());
+            if count_bidi {
+                metrics.bidi_stanza_received(rejected.kind());
+            }
             if rejected.can_reply() {
                 let mut output = Arena::try_new_in(Default::default(), context.allocator.clone())
                     .map_err(|_| StreamErrorCondition::InternalServerError)?;
@@ -258,6 +288,7 @@ mod tests {
                 &peer(),
                 &fixture.metrics,
                 &fixture.context,
+                false,
                 async |stanza| {
                     let view = stanza
                         .resolve()
@@ -310,6 +341,7 @@ mod tests {
                     &peer(),
                     &fixture.metrics,
                     &fixture.context,
+                    false,
                     async |_| {
                         delivered = true;
                         Ok(())
@@ -338,6 +370,7 @@ mod tests {
                 &peer(),
                 &fixture.metrics,
                 &fixture.context,
+                false,
                 async |_| {
                     delivered = true;
                     Ok(())
@@ -363,6 +396,7 @@ mod tests {
                 &peer(),
                 &fixture.metrics,
                 &fixture.context,
+                false,
                 async |_| {
                     delivered = true;
                     Err(StreamErrorCondition::SystemShutdown)

@@ -9,7 +9,7 @@ use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::Arena;
 use lonewolf_xmpp::parser::StreamEvent;
-use lonewolf_xmpp::stanza::StanzaNamespace;
+use lonewolf_xmpp::stanza::{StanzaKind, StanzaNamespace};
 use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::AsyncBufRead;
 
@@ -58,8 +58,8 @@ async fn watch<T>(
     }
 }
 
-enum WriteOutcome {
-    Written(Instant),
+pub(super) enum WriteOutcome {
+    Written { at: Instant, kind: StanzaKind },
     Discarded,
 }
 
@@ -77,10 +77,11 @@ fn discard<A: ChunkAllocator>(
     }
     drop(queued.reservation.take());
     inner.metrics.dropped(DropReason::InternalError, 1);
+    queued.write_outcome_recorded = true;
     Ok(WriteOutcome::Discarded)
 }
 
-async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
+pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     writer: &mut S2sWriter<W>,
     queued: &mut Queued<A>,
     inner: &Inner<A>,
@@ -135,6 +136,7 @@ async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     if let Err(reason) = result {
         if queued.reservation.is_none() {
             inner.metrics.dropped(DropReason::ConnectionLost, 1);
+            queued.write_outcome_recorded = true;
             tracing::debug!(
                 stanza_kind = kind.as_str(),
                 "s2s in-flight stanza discarded"
@@ -144,6 +146,7 @@ async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     }
     let written_at = Instant::now();
     inner.metrics.stanza_sent(kind);
+    queued.write_outcome_recorded = true;
     *buffered = true;
     if flush {
         watch(
@@ -156,7 +159,10 @@ async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
         .await?;
         *buffered = false;
     }
-    Ok(WriteOutcome::Written(written_at))
+    Ok(WriteOutcome::Written {
+        at: written_at,
+        kind,
+    })
 }
 
 async fn graceful<
@@ -275,7 +281,7 @@ async fn serve<
                 )
                 .await
                 {
-                    Ok(WriteOutcome::Written(written_at)) => {
+                    Ok(WriteOutcome::Written { at: written_at, .. }) => {
                         last_written = written_at;
                         *current = None;
                     }
@@ -889,7 +895,7 @@ mod tests {
                         &mut buffered
                     )
                     .await,
-                    Ok(WriteOutcome::Written(_))
+                    Ok(WriteOutcome::Written { .. })
                 ));
             }
             assert!(task.queue.receiver.is_empty());
@@ -970,7 +976,7 @@ mod tests {
                     &mut buffered
                 )
                 .await,
-                Ok(WriteOutcome::Written(_))
+                Ok(WriteOutcome::Written { .. })
             ));
             drop(first);
             assert!(buffered);

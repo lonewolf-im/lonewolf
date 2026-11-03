@@ -37,6 +37,7 @@ use crate::router::RouterHandle;
 
 mod bidi;
 pub(crate) mod connect;
+pub(crate) mod duplex;
 pub(crate) use bidi::BidiRegistration;
 
 type ClientTlsTransport =
@@ -209,6 +210,7 @@ impl Drop for Reservation {
 struct Queued<A: ChunkAllocator> {
     stanza: RoutedStanza<A>,
     reservation: Option<Reservation>,
+    write_outcome_recorded: bool,
 }
 
 impl<A: ChunkAllocator> Queued<A> {
@@ -245,6 +247,7 @@ impl<A: ChunkAllocator> LinkHandle<A> {
             return Err(RemoteError::Busy);
         }
         let queued = Queued {
+            write_outcome_recorded: false,
             stanza,
             reservation: Some(Reservation {
                 counters: Arc::clone(&self.counters),

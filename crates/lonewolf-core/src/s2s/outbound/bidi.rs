@@ -91,7 +91,10 @@ impl<A: ChunkAllocator + Clone + 'static> Inner<A> {
 }
 
 impl<A: ChunkAllocator + Clone + 'static> BidiRegistration<A> {
-    #[cfg_attr(not(test), expect(dead_code))]
+    pub(super) fn inner(&self) -> &Inner<A> {
+        &self.inner
+    }
+
     pub(crate) async fn assigned(&self) -> Option<LinkQueue<A>> {
         self.assigned.recv().await.ok()
     }

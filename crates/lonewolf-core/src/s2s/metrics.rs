@@ -719,12 +719,10 @@ impl S2sMetrics {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn bidi_stanza_sent(&self, kind: StanzaKind) {
         self.bidi_stanzas_sent[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn bidi_stanza_received(&self, kind: StanzaKind) {
         self.bidi_stanzas_received[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }

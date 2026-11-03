@@ -17,12 +17,24 @@ pub(super) struct SingleServer {
 
 impl SingleServer {
     pub fn start(extra: &str) -> TestResult<Self> {
-        Self::start_with_revocation(extra, Default::default())
+        Self::start_with(extra, Default::default(), Some(false))
     }
 
     pub fn start_with_revocation(
         extra: &str,
         revocation: super::super::support::federation::HostRevocation,
+    ) -> TestResult<Self> {
+        Self::start_with(extra, revocation, Some(false))
+    }
+
+    pub fn start_bidirectional(extra: &str) -> TestResult<Self> {
+        Self::start_with(extra, Default::default(), None)
+    }
+
+    fn start_with(
+        extra: &str,
+        revocation: super::super::support::federation::HostRevocation,
+        bidirectional: Option<bool>,
     ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let ca = Arc::new(FederationCa::new(directory.path())?);
@@ -31,7 +43,7 @@ impl SingleServer {
             domain: "a.test".into(),
             revocation,
             enabled: None,
-            bidirectional: Some(false),
+            bidirectional,
             federation: None,
             extensions: String::new(),
             extra_toml: extra.into(),

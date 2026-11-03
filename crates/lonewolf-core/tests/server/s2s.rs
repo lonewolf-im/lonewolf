@@ -39,7 +39,7 @@ fn inbound_external_success_orders_elements_and_rotates_stream_ids() -> Result {
         let third = success(&mut peer, &auth)?;
         received += 2 * HEADER.len() + auth.len() + FOOTER.len();
         sent += second.len() + third.len() + FOOTER.len()
-            + "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>".len()
+            + "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>".len()
             + "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>".len()
             + "<stream:features/>".len();
         assert_ne!(id(&first)?, id(&second)?);

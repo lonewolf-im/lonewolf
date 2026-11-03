@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::SystemTime;
 
 use compio::runtime::Runtime;
@@ -34,10 +34,34 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> TestResult<Self> {
+        Self::with_bidi(false)
+    }
+
+    fn with_bidi(bidi: bool) -> TestResult<Self> {
+        use crate::s2s::outbound::{BidiIngress, RemoteRouter};
+        use crate::s2s::revocation::PeerVerification;
         let config = Config::default();
         let hosts = Hosts::new(&config.hosts, None)?;
-        let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator));
         let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("state.redb"))?;
+        let metrics = S2sMetrics::new(0);
+        let mut router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator));
+        if bidi {
+            router = router.with_remote(RemoteRouter::new(
+                hosts.clone(),
+                PeerVerification {
+                    trust: PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?,
+                    revocation: PeerRevocation::disabled(),
+                },
+                Arc::new(crate::s2s::dns::Resolver::new(&config.s2s)?),
+                &config.limits.s2s,
+                GlobalChunkAllocator,
+                Arc::clone(&metrics),
+                Some(BidiIngress {
+                    storage: storage.clone(),
+                }),
+            ));
+        }
         Ok(Self {
             settings: Settings {
                 trust: PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?,
@@ -51,13 +75,13 @@ impl Fixture {
                 },
                 services: IngressServices {
                     router: router.handle(),
-                    storage: RedbStorage::open(directory.path().join("state.redb"))?,
+                    storage,
                     allocator: GlobalChunkAllocator,
                 },
                 streams: Arc::new(super::super::streams::InboundStreams::default()),
                 max_streams: 1,
                 idle_timeout: Duration::from_secs(30),
-                metrics: S2sMetrics::new(0),
+                metrics,
             },
             _directory: directory,
         })
@@ -94,6 +118,7 @@ impl Fixture {
             validity,
             settings: &self.settings,
             shutdown,
+            bidi: false,
         }
     }
 }
@@ -795,6 +820,345 @@ fn monitored_file_deadline_resets_the_stream_and_records_staleness() -> TestResu
             "s2s_streams_closed_total{direction=\"inbound\",outcome=\"revocation_stale\"}",
             1,
         )?;
+        Ok(())
+    })
+}
+
+#[derive(Default)]
+struct CloseInput {
+    bytes: std::collections::VecDeque<u8>,
+    eof: bool,
+    waker: Option<Waker>,
+}
+
+#[derive(Clone, Default)]
+struct CloseReader(Rc<RefCell<CloseInput>>);
+
+impl CloseReader {
+    fn supply(&self, bytes: &[u8], eof: bool) {
+        let mut state = self.0.borrow_mut();
+        state.bytes.extend(bytes);
+        state.eof = eof;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for CloseReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut state = self.0.borrow_mut();
+        if state.bytes.is_empty() && !state.eof {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        while output.remaining() > 0 {
+            let Some(byte) = state.bytes.pop_front() else {
+                break;
+            };
+            output.put_slice(&[byte]);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Default)]
+struct CloseOutput {
+    bytes: Vec<u8>,
+    paused: bool,
+    failed: bool,
+    blocked: bool,
+    flushed: bool,
+    polls: usize,
+    aborted: bool,
+    waker: Option<Waker>,
+}
+
+#[derive(Clone, Default)]
+struct CloseWriter(Rc<RefCell<CloseOutput>>);
+
+impl CloseWriter {
+    fn resume(&self) {
+        let mut state = self.0.borrow_mut();
+        state.paused = false;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl AsyncWrite for CloseWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut state = self.0.borrow_mut();
+        assert!(!state.aborted);
+        state.polls += 1;
+        if state.failed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if state.paused {
+            state.blocked = true;
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        state.bytes.extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut state = self.0.borrow_mut();
+        assert!(!state.aborted);
+        state.polls += 1;
+        state.flushed = true;
+        Poll::Ready(Ok(()))
+    }
+    fn poll_close(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut state = self.0.borrow_mut();
+        assert!(!state.aborted);
+        state.polls += 1;
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn close_reader(
+    fixture: &Fixture,
+) -> TestResult<(
+    CloseReader,
+    S2sReader<GlobalChunkAllocator, tokio::io::BufReader<CloseReader>>,
+)> {
+    let input = CloseReader::default();
+    input.supply(HEADER.as_bytes(), false);
+    let mut reader = S2sReader::new(
+        tokio::io::BufReader::new(input.clone()),
+        &fixture.settings.reader_limits,
+        GlobalChunkAllocator,
+        None,
+    );
+    assert!(matches!(
+        reader.next_event().await.map_err(|e| format!("{e:?}"))?,
+        Some(StreamEvent::StreamStart { .. })
+    ));
+    Ok((input, reader))
+}
+
+fn close_validity() -> (LinkValidity, crate::s2s::validity::ValidityMonitor) {
+    use crate::s2s::revocation::{RevocationSource, RevocationStatus, RevocationVerdict};
+    LinkValidity::monitored(
+        SystemTime::now() + Duration::from_secs(3600),
+        RevocationVerdict {
+            source: RevocationSource::Fetched,
+            status: RevocationStatus::Good,
+            next_update: None,
+            refresh_at: None,
+            pending: Vec::new(),
+            leases: Vec::new(),
+            recheckable: false,
+        },
+        Duration::from_secs(60),
+        Box::new(|| async { None }.boxed_local()),
+    )
+}
+
+#[test]
+fn buffered_stanza_and_close_flush_before_queue_handoff_and_peer_footer() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::with_bidi(true)?;
+        let router = &fixture.settings.services.router;
+        let remote = router.remote_router().ok_or("missing remote")?;
+        let older = remote.register_bidi(router, "localhost", "remote.test").ok_or("missing older")?;
+        let registration = remote.register_bidi(router, "localhost", "remote.test").ok_or("missing registration")?;
+        let mut source = fixture.reader("<message from='a@localhost' to='b@remote.test'><body>first</body></message><message from='a@localhost' to='b@remote.test'><body>second</body></message>").await?;
+        for _ in 0..2 {
+            let Some(StreamEvent::Stanza(stanza)) = source.next_event().await.map_err(|e| format!("{e:?}"))? else { return Err("missing stanza".into()); };
+            remote.route(router, "localhost", "remote.test", RoutedStanza::from_parsed(stanza)).map_err(|e| format!("{e:?}"))?;
+        }
+        let mut queue = Some(registration.assigned().await.ok_or("missing assignment")?);
+        let (input, mut reader) = close_reader(&fixture).await?;
+        let output = CloseWriter::default();
+        let mut writer = S2sWriter::new(output.clone());
+        let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(3600));
+        let mut group = WorkGroup::new();
+        let context = IngressContext { router: router.clone(), storage: fixture.settings.services.storage.clone(), allocator: GlobalChunkAllocator, work: group.handle() };
+        let peer = InboundPeer { local: "localhost".into(), remote: "remote.test".into(), connection_id: 1 };
+        let (stop, shutdown) = oneshot::channel::<()>();
+        let mut dispatch = async |_: &IngressContext<GlobalChunkAllocator>, _: &InboundPeer, _: RoutedStanza<GlobalChunkAllocator>| Ok(());
+        let end = {
+            let mut driver = std::pin::pin!(duplex::run_inbound(&registration, &mut queue, &mut reader, &mut writer, DuplexParameters { peer: &peer, context: &context, validity: &validity, idle_timeout: Duration::from_secs(30) }, async { let _ = shutdown.await; }, &mut dispatch));
+            assert!(poll!(driver.as_mut()).is_pending());
+            sample(&fixture.settings.metrics, "s2s_bidi_stanzas_sent_total{kind=\"message\"}", 1)?;
+            assert!(output.0.borrow().bytes.is_empty());
+            stop.send(()).map_err(|_| "driver stopped")?;
+            driver.await
+        };
+        assert!(matches!(end.reason, StreamClose::Shutdown));
+        assert!(queue.is_some());
+        sample(&fixture.settings.metrics, "s2s_outbound_queued_stanzas", 1)?;
+        output.0.borrow_mut().paused = true;
+        let mut registration = Some(registration);
+        let released = Cell::new(0);
+        let mut release = || {
+            if let Some(registration) = registration.take() {
+                assert!(output.0.borrow().flushed);
+                let state = output.0.borrow();
+                assert!(state.bytes.windows(b"<body>first</body></message>".len()).any(|bytes| bytes == b"<body>first</body></message>"));
+                assert!(state.bytes.ends_with(b"</stream:stream>"));
+                assert!(!state.bytes.windows(6).any(|bytes| bytes == b"second"));
+                released.set(released.get() + 1);
+                registration.release(queue.take());
+            }
+        };
+        let (_stop, shutdown) = signal();
+        let mut closing = Box::pin(finish(&mut reader, &mut writer, Closed::footer(StreamClose::StreamEnd, false), &validity, shutdown, || { output.0.borrow_mut().aborted = true; }, &mut release));
+        let mut assigned = Box::pin(older.assigned());
+        assert!(poll!(closing.as_mut()).is_pending());
+        assert!(output.0.borrow().blocked);
+        assert_eq!(released.get(), 0);
+        assert!(poll!(assigned.as_mut()).is_pending());
+        output.resume();
+        assert!(poll!(closing.as_mut()).is_pending());
+        assert_eq!(released.get(), 1);
+        assert!(!output.0.borrow().aborted);
+        let tail = assigned.await.ok_or("missing tail handoff")?;
+        sample(&fixture.settings.metrics, "s2s_outbound_queued_stanzas", 1)?;
+        input.supply(b"</stream:stream>", true);
+        closing.await;
+        assert!(output.0.borrow().aborted);
+        assert_eq!(released.get(), 1);
+        remote.stop();
+        older.release(Some(tail));
+        remote.join(Instant::now() + Duration::from_secs(1)).await?;
+        drop(context);
+        group.drain().await;
+        sample(&fixture.settings.metrics, "s2s_outbound_queued_stanzas", 0)?;
+        Ok(())
+    }))?
+}
+
+#[test]
+fn failed_cancelled_and_aborted_close_abort_before_releasing_once() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for case in 0..4 {
+            let fixture = Fixture::new()?;
+            let (_input, mut reader) = close_reader(&fixture).await?;
+            let output = CloseWriter::default();
+            output.0.borrow_mut().paused = case == 1 || case == 2;
+            output.0.borrow_mut().failed = case == 0;
+            let mut writer = S2sWriter::new(output.clone());
+            let (validity, monitor) = close_validity();
+            let (stop, shutdown) = signal();
+            let events = RefCell::new(Vec::new());
+            let released = Cell::new(false);
+            let mut release = || {
+                if !released.replace(true) {
+                    assert!(output.0.borrow().aborted);
+                    events.borrow_mut().push("release");
+                }
+            };
+            let closed = if case == 3 {
+                Closed {
+                    outcome: StreamClose::TransportError,
+                    wire: WireClose::Abort,
+                }
+            } else {
+                Closed::footer(StreamClose::StreamEnd, false)
+            };
+            let mut closing = Box::pin(finish(
+                &mut reader,
+                &mut writer,
+                closed,
+                &validity,
+                shutdown,
+                || {
+                    output.0.borrow_mut().aborted = true;
+                    events.borrow_mut().push("abort");
+                },
+                &mut release,
+            ));
+            if case == 1 || case == 2 {
+                assert!(poll!(closing.as_mut()).is_pending());
+                assert!(output.0.borrow().blocked);
+                assert!(!released.get());
+                assert!(!output.0.borrow().aborted);
+                if case == 1 {
+                    validity.record_invalidation(StreamClose::CertificateRevoked);
+                    drop(monitor);
+                } else {
+                    stop.send(Instant::now() - Duration::from_secs(1))
+                        .map_err(|_| "shutdown dropped")?;
+                }
+            }
+            closing.await;
+            assert_eq!(*events.borrow(), ["abort", "release"]);
+            if case == 3 {
+                assert_eq!(output.0.borrow().polls, 0);
+            }
+            let polls = output.0.borrow().polls;
+            output.resume();
+            assert_eq!(output.0.borrow().polls, polls);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn selected_reset_flushes_before_release_despite_existing_invalidation() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new()?;
+        let (input, mut reader) = close_reader(&fixture).await?;
+        let output = CloseWriter::default();
+        output.0.borrow_mut().paused = true;
+        let mut writer = S2sWriter::new(output.clone());
+        let (validity, monitor) = close_validity();
+        validity.record_invalidation(StreamClose::CertificateRevoked);
+        drop(monitor);
+        let (_stop, shutdown) = signal();
+        let events = RefCell::new(Vec::new());
+        let released = Cell::new(false);
+        let mut release = || {
+            if !released.replace(true) {
+                let state = output.0.borrow();
+                assert!(state.flushed);
+                assert!(!state.aborted);
+                events.borrow_mut().push("release");
+            }
+        };
+        let mut closing = Box::pin(finish(
+            &mut reader,
+            &mut writer,
+            Closed {
+                outcome: StreamClose::CertificateRevoked,
+                wire: WireClose::Error(StreamErrorCondition::Reset),
+            },
+            &validity,
+            shutdown,
+            || {
+                output.0.borrow_mut().aborted = true;
+                events.borrow_mut().push("abort");
+            },
+            &mut release,
+        ));
+        assert!(poll!(closing.as_mut()).is_pending());
+        assert!(output.0.borrow().blocked);
+        assert!(!released.get());
+        assert!(poll!(closing.as_mut()).is_pending());
+        input.supply(b"</stream:stream>", true);
+        output.resume();
+        closing.await;
+        assert_eq!(*events.borrow(), ["release", "abort"]);
+        assert!(
+            output
+                .0
+                .borrow()
+                .bytes
+                .windows(5)
+                .any(|bytes| bytes == b"reset")
+        );
         Ok(())
     })
 }

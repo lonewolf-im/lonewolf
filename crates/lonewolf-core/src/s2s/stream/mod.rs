@@ -44,6 +44,10 @@ const HEADER_PREFIX: &str = "<?xml version='1.0'?><stream:stream xmlns:stream='h
 
 pub(crate) const STARTTLS_REQUIRED_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
 pub(crate) const EXTERNAL_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>";
+pub(crate) const BIDI_NAMESPACE: &str = "urn:xmpp:bidi";
+#[expect(dead_code)]
+pub(crate) const BIDI_FEATURE_NAMESPACE: &str = "urn:xmpp:features:bidi";
+pub(crate) const EXTERNAL_BIDI_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>";
 pub(crate) const EMPTY_FEATURES: &str = "<stream:features/>";
 pub(crate) const STARTTLS: &str = "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 pub(crate) const PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";

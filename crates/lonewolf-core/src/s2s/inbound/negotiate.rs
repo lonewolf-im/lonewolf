@@ -22,7 +22,8 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::{Settings, ShutdownSignal};
 use crate::s2s::log_domain;
-use crate::s2s::metrics::{AuthOutcome, Direction, S2sMetrics};
+use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, S2sMetrics};
+use crate::s2s::outbound::RemoteRouter;
 use crate::s2s::revocation::{CheckPhase, RevocationStatus, RevocationVerdict};
 use crate::s2s::stream::traffic::CountingIo;
 use crate::s2s::stream::{self, Auth, S2sError, S2sReader, S2sWriter, SaslFailure};
@@ -46,9 +47,12 @@ pub(crate) struct Authenticated<A: ChunkAllocator> {
     pub(crate) reader: S2sReader<A, TlsInput>,
     pub(crate) writer: S2sWriter<TlsOutput>,
     pub(crate) connection_id: u64,
+    pub(crate) bidi: bool,
 }
 
 struct VerifiedPeer {
+    bidi_offered: bool,
+    bidi: bool,
     local: Box<str>,
     remote: Box<str>,
     valid_until: SystemTime,
@@ -196,6 +200,8 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     accounting.elapsed = Some(accounting.started.elapsed());
     match result {
         Ok(VerifiedPeer {
+            bidi_offered,
+            bidi,
             local,
             remote,
             valid_until,
@@ -203,10 +209,21 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             revocation,
         }) => {
             accounting.outcome = AuthOutcome::Success;
+            if bidi_offered {
+                settings.metrics.bidi_negotiated(
+                    Direction::Inbound,
+                    if bidi {
+                        BidiOutcome::Enabled
+                    } else {
+                        BidiOutcome::NotRequested
+                    },
+                );
+            }
             let Some(Connection::Tls(reader, writer)) = connection.take() else {
                 return Err(S2sError::Internal);
             };
             Ok(Authenticated {
+                bidi,
                 local,
                 remote,
                 valid_until,
@@ -306,6 +323,11 @@ async fn run<A: ChunkAllocator + Clone>(
     footer_sent: &mut bool,
     response_from: &mut Box<str>,
 ) -> Result<VerifiedPeer, Failure> {
+    let offer_bidi = settings
+        .services
+        .router
+        .remote_router()
+        .is_some_and(RemoteRouter::bidirectional);
     let plain = connection.as_mut().ok_or(S2sError::Internal)?;
     let initial = header(expected(plain, peer_footer).await?)?;
     if !settings.services.router.federates_domain(&initial.to) {
@@ -445,9 +467,36 @@ async fn run<A: ChunkAllocator + Clone>(
     tls.send(&stream::response_header_xml(&initial.to, Some(&remote))?)
         .await?;
     *header_sent = true;
-    tls.send(stream::EXTERNAL_FEATURES).await?;
+    tls.send(if offer_bidi {
+        stream::EXTERNAL_BIDI_FEATURES
+    } else {
+        stream::EXTERNAL_FEATURES
+    })
+    .await?;
+    let mut requested = false;
     for attempt in 0..2 {
-        let auth = expected(tls, peer_footer).await?;
+        let mut auth = expected(tls, peer_footer).await?;
+        if let StreamEvent::Element(element) = &auth
+            && {
+                let view = element
+                    .value()
+                    .resolve(element.arena())
+                    .map_err(S2sError::from)?;
+                view.name() == "bidi" && view.namespace() == stream::BIDI_NAMESPACE
+            }
+        {
+            if !offer_bidi
+                || requested
+                || !is_empty_element(element, "bidi", stream::BIDI_NAMESPACE)?
+            {
+                return Err(reject(
+                    StreamErrorCondition::NotAuthorized,
+                    AuthOutcome::Protocol,
+                ));
+            }
+            requested = true;
+            auth = expected(tls, peer_footer).await?;
+        }
         let StreamEvent::Element(element) = auth else {
             return Err(reject(
                 StreamErrorCondition::NotAuthorized,
@@ -524,6 +573,8 @@ async fn run<A: ChunkAllocator + Clone>(
     *header_sent = true;
     tls.send(stream::EMPTY_FEATURES).await?;
     Ok(VerifiedPeer {
+        bidi_offered: offer_bidi,
+        bidi: requested,
         local: initial.to,
         remote,
         valid_until,

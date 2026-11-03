@@ -129,6 +129,14 @@
     </implements>
     <implements>
       <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0288.html"/>
+        <xmpp:status>partial</xmpp:status>
+        <xmpp:version>1.0.1</xmpp:version>
+        <xmpp:note xml:lang="en">Servers that connect with certificate authentication can use their connection in both directions for one domain pair. Lonewolf does not yet request this on connections it opens. Server Dialback and additional domains on a shared connection are not supported. Not in a release yet.</xmpp:note>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0297.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0</xmpp:version>

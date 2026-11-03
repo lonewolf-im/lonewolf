@@ -25,7 +25,7 @@ use crate::config::limits::S2sLimits;
 use crate::hosts::{Hosts, peer_identity::PeerTrust, tls_identity};
 use crate::s2s::dns::{ResolveError, Resolved, ResolvedVia, Resolver};
 use crate::s2s::log_domain;
-use crate::s2s::metrics::{AuthOutcome, Direction, DnsOutcome, S2sMetrics};
+use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, DnsOutcome, S2sMetrics};
 use crate::s2s::revocation::{CheckPhase, PeerRevocation, RevocationStatus, RevocationVerdict};
 use crate::s2s::stream::traffic::CountingIo;
 use crate::s2s::stream::{self, Features, S2sError, S2sReader, S2sReaderLimits, S2sWriter};
@@ -42,6 +42,7 @@ type PlainInput = Compat<Pin<Box<AsyncReadStream<TcpStream>>>>;
 type PlainOutput = Pin<Box<AsyncStream<TcpStream>>>;
 
 pub(crate) struct ConnectContext<'a> {
+    pub(crate) bidirectional: bool,
     pub(crate) hosts: &'a Hosts,
     pub(crate) trust: &'a Arc<PeerTrust>,
     pub(crate) revocation: &'a Arc<PeerRevocation>,
@@ -548,6 +549,7 @@ impl<A: ChunkAllocator + Clone> Negotiation<A> {
 }
 
 struct VerifiedPeer {
+    bidi: bool,
     valid_until: SystemTime,
     chain: Arc<[CertificateDer<'static>]>,
     revocation: Option<RevocationVerdict>,
@@ -591,7 +593,12 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     ));
     flow.send(&header).await?;
     flow.header(remote).await?;
-    require_external(&features(flow.expected().await?)?)?;
+    let offered = features(flow.expected().await?)?;
+    require_external(&offered)?;
+    let bidi = context.bidirectional && offered.bidi;
+    if bidi {
+        flow.send(stream::BIDI_REQUEST).await?;
+    }
     flow.send(&stream::auth_external_xml(local)).await?;
     if sasl_reply(flow.expected().await?, false)? == SaslReply::Challenge {
         flow.send(EMPTY_RESPONSE).await?;
@@ -628,6 +635,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         }
     }
     Ok(VerifiedPeer {
+        bidi,
         valid_until,
         chain,
         revocation,
@@ -646,7 +654,7 @@ pub(crate) async fn establish<A: ChunkAllocator + Clone>(
     .await;
     match &result {
         Ok(stream) => {
-            tracing::info!(connection_id = stream.connection_id, local_domain = %safe_domain(local), remote_domain = %safe_domain(remote), direction = "outbound", "s2s connection authenticated")
+            tracing::info!(connection_id = stream.connection_id, local_domain = %safe_domain(local), remote_domain = %safe_domain(remote), direction = "outbound", bidi = stream.bidi, "s2s connection authenticated")
         }
         Err(error) => {
             tracing::warn!(local_domain = %safe_domain(local), remote_domain = %safe_domain(remote), stage = error.stage(), reason = error.reason(), "s2s connection failed")
@@ -738,6 +746,7 @@ where
         let (result, selected_at) = negotiated;
         match result {
             Ok(VerifiedPeer {
+                bidi,
                 valid_until,
                 chain,
                 revocation,
@@ -747,7 +756,18 @@ where
                 };
                 accounting.select(AuthOutcome::Success, selected_at);
                 accounting.record(selected_at);
+                if context.bidirectional {
+                    context.metrics.bidi_negotiated(
+                        Direction::Outbound,
+                        if bidi {
+                            BidiOutcome::Enabled
+                        } else {
+                            BidiOutcome::NotOffered
+                        },
+                    );
+                }
                 return Ok(OutboundStream {
+                    bidi,
                     _socket: socket,
                     reader,
                     writer,

@@ -172,7 +172,6 @@ where
     .await
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(super) async fn run_outbound<A, R, W, D>(
     inner: &Inner<A>,
     queue: &mut LinkQueue<A>,

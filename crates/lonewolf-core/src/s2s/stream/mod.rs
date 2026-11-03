@@ -45,7 +45,7 @@ const HEADER_PREFIX: &str = "<?xml version='1.0'?><stream:stream xmlns:stream='h
 pub(crate) const STARTTLS_REQUIRED_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
 pub(crate) const EXTERNAL_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>";
 pub(crate) const BIDI_NAMESPACE: &str = "urn:xmpp:bidi";
-#[expect(dead_code)]
+pub(crate) const BIDI_REQUEST: &str = "<bidi xmlns='urn:xmpp:bidi'/>";
 pub(crate) const BIDI_FEATURE_NAMESPACE: &str = "urn:xmpp:features:bidi";
 pub(crate) const EXTERNAL_BIDI_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>";
 pub(crate) const EMPTY_FEATURES: &str = "<stream:features/>";
@@ -63,6 +63,7 @@ pub(crate) struct InitialHeader {
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct Features {
+    pub(crate) bidi: bool,
     pub(crate) starttls: bool,
     pub(crate) external: bool,
 }
@@ -239,6 +240,8 @@ pub(crate) fn parse_features<A: ChunkAllocator>(element: &Parsed<Element, A>) ->
             };
             if child.name() == "starttls" && child.namespace() == TLS_NAMESPACE {
                 features.starttls = true;
+            } else if child.name() == "bidi" && child.namespace() == BIDI_FEATURE_NAMESPACE {
+                features.bidi = true;
             } else if child.name() == "mechanisms"
                 && child.namespace() == SASL_NAMESPACE
                 && let Ok(mechanisms) = child.children()

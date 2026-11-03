@@ -289,6 +289,27 @@ impl RawS2sListener {
         config: Arc<rustls::ServerConfig>,
         external: bool,
     ) -> TestResult<RawS2sPeer> {
+        self.accept_with_features(from, to, config, external, false)
+            .map(|(peer, _)| peer)
+    }
+
+    pub fn accept_offering_bidi(
+        &self,
+        from: &str,
+        to: &str,
+        config: Arc<rustls::ServerConfig>,
+    ) -> TestResult<(RawS2sPeer, bool)> {
+        self.accept_with_features(from, to, config, true, true)
+    }
+
+    fn accept_with_features(
+        &self,
+        from: &str,
+        to: &str,
+        config: Arc<rustls::ServerConfig>,
+        external: bool,
+        bidi: bool,
+    ) -> TestResult<(RawS2sPeer, bool)> {
         let peer = self.accept_until_proceed(from, to)?;
         let PeerTransport::Plain(socket) = peer.stream.into_inner().into_inner() else {
             return Err("expected plain peer transport".into());
@@ -298,9 +319,20 @@ impl RawS2sListener {
             socket,
         ))));
         assert_header(&stream.open_with(&opening(from, to))?, to, from);
+        let mut requested = false;
         if external {
-            stream.send(&format!("<stream:features><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>"))?;
-            let auth = stream.receive()?;
+            let feature = if bidi {
+                "<bidi xmlns='urn:xmpp:features:bidi'/>"
+            } else {
+                ""
+            };
+            stream.send(&format!("<stream:features><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms>{feature}</stream:features>"))?;
+            let mut auth = stream.receive()?;
+            if bidi && auth.name == "bidi" && auth.namespace == "urn:xmpp:bidi" {
+                auth.assert_xml("<bidi xmlns='urn:xmpp:bidi'/>")?;
+                requested = true;
+                auth = stream.receive()?;
+            }
             auth.assert_name(SASL_NAMESPACE, "auth");
             assert_eq!(auth.attribute("mechanism"), Some("EXTERNAL"));
             stream.send(&format!("<success xmlns='{SASL_NAMESPACE}'/>"))?;
@@ -310,11 +342,14 @@ impl RawS2sListener {
         } else {
             stream.send("<stream:features/>")?;
         }
-        Ok(RawS2sPeer {
-            stream,
-            from: from.into(),
-            to: to.into(),
-        })
+        Ok((
+            RawS2sPeer {
+                stream,
+                from: from.into(),
+                to: to.into(),
+            },
+            requested,
+        ))
     }
 }
 fn opening(from: &str, to: &str) -> String {

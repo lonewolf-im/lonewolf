@@ -13,7 +13,9 @@ use lonewolf_xmpp::stanza::{StanzaKind, StanzaNamespace};
 use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::AsyncBufRead;
 
+use super::duplex::{self, DuplexParameters};
 use super::*;
+use crate::s2s::ingress::{self, InboundPeer, IngressContext};
 use crate::s2s::metrics::{Direction, StreamClose};
 use crate::s2s::revocation::CheckPhase;
 use crate::s2s::stream::S2sError;
@@ -165,6 +167,14 @@ pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     })
 }
 
+fn close_condition(reason: StreamClose) -> Option<StreamErrorCondition> {
+    match reason {
+        reason if reason.certificate_invalid() => Some(StreamErrorCondition::Reset),
+        StreamClose::NotAuthorized => Some(StreamErrorCondition::NotAuthorized),
+        _ => None,
+    }
+}
+
 async fn graceful<
     A: ChunkAllocator + Clone,
     R: AsyncBufRead + Unpin + 'static,
@@ -173,15 +183,11 @@ async fn graceful<
     reader: &mut S2sReader<A, R>,
     writer: &mut S2sWriter<W>,
     reason: StreamClose,
+    condition: Option<StreamErrorCondition>,
     stop: Stop,
     validity: &LinkValidity,
     write_timeout: Duration,
 ) -> Result<(), StreamClose> {
-    let condition = match reason {
-        reason if reason.certificate_invalid() => Some(StreamErrorCondition::Reset),
-        StreamClose::NotAuthorized => Some(StreamErrorCondition::NotAuthorized),
-        _ => None,
-    };
     let stopped = (!matches!(reason, StreamClose::Shutdown)).then_some(stop);
     let validity = (!reason.certificate_invalid()).then_some(validity);
     watch(
@@ -336,59 +342,146 @@ async fn serve<
 struct LiveValidity<'a> {
     validity: &'a LinkValidity,
     monitor: Option<ValidityMonitor>,
-    log: MonitorLog<'a>,
+    connection_id: u64,
 }
 
 async fn connected<A, R, W>(
     inner: &Inner<A>,
+    router: &RouterHandle<A>,
     reader: &mut S2sReader<A, R>,
     writer: &mut S2sWriter<W>,
     live: LiveValidity<'_>,
-    receiver: &Receiver<Queued<A>>,
-    current: &mut Option<Queued<A>>,
+    queue: &mut LinkQueue<A>,
+    bidi: bool,
 ) -> StreamClose
 where
-    A: ChunkAllocator + Clone,
+    A: ChunkAllocator + Clone + 'static,
     R: AsyncBufRead + Unpin + 'static,
     W: AsyncWrite + Unpin,
 {
     let LiveValidity {
         validity,
         monitor,
-        log,
+        connection_id,
     } = live;
-    let work = async {
-        let closed = serve(inner, reader, writer, validity, receiver, current).await;
-        if closed.abort {
-            closed.reason
-        } else {
-            match graceful(
-                reader,
-                writer,
-                closed.reason,
-                inner.stopped.clone(),
-                validity,
-                Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
+    let write_timeout = Duration::from_secs(inner.limits.stalled_write_timeout_secs.get());
+    let timeout = Duration::from_secs(inner.limits.negotiation_timeout_secs.get());
+    let (reason, pending_ingress) = if bidi {
+        if let Some(ingress) = &inner.bidi {
+            let gauge = inner.metrics.bidi_stream_opened(Direction::Outbound);
+            let group = WorkGroup::new();
+            let context = IngressContext {
+                router: router.clone(),
+                storage: ingress.storage.clone(),
+                allocator: inner.allocator.clone(),
+                work: group.handle(),
+            };
+            let peer = InboundPeer {
+                local: queue.pair.0.clone(),
+                remote: queue.pair.1.clone(),
+                connection_id,
+            };
+            let work = async {
+                let end = duplex::run_outbound(
+                    inner,
+                    queue,
+                    reader,
+                    writer,
+                    DuplexParameters {
+                        peer: &peer,
+                        context: &context,
+                        validity,
+                        idle_timeout: Duration::from_secs(inner.limits.idle_timeout_secs.get()),
+                    },
+                    ingress::dispatch,
+                )
+                .await;
+                if end.abort {
+                    end.reason
+                } else {
+                    match graceful(
+                        reader,
+                        writer,
+                        end.reason,
+                        end.violation.or_else(|| close_condition(end.reason)),
+                        inner.stopped.clone(),
+                        validity,
+                        write_timeout,
+                    )
+                    .await
+                    {
+                        Ok(()) => end.reason,
+                        Err(reason) => reason,
+                    }
+                }
+            };
+            let reason = supervise(
+                monitor,
+                MonitorLog {
+                    direction: Direction::Outbound,
+                    connection_id,
+                    local: &peer.local,
+                    remote: &peer.remote,
+                },
+                timeout,
+                work,
             )
-            .await
-            {
-                Ok(()) => closed.reason,
-                Err(reason) => reason,
-            }
+            .await;
+            (reason, Some((context, group, gauge)))
+        } else {
+            (StreamClose::InternalError, None)
         }
+    } else {
+        let LinkQueue {
+            pair,
+            receiver,
+            current,
+            ..
+        } = queue;
+        let work = async {
+            let closed = serve(inner, reader, writer, validity, receiver, current).await;
+            if closed.abort {
+                closed.reason
+            } else {
+                match graceful(
+                    reader,
+                    writer,
+                    closed.reason,
+                    close_condition(closed.reason),
+                    inner.stopped.clone(),
+                    validity,
+                    write_timeout,
+                )
+                .await
+                {
+                    Ok(()) => closed.reason,
+                    Err(reason) => reason,
+                }
+            }
+        };
+        let reason = supervise(
+            monitor,
+            MonitorLog {
+                direction: Direction::Outbound,
+                connection_id,
+                local: &pair.0,
+                remote: &pair.1,
+            },
+            timeout,
+            work,
+        )
+        .await;
+        (reason, None)
     };
-    let reason = supervise(
-        monitor,
-        log,
-        Duration::from_secs(inner.limits.negotiation_timeout_secs.get()),
-        work,
-    )
-    .await;
     inner.metrics.stream_closed(Direction::Outbound, reason);
+    if let Some((context, mut group, _gauge)) = pending_ingress {
+        drop(context);
+        group.drain().await;
+    }
     reason
 }
 
-pub(super) async fn run<A: ChunkAllocator + Clone>(
+pub(super) async fn run<A: ChunkAllocator + Clone + 'static>(
     inner: Arc<Inner<A>>,
     router: RouterHandle<A>,
     mut queue: LinkQueue<A>,
@@ -403,6 +496,7 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
             Err(queue) => queue,
         };
         let context = connect::ConnectContext {
+            bidirectional: inner.bidi.is_some(),
             hosts: &inner.hosts,
             trust: &inner.trust,
             revocation: &inner.revocation,
@@ -487,20 +581,16 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         let gauge = inner.metrics.stream_opened(Direction::Outbound);
         connected(
             &inner,
+            &router,
             &mut stream.reader,
             &mut stream.writer,
             LiveValidity {
                 validity: &validity,
                 monitor,
-                log: MonitorLog {
-                    direction: Direction::Outbound,
-                    connection_id: stream.connection_id,
-                    local: &queue.pair.0,
-                    remote: &queue.pair.1,
-                },
+                connection_id: stream.connection_id,
             },
-            &queue.receiver,
-            &mut queue.current,
+            &mut queue,
+            stream.bidi,
         )
         .await;
         drop(stream);
@@ -1265,6 +1355,7 @@ mod tests {
                         &mut reader,
                         &mut writer,
                         StreamClose::StreamEnd,
+                        close_condition(StreamClose::StreamEnd),
                         manager.inner.stopped.clone(),
                         &validity,
                         Duration::from_secs(60)
@@ -1333,6 +1424,11 @@ mod tests {
         }
         run(async {
             let manager = manager(S2sLimits::default())?;
+            let router = crate::router::Router::new(
+                manager.inner.hosts.clone(),
+                crate::router::local::LocalRouter::new(GlobalChunkAllocator),
+            )
+            .handle();
             let mut task = manager
                 .admit("localhost", "remote.test", message().await?)
                 .map_err(|error| format!("{error:?}"))?
@@ -1393,20 +1489,16 @@ mod tests {
             );
             let mut serving = Box::pin(connected(
                 &manager.inner,
+                &router,
                 &mut reader,
                 &mut writer,
                 LiveValidity {
                     validity: &validity,
                     monitor: Some(monitor),
-                    log: MonitorLog {
-                        direction: Direction::Outbound,
-                        connection_id: 1,
-                        local: "localhost",
-                        remote: "remote.test",
-                    },
+                    connection_id: 1,
                 },
-                &task.queue.receiver,
-                &mut task.queue.current,
+                &mut task.queue,
+                false,
             ));
             assert!(poll!(serving.as_mut()).is_pending());
             assert!(matches!(

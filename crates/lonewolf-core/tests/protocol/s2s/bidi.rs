@@ -257,3 +257,176 @@ fn shutdown_closes_a_bidi_stream_with_system_shutdown() -> TestResult {
     assert_eq!(state.queued_bytes, 0);
     fixture.dns.stop()
 }
+
+fn outbound_listener(
+    fixture: &SingleServer,
+) -> TestResult<(RawS2sListener, std::sync::Arc<rustls::ServerConfig>)> {
+    let listener = RawS2sListener::bind()?;
+    fixture.dns.srv(
+        "b.test",
+        &[(0, 0, listener.address()?.port(), "server.b.test")],
+    );
+    fixture.dns.a("server.b.test", Ipv4Addr::LOCALHOST);
+    let config = peer::server_config(
+        &fixture.ca,
+        fixture
+            .ca
+            .server(fixture.directory.path(), "peer", &["b.test"])?,
+        "a.test",
+    )?;
+    Ok((listener, config))
+}
+
+#[test]
+fn outbound_link_requests_bidi_and_receives_over_it() -> TestResult {
+    let mut fixture = SingleServer::start_bidirectional("")?;
+    let (listener, config) = outbound_listener(&fixture)?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<message type='chat' to='bob@b.test/phone'><body>open link</body></message>")?;
+    let (mut peer, requested) = listener.accept_offering_bidi("b.test", "a.test", config)?;
+    assert!(requested);
+    peer.receive()?.assert_xml("<message xmlns='jabber:server' from='alice@a.test/desk' to='bob@b.test/phone' type='chat'><body>open link</body></message>")?;
+    peer.send("<message from='bob@b.test/phone' to='alice@a.test/desk' type='chat'><body>same link</body></message>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat'><body>same link</body></message>")?;
+    alice.send(
+        "<message type='chat' to='bob@b.test/phone'><body>same link reply</body></message>",
+    )?;
+    peer.receive()?.assert_xml("<message xmlns='jabber:server' from='alice@a.test/desk' to='bob@b.test/phone' type='chat'><body>same link reply</body></message>")?;
+    for sample in [
+        "lonewolf_s2s_bidi_negotiations_total{direction=\"outbound\",outcome=\"enabled\"} 1",
+        "lonewolf_s2s_bidi_streams{direction=\"outbound\"} 1",
+        "lonewolf_s2s_bidi_stanzas_received_total{kind=\"message\"} 1",
+        "lonewolf_s2s_stanzas_received_total{kind=\"message\"} 1",
+    ] {
+        fixture.suite.wait_for_metric(sample)?;
+    }
+    assert!(!fixture.suite.scrape_metrics()?.contains(
+        "lonewolf_s2s_streams_closed_total{direction=\"outbound\",outcome=\"not_authorized\"}"
+    ));
+    peer.close()?;
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_bidi_streams{direction=\"outbound\"} 0")?;
+    alice.close()?;
+    fixture.stop()
+}
+
+#[test]
+fn reverse_iq_is_answered_over_the_same_link() -> TestResult {
+    let mut fixture = SingleServer::start_bidirectional("")?;
+    let (listener, config) = outbound_listener(&fixture)?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<message to='bob@b.test/phone' type='chat'><body>open link</body></message>")?;
+    let (mut peer, requested) = listener.accept_offering_bidi("b.test", "a.test", config)?;
+    assert!(requested);
+    peer.receive()?.assert_name("jabber:server", "message");
+    peer.send("<iq type='get' id='p1' from='bob@b.test/phone' to='a.test'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+    let reply = peer.receive()?;
+    reply.assert_name("jabber:server", "iq");
+    assert_eq!(reply.attribute("id"), Some("p1"));
+    assert_eq!(reply.attribute("from"), Some("a.test"));
+    assert_eq!(reply.attribute("to"), Some("bob@b.test/phone"));
+    assert_eq!(reply.attribute("type"), Some("error"));
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_bidi_stanzas_received_total{kind=\"iq\"} 1")?;
+    peer.close()?;
+    alice.close()?;
+    fixture.stop()
+}
+
+#[test]
+fn outbound_link_without_offer_does_not_request_bidi() -> TestResult {
+    let mut fixture = SingleServer::start_bidirectional("")?;
+    let (listener, config) = outbound_listener(&fixture)?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    alice
+        .send("<message to='bob@b.test/phone' type='chat'><body>one direction</body></message>")?;
+    let mut peer = listener.accept("b.test", "a.test", config, true)?;
+    peer.receive()?.assert_name("jabber:server", "message");
+    fixture.suite.wait_for_metric(
+        "lonewolf_s2s_bidi_negotiations_total{direction=\"outbound\",outcome=\"not_offered\"} 1",
+    )?;
+    peer.send("<message from='bob@b.test/phone' to='alice@a.test/desk'><body>wrong direction</body></message>")?;
+    peer.expect_stream_error("not-authorized")?;
+    super::negotiation::closed(&fixture.suite, "outbound", "not_authorized", 1)?;
+    alice.close()?;
+    fixture.stop()
+}
+
+#[test]
+fn disabled_bidirectional_ignores_the_offer() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    let (listener, config) = outbound_listener(&fixture)?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<message to='bob@b.test/phone' type='chat'><body>disabled</body></message>")?;
+    let (mut peer, requested) = listener.accept_offering_bidi("b.test", "a.test", config)?;
+    assert!(!requested);
+    peer.receive()?.assert_name("jabber:server", "message");
+    peer.send("<message from='bob@b.test/phone' to='alice@a.test/desk'><body>wrong direction</body></message>")?;
+    peer.expect_stream_error("not-authorized")?;
+    super::negotiation::closed(&fixture.suite, "outbound", "not_authorized", 1)?;
+    assert!(
+        !fixture
+            .suite
+            .scrape_metrics()?
+            .contains("lonewolf_s2s_bidi_negotiations_total{direction=\"outbound\"")
+    );
+    alice.close()?;
+    fixture.stop()
+}
+
+#[test]
+fn reverse_stanza_from_another_domain_closes_the_link_with_invalid_from() -> TestResult {
+    let mut fixture = SingleServer::start_bidirectional("")?;
+    let (listener, config) = outbound_listener(&fixture)?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<message to='bob@b.test/phone' type='chat'><body>open link</body></message>")?;
+    let (mut peer, requested) = listener.accept_offering_bidi("b.test", "a.test", config)?;
+    assert!(requested);
+    peer.receive()?.assert_name("jabber:server", "message");
+    peer.send("<message from='mallory@c.test/x' to='alice@a.test/desk' type='chat'><body>wrong domain</body></message>")?;
+    peer.expect_stream_error("invalid-from")?;
+    super::negotiation::closed(&fixture.suite, "outbound", "invalid_from", 1)?;
+    alice.send(
+        "<iq to='a.test' type='get' id='rejected-fence'><ping xmlns='urn:xmpp:ping'/></iq>",
+    )?;
+    let reply = alice.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("id"), Some("rejected-fence"));
+    assert_eq!(reply.attribute("type"), Some("error"));
+    alice.close()?;
+    fixture.stop()
+}
+
+#[test]
+fn bidi_link_stays_open_while_the_peer_sends() -> TestResult {
+    let mut fixture = SingleServer::start_bidirectional("[limits.s2s]\nidle_timeout_secs = 2")?;
+    let (listener, config) = outbound_listener(&fixture)?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<message to='bob@b.test/phone' type='chat'><body>open link</body></message>")?;
+    let (mut peer, requested) = listener.accept_offering_bidi("b.test", "a.test", config)?;
+    assert!(requested);
+    peer.receive()?.assert_name("jabber:server", "message");
+    let started = std::time::Instant::now();
+    for second in 1..=4 {
+        std::thread::sleep(
+            (started + std::time::Duration::from_secs(second))
+                .saturating_duration_since(std::time::Instant::now()),
+        );
+        peer.send("<message from='bob@b.test/phone' to='alice@a.test/desk' type='chat'><body>active peer</body></message>")?;
+        alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat'><body>active peer</body></message>")?;
+    }
+    let silent = std::time::Instant::now();
+    peer.answer_close()?;
+    assert!(silent.elapsed() <= std::time::Duration::from_secs(3));
+    super::negotiation::closed(&fixture.suite, "outbound", "idle", 1)?;
+    alice.close()?;
+    fixture.stop()
+}

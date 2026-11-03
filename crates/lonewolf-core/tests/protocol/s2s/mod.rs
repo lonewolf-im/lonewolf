@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod bidi;
+mod bidi_pair;
 mod failures;
 mod iq;
 mod lifecycle;

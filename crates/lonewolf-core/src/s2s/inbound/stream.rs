@@ -66,18 +66,7 @@ impl Closed {
     }
 
     fn error(condition: StreamErrorCondition) -> Self {
-        let outcome = match condition {
-            StreamErrorCondition::Reset => StreamClose::CertificateExpired,
-            StreamErrorCondition::SystemShutdown => StreamClose::Shutdown,
-            StreamErrorCondition::Conflict => StreamClose::Conflict,
-            StreamErrorCondition::ImproperAddressing => StreamClose::ImproperAddressing,
-            StreamErrorCondition::HostUnknown => StreamClose::HostUnknown,
-            StreamErrorCondition::InvalidFrom => StreamClose::InvalidFrom,
-            StreamErrorCondition::InvalidNamespace => StreamClose::InvalidNamespace,
-            StreamErrorCondition::UnsupportedStanzaType => StreamClose::UnsupportedStanzaType,
-            StreamErrorCondition::InternalServerError => StreamClose::InternalError,
-            _ => StreamClose::ProtocolError,
-        };
+        let outcome = ingress::receive::violation_close(condition);
         Self {
             outcome,
             wire: WireClose::Error(condition),
@@ -94,13 +83,7 @@ impl Closed {
     fn reader_error(error: S2sError) -> Self {
         match error {
             S2sError::Stream(condition) => Self {
-                outcome: match condition {
-                    StreamErrorCondition::InvalidNamespace => StreamClose::InvalidNamespace,
-                    StreamErrorCondition::UnsupportedStanzaType => {
-                        StreamClose::UnsupportedStanzaType
-                    }
-                    _ => StreamClose::ProtocolError,
-                },
+                outcome: ingress::receive::reader_violation_close(condition),
                 wire: WireClose::Error(condition),
             },
             S2sError::Internal => Self::error(StreamErrorCondition::InternalServerError),
@@ -327,13 +310,19 @@ where
         ) {
             last_input = Instant::now();
         }
-        let result =
-            ingress::receive::process(event, peer, &settings.metrics, context, async |stanza| {
+        let result = ingress::receive::process(
+            event,
+            peer,
+            &settings.metrics,
+            context,
+            false,
+            async |stanza| {
                 interrupt(shutdown.clone(), validity, dispatch(context, peer, stanza))
                     .await?
                     .map_err(|_| StreamErrorCondition::InternalServerError)
-            })
-            .await;
+            },
+        )
+        .await;
         if let Err(condition) = result {
             return rejection(peer, stanza_kind, Closed::interrupted(condition, validity));
         }

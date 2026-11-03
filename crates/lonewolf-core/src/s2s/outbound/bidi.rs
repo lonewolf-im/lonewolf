@@ -58,7 +58,7 @@ impl<A: ChunkAllocator + Clone + 'static> RemoteRouter<A> {
 }
 
 impl<A: ChunkAllocator> State<A> {
-    fn offer_standby(
+    pub(super) fn offer_standby(
         &self,
         mut queue: LinkQueue<A>,
         metrics: &S2sMetrics,

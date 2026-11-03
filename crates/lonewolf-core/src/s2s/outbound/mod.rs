@@ -128,6 +128,12 @@ pub(crate) struct LinkQueue<A: ChunkAllocator> {
     current: Option<Queued<A>>,
 }
 
+enum FailureDisposition<A: ChunkAllocator> {
+    HandedOff,
+    Bounce(LinkQueue<A>),
+    Shutdown(LinkQueue<A>),
+}
+
 impl<A: ChunkAllocator> LinkQueue<A> {
     fn is_drained(&self) -> bool {
         self.receiver.is_empty() && self.current.is_none()
@@ -594,24 +600,27 @@ impl<A: ChunkAllocator> Inner<A> {
 
     fn failed(
         &self,
-        pair: &Pair,
-        counters: &Arc<QueueCounters>,
+        queue: LinkQueue<A>,
         failures: u32,
         condition: RemoteFailure,
         now: Instant,
         jitter: u16,
-    ) -> bool {
+    ) -> FailureDisposition<A> {
         let mut state = self.state.lock();
-        if !state.owns(pair, counters) {
-            return false;
+        if !state.owns(&queue.pair, &queue.counters) {
+            return FailureDisposition::Shutdown(queue);
         }
         if state.stopped {
-            state.entries.remove(pair);
-            return false;
+            state.entries.remove(&queue.pair);
+            return FailureDisposition::Shutdown(queue);
         }
+        let queue = match state.offer_standby(queue, &self.metrics) {
+            Ok(()) => return FailureDisposition::HandedOff,
+            Err(queue) => queue,
+        };
         let failures = failures.saturating_add(1);
         state.entries.insert(
-            pair.clone(),
+            queue.pair.clone(),
             Entry::Backoff {
                 started_at: now,
                 delay: backoff_delay(&self.limits, failures, jitter),
@@ -619,7 +628,7 @@ impl<A: ChunkAllocator> Inner<A> {
                 failures,
             },
         );
-        true
+        FailureDisposition::Bounce(queue)
     }
 }
 

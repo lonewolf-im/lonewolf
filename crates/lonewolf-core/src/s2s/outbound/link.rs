@@ -417,26 +417,20 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         let mut stream = match result {
             None => break,
             Some(Err(error)) => {
-                queue = match inner.offer_standby(queue) {
-                    Ok(()) => return,
-                    Err(queue) => queue,
-                };
                 let condition = match error.condition() {
                     lonewolf_xmpp::stanza::StanzaErrorCondition::RemoteServerNotFound => {
                         RemoteFailure::NotFound
                     }
                     _ => RemoteFailure::Timeout,
                 };
-                if !inner.failed(
-                    &queue.pair,
-                    &queue.counters,
-                    failures,
-                    condition,
-                    Instant::now(),
-                    jitter(),
-                ) {
-                    break;
-                }
+                queue = match inner.failed(queue, failures, condition, Instant::now(), jitter()) {
+                    FailureDisposition::HandedOff => return,
+                    FailureDisposition::Bounce(queue) => queue,
+                    FailureDisposition::Shutdown(returned) => {
+                        queue = returned;
+                        break;
+                    }
+                };
                 queue.receiver.close();
                 while let Some(queued) = queue
                     .current

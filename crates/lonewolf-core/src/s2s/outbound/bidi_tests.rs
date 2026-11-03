@@ -9,7 +9,7 @@ use lonewolf_storage::Storage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use prometheus_client::registry::Registry;
 
-use super::manager_tests::{manager, message, run};
+use super::manager_tests::{manager, message, run, stanza};
 use super::*;
 use crate::config::Config;
 use crate::router::{Router, local::LocalRouter};
@@ -381,6 +381,153 @@ fn dial_failure_hands_the_queue_to_a_standby_registered_meanwhile() -> TestResul
         assert!(!fixture.render()?.contains("lonewolf_s2s_bounces_total"));
         fixture.remote.stop();
         registration.release(Some(queue));
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn registration_before_failure_disposition_receives_the_queue() -> TestResult {
+    run(async {
+        let fixture = Fixture::new()?;
+        let task = fixture
+            .remote
+            .admit(
+                "localhost",
+                "remote.test",
+                stanza(
+                    "<message from='alice@localhost/desk' to='bob@remote.test/phone' id='before'/>",
+                )
+                .await?,
+            )
+            .map_err(|error| format!("{error:?}"))?
+            .ok_or("missing launch")?;
+        let counters = Arc::clone(&task.queue.counters);
+        let registration = fixture.register()?;
+        assert!(matches!(
+            fixture.remote.inner.failed(
+                task.queue,
+                0,
+                RemoteFailure::Timeout,
+                Instant::now(),
+                1000,
+            ),
+            FailureDisposition::HandedOff
+        ));
+        let queue = registration
+            .assigned()
+            .await
+            .ok_or("missing assigned queue")?;
+        assert!(Arc::ptr_eq(&queue.counters, &counters));
+        assert_eq!(queue.pair.0.as_ref(), "localhost");
+        assert_eq!(queue.pair.1.as_ref(), "remote.test");
+        let received = queue.receiver.try_recv()?.into_stanza();
+        assert_eq!(received.resolve()?.id()?, Some("before"));
+        assert_eq!(fixture.snapshot().backoff, 0);
+        assert_sample(
+            &fixture.render()?,
+            "lonewolf_s2s_bidi_handoffs_total{target=\"inbound_stream\"} 1",
+        );
+        assert!(!fixture.render()?.contains("lonewolf_s2s_bounces_total"));
+        registration.release(Some(queue));
+        drop(task.guard);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn registration_after_failure_disposition_clears_backoff_without_reclaiming_old_queue() -> TestResult
+{
+    run(async {
+        let fixture = Fixture::new()?;
+        let old = fixture
+            .remote
+            .admit(
+                "localhost",
+                "remote.test",
+                stanza(
+                    "<message from='alice@localhost/desk' to='bob@remote.test/phone' id='old'/>",
+                )
+                .await?,
+            )
+            .map_err(|error| format!("{error:?}"))?
+            .ok_or("missing old launch")?;
+        let now = Instant::now();
+        let FailureDisposition::Bounce(old_queue) =
+            fixture
+                .remote
+                .inner
+                .failed(old.queue, 3, RemoteFailure::Timeout, now, 1000)
+        else {
+            return Err("failure without a standby did not publish backoff".into());
+        };
+        {
+            let state = fixture.remote.inner.state.lock();
+            let Some(Entry::Backoff {
+                started_at,
+                delay,
+                condition,
+                failures,
+            }) = state.entries.get(&old_queue.pair)
+            else {
+                return Err("missing backoff".into());
+            };
+            assert_eq!(*started_at, now);
+            assert_eq!(*delay, Duration::from_secs(240));
+            assert_eq!(*condition, RemoteFailure::Timeout);
+            assert_eq!(*failures, 4);
+        }
+        let registration = fixture.register()?;
+        assert_eq!(fixture.snapshot().backoff, 0);
+        assert!(fixture.remote.inner.state.lock().entries.is_empty());
+        let replacement = fixture.remote.admit(
+            "localhost",
+            "remote.test",
+            stanza("<message from='alice@localhost/desk' to='bob@remote.test/phone' id='replacement'/>").await?,
+        ).map_err(|error| format!("{error:?}"))?.ok_or("missing replacement launch")?;
+        assert!(!Arc::ptr_eq(
+            &old_queue.counters,
+            &replacement.queue.counters
+        ));
+        let replacement_counters = Arc::clone(&replacement.queue.counters);
+        assert!(
+            fixture
+                .remote
+                .inner
+                .offer_standby(replacement.queue)
+                .is_ok()
+        );
+        let queue = registration
+            .assigned()
+            .await
+            .ok_or("missing replacement queue")?;
+        assert!(Arc::ptr_eq(&queue.counters, &replacement_counters));
+        old_queue.receiver.close();
+        assert!(old_queue.current.is_none());
+        let received = old_queue.receiver.try_recv()?.into_stanza();
+        assert_eq!(received.resolve()?.id()?, Some("old"));
+        assert!(old_queue.is_drained());
+        fixture
+            .remote
+            .inner
+            .remove(&old_queue.pair, &old_queue.counters);
+        assert!(
+            fixture
+                .remote
+                .inner
+                .state
+                .lock()
+                .owns(&queue.pair, &queue.counters)
+        );
+        assert_eq!(fixture.snapshot().connecting, 1);
+        let received = queue.receiver.try_recv()?.into_stanza();
+        assert_eq!(received.resolve()?.id()?, Some("replacement"));
+        assert_sample(
+            &fixture.render()?,
+            "lonewolf_s2s_bidi_handoffs_total{target=\"inbound_stream\"} 1",
+        );
+        registration.release(Some(queue));
+        drop(old_queue);
+        drop((old.guard, replacement.guard));
         fixture.finish().await
     })
 }

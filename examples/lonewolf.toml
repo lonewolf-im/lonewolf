@@ -307,6 +307,11 @@
 # No listener opens while no host federates.
 # enabled = true
 
+# Use one connection for traffic in both directions with servers that support
+# bidirectional streams (XEP-0288). Turn this off if a peer misbehaves on shared
+# connections; each direction then uses its own connection.
+# bidirectional = true
+
 # Choose local endpoints for connections from other XMPP servers.
 # These sections replace the default endpoint and need at least one entry when enabled.
 # [[s2s.listeners]]

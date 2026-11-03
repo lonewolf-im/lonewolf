@@ -10,9 +10,23 @@ use nix::sys::signal::Signal;
 use super::{outbound as out, support::*};
 
 fn authenticated(fixture: &Fixture, address: SocketAddr) -> Result<Peer> {
-    let (mut peer, _) = start_tls(address, fixture.client(Some("peer.test"), false)?)?;
-    external(&mut peer, HEADER)?;
-    success(&mut peer, AUTH)?;
+    authenticated_with_limits(fixture, address, 524288, 600)
+}
+
+fn authenticated_with_limits(
+    fixture: &Fixture,
+    address: SocketAddr,
+    max_bytes: u32,
+    idle: u32,
+) -> Result<Peer> {
+    let (mut peer, _) = start_tls_with_limits(
+        address,
+        fixture.client(Some("peer.test"), false)?,
+        max_bytes,
+        idle,
+    )?;
+    external_with_limits(&mut peer, HEADER, max_bytes, idle)?;
+    success_with_limits(&mut peer, AUTH, max_bytes, idle)?;
     Ok(peer)
 }
 
@@ -154,7 +168,7 @@ fn shared_inbound_pair_limit_survives_conflict_and_releases_after_close() -> Res
 fn inbound_idle_and_actual_certificate_deadlines_close_with_lifetime_outcomes() -> Result {
     let fixture = Fixture::new()?;
     let (mut server, address) = fixture.server("[limits.s2s]\nidle_timeout_secs=1\n")?;
-    let mut idle = authenticated(&fixture, address)?;
+    let mut idle = authenticated_with_limits(&fixture, address, 524288, 1)?;
     assert_eq!(until(&mut idle, FOOTER)?, FOOTER);
     idle.write_all(FOOTER.as_bytes())?;
     idle.conn.send_close_notify();
@@ -299,7 +313,7 @@ fn outgoing_idle_footer_forbidden_stanza_and_peer_error_remove_links_and_reestab
         wait_sample(&server, "lonewolf_s2s_outbound_links{state=\"ready\"}", 0)?;
         if mode == "idle" {
             drop(initiator);
-            initiator = authenticated(&fixture, inbound_address)?;
+            initiator = authenticated_with_limits(&fixture, inbound_address, 524288, 1)?;
         }
         out::trigger(&mut initiator, "next")?;
         let mut next = out::establish(&listener, config, &fixture)?;
@@ -765,7 +779,7 @@ fn authenticated_oversize_and_malformed_xml_keep_the_exact_wire_error_and_one_pr
     ] {
         let fixture = Fixture::new()?;
         let (mut server, address) = fixture.server("[limits.s2s]\nmax_stanza_bytes=10000\n")?;
-        let mut peer = authenticated(&fixture, address)?;
+        let mut peer = authenticated_with_limits(&fixture, address, 10000, 600)?;
         peer.write_all(xml.as_bytes())?;
         peer.flush()?;
         let response = until(&mut peer, FOOTER)?;

@@ -1416,7 +1416,11 @@ fn s2s_timeouts_reject_platform_clock_overflow() -> TestResult {
             }
             assert_eq!(
                 config.validate(),
-                Err(format!("{path} exceeds the platform clock range"))
+                Err(if path == "limits.s2s.idle_timeout_secs" {
+                    format!("{path} must not exceed {}", u32::MAX)
+                } else {
+                    format!("{path} exceeds the platform clock range")
+                })
             );
         }
     }
@@ -1425,20 +1429,20 @@ fn s2s_timeouts_reject_platform_clock_overflow() -> TestResult {
 
 #[test]
 fn s2s_stanza_size_and_backoff_accept_their_boundaries() -> TestResult {
-    for size in [10_000, isize::MAX as usize] {
+    let maximum = (u32::MAX as usize).min(isize::MAX as usize);
+    for size in [10_000, maximum] {
         let mut config = Config::default();
         config.limits.s2s.max_stanza_bytes = NonZeroUsize::new(size).ok_or("invalid size")?;
         config.limits.s2s.failure_backoff_initial_secs = config.limits.s2s.failure_backoff_max_secs;
         config.validate()?;
     }
     let mut config = Config::default();
-    config.limits.s2s.max_stanza_bytes =
-        NonZeroUsize::new(isize::MAX as usize + 1).ok_or("invalid size")?;
+    config.limits.s2s.max_stanza_bytes = NonZeroUsize::new(maximum + 1).ok_or("invalid size")?;
     assert_eq!(
         config.validate(),
         Err(format!(
             "limits.s2s.max_stanza_bytes must be between 10000 and {}",
-            isize::MAX
+            maximum
         ))
     );
     Ok(())

@@ -13,6 +13,7 @@ use super::manager_tests::{manager, message, run, stanza};
 use super::*;
 use crate::config::Config;
 use crate::router::{Router, local::LocalRouter};
+use crate::s2s::metrics::StreamClose;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 type Registration = BidiRegistration<GlobalChunkAllocator>;
@@ -618,5 +619,92 @@ fn stop_closes_standby_channels() -> TestResult {
         }
         drop(registration);
         fixture.finish().await
+    })
+}
+
+#[test]
+fn handoff_rechecks_an_unwritten_head_against_only_the_destination_writer() -> TestResult {
+    use crate::s2s::stream::limits::StreamLimits;
+    use crate::s2s::validity::LinkValidity;
+    use std::time::SystemTime;
+    run(async {
+        for (old_maximum, next_maximum) in [(0, None), (4096, Some(0)), (0, Some(4096))] {
+            let fixture = Fixture::new()?;
+            let first = fixture.register()?;
+            fixture.route().await?;
+            let mut queue = first.assigned().await.ok_or("assigned queue")?;
+            queue.current = Some(queue.receiver.recv().await?);
+            let counters = Arc::clone(&queue.counters);
+            let mut old_writer = S2sWriter::new(Vec::new());
+            old_writer.update_peer_limits(Some(StreamLimits {
+                max_bytes: Some(old_maximum),
+                idle_seconds: Some(1),
+            }));
+            let expired = LinkValidity::fixed(SystemTime::now() - Duration::from_secs(1));
+            let mut buffered = false;
+            assert!(matches!(
+                link::write(
+                    &mut old_writer,
+                    queue.current.as_mut().ok_or("head")?,
+                    &fixture.remote.inner,
+                    &expired,
+                    true,
+                    &mut buffered
+                )
+                .await,
+                Err(StreamClose::CertificateExpired)
+            ));
+            assert!(queue.current.as_ref().ok_or("head")?.reservation.is_some());
+            let next = fixture.register()?;
+            first.release(Some(queue));
+            let mut queue = next.assigned().await.ok_or("handoff queue")?;
+            assert!(Arc::ptr_eq(&queue.counters, &counters));
+            assert_eq!(queue.counters.count.load(Ordering::Relaxed), 1);
+            let mut writer = S2sWriter::new(Vec::new());
+            assert_eq!(writer.peer_limits(), StreamLimits::default());
+            if let Some(max_bytes) = next_maximum {
+                writer.update_peer_limits(Some(StreamLimits {
+                    max_bytes: Some(max_bytes),
+                    idle_seconds: None,
+                }));
+            }
+            let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
+            let result = link::write(
+                &mut writer,
+                queue.current.as_mut().ok_or("head")?,
+                &fixture.remote.inner,
+                &validity,
+                true,
+                &mut buffered,
+            )
+            .await;
+            if next_maximum == Some(0) {
+                assert!(matches!(result, Ok(link::WriteOutcome::PeerSizeRejected)));
+                link::reject_peer_size(&fixture.router.handle(), &mut queue.current);
+                assert_sample(
+                    &fixture.render()?,
+                    "lonewolf_s2s_peer_size_rejections_total 1",
+                );
+            } else {
+                assert!(matches!(result, Ok(link::WriteOutcome::Written { .. })));
+                queue.current = None;
+                assert_sample(
+                    &fixture.render()?,
+                    "lonewolf_s2s_stanzas_sent_total{kind=\"message\"} 1",
+                );
+                assert!(
+                    !fixture
+                        .render()?
+                        .contains("lonewolf_s2s_peer_size_rejections_total")
+                );
+            }
+            assert_eq!(queue.counters.count.load(Ordering::Relaxed), 0);
+            assert_eq!(queue.counters.bytes.load(Ordering::Relaxed), 0);
+            assert!(!fixture.render()?.contains("reason=\"connection_lost\""));
+            fixture.remote.stop();
+            next.release(Some(queue));
+            fixture.finish().await?;
+        }
+        Ok(())
     })
 }

@@ -358,19 +358,19 @@ fn constants_and_negotiation_builders_emit_exact_xml() {
 fn feature_parsing_selects_namespaces_and_exact_mechanism_text() -> TestResult {
     Runtime::new()?.block_on(async {
         for (body, expected) in [
-            ("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls>", Features { bidi: false, starttls: true, external: false }),
-            ("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>", Features { bidi: false, starttls: false, external: true }),
-            ("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>SCRAM-SHA-256</mechanism><mechanism>EXTERNAL</mechanism></mechanisms>", Features { bidi: false, starttls: false, external: true }),
-            ("<bidi xmlns='urn:xmpp:features:bidi'/>", Features { starttls: false, external: false, bidi: true }),
+            ("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls>", Features { limits: None, bidi: false, starttls: true, external: false }),
+            ("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>", Features { limits: None, bidi: false, starttls: false, external: true }),
+            ("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>SCRAM-SHA-256</mechanism><mechanism>EXTERNAL</mechanism></mechanisms>", Features { limits: None, bidi: false, starttls: false, external: true }),
+            ("<bidi xmlns='urn:xmpp:features:bidi'/>", Features { starttls: false, external: false, bidi: true, limits: None }),
             ("<bidi xmlns='urn:xmpp:bidi'/>", Features::default()),
-            ("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/>", Features { starttls: false, external: true, bidi: true }),
+            ("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/>", Features { starttls: false, external: true, bidi: true, limits: None }),
             ("<dialback xmlns='urn:xmpp:features:dialback'/>", Features::default()),
             ("<starttls xmlns='urn:wrong'/><mechanisms xmlns='urn:wrong'><mechanism>EXTERNAL</mechanism></mechanisms>", Features::default()),
             ("<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism> EXTERNAL</mechanism><mechanism>external</mechanism><mechanism xmlns='urn:wrong'>EXTERNAL</mechanism></mechanisms>", Features::default()),
-            ("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>", Features { bidi: false, starttls: true, external: true }),
+            ("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms>", Features { limits: None, bidi: false, starttls: true, external: true }),
         ] {
             let parsed = element(&format!("<stream:features xmlns:stream='http://etherx.jabber.org/streams'>{body}</stream:features>")).await?;
-            assert_eq!(parse_features(&parsed), expected);
+            assert_eq!(parse_features(&parsed)?, expected);
         }
         Ok(())
     })
@@ -1105,6 +1105,70 @@ fn transport_end_preserves_buffered_bytes_rejects_io_errors_and_is_terminal_on_c
             assert!(dropped.get());
             assert!(matches!(reader.next_event().await, Err(S2sError::Internal)));
         }
+        Ok(())
+    })
+}
+
+#[test]
+fn peer_limits_are_writer_local_and_control_elements_are_preflighted() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use super::limits::StreamLimits;
+        let output = Output::default();
+        let mut writer = S2sWriter::new(output.clone());
+        assert_eq!(writer.peer_limits(), StreamLimits::default());
+        writer.update_peer_limits(Some(StreamLimits {
+            max_bytes: Some(4),
+            idle_seconds: Some(0),
+        }));
+        success(writer.send("<x/>").await)?;
+        assert_eq!(output.0.borrow().as_slice(), b"<x/>");
+        writer.update_peer_limits(None);
+        assert!(matches!(
+            writer.send("<xx/>").await,
+            Err(S2sError::Stream(StreamErrorCondition::PolicyViolation))
+        ));
+        assert_eq!(output.0.borrow().as_slice(), b"<x/>");
+        writer.update_peer_limits(Some(StreamLimits {
+            max_bytes: Some(0),
+            idle_seconds: None,
+        }));
+        assert!(matches!(
+            writer.send("<x/>").await,
+            Err(S2sError::Stream(StreamErrorCondition::PolicyViolation))
+        ));
+        success(writer.send_header(HEADER).await)?;
+        success(
+            writer
+                .close(Some(StreamErrorCondition::PolicyViolation))
+                .await,
+        )?;
+        assert!(std::str::from_utf8(&output.0.borrow())?.ends_with("</stream:stream>"));
+        let fresh = S2sWriter::new(Output::default());
+        assert_eq!(fresh.peer_limits(), StreamLimits::default());
+        writer.update_peer_limits(Some(StreamLimits::default()));
+        assert_eq!(writer.peer_limits(), fresh.peer_limits());
+        Ok(())
+    })
+}
+
+#[test]
+fn size_preflight_matches_serializer_with_escaping_unicode_and_namespaces() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let mut input = reader(&format!("{HEADER}<message from='a@peer.test/r' to='b@local.test/r'><x:payload xmlns:x='urn:payload' x:a='&amp;&quot;'>é&amp;&lt;🙂</x:payload></message>"), &limits());
+        assert!(matches!(success(input.next_event().await)?, Some(StreamEvent::StreamStart { .. })));
+        let Some(StreamEvent::Stanza(parsed)) = success(input.next_event().await)? else { return Err("stanza".into()); };
+        let source = parsed.value().resolve(parsed.arena())?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let scoped = source.rescope_in(lonewolf_xmpp::stanza::StanzaNamespace::Server, &mut arena)?;
+        let view = scoped.resolve(&arena)?;
+        let mut actual = Vec::new();
+        view.write_xml_async(&mut actual).await.map_err(|e| format!("{e:?}"))?;
+        let length: u32 = actual.len().try_into()?;
+        assert!(success(super::limits::stanza_fits(&view, length).await)?);
+        assert!(!success(super::limits::stanza_fits(&view, length - 1).await)?);
+        assert!(!success(super::limits::stanza_fits(&view, 0).await)?);
+        let xml = std::str::from_utf8(&actual)?;
+        assert!(xml.contains("urn:payload") && xml.contains("&amp;") && xml.contains("🙂"));
         Ok(())
     })
 }

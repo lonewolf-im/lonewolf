@@ -80,6 +80,20 @@ impl<A: ChunkAllocator + Clone> Connection<A> {
         }
     }
 
+    async fn send_header(&mut self, xml: &str) -> Result<(), S2sError> {
+        match self {
+            Self::Plain(_, writer) => writer.send_header(xml).await,
+            Self::Tls(_, writer) => writer.send_header(xml).await,
+        }
+    }
+
+    fn update_peer_limits(&mut self, update: Option<stream::limits::StreamLimits>) {
+        match self {
+            Self::Plain(_, writer) => writer.update_peer_limits(update),
+            Self::Tls(_, writer) => writer.update_peer_limits(update),
+        }
+    }
+
     async fn close(&mut self, condition: Option<StreamErrorCondition>) -> Result<(), S2sError> {
         match self {
             Self::Plain(_, writer) => writer.close(condition).await,
@@ -242,7 +256,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                 let _ = compio::time::timeout_at(deadline, async {
                     if !header_sent {
                         connection
-                            .send(&stream::response_header_xml(&response_from, None)?)
+                            .send_header(&stream::response_header_xml(&response_from, None)?)
                             .await?;
                     }
                     if !footer_sent {
@@ -323,6 +337,11 @@ async fn run<A: ChunkAllocator + Clone>(
     footer_sent: &mut bool,
     response_from: &mut Box<str>,
 ) -> Result<VerifiedPeer, Failure> {
+    let local_limits = stream::limits::local_limits(
+        settings.reader_limits.max_stanza_bytes.get(),
+        settings.idle_timeout.as_secs(),
+    )?;
+    let mut features_xml = String::new();
     let offer_bidi = settings
         .services
         .router
@@ -332,7 +351,7 @@ async fn run<A: ChunkAllocator + Clone>(
     let initial = header(expected(plain, peer_footer).await?)?;
     if !settings.services.router.federates_domain(&initial.to) {
         plain
-            .send(&stream::response_header_xml(
+            .send_header(&stream::response_header_xml(
                 settings.hosts.default_host_name(),
                 initial.from.as_deref(),
             )?)
@@ -345,13 +364,18 @@ async fn run<A: ChunkAllocator + Clone>(
     }
     *response_from = initial.to.clone();
     plain
-        .send(&stream::response_header_xml(
+        .send_header(&stream::response_header_xml(
             &initial.to,
             initial.from.as_deref(),
         )?)
         .await?;
     *header_sent = true;
-    plain.send(stream::STARTTLS_REQUIRED_FEATURES).await?;
+    stream::limits::write_features_xml(
+        &mut features_xml,
+        stream::limits::FeaturePhase::StartTls,
+        local_limits,
+    )?;
+    plain.send(&features_xml).await?;
     match expected(plain, peer_footer).await? {
         StreamEvent::Element(element) if is_empty_element(&element, "starttls", TLS_NAMESPACE)? => {
         }
@@ -409,14 +433,16 @@ async fn run<A: ChunkAllocator + Clone>(
             )
         })
     });
-    let (input, output) =
-        CountingIo::new(tls, Arc::clone(&settings.metrics), Direction::Inbound).split();
+    let counted = CountingIo::new(tls, Arc::clone(&settings.metrics), Direction::Inbound);
+    let activity = counted.activity();
+    let (input, output) = counted.split();
     *connection = Some(Connection::Tls(
         S2sReader::from_state(
             BufReader::new(input.compat()),
             state,
             settings.services.allocator.clone(),
-        ),
+        )
+        .with_activity(activity),
         S2sWriter::new(output),
     ));
     *header_sent = false;
@@ -464,15 +490,15 @@ async fn run<A: ChunkAllocator + Clone>(
             tracing::debug!(reason = reason.as_str(), direction = "inbound", local_domain = %log_domain(&initial.to), remote_domain = %log_domain(&remote), "s2s revocation status unknown");
         }
     }
-    tls.send(&stream::response_header_xml(&initial.to, Some(&remote))?)
+    tls.send_header(&stream::response_header_xml(&initial.to, Some(&remote))?)
         .await?;
     *header_sent = true;
-    tls.send(if offer_bidi {
-        stream::EXTERNAL_BIDI_FEATURES
-    } else {
-        stream::EXTERNAL_FEATURES
-    })
-    .await?;
+    stream::limits::write_features_xml(
+        &mut features_xml,
+        stream::limits::FeaturePhase::Sasl { bidi: offer_bidi },
+        local_limits,
+    )?;
+    tls.send(&features_xml).await?;
     let mut requested = false;
     for attempt in 0..2 {
         let mut auth = expected(tls, peer_footer).await?;
@@ -485,15 +511,13 @@ async fn run<A: ChunkAllocator + Clone>(
                 view.name() == "bidi" && view.namespace() == stream::BIDI_NAMESPACE
             }
         {
-            if !offer_bidi
-                || requested
-                || !is_empty_element(element, "bidi", stream::BIDI_NAMESPACE)?
-            {
+            if !offer_bidi || requested {
                 return Err(reject(
                     StreamErrorCondition::NotAuthorized,
                     AuthOutcome::Protocol,
                 ));
             }
+            tls.update_peer_limits(stream::limits::parse_bidi(element)?);
             requested = true;
             auth = expected(tls, peer_footer).await?;
         }
@@ -568,10 +592,15 @@ async fn run<A: ChunkAllocator + Clone>(
             AuthOutcome::InvalidFrom,
         ));
     }
-    tls.send(&stream::response_header_xml(&initial.to, Some(&remote))?)
+    tls.send_header(&stream::response_header_xml(&initial.to, Some(&remote))?)
         .await?;
     *header_sent = true;
-    tls.send(stream::EMPTY_FEATURES).await?;
+    stream::limits::write_features_xml(
+        &mut features_xml,
+        stream::limits::FeaturePhase::Authenticated,
+        local_limits,
+    )?;
+    tls.send(&features_xml).await?;
     Ok(VerifiedPeer {
         bidi_offered: offer_bidi,
         bidi: requested,

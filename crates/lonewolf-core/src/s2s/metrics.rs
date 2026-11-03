@@ -344,13 +344,15 @@ pub(crate) enum BounceCondition {
     RemoteServerNotFound,
     RemoteServerTimeout,
     ResourceConstraint,
+    PolicyViolation,
 }
 
 impl BounceCondition {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::RemoteServerNotFound,
         Self::RemoteServerTimeout,
         Self::ResourceConstraint,
+        Self::PolicyViolation,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -358,6 +360,7 @@ impl BounceCondition {
             Self::RemoteServerNotFound => "remote_server_not_found",
             Self::RemoteServerTimeout => "remote_server_timeout",
             Self::ResourceConstraint => "resource_constraint",
+            Self::PolicyViolation => "policy_violation",
         }
     }
 }
@@ -528,6 +531,7 @@ pub(crate) struct S2sMetrics {
     rate_limited: [AtomicU64; InboundLimit::ALL.len()],
     dns: [AtomicU64; DnsOutcome::ALL.len()],
     admission_rejected: [AtomicU64; AdmissionReason::ALL.len()],
+    peer_size_rejections: AtomicU64,
     bounces: [AtomicU64; BounceCondition::ALL.len()],
     dropped: [AtomicU64; DropReason::ALL.len()],
     bidi_negotiations: [[AtomicU64; BidiOutcome::ALL.len()]; Direction::ALL.len()],
@@ -565,6 +569,7 @@ impl S2sMetrics {
             rate_limited: Default::default(),
             dns: Default::default(),
             admission_rejected: Default::default(),
+            peer_size_rejections: AtomicU64::new(0),
             bounces: Default::default(),
             dropped: Default::default(),
             bidi_negotiations: Default::default(),
@@ -693,6 +698,10 @@ impl S2sMetrics {
 
     pub(crate) fn admission_rejected(&self, reason: AdmissionReason) {
         self.admission_rejected[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn peer_size_rejected(&self) {
+        self.peer_size_rejections.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn bounced(&self, condition: BounceCondition) {
@@ -1112,6 +1121,15 @@ impl Collector for S2sCollector {
                 )
             }),
         )?;
+        let rejected = metrics.peer_size_rejections.load(Ordering::Relaxed);
+        if rejected != 0 {
+            ConstCounter::new(rejected).encode(encoder.encode_descriptor(
+                "s2s_peer_size_rejections",
+                "Routed stanzas rejected by the peer maximum byte size.",
+                None,
+                MetricType::Counter,
+            )?)?;
+        }
         encode_counter(
             &mut encoder,
             "s2s_bounces",

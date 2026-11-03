@@ -239,8 +239,8 @@
 # Limit each outbound connection attempt in seconds; expired attempts fail.
 # connect_timeout_secs = 10
 
-# Limit incoming stanza bytes, including XML markup; oversized stanzas close the stream.
-# Choose at least 10,000 bytes and no more than the platform allocation range.
+# Limit incoming stanza bytes, including XML markup, and announce this limit to peers.
+# Choose 10,000 through 4,294,967,295 bytes within the platform allocation range.
 # max_stanza_bytes = 524_288
 
 # Limit stanza traffic per connection; processing waits when the allowance is empty.
@@ -262,7 +262,8 @@
 # Limit queued bytes per link; a full queue rejects new stanzas with resource-constraint.
 # max_queued_bytes_per_link = 4_194_304
 
-# Close idle links after this many seconds without traffic.
+# Close idle links after this many seconds without traffic and announce the interval to peers.
+# Choose 1 through 4,294,967,295 seconds within the platform clock range.
 # idle_timeout_secs = 600
 
 # Close a link when a write cannot make progress for this many seconds.

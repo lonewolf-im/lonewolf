@@ -277,7 +277,7 @@ fn features<A: ChunkAllocator>(event: StreamEvent<A>) -> Result<Features, Failur
     if element.name() != "features" || element.namespace() != STREAM_NAMESPACE {
         return Err(protocol());
     }
-    Ok(stream::parse_features(&parsed))
+    Ok(stream::parse_features(&parsed)?)
 }
 
 fn require_starttls(features: &Features) -> Result<(), Failure> {
@@ -457,6 +457,20 @@ impl<A: ChunkAllocator + Clone> Connection<A> {
             Self::Tls(_, writer) => writer.close(condition).await,
         }
     }
+    async fn send_header(&mut self, xml: &str) -> Result<(), S2sError> {
+        match self {
+            Self::Plain(_, writer) => writer.send_header(xml).await,
+            Self::Tls(_, writer) => writer.send_header(xml).await,
+        }
+    }
+
+    fn update_peer_limits(&mut self, update: Option<stream::limits::StreamLimits>) {
+        match self {
+            Self::Plain(_, writer) => writer.update_peer_limits(update),
+            Self::Tls(_, writer) => writer.update_peer_limits(update),
+        }
+    }
+
     async fn shutdown(&mut self, peer_footer: bool) -> Result<(), S2sError> {
         match self {
             Self::Plain(_, writer) => writer.shutdown().await,
@@ -483,6 +497,26 @@ struct TlsSetup {
 }
 
 impl<A: ChunkAllocator + Clone> Negotiation<A> {
+    async fn send_header(&mut self, xml: &str) -> Result<(), Failure> {
+        self.connection
+            .as_mut()
+            .ok_or_else(protocol)?
+            .send_header(xml)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn update_peer_limits(
+        &mut self,
+        update: Option<stream::limits::StreamLimits>,
+    ) -> Result<(), Failure> {
+        self.connection
+            .as_mut()
+            .ok_or_else(protocol)?
+            .update_peer_limits(update);
+        Ok(())
+    }
+
     async fn expected(&mut self) -> Result<StreamEvent<A>, Failure> {
         match self
             .connection
@@ -565,9 +599,11 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     allocator: A,
 ) -> Result<VerifiedPeer, Failure> {
     let header = stream::initial_header_xml(local, remote);
-    flow.send(&header).await?;
+    flow.send_header(&header).await?;
     flow.header(remote).await?;
-    require_starttls(&features(flow.expected().await?)?)?;
+    let offered = features(flow.expected().await?)?;
+    require_starttls(&offered)?;
+    flow.update_peer_limits(offered.limits)?;
     flow.send(stream::STARTTLS).await?;
     proceed(flow.expected().await?)?;
     let Some(Connection::Plain(mut reader, writer)) = flow.connection.take() else {
@@ -585,19 +621,28 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         .await
         .map_err(tls_failure)?;
     let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
-    let (input, output) =
-        CountingIo::new(tls, Arc::clone(&context.metrics), Direction::Outbound).split();
+    let counted = CountingIo::new(tls, Arc::clone(&context.metrics), Direction::Outbound);
+    let activity = counted.activity();
+    let (input, output) = counted.split();
     flow.connection = Some(Connection::Tls(
-        S2sReader::from_state(BufReader::new(input.compat()), state, allocator),
+        S2sReader::from_state(BufReader::new(input.compat()), state, allocator)
+            .with_activity(activity),
         S2sWriter::new(output),
     ));
-    flow.send(&header).await?;
+    flow.send_header(&header).await?;
     flow.header(remote).await?;
     let offered = features(flow.expected().await?)?;
     require_external(&offered)?;
+    flow.update_peer_limits(offered.limits)?;
     let bidi = context.bidirectional && offered.bidi;
     if bidi {
-        flow.send(stream::BIDI_REQUEST).await?;
+        let mut xml = String::new();
+        let limits = stream::limits::local_limits(
+            context.limits.max_stanza_bytes.get(),
+            context.limits.idle_timeout_secs.get(),
+        )?;
+        stream::limits::write_bidi_xml(&mut xml, limits)?;
+        flow.send(&xml).await?;
     }
     flow.send(&stream::auth_external_xml(local)).await?;
     if sasl_reply(flow.expected().await?, false)? == SaslReply::Challenge {
@@ -608,9 +653,10 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         return Err(protocol());
     };
     reader.restart()?;
-    flow.send(&header).await?;
+    flow.send_header(&header).await?;
     flow.header(remote).await?;
-    features(flow.expected().await?)?;
+    let offered = features(flow.expected().await?)?;
+    flow.update_peer_limits(offered.limits)?;
     let validity = context
         .trust
         .verify_chain(certificates.as_deref().unwrap_or(&[]), UnixTime::now())

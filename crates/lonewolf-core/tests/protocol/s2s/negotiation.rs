@@ -17,24 +17,29 @@ pub(super) struct SingleServer {
 
 impl SingleServer {
     pub fn start(extra: &str) -> TestResult<Self> {
-        Self::start_with(extra, Default::default(), Some(false))
+        Self::start_with(extra, Default::default(), Some(false), "")
     }
 
     pub fn start_with_revocation(
         extra: &str,
         revocation: super::super::support::federation::HostRevocation,
     ) -> TestResult<Self> {
-        Self::start_with(extra, revocation, Some(false))
+        Self::start_with(extra, revocation, Some(false), "")
     }
 
     pub fn start_bidirectional(extra: &str) -> TestResult<Self> {
-        Self::start_with(extra, Default::default(), None)
+        Self::start_with(extra, Default::default(), None, "")
+    }
+
+    pub fn start_bidirectional_with_extensions(extra: &str, extensions: &str) -> TestResult<Self> {
+        Self::start_with(extra, Default::default(), None, extensions)
     }
 
     fn start_with(
         extra: &str,
         revocation: super::super::support::federation::HostRevocation,
         bidirectional: Option<bool>,
+        extensions: &str,
     ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let ca = Arc::new(FederationCa::new(directory.path())?);
@@ -45,7 +50,7 @@ impl SingleServer {
             enabled: None,
             bidirectional,
             federation: None,
-            extensions: String::new(),
+            extensions: extensions.into(),
             extra_toml: extra.into(),
             ca: Arc::clone(&ca),
             dns: dns.address(),
@@ -60,7 +65,16 @@ impl SingleServer {
     }
 
     pub fn connect(&self) -> TestResult<RawS2sPeer> {
-        RawS2sPeer::connect(self.suite.s2s_addresses()?[0], "b.test", "a.test")
+        let config = lonewolf_core::config::Config::load(Some(
+            &self.suite.fixture_path().join("lonewolf.toml"),
+        ))?;
+        Ok(
+            RawS2sPeer::connect(self.suite.s2s_addresses()?[0], "b.test", "a.test")?
+                .expecting_limits(
+                    config.limits.s2s.max_stanza_bytes.get().try_into()?,
+                    config.limits.s2s.idle_timeout_secs.get().try_into()?,
+                ),
+        )
     }
 
     pub fn client_config(&self) -> TestResult<Arc<rustls::ClientConfig>> {

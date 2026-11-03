@@ -155,10 +155,17 @@ impl From<S2sLimitsInput> for S2sLimits {
 
 impl S2sLimits {
     fn validate(&self) -> Result<(), String> {
-        if !(10_000..=isize::MAX as usize).contains(&self.max_stanza_bytes.get()) {
+        let max_stanza_bytes = (u32::MAX as usize).min(isize::MAX as usize);
+        if !(10_000..=max_stanza_bytes).contains(&self.max_stanza_bytes.get()) {
             return Err(format!(
                 "limits.s2s.max_stanza_bytes must be between 10000 and {}",
-                isize::MAX
+                max_stanza_bytes
+            ));
+        }
+        if self.idle_timeout_secs.get() > u64::from(u32::MAX) {
+            return Err(format!(
+                "limits.s2s.idle_timeout_secs must not exceed {}",
+                u32::MAX
             ));
         }
         for (field, value) in [

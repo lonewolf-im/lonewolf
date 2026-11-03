@@ -9,7 +9,7 @@ use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::Arena;
 use lonewolf_xmpp::parser::StreamEvent;
-use lonewolf_xmpp::stanza::{StanzaKind, StanzaNamespace};
+use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaKind, StanzaNamespace};
 use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::AsyncBufRead;
 
@@ -19,6 +19,7 @@ use crate::s2s::ingress::{self, InboundPeer, IngressContext};
 use crate::s2s::metrics::{Direction, StreamClose};
 use crate::s2s::revocation::CheckPhase;
 use crate::s2s::stream::S2sError;
+use crate::s2s::stream::traffic::{IdleClock, SystemIdleClock};
 use crate::s2s::validity::{LinkValidity, MonitorLog, ValidityMonitor, supervise};
 
 const CLOSE_BUDGET: Duration = Duration::from_secs(6);
@@ -30,6 +31,24 @@ async fn watch<T>(
     timeout: Duration,
     timeout_reason: StreamClose,
     work: impl Future<Output = Result<T, S2sError>>,
+) -> Result<T, StreamClose> {
+    let work = async {
+        compio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| timeout_reason)?
+            .map_err(|error| match error {
+                S2sError::PeerError(_) => StreamClose::PeerError,
+                S2sError::Timeout => StreamClose::StalledWrite,
+                _ => StreamClose::TransportError,
+            })
+    };
+    watch_control(stop, validity, work).await
+}
+
+async fn watch_control<T>(
+    stop: Option<Stop>,
+    validity: Option<&LinkValidity>,
+    work: impl Future<Output = Result<T, StreamClose>>,
 ) -> Result<T, StreamClose> {
     let stop = async {
         match stop {
@@ -43,16 +62,6 @@ async fn watch<T>(
             None => std::future::pending().await,
         }
     };
-    let work = async {
-        compio::time::timeout(timeout, work)
-            .await
-            .map_err(|_| timeout_reason)?
-            .map_err(|error| match error {
-                S2sError::PeerError(_) => StreamClose::PeerError,
-                S2sError::Timeout => StreamClose::StalledWrite,
-                _ => StreamClose::TransportError,
-            })
-    };
     match select(pin!(stop), pin!(select(pin!(expiry), pin!(work)))).await {
         Either::Left(_) => Err(StreamClose::Shutdown),
         Either::Right((Either::Left((reason, _)), _)) => Err(reason),
@@ -63,6 +72,7 @@ async fn watch<T>(
 pub(super) enum WriteOutcome {
     Written { at: Instant, kind: StanzaKind },
     Discarded,
+    PeerSizeRejected,
 }
 
 fn discard<A: ChunkAllocator>(
@@ -106,19 +116,36 @@ pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
         .and_then(|(arena, copy)| copy.resolve(arena).ok());
     let Some(view) = view else {
         let outcome = discard(inner, queued, validity)?;
-        if flush && *buffered {
-            watch(
-                Some(inner.stopped.clone()),
-                Some(validity),
-                Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
-                StreamClose::StalledWrite,
-                writer.flush(),
-            )
-            .await?;
-            *buffered = false;
+        if flush {
+            flush_buffered(writer, inner, validity, buffered).await?;
         }
         return Ok(outcome);
     };
+    if let Some(maximum) = writer.peer_limits().max_bytes {
+        match crate::s2s::stream::limits::stanza_fits(&view, maximum).await {
+            Ok(false) => {
+                let state = inner.state.lock();
+                if state.stopped {
+                    return Err(StreamClose::Shutdown);
+                }
+                if let Err(reason) = validity.check(SystemTime::now()) {
+                    return Err(validity.record_invalidation(reason));
+                }
+                drop(queued.reservation.take());
+                queued.write_outcome_recorded = true;
+                inner.metrics.peer_size_rejected();
+                return Ok(WriteOutcome::PeerSizeRejected);
+            }
+            Err(_) => {
+                let outcome = discard(inner, queued, validity)?;
+                if flush {
+                    flush_buffered(writer, inner, validity, buffered).await?;
+                }
+                return Ok(outcome);
+            }
+            Ok(true) => {}
+        }
+    }
     let kind = view.kind();
     let timeout = Duration::from_secs(inner.limits.stalled_write_timeout_secs.get());
     let result = {
@@ -151,20 +178,47 @@ pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     queued.write_outcome_recorded = true;
     *buffered = true;
     if flush {
+        flush_buffered(writer, inner, validity, buffered).await?;
+    }
+    Ok(WriteOutcome::Written {
+        at: written_at,
+        kind,
+    })
+}
+
+pub(super) fn reject_peer_size<A: ChunkAllocator + Clone + 'static>(
+    router: &RouterHandle<A>,
+    current: &mut Option<Queued<A>>,
+) {
+    if let Some(queued) = current.take()
+        && let Some(remote) = router.remote_router()
+    {
+        let _ = remote.bounce(
+            router,
+            queued.into_stanza(),
+            StanzaErrorCondition::PolicyViolation,
+        );
+    }
+}
+
+pub(super) async fn flush_buffered<A: ChunkAllocator, W: AsyncWrite + Unpin>(
+    writer: &mut S2sWriter<W>,
+    inner: &Inner<A>,
+    validity: &LinkValidity,
+    buffered: &mut bool,
+) -> Result<(), StreamClose> {
+    if *buffered {
         watch(
             Some(inner.stopped.clone()),
             Some(validity),
-            timeout,
+            Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
             StreamClose::StalledWrite,
             writer.flush(),
         )
         .await?;
         *buffered = false;
     }
-    Ok(WriteOutcome::Written {
-        at: written_at,
-        kind,
-    })
+    Ok(())
 }
 
 fn close_condition(reason: StreamClose) -> Option<StreamErrorCondition> {
@@ -243,8 +297,36 @@ async fn serve<
     validity: &LinkValidity,
     receiver: &Receiver<Queued<A>>,
     current: &mut Option<Queued<A>>,
+    router: &RouterHandle<A>,
 ) -> Closed {
-    let mut last_written = Instant::now();
+    serve_with_clock(
+        inner,
+        reader,
+        writer,
+        validity,
+        (receiver, current),
+        router,
+        &SystemIdleClock,
+    )
+    .await
+}
+
+async fn serve_with_clock<
+    A: ChunkAllocator + Clone,
+    R: AsyncBufRead + Unpin + 'static,
+    W: AsyncWrite + Unpin,
+>(
+    inner: &Inner<A>,
+    reader: &mut S2sReader<A, R>,
+    writer: &mut S2sWriter<W>,
+    validity: &LinkValidity,
+    queue: (&Receiver<Queued<A>>, &mut Option<Queued<A>>),
+    router: &RouterHandle<A>,
+    clock: &impl IdleClock,
+) -> Closed {
+    let (receiver, current) = queue;
+    let mut last_written = clock.now();
+    let physical = reader.activity();
     let mut buffered = false;
     loop {
         let next = async {
@@ -259,17 +341,21 @@ async fn serve<
                 Either::Right((result, _)) => result,
             }
         };
-        let idle = Duration::from_secs(inner.limits.idle_timeout_secs.get())
-            .saturating_sub(last_written.elapsed());
-        match watch(
-            Some(inner.stopped.clone()),
-            Some(validity),
-            idle,
-            StreamClose::Idle,
-            next,
-        )
-        .await
-        {
+        let last_activity = physical
+            .as_ref()
+            .map_or(last_written, |physical| physical.last().max(last_written));
+        let deadline = last_activity + Duration::from_secs(inner.limits.idle_timeout_secs.get());
+        let next = async {
+            match select(pin!(clock.sleep_until(deadline)), pin!(next)).await {
+                Either::Left(_) => Err(StreamClose::Idle),
+                Either::Right((result, _)) => result.map_err(|error| match error {
+                    S2sError::PeerError(_) => StreamClose::PeerError,
+                    S2sError::Timeout => StreamClose::StalledWrite,
+                    _ => StreamClose::TransportError,
+                }),
+            }
+        };
+        match watch_control(Some(inner.stopped.clone()), Some(validity), next).await {
             Ok(Next::Queued) => {
                 let Some(queued) = current.as_mut() else {
                     return Closed {
@@ -290,6 +376,17 @@ async fn serve<
                     Ok(WriteOutcome::Written { at: written_at, .. }) => {
                         last_written = written_at;
                         *current = None;
+                    }
+                    Ok(WriteOutcome::PeerSizeRejected) => {
+                        reject_peer_size(router, current);
+                        if let Err(reason) =
+                            flush_buffered(writer, inner, validity, &mut buffered).await
+                        {
+                            return Closed {
+                                reason,
+                                abort: true,
+                            };
+                        }
                     }
                     Ok(WriteOutcome::Discarded) => {
                         *current = None;
@@ -325,6 +422,14 @@ async fn serve<
                     reason: StreamClose::NotAuthorized,
                     abort: false,
                 };
+            }
+            Err(StreamClose::Idle)
+                if physical.as_ref().is_some_and(|physical| {
+                    clock.now().saturating_duration_since(physical.last())
+                        < Duration::from_secs(inner.limits.idle_timeout_secs.get())
+                }) =>
+            {
+                continue;
             }
             Err(reason) => {
                 let abort = matches!(
@@ -439,7 +544,7 @@ where
             ..
         } = queue;
         let work = async {
-            let closed = serve(inner, reader, writer, validity, receiver, current).await;
+            let closed = serve(inner, reader, writer, validity, receiver, current, router).await;
             if closed.abort {
                 closed.reason
             } else {
@@ -1260,6 +1365,11 @@ mod tests {
                         &LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60)),
                         &task.queue.receiver,
                         &mut current,
+                        &crate::router::Router::new(
+                            manager.inner.hosts.clone(),
+                            crate::router::local::LocalRouter::new(GlobalChunkAllocator),
+                        )
+                        .handle(),
                     )
                     .await;
                     assert_eq!(closed.reason.as_str(), expected.as_str());
@@ -1646,6 +1756,188 @@ mod tests {
                     &task.queue.pair,
                     &mut Some(head),
                 );
+                drop(task);
+                manager
+                    .join(Instant::now() + Duration::from_secs(5))
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+    #[test]
+    fn physical_whitespace_and_partial_xml_extend_outbound_idle_until_silence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::s2s::stream::traffic::{
+            CountingIo,
+            test_support::{Clock, Fragments},
+        };
+        use tokio_util::compat::FuturesAsyncReadCompatExt;
+        run(async {
+            let manager = manager(S2sLimits {
+                idle_timeout_secs: std::num::NonZeroU64::new(1).ok_or("timeout")?,
+                ..Default::default()
+            })?;
+            let task = manager
+                .admit("localhost", "remote.test", message().await?)
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or("launch")?;
+            drop(task.queue.receiver.recv().await?);
+            let input = Fragments::default();
+            input.push(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0'>");
+            let counted = CountingIo::new(
+                input.clone(),
+                Arc::clone(&manager.inner.metrics),
+                Direction::Outbound,
+            );
+            let activity = counted.activity();
+            let mut reader = S2sReader::new(
+                tokio::io::BufReader::new(counted.compat()),
+                &S2sReaderLimits {
+                    max_stanza_bytes: manager.inner.limits.max_stanza_bytes,
+                    stanzas: manager.inner.limits.incoming_stanzas_per_connection.clone(),
+                    xml: manager.inner.limits.incoming_xml_per_connection.clone(),
+                },
+                GlobalChunkAllocator,
+                None,
+            )
+            .with_activity(activity.clone());
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::StreamStart { .. }))
+            ));
+            let router = crate::router::Router::new(
+                manager.inner.hosts.clone(),
+                crate::router::local::LocalRouter::new(GlobalChunkAllocator),
+            )
+            .handle();
+            let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
+            let clock = Clock::new();
+            let mut current = None;
+            let mut writer = S2sWriter::new(Vec::new());
+            let end = {
+                let mut running = pin!(serve_with_clock(
+                    &manager.inner,
+                    &mut reader,
+                    &mut writer,
+                    &validity,
+                    (&task.queue.receiver, &mut current),
+                    &router,
+                    &clock
+                ));
+                assert!(futures_util::poll!(running.as_mut()).is_pending());
+                assert!(futures_util::poll!(running.as_mut()).is_pending());
+                for fragment in [b" \n".as_slice(), b"<message", b" from='"] {
+                    clock.advance(Duration::from_millis(500));
+                    let before = input.polls();
+                    input.push(fragment);
+                    assert!(futures_util::poll!(running.as_mut()).is_pending());
+                    assert!(input.polls() > before);
+                    activity.record(clock.now());
+                }
+                clock.advance(Duration::from_millis(999));
+                assert!(futures_util::poll!(running.as_mut()).is_pending());
+                clock.advance(Duration::from_millis(1));
+                running.await
+            };
+            assert!(matches!(end.reason, StreamClose::Idle));
+            assert!(!end.abort);
+            assert!(current.is_none());
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+            manager.stop();
+            manager.inner.remove(&task.queue.pair, &task.queue.counters);
+            drop(task);
+            manager
+                .join(Instant::now() + Duration::from_secs(5))
+                .await?;
+            Ok(())
+        })
+    }
+    #[test]
+    fn routed_preflight_preserves_exact_boundary_and_control_accounting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::s2s::stream::limits::StreamLimits;
+        run(async {
+            for (fits, stopped, expired) in [
+                (true, false, false),
+                (false, false, false),
+                (false, true, false),
+                (false, false, true),
+            ] {
+                let manager = manager(S2sLimits::default())?;
+                let task = manager
+                    .admit("localhost", "remote.test", message().await?)
+                    .map_err(|error| format!("{error:?}"))?
+                    .ok_or("launch")?;
+                let mut head = task.queue.receiver.recv().await?;
+                let mut arena = Arena::try_new(Default::default())?;
+                let scoped = head
+                    .stanza
+                    .resolve()?
+                    .rescope_in(StanzaNamespace::Server, &mut arena)?;
+                let mut exact = Vec::new();
+                scoped
+                    .resolve(&arena)?
+                    .write_xml_async(&mut exact)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?;
+                let maximum: u32 = (exact.len() - usize::from(!fits)).try_into()?;
+                let calls = Arc::new(PlMutex::new(Calls {
+                    accepts: true,
+                    ..Default::default()
+                }));
+                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                writer.update_peer_limits(Some(StreamLimits {
+                    max_bytes: Some(maximum),
+                    idle_seconds: None,
+                }));
+                if stopped {
+                    manager.stop();
+                }
+                let valid_until = if expired {
+                    SystemTime::now() - Duration::from_secs(1)
+                } else {
+                    SystemTime::now() + Duration::from_secs(60)
+                };
+                let validity = LinkValidity::fixed(valid_until);
+                let mut buffered = !fits;
+                let result = write(
+                    &mut writer,
+                    &mut head,
+                    &manager.inner,
+                    &validity,
+                    true,
+                    &mut buffered,
+                )
+                .await;
+                if stopped {
+                    assert!(matches!(result, Err(StreamClose::Shutdown)));
+                } else if expired {
+                    assert!(matches!(result, Err(StreamClose::CertificateExpired)));
+                } else if fits {
+                    assert!(matches!(result, Ok(WriteOutcome::Written { .. })));
+                    assert_eq!(calls.lock().output, exact);
+                } else {
+                    assert!(matches!(result, Ok(WriteOutcome::PeerSizeRejected)));
+                    assert_eq!(calls.lock().flushes, 0);
+                }
+                if !fits {
+                    assert_eq!(calls.lock().writes, 0);
+                }
+                assert_eq!(head.reservation.is_some(), stopped || expired);
+                assert_eq!(
+                    task.queue.counters.count.load(Ordering::Relaxed),
+                    usize::from(stopped || expired)
+                );
+                let metrics = render(&manager.inner.metrics)?;
+                assert_eq!(
+                    metrics.contains("s2s_peer_size_rejections_total 1"),
+                    !fits && !stopped && !expired
+                );
+                assert!(!metrics.contains("reason=\"connection_lost\""));
+                assert!(!metrics.contains("reason=\"internal_error\""));
+                drop(head);
+                manager.stop();
+                manager.inner.remove(&task.queue.pair, &task.queue.counters);
                 drop(task);
                 manager
                     .join(Instant::now() + Duration::from_secs(5))

@@ -525,3 +525,33 @@ fn named_profiles_use_independent_recipient_rate_defaults() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn s2s_wire_ranges_are_validated_even_when_federation_and_bidi_are_disabled() -> TestResult {
+    let maximum = (u32::MAX as usize).min(isize::MAX as usize);
+    for enabled in [false, true] {
+        for bidi in [false, true] {
+            for (field, value, valid) in [
+                ("max_stanza_bytes", 0, false),
+                ("max_stanza_bytes", 9999, false),
+                ("max_stanza_bytes", 10000, true),
+                ("max_stanza_bytes", maximum as u64, true),
+                ("max_stanza_bytes", maximum as u64 + 1, false),
+                ("idle_timeout_secs", 0, false),
+                ("idle_timeout_secs", 1, true),
+                ("idle_timeout_secs", u64::from(u32::MAX), true),
+                ("idle_timeout_secs", u64::from(u32::MAX) + 1, false),
+            ] {
+                let file = config_file(&format!(
+                    "[s2s]\nenabled={enabled}\nbidirectional={bidi}\n[limits.s2s]\n{field}={value}"
+                ))?;
+                assert_eq!(
+                    Config::load(Some(file.path())).is_ok(),
+                    valid,
+                    "{field}={value}, enabled={enabled}, bidi={bidi}"
+                );
+            }
+        }
+    }
+    Ok(())
+}

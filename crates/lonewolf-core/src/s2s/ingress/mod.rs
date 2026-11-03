@@ -46,6 +46,7 @@ impl From<StageFailure> for IngressFailure {
 mod iq;
 mod message;
 mod presence;
+pub(crate) mod receive;
 
 pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
     context: &IngressContext<A>,

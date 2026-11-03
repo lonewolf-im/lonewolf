@@ -389,6 +389,42 @@ impl DropReason {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BidiOutcome {
+    Enabled,
+    NotOffered,
+    NotRequested,
+}
+
+impl BidiOutcome {
+    const ALL: [Self; 3] = [Self::Enabled, Self::NotOffered, Self::NotRequested];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::NotOffered => "not_offered",
+            Self::NotRequested => "not_requested",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BidiHandoff {
+    InboundStream,
+    DialedLink,
+}
+
+impl BidiHandoff {
+    const ALL: [Self; 2] = [Self::InboundStream, Self::DialedLink];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::InboundStream => "inbound_stream",
+            Self::DialedLink => "dialed_link",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CrlFetchOutcome {
     Success,
     DnsFailed,
@@ -494,6 +530,11 @@ pub(crate) struct S2sMetrics {
     admission_rejected: [AtomicU64; AdmissionReason::ALL.len()],
     bounces: [AtomicU64; BounceCondition::ALL.len()],
     dropped: [AtomicU64; DropReason::ALL.len()],
+    bidi_negotiations: [[AtomicU64; BidiOutcome::ALL.len()]; Direction::ALL.len()],
+    bidi_streams: [AtomicU64; Direction::ALL.len()],
+    bidi_stanzas_sent: [AtomicU64; KINDS.len()],
+    bidi_stanzas_received: [AtomicU64; KINDS.len()],
+    bidi_handoffs: [AtomicU64; BidiHandoff::ALL.len()],
     crl_file_load_failures: [AtomicU64; 3],
     crl_file_next_update: AtomicU64,
     crl_fetches: [AtomicU64; CrlFetchOutcome::ALL.len()],
@@ -526,6 +567,11 @@ impl S2sMetrics {
             admission_rejected: Default::default(),
             bounces: Default::default(),
             dropped: Default::default(),
+            bidi_negotiations: Default::default(),
+            bidi_streams: Default::default(),
+            bidi_stanzas_sent: Default::default(),
+            bidi_stanzas_received: Default::default(),
+            bidi_handoffs: Default::default(),
             crl_file_load_failures: Default::default(),
             crl_file_next_update: AtomicU64::new(0),
             crl_fetches: Default::default(),
@@ -657,6 +703,37 @@ impl S2sMetrics {
         self.dropped[reason as usize].fetch_add(count, Ordering::Relaxed);
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn bidi_negotiated(&self, direction: Direction, outcome: BidiOutcome) {
+        self.bidi_negotiations[direction as usize][outcome as usize]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn bidi_stream_opened(self: &Arc<Self>, direction: Direction) -> ConnectionGauge {
+        self.bidi_streams[direction as usize].fetch_add(1, Ordering::Relaxed);
+        ConnectionGauge {
+            metrics: Arc::clone(self),
+            direction,
+            kind: GaugeKind::Bidi,
+        }
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn bidi_stanza_sent(&self, kind: StanzaKind) {
+        self.bidi_stanzas_sent[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn bidi_stanza_received(&self, kind: StanzaKind) {
+        self.bidi_stanzas_received[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn bidi_handoff(&self, target: BidiHandoff) {
+        self.bidi_handoffs[target as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn shutdown_state(&self) -> crate::test_support::S2sShutdownState {
         let source = self.link_source.read().as_ref().and_then(Weak::upgrade);
@@ -678,6 +755,7 @@ impl S2sMetrics {
 enum GaugeKind {
     Connection,
     Stream,
+    Bidi,
 }
 
 #[must_use]
@@ -692,6 +770,7 @@ impl Drop for ConnectionGauge {
         let counters = match self.kind {
             GaugeKind::Connection => &self.metrics.connections,
             GaugeKind::Stream => &self.metrics.streams,
+            GaugeKind::Bidi => &self.metrics.bidi_streams,
         };
         counters[self.direction as usize].fetch_sub(1, Ordering::Relaxed);
     }
@@ -814,6 +893,11 @@ impl Collector for S2sCollector {
                 "Authenticated S2S streams.",
                 &metrics.streams,
             ),
+            (
+                "s2s_bidi_streams",
+                "Authenticated S2S streams that carry stanzas in both directions.",
+                &metrics.bidi_streams,
+            ),
         ] {
             let mut family = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
             for direction in Direction::ALL {
@@ -868,6 +952,23 @@ impl Collector for S2sCollector {
                             ("outcome", outcome.as_str()),
                         ],
                         metrics.authentications[direction as usize][outcome as usize]
+                            .load(Ordering::Relaxed),
+                    )
+                })
+            }),
+        )?;
+        encode_counter(
+            &mut encoder,
+            "s2s_bidi_negotiations",
+            "Authenticated S2S streams by bidirectional negotiation outcome.",
+            Direction::ALL.into_iter().flat_map(|direction| {
+                BidiOutcome::ALL.map(|outcome| {
+                    (
+                        [
+                            ("direction", direction.as_str()),
+                            ("outcome", outcome.as_str()),
+                        ],
+                        metrics.bidi_negotiations[direction as usize][outcome as usize]
                             .load(Ordering::Relaxed),
                     )
                 })
@@ -935,6 +1036,16 @@ impl Collector for S2sCollector {
                 "s2s_stanzas_sent",
                 "Stanzas written to outbound streams.",
                 &metrics.stanzas_sent,
+            ),
+            (
+                "s2s_bidi_stanzas_sent",
+                "Stanzas sent on inbound bidirectional streams.",
+                &metrics.bidi_stanzas_sent,
+            ),
+            (
+                "s2s_bidi_stanzas_received",
+                "Stanzas received on outbound bidirectional links.",
+                &metrics.bidi_stanzas_received,
             ),
         ] {
             encode_counter(
@@ -1014,6 +1125,17 @@ impl Collector for S2sCollector {
                 (
                     [("condition", value.as_str())],
                     metrics.bounces[value as usize].load(Ordering::Relaxed),
+                )
+            }),
+        )?;
+        encode_counter(
+            &mut encoder,
+            "s2s_bidi_handoffs",
+            "Outbound link queues moved to an inbound bidirectional stream or to a new dialed link.",
+            BidiHandoff::ALL.map(|target| {
+                (
+                    [("target", target.as_str())],
+                    metrics.bidi_handoffs[target as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;

@@ -119,6 +119,10 @@ const DROP_REASON_LABELS: [&str; 4] = [
     "internal_error",
 ];
 
+const BIDI_OUTCOME_LABELS: [&str; 3] = ["enabled", "not_offered", "not_requested"];
+
+const BIDI_HANDOFF_LABELS: [&str; 2] = ["inbound_stream", "dialed_link"];
+
 #[test]
 fn label_values_and_indexes_are_fixed() {
     for (index, value) in Direction::ALL.into_iter().enumerate() {
@@ -161,6 +165,14 @@ fn label_values_and_indexes_are_fixed() {
         assert_eq!(value as usize, index);
         assert_eq!(value.as_str(), DROP_REASON_LABELS[index]);
     }
+    for (index, value) in BidiOutcome::ALL.into_iter().enumerate() {
+        assert_eq!(value as usize, index);
+        assert_eq!(value.as_str(), BIDI_OUTCOME_LABELS[index]);
+    }
+    for (index, value) in BidiHandoff::ALL.into_iter().enumerate() {
+        assert_eq!(value as usize, index);
+        assert_eq!(value.as_str(), BIDI_HANDOFF_LABELS[index]);
+    }
     for (index, kind) in KINDS.into_iter().enumerate() {
         assert_eq!(kind_index(kind), index);
         assert_eq!(kind.as_str(), ["message", "presence", "iq"][index]);
@@ -172,6 +184,10 @@ fn record_all(metrics: &Arc<S2sMetrics>) -> Vec<ConnectionGauge> {
     for direction in Direction::ALL {
         guards.push(metrics.connection_opened(direction));
         guards.push(metrics.stream_opened(direction));
+        guards.push(metrics.bidi_stream_opened(direction));
+        for outcome in BidiOutcome::ALL {
+            metrics.bidi_negotiated(direction, outcome);
+        }
         for outcome in AuthOutcome::ALL {
             metrics.authentication(direction, outcome, Duration::from_millis(500));
         }
@@ -203,6 +219,11 @@ fn record_all(metrics: &Arc<S2sMetrics>) -> Vec<ConnectionGauge> {
     for kind in KINDS {
         metrics.stanza_received(kind);
         metrics.stanza_sent(kind);
+        metrics.bidi_stanza_sent(kind);
+        metrics.bidi_stanza_received(kind);
+    }
+    for target in BidiHandoff::ALL {
+        metrics.bidi_handoff(target);
     }
     for limit in InboundLimit::ALL {
         metrics.rate_limited(limit);
@@ -235,7 +256,7 @@ fn every_recorder_encodes_exact_samples() -> Result<(), fmt::Error> {
     let _guards = record_all(&metrics);
     let output = render(&metrics)?;
     for direction in DIRECTION_LABELS {
-        for name in ["connections", "streams"] {
+        for name in ["connections", "streams", "bidi_streams"] {
             assert_sample(
                 &output,
                 &format!("lonewolf_s2s_{name}{{direction=\"{direction}\"}} 1"),
@@ -256,6 +277,14 @@ fn every_recorder_encodes_exact_samples() -> Result<(), fmt::Error> {
                 &output,
                 &format!(
                     "lonewolf_s2s_authentications_total{{direction=\"{direction}\",outcome=\"{outcome}\"}} 1"
+                ),
+            );
+        }
+        for outcome in BIDI_OUTCOME_LABELS {
+            assert_sample(
+                &output,
+                &format!(
+                    "lonewolf_s2s_bidi_negotiations_total{{direction=\"{direction}\",outcome=\"{outcome}\"}} 1"
                 ),
             );
         }
@@ -317,12 +346,23 @@ fn every_recorder_encodes_exact_samples() -> Result<(), fmt::Error> {
         }
     }
     for kind in ["message", "presence", "iq"] {
-        for name in ["received", "sent"] {
+        for name in [
+            "stanzas_received",
+            "stanzas_sent",
+            "bidi_stanzas_sent",
+            "bidi_stanzas_received",
+        ] {
             assert_sample(
                 &output,
-                &format!("lonewolf_s2s_stanzas_{name}_total{{kind=\"{kind}\"}} 1"),
+                &format!("lonewolf_s2s_{name}_total{{kind=\"{kind}\"}} 1"),
             );
         }
+    }
+    for target in BIDI_HANDOFF_LABELS {
+        assert_sample(
+            &output,
+            &format!("lonewolf_s2s_bidi_handoffs_total{{target=\"{target}\"}} 1"),
+        );
     }
     for value in INBOUND_LIMIT_LABELS {
         assert_sample(
@@ -373,7 +413,7 @@ fn untouched_counter_families_are_omitted() -> Result<(), fmt::Error> {
     );
     assert!(!output.contains("outcome=\"fallback\""));
     for direction in DIRECTION_LABELS {
-        for name in ["connections", "streams"] {
+        for name in ["connections", "streams", "bidi_streams"] {
             assert_sample(
                 &output,
                 &format!("lonewolf_s2s_{name}{{direction=\"{direction}\"}} 0"),
@@ -392,6 +432,8 @@ fn guards_release_connection_and_stream_counts_on_cancellation() -> Result<(), f
         let _outbound = task_metrics.connection_opened(Direction::Outbound);
         let _inbound_stream = task_metrics.stream_opened(Direction::Inbound);
         let _outbound_stream = task_metrics.stream_opened(Direction::Outbound);
+        let _inbound_bidi = task_metrics.bidi_stream_opened(Direction::Inbound);
+        let _outbound_bidi = task_metrics.bidi_stream_opened(Direction::Outbound);
         std::future::pending::<()>().await;
     });
     assert_eq!(
@@ -402,7 +444,7 @@ fn guards_release_connection_and_stream_counts_on_cancellation() -> Result<(), f
     );
     let output = render(&metrics)?;
     for direction in DIRECTION_LABELS {
-        for name in ["connections", "streams"] {
+        for name in ["connections", "streams", "bidi_streams"] {
             assert_sample(
                 &output,
                 &format!("lonewolf_s2s_{name}{{direction=\"{direction}\"}} 1"),
@@ -412,7 +454,7 @@ fn guards_release_connection_and_stream_counts_on_cancellation() -> Result<(), f
     drop(future);
     let output = render(&metrics)?;
     for direction in DIRECTION_LABELS {
-        for name in ["connections", "streams"] {
+        for name in ["connections", "streams", "bidi_streams"] {
             assert_sample(
                 &output,
                 &format!("lonewolf_s2s_{name}{{direction=\"{direction}\"}} 0"),
@@ -501,6 +543,7 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
         let expected: &[&str] = match name {
             "lonewolf_s2s_connections"
             | "lonewolf_s2s_streams"
+            | "lonewolf_s2s_bidi_streams"
             | "lonewolf_s2s_received_bytes_total"
             | "lonewolf_s2s_sent_bytes_total"
             | "lonewolf_s2s_negotiation_duration_seconds_count"
@@ -514,20 +557,24 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             | "lonewolf_s2s_crl_cache_bytes" => &[],
             "lonewolf_s2s_connections_accepted_total" => &["listener"],
             "lonewolf_s2s_connections_rejected_total" => &["listener", "reason"],
-            "lonewolf_s2s_authentications_total" | "lonewolf_s2s_streams_closed_total" => {
-                &["direction", "outcome"]
-            }
+            "lonewolf_s2s_authentications_total"
+            | "lonewolf_s2s_streams_closed_total"
+            | "lonewolf_s2s_bidi_negotiations_total" => &["direction", "outcome"],
             "lonewolf_s2s_revocation_checks_total" => {
                 &["direction", "source", "phase", "status", "reason"]
             }
             "lonewolf_s2s_negotiation_duration_seconds_bucket" => &["le", "direction"],
-            "lonewolf_s2s_stanzas_received_total" | "lonewolf_s2s_stanzas_sent_total" => &["kind"],
+            "lonewolf_s2s_stanzas_received_total"
+            | "lonewolf_s2s_stanzas_sent_total"
+            | "lonewolf_s2s_bidi_stanzas_sent_total"
+            | "lonewolf_s2s_bidi_stanzas_received_total" => &["kind"],
             "lonewolf_s2s_rate_limited_total" => &["limit"],
             "lonewolf_s2s_dns_resolutions_total" => &["outcome"],
             "lonewolf_s2s_admission_rejections_total" | "lonewolf_s2s_dropped_stanzas_total" => {
                 &["reason"]
             }
             "lonewolf_s2s_bounces_total" => &["condition"],
+            "lonewolf_s2s_bidi_handoffs_total" => &["target"],
             "lonewolf_s2s_outbound_links" => &["state"],
             "lonewolf_s2s_outbound_queued_stanzas" | "lonewolf_s2s_outbound_queued_bytes" => &[],
             _ => panic!("unexpected sample: {line}"),
@@ -540,7 +587,7 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             .collect::<Result<_, _>>()?;
         assert_eq!(actual, expected, "{line}");
     }
-    assert_eq!(families.len(), 29);
+    assert_eq!(families.len(), 34);
     Ok(())
 }
 

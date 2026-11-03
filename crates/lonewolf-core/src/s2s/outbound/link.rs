@@ -385,12 +385,9 @@ where
 pub(super) async fn run<A: ChunkAllocator + Clone>(
     inner: Arc<Inner<A>>,
     router: RouterHandle<A>,
-    pair: Pair,
-    counters: Arc<QueueCounters>,
-    receiver: QueueReceiver<A>,
+    mut queue: LinkQueue<A>,
     mut failures: u32,
 ) {
-    let mut current = None;
     loop {
         if inner.state.lock().stopped {
             break;
@@ -405,7 +402,12 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         };
         let result = stopping(
             inner.stopped.clone(),
-            connect::establish(&pair.0, &pair.1, &context, inner.allocator.clone()),
+            connect::establish(
+                &queue.pair.0,
+                &queue.pair.1,
+                &context,
+                inner.allocator.clone(),
+            ),
         )
         .await;
         let mut stream = match result {
@@ -418,8 +420,8 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
                     _ => RemoteFailure::Timeout,
                 };
                 if !inner.failed(
-                    &pair,
-                    &counters,
+                    &queue.pair,
+                    &queue.counters,
                     failures,
                     condition,
                     Instant::now(),
@@ -427,8 +429,12 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
                 ) {
                     break;
                 }
-                receiver.close();
-                while let Some(queued) = current.take().or_else(|| receiver.try_recv().ok()) {
+                queue.receiver.close();
+                while let Some(queued) = queue
+                    .current
+                    .take()
+                    .or_else(|| queue.receiver.try_recv().ok())
+                {
                     let stanza = queued.into_stanza();
                     if stopping(
                         inner.stopped.clone(),
@@ -469,7 +475,7 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
             }
             _ => (LinkValidity::fixed(stream.valid_until), None),
         };
-        ready(&counters, &mut failures);
+        ready(&queue.counters, &mut failures);
         let gauge = inner.metrics.stream_opened(Direction::Outbound);
         connected(
             &inner,
@@ -481,32 +487,29 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
                 log: MonitorLog {
                     direction: Direction::Outbound,
                     connection_id: stream.connection_id,
-                    local: &pair.0,
-                    remote: &pair.1,
+                    local: &queue.pair.0,
+                    remote: &queue.pair.1,
                 },
             },
-            &receiver,
-            &mut current,
+            &queue.receiver,
+            &mut queue.current,
         )
         .await;
         drop(stream);
         drop(gauge);
-        counters.ready.store(false, Ordering::Relaxed);
+        queue.counters.ready.store(false, Ordering::Relaxed);
         let mut state = inner.state.lock();
-        if state.stopped
-            || (receiver.is_empty() && current.is_none())
-            || !state.owns(&pair, &counters)
-        {
-            if state.owns(&pair, &counters) {
-                state.entries.remove(&pair);
+        if state.stopped || queue.is_drained() || !state.owns(&queue.pair, &queue.counters) {
+            if state.owns(&queue.pair, &queue.counters) {
+                state.entries.remove(&queue.pair);
             }
             break;
         }
         drop(state);
     }
-    receiver.close();
-    shutdown_queue(&inner, &receiver, &pair, &mut current);
-    inner.remove(&pair, &counters);
+    queue.receiver.close();
+    shutdown_queue(&inner, &queue.receiver, &queue.pair, &mut queue.current);
+    inner.remove(&queue.pair, &queue.counters);
 }
 
 fn shutdown_queue<A: ChunkAllocator>(
@@ -612,8 +615,8 @@ mod tests {
                     .map_err(|error| format!("{error:?}"))?
                     .is_none()
             );
-            let mut current = task.receiver.recv().await?;
-            assert_eq!(task.counters.count.load(Ordering::Relaxed), 2);
+            let mut current = task.queue.receiver.recv().await?;
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 2);
             let calls = Arc::new(PlMutex::new(Calls::default()));
             let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
             let expiry = rcgen::CertificateParams::default().not_after;
@@ -643,10 +646,15 @@ mod tests {
             assert_eq!(calls.lock().writes, writes);
             assert_eq!(calls.lock().flushes, 0);
             assert_eq!(calls.lock().closes, 0);
-            assert_eq!(task.counters.count.load(Ordering::Relaxed), 1);
-            shutdown_queue(&manager.inner, &task.receiver, &task.pair, &mut None);
-            assert_eq!(task.counters.count.load(Ordering::Relaxed), 0);
-            assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 1);
+            shutdown_queue(
+                &manager.inner,
+                &task.queue.receiver,
+                &task.queue.pair,
+                &mut None,
+            );
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+            assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
             assert!(
                 render(&manager.inner.metrics)?
                     .contains("s2s_dropped_stanzas_total{reason=\"shutdown\"} 1")
@@ -670,7 +678,7 @@ mod tests {
                 .admit("localhost", "remote.test", message().await?)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or("launch")?;
-            let mut source = task.receiver.recv().await?;
+            let mut source = task.queue.receiver.recv().await?;
             let mut buffered = false;
             {
                 let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
@@ -722,7 +730,7 @@ mod tests {
                 manager
                     .admit("localhost", "remote.test", message().await?)
                     .map_err(|error| format!("{error:?}"))?;
-                let mut current = Some(task.receiver.recv().await?);
+                let mut current = Some(task.queue.receiver.recv().await?);
                 let calls = Arc::new(PlMutex::new(Calls::default()));
                 let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
                 if stopped {
@@ -749,7 +757,7 @@ mod tests {
                 }
                 assert_eq!(calls.lock().writes, 0);
                 assert!(current.as_ref().ok_or("head")?.reservation.is_some());
-                assert_eq!(task.counters.count.load(Ordering::Relaxed), 2);
+                assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 2);
                 assert!(
                     !render(&manager.inner.metrics)?
                         .contains("s2s_dropped_stanzas_total{reason=\"connection_lost\"} 1")
@@ -759,9 +767,14 @@ mod tests {
                         .contains("s2s_stanzas_sent_total{kind=\"message\"} 1")
                 );
                 manager.stop();
-                shutdown_queue(&manager.inner, &task.receiver, &task.pair, &mut current);
-                assert_eq!(task.counters.count.load(Ordering::Relaxed), 0);
-                assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+                shutdown_queue(
+                    &manager.inner,
+                    &task.queue.receiver,
+                    &task.queue.pair,
+                    &mut current,
+                );
+                assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+                assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
                 assert!(
                     render(&manager.inner.metrics)?
                         .contains("s2s_dropped_stanzas_total{reason=\"shutdown\"} 2")
@@ -842,7 +855,7 @@ mod tests {
             let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
             let mut buffered = false;
             let valid = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
-            let mut head = task.receiver.recv().await?;
+            let mut head = task.queue.receiver.recv().await?;
             allocator.exhausted.store(true, Ordering::Relaxed);
             assert!(matches!(
                 write(
@@ -858,11 +871,11 @@ mod tests {
             ));
             assert!(head.reservation.is_none());
             assert_eq!(calls.lock().writes, 0);
-            assert_eq!(task.counters.count.load(Ordering::Relaxed), 2);
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 2);
             drop(head);
             allocator.exhausted.store(false, Ordering::Relaxed);
             for id in ["first-tail", "second-tail"] {
-                let mut queued = task.receiver.recv().await?;
+                let mut queued = task.queue.receiver.recv().await?;
                 assert_eq!(queued.stanza.resolve()?.id()?, Some(id));
                 assert!(matches!(
                     write(
@@ -870,16 +883,16 @@ mod tests {
                         &mut queued,
                         &manager.inner,
                         &valid,
-                        task.receiver.is_empty(),
+                        task.queue.receiver.is_empty(),
                         &mut buffered
                     )
                     .await,
                     Ok(WriteOutcome::Written(_))
                 ));
             }
-            assert!(task.receiver.is_empty());
-            assert_eq!(task.counters.count.load(Ordering::Relaxed), 0);
-            assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+            assert!(task.queue.receiver.is_empty());
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+            assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
             assert_eq!(allocator.live.load(Ordering::Relaxed), 0);
             {
                 let calls = calls.lock();
@@ -898,7 +911,13 @@ mod tests {
                 )));
             }
             assert!(!output.contains("s2s_streams_closed_total{"));
-            assert!(manager.inner.state.lock().owns(&task.pair, &task.counters));
+            assert!(
+                manager
+                    .inner
+                    .state
+                    .lock()
+                    .owns(&task.queue.pair, &task.queue.counters)
+            );
             drop(task);
             manager
                 .join(Instant::now() + Duration::from_secs(5))
@@ -938,7 +957,7 @@ mod tests {
             let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
             let mut buffered = false;
             let valid = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
-            let mut first = task.receiver.recv().await?;
+            let mut first = task.queue.receiver.recv().await?;
             assert!(matches!(
                 write(
                     &mut writer,
@@ -954,7 +973,7 @@ mod tests {
             drop(first);
             assert!(buffered);
             assert_eq!(calls.lock().writes, 0);
-            let mut last = task.receiver.recv().await?;
+            let mut last = task.queue.receiver.recv().await?;
             allocator.exhausted.store(true, Ordering::Relaxed);
             assert!(matches!(
                 write(
@@ -970,8 +989,8 @@ mod tests {
             ));
             drop(last);
             assert!(!buffered);
-            assert_eq!(task.counters.count.load(Ordering::Relaxed), 0);
-            assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+            assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
             assert_eq!(allocator.live.load(Ordering::Relaxed), 0);
             {
                 let calls = calls.lock();
@@ -1018,7 +1037,7 @@ mod tests {
                         controlled_stanza("tail", allocator.clone()).await?,
                     )
                     .map_err(|error| format!("{error:?}"))?;
-                let mut current = Some(task.receiver.recv().await?);
+                let mut current = Some(task.queue.receiver.recv().await?);
                 let calls = Arc::new(PlMutex::new(Calls::default()));
                 let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
                 let mut buffered = false;
@@ -1048,7 +1067,12 @@ mod tests {
                     current = None;
                 }
                 manager.stop();
-                shutdown_queue(&manager.inner, &task.receiver, &task.pair, &mut current);
+                shutdown_queue(
+                    &manager.inner,
+                    &task.queue.receiver,
+                    &task.queue.pair,
+                    &mut current,
+                );
                 let output = render(&manager.inner.metrics)?;
                 let committed = !stopped_first && !expired;
                 let shutdown = if committed { 1 } else { 2 };
@@ -1063,8 +1087,8 @@ mod tests {
                     !output.contains("s2s_dropped_stanzas_total{reason=\"connection_lost\"} 1")
                 );
                 assert_eq!(calls.lock().writes, 0);
-                assert_eq!(task.counters.count.load(Ordering::Relaxed), 0);
-                assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+                assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+                assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
                 assert_eq!(allocator.live.load(Ordering::Relaxed), 0);
                 drop(task);
                 manager
@@ -1100,11 +1124,11 @@ mod tests {
                         .admit("localhost", "remote.test", message().await?)
                         .map_err(|error| format!("{error:?}"))?;
                     let mut current = if retained {
-                        Some(task.receiver.recv().await?)
+                        Some(task.queue.receiver.recv().await?)
                     } else {
                         None
                     };
-                    let queued_bytes = task.counters.bytes.load(Ordering::Relaxed);
+                    let queued_bytes = task.queue.counters.bytes.load(Ordering::Relaxed);
                     let xml = format!(
                         "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0'>{event}"
                     );
@@ -1136,15 +1160,18 @@ mod tests {
                         &mut reader,
                         &mut writer,
                         &LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60)),
-                        &task.receiver,
+                        &task.queue.receiver,
                         &mut current,
                     )
                     .await;
                     assert_eq!(closed.reason.as_str(), expected.as_str());
                     assert_eq!(calls.lock().writes, 0);
                     assert_eq!(calls.lock().flushes, 0);
-                    assert_eq!(task.counters.count.load(Ordering::Relaxed), 2);
-                    assert_eq!(task.counters.bytes.load(Ordering::Relaxed), queued_bytes);
+                    assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 2);
+                    assert_eq!(
+                        task.queue.counters.bytes.load(Ordering::Relaxed),
+                        queued_bytes
+                    );
                     assert_eq!(current.is_some(), retained);
                     assert!(
                         !render(&manager.inner.metrics)?
@@ -1298,11 +1325,11 @@ mod tests {
         }
         run(async {
             let manager = manager(S2sLimits::default())?;
-            let task = manager
+            let mut task = manager
                 .admit("localhost", "remote.test", message().await?)
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or("launch")?;
-            drop(task.receiver.recv().await?);
+            drop(task.queue.receiver.recv().await?);
             let peer_ready = Rc::new(Cell::new(false));
             let mut reader = S2sReader::new(
                 tokio::io::BufReader::new(PeerInput {
@@ -1356,7 +1383,6 @@ mod tests {
                 Duration::from_secs(60),
                 revalidate,
             );
-            let mut current = None;
             let mut serving = Box::pin(connected(
                 &manager.inner,
                 &mut reader,
@@ -1371,8 +1397,8 @@ mod tests {
                         remote: "remote.test",
                     },
                 },
-                &task.receiver,
-                &mut current,
+                &task.queue.receiver,
+                &mut task.queue.current,
             ));
             assert!(poll!(serving.as_mut()).is_pending());
             assert!(matches!(
@@ -1386,9 +1412,9 @@ mod tests {
                     .is_none()
             );
             assert!(matches!(serving.await, StreamClose::CertificateRevoked));
-            assert!(current.is_none());
-            assert_eq!(task.receiver.len(), 1);
-            assert_eq!(task.counters.count.load(Ordering::Relaxed), 1);
+            assert!(task.queue.current.is_none());
+            assert_eq!(task.queue.receiver.len(), 1);
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 1);
             let xml = std::str::from_utf8(&calls.lock().output)?.to_owned();
             assert!(xml.contains("reset"));
             assert_eq!(xml.matches("</stream:stream>").count(), 1);
@@ -1403,7 +1429,12 @@ mod tests {
             assert!(metrics.lines().any(|line| line == "lonewolf_s2s_streams_closed_total{direction=\"outbound\",outcome=\"certificate_revoked\"} 1"));
             assert!(!metrics.contains("s2s_dropped_stanzas_total{reason=\"connection_lost\"}"));
             manager.stop();
-            shutdown_queue(&manager.inner, &task.receiver, &task.pair, &mut current);
+            shutdown_queue(
+                &manager.inner,
+                &task.queue.receiver,
+                &task.queue.pair,
+                &mut task.queue.current,
+            );
             drop(task);
             manager
                 .join(Instant::now() + Duration::from_secs(5))
@@ -1433,7 +1464,7 @@ mod tests {
                     )
                     .map_err(|error| format!("{error:?}"))?
                     .ok_or("launch")?;
-                let mut head = task.receiver.recv().await?;
+                let mut head = task.queue.receiver.recv().await?;
                 let token = Arc::new(());
                 let initial = RevocationVerdict {
                     source: RevocationSource::File,
@@ -1503,13 +1534,18 @@ mod tests {
                 ));
                 assert_eq!(Arc::strong_count(&token), 1);
                 assert!(head.reservation.is_some());
-                assert_eq!(task.counters.count.load(Ordering::Relaxed), 1);
+                assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 1);
                 assert_eq!(calls.lock().writes, 0);
                 let metrics = render(&manager.inner.metrics)?;
                 assert!(!metrics.contains("s2s_dropped_stanzas_total{reason=\"connection_lost\"}"));
                 assert!(!metrics.contains("s2s_dropped_stanzas_total{reason=\"internal_error\"}"));
                 manager.stop();
-                shutdown_queue(&manager.inner, &task.receiver, &task.pair, &mut Some(head));
+                shutdown_queue(
+                    &manager.inner,
+                    &task.queue.receiver,
+                    &task.queue.pair,
+                    &mut Some(head),
+                );
                 drop(task);
                 manager
                     .join(Instant::now() + Duration::from_secs(5))

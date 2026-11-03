@@ -104,10 +104,21 @@ struct Inner<A: ChunkAllocator> {
 
 struct Launch<A: ChunkAllocator> {
     guard: WorkGuard,
+    queue: LinkQueue<A>,
+    failures: u32,
+}
+
+pub(crate) struct LinkQueue<A: ChunkAllocator> {
     pair: Pair,
     counters: Arc<QueueCounters>,
     receiver: QueueReceiver<A>,
-    failures: u32,
+    current: Option<Queued<A>>,
+}
+
+impl<A: ChunkAllocator> LinkQueue<A> {
+    fn is_drained(&self) -> bool {
+        self.receiver.is_empty() && self.current.is_none()
+    }
 }
 
 struct State<A: ChunkAllocator> {
@@ -332,14 +343,10 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         };
         let inner = Arc::clone(&self.inner);
         let router = router.clone();
-        compio::runtime::spawn(task.guard.run(link::run(
-            inner,
-            router,
-            task.pair,
-            task.counters,
-            task.receiver,
-            task.failures,
-        )))
+        compio::runtime::spawn(
+            task.guard
+                .run(link::run(inner, router, task.queue, task.failures)),
+        )
         .detach();
         Ok(())
     }
@@ -410,9 +417,12 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         let guard = self.inner.work.start();
         Ok(Some(Launch {
             guard,
-            pair,
-            counters,
-            receiver: QueueReceiver(receiver),
+            queue: LinkQueue {
+                pair,
+                counters,
+                receiver: QueueReceiver(receiver),
+                current: None,
+            },
             failures,
         }))
     }

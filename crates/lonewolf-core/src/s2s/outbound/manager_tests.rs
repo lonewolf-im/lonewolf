@@ -124,11 +124,11 @@ fn count_and_byte_refusals_release_only_their_own_reservations() -> TestResult {
             manager.admit("localhost", "remote.test", message.clone()),
             Err(RemoteError::Busy)
         ));
-        assert_eq!(task.counters.count.load(Ordering::Relaxed), 1);
-        assert_eq!(task.counters.bytes.load(Ordering::Relaxed), bytes);
-        drop(task.receiver.recv().await?.into_stanza());
-        assert_eq!(task.counters.count.load(Ordering::Relaxed), 0);
-        assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 1);
+        assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), bytes);
+        drop(task.queue.receiver.recv().await?.into_stanza());
+        assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+        assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
         assert!(
             manager
                 .admit("localhost", "remote.test", message.clone())
@@ -139,14 +139,14 @@ fn count_and_byte_refusals_release_only_their_own_reservations() -> TestResult {
             render(&manager.inner.metrics)?
                 .contains("s2s_admission_rejections_total{reason=\"queue_full\"} 1")
         );
-        drop(task.receiver);
-        assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+        drop(task.queue.receiver);
+        assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
         assert!(matches!(
             manager.admit("localhost", "remote.test", message.clone()),
             Err(RemoteError::Busy)
         ));
-        assert_eq!(task.counters.count.load(Ordering::Relaxed), 0);
-        assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+        assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
         drop(task.guard);
         manager.join(Instant::now() + TIMEOUT).await?;
         limits.max_queued_stanzas_per_link = NonZeroUsize::new(2).ok_or("count")?;
@@ -160,15 +160,18 @@ fn count_and_byte_refusals_release_only_their_own_reservations() -> TestResult {
             manager.admit("localhost", "remote.test", message.clone()),
             Err(RemoteError::Busy)
         ));
-        assert_eq!(task.counters.bytes.load(Ordering::Relaxed), bytes);
-        task.counters.bytes.store(usize::MAX, Ordering::Relaxed);
+        assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), bytes);
+        task.queue
+            .counters
+            .bytes
+            .store(usize::MAX, Ordering::Relaxed);
         assert!(matches!(
             manager.admit("localhost", "remote.test", message),
             Err(RemoteError::Busy)
         ));
-        task.counters.bytes.store(bytes, Ordering::Relaxed);
-        drop(task.receiver);
-        assert_eq!(task.counters.bytes.load(Ordering::Relaxed), 0);
+        task.queue.counters.bytes.store(bytes, Ordering::Relaxed);
+        drop(task.queue.receiver);
+        assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
         drop(task.guard);
         manager.join(Instant::now() + TIMEOUT).await?;
         Ok(())
@@ -240,7 +243,7 @@ fn retained_pairs_enforce_cached_precedence_and_expired_only_eviction() -> TestR
                 .map_err(|error| format!("{error:?}"))?
                 .is_none()
         );
-        drop(live.receiver);
+        drop(live.queue.receiver);
         drop(live.guard);
         manager.join(Instant::now() + TIMEOUT).await?;
         assert!(
@@ -266,8 +269,8 @@ fn failure_retention_identity_and_expired_retry_use_one_slot() -> TestResult {
             .ok_or("launch")?;
         let now = Instant::now();
         assert!(manager.inner.failed(
-            &first.pair,
-            &first.counters,
+            &first.queue.pair,
+            &first.queue.counters,
             u32::MAX,
             RemoteFailure::Timeout,
             now,
@@ -279,7 +282,7 @@ fn failure_retention_identity_and_expired_retry_use_one_slot() -> TestResult {
         ));
         {
             let mut state = manager.inner.state.lock();
-            if let Some(Entry::Backoff { delay, .. }) = state.entries.get_mut(&first.pair) {
+            if let Some(Entry::Backoff { delay, .. }) = state.entries.get_mut(&first.queue.pair) {
                 *delay = Duration::ZERO;
             }
         }
@@ -289,10 +292,12 @@ fn failure_retention_identity_and_expired_retry_use_one_slot() -> TestResult {
             .ok_or("retry")?;
         assert_eq!(second.failures, u32::MAX);
         assert_eq!(manager.inner.state.lock().entries.len(), 1);
-        manager.inner.remove(&first.pair, &first.counters);
+        manager
+            .inner
+            .remove(&first.queue.pair, &first.queue.counters);
         assert!(!manager.inner.failed(
-            &first.pair,
-            &first.counters,
+            &first.queue.pair,
+            &first.queue.counters,
             0,
             RemoteFailure::NotFound,
             now,
@@ -303,18 +308,18 @@ fn failure_retention_identity_and_expired_retry_use_one_slot() -> TestResult {
                 .inner
                 .state
                 .lock()
-                .owns(&second.pair, &second.counters)
+                .owns(&second.queue.pair, &second.queue.counters)
         );
         assert!(manager.inner.failed(
-            &second.pair,
-            &second.counters,
+            &second.queue.pair,
+            &second.queue.counters,
             0,
             RemoteFailure::NotFound,
             now,
             1000
         ));
         assert!(matches!(
-            manager.inner.state.lock().entries.get(&second.pair),
+            manager.inner.state.lock().entries.get(&second.queue.pair),
             Some(Entry::Backoff { failures: 1, .. })
         ));
         drop(first);
@@ -421,12 +426,12 @@ fn registered_catalog_observes_persistent_queue_link_and_failure_state() -> Test
         );
         assert!(render(&clone.inner.metrics)?.contains("s2s_outbound_queued_stanzas 1"));
         let mut failures = 9;
-        ready(&task.counters, &mut failures);
+        ready(&task.queue.counters, &mut failures);
         assert_eq!(failures, 0);
         assert!(render(&clone.inner.metrics)?.contains("s2s_outbound_links{state=\"ready\"} 1"));
         assert!(clone.inner.failed(
-            &task.pair,
-            &task.counters,
+            &task.queue.pair,
+            &task.queue.counters,
             0,
             RemoteFailure::Timeout,
             Instant::now(),

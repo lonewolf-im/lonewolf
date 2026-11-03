@@ -729,7 +729,6 @@ impl S2sMetrics {
         self.bidi_stanzas_received[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn bidi_handoff(&self, target: BidiHandoff) {
         self.bidi_handoffs[target as usize].fetch_add(1, Ordering::Relaxed);
     }

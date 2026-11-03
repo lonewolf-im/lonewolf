@@ -44,6 +44,7 @@ pub(super) fn manager_with_allocator<A: ChunkAllocator + Clone>(
         &limits,
         allocator,
         S2sMetrics::new(0),
+        None,
     ))
 }
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_channel::{Receiver, Sender};
@@ -14,6 +14,7 @@ use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Either, Shared, select};
 use futures_util::io::{ReadHalf, WriteHalf};
+use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::RoutedStanza;
 use parking_lot::Mutex as PlMutex;
@@ -34,7 +35,9 @@ use crate::delivery::{WorkGroup, WorkGuard, WorkHandle};
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 use crate::router::RouterHandle;
 
+mod bidi;
 pub(crate) mod connect;
+pub(crate) use bidi::BidiRegistration;
 
 type ClientTlsTransport =
     CountingIo<futures_rustls::client::TlsStream<Pin<Box<AsyncStream<TcpStream>>>>>;
@@ -52,6 +55,8 @@ pub(crate) struct OutboundStream<A: ChunkAllocator> {
     _connection_gauge: ConnectionGauge,
 }
 
+#[cfg(test)]
+mod bidi_tests;
 mod bounce;
 mod link;
 #[cfg(test)]
@@ -80,6 +85,12 @@ pub(crate) struct RemoteRouter<A: ChunkAllocator> {
     inner: Arc<Inner<A>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct BidiIngress {
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) storage: RedbStorage,
+}
+
 impl<A: ChunkAllocator> Clone for RemoteRouter<A> {
     fn clone(&self) -> Self {
         Self {
@@ -96,6 +107,8 @@ struct Inner<A: ChunkAllocator> {
     limits: S2sLimits,
     allocator: A,
     metrics: Arc<S2sMetrics>,
+    bidi: Option<BidiIngress>,
+    next_standby: AtomicU64,
     state: PlMutex<State<A>>,
     work: WorkHandle,
     group: async_lock::Mutex<WorkGroup>,
@@ -123,8 +136,14 @@ impl<A: ChunkAllocator> LinkQueue<A> {
 
 struct State<A: ChunkAllocator> {
     entries: HashMap<Pair, Entry<A>>,
+    standby: HashMap<Pair, Vec<Standby<A>>>,
     stopped: bool,
     stop: Option<oneshot::Sender<()>>,
+}
+
+struct Standby<A: ChunkAllocator> {
+    id: u64,
+    sender: Sender<LinkQueue<A>>,
 }
 
 enum Entry<A: ChunkAllocator> {
@@ -301,6 +320,7 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         limits: &S2sLimits,
         allocator: A,
         metrics: Arc<S2sMetrics>,
+        bidi: Option<BidiIngress>,
     ) -> Self {
         let group = WorkGroup::new();
         let work = group.handle();
@@ -313,8 +333,11 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
             limits: limits.clone(),
             allocator,
             metrics,
+            bidi,
+            next_standby: AtomicU64::new(0),
             state: PlMutex::new(State {
                 entries: HashMap::new(),
+                standby: HashMap::new(),
                 stopped: false,
                 stop: Some(stop),
             }),
@@ -329,6 +352,10 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         let source: Arc<dyn LinkStats> = inner.clone();
         inner.metrics.set_link_source(Arc::downgrade(&source));
         Self { inner }
+    }
+
+    pub(crate) fn bidirectional(&self) -> bool {
+        self.inner.bidi.is_some()
     }
 
     pub(crate) fn route(
@@ -430,6 +457,7 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
     pub(crate) fn stop(&self) {
         let mut state = self.inner.state.lock();
         state.stopped = true;
+        state.standby.clear();
         state
             .entries
             .retain(|_, entry| matches!(entry, Entry::Link(_)));

@@ -392,6 +392,10 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         if inner.state.lock().stopped {
             break;
         }
+        queue = match inner.offer_standby(queue) {
+            Ok(()) => return,
+            Err(queue) => queue,
+        };
         let context = connect::ConnectContext {
             hosts: &inner.hosts,
             trust: &inner.trust,
@@ -413,6 +417,10 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
         let mut stream = match result {
             None => break,
             Some(Err(error)) => {
+                queue = match inner.offer_standby(queue) {
+                    Ok(()) => return,
+                    Err(queue) => queue,
+                };
                 let condition = match error.condition() {
                     lonewolf_xmpp::stanza::StanzaErrorCondition::RemoteServerNotFound => {
                         RemoteFailure::NotFound
@@ -512,7 +520,7 @@ pub(super) async fn run<A: ChunkAllocator + Clone>(
     inner.remove(&queue.pair, &queue.counters);
 }
 
-fn shutdown_queue<A: ChunkAllocator>(
+pub(super) fn shutdown_queue<A: ChunkAllocator>(
     inner: &Inner<A>,
     receiver: &Receiver<Queued<A>>,
     pair: &Pair,

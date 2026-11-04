@@ -66,8 +66,8 @@ fn strict_options_defaults_boundaries_and_host_quota_isolation() -> TestResult {
 fn builtin_independent_selection_and_exact_route_constraint_and_discovery_inventory() -> TestResult
 {
     let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
-    let factories = crate::builtin();
-    assert_eq!(factories.len(), 6);
+    let factories = crate::builtin(env!("CARGO_PKG_VERSION"));
+    assert_eq!(factories.len(), 7);
     assert_eq!(
         factories
             .iter()
@@ -147,7 +147,7 @@ fn builtin_independent_selection_and_exact_route_constraint_and_discovery_invent
 
 fn configured_handler(domain: &str, kind: IqRequestType) -> TestResult<Arc<TestHandler>> {
     let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
-    for factory in crate::builtin() {
+    for factory in crate::builtin(env!("CARGO_PKG_VERSION")) {
         catalog.register_factory(factory)?;
     }
     let names = ["disco".into(), "vcard".into()];

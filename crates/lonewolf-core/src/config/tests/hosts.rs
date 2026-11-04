@@ -198,7 +198,7 @@ fn extension_option_tables_are_kept_per_host() -> TestResult {
 
 fn builtin_catalog() -> Result<Extensions<GlobalChunkAllocator, RedbStorage>, RegistrationError> {
     let mut catalog = Extensions::default();
-    for factory in lonewolf_extension::builtin() {
+    for factory in lonewolf_extension::builtin(env!("CARGO_PKG_VERSION")) {
         catalog.register_factory(factory)?;
     }
     Ok(catalog)

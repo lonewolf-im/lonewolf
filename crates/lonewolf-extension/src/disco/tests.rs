@@ -118,7 +118,7 @@ fn server_queries_for_any_node_are_item_not_found() -> TestResult {
 #[test]
 fn disco_registers_routes_identities_and_features() -> TestResult {
     let mut extensions = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
-    for factory in crate::builtin() {
+    for factory in crate::builtin(env!("CARGO_PKG_VERSION")) {
         extensions.register_factory(factory)?;
     }
     let registry = extensions.enable_host("example.com", ["disco"])?;

@@ -343,7 +343,10 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for Shared<A, S> {
     }
 }
 
-pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, S>>; 6] {
+/// `server_version` is the release that software version replies report.
+pub fn builtin<A: ChunkAllocator, S: Storage>(
+    server_version: &'static str,
+) -> [Box<dyn ExtensionFactory<A, S>>; 7] {
     [
         Box::new(roster::RosterFactory),
         Box::new(vcard::VCardFactory),
@@ -351,6 +354,7 @@ pub fn builtin<A: ChunkAllocator, S: Storage>() -> [Box<dyn ExtensionFactory<A, 
         Box::new(Shared(Arc::new(disco::Disco))),
         Box::new(Shared(Arc::new(ping::Ping))),
         Box::new(Shared(Arc::new(carbons::Carbons))),
+        Box::new(version::VersionFactory::new(server_version)),
     ]
 }
 

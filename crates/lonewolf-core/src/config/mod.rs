@@ -240,6 +240,7 @@ impl Default for HostConfig {
                 lonewolf_extension::ping::NAME.into(),
                 lonewolf_extension::vcard::NAME.into(),
                 lonewolf_extension::carbons::NAME.into(),
+                lonewolf_extension::version::NAME.into(),
             ],
             federation: true,
             options: BTreeMap::new(),

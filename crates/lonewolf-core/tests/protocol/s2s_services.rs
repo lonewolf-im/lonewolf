@@ -26,9 +26,9 @@ const SERVICE: &str = "echo.local.test";
 const FOOTER: &str = "</stream:stream>";
 const STARTTLS: &str = "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 const PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
-const TLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
+const TLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls><limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>524288</max-bytes><idle-seconds>600</idle-seconds></limits></stream:features>";
 const EXTERNAL_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>";
-const EXTERNAL_BIDI_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>";
+const EXTERNAL_BIDI_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/><limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>524288</max-bytes><idle-seconds>600</idle-seconds></limits></stream:features>";
 type SendingPeer = XmlStream<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
 struct Signer {
@@ -218,7 +218,7 @@ fn authenticate(
     let mut peer = peer.restart();
     assert_eq!(peer.open_with(&header)?.attribute("from"), Some(SERVICE));
     peer.features()?
-        .assert_xml("<stream:features xmlns:stream='http://etherx.jabber.org/streams'/>")?;
+        .assert_xml("<stream:features xmlns:stream='http://etherx.jabber.org/streams'><limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>524288</max-bytes><idle-seconds>600</idle-seconds></limits></stream:features>")?;
     Ok(peer)
 }
 

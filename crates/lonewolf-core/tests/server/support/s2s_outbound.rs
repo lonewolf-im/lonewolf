@@ -131,9 +131,18 @@ pub fn start(fixture: &Fixture, endpoints: &[SocketAddr], extra: &str) -> Result
         .join(",");
     let (server, address) =
         fixture.server(&format!("[s2s.routes]\n'peer.test'=[{route}]\n{extra}"))?;
-    let (mut peer, _) = support::start_tls(address, fixture.client(Some("peer.test"), false)?)?;
-    support::external(&mut peer, support::HEADER)?;
-    support::success(&mut peer, support::AUTH)?;
+    let config =
+        lonewolf_core::config::Config::load(Some(&server.directory.path().join("lonewolf.toml")))?;
+    let maximum = config.limits.s2s.max_stanza_bytes.get().try_into()?;
+    let idle = config.limits.s2s.idle_timeout_secs.get().try_into()?;
+    let (mut peer, _) = support::start_tls_with_limits(
+        address,
+        fixture.client(Some("peer.test"), false)?,
+        maximum,
+        idle,
+    )?;
+    support::external_with_limits(&mut peer, support::HEADER, maximum, idle)?;
+    support::success_with_limits(&mut peer, support::AUTH, maximum, idle)?;
     Ok((server, peer))
 }
 

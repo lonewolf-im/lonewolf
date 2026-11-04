@@ -62,8 +62,19 @@ pub struct RawS2sPeer {
     stream: XmlStream<PeerTransport>,
     from: String,
     to: String,
+    local_max: u32,
+    local_idle: u32,
 }
 impl RawS2sPeer {
+    pub fn expecting_limits(mut self, max_bytes: u32, idle_seconds: u32) -> Self {
+        self.local_max = max_bytes;
+        self.local_idle = idle_seconds;
+        self
+    }
+    fn local_limits_xml(&self) -> String {
+        limits_xml(self.local_max, self.local_idle)
+    }
+
     pub fn connect(address: SocketAddr, from: &str, to: &str) -> TestResult<Self> {
         Self::connect_with_response_from(address, from, to, to)
     }
@@ -79,6 +90,8 @@ impl RawS2sPeer {
             stream: XmlStream::new(PeerTransport::Plain(socket)),
             from: from.into(),
             to: to.into(),
+            local_max: 524288,
+            local_idle: 600,
         };
         assert_header(
             &peer.stream.open_with(&opening(from, to))?,
@@ -88,8 +101,9 @@ impl RawS2sPeer {
         Ok(peer)
     }
     pub fn expect_starttls_features(&mut self) -> TestResult {
+        let limits = self.local_limits_xml();
         self.stream.features()?.assert_xml(&format!(
-            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><starttls xmlns='{TLS_NAMESPACE}'><required/></starttls></stream:features>"
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><starttls xmlns='{TLS_NAMESPACE}'><required/></starttls>{limits}</stream:features>"
         ))?;
         Ok(())
     }
@@ -127,15 +141,17 @@ impl RawS2sPeer {
         Ok(self)
     }
     pub fn expect_external_offered(&mut self) -> TestResult {
+        let limits = self.local_limits_xml();
         let features = self.stream.features()?;
         features.assert_xml(&format!(
-            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>"
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms>{limits}</stream:features>"
         ))?;
         Ok(())
     }
     pub fn expect_external_and_bidi_offered(&mut self) -> TestResult {
+        let limits = self.local_limits_xml();
         self.stream.features()?.assert_xml(&format!(
-            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>"
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/>{limits}</stream:features>"
         ))
     }
     pub fn request_bidi(&mut self) -> TestResult {
@@ -165,7 +181,10 @@ impl RawS2sPeer {
         self.stream = self.stream.restart();
         assert_header(&self.stream.open_with(&opening(from, to))?, to, from);
         let features = self.stream.features()?;
-        assert!(features.children.is_empty(), "{features:?}");
+        features.assert_xml(&format!(
+            "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>{}</stream:features>",
+            self.local_limits_xml()
+        ))?;
         Ok(self)
     }
     pub fn send(&mut self, xml: &str) -> TestResult {
@@ -228,11 +247,28 @@ impl RawS2sPeer {
 
 pub struct RawS2sListener {
     listener: TcpListener,
+    local_max: u32,
+    local_idle: u32,
+    advertisements: [String; 3],
 }
 impl RawS2sListener {
+    pub fn advertising(mut self, pre_tls: &str, post_tls: &str, post_sasl: &str) -> Self {
+        self.advertisements = [pre_tls.into(), post_tls.into(), post_sasl.into()];
+        self
+    }
+
+    pub fn expecting_limits(mut self, max_bytes: u32, idle_seconds: u32) -> Self {
+        self.local_max = max_bytes;
+        self.local_idle = idle_seconds;
+        self
+    }
+
     pub fn bind() -> TestResult<Self> {
         Ok(Self {
             listener: TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?,
+            local_max: 524288,
+            local_idle: 600,
+            advertisements: Default::default(),
         })
     }
     pub fn address(&self) -> TestResult<SocketAddr> {
@@ -272,7 +308,7 @@ impl RawS2sListener {
         let mut stream = XmlStream::new(PeerTransport::Plain(socket));
         let header = stream.open_with(&opening(from, to))?;
         assert_header(&header, to, from);
-        stream.send(&format!("<stream:features><starttls xmlns='{TLS_NAMESPACE}'><required/></starttls></stream:features>"))?;
+        stream.send(&format!("<stream:features><starttls xmlns='{TLS_NAMESPACE}'><required/></starttls>{}</stream:features>", self.advertisements[0]))?;
         stream.receive()?.assert_name(TLS_NAMESPACE, "starttls");
         stream.send(&format!("<proceed xmlns='{TLS_NAMESPACE}'/>"))?;
         assert!(!stream.has_buffered_input());
@@ -280,6 +316,8 @@ impl RawS2sListener {
             stream,
             from: from.into(),
             to: to.into(),
+            local_max: 524288,
+            local_idle: 600,
         })
     }
     pub fn accept(
@@ -326,10 +364,13 @@ impl RawS2sListener {
             } else {
                 ""
             };
-            stream.send(&format!("<stream:features><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms>{feature}</stream:features>"))?;
+            stream.send(&format!("<stream:features><mechanisms xmlns='{SASL_NAMESPACE}'><mechanism>EXTERNAL</mechanism></mechanisms>{feature}{}</stream:features>", self.advertisements[1]))?;
             let mut auth = stream.receive()?;
             if bidi && auth.name == "bidi" && auth.namespace == "urn:xmpp:bidi" {
-                auth.assert_xml("<bidi xmlns='urn:xmpp:bidi'/>")?;
+                auth.assert_xml(&format!(
+                    "<bidi xmlns='urn:xmpp:bidi'>{}</bidi>",
+                    limits_xml(self.local_max, self.local_idle)
+                ))?;
                 requested = true;
                 auth = stream.receive()?;
             }
@@ -338,7 +379,14 @@ impl RawS2sListener {
             stream.send(&format!("<success xmlns='{SASL_NAMESPACE}'/>"))?;
             stream = stream.restart();
             assert_header(&stream.open_with(&opening(from, to))?, to, from);
-            stream.send("<stream:features/>")?;
+            if self.advertisements[2].is_empty() {
+                stream.send("<stream:features/>")?;
+            } else {
+                stream.send(&format!(
+                    "<stream:features>{}</stream:features>",
+                    self.advertisements[2]
+                ))?;
+            }
         } else {
             stream.send("<stream:features/>")?;
         }
@@ -347,11 +395,19 @@ impl RawS2sListener {
                 stream,
                 from: from.into(),
                 to: to.into(),
+                local_max: 524288,
+                local_idle: 600,
             },
             requested,
         ))
     }
 }
+pub fn limits_xml(max_bytes: u32, idle_seconds: u32) -> String {
+    format!(
+        "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>{max_bytes}</max-bytes><idle-seconds>{idle_seconds}</idle-seconds></limits>"
+    )
+}
+
 fn opening(from: &str, to: &str) -> String {
     format!(
         "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' from='{from}' to='{to}'>"

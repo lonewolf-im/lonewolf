@@ -27,6 +27,7 @@ fn inbound_external_success_orders_elements_and_rotates_stream_ids() -> Result {
     let (mut server, address) = fixture.server("")?;
     let mut received = 0;
     let mut sent = 0;
+    let limits = "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>524288</max-bytes><idle-seconds>600</idle-seconds></limits>";
     for auth in [
         AUTH.to_owned(),
         format!(
@@ -41,7 +42,8 @@ fn inbound_external_success_orders_elements_and_rotates_stream_ids() -> Result {
         sent += second.len() + third.len() + FOOTER.len()
             + "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>".len()
             + "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>".len()
-            + "<stream:features/>".len();
+            + "<stream:features></stream:features>".len()
+            + 2 * limits.len();
         assert_ne!(id(&first)?, id(&second)?);
         assert_ne!(id(&second)?, id(&third)?);
         assert_ne!(id(&first)?, id(&third)?);

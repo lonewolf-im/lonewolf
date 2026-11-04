@@ -24,6 +24,7 @@ use crate::s2s::log_domain;
 use crate::s2s::metrics::{Direction, S2sMetrics, StreamClose};
 use crate::s2s::outbound::duplex::{self, DuplexEnd, DuplexParameters};
 use crate::s2s::revocation::CheckPhase;
+use crate::s2s::stream::traffic::{IdleClock, SystemIdleClock};
 use crate::s2s::stream::{S2sError, S2sReader, S2sWriter};
 use crate::s2s::validity::{LinkValidity, MonitorLog, supervise};
 
@@ -344,17 +345,66 @@ where
         RoutedStanza<A>,
     ) -> Result<(), IngressFailure>,
 {
-    let mut last_input = Instant::now();
+    receive_with_clock(
+        reader,
+        Receiving {
+            peer,
+            validity,
+            settings,
+            shutdown,
+            context,
+        },
+        dispatch,
+        &SystemIdleClock,
+    )
+    .await
+}
+
+struct Receiving<'a, A: ChunkAllocator> {
+    peer: &'a InboundPeer,
+    validity: &'a LinkValidity,
+    settings: &'a Settings<A>,
+    shutdown: ShutdownSignal,
+    context: &'a IngressContext<A>,
+}
+
+async fn receive_with_clock<A, R, D>(
+    reader: &mut S2sReader<A, R>,
+    parameters: Receiving<'_, A>,
+    dispatch: &mut D,
+    clock: &impl IdleClock,
+) -> Closed
+where
+    A: ChunkAllocator + Clone + 'static,
+    R: AsyncBufRead + Unpin + 'static,
+    D: for<'a> AsyncFnMut(
+        &'a IngressContext<A>,
+        &'a InboundPeer,
+        RoutedStanza<A>,
+    ) -> Result<(), IngressFailure>,
+{
+    let Receiving {
+        peer,
+        validity,
+        settings,
+        shutdown,
+        context,
+    } = parameters;
+    let mut last_input = clock.now();
+    let physical = reader.activity();
     loop {
-        let remaining = settings.idle_timeout.saturating_sub(last_input.elapsed());
+        let last_activity = physical
+            .as_ref()
+            .map_or(last_input, |physical| physical.last().max(last_input));
+        let deadline = last_activity + settings.idle_timeout;
         let event = interrupt(shutdown.clone(), validity, async {
-            if remaining.is_zero() {
+            if clock.now() >= deadline {
                 return Err(Closed::footer(StreamClose::Idle, false));
             }
-            compio::time::timeout(remaining, reader.next_event())
-                .await
-                .map_err(|_| Closed::footer(StreamClose::Idle, false))?
-                .map_err(Closed::reader_error)
+            match select(pin!(clock.sleep_until(deadline)), pin!(reader.next_event())).await {
+                Either::Left(_) => Err(Closed::footer(StreamClose::Idle, false)),
+                Either::Right((result, _)) => result.map_err(Closed::reader_error),
+            }
         })
         .await;
         let event = match event {
@@ -363,6 +413,15 @@ where
             }
             Ok(Ok(Some(event))) => event,
             Ok(Ok(None)) => return Closed::reader_error(S2sError::Eof),
+            Ok(Err(closed))
+                if matches!(closed.outcome, StreamClose::Idle)
+                    && physical.as_ref().is_some_and(|physical| {
+                        clock.now().saturating_duration_since(physical.last())
+                            < settings.idle_timeout
+                    }) =>
+            {
+                continue;
+            }
             Ok(Err(closed)) => return rejection(peer, "stream", closed),
             Err(condition) => {
                 return rejection(peer, "stream", Closed::interrupted(condition, validity));
@@ -373,7 +432,7 @@ where
             event,
             StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_)
         ) {
-            last_input = Instant::now();
+            last_input = clock.now();
         }
         let result = ingress::receive::process(
             event,

@@ -17,6 +17,7 @@ use super::*;
 use crate::s2s::ingress::{InboundPeer, IngressContext, IngressFailure, receive};
 use crate::s2s::metrics::StreamClose;
 use crate::s2s::stream::S2sError;
+use crate::s2s::stream::traffic::{IdleClock, SystemIdleClock};
 use crate::s2s::validity::LinkValidity;
 
 pub(in crate::s2s) struct DuplexEnd {
@@ -52,21 +53,6 @@ pub(in crate::s2s) struct DuplexParameters<'a, A: ChunkAllocator> {
     pub(in crate::s2s) context: &'a IngressContext<A>,
     pub(in crate::s2s) validity: &'a LinkValidity,
     pub(in crate::s2s) idle_timeout: Duration,
-}
-
-trait IdleClock {
-    fn now(&self) -> Instant;
-    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()>;
-}
-
-struct SystemIdleClock;
-impl IdleClock for SystemIdleClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-    async fn sleep_until(&self, deadline: Instant) {
-        compio::time::sleep_until(deadline).await;
-    }
 }
 
 async fn cooperate() {
@@ -293,7 +279,7 @@ async fn sending<A, W>(
     source: &mut QueueSource<'_, A>,
     writer: &mut S2sWriter<W>,
     inner: &Inner<A>,
-    validity: &LinkValidity,
+    parameters: &DuplexParameters<'_, A>,
     activity: &Activity,
     count_bidi: bool,
     clock: &impl IdleClock,
@@ -353,7 +339,7 @@ where
             writer,
             head,
             inner,
-            validity,
+            parameters.validity,
             queue.receiver.is_empty(),
             &mut buffered,
         )
@@ -365,6 +351,19 @@ where
                 queue.current = None;
                 if count_bidi {
                     inner.metrics.bidi_stanza_sent(kind);
+                }
+            }
+            Ok(link::WriteOutcome::PeerSizeRejected) => {
+                link::reject_peer_size(&parameters.context.router, &mut queue.current);
+                activity.sending.set(true);
+                let result =
+                    link::flush_buffered(writer, inner, parameters.validity, &mut buffered).await;
+                activity.sending.set(false);
+                if let Err(reason) = result {
+                    return SendEnd::Failed {
+                        reason,
+                        abort: true,
+                    };
                 }
             }
             Ok(link::WriteOutcome::Discarded) => queue.current = None,
@@ -423,6 +422,12 @@ where
         sending: Cell::new(false),
         stop: StopRequest::default(),
     };
+    let physical = reader.activity();
+    let last_activity = || {
+        physical.as_ref().map_or(activity.at.get(), |physical| {
+            physical.last().max(activity.at.get())
+        })
+    };
     let end = {
         let mut receiving = pin!(Some(receiving(
             reader,
@@ -437,14 +442,14 @@ where
             &mut source,
             writer,
             inner,
-            parameters.validity,
+            &parameters,
             &activity,
             !outbound,
             clock
         )));
         let mut invalid = pin!(parameters.validity.wait());
         let mut shutdown = pin!(shutdown);
-        let mut deadline = activity.at.get() + parameters.idle_timeout;
+        let mut deadline = last_activity() + parameters.idle_timeout;
         loop {
             let Some(receiver) = receiving.as_mut().as_pin_mut() else {
                 break DuplexEnd::new(StreamClose::InternalError);
@@ -488,7 +493,7 @@ where
                 FirstEvent::Invalid(reason) => DuplexEnd::new(reason),
                 FirstEvent::Idle => {
                     let now = clock.now();
-                    let idle_at = activity.at.get() + parameters.idle_timeout;
+                    let idle_at = last_activity() + parameters.idle_timeout;
                     if now < idle_at {
                         deadline = idle_at;
                         continue;

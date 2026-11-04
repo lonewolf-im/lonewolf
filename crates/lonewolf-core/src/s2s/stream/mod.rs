@@ -35,6 +35,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 use super::metrics::{InboundLimit, S2sMetrics};
 use crate::config::limits::{ByteRate, EventRate};
 
+pub(crate) mod limits;
 pub(crate) mod traffic;
 
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
@@ -42,12 +43,14 @@ const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const STREAM_FOOTER: &str = "</stream:stream>";
 const HEADER_PREFIX: &str = "<?xml version='1.0'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' from='";
 
+#[cfg(test)]
 pub(crate) const STARTTLS_REQUIRED_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
+#[cfg(test)]
 pub(crate) const EXTERNAL_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>";
 pub(crate) const BIDI_NAMESPACE: &str = "urn:xmpp:bidi";
-pub(crate) const BIDI_REQUEST: &str = "<bidi xmlns='urn:xmpp:bidi'/>";
 pub(crate) const BIDI_FEATURE_NAMESPACE: &str = "urn:xmpp:features:bidi";
-pub(crate) const EXTERNAL_BIDI_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>";
+
+#[cfg(test)]
 pub(crate) const EMPTY_FEATURES: &str = "<stream:features/>";
 pub(crate) const STARTTLS: &str = "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
 pub(crate) const PROCEED: &str = "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>";
@@ -63,6 +66,7 @@ pub(crate) struct InitialHeader {
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct Features {
+    pub(crate) limits: Option<limits::StreamLimits>,
     pub(crate) bidi: bool,
     pub(crate) starttls: bool,
     pub(crate) external: bool,
@@ -229,8 +233,14 @@ pub(crate) fn validate_response_header<A: ChunkAllocator>(
     Ok(())
 }
 
-pub(crate) fn parse_features<A: ChunkAllocator>(element: &Parsed<Element, A>) -> Features {
-    let mut features = Features::default();
+pub(crate) fn parse_features<A: ChunkAllocator>(
+    element: &Parsed<Element, A>,
+) -> Result<Features, HandleError> {
+    let parent = element.value().resolve(element.arena())?;
+    let mut features = Features {
+        limits: limits::parse_limits(&parent)?,
+        ..Features::default()
+    };
     if let Ok(element) = element.value().resolve(element.arena())
         && let Ok(children) = element.children()
     {
@@ -258,7 +268,7 @@ pub(crate) fn parse_features<A: ChunkAllocator>(element: &Parsed<Element, A>) ->
             }
         }
     }
-    features
+    Ok(features)
 }
 
 pub(crate) fn auth_external_xml(authzid: &str) -> String {
@@ -329,6 +339,7 @@ pub(crate) struct S2sReader<A: ChunkAllocator, R> {
     ready: Option<ReadState<A, R>>,
     pending: Option<PendingRead<A, R>>,
     abandon: Rc<Cell<bool>>,
+    activity: Option<traffic::ConnectionActivity>,
 }
 
 struct ReadState<A: ChunkAllocator, R> {
@@ -413,7 +424,17 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
             }),
             pending: None,
             abandon: Rc::new(Cell::new(false)),
+            activity: None,
         }
+    }
+
+    pub(crate) fn with_activity(mut self, activity: traffic::ConnectionActivity) -> Self {
+        self.activity = Some(activity);
+        self
+    }
+
+    pub(crate) fn activity(&self) -> Option<traffic::ConnectionActivity> {
+        self.activity.clone()
     }
 
     pub(crate) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, S2sError> {
@@ -567,16 +588,39 @@ fn peer_stream_error<A: ChunkAllocator>(
 
 pub(crate) struct S2sWriter<W> {
     output: BufWriter<W>,
+    peer_limits: limits::StreamLimits,
 }
 
 impl<W: AsyncWrite + Unpin> S2sWriter<W> {
     pub(crate) fn new(output: W) -> Self {
         Self {
             output: BufWriter::with_capacity(4_096, output),
+            peer_limits: limits::StreamLimits::default(),
+        }
+    }
+
+    pub(crate) fn peer_limits(&self) -> limits::StreamLimits {
+        self.peer_limits
+    }
+
+    pub(crate) fn update_peer_limits(&mut self, update: Option<limits::StreamLimits>) {
+        if let Some(limits) = update {
+            self.peer_limits = limits;
         }
     }
 
     pub(crate) async fn send(&mut self, xml: &str) -> Result<(), S2sError> {
+        if self
+            .peer_limits
+            .max_bytes
+            .is_some_and(|max| xml.len() as u64 > u64::from(max))
+        {
+            return Err(S2sError::Stream(StreamErrorCondition::PolicyViolation));
+        }
+        self.send_header(xml).await
+    }
+
+    pub(crate) async fn send_header(&mut self, xml: &str) -> Result<(), S2sError> {
         self.output.write_all(xml.as_bytes()).await?;
         self.flush().await
     }
@@ -607,8 +651,8 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
         condition: Option<StreamErrorCondition>,
     ) -> Result<(), S2sError> {
         match condition {
-            Some(condition) => self.send(&stream_error_xml(condition)).await,
-            None => self.send(STREAM_FOOTER).await,
+            Some(condition) => self.send_header(&stream_error_xml(condition)).await,
+            None => self.send_header(STREAM_FOOTER).await,
         }
     }
 }

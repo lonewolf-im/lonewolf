@@ -408,6 +408,7 @@ fn reverse_stanza_from_another_domain_closes_the_link_with_invalid_from() -> Tes
 fn bidi_link_stays_open_while_the_peer_sends() -> TestResult {
     let mut fixture = SingleServer::start_bidirectional("[limits.s2s]\nidle_timeout_secs = 2")?;
     let (listener, config) = outbound_listener(&fixture)?;
+    let listener = listener.expecting_limits(524288, 2);
     fixture.suite.create_account("alice", PASSWORD)?;
     let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message to='bob@b.test/phone' type='chat'><body>open link</body></message>")?;

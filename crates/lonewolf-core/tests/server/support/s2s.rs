@@ -231,13 +231,27 @@ pub fn id(header: &str) -> Result<&str> {
 }
 
 pub fn start_tls(address: SocketAddr, config: Arc<rustls::ClientConfig>) -> Result<(Peer, String)> {
+    start_tls_with_limits(address, config, 524288, 600)
+}
+
+pub fn start_tls_with_limits(
+    address: SocketAddr,
+    config: Arc<rustls::ClientConfig>,
+    maximum: u32,
+    idle: u32,
+) -> Result<(Peer, String)> {
+    let limits = format!(
+        "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>{maximum}</max-bytes><idle-seconds>{idle}</idle-seconds></limits>"
+    );
     let mut tcp = connect(address)?;
     tcp.write_all(HEADER.as_bytes())?;
     let first = response_header(&mut tcp)?;
     let features = until(&mut tcp, "</stream:features>")?;
     assert_eq!(
         features,
-        "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>"
+        format!(
+            "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls>{limits}</stream:features>"
+        )
     );
     tcp.write_all(STARTTLS.as_bytes())?;
     assert_eq!(
@@ -251,16 +265,37 @@ pub fn start_tls(address: SocketAddr, config: Arc<rustls::ClientConfig>) -> Resu
 }
 
 pub fn external(peer: &mut Peer, header: &str) -> Result<String> {
+    external_with_limits(peer, header, 524288, 600)
+}
+
+pub fn external_with_limits(
+    peer: &mut Peer,
+    header: &str,
+    maximum: u32,
+    idle: u32,
+) -> Result<String> {
+    let limits = format!(
+        "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>{maximum}</max-bytes><idle-seconds>{idle}</idle-seconds></limits>"
+    );
     peer.write_all(header.as_bytes())?;
     let header = response_header(peer)?;
     assert_eq!(
         until(peer, "</stream:features>")?,
-        "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>"
+        format!(
+            "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/>{limits}</stream:features>"
+        )
     );
     Ok(header)
 }
 
 pub fn success(peer: &mut Peer, auth: &str) -> Result<String> {
+    success_with_limits(peer, auth, 524288, 600)
+}
+
+pub fn success_with_limits(peer: &mut Peer, auth: &str, maximum: u32, idle: u32) -> Result<String> {
+    let limits = format!(
+        "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>{maximum}</max-bytes><idle-seconds>{idle}</idle-seconds></limits>"
+    );
     peer.write_all(auth.as_bytes())?;
     assert_eq!(
         until(peer, "/>")?,
@@ -268,7 +303,10 @@ pub fn success(peer: &mut Peer, auth: &str) -> Result<String> {
     );
     peer.write_all(HEADER.as_bytes())?;
     let header = response_header(peer)?;
-    assert_eq!(until(peer, "/>")?, "<stream:features/>");
+    assert_eq!(
+        until(peer, "</stream:features>")?,
+        format!("<stream:features>{limits}</stream:features>")
+    );
     Ok(header)
 }
 

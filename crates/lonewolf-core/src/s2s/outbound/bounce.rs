@@ -80,6 +80,7 @@ pub(crate) async fn bounce<A: ChunkAllocator + Clone>(
     match result {
         Ok(()) => remote.inner.metrics.bounced(match condition {
             StanzaErrorCondition::ResourceConstraint => BounceCondition::ResourceConstraint,
+            StanzaErrorCondition::PolicyViolation => BounceCondition::PolicyViolation,
             StanzaErrorCondition::RemoteServerNotFound => BounceCondition::RemoteServerNotFound,
             _ => BounceCondition::RemoteServerTimeout,
         }),
@@ -141,6 +142,7 @@ mod tests {
                     (StanzaErrorCondition::RemoteServerNotFound, "remote-server-not-found"),
                     (StanzaErrorCondition::RemoteServerTimeout, "remote-server-timeout"),
                     (StanzaErrorCondition::ResourceConstraint, "resource-constraint"),
+                    (StanzaErrorCondition::PolicyViolation, "policy-violation"),
                 ] {
                     let reply = reply(&source, condition, lonewolf_util::arena::GlobalChunkAllocator).ok_or("reply")?;
                     let view = reply.resolve()?;
@@ -150,6 +152,7 @@ mod tests {
                     let mut output = String::new();
                     view.write_xml(&mut output)?;
                     assert!(output.contains(name), "{output}");
+                    assert!(!output.contains(" by="), "{output}");
                 }
             }
             Ok(())

@@ -106,10 +106,11 @@ const ADMISSION_REASON_LABELS: [&str; 5] = [
     "stopped",
 ];
 
-const BOUNCE_CONDITION_LABELS: [&str; 3] = [
+const BOUNCE_CONDITION_LABELS: [&str; 4] = [
     "remote_server_not_found",
     "remote_server_timeout",
     "resource_constraint",
+    "policy_violation",
 ];
 
 const DROP_REASON_LABELS: [&str; 4] = [
@@ -234,6 +235,7 @@ fn record_all(metrics: &Arc<S2sMetrics>) -> Vec<ConnectionGauge> {
     for reason in AdmissionReason::ALL {
         metrics.admission_rejected(reason);
     }
+    metrics.peer_size_rejected();
     for condition in BounceCondition::ALL {
         metrics.bounced(condition);
     }
@@ -382,6 +384,7 @@ fn every_recorder_encodes_exact_samples() -> Result<(), fmt::Error> {
             &format!("lonewolf_s2s_admission_rejections_total{{reason=\"{value}\"}} 1"),
         );
     }
+    assert_sample(&output, "lonewolf_s2s_peer_size_rejections_total 1");
     for value in BOUNCE_CONDITION_LABELS {
         assert_sample(
             &output,
@@ -551,7 +554,8 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             "lonewolf_s2s_crl_fetches_total" => &["outcome"],
             "lonewolf_s2s_crl_cache_evictions_total" => &["reason"],
             "lonewolf_s2s_crl_fetch_duration_seconds_bucket" => &["le"],
-            "lonewolf_s2s_crl_fetch_duration_seconds_count"
+            "lonewolf_s2s_peer_size_rejections_total"
+            | "lonewolf_s2s_crl_fetch_duration_seconds_count"
             | "lonewolf_s2s_crl_fetch_duration_seconds_sum"
             | "lonewolf_s2s_crl_cache_entries"
             | "lonewolf_s2s_crl_cache_bytes" => &[],
@@ -587,7 +591,7 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             .collect::<Result<_, _>>()?;
         assert_eq!(actual, expected, "{line}");
     }
-    assert_eq!(families.len(), 34);
+    assert_eq!(families.len(), 35);
     Ok(())
 }
 

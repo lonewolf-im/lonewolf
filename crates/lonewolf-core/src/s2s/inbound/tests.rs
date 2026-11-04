@@ -1162,3 +1162,83 @@ fn selected_reset_flushes_before_release_despite_existing_invalidation() -> Test
         Ok(())
     })
 }
+
+#[test]
+fn physical_whitespace_and_partial_xml_extend_inbound_idle_until_silence() -> TestResult {
+    use crate::s2s::stream::traffic::{
+        CountingIo,
+        test_support::{Clock, Fragments},
+    };
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    Runtime::new()?.block_on(async {
+        let mut fixture = Fixture::new()?;
+        fixture.settings.idle_timeout = Duration::from_millis(200);
+        let clock = Clock::new();
+        let input = Fragments::default();
+        input.push(HEADER.as_bytes());
+        let counted = CountingIo::new(
+            input.clone(),
+            Arc::clone(&fixture.settings.metrics),
+            Direction::Inbound,
+        );
+        let activity = counted.activity();
+        let mut reader = S2sReader::new(
+            tokio::io::BufReader::new(counted.compat()),
+            &fixture.settings.reader_limits,
+            GlobalChunkAllocator,
+            None,
+        )
+        .with_activity(activity.clone());
+        assert!(matches!(
+            reader.next_event().await,
+            Ok(Some(StreamEvent::StreamStart { .. }))
+        ));
+        activity.record(clock.now());
+        let peer = peer();
+        let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
+        let (_stop, shutdown) = signal();
+        let group = WorkGroup::new();
+        let context = IngressContext {
+            router: fixture.settings.services.router.clone(),
+            storage: fixture.settings.services.storage.clone(),
+            allocator: GlobalChunkAllocator,
+            work: group.handle(),
+        };
+        let received = Cell::new(0);
+        let mut dispatch =
+            async |_: &IngressContext<GlobalChunkAllocator>,
+                   _: &InboundPeer,
+                   _: RoutedStanza<GlobalChunkAllocator>| {
+                received.set(received.get() + 1);
+                Ok(())
+            };
+        let mut running = std::pin::pin!(receive_with_clock(
+            &mut reader,
+            Receiving {
+                peer: &peer,
+                validity: &validity,
+                settings: &fixture.settings,
+                shutdown,
+                context: &context
+            },
+            &mut dispatch,
+            &clock
+        ));
+        assert!(poll!(running.as_mut()).is_pending());
+        assert!(poll!(running.as_mut()).is_pending());
+        for fragment in [b" \n".as_slice(), b"<message", b" from='"] {
+            clock.advance(Duration::from_millis(100));
+            let before = input.polls();
+            input.push(fragment);
+            assert!(poll!(running.as_mut()).is_pending());
+            assert!(input.polls() > before);
+            activity.record(clock.now());
+        }
+        assert_eq!(received.get(), 0);
+        clock.advance(Duration::from_millis(199));
+        assert!(poll!(running.as_mut()).is_pending());
+        clock.advance(Duration::from_millis(1));
+        assert!(matches!(running.await.outcome, StreamClose::Idle));
+        Ok(())
+    })
+}

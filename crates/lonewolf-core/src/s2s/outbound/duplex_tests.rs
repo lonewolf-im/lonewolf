@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use super::*;
 use crate::config::Config;
 use crate::router::{Router, local::LocalRouter};
+use crate::s2s::metrics::Direction;
 use crate::s2s::outbound::manager_tests::{run as test, stanza_in};
 use crate::s2s::revocation::{RevocationSource, RevocationStatus, RevocationVerdict};
 use crate::s2s::stream::S2sReaderLimits;
@@ -1154,6 +1155,266 @@ fn ready_batches_cooperate_with_shutdown_and_invalidation() -> TestResult {
             assert_eq!(output.text()?.matches("<message").count(), 1);
             f.cleanup(queue);
             f.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> TestResult {
+    use crate::s2s::stream::traffic::{CountingIo, test_support::Fragments};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    test(async {
+        for outbound in [false, true] {
+            let f = Fixture::new(GlobalChunkAllocator)?;
+            let mut queue = f.queue(0).await?;
+            let input = Fragments::default();
+            input.push(HEADER.as_bytes());
+            let counted = CountingIo::new(
+                input.clone(),
+                Arc::clone(&f.remote.inner.metrics),
+                Direction::Outbound,
+            );
+            let activity = counted.activity();
+            let mut reader = S2sReader::new(
+                tokio::io::BufReader::new(counted.compat()),
+                &S2sReaderLimits {
+                    max_stanza_bytes: f.remote.inner.limits.max_stanza_bytes,
+                    stanzas: f
+                        .remote
+                        .inner
+                        .limits
+                        .incoming_stanzas_per_connection
+                        .clone(),
+                    xml: f.remote.inner.limits.incoming_xml_per_connection.clone(),
+                },
+                GlobalChunkAllocator,
+                None,
+            )
+            .with_activity(activity.clone());
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::StreamStart { .. }))
+            ));
+            let clock = Clock::new();
+            let p = peer();
+            let v = valid();
+            let mut writer = S2sWriter::new(Output::default());
+            let received = Cell::new(0);
+            let end = {
+                let mut parameters = parameters(&p, &f.context, &v);
+                parameters.idle_timeout = Duration::from_millis(200);
+                let mut running = pin!(run(
+                    Session {
+                        inner: &f.remote.inner,
+                        source: QueueSource::Owned(&mut queue),
+                        outbound
+                    },
+                    &mut reader,
+                    &mut writer,
+                    parameters,
+                    f.remote.inner.stopped.clone(),
+                    async |_, _, _| {
+                        received.set(received.get() + 1);
+                        Ok(())
+                    },
+                    &clock
+                ));
+                assert!(poll!(running.as_mut()).is_pending());
+                assert!(poll!(running.as_mut()).is_pending());
+                for fragment in [b" \n".as_slice(), b"<message", b" from='"] {
+                    clock.advance(Duration::from_millis(100));
+                    let before = input.polls();
+                    input.push(fragment);
+                    assert!(poll!(running.as_mut()).is_pending());
+                    assert!(input.polls() > before);
+                    activity.record(clock.now());
+                }
+                assert_eq!(received.get(), 0);
+                clock.advance(Duration::from_millis(199));
+                assert!(poll!(running.as_mut()).is_pending());
+                clock.advance(Duration::from_millis(1));
+                running.await
+            };
+            assert!(matches!(end.reason, StreamClose::Idle));
+            assert!(!end.abort);
+            f.cleanup(queue);
+            f.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn incomplete_ready_reads_cooperate_before_shutdown_or_invalidation() -> TestResult {
+    use crate::s2s::stream::traffic::{CountingIo, test_support::Fragments};
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    test(async {
+        for invalidate in [false, true] {
+            let f = Fixture::new(GlobalChunkAllocator)?;
+            let mut queue = f.queue(0).await?;
+            let input = Fragments::default();
+            input.push(HEADER.as_bytes());
+            let counted = CountingIo::new(
+                input.clone(),
+                Arc::clone(&f.remote.inner.metrics),
+                Direction::Outbound,
+            );
+            let activity = counted.activity();
+            let mut reader = S2sReader::new(
+                tokio::io::BufReader::new(counted.compat()),
+                &S2sReaderLimits {
+                    max_stanza_bytes: f.remote.inner.limits.max_stanza_bytes,
+                    stanzas: f
+                        .remote
+                        .inner
+                        .limits
+                        .incoming_stanzas_per_connection
+                        .clone(),
+                    xml: f.remote.inner.limits.incoming_xml_per_connection.clone(),
+                },
+                GlobalChunkAllocator,
+                None,
+            )
+            .with_activity(activity);
+            assert!(matches!(
+                reader.next_event().await,
+                Ok(Some(StreamEvent::StreamStart { .. }))
+            ));
+            input.push(b"<message");
+            input.push(b" from='u@remote.test/r' to='v@localhost'/>");
+            let p = peer();
+            let (v, monitor) = expire_later();
+            let mut monitor = Some(monitor);
+            let mut writer = S2sWriter::new(Output::default());
+            let received = Cell::new(0);
+            let (stop, stopped) = oneshot::channel();
+            let end = {
+                let mut running = pin!(run(
+                    Session {
+                        inner: &f.remote.inner,
+                        source: QueueSource::Owned(&mut queue),
+                        outbound: true
+                    },
+                    &mut reader,
+                    &mut writer,
+                    parameters(&p, &f.context, &v),
+                    async {
+                        let _ = stopped.await;
+                    },
+                    async |_, _, _| {
+                        received.set(received.get() + 1);
+                        Ok(())
+                    },
+                    &SystemIdleClock
+                ));
+                assert!(poll!(running.as_mut()).is_pending());
+                let before = input.polls();
+                assert!(poll!(running.as_mut()).is_pending());
+                assert_eq!(input.polls(), before + 1);
+                assert_eq!(received.get(), 0);
+                if invalidate {
+                    v.record_invalidation(StreamClose::CertificateExpired);
+                    drop(monitor.take());
+                } else {
+                    stop.send(()).map_err(|_| "shutdown")?;
+                }
+                let end = running.await;
+                assert_eq!(input.polls(), before + 1);
+                end
+            };
+            assert!(matches!(end.reason, StreamClose::CertificateExpired) == invalidate);
+            assert!(matches!(end.reason, StreamClose::Shutdown) != invalidate);
+            assert_eq!(received.get(), 0);
+            f.cleanup(queue);
+            f.finish().await?;
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn peer_size_rejection_transfers_ownership_before_prior_flush_can_be_aborted() -> TestResult {
+    use crate::s2s::stream::limits::StreamLimits;
+    test(async {
+        for shutdown in [false, true] {
+            let f = Fixture::new(GlobalChunkAllocator)?;
+            let mut queue = f.queue(0).await?;
+            let first = stanza_in("<message from='v@localhost' to='u@remote.test/r' id='first'><body>ok</body></message>", GlobalChunkAllocator).await?;
+            assert!(
+                f.remote
+                    .admit("localhost", "remote.test", first)
+                    .map_err(|error| format!("{error:?}"))?
+                    .is_none()
+            );
+            queue.current = Some(queue.receiver.recv().await?);
+            let rejected = stanza_in(&format!("<message type='error' from='v@localhost' to='u@remote.test/r' id='second'><body>{}</body><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>", "x".repeat(1024)), GlobalChunkAllocator).await?;
+            assert!(
+                f.remote
+                    .admit("localhost", "remote.test", rejected)
+                    .map_err(|error| format!("{error:?}"))?
+                    .is_none()
+            );
+            let (input, mut reader) = f.reader().await?;
+            let output = Output::default();
+            output.0.borrow_mut().paused_flush = true;
+            let mut writer = S2sWriter::new(output.clone());
+            writer.update_peer_limits(Some(StreamLimits {
+                max_bytes: Some(300),
+                idle_seconds: None,
+            }));
+            let p = peer();
+            let v = valid();
+            let end = {
+                let mut running = pin!(run_outbound(
+                    &f.remote.inner,
+                    &mut queue,
+                    &mut reader,
+                    &mut writer,
+                    parameters(&p, &f.context, &v),
+                    dispatch
+                ));
+                assert!(poll!(running.as_mut()).is_pending());
+                assert!(!output.0.borrow().blocked_flush);
+                assert!(poll!(running.as_mut()).is_pending());
+                assert!(output.0.borrow().blocked_flush);
+                sample(&f.metrics()?, "lonewolf_s2s_peer_size_rejections_total 1");
+                sample(&f.metrics()?, "lonewolf_s2s_outbound_queued_stanzas 0");
+                if shutdown {
+                    f.remote.stop();
+                } else {
+                    input.fail()?;
+                }
+                running.await
+            };
+            assert!(matches!(end.reason, StreamClose::Shutdown) == shutdown);
+            assert!(matches!(end.reason, StreamClose::TransportError) != shutdown);
+            assert!(end.abort);
+            assert!(queue.current.is_none());
+            assert_eq!(queue.counters.count.load(Ordering::Relaxed), 0);
+            assert_eq!(queue.counters.bytes.load(Ordering::Relaxed), 0);
+            f.cleanup(queue);
+            let remote = f.remote.clone();
+            f.finish().await?;
+            let mut registry = prometheus_client::registry::Registry::default();
+            remote
+                .inner
+                .metrics
+                .register(registry.sub_registry_with_prefix("lonewolf"));
+            let mut metrics = String::new();
+            prometheus_client::encoding::text::encode(&mut metrics, &registry)?;
+            sample(&metrics, "lonewolf_s2s_peer_size_rejections_total 1");
+            sample(
+                &metrics,
+                "lonewolf_s2s_stanzas_sent_total{kind=\"message\"} 1",
+            );
+            sample(
+                &metrics,
+                "lonewolf_s2s_dropped_stanzas_total{reason=\"not_bounceable\"} 1",
+            );
+            assert!(!metrics.contains("reason=\"connection_lost\""));
+            assert!(!output.text()?.contains("second"));
+            assert!(output.text()?.contains("first"));
         }
         Ok(())
     })

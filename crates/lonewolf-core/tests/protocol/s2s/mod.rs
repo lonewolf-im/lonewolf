@@ -5,6 +5,7 @@ mod bidi_pair;
 mod failures;
 mod iq;
 mod lifecycle;
+mod limits;
 mod messages;
 mod negotiation;
 mod presence;

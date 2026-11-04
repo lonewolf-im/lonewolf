@@ -132,7 +132,7 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0288.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0.1</xmpp:version>
-        <xmpp:note xml:lang="en">Bidirectional streams with certificate authentication for one domain pair per connection, on connections in either direction. Server Dialback and additional domains on a shared connection are not supported. Not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Bidirectional streams with certificate authentication and limits-bearing requests for one domain pair per connection, on connections in either direction. Server Dialback and additional domains on a shared connection are not supported. Not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -150,6 +150,14 @@
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>1.0.0</xmpp:version>
         <xmpp:since>0.1.0</xmpp:since>
+      </xmpp:SupportedXep>
+    </implements>
+    <implements>
+      <xmpp:SupportedXep>
+        <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0478.html"/>
+        <xmpp:status>partial</xmpp:status>
+        <xmpp:version>0.2.0</xmpp:version>
+        <xmpp:note xml:lang="en">S2S feature and bidi limits advertisements with per-connection peer byte limits. C2S announcements are not supported. Peer idle advice does not trigger keepalives. Not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
   </Project>

@@ -223,6 +223,11 @@ Found a security problem? Please report it privately instead; see
 Thinking about a new feature? Check the [roadmap](docs/ROADMAP.md) first. It may
 already be planned, and it helps us figure out where the feature fits.
 
+## Contact
+
+Contact the maintainer on XMPP at the official JID:
+[ortuman@lonewolf-im.com](xmpp:ortuman@lonewolf-im.com).
+
 ## License
 
 Lonewolf is licensed under [Apache-2.0](LICENSE).

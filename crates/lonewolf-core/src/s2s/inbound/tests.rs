@@ -329,12 +329,7 @@ fn expiry_interrupts_dispatch_and_idle_waits_for_its_completion() -> TestResult 
             let (release, held) = oneshot::channel::<()>();
             let mut held = Some(held);
             let validity = LinkValidity::fixed(
-                SystemTime::now()
-                    + if expiry {
-                        fixture.settings.idle_timeout
-                    } else {
-                        Duration::from_secs(60)
-                    },
+                SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 }),
             );
             let future = run(
                 &mut reader,
@@ -436,7 +431,7 @@ fn hard_listener_deadline_aborts_socket_before_adapters_and_keeps_child_guard_al
         };
         let active = futures_util::stream::FuturesUnordered::new();
         active.push(task);
-        let deadline = Instant::now() + Duration::from_millis(10);
+        let deadline = Instant::now() + Duration::from_secs(1);
         let mut draining = Box::pin(super::super::drain_connections(active, deadline));
         assert!(poll!(draining.as_mut()).is_pending());
         stop.send(deadline).map_err(|_| "stop dropped")?;

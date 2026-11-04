@@ -531,10 +531,9 @@ fn proxy_preserves_alabel_host_and_path_and_rejects_wrong_host_and_token() -> Te
 fn ipv6_listener_works_when_available_and_bind_collision_rolls_back_all_endpoints() -> TestResult {
     let ca = FakeAcmeCa::start()?;
     let mut server = C2sSuite::managed(&ca)?;
-    match std::net::TcpListener::bind("[::1]:0") {
-        Ok(listener) => {
-            let address = listener.local_addr()?;
-            server.reserve_listener(listener)?;
+    match ports::reserve_loopback_address(std::net::Ipv6Addr::LOCALHOST.into()) {
+        Ok((reservation, address)) => {
+            server.reserve_listener(reservation, address)?;
             server.start(&ca)?;
             server.wait_certificate(None)?;
             server.account("xmpp.example.test")?;
@@ -1305,9 +1304,11 @@ fn twenty_bootstraps_under_concurrent_tcp_activity_cover_proxy_ipv6_and_cached_r
                             let mut ca = FakeAcmeCa::start()?;
                             let mut server = C2sSuite::managed(&ca)?;
                             if number % 5 == 1 {
-                                match std::net::TcpListener::bind("[::1]:0") {
-                                    Ok(listener) => {
-                                        server.reserve_listener(listener)?;
+                                match ports::reserve_loopback_address(
+                                    std::net::Ipv6Addr::LOCALHOST.into(),
+                                ) {
+                                    Ok((reservation, address)) => {
+                                        server.reserve_listener(reservation, address)?;
                                         ipv6 += 1;
                                     }
                                     Err(error)

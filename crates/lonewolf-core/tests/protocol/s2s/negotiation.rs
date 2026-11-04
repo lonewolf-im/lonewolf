@@ -411,8 +411,19 @@ fn assert_tls_rejection(result: TestResult<RawS2sPeer>) -> TestResult {
         Some(quick_xml::Error::Io(error)) => error.as_ref(),
         _ => return Err(format!("TLS failure did not return an XML I/O error: {error:?}").into()),
     };
-    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error}");
+    assert_aborted_transport(error);
     Ok(())
+}
+
+pub(super) fn assert_aborted_transport(error: &std::io::Error) {
+    // A peer that closes with unread input sends a reset instead of a clean end of stream.
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+        ),
+        "{error}"
+    );
 }
 
 #[test]

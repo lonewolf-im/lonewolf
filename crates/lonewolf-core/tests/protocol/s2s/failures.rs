@@ -11,7 +11,9 @@ use super::super::support::federation::{
     refused_endpoint,
 };
 use super::super::support::{PASSWORD, TestResult};
-use super::negotiation::{SingleServer, authentication, closed, expect_bounce};
+use super::negotiation::{
+    SingleServer, assert_aborted_transport, authentication, closed, expect_bounce,
+};
 
 #[test]
 fn srv_records_are_followed_in_priority_order() -> TestResult {
@@ -219,7 +221,7 @@ fn receiving_peer_with_wrong_certificate_bounces_remote_server_timeout() -> Test
     let error = error
         .downcast_ref::<std::io::Error>()
         .ok_or("TLS failure did not return an I/O error")?;
-    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error}");
+    assert_aborted_transport(error);
     expect_bounce(&mut alice, "wrong-certificate", "remote-server-timeout")?;
     authentication(&fixture.suite, "outbound", "certificate_name", 1)?;
     fixture
@@ -259,7 +261,7 @@ fn receiving_peer_with_self_signed_ca_leaf_bounces_remote_server_timeout() -> Te
     let error = error
         .downcast_ref::<std::io::Error>()
         .ok_or("TLS failure did not return an I/O error")?;
-    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof, "{error}");
+    assert_aborted_transport(error);
     expect_bounce(&mut alice, "ca-leaf", "remote-server-timeout")?;
     authentication(&fixture.suite, "outbound", "certificate_untrusted", 1)?;
     let metrics = fixture.suite.scrape_metrics()?;

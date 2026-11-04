@@ -224,9 +224,9 @@ Thinking about a new feature? Check the [roadmap](docs/ROADMAP.md) first. It may
 already be planned, and it helps us figure out where the feature fits.
 
 ## Contact
+If you have any suggestion or question:
 
-Contact the maintainer on XMPP at the official JID:
-[ortuman@lonewolf-im.com](xmpp:ortuman@lonewolf-im.com).
+JID: [ortuman@lonewolf-im.com](xmpp:ortuman@lonewolf-im.com)
 
 ## License
 

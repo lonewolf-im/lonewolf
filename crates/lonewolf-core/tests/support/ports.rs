@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -21,13 +21,26 @@ fn reusable_socket(address: SocketAddr) -> io::Result<Socket> {
 }
 
 pub fn reserve_listener_address() -> io::Result<(Socket, SocketAddr)> {
+    reserve_loopback_address(Ipv4Addr::LOCALHOST.into())
+}
+
+pub fn reserve_loopback_address(loopback: IpAddr) -> io::Result<(Socket, SocketAddr)> {
+    let wildcard: IpAddr = if loopback.is_ipv6() {
+        Ipv6Addr::UNSPECIFIED.into()
+    } else {
+        Ipv4Addr::UNSPECIFIED.into()
+    };
     // A wildcard reservation excludes automatic port allocation without taking the exact endpoint.
-    let reservation = reusable_socket((Ipv4Addr::UNSPECIFIED, 0).into())?;
-    let address = reservation
+    let reservation = reusable_socket((wildcard, 0).into())?;
+    let port = reservation
         .local_addr()?
         .as_socket()
-        .ok_or_else(|| io::Error::other("missing reservation address"))?;
-    Ok((reservation, (Ipv4Addr::LOCALHOST, address.port()).into()))
+        .ok_or_else(|| io::Error::other("missing reservation address"))?
+        .port();
+    let address = SocketAddr::new(loopback, port);
+    // Hosts without this loopback address fail here instead of when the server binds it.
+    reusable_socket(address)?;
+    Ok((reservation, address))
 }
 
 pub fn bind_released_listener(address: SocketAddr, deadline: Instant) -> io::Result<Socket> {

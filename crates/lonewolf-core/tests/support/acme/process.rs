@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -16,9 +16,11 @@ use lonewolf_acme::{StateStore, StoredAccount, StoredHost};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use rustls::{ClientConfig, SupportedProtocolVersion};
+use socket2::Socket;
 
 use super::readiness::ReadinessSocket;
 use super::{Client, FakeAcmeCa, PASSWORD, PlainClient, TIMEOUT, TLS_NAMESPACE, TestResult, tls};
+use crate::ports;
 
 pub struct AcmeServer {
     pub directory: tempfile::TempDir,
@@ -32,7 +34,9 @@ pub struct AcmeServer {
     pub tls: Arc<ClientConfig>,
     pub roots: rustls::RootCertStore,
     pub directory_url: String,
-    reservation: Option<TcpListener>,
+    // Held for the fixture lifetime so released ports are never reassigned between server runs.
+    _address_reservation: Socket,
+    _challenge_reservation: Socket,
     pub launch_count: usize,
     pub setup_retries: usize,
     pub setup_failures: Vec<SetupFailure>,
@@ -81,8 +85,8 @@ fn retryable_bind_failure(
 impl AcmeServer {
     pub fn configure(ca: &FakeAcmeCa, hosts: &str, extra: &str) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
-        let reservation = TcpListener::bind("127.0.0.1:0")?;
-        let challenge = reservation.local_addr()?;
+        let (address_reservation, address) = ports::reserve_listener_address()?;
+        let (challenge_reservation, challenge) = ports::reserve_listener_address()?;
         fs::write(
             directory.path().join("lonewolf.toml"),
             format!(
@@ -93,7 +97,7 @@ default_host = "xmpp.example.test"
 [s2s]
 enabled = false
 [[c2s.listeners]]
-address = "127.0.0.1:0"
+address = "{address}"
 [letsencrypt]
 listen = ["{challenge}"]
 state_path = "acme/state.redb"
@@ -115,13 +119,14 @@ ca_certificates_path = {:?}
             clock: None,
             clock_start: None,
             readiness: ReadinessSocket::bind()?,
-            address: "127.0.0.1:0".parse()?,
+            address,
             metrics: None,
             challenge,
             tls,
             roots,
             directory_url: ca.directory_url(),
-            reservation: Some(reservation),
+            _address_reservation: address_reservation,
+            _challenge_reservation: challenge_reservation,
             launch_count: 0,
             setup_retries: 0,
             setup_failures: Vec::new(),
@@ -146,7 +151,6 @@ ca_certificates_path = {:?}
     }
     pub fn spawn(&mut self) -> TestResult {
         assert!(self.child.is_none());
-        self.reservation.take();
         if let Some((now, mode)) = self.clock_start {
             let (child, clock) = super::clock::spawn(self.path(), &self.readiness, now, mode)?;
             self.child = Some(child);
@@ -201,10 +205,9 @@ ca_certificates_path = {:?}
                 format!("ACME manager did not park at generation {generation}: {error}").into()
             })
     }
-    pub fn reserve_listener(&mut self, listener: TcpListener) -> TestResult {
-        let address = listener.local_addr()?;
+    pub fn reserve_listener(&mut self, reservation: Socket, address: SocketAddr) -> TestResult {
         self.retarget(address)?;
-        self.reservation = Some(listener);
+        self._challenge_reservation = reservation;
         Ok(())
     }
     fn retarget(&mut self, address: SocketAddr) -> TestResult {
@@ -278,10 +281,10 @@ ca_certificates_path = {:?}
                 )
                 .into());
             }
-            let reservation = TcpListener::bind(SocketAddr::new(self.challenge.ip(), 0))?;
-            self.retarget(reservation.local_addr()?)?;
+            let (reservation, address) = ports::reserve_loopback_address(self.challenge.ip())?;
+            self.retarget(address)?;
             update_route(self.challenge);
-            self.reservation = Some(reservation);
+            self._challenge_reservation = reservation;
             self.setup_retries += 1;
             eprintln!(
                 "ACME fixture bind-phase setup retry {}/3",

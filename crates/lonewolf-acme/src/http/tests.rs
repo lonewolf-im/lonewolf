@@ -433,7 +433,11 @@ fn bound_endpoints_share_challenges_and_release_sockets_on_shutdown() -> TestRes
 fn ipv6_listener_is_ipv6_only_when_available() -> TestResult {
     Runtime::new()?.block_on(async {
         let (challenges, _one, _two) = challenges();
-        let server = match Http01Server::bind(&["[::]:0".parse()?], challenges).await {
+        // Holding the IPv4 port first makes the IPv6 bind prove that the listener is IPv6-only.
+        let v4 = StdListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = v4.local_addr()?.port();
+        let ipv6_address = SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port);
+        let server = match Http01Server::bind(&[ipv6_address], challenges).await {
             Ok(server) => server,
             Err(error)
                 if matches!(
@@ -446,8 +450,7 @@ fn ipv6_listener_is_ipv6_only_when_available() -> TestResult {
             }
             Err(error) => return Err(error.into()),
         };
-        let port = server.local_addrs()?[0].port();
-        let _v4 = StdListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+        assert_eq!(server.local_addrs()?, [ipv6_address]);
         let (stop, stopped) = oneshot::channel();
         let task = compio::runtime::spawn(server.run(async { stopped.await.unwrap() }));
         let response = request(

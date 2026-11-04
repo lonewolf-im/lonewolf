@@ -30,6 +30,7 @@ pub mod roster;
 pub mod service;
 mod slots;
 pub mod vcard;
+pub mod version;
 
 pub use slots::Slots;
 

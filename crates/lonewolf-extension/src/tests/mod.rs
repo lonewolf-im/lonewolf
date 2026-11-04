@@ -261,7 +261,7 @@ fn discovery_lists_registered_services() -> Result<(), RegistrationError> {
 #[test]
 fn builtin_extensions_declare_their_discovery_features() -> Result<(), RegistrationError> {
     let mut extensions = TestExtensions::default();
-    for factory in super::builtin() {
+    for factory in super::builtin(env!("CARGO_PKG_VERSION")) {
         extensions.register_factory(factory)?;
     }
 

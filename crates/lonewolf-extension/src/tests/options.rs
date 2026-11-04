@@ -142,7 +142,7 @@ fn factory_names_share_instance_registration_checks() -> TestResult {
 #[test]
 fn invalid_builtin_options_identify_the_host_and_extension() -> TestResult {
     let mut catalog = TestExtensions::default();
-    for factory in crate::builtin() {
+    for factory in crate::builtin(env!("CARGO_PKG_VERSION")) {
         catalog.register_factory(factory)?;
     }
     for (name, key) in [
@@ -205,7 +205,7 @@ fn invalid_builtin_options_identify_the_host_and_extension() -> TestResult {
 #[test]
 fn options_require_an_enabled_known_extension() -> TestResult {
     let mut catalog = TestExtensions::default();
-    for factory in crate::builtin() {
+    for factory in crate::builtin(env!("CARGO_PKG_VERSION")) {
         catalog.register_factory(factory)?;
     }
     for (name, names, expected) in [
@@ -238,6 +238,16 @@ fn options_require_an_enabled_known_extension() -> TestResult {
             "ping",
             vec!["disco".into()],
             RegistrationError::OptionsWithoutExtension("ping".into()),
+        ),
+        (
+            "version",
+            vec![],
+            RegistrationError::OptionsWithoutExtension("version".into()),
+        ),
+        (
+            "version",
+            vec!["disco".into()],
+            RegistrationError::OptionsWithoutExtension("version".into()),
         ),
         (
             "vcard",
@@ -442,7 +452,7 @@ fn option_errors_preserve_display_and_source() {
 #[test]
 fn disco_rejects_host_options() -> TestResult {
     let mut catalog = TestExtensions::default();
-    for factory in crate::builtin() {
+    for factory in crate::builtin(env!("CARGO_PKG_VERSION")) {
         catalog.register_factory(factory)?;
     }
     let options = BTreeMap::from([("disco".into(), toml::from_str("x = 1")?)]);
@@ -475,7 +485,7 @@ fn carbons_rejects_host_options() -> TestResult {
 
 fn rejects_shared_options(name: &'static str) -> TestResult {
     let mut catalog = TestExtensions::default();
-    for factory in crate::builtin() {
+    for factory in crate::builtin(env!("CARGO_PKG_VERSION")) {
         catalog.register_factory(factory)?;
     }
     for table in [toml::Table::new(), toml::from_str("x = 1")?] {

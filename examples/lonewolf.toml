@@ -26,7 +26,8 @@
 # Choose extensions included in the server build for this host.
 # This list replaces the default, including when it is empty.
 # Enable disco to let clients discover the features selected for this host.
-# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons"]
+# Remove version to stop telling clients and other servers which Lonewolf release this host runs.
+# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version"]
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
@@ -36,7 +37,7 @@
 # federation = true
 
 # Stored profiles are public to authenticated local users and users of federated domains.
-# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons"]
+# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.
 # Keep roster in this host's extension list when configuring these limits.
@@ -61,6 +62,12 @@
 # Reducing this budget does not delete or hide stored profiles; new documents must fit.
 # [hosts."example.com".vcard]
 # max_bytes = 262_144
+
+# Choose whether software version replies also name the operating system.
+# Publishing it can help attackers target this host, so turn it on only when you need it.
+# Keep version in this host's extension list when configuring this setting.
+# [hosts."example.com".version]
+# show_os = false
 
 # Choose certificate files or automatic certificates for each host except localhost.
 # Localhost uses a new self-signed certificate on each start if you omit its TLS section.

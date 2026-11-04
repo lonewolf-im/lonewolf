@@ -21,7 +21,7 @@ type TestExtensions = Extensions<GlobalChunkAllocator, RedbStorage>;
 
 fn builtin_catalog() -> Result<TestExtensions, RegistrationError> {
     let mut catalog = TestExtensions::default();
-    let factories = crate::builtin();
+    let factories = crate::builtin(env!("CARGO_PKG_VERSION"));
     assert_eq!(
         factories.each_ref().map(|factory| factory.name()),
         [
@@ -30,7 +30,8 @@ fn builtin_catalog() -> Result<TestExtensions, RegistrationError> {
             crate::offline::NAME,
             crate::disco::NAME,
             NAME,
-            crate::carbons::NAME
+            crate::carbons::NAME,
+            crate::version::NAME
         ]
     );
     for factory in factories {

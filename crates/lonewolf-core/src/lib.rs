@@ -194,7 +194,7 @@ fn run_internal(
                     None => return Ok(()),
                 }
                 let storage = stores.storage(account_store)?;
-                for factory in lonewolf_extension::builtin() {
+                for factory in lonewolf_extension::builtin(build.version) {
                     extensions
                         .register_factory(factory)
                         .map_err(RunError::ExtensionCatalog)?;

@@ -80,7 +80,7 @@ fn discovery_advertises_carbons_on_the_server_only() -> TestResult {
         "localhost",
         true,
         &format!(
-            "<feature var='jabber:iq:roster'/><feature var='msgoffline'/>{FEATURES}<feature var='urn:xmpp:ping'/><feature var='vcard-temp'/>"
+            "<feature var='jabber:iq:roster'/><feature var='jabber:iq:version'/><feature var='msgoffline'/>{FEATURES}<feature var='urn:xmpp:ping'/><feature var='vcard-temp'/>"
         ),
     )?;
     discovery(

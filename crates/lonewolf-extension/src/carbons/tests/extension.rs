@@ -14,7 +14,7 @@ type Registry = ExtensionRegistry<GlobalChunkAllocator, RedbStorage>;
 
 pub(super) fn catalog() -> TestResult<Extensions<GlobalChunkAllocator, RedbStorage>> {
     let mut catalog = Extensions::default();
-    for factory in crate::builtin() {
+    for factory in crate::builtin(env!("CARGO_PKG_VERSION")) {
         catalog.register_factory(factory)?;
     }
     Ok(catalog)

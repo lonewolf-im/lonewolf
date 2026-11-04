@@ -15,6 +15,8 @@ mod discovery;
 
 mod ping;
 
+mod version;
+
 mod extensions;
 
 mod services;

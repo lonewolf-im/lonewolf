@@ -546,6 +546,10 @@ mod tests {
     use lonewolf_storage::offline::{
         OfflineError, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage,
     };
+    use lonewolf_storage::private::{
+        PrivateXmlChange, PrivateXmlError, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites,
+        StoredPrivateXml,
+    };
     use lonewolf_storage::roster::{self, RosterReads, RosterWrites};
     use lonewolf_storage::vcard::{StoredVCard, VCardError, VCardQuota, VCardReads, VCardWrites};
     use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
@@ -890,6 +894,32 @@ mod tests {
         }
 
         async fn delete_vcard(&mut self, _: &AccountKey) -> Result<(), VCardError> {
+            unreachable!()
+        }
+    }
+
+    impl PrivateXmlReads for MemoryTransaction {
+        async fn private_xml(
+            &self,
+            _: &AccountKey,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<StoredPrivateXml>, PrivateXmlError> {
+            unreachable!()
+        }
+    }
+
+    impl PrivateXmlWrites for MemoryTransaction {
+        async fn update_private_xml(
+            &mut self,
+            _: &AccountKey,
+            _: &[PrivateXmlChange<'_>],
+            _: PrivateXmlQuota,
+        ) -> Result<(), PrivateXmlError> {
+            unreachable!()
+        }
+
+        async fn clear_private_xml(&mut self, _: &AccountKey) -> Result<(), PrivateXmlError> {
             unreachable!()
         }
     }

@@ -10,6 +10,10 @@ use futures_channel::oneshot;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 use lonewolf_storage::account::*;
 use lonewolf_storage::offline::*;
+use lonewolf_storage::private::{
+    PrivateXmlChange, PrivateXmlError, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites,
+    StoredPrivateXml,
+};
 use lonewolf_storage::roster::*;
 use lonewolf_storage::vcard::{StoredVCard, VCardError, VCardQuota, VCardReads, VCardWrites};
 use lonewolf_storage::{ReadTransaction, StorageError, StorageErrorKind, WriteTransaction};
@@ -198,6 +202,32 @@ impl VCardWrites for FailedCommit {
     }
 
     async fn delete_vcard(&mut self, _: &AccountKey) -> Result<(), VCardError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+}
+
+impl PrivateXmlReads for FailedCommit {
+    async fn private_xml(
+        &self,
+        _: &AccountKey,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<StoredPrivateXml>, PrivateXmlError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+}
+
+impl PrivateXmlWrites for FailedCommit {
+    async fn update_private_xml(
+        &mut self,
+        _: &AccountKey,
+        _: &[PrivateXmlChange<'_>],
+        _: PrivateXmlQuota,
+    ) -> Result<(), PrivateXmlError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+
+    async fn clear_private_xml(&mut self, _: &AccountKey) -> Result<(), PrivateXmlError> {
         unreachable!("commit test cannot use storage operations")
     }
 }

@@ -9,6 +9,7 @@ compile_error!("Lonewolf supports Unix targets only.");
 pub mod account;
 pub mod metrics;
 pub mod offline;
+pub mod private;
 pub mod roster;
 pub mod vcard;
 

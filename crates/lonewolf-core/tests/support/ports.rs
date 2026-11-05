@@ -33,12 +33,15 @@ pub fn reserve_loopback_address(loopback: IpAddr) -> io::Result<(PortReservation
     let socket = reusable_socket((loopback, 0).into())?;
     socket.listen(1)?;
     let listener: TcpListener = socket.into();
-    let address = listener.local_addr()?;
-    let keeper = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+    // A fork can retain the auxiliary listener, so it must not own the reserved port.
+    let socket = reusable_socket((loopback, 0).into())?;
+    socket.connect_timeout(&listener.local_addr()?.into(), Duration::from_secs(5))?;
+    let keeper: TcpStream = socket.into();
+    let address = keeper.local_addr()?;
     let (accepted, _) = listener.accept()?;
-    // The reservation carries no data and must not leave its port in TIME_WAIT.
+    // Forked children can retain either endpoint, so both use abortive close.
     socket2::SockRef::from(&accepted).set_linger(Some(Duration::ZERO))?;
-    // An established connection retains the exact endpoint without keeping a listener alive.
+    socket2::SockRef::from(&keeper).set_linger(Some(Duration::ZERO))?;
     let reservation = PortReservation {
         _accepted: accepted,
         _keeper: keeper,

@@ -16,7 +16,6 @@ use lonewolf_acme::{StateStore, StoredAccount, StoredHost};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use rustls::{ClientConfig, SupportedProtocolVersion};
-use socket2::Socket;
 
 use super::readiness::ReadinessSocket;
 use super::{Client, FakeAcmeCa, PASSWORD, PlainClient, TIMEOUT, TLS_NAMESPACE, TestResult, tls};
@@ -34,9 +33,7 @@ pub struct AcmeServer {
     pub tls: Arc<ClientConfig>,
     pub roots: rustls::RootCertStore,
     pub directory_url: String,
-    // Held for the fixture lifetime so released ports are never reassigned between server runs.
-    _address_reservation: Socket,
-    _challenge_reservation: Socket,
+    _challenge_reservation: ports::PortReservation,
     pub launch_count: usize,
     pub setup_retries: usize,
     pub setup_failures: Vec<SetupFailure>,
@@ -85,7 +82,7 @@ fn retryable_bind_failure(
 impl AcmeServer {
     pub fn configure(ca: &FakeAcmeCa, hosts: &str, extra: &str) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
-        let (address_reservation, address) = ports::reserve_listener_address()?;
+        let address = "127.0.0.1:0".parse()?;
         let (challenge_reservation, challenge) = ports::reserve_listener_address()?;
         fs::write(
             directory.path().join("lonewolf.toml"),
@@ -125,7 +122,6 @@ ca_certificates_path = {:?}
             tls,
             roots,
             directory_url: ca.directory_url(),
-            _address_reservation: address_reservation,
             _challenge_reservation: challenge_reservation,
             launch_count: 0,
             setup_retries: 0,
@@ -205,7 +201,11 @@ ca_certificates_path = {:?}
                 format!("ACME manager did not park at generation {generation}: {error}").into()
             })
     }
-    pub fn reserve_listener(&mut self, reservation: Socket, address: SocketAddr) -> TestResult {
+    pub fn reserve_listener(
+        &mut self,
+        reservation: ports::PortReservation,
+        address: SocketAddr,
+    ) -> TestResult {
         self.retarget(address)?;
         self._challenge_reservation = reservation;
         Ok(())

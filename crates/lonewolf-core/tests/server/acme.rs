@@ -991,7 +991,13 @@ fn sigterm(stage: AcmeStage) -> TestResult {
     let ca = FakeAcmeCa::start()?;
     ca.set_fault(stage, AcmeFault::Hold);
     let mut server = C2sSuite::managed(&ca)?;
+    let (_reservation, address) = ports::reserve_listener_address()?;
+    server.replace_config(&server.config()?.replace(
+        "address = \"127.0.0.1:0\"",
+        &format!("address = \"{address}\""),
+    ))?;
     server.start(&ca)?;
+    assert_eq!(server.address, address);
     ca.wait_for(stage)?;
     let start = std::time::Instant::now();
     assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());

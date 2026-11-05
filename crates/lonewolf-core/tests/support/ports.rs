@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -20,26 +20,27 @@ fn reusable_socket(address: SocketAddr) -> io::Result<Socket> {
     Ok(socket)
 }
 
-pub fn reserve_listener_address() -> io::Result<(Socket, SocketAddr)> {
+pub struct PortReservation {
+    _accepted: TcpStream,
+    _keeper: TcpStream,
+}
+
+pub fn reserve_listener_address() -> io::Result<(PortReservation, SocketAddr)> {
     reserve_loopback_address(Ipv4Addr::LOCALHOST.into())
 }
 
-pub fn reserve_loopback_address(loopback: IpAddr) -> io::Result<(Socket, SocketAddr)> {
-    let wildcard: IpAddr = if loopback.is_ipv6() {
-        Ipv6Addr::UNSPECIFIED.into()
-    } else {
-        Ipv4Addr::UNSPECIFIED.into()
+pub fn reserve_loopback_address(loopback: IpAddr) -> io::Result<(PortReservation, SocketAddr)> {
+    let socket = reusable_socket((loopback, 0).into())?;
+    socket.listen(1)?;
+    let listener: TcpListener = socket.into();
+    let address = listener.local_addr()?;
+    let keeper = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+    let (accepted, _) = listener.accept()?;
+    // An established connection retains the exact endpoint without keeping a listener alive.
+    let reservation = PortReservation {
+        _accepted: accepted,
+        _keeper: keeper,
     };
-    // A wildcard reservation excludes automatic port allocation without taking the exact endpoint.
-    let reservation = reusable_socket((wildcard, 0).into())?;
-    let port = reservation
-        .local_addr()?
-        .as_socket()
-        .ok_or_else(|| io::Error::other("missing reservation address"))?
-        .port();
-    let address = SocketAddr::new(loopback, port);
-    // Hosts without this loopback address fail here instead of when the server binds it.
-    reusable_socket(address)?;
     Ok((reservation, address))
 }
 

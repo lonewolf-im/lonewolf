@@ -27,14 +27,23 @@ fn bind_reusable_socket(address: SocketAddr) -> io::Result<Socket> {
     Ok(socket)
 }
 
-fn reserve_listener_address() -> io::Result<(Socket, SocketAddr)> {
-    // A wildcard reservation excludes automatic port allocation without taking the exact endpoint.
-    let reservation = bind_reusable_socket((Ipv4Addr::UNSPECIFIED, 0).into())?;
-    let address = reservation
-        .local_addr()?
-        .as_socket()
-        .ok_or_else(|| io::Error::other("missing reservation address"))?;
-    Ok((reservation, (Ipv4Addr::LOCALHOST, address.port()).into()))
+struct PortReservation {
+    _accepted: StdStream,
+    _keeper: StdStream,
+}
+
+fn reserve_listener_address() -> io::Result<(PortReservation, SocketAddr)> {
+    let socket = bind_reusable_listener((Ipv4Addr::LOCALHOST, 0).into())?;
+    let listener: StdListener = socket.into();
+    let address = listener.local_addr()?;
+    let keeper = StdStream::connect_timeout(&address, Duration::from_secs(5))?;
+    let (accepted, _) = listener.accept()?;
+    // An established connection retains the exact endpoint without keeping a listener alive.
+    let reservation = PortReservation {
+        _accepted: accepted,
+        _keeper: keeper,
+    };
+    Ok((reservation, address))
 }
 
 fn bind_reusable_listener(address: SocketAddr) -> io::Result<Socket> {
@@ -81,6 +90,11 @@ async fn bind_released_listener(address: SocketAddr, deadline: Instant) -> io::R
 fn release_probe_rejects_a_live_listener_and_waits_for_delayed_release() -> TestResult {
     Runtime::new()?.block_on(async {
         let (_reservation, address) = reserve_listener_address()?;
+        let exclusive = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        assert_eq!(
+            exclusive.bind(&address.into()).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
         let listener = bind_reusable_listener(address)?;
         let deadline = Instant::now() + Duration::from_millis(20);
         assert_eq!(

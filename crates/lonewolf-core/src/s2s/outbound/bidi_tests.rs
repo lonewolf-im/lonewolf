@@ -41,6 +41,8 @@ impl RefusedEndpoint {
         let address = listener.local_addr()?;
         let keeper = TcpStream::connect_timeout(&address, remaining(deadline)?)?;
         let (accepted, _) = listener.accept()?;
+        // The reservation carries no data and must not leave its port in TIME_WAIT.
+        socket2::SockRef::from(&accepted).set_linger(Some(Duration::ZERO))?;
         // A bound, non-listening socket can drop connection attempts on macOS.
         drop(listener);
         let endpoint = Self {

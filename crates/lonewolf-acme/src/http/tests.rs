@@ -23,7 +23,9 @@ const AUTHORIZATION: &str =
 fn bind_reusable_socket(address: SocketAddr) -> io::Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
-    socket.bind(&address.into())?;
+    socket
+        .bind(&address.into())
+        .map_err(|e| io::Error::new(e.kind(), format!("bind {address}: {e}")))?;
     Ok(socket)
 }
 
@@ -36,8 +38,13 @@ fn reserve_listener_address() -> io::Result<(PortReservation, SocketAddr)> {
     let socket = bind_reusable_listener((Ipv4Addr::LOCALHOST, 0).into())?;
     let listener: StdListener = socket.into();
     let address = listener.local_addr()?;
-    let keeper = StdStream::connect_timeout(&address, Duration::from_secs(5))?;
-    let (accepted, _) = listener.accept()?;
+    let keeper = StdStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|e| io::Error::new(e.kind(), format!("connect {address}: {e}")))?;
+    let (accepted, _) = listener
+        .accept()
+        .map_err(|e| io::Error::new(e.kind(), format!("accept {address}: {e}")))?;
+    // The reservation carries no data and must not leave its port in TIME_WAIT.
+    socket2::SockRef::from(&accepted).set_linger(Some(Duration::ZERO))?;
     // An established connection retains the exact endpoint without keeping a listener alive.
     let reservation = PortReservation {
         _accepted: accepted,
@@ -48,7 +55,9 @@ fn reserve_listener_address() -> io::Result<(PortReservation, SocketAddr)> {
 
 fn bind_reusable_listener(address: SocketAddr) -> io::Result<Socket> {
     let socket = bind_reusable_socket(address)?;
-    socket.listen(128)?;
+    socket
+        .listen(128)
+        .map_err(|e| io::Error::new(e.kind(), format!("listen {address}: {e}")))?;
     Ok(socket)
 }
 
@@ -89,7 +98,7 @@ async fn bind_released_listener(address: SocketAddr, deadline: Instant) -> io::R
 #[test]
 fn release_probe_rejects_a_live_listener_and_waits_for_delayed_release() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (_reservation, address) = reserve_listener_address()?;
+        let (reservation, address) = reserve_listener_address()?;
         let exclusive = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         assert_eq!(
             exclusive.bind(&address.into()).unwrap_err().kind(),
@@ -113,7 +122,17 @@ fn release_probe_rejects_a_live_listener_and_waits_for_delayed_release() -> Test
             },
         )
         .await;
-        let _replacement = replacement?;
+        drop(replacement?);
+        // Keep the endpoint bound; Linux rechecks conflicts when listen starts.
+        let released = bind_reusable_socket(address)?;
+        released.set_reuse_address(false)?;
+        drop(reservation);
+        released.listen(128).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("listen {address} after reservation cleanup: {error}"),
+            )
+        })?;
         Ok(())
     })
 }

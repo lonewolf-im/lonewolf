@@ -24,6 +24,8 @@ pub(crate) fn reserve_listener_address() -> io::Result<(PortReservation, SocketA
     let address = listener.local_addr()?;
     let keeper = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
     let (accepted, _) = listener.accept()?;
+    // The reservation carries no data and must not leave its port in TIME_WAIT.
+    socket2::SockRef::from(&accepted).set_linger(Some(Duration::ZERO))?;
     // An established connection retains the exact endpoint without keeping a listener alive.
     let reservation = PortReservation {
         _accepted: accepted,
@@ -64,7 +66,7 @@ pub(crate) async fn bind_released_listener(
 fn release_probe_rejects_a_live_listener_and_waits_for_delayed_release()
 -> Result<(), Box<dyn std::error::Error>> {
     compio::runtime::Runtime::new()?.block_on(async {
-        let (_reservation, address) = reserve_listener_address()?;
+        let (reservation, address) = reserve_listener_address()?;
         let exclusive = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         assert_eq!(
             exclusive.bind(&address.into()).unwrap_err().kind(),
@@ -88,7 +90,17 @@ fn release_probe_rejects_a_live_listener_and_waits_for_delayed_release()
             },
         )
         .await;
-        let _replacement = replacement?;
+        drop(replacement?);
+        // Keep the endpoint bound; Linux rechecks conflicts when listen starts.
+        let released = bind_reusable_socket(address)?;
+        released.set_reuse_address(false)?;
+        drop(reservation);
+        released.listen(128).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("listen {address} after reservation cleanup: {error}"),
+            )
+        })?;
         Ok(())
     })
 }

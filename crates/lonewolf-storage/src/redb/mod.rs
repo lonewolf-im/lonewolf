@@ -18,7 +18,7 @@ use lonewolf_util::blocking::BlockingExecutor;
 
 use crate::metrics::{StoreMetrics, StoreOperation};
 use crate::storage::{ReadTransaction, Storage, WriteTransaction};
-use crate::{StorageError, StorageErrorKind, account, offline, roster, vcard};
+use crate::{StorageError, StorageErrorKind, account, offline, private, roster, vcard};
 
 mod error;
 mod jid;
@@ -129,6 +129,7 @@ fn initialize(database: &Database) -> Result<ScramDecoy, StorageError> {
     roster::redb::initialize(&transaction)?;
     offline::redb::initialize(&transaction)?;
     vcard::redb::initialize(&transaction)?;
+    private::redb::initialize(&transaction)?;
     transaction.commit().map_err(commit_error)?;
     Ok(decoy)
 }

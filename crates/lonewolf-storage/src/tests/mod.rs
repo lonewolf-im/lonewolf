@@ -2,6 +2,7 @@
 
 pub(crate) mod account;
 pub(crate) mod offline;
+pub(crate) mod private;
 pub(crate) mod roster;
 pub(crate) mod transaction;
 pub(crate) mod vcard;
@@ -211,6 +212,14 @@ macro_rules! storage_contract_tests {
             vcard::vcard_hard_ceiling_applies_even_with_an_oversized_quota,
             vcard::vcard_missing_accounts_reject_replacement_and_allow_repeated_removal,
             vcard::vcard_concurrent_writers_observe_only_complete_documents,
+            private::private_xml_round_trip_isolates_owners_namespaces_and_names,
+            private::private_xml_updates_apply_in_order_and_the_last_change_wins,
+            private::private_xml_quota_counts_items_and_bytes_and_rejections_change_nothing,
+            private::private_xml_over_quota_accounts_can_shrink_but_not_grow,
+            private::private_xml_large_elements_remain_readable_and_replaceable_after_quota_reduction,
+            private::private_xml_missing_accounts_reject_updates_and_allow_repeated_clearing,
+            private::private_xml_clear_removes_only_one_owner,
+            private::private_xml_snapshots_ignore_uncommitted_and_dropped_updates,
             transaction::uncommitted_writes_are_visible_only_inside_their_transaction,
             transaction::dropping_a_write_transaction_aborts_every_write,
             transaction::commit_persists_account_and_roster_writes_together,

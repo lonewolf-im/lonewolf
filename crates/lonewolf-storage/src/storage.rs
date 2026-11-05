@@ -7,6 +7,7 @@ use lonewolf_auth::server::ScramDecoy;
 use crate::StorageError;
 use crate::account::{AccountReads, AccountWrites};
 use crate::offline::{OfflineReads, OfflineWrites};
+use crate::private::{PrivateXmlReads, PrivateXmlWrites};
 use crate::roster::{RosterReads, RosterWrites};
 use crate::vcard::{VCardReads, VCardWrites};
 
@@ -31,7 +32,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
 }
 
 pub trait ReadTransaction:
-    AccountReads + OfflineReads + RosterReads + VCardReads + Send + Sync
+    AccountReads + OfflineReads + PrivateXmlReads + RosterReads + VCardReads + Send + Sync
 {
 }
 
@@ -40,7 +41,7 @@ pub trait ReadTransaction:
 ///
 /// Dropping the transaction without committing aborts every write in it.
 pub trait WriteTransaction:
-    ReadTransaction + AccountWrites + OfflineWrites + RosterWrites + VCardWrites
+    ReadTransaction + AccountWrites + OfflineWrites + PrivateXmlWrites + RosterWrites + VCardWrites
 {
     /// Persists every write made through this transaction.
     ///

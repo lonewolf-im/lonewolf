@@ -24,6 +24,8 @@ use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY};
 use crate::account::{AccountReads, AccountWrites};
 use crate::offline::redb::{MESSAGES, SEQUENCES};
 use crate::offline::{OfflineReads, OfflineWrites};
+use crate::private::redb::ELEMENTS;
+use crate::private::{PrivateXmlChange, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites};
 use crate::roster::redb::{ITEMS, PENDING, VERSIONS};
 use crate::roster::{RosterReads, RosterSubscription, RosterWrites, SubscriptionState};
 use crate::tests::{
@@ -70,7 +72,7 @@ fn fresh_database_initializes_all_tables() -> TestResult {
     let storage = RedbStorage::new(database)?;
     let transaction = storage.as_ref().begin_read()?;
     let tables: Vec<_> = transaction.list_tables()?.collect();
-    assert_eq!(tables.len(), 8);
+    assert_eq!(tables.len(), 9);
     for expected in [
         ACCOUNTS.name(),
         DECOY_SECRET.name(),
@@ -80,6 +82,7 @@ fn fresh_database_initializes_all_tables() -> TestResult {
         MESSAGES.name(),
         SEQUENCES.name(),
         VCARDS.name(),
+        ELEMENTS.name(),
     ] {
         assert!(
             tables.iter().any(|table| table.name() == expected),
@@ -111,7 +114,7 @@ fn unknown_tables_are_left_untouched() -> TestResult {
     let reinitialized = initialize(storage.as_ref())?;
     assert_eq!(decoy_salt(&reinitialized)?, before);
     let transaction = storage.as_ref().begin_read()?;
-    assert_eq!(transaction.list_tables()?.count(), 9);
+    assert_eq!(transaction.list_tables()?.count(), 10);
     assert_eq!(
         transaction
             .open_table(METADATA)?
@@ -150,7 +153,7 @@ fn existing_database_gains_offline_tables_without_changing_accounts() -> TestRes
         Ok::<_, Box<dyn Error>>(())
     })?;
     let reader = storage.as_ref().begin_read()?;
-    assert_eq!(reader.list_tables()?.count(), 8);
+    assert_eq!(reader.list_tables()?.count(), 9);
     reader.open_table(MESSAGES)?;
     reader.open_table(SEQUENCES)?;
     Ok(())
@@ -454,6 +457,25 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         assert_worker_threads(&backend)?;
         assert!(writer.vcard(&alice).await?.is_some());
         assert_worker_threads(&backend)?;
+        writer
+            .update_private_xml(
+                &alice,
+                &[PrivateXmlChange {
+                    namespace: "urn:worker",
+                    name: "worker",
+                    xml: Some("worker private XML"),
+                }],
+                PrivateXmlQuota::default(),
+            )
+            .await?;
+        assert_worker_threads(&backend)?;
+        assert!(
+            writer
+                .private_xml(&alice, "urn:worker", "worker")
+                .await?
+                .is_some()
+        );
+        assert_worker_threads(&backend)?;
         assert_eq!(
             writer.accounts_after(None, NonZeroUsize::MAX).await?.len(),
             1
@@ -542,6 +564,8 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
         writer.delete_account(&alice).await?;
         assert_worker_threads(&backend)?;
         writer.delete_vcard(&alice).await?;
+        assert_worker_threads(&backend)?;
+        writer.clear_private_xml(&alice).await?;
         assert_worker_threads(&backend)?;
         writer.commit().await?;
         assert_worker_threads(&backend)?;
@@ -875,6 +899,7 @@ fn existing_database_gains_only_an_empty_vcard_table_without_rewriting_other_row
     })?;
     let transaction = storage.as_ref().begin_write()?;
     transaction.delete_table(VCARDS)?;
+    transaction.delete_table(ELEMENTS)?;
     transaction.open_table(METADATA)?.insert("unknown", 42)?;
     transaction.commit()?;
     let before = storage.as_ref().begin_read()?;
@@ -936,8 +961,9 @@ fn existing_database_gains_only_an_empty_vcard_table_without_rewriting_other_row
     let expected = snapshot(&before)?;
     initialize(storage.as_ref())?;
     let after = storage.as_ref().begin_read()?;
-    assert_eq!(after.list_tables()?.count(), 9);
+    assert_eq!(after.list_tables()?.count(), 10);
     assert!(after.open_table(VCARDS)?.is_empty()?);
+    assert!(after.open_table(ELEMENTS)?.is_empty()?);
     assert_eq!(snapshot(&after)?, expected);
     assert_eq!(snapshot(&before)?, expected);
     Ok(())

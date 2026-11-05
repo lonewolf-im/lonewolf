@@ -36,6 +36,8 @@ pub fn reserve_loopback_address(loopback: IpAddr) -> io::Result<(PortReservation
     let address = listener.local_addr()?;
     let keeper = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
     let (accepted, _) = listener.accept()?;
+    // The reservation carries no data and must not leave its port in TIME_WAIT.
+    socket2::SockRef::from(&accepted).set_linger(Some(Duration::ZERO))?;
     // An established connection retains the exact endpoint without keeping a listener alive.
     let reservation = PortReservation {
         _accepted: accepted,

@@ -44,10 +44,11 @@ pub struct FakeDns {
 
 impl FakeDns {
     pub fn start() -> TestResult<Self> {
-        let (udp, tcp) = loop {
-            let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-            match TcpListener::bind(udp.local_addr()?) {
-                Ok(tcp) => break (udp, tcp),
+        let (tcp, udp) = loop {
+            // UDP can select a port held by a TCP reservation.
+            let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            match UdpSocket::bind(tcp.local_addr()?) {
+                Ok(udp) => break (tcp, udp),
                 Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
                 Err(error) => return Err(error.into()),
             }

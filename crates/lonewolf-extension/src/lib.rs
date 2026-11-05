@@ -17,6 +17,7 @@ pub mod account;
 pub mod archive;
 pub mod carbons;
 pub mod delivery;
+mod detached;
 pub mod disco;
 pub mod discovery;
 pub mod iq;

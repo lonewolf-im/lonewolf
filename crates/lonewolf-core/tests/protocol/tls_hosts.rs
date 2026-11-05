@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[allow(dead_code)]
+#[path = "../support/ports.rs"]
+mod ports;
+
 use crate::support::ALTERNATE_PASSWORD;
 
 use std::io::Write;
@@ -186,10 +190,10 @@ fn pending_managed_host_rejects_starttls_before_proceed_without_disrupting_file_
     let directory_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     directory_listener.set_nonblocking(true)?;
     let directory_url = format!("https://{}/directory", directory_listener.local_addr()?);
-    let http_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let (_http_reservation, http_address) = ports::reserve_listener_address()?;
     let hosts = format!(
         "[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n[letsencrypt]\nlisten = ['{}']\nstate_path = 'acme.redb'\ndirectory_url = '{directory_url}'",
-        http_reservation.local_addr()?,
+        http_address,
     );
     let mut suite = C2sSuite::with_hosts_and_setup(&hosts, |directory| {
         let not_before_unix = std::time::SystemTime::now()
@@ -219,7 +223,6 @@ fn pending_managed_host_rejects_starttls_before_proceed_without_disrupting_file_
                 .await?;
             Ok::<(), Box<dyn std::error::Error>>(())
         })?;
-        drop(http_reservation);
         Ok(())
     })?;
     let mut pending = suite.tcp_client()?;

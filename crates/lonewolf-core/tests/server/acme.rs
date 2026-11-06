@@ -370,7 +370,7 @@ fn profile_change_renews_early_then_follows_the_new_certificate_schedule() -> Te
 fn short_lifetime_renewal_retries_stay_within_the_lifetime_cap() -> TestResult {
     let ca = FakeAcmeCa::start()?;
     ca.profiles(&[("shortlived", 576_000 - 60)]);
-    ca.set_fault(AcmeStage::Ari, AcmeFault::Hold);
+    ca.set_fault(AcmeStage::Ari, AcmeFault::Status(503, 1));
     let mut server = C2sSuite::configure(
         &ca,
         "[hosts.\"xmpp.example.test\".tls]\nprovider='letsencrypt'",
@@ -426,6 +426,8 @@ fn short_lifetime_renewal_retries_stay_within_the_lifetime_cap() -> TestResult {
     let stored = record.certificate.ok_or("certificate")?;
     assert_eq!(stored.material.chain[0], a);
     assert_eq!(stored.profile.as_deref(), Some("shortlived"));
+    assert_eq!(stored.renew_at_unix, stored.fallback_at_unix);
+    assert!(stored.ari_window.is_none());
     assert!(ca.counts().errors.is_empty(), "{:?}", ca.counts());
     Ok(())
 }

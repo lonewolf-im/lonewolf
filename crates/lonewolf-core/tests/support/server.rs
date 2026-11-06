@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lonewolf_core::test_support::spawn_child;
 use parking_lot::{Condvar as PlCondvar, Mutex as PlMutex};
 use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
@@ -39,8 +40,9 @@ impl C2sSuitePermit {
 
 fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> TestResult<Child> {
     super::federation::remove_shutdown_receipt(directory)?;
+    let mut command = Command::new(std::env::current_exe()?);
     readiness
-        .configure(&mut Command::new(std::env::current_exe()?))
+        .configure(&mut command)
         .args([
             "--exact",
             "support::server::server_process",
@@ -51,9 +53,8 @@ fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> TestResult<Ch
         .current_dir(directory)
         .env("LONEWOLF_WORKER_COUNT", "2")
         .stdout(Stdio::null())
-        .stderr(fs::File::create(directory.join("server.log"))?)
-        .spawn()
-        .map_err(|error| super::context("spawn protocol server", error.into()))
+        .stderr(fs::File::create(directory.join("server.log"))?);
+    spawn_child(&mut command).map_err(|error| super::context("spawn protocol server", error.into()))
 }
 
 impl Drop for C2sSuitePermit {

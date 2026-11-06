@@ -14,6 +14,10 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use parking_lot::Mutex as PlMutex;
 
+mod process;
+
+pub use process::spawn_child;
+
 static S2S_REVALIDATION_MILLIS: AtomicU64 = AtomicU64::new(0);
 static S2S_CRL_PUBLIC_ONLY: AtomicBool = AtomicBool::new(false);
 

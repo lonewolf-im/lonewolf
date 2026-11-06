@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use futures_executor::block_on;
 use lonewolf_acme::test_support::{ClockMode, ClockSnapshot, Parked};
 use lonewolf_acme::{StateStore, StoredAccount, StoredHost};
+use lonewolf_core::test_support::spawn_child;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use rustls::{ClientConfig, SupportedProtocolVersion};
@@ -154,15 +155,14 @@ ca_certificates_path = {:?}
             self.launch_count += 1;
             return Ok(());
         }
-        self.child = Some(
-            self.readiness
-                .configure(&mut Command::new(env!("CARGO_BIN_EXE_lonewolf")))
-                .current_dir(self.path())
-                .env("LONEWOLF_WORKER_COUNT", "2")
-                .stdout(Stdio::null())
-                .stderr(fs::File::create(self.path().join("server.log"))?)
-                .spawn()?,
-        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lonewolf"));
+        self.readiness
+            .configure(&mut command)
+            .current_dir(self.path())
+            .env("LONEWOLF_WORKER_COUNT", "2")
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(self.path().join("server.log"))?);
+        self.child = Some(spawn_child(&mut command)?);
         self.launch_count += 1;
         Ok(())
     }

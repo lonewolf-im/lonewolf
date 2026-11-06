@@ -18,6 +18,9 @@ use lonewolf_auth::scram::{
 };
 use lonewolf_storage::account::{AccountKey, AccountReads, AccountWrites, NewAccount};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::private::{
+    PrivateXmlChange, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites,
+};
 use lonewolf_storage::vcard::{MAX_VCARD_BYTES, VCardQuota, VCardReads, VCardWrites};
 use lonewolf_storage::{RedbStorage, Storage, StorageErrorKind, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
@@ -42,6 +45,9 @@ const VCARDS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_vcar
 const MESSAGES: TableDefinition<(&str, u64), &[u8]> =
     TableDefinition::new("lonewolf_offline_messages");
 const SEQUENCES: TableDefinition<&str, u64> = TableDefinition::new("lonewolf_offline_sequences");
+const PRIVATE_XML: TableDefinition<(&str, &str, &str), &[u8]> =
+    TableDefinition::new("lonewolf_private_xml");
+const PREFS: &str = "<prefs xmlns='urn:test:prefs' xml:lang='' xml:space='default'>alice</prefs>";
 
 fn run_test(test: impl Future<Output = TestResult>) -> TestResult {
     Runtime::new()?.block_on(timeout(Duration::from_secs(5), test))?
@@ -453,6 +459,151 @@ fn submitted_deletion_commit_failure_remains_typed_and_recovery_keeps_state_atom
                 CARD
             );
         }
+        Ok(())
+    })
+}
+
+async fn seed_private_xml(storage: &RedbStorage, owner: &AccountKey) -> TestResult {
+    let mut transaction = storage.begin_write().await?;
+    transaction
+        .update_private_xml(
+            owner,
+            &[
+                PrivateXmlChange {
+                    namespace: "urn:test:prefs",
+                    name: "prefs",
+                    xml: Some(PREFS),
+                },
+                PrivateXmlChange {
+                    namespace: "storage:bookmarks",
+                    name: "storage",
+                    xml: Some(
+                        "<storage xmlns='storage:bookmarks' xml:lang='' xml:space='default'/>",
+                    ),
+                },
+            ],
+            PrivateXmlQuota::default(),
+        )
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+#[test]
+fn disabled_extension_cleanup_removes_only_the_deleted_owners_private_xml() -> TestResult {
+    run_test(async {
+        let storage = storage(InMemoryBackend::new())?;
+        let router = router()?;
+        let handle = router.handle();
+        let alice = key("Alice@LOCALHOST")?;
+        let bob = key("bob@localhost")?;
+        seed(&storage, &alice, CARD).await?;
+        seed(&storage, &bob, OTHER_CARD).await?;
+        seed_private_xml(&storage, &alice).await?;
+        seed_private_xml(&storage, &bob).await?;
+        let before = storage.begin_read().await?;
+
+        assert!(delete(&alice, &storage, &handle, &GlobalChunkAllocator).await?);
+
+        assert!(
+            before
+                .private_xml(&alice, "urn:test:prefs", "prefs")
+                .await?
+                .is_some()
+        );
+        let after = storage.begin_read().await?;
+        for (namespace, name) in [
+            ("urn:test:prefs", "prefs"),
+            ("storage:bookmarks", "storage"),
+        ] {
+            assert!(after.private_xml(&alice, namespace, name).await?.is_none());
+            assert!(after.private_xml(&bob, namespace, name).await?.is_some());
+        }
+        let raw = storage.as_ref().begin_read()?;
+        assert_eq!(raw.open_table(PRIVATE_XML)?.len()?, 2);
+        let mut transaction = storage.begin_write().await?;
+        transaction.create_account(new_account(&alice)).await?;
+        transaction.commit().await?;
+        assert!(
+            storage
+                .begin_read()
+                .await?
+                .private_xml(&alice, "urn:test:prefs", "prefs")
+                .await?
+                .is_none()
+        );
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn missing_account_cleanup_removes_orphaned_invalid_and_over_budget_private_xml() -> TestResult {
+    run_test(async {
+        let storage = storage(InMemoryBackend::new())?;
+        let router = router()?;
+        let handle = router.handle();
+        let alice = key("alice@localhost")?;
+        for bytes in [
+            PREFS.as_bytes().to_vec(),
+            b"<not-valid-xml\xff".to_vec(),
+            vec![b'x'; 5_242_881],
+        ] {
+            let transaction = storage.as_ref().begin_write()?;
+            transaction.open_table(PRIVATE_XML)?.insert(
+                (alice.as_str(), "urn:test:prefs", "prefs"),
+                bytes.as_slice(),
+            )?;
+            transaction.commit()?;
+            assert!(!delete(&alice, &storage, &handle, &GlobalChunkAllocator).await?);
+            assert!(
+                storage
+                    .as_ref()
+                    .begin_read()?
+                    .open_table(PRIVATE_XML)?
+                    .is_empty()?
+            );
+        }
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn precommit_private_xml_cleanup_failure_rolls_back_every_other_cleanup() -> TestResult {
+    run_test(async {
+        let storage = storage(InMemoryBackend::new())?;
+        let router = router()?;
+        let handle = router.handle();
+        let alice = key("alice@localhost")?;
+        seed(&storage, &alice, CARD).await?;
+        let transaction = storage.as_ref().begin_write()?;
+        transaction.delete_table(PRIVATE_XML)?;
+        let wrong_type: TableDefinition<&str, &str> = TableDefinition::new("lonewolf_private_xml");
+        transaction
+            .open_table(wrong_type)?
+            .insert(alice.as_str(), PREFS)?;
+        transaction.commit()?;
+
+        let error = delete(&alice, &storage, &handle, &GlobalChunkAllocator)
+            .await
+            .expect_err("cleanup accepted a wrong table type");
+        assert!(
+            matches!(error, DeleterError::Storage(error) if error.kind() == StorageErrorKind::CorruptData)
+        );
+        let after = storage.begin_read().await?;
+        assert!(after.account(&alice).await?.is_some());
+        assert_eq!(
+            after
+                .vcard(&alice)
+                .await?
+                .ok_or("card changed")?
+                .xml
+                .as_ref(),
+            CARD
+        );
+        assert_eq!(after.offline_count(&alice).await?, 1);
+        router.shutdown().await?;
         Ok(())
     })
 }

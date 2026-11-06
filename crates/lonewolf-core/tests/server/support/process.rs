@@ -8,6 +8,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lonewolf_core::test_support::spawn_child;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
@@ -34,13 +35,14 @@ impl Server {
             format!("[xmpp]\nstanza_pool_size_mib = 8\n{config}"),
         )?;
         let readiness = ReadinessSocket::bind()?;
-        let child = readiness
-            .configure(&mut Command::new(env!("CARGO_BIN_EXE_lonewolf")))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lonewolf"));
+        readiness
+            .configure(&mut command)
             .current_dir(directory.path())
             .env("LONEWOLF_WORKER_COUNT", workers.to_string())
             .stdout(Stdio::null())
-            .stderr(fs::File::create(directory.path().join("server.log"))?)
-            .spawn()?;
+            .stderr(fs::File::create(directory.path().join("server.log"))?);
+        let child = spawn_child(&mut command)?;
         Ok(Self {
             child,
             directory,

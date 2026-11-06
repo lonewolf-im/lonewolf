@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lonewolf_acme::test_support::{ClockMode, ClockSnapshot, Parked, TestClock};
+use lonewolf_core::test_support::spawn_child;
 
 use super::readiness::ReadinessSocket;
 use super::{TIMEOUT, TestResult};
@@ -140,8 +141,9 @@ pub fn spawn(
     let (parent, child) = UnixStream::pair()?;
     parent.set_read_timeout(Some(TIMEOUT))?;
     parent.set_write_timeout(Some(TIMEOUT))?;
-    let mut process = readiness
-        .configure(&mut Command::new(std::env::current_exe()?))
+    let mut command = Command::new(std::env::current_exe()?);
+    readiness
+        .configure(&mut command)
         .args([
             "--exact",
             "support::clock::server_process",
@@ -153,8 +155,8 @@ pub fn spawn(
         .current_dir(directory)
         .stdin(Stdio::from(OwnedFd::from(child)))
         .stdout(Stdio::null())
-        .stderr(fs::File::create(directory.join("server.log"))?)
-        .spawn()?;
+        .stderr(fs::File::create(directory.join("server.log"))?);
+    let mut process = spawn_child(&mut command)?;
     let mut control = ClockControl { socket: parent };
     let initialized = (|| {
         let mut frame = Frame::new(INIT);

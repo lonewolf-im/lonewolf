@@ -5,6 +5,7 @@ pub mod artifacts;
 use lonewolf_bench::config::{
     MeasurementConfig, MetricsConfig, RunConfig, ScenarioConfig, TargetConfig,
 };
+use lonewolf_core::test_support::spawn_child;
 use std::{
     ffi::OsStr,
     fs::{self, OpenOptions},
@@ -69,10 +70,10 @@ impl Process {
     pub fn spawn_command(command: &mut Command) -> TestResult<Self> {
         let stdout = tempfile::tempfile()?;
         let stderr = tempfile::tempfile()?;
-        let child = command
+        command
             .stdout(Stdio::from(stdout.try_clone()?))
-            .stderr(Stdio::from(stderr.try_clone()?))
-            .spawn()?;
+            .stderr(Stdio::from(stderr.try_clone()?));
+        let child = spawn_child(command)?;
         Ok(Self {
             child,
             stdout,

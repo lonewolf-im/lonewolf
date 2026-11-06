@@ -15,6 +15,8 @@ mod discovery;
 
 mod ping;
 
+mod private;
+
 mod version;
 
 mod extensions;

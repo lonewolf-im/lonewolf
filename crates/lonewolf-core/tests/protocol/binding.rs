@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::support::ALTERNATE_PASSWORD;
+use crate::support::{ALTERNATE_PASSWORD, context};
 
 use super::support::{BIND_NAMESPACE, C2sSuite, OPEN, TestResult};
 
@@ -769,17 +769,26 @@ fn pre_bind_responses_preserve_namespace_and_address_gate_precedence() -> TestRe
             ("to='bad@'", "not-authorized"),
             ("to=''", "not-authorized"),
         ] {
-            let suite = C2sSuite::start()?;
-            suite.create_account("alice", ALTERNATE_PASSWORD)?;
-            let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
+            let suite =
+                C2sSuite::start().map_err(|error| context("start pre-bind server", error))?;
+            suite
+                .create_account("alice", ALTERNATE_PASSWORD)
+                .map_err(|error| context("create pre-bind account", error))?;
+            let mut client = suite
+                .authenticated_client("alice", ALTERNATE_PASSWORD)
+                .map_err(|error| context("authenticate pre-bind client", error))?;
 
             let payload = if envelope.starts_with("type='error' id=") {
                 "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
             } else {
                 ""
             };
-            client.send(&format!("<iq {envelope} {address}>{payload}</iq>"))?;
-            client.expect_stream_error(condition)?;
+            client
+                .send(&format!("<iq {envelope} {address}>{payload}</iq>"))
+                .map_err(|error| context("send pre-bind response", error))?;
+            client
+                .expect_stream_error(condition)
+                .map_err(|error| context("expect pre-bind stream error closure", error))?;
         }
     }
     Ok(())

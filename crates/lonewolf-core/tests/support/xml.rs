@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 use std::io::{BufReader, Cursor, Read, Write};
 
 use quick_xml::events::{BytesStart, Event};
@@ -8,6 +10,28 @@ use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 
 use super::TestResult;
+
+#[derive(Debug)]
+struct OperationError {
+    operation: &'static str,
+    source: Box<dyn Error>,
+}
+
+impl fmt::Display for OperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.operation, self.source)
+    }
+}
+
+impl Error for OperationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub fn context(operation: &'static str, source: Box<dyn Error>) -> Box<dyn Error> {
+    Box::new(OperationError { operation, source })
+}
 
 pub trait CloseTransport: Read + Write {
     fn close_notify(&mut self) -> std::io::Result<()>;
@@ -312,12 +336,17 @@ impl<R: Read> XmlStream<R> {
         R: CloseTransport,
     {
         for _ in 0..=max_stanzas {
-            let error = self.receive()?;
+            let error = self
+                .receive()
+                .map_err(|error| context("receive stream error", error))?;
             if error.namespace == STREAM_NAMESPACE && error.name == "error" {
                 assert_eq!(error.children.len(), 1, "{error:?}");
                 error.child(super::STREAM_ERRORS, condition)?;
-                self.expect_footer()?;
-                return self.complete_close(true);
+                self.expect_footer()
+                    .map_err(|error| context("receive stream footer", error))?;
+                return self
+                    .complete_close(true)
+                    .map_err(|error| context("complete stream error closure", error));
             }
             assert_eq!(error.namespace, "jabber:client", "{error:?}");
             assert_eq!(error.name, "presence", "{error:?}");

@@ -27,6 +27,7 @@ pub mod offline;
 pub mod ping;
 pub mod policy;
 pub mod presence;
+pub mod private;
 pub mod roster;
 pub mod service;
 mod slots;

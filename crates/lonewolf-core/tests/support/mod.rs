@@ -14,6 +14,7 @@ pub mod xml;
 
 pub use client::{Client, PlainClient};
 pub use server::C2sSuite;
+pub use xml::context;
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -66,7 +67,6 @@ impl Signal {
         }
     }
 
-    /// Each raise appends one byte, so the file length counts occurrences.
     pub fn path(self, fixture: &Path) -> PathBuf {
         fixture.join(SIGNAL_DIRECTORY).join(self.file_name())
     }

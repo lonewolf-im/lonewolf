@@ -37,7 +37,7 @@ impl C2sSuitePermit {
     }
 }
 
-fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> std::io::Result<Child> {
+fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> TestResult<Child> {
     super::federation::remove_shutdown_receipt(directory)?;
     readiness
         .configure(&mut Command::new(std::env::current_exe()?))
@@ -53,6 +53,7 @@ fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> std::io::Resu
         .stdout(Stdio::null())
         .stderr(fs::File::create(directory.join("server.log"))?)
         .spawn()
+        .map_err(|error| super::context("spawn protocol server", error.into()))
 }
 
 impl Drop for C2sSuitePermit {

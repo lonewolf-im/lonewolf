@@ -145,12 +145,13 @@ impl<A: ChunkAllocator + Clone + 'static> BidiRegistration<A> {
             );
         }
         for (guard, queue) in launches.into_iter().flatten() {
-            compio::runtime::spawn(guard.run(link::run(
+            compio::runtime::spawn(link::task(
+                guard,
                 Arc::clone(&self.inner),
                 self.router.clone(),
                 queue,
                 0,
-            )))
+            ))
             .detach();
         }
     }

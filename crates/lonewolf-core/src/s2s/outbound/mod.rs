@@ -379,10 +379,13 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         };
         let inner = Arc::clone(&self.inner);
         let router = router.clone();
-        compio::runtime::spawn(
-            task.guard
-                .run(link::run(inner, router, task.queue, task.failures)),
-        )
+        compio::runtime::spawn(link::task(
+            task.guard,
+            inner,
+            router,
+            task.queue,
+            task.failures,
+        ))
         .detach();
         Ok(())
     }

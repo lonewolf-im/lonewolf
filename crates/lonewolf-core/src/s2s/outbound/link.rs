@@ -586,7 +586,21 @@ where
     reason
 }
 
-pub(super) async fn run<A: ChunkAllocator + Clone + 'static>(
+/// Builds the detached task that drives one outbound link.
+///
+/// The link state is boxed so spawning moves only a pointer. Unoptimized builds copy a spawned
+/// future through many frames, and the inline state overflows a worker stack.
+pub(super) fn task<A: ChunkAllocator + Clone + 'static>(
+    guard: WorkGuard,
+    inner: Arc<Inner<A>>,
+    router: RouterHandle<A>,
+    queue: LinkQueue<A>,
+    failures: u32,
+) -> impl Future<Output = ()> + 'static {
+    guard.run(Box::pin(run(inner, router, queue, failures)))
+}
+
+async fn run<A: ChunkAllocator + Clone + 'static>(
     inner: Arc<Inner<A>>,
     router: RouterHandle<A>,
     mut queue: LinkQueue<A>,

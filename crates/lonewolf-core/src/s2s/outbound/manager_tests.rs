@@ -651,3 +651,34 @@ fn eviction_uses_logical_expiry_instead_of_failure_start_time() -> TestResult {
     assert!(state.entries.contains_key(&pair("earlier-start.test")));
     Ok(())
 }
+
+#[test]
+fn spawned_link_tasks_keep_link_state_off_the_stack() -> TestResult {
+    run(async {
+        let remote = manager(S2sLimits::default())?;
+        let router = Router::new(
+            remote.inner.hosts.clone(),
+            LocalRouter::new(GlobalChunkAllocator),
+        )
+        .with_remote(remote.clone());
+        let (_sender, receiver) = async_channel::bounded(1);
+        let task = link::task(
+            remote.inner.work.start(),
+            Arc::clone(&remote.inner),
+            router.handle(),
+            LinkQueue {
+                pair: ("localhost".into(), "remote.test".into()),
+                counters: Arc::new(QueueCounters::default()),
+                receiver: QueueReceiver(receiver),
+                current: None,
+            },
+            0,
+        );
+        let size = std::mem::size_of_val(&task);
+        assert!(size <= 256, "spawned link task is {size} bytes");
+        drop(task);
+        remote.join(Instant::now() + TIMEOUT).await?;
+        router.shutdown().await?;
+        Ok(())
+    })
+}

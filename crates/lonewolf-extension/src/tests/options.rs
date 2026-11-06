@@ -255,6 +255,16 @@ fn options_require_an_enabled_known_extension() -> TestResult {
             RegistrationError::OptionsWithoutExtension("vcard".into()),
         ),
         (
+            "private",
+            vec![],
+            RegistrationError::OptionsWithoutExtension("private".into()),
+        ),
+        (
+            "private",
+            vec!["disco".into()],
+            RegistrationError::OptionsWithoutExtension("private".into()),
+        ),
+        (
             "vcard",
             vec!["disco".into()],
             RegistrationError::OptionsWithoutExtension("vcard".into()),

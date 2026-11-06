@@ -31,7 +31,8 @@ fn builtin_catalog() -> Result<TestExtensions, RegistrationError> {
             crate::disco::NAME,
             NAME,
             crate::carbons::NAME,
-            crate::version::NAME
+            crate::version::NAME,
+            crate::private::NAME
         ]
     );
     for factory in factories {

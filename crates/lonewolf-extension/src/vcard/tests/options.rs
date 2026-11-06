@@ -67,7 +67,7 @@ fn builtin_independent_selection_and_exact_route_constraint_and_discovery_invent
 {
     let mut catalog = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
     let factories = crate::builtin(env!("CARGO_PKG_VERSION"));
-    assert_eq!(factories.len(), 7);
+    assert_eq!(factories.len(), 8);
     assert_eq!(
         factories
             .iter()

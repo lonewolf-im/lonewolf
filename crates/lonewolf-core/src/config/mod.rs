@@ -241,6 +241,7 @@ impl Default for HostConfig {
                 lonewolf_extension::vcard::NAME.into(),
                 lonewolf_extension::carbons::NAME.into(),
                 lonewolf_extension::version::NAME.into(),
+                lonewolf_extension::private::NAME.into(),
             ],
             federation: true,
             options: BTreeMap::new(),

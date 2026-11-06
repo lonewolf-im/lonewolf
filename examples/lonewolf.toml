@@ -27,7 +27,7 @@
 # This list replaces the default, including when it is empty.
 # Enable disco to let clients discover the features selected for this host.
 # Remove version to stop telling clients and other servers which Lonewolf release this host runs.
-# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version"]
+# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"]
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
@@ -37,7 +37,7 @@
 # federation = true
 
 # Stored profiles are public to authenticated local users and users of federated domains.
-# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version"]
+# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.
 # Keep roster in this host's extension list when configuring these limits.
@@ -68,6 +68,16 @@
 # Keep version in this host's extension list when configuring this setting.
 # [hosts."example.com".version]
 # show_os = false
+
+# Adjust how much private XML each account can keep for client settings and legacy bookmarks.
+# Raise these limits when clients store large bookmark lists.
+# The byte budget counts stored XML, including the namespace, language, and whitespace markup that Lonewolf adds.
+# Very large item counts slow down storage writes for all users.
+# Lowering a limit keeps stored data readable, and clients can still shrink or remove it.
+# Keep private in this host's extension list when configuring these limits.
+# [hosts."example.com".private]
+# max_items = 50
+# max_bytes = 2_097_152
 
 # Choose certificate files or automatic certificates for each host except localhost.
 # Localhost uses a new self-signed certificate on each start if you omit its TLS section.

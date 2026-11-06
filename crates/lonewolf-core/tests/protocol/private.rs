@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fs;
+
 use crate::support::{C2sSuite, Client, PASSWORD, TestResult, barrier};
+
+#[path = "../support/private.rs"]
+mod fixtures;
 
 const MARKER: &str = "PRIVATE-XML-MARKER-0049";
 const FORBIDDEN: &str = "This operation requires an omitted destination or your authenticated bare JID without a resource.";
@@ -12,6 +17,13 @@ fn query(children: &str) -> String {
     format!("<query xmlns='jabber:iq:private'>{children}</query>")
 }
 
+fn result_xml(id: &str, from: Option<&str>, to: &str, payload: &str) -> String {
+    let from = from
+        .map(|from| format!(" from='{from}'"))
+        .unwrap_or_default();
+    format!("<iq xmlns='jabber:client' type='result' id='{id}'{from} to='{to}'>{payload}</iq>")
+}
+
 fn expect_result(
     client: &mut Client,
     id: &str,
@@ -19,12 +31,7 @@ fn expect_result(
     to: &str,
     payload: &str,
 ) -> TestResult {
-    let from = from
-        .map(|from| format!(" from='{from}'"))
-        .unwrap_or_default();
-    client.expect_xml(&format!(
-        "<iq xmlns='jabber:client' type='result' id='{id}'{from} to='{to}'>{payload}</iq>"
-    ))
+    client.expect_xml(&result_xml(id, from, to, payload))
 }
 
 struct Expected<'a> {
@@ -563,4 +570,284 @@ fn private_xml_is_isolated_per_account() -> TestResult {
     }
     bob.close()?;
     alice.close()
+}
+
+#[test]
+fn private_xml_reduced_limits_keep_data_readable_after_restart() -> TestResult {
+    const LARGE_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+
+    let mut suite = C2sSuite::with_hosts_and_setup(
+        "[hosts.localhost]\nextensions = ['private']\n[hosts.localhost.private]\nmax_items = 50\nmax_bytes = 6_291_456",
+        |directory| {
+            let config = directory.join("lonewolf.toml");
+            fs::write(
+                &config,
+                fs::read_to_string(&config)?.replace(
+                    "[limits.c2s.profiles.default]",
+                    "[limits.c2s.profiles.default]\nmax_stanza_bytes = 2_097_152",
+                ),
+            )?;
+            Ok(())
+        },
+    )?;
+    suite.create_account("alice", PASSWORD)?;
+    let large = "x".repeat(1_048_577);
+    let same = "y".repeat(large.len());
+    let smaller = "z".repeat(large.len() - 1);
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send(&format!(
+        "<iq type='set' id='store'>{}</iq>",
+        query(&format!(
+            "<a xmlns='urn:a'>{large}</a><b xmlns='urn:b'>1</b><c xmlns='urn:c'>1</c>"
+        ))
+    ))?;
+    expect_result(&mut alice, "store", None, DESK, "")?;
+    alice.send(&format!(
+        "<iq type='get' id='initial'>{}</iq>",
+        query("<a xmlns='urn:a'/>")
+    ))?;
+    alice.expect_xml_with_max_bytes(
+        &result_xml(
+            "initial",
+            None,
+            DESK,
+            &query(&format!(
+                "<a xmlns='urn:a' xml:lang='' xml:space='default'>{large}</a>"
+            )),
+        ),
+        LARGE_RESPONSE_BYTES,
+    )?;
+    alice.close()?;
+    let config = suite.fixture_path().join("lonewolf.toml");
+    fs::write(
+        &config,
+        fs::read_to_string(&config)?
+            .replace("max_items = 50", "max_items = 1")
+            .replace("max_bytes = 6_291_456", "max_bytes = 150"),
+    )?;
+    suite.restart()?;
+    let mut alice = suite.connect("alice", PASSWORD, "after")?;
+    let after = "alice@localhost/after";
+    for (name, value) in [("a", large.as_str()), ("b", "1"), ("c", "1")] {
+        alice.send(&format!(
+            "<iq type='get' id='read'>{}</iq>",
+            query(&format!("<{name} xmlns='urn:{name}'/>"))
+        ))?;
+        let payload = query(&format!(
+            "<{name} xmlns='urn:{name}' xml:lang='' xml:space='default'>{value}</{name}>"
+        ));
+        if name == "a" {
+            alice.expect_xml_with_max_bytes(
+                &result_xml("read", None, after, &payload),
+                LARGE_RESPONSE_BYTES,
+            )?;
+        } else {
+            expect_result(&mut alice, "read", None, after, &payload)?;
+        }
+    }
+    let quota = "Private XML storage for this account is limited to 1 elements and 150 bytes. Remove stored elements or store less XML.";
+    alice.send(&format!(
+        "<iq type='set' id='grow'>{}</iq>",
+        query("<d xmlns='urn:d'>1</d>")
+    ))?;
+    expect_error(
+        &mut alice,
+        "grow",
+        None,
+        after,
+        Expected {
+            kind: "wait",
+            condition: "resource-constraint",
+            text: quota,
+        },
+    )?;
+    for (id, value) in [("same", same.as_str()), ("shrink", smaller.as_str())] {
+        alice.send(&format!(
+            "<iq type='set' id='{id}'>{}</iq>",
+            query(&format!("<a xmlns='urn:a'>{value}</a>"))
+        ))?;
+        expect_result(&mut alice, id, None, after, "")?;
+    }
+    alice.send(&format!(
+        "<iq type='set' id='grow-bytes'>{}</iq>",
+        query(&format!("<a xmlns='urn:a'>{large}</a>"))
+    ))?;
+    expect_error(
+        &mut alice,
+        "grow-bytes",
+        None,
+        after,
+        Expected {
+            kind: "wait",
+            condition: "resource-constraint",
+            text: quota,
+        },
+    )?;
+    alice.send(&format!(
+        "<iq type='set' id='remove'>{}</iq>",
+        query("<b xmlns='urn:b'/>")
+    ))?;
+    expect_result(&mut alice, "remove", None, after, "")?;
+    alice.send(&format!(
+        "<iq type='get' id='read'>{}</iq>",
+        query("<a xmlns='urn:a'/>")
+    ))?;
+    alice.expect_xml_with_max_bytes(
+        &result_xml(
+            "read",
+            None,
+            after,
+            &query(&format!(
+                "<a xmlns='urn:a' xml:lang='' xml:space='default'>{smaller}</a>"
+            )),
+        ),
+        LARGE_RESPONSE_BYTES,
+    )?;
+    alice.close()?;
+    fs::write(
+        &config,
+        fs::read_to_string(&config)?
+            .replace("max_stanza_bytes = 2_097_152", "max_stanza_bytes = 65_536"),
+    )?;
+    suite.restart()?;
+    let mut alice = suite.connect("alice", PASSWORD, "small-stanzas")?;
+    let after = "alice@localhost/small-stanzas";
+    alice.send(&format!(
+        "<iq type='get' id='retained'>{}</iq>",
+        query("<a xmlns='urn:a'/>")
+    ))?;
+    alice.expect_xml_with_max_bytes(
+        &result_xml(
+            "retained",
+            None,
+            after,
+            &query(&format!(
+                "<a xmlns='urn:a' xml:lang='' xml:space='default'>{smaller}</a>"
+            )),
+        ),
+        LARGE_RESPONSE_BYTES,
+    )?;
+    alice.send(&format!(
+        "<iq type='set' id='remove-large'>{}</iq>",
+        query("<a xmlns='urn:a'/>")
+    ))?;
+    expect_result(&mut alice, "remove-large", None, after, "")?;
+    alice.send(&format!(
+        "<iq type='get' id='gone'>{}</iq>",
+        query("<a xmlns='urn:a'/>")
+    ))?;
+    expect_result(
+        &mut alice,
+        "gone",
+        None,
+        after,
+        &query("<a xmlns='urn:a'/>"),
+    )?;
+    alice.close()
+}
+
+#[test]
+fn private_xml_deletion_while_enabled_or_disabled_clears_every_row() -> TestResult {
+    let valid = b"<n xmlns='urn:n' xml:lang='' xml:space='default'>retained</n>".as_slice();
+    let huge = vec![b'x'; 5_242_881];
+    let invalid = format!("\u{fffd}{MARKER}").into_bytes();
+    let invalid = [invalid.as_slice(), b"\xff"].concat();
+    for enabled in [false, true] {
+        for bytes in [valid, invalid.as_slice(), huge.as_slice()] {
+            let mut suite = C2sSuite::with_extensions_and_setup(
+                if enabled { "'private'" } else { "'disco'" },
+                |path| {
+                    fixtures::seed(
+                        path,
+                        "alice@localhost",
+                        &[
+                            ("urn:n", "n", bytes),
+                            ("storage:bookmarks", "storage", valid),
+                        ],
+                    )
+                },
+            )?;
+            suite.delete_account("alice")?;
+            suite.create_account("alice", PASSWORD)?;
+            if !enabled {
+                let config = suite.fixture_path().join("lonewolf.toml");
+                fs::write(
+                    &config,
+                    fs::read_to_string(&config)?.replace(
+                        "extensions = ['disco']",
+                        "extensions = ['disco', 'private']",
+                    ),
+                )?;
+                suite.restart()?;
+            }
+            let mut alice = suite.connect("alice", PASSWORD, "new")?;
+            for element in ["<n xmlns='urn:n'/>", "<storage xmlns='storage:bookmarks'/>"] {
+                alice.send(&format!("<iq type='get' id='gone'>{}</iq>", query(element)))?;
+                expect_result(
+                    &mut alice,
+                    "gone",
+                    None,
+                    "alice@localhost/new",
+                    &query(element),
+                )?;
+            }
+            alice.close()?;
+            suite.stop()?;
+            assert!(fixtures::rows(suite.fixture_path(), "alice@localhost")?.is_empty());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn private_xml_corrupt_rows_answer_payload_free_internal_errors_until_replaced() -> TestResult {
+    for bytes in [
+        b"\xff\xfe".to_vec(),
+        Vec::new(),
+        b"<n xmlns='urn:n' xml:space='default'>1</n>".to_vec(),
+        b"<n xmlns='urn:n' xml:lang=''>1</n>".to_vec(),
+        b"<other xmlns='urn:n' xml:lang='' xml:space='default'>1</other>".to_vec(),
+        format!("<n xmlns='urn:n' xml:lang='' xml:space='default'>{MARKER}").into_bytes(),
+    ] {
+        let mut suite = C2sSuite::with_extensions_and_setup("'private'", |path| {
+            fixtures::seed(path, "alice@localhost", &[("urn:n", "n", &bytes)])
+        })?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        for _ in 0..2 {
+            alice.send(&format!(
+                "<iq type='get' id='corrupt'>{}</iq>",
+                query("<n xmlns='urn:n'/>")
+            ))?;
+            expect_error(
+                &mut alice,
+                "corrupt",
+                None,
+                DESK,
+                Expected {
+                    kind: "cancel",
+                    condition: "internal-server-error",
+                    text: "The server could not complete the request. Try again later.",
+                },
+            )?;
+        }
+        alice.send(&format!(
+            "<iq type='set' id='replace'>{}</iq>",
+            query("<n xmlns='urn:n'>fixed</n>")
+        ))?;
+        expect_result(&mut alice, "replace", None, DESK, "")?;
+        alice.send(&format!(
+            "<iq type='get' id='read'>{}</iq>",
+            query("<n xmlns='urn:n'/>")
+        ))?;
+        expect_result(
+            &mut alice,
+            "read",
+            None,
+            DESK,
+            &query("<n xmlns='urn:n' xml:lang='' xml:space='default'>fixed</n>"),
+        )?;
+        alice.close()?;
+        suite.stop()?;
+    }
+    Ok(())
 }

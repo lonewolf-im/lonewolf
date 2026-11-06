@@ -11,6 +11,8 @@ use quick_xml::reader::NsReader;
 
 use super::TestResult;
 
+const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug)]
 struct OperationError {
     operation: &'static str,
@@ -102,8 +104,12 @@ impl Element {
     }
 
     pub fn assert_xml(&self, expected: &str) -> TestResult {
+        self.assert_xml_with_max_bytes(expected, DEFAULT_MAX_RESPONSE_BYTES)
+    }
+
+    fn assert_xml_with_max_bytes(&self, expected: &str, max_bytes: u64) -> TestResult {
         let mut stream = XmlStream::new(Cursor::new(expected.as_bytes()));
-        let expected = stream.receive()?;
+        let expected = stream.receive_with_max_bytes(max_bytes)?;
         self.assert_same_content(&expected);
         Ok(())
     }
@@ -271,10 +277,14 @@ impl<R: Read> XmlStream<R> {
     }
 
     pub fn receive(&mut self) -> TestResult<Element> {
+        self.receive_with_max_bytes(DEFAULT_MAX_RESPONSE_BYTES)
+    }
+
+    fn receive_with_max_bytes(&mut self, max_bytes: u64) -> TestResult<Element> {
         let start_offset = self.reader.buffer_position();
         let mut stack: Vec<Element> = Vec::new();
         loop {
-            if self.reader.buffer_position() - start_offset > 1024 * 1024 || stack.len() > 128 {
+            if self.reader.buffer_position() - start_offset > max_bytes || stack.len() > 128 {
                 return Err("XML response exceeded test limits".into());
             }
             self.buffer.clear();
@@ -317,7 +327,12 @@ impl<R: Read> XmlStream<R> {
     }
 
     pub fn expect_xml(&mut self, expected: &str) -> TestResult {
-        self.receive()?.assert_xml(expected)
+        self.expect_xml_with_max_bytes(expected, DEFAULT_MAX_RESPONSE_BYTES)
+    }
+
+    pub fn expect_xml_with_max_bytes(&mut self, expected: &str, max_bytes: u64) -> TestResult {
+        self.receive_with_max_bytes(max_bytes)?
+            .assert_xml_with_max_bytes(expected, max_bytes)
     }
 
     pub fn expect_stream_error(&mut self, condition: &str) -> TestResult

@@ -265,11 +265,18 @@ mod internal;
 #[test]
 fn provisioning_uses_fresh_salts_and_keeps_errors_distinct() -> TestResult {
     use crate::scram::ProvisioningError;
-    let iterations = ScramIterations::new(4096)?;
+    let iterations = ScramIterations::new(10_000)?;
     let first = ScramCredentials::provision("ocean copper lantern meadow", iterations)?;
     let second = ScramCredentials::provision("ocean copper lantern meadow", iterations)?;
     let first_sha1 = first.sha1().ok_or("missing SHA-1 verifier")?;
     let first_sha256 = first.sha256().ok_or("missing SHA-256 verifier")?;
+    let first_sha512 = first.sha512().ok_or("missing SHA-512 verifier")?;
+    assert_ne!(first_sha512.salt(), first_sha1.salt());
+    assert_ne!(first_sha512.salt(), first_sha256.salt());
+    assert_ne!(
+        first_sha512.salt(),
+        second.sha512().ok_or("missing SHA-512 verifier")?.salt()
+    );
     assert_ne!(first_sha1.salt(), first_sha256.salt());
     assert_ne!(
         first_sha1.salt(),
@@ -288,5 +295,71 @@ fn provisioning_uses_fresh_salts_and_keeps_errors_distinct() -> TestResult {
     let error = ProvisioningError::from(ScramError::InvalidPassword);
     assert!(error.source().is_some());
     assert_eq!(error.to_string(), "password is not valid for SCRAM");
+    Ok(())
+}
+
+#[test]
+fn sha512_derivation_enforces_its_floor_and_preserves_password_preparation() -> TestResult {
+    for count in [4096, 9_999] {
+        assert!(matches!(
+            ScramVerifier::derive(
+                ScramHash::Sha512,
+                "pencil",
+                SALT,
+                ScramIterations::new(count)?
+            ),
+            Err(ScramError::InvalidIterations)
+        ));
+    }
+    for (input, expected) in [
+        ("I\u{ad}X", "IX"),
+        ("\u{aa}", "a"),
+        ("e\u{301}", "é"),
+        ("a\u{a0}b", "a b"),
+    ] {
+        let iterations = ScramIterations::new(10_000)?;
+        let ScramVerifier::Sha512(actual) =
+            ScramVerifier::derive(ScramHash::Sha512, input, SALT, iterations)?
+        else {
+            return Err("wrong hash".into());
+        };
+        let ScramVerifier::Sha512(expected) =
+            ScramVerifier::derive(ScramHash::Sha512, expected, SALT, iterations)?
+        else {
+            return Err("wrong hash".into());
+        };
+        assert_same_verifier(&actual, &expected);
+    }
+    for invalid in ["", "\u{7}", "\u{221}"] {
+        assert!(matches!(
+            ScramVerifier::derive(
+                ScramHash::Sha512,
+                invalid,
+                SALT,
+                ScramIterations::new(10_000)?
+            ),
+            Err(ScramError::InvalidPassword)
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn inserting_a_verifier_changes_only_its_family() -> TestResult {
+    let sha512 = ScramVerifierData::new([31; 16], NonZeroU32::MIN, [32; 64], [33; 64]);
+    let credentials = ScramCredentials::new(ScramVerifier::Sha512(sha512.clone()));
+    assert!(credentials.sha1().is_none());
+    assert!(credentials.sha256().is_none());
+    assert_same_verifier(credentials.sha512().ok_or("missing SHA-512")?, &sha512);
+    let credentials = credentials.with_verifier(ScramVerifier::Sha1(sha1()));
+    assert_same_verifier(credentials.sha1().ok_or("missing SHA-1")?, &sha1());
+    assert_same_verifier(credentials.sha512().ok_or("missing SHA-512")?, &sha512);
+    assert!(credentials.sha256().is_none());
+    let replacement = ScramVerifierData::new([41; 16], NonZeroU32::MIN, [42; 64], [43; 64]);
+    let credentials = credentials.with_verifier(ScramVerifier::Sha512(replacement.clone()));
+    assert_same_verifier(credentials.sha1().ok_or("missing SHA-1")?, &sha1());
+    assert_same_verifier(credentials.sha512().ok_or("missing SHA-512")?, &replacement);
+    assert!(credentials.sha256().is_none());
+    assert!(ScramCredentials::both(sha1(), sha256()).sha512().is_none());
     Ok(())
 }

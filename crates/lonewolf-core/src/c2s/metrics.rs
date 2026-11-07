@@ -62,12 +62,14 @@ impl RateLimit {
     }
 }
 
-const MECHANISMS: [Option<SaslMechanism>; 6] = [
+const MECHANISMS: [Option<SaslMechanism>; 8] = [
     Some(SaslMechanism::External),
     Some(SaslMechanism::Scram(Mechanism::Sha1)),
     Some(SaslMechanism::Scram(Mechanism::Sha1Plus)),
     Some(SaslMechanism::Scram(Mechanism::Sha256)),
     Some(SaslMechanism::Scram(Mechanism::Sha256Plus)),
+    Some(SaslMechanism::Scram(Mechanism::Sha512)),
+    Some(SaslMechanism::Scram(Mechanism::Sha512Plus)),
     None,
 ];
 
@@ -78,7 +80,9 @@ fn mechanism_index(mechanism: Option<SaslMechanism>) -> usize {
         Some(SaslMechanism::Scram(Mechanism::Sha1Plus)) => 2,
         Some(SaslMechanism::Scram(Mechanism::Sha256)) => 3,
         Some(SaslMechanism::Scram(Mechanism::Sha256Plus)) => 4,
-        None => 5,
+        Some(SaslMechanism::Scram(Mechanism::Sha512)) => 5,
+        Some(SaslMechanism::Scram(Mechanism::Sha512Plus)) => 6,
+        None => 7,
     }
 }
 
@@ -258,7 +262,6 @@ pub(super) struct C2sMetrics {
 }
 
 impl C2sMetrics {
-    /// Every worker handle shares the histograms created here.
     pub(super) fn new(
         listeners: usize,
         workers: NonZeroUsize,
@@ -795,6 +798,8 @@ mod tests {
             "SCRAM-SHA-1-PLUS",
             "SCRAM-SHA-256",
             "SCRAM-SHA-256-PLUS",
+            "SCRAM-SHA-512",
+            "SCRAM-SHA-512-PLUS",
             "none",
         ];
         for (index, mechanism) in MECHANISMS.into_iter().enumerate() {

@@ -7,7 +7,7 @@
   <Project>
     <name>Lonewolf</name>
     <shortdesc xml:lang="en">A standalone XMPP server written in Rust</shortdesc>
-    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as a single binary with embedded storage, so there's no database to set up. It's still early: today it handles chat between accounts on the domains you run, and federation with other servers is on the way.</description>
+    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as a single binary with embedded storage, so there's no database to set up. It's still early: today it handles chat between accounts on the domains you run, and federation with other servers is on the way. Opt-in SCRAM-SHA-512 and SCRAM-SHA-512-PLUS implement expired Internet-Draft draft-melnikov-scram-sha-512-05, not an RFC or an IANA-registered SASL mechanism. SHA-512 authentication is not in a release yet.</description>
     <created>2026-09-17</created>
 
     <homepage rdf:resource="https://github.com/lonewolf-im/lonewolf"/>
@@ -61,6 +61,7 @@
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc4422"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc5802"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc7677"/>
+    <implements rdf:resource="https://datatracker.ietf.org/doc/html/draft-melnikov-scram-sha-512-05"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc4013"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc5929"/>
     <implements rdf:resource="https://www.rfc-editor.org/info/rfc9266"/>

@@ -5,7 +5,7 @@ use base64::engine::general_purpose::STANDARD;
 use hmac::digest::Output;
 use hmac::{EagerHash, Hmac, KeyInit, Mac};
 use sha1::Sha1;
-use sha2::Sha256;
+use sha2::{Sha256, Sha512};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -19,6 +19,8 @@ pub enum Mechanism {
     Sha1Plus,
     Sha256,
     Sha256Plus,
+    Sha512,
+    Sha512Plus,
 }
 
 impl Mechanism {
@@ -28,6 +30,8 @@ impl Mechanism {
             Self::Sha1Plus => "SCRAM-SHA-1-PLUS",
             Self::Sha256 => "SCRAM-SHA-256",
             Self::Sha256Plus => "SCRAM-SHA-256-PLUS",
+            Self::Sha512 => "SCRAM-SHA-512",
+            Self::Sha512Plus => "SCRAM-SHA-512-PLUS",
         }
     }
 
@@ -37,6 +41,8 @@ impl Mechanism {
             "SCRAM-SHA-1-PLUS" => Self::Sha1Plus,
             "SCRAM-SHA-256" => Self::Sha256,
             "SCRAM-SHA-256-PLUS" => Self::Sha256Plus,
+            "SCRAM-SHA-512" => Self::Sha512,
+            "SCRAM-SHA-512-PLUS" => Self::Sha512Plus,
             _ => return None,
         })
     }
@@ -45,11 +51,12 @@ impl Mechanism {
         match self {
             Self::Sha1 | Self::Sha1Plus => ScramHash::Sha1,
             Self::Sha256 | Self::Sha256Plus => ScramHash::Sha256,
+            Self::Sha512 | Self::Sha512Plus => ScramHash::Sha512,
         }
     }
 
     pub fn is_plus(self) -> bool {
-        matches!(self, Self::Sha1Plus | Self::Sha256Plus)
+        matches!(self, Self::Sha1Plus | Self::Sha256Plus | Self::Sha512Plus)
     }
 }
 
@@ -169,10 +176,12 @@ impl ClientFirst {
         let salt = match &verifier {
             ScramVerifier::Sha1(value) => value.salt(),
             ScramVerifier::Sha256(value) => value.salt(),
+            ScramVerifier::Sha512(value) => value.salt(),
         };
         let iterations = match &verifier {
             ScramVerifier::Sha1(value) => value.iterations(),
             ScramVerifier::Sha256(value) => value.iterations(),
+            ScramVerifier::Sha512(value) => value.iterations(),
         };
         let mut nonce = String::with_capacity(self.nonce.len() + server_nonce.len());
         nonce.push_str(&self.nonce);
@@ -210,6 +219,7 @@ impl ScramServer {
         match (&self.verifier, current) {
             (ScramVerifier::Sha1(a), ScramVerifier::Sha1(b)) => same_verifier(a, b),
             (ScramVerifier::Sha256(a), ScramVerifier::Sha256(b)) => same_verifier(a, b),
+            (ScramVerifier::Sha512(a), ScramVerifier::Sha512(b)) => same_verifier(a, b),
             _ => false,
         }
     }
@@ -267,7 +277,12 @@ impl ScramServer {
         auth_message.push_str(&self.server_first);
         auth_message.push(',');
         auth_message.push_str(without_proof);
-        let mut response = String::with_capacity(46);
+        let capacity = match self.verifier {
+            ScramVerifier::Sha1(_) => 30,
+            ScramVerifier::Sha256(_) => 46,
+            ScramVerifier::Sha512(_) => 90,
+        };
+        let mut response = String::with_capacity(capacity);
         response.push_str("v=");
         match &self.verifier {
             ScramVerifier::Sha1(verifier) => STANDARD.encode_string(
@@ -276,6 +291,10 @@ impl ScramServer {
             ),
             ScramVerifier::Sha256(verifier) => STANDARD.encode_string(
                 verify::<Sha256, 32>(verifier, auth_message.as_bytes(), &proof)?,
+                &mut response,
+            ),
+            ScramVerifier::Sha512(verifier) => STANDARD.encode_string(
+                verify::<Sha512, 64>(verifier, auth_message.as_bytes(), &proof)?,
                 &mut response,
             ),
         }
@@ -302,40 +321,55 @@ impl ScramDecoy {
     }
 
     pub fn verifier(&self, hash: ScramHash, account: &str) -> Result<ScramVerifier, ServerError> {
-        let prefix: &[u8] = match hash {
-            ScramHash::Sha1 => b"sha1",
-            ScramHash::Sha256 => b"sha256",
-        };
-        let salt = self.derive(prefix, b"salt", account)?;
-        let stored = self.derive(prefix, b"stored", account)?;
-        let server = self.derive(prefix, b"server", account)?;
-        let mut salt16 = [0; 16];
-        salt16.copy_from_slice(&salt[..16]);
         Ok(match hash {
             ScramHash::Sha1 => {
-                let mut stored20 = [0; 20];
-                let mut server20 = [0; 20];
-                stored20.copy_from_slice(&stored[..20]);
-                server20.copy_from_slice(&server[..20]);
-                ScramVerifier::Sha1(ScramVerifierData::new(
-                    salt16,
-                    SCRAM_POLICY_ITERATIONS,
-                    stored20,
-                    server20,
-                ))
+                ScramVerifier::Sha1(self.verifier_data::<Sha256, 32, 20>(b"sha1", account)?)
             }
-            ScramHash::Sha256 => ScramVerifier::Sha256(ScramVerifierData::new(
-                salt16,
-                SCRAM_POLICY_ITERATIONS,
-                stored,
-                server,
-            )),
+            ScramHash::Sha256 => {
+                ScramVerifier::Sha256(self.verifier_data::<Sha256, 32, 32>(b"sha256", account)?)
+            }
+            ScramHash::Sha512 => {
+                ScramVerifier::Sha512(self.verifier_data::<Sha512, 64, 64>(b"sha512", account)?)
+            }
         })
     }
 
-    fn derive(&self, hash: &[u8], purpose: &[u8], account: &str) -> Result<[u8; 32], ServerError> {
+    fn verifier_data<H: EagerHash, const M: usize, const N: usize>(
+        &self,
+        hash: &[u8],
+        account: &str,
+    ) -> Result<ScramVerifierData<N>, ServerError>
+    where
+        [u8; M]: From<Output<Hmac<H>>>,
+    {
+        let salt = self.derive::<H, M>(hash, b"salt", account)?;
+        let stored = self.derive::<H, M>(hash, b"stored", account)?;
+        let server = self.derive::<H, M>(hash, b"server", account)?;
+        let mut salt16 = [0; 16];
+        let mut stored_key = [0; N];
+        let mut server_key = [0; N];
+        salt16.copy_from_slice(&salt[..16]);
+        stored_key.copy_from_slice(&stored[..N]);
+        server_key.copy_from_slice(&server[..N]);
+        Ok(ScramVerifierData::new(
+            salt16,
+            SCRAM_POLICY_ITERATIONS,
+            stored_key,
+            server_key,
+        ))
+    }
+
+    fn derive<H: EagerHash, const N: usize>(
+        &self,
+        hash: &[u8],
+        purpose: &[u8],
+        account: &str,
+    ) -> Result<[u8; N], ServerError>
+    where
+        [u8; N]: From<Output<Hmac<H>>>,
+    {
         let mut mac =
-            Hmac::<Sha256>::new_from_slice(self.0.as_ref()).map_err(|_| ServerError::Malformed)?;
+            Hmac::<H>::new_from_slice(self.0.as_ref()).map_err(|_| ServerError::Malformed)?;
         mac.update(hash);
         mac.update(&[0]);
         mac.update(purpose);

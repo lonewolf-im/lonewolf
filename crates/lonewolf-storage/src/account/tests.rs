@@ -115,7 +115,7 @@ fn diagnostics_omit_account_identity_and_credential_material() -> TestResult {
     assert_eq!(format!("{:?}", account.key), "AccountKey { .. }");
     assert_eq!(
         format!("{account:?}"),
-        "NewAccount { key: AccountKey { .. }, credentials: ScramCredentials { sha1: Some(ScramVerifierData { .. }), sha256: Some(ScramVerifierData { .. }) } }"
+        "NewAccount { key: AccountKey { .. }, credentials: ScramCredentials { sha1: Some(ScramVerifierData { .. }), sha256: Some(ScramVerifierData { .. }), sha512: None } }"
     );
     let public = Account { key: account.key };
     assert_eq!(format!("{public:?}"), "Account { key: AccountKey { .. } }");

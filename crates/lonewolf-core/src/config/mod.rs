@@ -717,7 +717,7 @@ impl Default for TcpListenerConfig {
     fn default() -> Self {
         Self {
             address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5222)),
-            auth_mechanisms: AuthMechanisms::ALL,
+            auth_mechanisms: AuthMechanisms::DEFAULT,
             limits: None,
         }
     }
@@ -727,7 +727,8 @@ impl Default for TcpListenerConfig {
 pub struct AuthMechanisms(u8);
 
 impl AuthMechanisms {
-    pub const ALL: Self = Self(0b1_1111);
+    pub const ALL: Self = Self(0b111_1111);
+    pub const DEFAULT: Self = Self(0b1_1111);
 
     const EXTERNAL: u8 = 0b1_0000;
 
@@ -741,6 +742,8 @@ impl AuthMechanisms {
             Mechanism::Sha1Plus => 0b0010,
             Mechanism::Sha256 => 0b0100,
             Mechanism::Sha256Plus => 0b1000,
+            Mechanism::Sha512 => 0b10_0000,
+            Mechanism::Sha512Plus => 0b100_0000,
         }
     }
 
@@ -749,7 +752,9 @@ impl AuthMechanisms {
     }
 
     pub fn has_plus(self) -> bool {
-        self.allows(Mechanism::Sha1Plus) || self.allows(Mechanism::Sha256Plus)
+        self.allows(Mechanism::Sha1Plus)
+            || self.allows(Mechanism::Sha256Plus)
+            || self.allows(Mechanism::Sha512Plus)
     }
 
     pub fn has_scram(self) -> bool {
@@ -763,7 +768,7 @@ impl AuthMechanisms {
 
 impl Default for AuthMechanisms {
     fn default() -> Self {
-        Self::ALL
+        Self::DEFAULT
     }
 }
 

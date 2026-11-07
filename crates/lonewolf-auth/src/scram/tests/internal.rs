@@ -47,11 +47,11 @@ fn ascii_password_preparation_borrows_the_input() -> TestResult {
 
 #[test]
 fn random_source_failure_never_returns_a_verifier() -> TestResult {
-    for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+    for hash in [ScramHash::Sha1, ScramHash::Sha256, ScramHash::Sha512] {
         let result = ScramVerifier::generate_with_salt_source(
             hash,
             "pencil",
-            ScramIterations::new(4096)?,
+            ScramIterations::new(hash.minimum_iterations())?,
             |salt| {
                 salt[0] = 42;
                 Err(getrandom::Error::UNSUPPORTED)
@@ -113,8 +113,8 @@ fn provisioning_rejects_prepared_weakness_before_randomness_or_derivation() -> T
 }
 
 #[test]
-fn provisioning_derives_both_hashes_from_prepared_scalars_with_independent_salts() -> TestResult {
-    let iterations = ScramIterations::new(4096)?;
+fn provisioning_derives_all_hashes_from_prepared_scalars_with_independent_salts() -> TestResult {
+    let iterations = ScramIterations::new(10_000)?;
     for (raw, prepared) in [
         (
             format!("abc{}", "a".repeat(12)),
@@ -140,7 +140,7 @@ fn provisioning_derives_both_hashes_from_prepared_scalars_with_independent_salts
             salt.fill(calls);
             Ok(())
         })?;
-        assert_eq!(calls, 2);
+        assert_eq!(calls, 3);
         let sha1 = credentials.sha1().ok_or("missing SHA-1 verifier")?;
         let sha256 = credentials.sha256().ok_or("missing SHA-256 verifier")?;
         assert_eq!(sha1.salt(), &[1; 16]);
@@ -159,17 +159,26 @@ fn provisioning_derives_both_hashes_from_prepared_scalars_with_independent_salts
         };
         assert_eq!(sha256.stored_key(), expected.stored_key());
         assert_eq!(sha256.server_key(), expected.server_key());
+        let sha512 = credentials.sha512().ok_or("missing SHA-512 verifier")?;
+        assert_eq!(sha512.salt(), &[3; 16]);
+        let ScramVerifier::Sha512(expected) =
+            ScramVerifier::derive(ScramHash::Sha512, &prepared, [3; 16], iterations)?
+        else {
+            return Err("wrong hash".into());
+        };
+        assert_eq!(sha512.stored_key(), expected.stored_key());
+        assert_eq!(sha512.server_key(), expected.server_key());
     }
     Ok(())
 }
 
 #[test]
 fn provisioning_random_failure_stops_without_returning_credentials() -> TestResult {
-    for fail_at in [1, 2] {
+    for fail_at in [1, 2, 3] {
         let mut calls = 0;
         let result = ScramCredentials::provision_with_salt_source(
             "ocean copper lantern meadow",
-            ScramIterations::new(4096)?,
+            ScramIterations::new(10_000)?,
             |salt| {
                 calls += 1;
                 salt.fill(calls);
@@ -190,6 +199,31 @@ fn provisioning_random_failure_stops_without_returning_credentials() -> TestResu
         ));
         assert!(error.source().is_some());
         assert_eq!(error.to_string(), "secure random source is unavailable");
+    }
+    Ok(())
+}
+
+#[test]
+fn sha512_and_provisioning_reject_low_cost_before_requesting_salts() -> TestResult {
+    for count in [4096, 9_999] {
+        let iterations = ScramIterations::new(count)?;
+        assert!(matches!(
+            ScramVerifier::generate_with_salt_source(
+                ScramHash::Sha512,
+                "pencil",
+                iterations,
+                |_| panic!("invalid cost must not request a salt")
+            ),
+            Err(ScramError::InvalidIterations)
+        ));
+        assert!(matches!(
+            ScramCredentials::provision_with_salt_source(
+                "ocean copper lantern meadow",
+                iterations,
+                |_| panic!("invalid cost must not request a salt")
+            ),
+            Err(ProvisioningError::Scram(ScramError::InvalidIterations))
+        ));
     }
     Ok(())
 }

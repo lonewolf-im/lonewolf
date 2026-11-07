@@ -10,6 +10,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
 
+mod sha512;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
@@ -291,6 +293,13 @@ fn mechanism_names_match_protocol_literals() {
             ScramHash::Sha256,
             true,
         ),
+        (Mechanism::Sha512, "SCRAM-SHA-512", ScramHash::Sha512, false),
+        (
+            Mechanism::Sha512Plus,
+            "SCRAM-SHA-512-PLUS",
+            ScramHash::Sha512,
+            true,
+        ),
     ] {
         assert_eq!(mechanism.name(), name);
         assert_eq!(Mechanism::from_name(name), Some(mechanism));
@@ -301,7 +310,7 @@ fn mechanism_names_match_protocol_literals() {
         "",
         "scram-sha-256",
         "SCRAM-SHA-256 ",
-        "SCRAM-SHA-512",
+        "SCRAM-SHA3-512",
         "PLAIN",
     ] {
         assert_eq!(Mechanism::from_name(name), None, "{name:?}");
@@ -345,10 +354,17 @@ fn verifier_hash_must_match_selected_mechanism() -> TestResult {
     for (mechanism, hash) in [
         (Mechanism::Sha1, ScramHash::Sha256),
         (Mechanism::Sha256, ScramHash::Sha1),
+        (Mechanism::Sha512, ScramHash::Sha256),
+        (Mechanism::Sha256, ScramHash::Sha512),
     ] {
         let first = ClientFirst::parse(mechanism, b"n,,n=user,r=nonce", true)
             .map_err(|error| format!("invalid client first: {error:?}"))?;
-        let verifier = ScramVerifier::derive(hash, "pencil", [7; 16], ScramIterations::new(4096)?)?;
+        let verifier = ScramVerifier::derive(
+            hash,
+            "pencil",
+            [7; 16],
+            ScramIterations::new(hash.minimum_iterations())?,
+        )?;
         assert_eq!(
             first.start(verifier, "server").map(|_| ()),
             Err(ServerError::HashMismatch),
@@ -398,17 +414,23 @@ fn proof_length_must_match_the_selected_hash() -> TestResult {
     for (mechanism, hash, proof_len) in [
         (Mechanism::Sha1, ScramHash::Sha1, 20),
         (Mechanism::Sha256, ScramHash::Sha256, 32),
+        (Mechanism::Sha512, ScramHash::Sha512, 64),
     ] {
         let first = ClientFirst::parse(mechanism, b"n,,n=user,r=nonce", true)
             .map_err(|error| format!("invalid client first: {error:?}"))?;
-        let verifier = ScramVerifier::derive(hash, "pencil", [7; 16], ScramIterations::new(4096)?)?;
+        let verifier = ScramVerifier::derive(
+            hash,
+            "pencil",
+            [7; 16],
+            ScramIterations::new(hash.minimum_iterations())?,
+        )?;
         let (server, _) = first
             .start(verifier, "server")
             .map_err(|error| format!("cannot start: {error:?}"))?;
         for length in [0, proof_len - 1, proof_len + 1] {
             let input = format!(
                 "c=biws,r=nonceserver,p={}",
-                STANDARD.encode(&[0; 33][..length])
+                STANDARD.encode(&[0; 65][..length])
             );
             assert_eq!(
                 server.finish(input.as_bytes(), &[]),
@@ -418,7 +440,7 @@ fn proof_length_must_match_the_selected_hash() -> TestResult {
         }
         let input = format!(
             "c=biws,r=nonceserver,p={}",
-            STANDARD.encode(&[0; 32][..proof_len])
+            STANDARD.encode(&[0; 64][..proof_len])
         );
         assert_eq!(
             server.finish(input.as_bytes(), &[]),

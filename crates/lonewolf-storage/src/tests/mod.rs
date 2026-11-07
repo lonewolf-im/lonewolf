@@ -96,6 +96,7 @@ pub(crate) fn assert_scram(actual: Option<ScramVerifier>, marker: u8) -> TestRes
     match actual.ok_or("missing verifier")? {
         ScramVerifier::Sha1(value) => assert_verifier(&value, marker),
         ScramVerifier::Sha256(value) => assert_verifier(&value, marker),
+        ScramVerifier::Sha512(value) => assert_verifier(&value, marker),
     }
     Ok(())
 }
@@ -127,7 +128,7 @@ pub(crate) fn decoy_salt(decoy: &ScramDecoy) -> TestResult<[u8; 16]> {
         .map_err(|error| format!("cannot build decoy: {error:?}"))?;
     match verifier {
         ScramVerifier::Sha256(verifier) => Ok(*verifier.salt()),
-        ScramVerifier::Sha1(_) => Err("wrong hash".into()),
+        ScramVerifier::Sha1(_) | ScramVerifier::Sha512(_) => Err("wrong hash".into()),
     }
 }
 

@@ -7,6 +7,17 @@ use rustls::{ProtocolVersion, SupportedProtocolVersion, version};
 
 use super::support::{C2sSuite, Client, OPEN, SASL_NAMESPACE, STREAM_ERRORS, TestResult};
 
+mod sha512;
+
+const ALL_SCRAM_MECHANISMS: &[&str] = &[
+    "SCRAM-SHA-512-PLUS",
+    "SCRAM-SHA-512",
+    "SCRAM-SHA-256-PLUS",
+    "SCRAM-SHA-256",
+    "SCRAM-SHA-1-PLUS",
+    "SCRAM-SHA-1",
+];
+
 #[test]
 fn scram_sha256_authenticates() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
@@ -45,21 +56,25 @@ fn authenticated_message_preserves_feff_and_replacement_characters() -> TestResu
 }
 
 #[test]
-fn tls12_exporter_authenticates_both_plus_mechanisms() -> TestResult {
-    exporter_authenticates_both_plus_mechanisms(&version::TLS12)
+fn tls12_exporter_authenticates_all_plus_mechanisms() -> TestResult {
+    exporter_authenticates_all_plus_mechanisms(&version::TLS12)
 }
 
 #[test]
-fn tls13_exporter_authenticates_both_plus_mechanisms() -> TestResult {
-    exporter_authenticates_both_plus_mechanisms(&version::TLS13)
+fn tls13_exporter_authenticates_all_plus_mechanisms() -> TestResult {
+    exporter_authenticates_all_plus_mechanisms(&version::TLS13)
 }
 
-fn exporter_authenticates_both_plus_mechanisms(
+fn exporter_authenticates_all_plus_mechanisms(
     version: &'static SupportedProtocolVersion,
 ) -> TestResult {
-    let suite = C2sSuite::with_extensions("")?;
+    let suite = C2sSuite::with_auth_mechanisms(ALL_SCRAM_MECHANISMS)?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
+    for mechanism in [
+        "SCRAM-SHA-1-PLUS",
+        "SCRAM-SHA-256-PLUS",
+        "SCRAM-SHA-512-PLUS",
+    ] {
         let mut client = Client::secure_with_versions(&suite, &[version])?;
         assert_eq!(
             client.transport().conn.protocol_version(),
@@ -79,10 +94,14 @@ fn exporter_authenticates_both_plus_mechanisms(
 }
 
 #[test]
-fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
-    let suite = C2sSuite::start()?;
+fn tls12_absent_exporter_context_rejects_all_plus_mechanisms() -> TestResult {
+    let suite = C2sSuite::with_auth_mechanisms(ALL_SCRAM_MECHANISMS)?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
+    for mechanism in [
+        "SCRAM-SHA-1-PLUS",
+        "SCRAM-SHA-256-PLUS",
+        "SCRAM-SHA-512-PLUS",
+    ] {
         let mut client = Client::secure_with_versions(&suite, &[&version::TLS12])?;
         assert_eq!(
             client.transport().conn.protocol_version(),
@@ -123,11 +142,15 @@ fn tls12_absent_exporter_context_rejects_both_plus_mechanisms() -> TestResult {
 }
 
 #[test]
-fn wrong_exporter_data_rejects_both_plus_mechanisms_on_each_tls_version() -> TestResult {
-    let suite = C2sSuite::start()?;
+fn wrong_exporter_data_rejects_all_plus_mechanisms_on_each_tls_version() -> TestResult {
+    let suite = C2sSuite::with_auth_mechanisms(ALL_SCRAM_MECHANISMS)?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for version in [&version::TLS12, &version::TLS13] {
-        for mechanism in ["SCRAM-SHA-1-PLUS", "SCRAM-SHA-256-PLUS"] {
+        for mechanism in [
+            "SCRAM-SHA-1-PLUS",
+            "SCRAM-SHA-256-PLUS",
+            "SCRAM-SHA-512-PLUS",
+        ] {
             let mut client = Client::secure_with_versions(&suite, &[version])?;
             assert_eq!(
                 client.transport().conn.protocol_version(),
@@ -1717,19 +1740,27 @@ fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
 }
 
 #[test]
-fn provisioned_passwords_authenticate_both_hashes_after_rejected_and_valid_rotation() -> TestResult
-{
-    let suite = C2sSuite::with_extensions("")?;
+fn provisioned_passwords_authenticate_all_mechanisms_after_rejected_and_valid_rotation()
+-> TestResult {
+    let suite = C2sSuite::with_auth_mechanisms(ALL_SCRAM_MECHANISMS)?;
     suite.create_account("alice", PASSWORD)?;
     suite.reject_weak_password_change("alice", "a")?;
     for password in [PASSWORD, NEW_PASSWORD] {
         if password == NEW_PASSWORD {
             suite.change_password("alice", password)?;
         }
-        for mechanism in ["SCRAM-SHA-1", "SCRAM-SHA-256"] {
+        for mechanism in ALL_SCRAM_MECHANISMS {
+            let binding = mechanism
+                .ends_with("-PLUS")
+                .then_some("tls-server-end-point");
             let mut client = suite.unauthenticated_client()?;
+            if password == NEW_PASSWORD {
+                client.scram("alice", PASSWORD, mechanism, binding)?.assert_xml(
+                    "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+                )?;
+            }
             client
-                .scram("alice", password, mechanism, None)?
+                .scram("alice", password, mechanism, binding)?
                 .assert_name(SASL_NAMESPACE, "success");
             let mut client = client.restart();
             client.open()?;

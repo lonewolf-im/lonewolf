@@ -149,13 +149,14 @@ async fn delete(storage: &RedbStorage, key: &AccountKey) -> TestResult {
 }
 
 async fn assert_password(storage: &RedbStorage, password: &str) -> TestResult {
-    for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+    for hash in [ScramHash::Sha1, ScramHash::Sha256, ScramHash::Sha512] {
         let verifier = scram(storage, &key("alice@example.org")?, hash)
             .await?
             .ok_or("missing credentials")?;
         let (salt, iterations) = match &verifier {
             ScramVerifier::Sha1(v) => (*v.salt(), v.iterations()),
             ScramVerifier::Sha256(v) => (*v.salt(), v.iterations()),
+            ScramVerifier::Sha512(v) => (*v.salt(), v.iterations()),
         };
         let expected = ScramVerifier::derive(
             hash,
@@ -169,6 +170,10 @@ async fn assert_password(storage: &RedbStorage, password: &str) -> TestResult {
                 assert_eq!(actual.server_key(), expected.server_key());
             }
             (ScramVerifier::Sha256(actual), ScramVerifier::Sha256(expected)) => {
+                assert_eq!(actual.stored_key(), expected.stored_key());
+                assert_eq!(actual.server_key(), expected.server_key());
+            }
+            (ScramVerifier::Sha512(actual), ScramVerifier::Sha512(expected)) => {
                 assert_eq!(actual.stored_key(), expected.stored_key());
                 assert_eq!(actual.server_key(), expected.server_key());
             }
@@ -227,7 +232,7 @@ fn account_lifecycle_uses_canonical_jids_and_never_returns_credentials() -> Test
                 .status,
             404
         );
-        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+        for hash in [ScramHash::Sha1, ScramHash::Sha256, ScramHash::Sha512] {
             assert!(
                 scram(&accounts, &key("alice@example.org")?, hash)
                     .await?
@@ -623,7 +628,7 @@ fn weak_creation_and_replacement_preserve_account_state() -> TestResult {
         )
         .await?;
         assert_eq!(reply.status, 201);
-        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+        for hash in [ScramHash::Sha1, ScramHash::Sha256, ScramHash::Sha512] {
             let before = scram(&accounts, &alice, hash)
                 .await?
                 .ok_or("missing verifier")?;
@@ -646,6 +651,11 @@ fn weak_creation_and_replacement_preserve_account_state() -> TestResult {
                     assert_eq!(before.server_key(), after.server_key());
                 }
                 (ScramVerifier::Sha256(before), ScramVerifier::Sha256(after)) => {
+                    assert_eq!(before.salt(), after.salt());
+                    assert_eq!(before.stored_key(), after.stored_key());
+                    assert_eq!(before.server_key(), after.server_key());
+                }
+                (ScramVerifier::Sha512(before), ScramVerifier::Sha512(after)) => {
                     assert_eq!(before.salt(), after.salt());
                     assert_eq!(before.stored_key(), after.stored_key());
                     assert_eq!(before.server_key(), after.server_key());

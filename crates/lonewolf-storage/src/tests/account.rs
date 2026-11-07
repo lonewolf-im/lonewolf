@@ -35,19 +35,17 @@ pub(crate) fn absent_accounts_and_absent_hashes_return_none<S: Storage>(storage:
     block_on(async {
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_none());
-        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+        for hash in [ScramHash::Sha1, ScramHash::Sha256, ScramHash::Sha512] {
             assert!(reader.scram(&alice, hash).await?.is_none());
         }
         drop(reader);
 
-        for (present, absent) in [
-            (ScramVerifier::Sha1(verifier(10)), ScramHash::Sha256),
-            (ScramVerifier::Sha256(verifier(20)), ScramHash::Sha1),
+        for (name, present) in [
+            ("sha1@example.com", ScramVerifier::Sha1(verifier(10))),
+            ("sha256@example.com", ScramVerifier::Sha256(verifier(20))),
+            ("sha512@example.com", ScramVerifier::Sha512(verifier(30))),
         ] {
-            let account = key(match absent {
-                ScramHash::Sha1 => "sha256@example.com",
-                ScramHash::Sha256 => "sha1@example.com",
-            })?;
+            let account = key(name)?;
             let hash = present.hash();
             let new = NewAccount {
                 key: account.clone(),
@@ -56,15 +54,14 @@ pub(crate) fn absent_accounts_and_absent_hashes_return_none<S: Storage>(storage:
             write(&storage, async |tx| tx.create_account(new).await).await?;
             let reader = storage.begin_read().await?;
             assert!(reader.account(&account).await?.is_some());
-            assert!(reader.scram(&account, absent).await?.is_none());
-            assert_eq!(
-                reader
-                    .scram(&account, hash)
-                    .await?
-                    .ok_or("missing verifier")?
-                    .hash(),
-                hash
-            );
+            for candidate in [ScramHash::Sha1, ScramHash::Sha256, ScramHash::Sha512] {
+                let stored = reader.scram(&account, candidate).await?;
+                if candidate == hash {
+                    assert_eq!(stored.ok_or("missing verifier")?.hash(), hash);
+                } else {
+                    assert!(stored.is_none());
+                }
+            }
         }
         Ok(())
     })
@@ -86,6 +83,12 @@ pub(crate) fn non_policy_iterations_are_rejected_without_changing_accounts<S: St
         NonZeroU32::MIN.saturating_add(4095),
         [8; 20],
         [9; 20],
+    );
+    let legacy_sha512 = ScramVerifierData::new(
+        [7; 16],
+        NonZeroU32::MIN.saturating_add(9_999),
+        [8; 64],
+        [9; 64],
     );
     let legacy = ScramCredentials::new(ScramVerifier::Sha256(legacy_sha256.clone()));
     block_on(async {
@@ -113,6 +116,8 @@ pub(crate) fn non_policy_iterations_are_rejected_without_changing_accounts<S: St
             legacy,
             ScramCredentials::new(ScramVerifier::Sha1(legacy_sha1)),
             ScramCredentials::both(verifier(10), legacy_sha256),
+            ScramCredentials::new(ScramVerifier::Sha512(legacy_sha512.clone())),
+            ScramCredentials::all(verifier(10), verifier(13), legacy_sha512),
         ] {
             assert!(matches!(
                 writer.replace_credentials(&alice, invalid).await,
@@ -225,10 +230,16 @@ pub(crate) fn deletion_removes_the_account_and_all_its_credentials<S: Storage>(
     block_on(async {
         let mut writer = storage.begin_write().await?;
         writer
-            .create_account(new_account("alice@example.com", 10)?)
+            .create_account(NewAccount {
+                key: alice.clone(),
+                credentials: ScramCredentials::all(verifier(10), verifier(20), verifier(30)),
+            })
             .await?;
         writer
-            .create_account(new_account("alice@example.org", 10)?)
+            .create_account(NewAccount {
+                key: other.clone(),
+                credentials: ScramCredentials::all(verifier(10), verifier(20), verifier(30)),
+            })
             .await?;
         writer.commit().await?;
 
@@ -247,7 +258,7 @@ pub(crate) fn deletion_removes_the_account_and_all_its_credentials<S: Storage>(
 
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_none());
-        for hash in [ScramHash::Sha1, ScramHash::Sha256] {
+        for hash in [ScramHash::Sha1, ScramHash::Sha256, ScramHash::Sha512] {
             assert!(reader.scram(&alice, hash).await?.is_none());
             assert!(reader.scram(&other, hash).await?.is_some());
         }

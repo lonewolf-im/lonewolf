@@ -7,12 +7,13 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::digest::Output;
+use hmac::{EagerHash, Hmac, KeyInit, Mac};
 use quick_xml::escape::escape;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned, SupportedProtocolVersion};
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use socket2::SockRef;
 
 use super::xml::{Element, XmlStream};
@@ -393,7 +394,17 @@ impl Client {
         gs2: &str,
         channel: &[u8],
     ) -> TestResult<ScramExchange> {
-        let sha1 = mechanism.starts_with("SCRAM-SHA-1");
+        if !matches!(
+            mechanism,
+            "SCRAM-SHA-1"
+                | "SCRAM-SHA-1-PLUS"
+                | "SCRAM-SHA-256"
+                | "SCRAM-SHA-256-PLUS"
+                | "SCRAM-SHA-512"
+                | "SCRAM-SHA-512-PLUS"
+        ) {
+            return Err("unsupported test client SCRAM mechanism".into());
+        }
         let mut random = [0; 18];
         graviola::random::fill(&mut random)?;
         let nonce = STANDARD.encode(random);
@@ -412,30 +423,32 @@ impl Client {
         let salt = STANDARD.decode(scram_attribute(&challenge, "s=")?)?;
         let iterations = scram_attribute(&challenge, "i=")?.parse()?;
         assert!((1..=1_000_000).contains(&iterations));
-        let mut salted = vec![0; if sha1 { 20 } else { 32 }];
-        if sha1 {
-            pbkdf2::pbkdf2_hmac::<Sha1>(password.as_bytes(), &salt, iterations, &mut salted);
-        } else {
-            pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut salted);
-        }
         let final_without_proof = format!("c={},r={server_nonce}", STANDARD.encode(channel));
         let auth_message = format!("{first},{challenge},{final_without_proof}");
-        let client_key = hmac(sha1, &salted, b"Client Key")?;
-        let stored_key = if sha1 {
-            Sha1::digest(&client_key).to_vec()
-        } else {
-            Sha256::digest(&client_key).to_vec()
-        };
-        let client_signature = hmac(sha1, &stored_key, auth_message.as_bytes())?;
-        let mut proof = client_key;
-        for (byte, signature) in proof.iter_mut().zip(client_signature) {
-            *byte ^= signature;
+        match mechanism {
+            "SCRAM-SHA-1" | "SCRAM-SHA-1-PLUS" => scram_proof::<Sha1, 20>(
+                password,
+                &salt,
+                iterations,
+                &auth_message,
+                &final_without_proof,
+            ),
+            "SCRAM-SHA-256" | "SCRAM-SHA-256-PLUS" => scram_proof::<Sha256, 32>(
+                password,
+                &salt,
+                iterations,
+                &auth_message,
+                &final_without_proof,
+            ),
+            "SCRAM-SHA-512" | "SCRAM-SHA-512-PLUS" => scram_proof::<Sha512, 64>(
+                password,
+                &salt,
+                iterations,
+                &auth_message,
+                &final_without_proof,
+            ),
+            _ => Err("unsupported test client SCRAM mechanism".into()),
         }
-        let server_key = hmac(sha1, &salted, b"Server Key")?;
-        Ok(ScramExchange {
-            response: format!("{final_without_proof},p={}", STANDARD.encode(proof)),
-            server_signature: hmac(sha1, &server_key, auth_message.as_bytes())?,
-        })
     }
 
     pub fn finish_scram(&mut self, exchange: ScramExchange) -> TestResult<Element> {
@@ -454,16 +467,38 @@ impl Client {
     }
 }
 
-fn hmac(sha1: bool, key: &[u8], message: &[u8]) -> TestResult<Vec<u8>> {
-    if sha1 {
-        let mut mac = Hmac::<Sha1>::new_from_slice(key)?;
-        mac.update(message);
-        Ok(mac.finalize().into_bytes().to_vec())
-    } else {
-        let mut mac = Hmac::<Sha256>::new_from_slice(key)?;
-        mac.update(message);
-        Ok(mac.finalize().into_bytes().to_vec())
+fn scram_proof<H: EagerHash, const N: usize>(
+    password: &str,
+    salt: &[u8],
+    iterations: u32,
+    message: &str,
+    final_without_proof: &str,
+) -> TestResult<ScramExchange>
+where
+    [u8; N]: From<Output<H>> + From<Output<Hmac<H>>>,
+{
+    let mut salted = [0; N];
+    pbkdf2::pbkdf2_hmac::<H>(password.as_bytes(), salt, iterations, &mut salted);
+    let mut proof = hmac::<H, N>(&salted, b"Client Key")?;
+    let stored_key: [u8; N] = H::digest(proof).into();
+    let signature = hmac::<H, N>(&stored_key, message.as_bytes())?;
+    for (byte, signature) in proof.iter_mut().zip(signature) {
+        *byte ^= signature;
     }
+    let server_key = hmac::<H, N>(&salted, b"Server Key")?;
+    Ok(ScramExchange {
+        response: format!("{final_without_proof},p={}", STANDARD.encode(proof)),
+        server_signature: hmac::<H, N>(&server_key, message.as_bytes())?.to_vec(),
+    })
+}
+
+fn hmac<H: EagerHash, const N: usize>(key: &[u8], message: &[u8]) -> TestResult<[u8; N]>
+where
+    [u8; N]: From<Output<Hmac<H>>>,
+{
+    let mut mac = Hmac::<H>::new_from_slice(key)?;
+    mac.update(message);
+    Ok(mac.finalize().into_bytes().into())
 }
 
 fn scram_attribute<'a>(message: &'a str, prefix: &str) -> TestResult<&'a str> {

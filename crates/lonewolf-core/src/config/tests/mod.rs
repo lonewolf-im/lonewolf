@@ -274,6 +274,38 @@ fn c2s_defaults_to_one_ipv4_endpoint_on_port_5222() -> TestResult {
 }
 
 #[test]
+fn sha512_mechanisms_are_independent_and_opt_in() -> TestResult {
+    for mechanisms in [
+        super::AuthMechanisms::default(),
+        TcpListenerConfig::default().auth_mechanisms,
+    ] {
+        assert!(!mechanisms.allows(Mechanism::Sha512));
+        assert!(!mechanisms.allows(Mechanism::Sha512Plus));
+    }
+    let file = config_file("[[c2s.listeners]]\n")?;
+    assert_eq!(
+        Config::load(Some(file.path()))?.c2s.listeners[0].auth_mechanisms,
+        super::AuthMechanisms::DEFAULT
+    );
+    for (names, normal, plus) in [
+        ("['SCRAM-SHA-512']", true, false),
+        ("['SCRAM-SHA-512-PLUS']", false, true),
+        ("['SCRAM-SHA-512', 'SCRAM-SHA-512-PLUS']", true, true),
+    ] {
+        let file = config_file(&format!("[[c2s.listeners]]\nauth_mechanisms = {names}\n"))?;
+        let mechanisms = Config::load(Some(file.path()))?.c2s.listeners[0].auth_mechanisms;
+        assert_eq!(mechanisms.allows(Mechanism::Sha512), normal);
+        assert_eq!(mechanisms.allows(Mechanism::Sha512Plus), plus);
+        assert_eq!(mechanisms.has_plus(), plus);
+        assert!(!mechanisms.allows_external());
+        assert!(!mechanisms.allows(Mechanism::Sha256));
+    }
+    assert!(super::AuthMechanisms::ALL.allows(Mechanism::Sha512));
+    assert!(super::AuthMechanisms::ALL.allows(Mechanism::Sha512Plus));
+    Ok(())
+}
+
+#[test]
 fn configured_c2s_endpoints_replace_the_default_and_allow_ipv6() -> TestResult {
     let file = config_file(
         "[[c2s.listeners]]\naddress = '127.0.0.1:6222'\n[[c2s.listeners]]\naddress = '[::1]:6222'\n",
@@ -349,6 +381,15 @@ fn empty_auth_mechanisms_are_rejected() -> TestResult {
 fn unsupported_or_duplicate_auth_mechanisms_are_rejected() -> TestResult {
     for (names, reason) in [
         ("['PLAIN']", "unsupported auth mechanism"),
+        ("['scram-sha-512']", "unsupported auth mechanism"),
+        (
+            "['SCRAM-SHA-512', 'SCRAM-SHA-512']",
+            "duplicate auth mechanism",
+        ),
+        (
+            "['SCRAM-SHA-512-PLUS', 'SCRAM-SHA-512-PLUS']",
+            "duplicate auth mechanism",
+        ),
         ("['EXTERNAL', 'EXTERNAL']", "duplicate auth mechanism"),
         (
             "['SCRAM-SHA-256', 'SCRAM-SHA-256']",

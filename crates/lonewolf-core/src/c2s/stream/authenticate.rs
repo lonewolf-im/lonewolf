@@ -103,7 +103,7 @@ pub(super) fn sasl_features(
     if !mechanisms.has_scram() && !offer_external {
         return None;
     }
-    let mut features = String::with_capacity(480);
+    let mut features = String::with_capacity(576);
     features.push_str("<stream:features>");
     if mechanisms.has_plus() {
         features.push_str("<sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/><channel-binding type='tls-exporter'/></sasl-channel-binding>");
@@ -113,6 +113,8 @@ pub(super) fn sasl_features(
         features.push_str("<mechanism>EXTERNAL</mechanism>");
     }
     for mechanism in [
+        Mechanism::Sha512Plus,
+        Mechanism::Sha512,
         Mechanism::Sha256Plus,
         Mechanism::Sha256,
         Mechanism::Sha1Plus,
@@ -759,12 +761,16 @@ mod tests {
                 exporter: [0; 32],
                 server_end_point: selected_b.server_end_point,
             };
-            for mechanism in [Mechanism::Sha1Plus, Mechanism::Sha256Plus] {
+            for mechanism in [
+                Mechanism::Sha1Plus,
+                Mechanism::Sha256Plus,
+                Mechanism::Sha512Plus,
+            ] {
                 let verifier = ScramVerifier::derive(
                     mechanism.hash(),
                     "pencil",
                     [7; 16],
-                    ScramIterations::new(4096)?,
+                    ScramIterations::new(mechanism.hash().minimum_iterations())?,
                 )?;
                 let first =
                     ClientFirst::parse(mechanism, b"p=tls-server-end-point,,n=alice,r=nonce", true)
@@ -793,7 +799,7 @@ mod tests {
         use hmac::{Hmac, KeyInit, Mac};
         use lonewolf_auth::scram::ScramHash;
         use sha1::Sha1;
-        use sha2::{Digest, Sha256};
+        use sha2::{Digest, Sha256, Sha512};
         let mut channel = b"p=tls-server-end-point,,".to_vec();
         channel.extend_from_slice(digest);
         let without_proof = format!("c={},r=nonceserver", STANDARD.encode(channel));
@@ -819,6 +825,19 @@ mod tests {
                 mac.update(b"Client Key");
                 let mut key = mac.finalize().into_bytes();
                 let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&Sha256::digest(key))?;
+                mac.update(message.as_bytes());
+                for (byte, signature) in key.iter_mut().zip(mac.finalize().into_bytes()) {
+                    *byte ^= signature;
+                }
+                key.to_vec()
+            }
+            ScramHash::Sha512 => {
+                let mut salted = [0; 64];
+                pbkdf2::pbkdf2_hmac::<Sha512>(b"pencil", &[7; 16], 10_000, &mut salted);
+                let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(&salted)?;
+                mac.update(b"Client Key");
+                let mut key = mac.finalize().into_bytes();
+                let mut mac = <Hmac<Sha512> as KeyInit>::new_from_slice(&Sha512::digest(key))?;
                 mac.update(message.as_bytes());
                 for (byte, signature) in key.iter_mut().zip(mac.finalize().into_bytes()) {
                     *byte ^= signature;

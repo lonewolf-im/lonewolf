@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use hmac::digest::Output;
 use hmac::{EagerHash, Hmac, KeyInit, Mac};
 use sha1::Sha1;
-use sha2::Sha256;
+use sha2::{Sha256, Sha512};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const SCRAM_POLICY_ITERATIONS: NonZeroU32 = match NonZeroU32::new(100_000) {
@@ -24,11 +24,7 @@ pub struct ScramIterations(NonZeroU32);
 impl ScramIterations {
     pub const MIN: u32 = 4096;
 
-    /// Enforces the minimum cost for newly derived verifiers.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScramError::InvalidIterations`] below [`Self::MIN`].
+    /// Rejects counts below 4,096; SHA-512 derivation also requires at least 10,000.
     pub fn new(iterations: u32) -> Result<Self, ScramError> {
         NonZeroU32::new(iterations)
             .filter(|iterations| iterations.get() >= Self::MIN)
@@ -52,7 +48,9 @@ pub enum ScramError {
 impl fmt::Display for ScramError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::InvalidIterations => "SCRAM iteration count must be at least 4096",
+            Self::InvalidIterations => {
+                "SCRAM iteration count must be at least 4096, or 10000 for SHA-512"
+            }
             Self::InvalidPassword => "password is not valid for SCRAM",
             Self::RandomUnavailable(_) => "secure random source is unavailable",
             Self::DerivationFailed => "SCRAM key derivation failed",
@@ -105,6 +103,23 @@ impl From<ScramError> for ProvisioningError {
 pub enum ScramHash {
     Sha1,
     Sha256,
+    Sha512,
+}
+
+impl ScramHash {
+    pub fn minimum_iterations(self) -> u32 {
+        match self {
+            Self::Sha1 | Self::Sha256 => ScramIterations::MIN,
+            Self::Sha512 => 10_000,
+        }
+    }
+
+    fn validate_iterations(self, iterations: ScramIterations) -> Result<(), ScramError> {
+        if iterations.get() < self.minimum_iterations() {
+            return Err(ScramError::InvalidIterations);
+        }
+        Ok(())
+    }
 }
 
 /// Retains verifier keys without erasing them on drop.
@@ -120,6 +135,7 @@ pub struct ScramVerifierData<const N: usize> {
 
 pub type ScramSha1Verifier = ScramVerifierData<20>;
 pub type ScramSha256Verifier = ScramVerifierData<32>;
+pub type ScramSha512Verifier = ScramVerifierData<64>;
 
 impl<const N: usize> ScramVerifierData<N> {
     /// Accepts stored values without validating their keys or minimum cost.
@@ -168,19 +184,12 @@ impl<const N: usize> fmt::Debug for ScramVerifierData<N> {
 pub enum ScramVerifier {
     Sha1(ScramSha1Verifier),
     Sha256(ScramSha256Verifier),
+    Sha512(ScramSha512Verifier),
 }
 
 impl ScramVerifier {
-    /// Derives a verifier with a fresh cryptographic salt.
-    ///
-    /// The password must pass SASLprep and remain nonempty. The caller retains
-    /// responsibility for erasing its password buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScramError::InvalidPassword`] for a rejected password,
-    /// [`ScramError::RandomUnavailable`] if salt generation fails, or
-    /// [`ScramError::DerivationFailed`] if HMAC initialization fails.
+    /// Requires a nonempty SASLprep password and the hash's minimum iteration count.
+    /// The caller must erase its password buffer; salt generation can fail.
     pub fn generate(
         hash: ScramHash,
         password: &str,
@@ -189,13 +198,7 @@ impl ScramVerifier {
         Self::generate_with_salt_source(hash, password, iterations, getrandom::fill)
     }
 
-    /// Password preparation and ownership follow [`Self::generate`]. New
-    /// credentials need an independently generated cryptographic salt.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScramError::InvalidPassword`] for a rejected password or
-    /// [`ScramError::DerivationFailed`] if HMAC initialization fails.
+    /// Follows [`Self::generate`]; new credentials require an independent random salt.
     pub fn derive(
         hash: ScramHash,
         password: &str,
@@ -213,6 +216,7 @@ impl ScramVerifier {
         fill: impl FnOnce(&mut [u8]) -> Result<(), getrandom::Error>,
     ) -> Result<Self, ScramError> {
         let password = PreparedPassword::new(password)?;
+        hash.validate_iterations(iterations)?;
         let mut salt = [0; 16];
         fill(&mut salt).map_err(ScramError::RandomUnavailable)?;
         Self::derive_prepared(hash, password.0.as_bytes(), salt, iterations)
@@ -224,6 +228,7 @@ impl ScramVerifier {
         salt: [u8; 16],
         iterations: ScramIterations,
     ) -> Result<Self, ScramError> {
+        hash.validate_iterations(iterations)?;
         Ok(match hash {
             ScramHash::Sha1 => {
                 let (stored_key, server_key) =
@@ -245,6 +250,16 @@ impl ScramVerifier {
                     server_key,
                 ))
             }
+            ScramHash::Sha512 => {
+                let (stored_key, server_key) =
+                    derive_keys::<Sha512, 64>(password, &salt, iterations)?;
+                Self::Sha512(ScramSha512Verifier::new(
+                    salt,
+                    iterations.0,
+                    stored_key,
+                    server_key,
+                ))
+            }
         })
     }
 
@@ -252,6 +267,7 @@ impl ScramVerifier {
         match self {
             Self::Sha1(_) => ScramHash::Sha1,
             Self::Sha256(_) => ScramHash::Sha256,
+            Self::Sha512(_) => ScramHash::Sha512,
         }
     }
 
@@ -259,6 +275,7 @@ impl ScramVerifier {
         match self {
             Self::Sha1(verifier) => verifier.iterations(),
             Self::Sha256(verifier) => verifier.iterations(),
+            Self::Sha512(verifier) => verifier.iterations(),
         }
     }
 }
@@ -267,11 +284,12 @@ impl ScramVerifier {
 pub struct ScramCredentials {
     sha1: Option<ScramSha1Verifier>,
     sha256: Option<ScramSha256Verifier>,
+    sha512: Option<ScramSha512Verifier>,
 }
 
 impl ScramCredentials {
     /// Requires at least 15 scalars and 3 distinct scalars after SASLprep.
-    /// Derivation blocks the caller; the caller must erase its raw password buffer.
+    /// Requires at least 10,000 iterations; the caller must erase its password buffer.
     pub fn provision(
         password: &str,
         iterations: ScramIterations,
@@ -298,10 +316,13 @@ impl ScramCredentials {
         if scalar_count < 15 || distinct_count < 3 {
             return Err(ProvisioningError::WeakPassword);
         }
+        ScramHash::Sha512.validate_iterations(iterations)?;
         let mut sha1_salt = [0; 16];
         let mut sha256_salt = [0; 16];
+        let mut sha512_salt = [0; 16];
         fill(&mut sha1_salt).map_err(ScramError::RandomUnavailable)?;
         fill(&mut sha256_salt).map_err(ScramError::RandomUnavailable)?;
+        fill(&mut sha512_salt).map_err(ScramError::RandomUnavailable)?;
         let sha1 = ScramVerifier::derive_prepared(
             ScramHash::Sha1,
             password.0.as_bytes(),
@@ -314,31 +335,58 @@ impl ScramCredentials {
             sha256_salt,
             iterations,
         )?;
-        match (sha1, sha256) {
-            (ScramVerifier::Sha1(sha1), ScramVerifier::Sha256(sha256)) => {
-                Ok(Self::both(sha1, sha256))
-            }
+        let sha512 = ScramVerifier::derive_prepared(
+            ScramHash::Sha512,
+            password.0.as_bytes(),
+            sha512_salt,
+            iterations,
+        )?;
+        match (sha1, sha256, sha512) {
+            (
+                ScramVerifier::Sha1(sha1),
+                ScramVerifier::Sha256(sha256),
+                ScramVerifier::Sha512(sha512),
+            ) => Ok(Self::all(sha1, sha256, sha512)),
             _ => Err(ScramError::DerivationFailed.into()),
         }
     }
 
     pub fn new(verifier: ScramVerifier) -> Self {
-        match verifier {
-            ScramVerifier::Sha1(verifier) => Self {
-                sha1: Some(verifier),
-                sha256: None,
-            },
-            ScramVerifier::Sha256(verifier) => Self {
-                sha1: None,
-                sha256: Some(verifier),
-            },
+        Self {
+            sha1: None,
+            sha256: None,
+            sha512: None,
         }
+        .with_verifier(verifier)
+    }
+
+    /// Replaces the selected family and retains every other family.
+    pub fn with_verifier(mut self, verifier: ScramVerifier) -> Self {
+        match verifier {
+            ScramVerifier::Sha1(verifier) => self.sha1 = Some(verifier),
+            ScramVerifier::Sha256(verifier) => self.sha256 = Some(verifier),
+            ScramVerifier::Sha512(verifier) => self.sha512 = Some(verifier),
+        }
+        self
     }
 
     pub fn both(sha1: ScramSha1Verifier, sha256: ScramSha256Verifier) -> Self {
         Self {
             sha1: Some(sha1),
             sha256: Some(sha256),
+            sha512: None,
+        }
+    }
+
+    pub fn all(
+        sha1: ScramSha1Verifier,
+        sha256: ScramSha256Verifier,
+        sha512: ScramSha512Verifier,
+    ) -> Self {
+        Self {
+            sha1: Some(sha1),
+            sha256: Some(sha256),
+            sha512: Some(sha512),
         }
     }
 
@@ -348,6 +396,10 @@ impl ScramCredentials {
 
     pub fn sha256(&self) -> Option<&ScramSha256Verifier> {
         self.sha256.as_ref()
+    }
+
+    pub fn sha512(&self) -> Option<&ScramSha512Verifier> {
+        self.sha512.as_ref()
     }
 }
 

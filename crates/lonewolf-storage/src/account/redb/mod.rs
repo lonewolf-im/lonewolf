@@ -9,7 +9,7 @@ use ::redb::{
 };
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramSha1Verifier, ScramSha256Verifier,
-    ScramVerifier, ScramVerifierData,
+    ScramSha512Verifier, ScramVerifier, ScramVerifierData,
 };
 use lonewolf_auth::server::ScramDecoy;
 use lonewolf_xmpp::jid::MAX_PART_LEN;
@@ -26,13 +26,10 @@ pub(crate) const DECOY_SECRET_KEY: &str = "secret";
 const RECORD_VERSION: u8 = 1;
 const SHA1: u8 = 1;
 const SHA256: u8 = 2;
-const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2);
+const SHA512: u8 = 4;
+const MAX_RECORD_BYTES: usize = 2 + (16 + 4 + 20 * 2) + (16 + 4 + 32 * 2) + (16 + 4 + 64 * 2);
 
-/// Creates the account tables and loads or creates the SCRAM decoy secret.
-///
-/// # Errors
-///
-/// Returns [`StorageErrorKind::CorruptData`] for incomplete account or decoy state.
+/// Returns [`StorageErrorKind::CorruptData`] if account or decoy state is incomplete.
 pub(crate) fn initialize(transaction: &WriteTransaction) -> Result<ScramDecoy, StorageError> {
     let mut accounts_table_exists = false;
     let mut decoy_table_exists = false;
@@ -167,6 +164,7 @@ fn read_scram<T: ReadableTable<&'static str, &'static [u8]>>(
     Ok(match hash {
         ScramHash::Sha1 => credentials.sha1.map(ScramVerifier::Sha1),
         ScramHash::Sha256 => credentials.sha256.map(ScramVerifier::Sha256),
+        ScramHash::Sha512 => credentials.sha512.map(ScramVerifier::Sha512),
     })
 }
 
@@ -267,6 +265,9 @@ fn validate_iterations(credentials: &ScramCredentials) -> Result<(), AccountErro
         || credentials
             .sha256()
             .is_some_and(|verifier| verifier.iterations() != SCRAM_POLICY_ITERATIONS)
+        || credentials
+            .sha512()
+            .is_some_and(|verifier| verifier.iterations() != SCRAM_POLICY_ITERATIONS)
     {
         return Err(AccountError::UnsupportedIterations);
     }
@@ -299,10 +300,10 @@ impl EncodedCredentials {
 struct DecodedCredentials {
     sha1: Option<ScramSha1Verifier>,
     sha256: Option<ScramSha256Verifier>,
+    sha512: Option<ScramSha512Verifier>,
 }
 
-// The disk format uses a version and hash mask, then SHA-1 before SHA-256.
-// Each verifier stores salt, little-endian iterations, stored key, and server key.
+// Family order and field widths must remain compatible with stored account records.
 fn encode_credentials(credentials: &ScramCredentials) -> EncodedCredentials {
     let mut record = EncodedCredentials {
         bytes: [0; MAX_RECORD_BYTES],
@@ -317,6 +318,10 @@ fn encode_credentials(credentials: &ScramCredentials) -> EncodedCredentials {
         record.bytes[1] |= SHA256;
         record.append_verifier(verifier);
     }
+    if let Some(verifier) = credentials.sha512() {
+        record.bytes[1] |= SHA512;
+        record.append_verifier(verifier);
+    }
     record
 }
 
@@ -325,7 +330,7 @@ fn decode_credentials(mut bytes: &[u8]) -> Result<DecodedCredentials, StorageErr
     if version != RECORD_VERSION {
         return Err(StorageError::new(StorageErrorKind::UnsupportedVersion));
     }
-    if hashes == 0 || hashes & !(SHA1 | SHA256) != 0 {
+    if hashes == 0 || hashes & !(SHA1 | SHA256 | SHA512) != 0 {
         return Err(StorageError::new(StorageErrorKind::CorruptData));
     }
     let sha1 = if hashes & SHA1 != 0 {
@@ -338,10 +343,19 @@ fn decode_credentials(mut bytes: &[u8]) -> Result<DecodedCredentials, StorageErr
     } else {
         None
     };
+    let sha512 = if hashes & SHA512 != 0 {
+        Some(decode_verifier(&mut bytes)?)
+    } else {
+        None
+    };
     if !bytes.is_empty() {
         return Err(StorageError::new(StorageErrorKind::CorruptData));
     }
-    Ok(DecodedCredentials { sha1, sha256 })
+    Ok(DecodedCredentials {
+        sha1,
+        sha256,
+        sha512,
+    })
 }
 
 fn decode_verifier<const N: usize>(

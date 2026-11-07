@@ -305,6 +305,8 @@
 
 # Choose the SASL mechanisms this endpoint offers and accepts after TLS.
 # Include at least one mechanism.
+# Add SCRAM-SHA-512 or SCRAM-SHA-512-PLUS only after replacing existing account passwords.
+# These mechanisms follow an expired Internet-Draft and require compatible clients.
 # EXTERNAL requires a verified client certificate for the selected host.
 # Listeners that offer only EXTERNAL need client certificate trust configured for every host.
 # auth_mechanisms = ["EXTERNAL", "SCRAM-SHA-256-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-1-PLUS", "SCRAM-SHA-1"]

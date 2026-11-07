@@ -247,3 +247,61 @@ fn stanza_byte_and_rate_limit_counters_are_reported() -> TestResult {
     alice.close()?;
     suite.stop()
 }
+
+#[test]
+fn sha512_authentication_metrics_count_exact_success_and_failure_deltas() -> TestResult {
+    let mut suite = C2sSuite::with_auth_mechanisms(&["SCRAM-SHA-512", "SCRAM-SHA-512-PLUS"])?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let before = suite.scrape_metrics()?;
+    assert!(!before.contains("lonewolf_c2s_authentications_total"));
+    for (mechanism, binding) in [
+        ("SCRAM-SHA-512", None),
+        ("SCRAM-SHA-512-PLUS", Some("tls-server-end-point")),
+    ] {
+        for (username, password) in [("alice", "wrong"), ("missing", ALTERNATE_PASSWORD)] {
+            let mut client = suite.unauthenticated_client()?;
+            client
+                .scram(username, password, mechanism, binding)?
+                .assert_xml(
+                    "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+                )?;
+            client.close()?;
+        }
+        let mut client = suite.unauthenticated_client()?;
+        client
+            .scram("alice", ALTERNATE_PASSWORD, mechanism, binding)?
+            .assert_name("urn:ietf:params:xml:ns:xmpp-sasl", "success");
+        let mut client = client.restart();
+        client.open()?;
+        client.bind(Some("desk"))?;
+        client.close()?;
+        for (outcome, delta) in [("success", 1.0), ("not_authorized", 2.0)] {
+            let series = format!(
+                "lonewolf_c2s_authentications_total{{listener=\"0\",mechanism=\"{mechanism}\",outcome=\"{outcome}\"}}"
+            );
+            let initial = sample_value(&before, &series).unwrap_or_default();
+            let after = suite.wait_for_metric(&format!("{series} {}", initial + delta))?;
+            assert_eq!(sample_value(&after, &series), Some(initial + delta));
+        }
+    }
+    let after = suite.scrape_metrics()?;
+    for mechanism in [
+        "SCRAM-SHA-1",
+        "SCRAM-SHA-1-PLUS",
+        "SCRAM-SHA-256",
+        "SCRAM-SHA-256-PLUS",
+        "EXTERNAL",
+        "none",
+    ] {
+        for outcome in ["success", "not_authorized"] {
+            let series = format!(
+                "lonewolf_c2s_authentications_total{{listener=\"0\",mechanism=\"{mechanism}\",outcome=\"{outcome}\"}}"
+            );
+            assert_eq!(
+                sample_value(&before, &series),
+                sample_value(&after, &series)
+            );
+        }
+    }
+    suite.stop()
+}

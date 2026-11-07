@@ -532,6 +532,11 @@ fn hmac_scram(
             Ok(mac.finalize().into_bytes().to_vec())
         }
         ScramHash::Sha256 => Ok(hmac_sha256(key, message)?.to_vec()),
+        ScramHash::Sha512 => {
+            let mut mac = Hmac::<sha2::Sha512>::new_from_slice(key)?;
+            mac.update(message);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
     }
 }
 
@@ -951,10 +956,12 @@ fn external_features_require_connection_candidates_and_precede_scram()
     let absent = sasl_features(AuthMechanisms::ALL, false).ok_or("missing SCRAM offer")?;
     assert!(!absent.contains("EXTERNAL"));
     let present = sasl_features(AuthMechanisms::ALL, true).ok_or("missing EXTERNAL offer")?;
-    assert!(
-        present
-            .contains("<mechanism>EXTERNAL</mechanism><mechanism>SCRAM-SHA-256-PLUS</mechanism>")
-    );
+    assert!(present.contains(concat!(
+        "<mechanism>EXTERNAL</mechanism>",
+        "<mechanism>SCRAM-SHA-512-PLUS</mechanism><mechanism>SCRAM-SHA-512</mechanism>",
+        "<mechanism>SCRAM-SHA-256-PLUS</mechanism><mechanism>SCRAM-SHA-256</mechanism>",
+        "<mechanism>SCRAM-SHA-1-PLUS</mechanism><mechanism>SCRAM-SHA-1</mechanism>",
+    )));
     Ok(())
 }
 

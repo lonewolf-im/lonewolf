@@ -14,7 +14,7 @@ use crate::tests::{
     TestResult, assert_scram, assert_storage_error, credentials, key, new_account, read, verifier,
     write,
 };
-use crate::{RedbStorage, Storage, StorageErrorKind};
+use crate::{RedbStorage, Storage, StorageErrorKind, WriteTransaction};
 
 const PAGE: NonZeroUsize = const { NonZeroUsize::new(1000).unwrap() };
 
@@ -45,7 +45,18 @@ fn malformed_records_fail_operations_and_stay_unchanged_when_the_transaction_is_
     let alice = key("alice@example.com")?;
     let mut zero_iterations = [0; 86];
     zero_iterations[..2].copy_from_slice(&[1, 2]);
-    for bytes in [&[][..], &[1], &[1, 0], &[1, 4], &[1, 2], &zero_iterations] {
+    let mut zero_sha512_iterations = [0; 150];
+    zero_sha512_iterations[..2].copy_from_slice(&[1, 4]);
+    for bytes in [
+        &[][..],
+        &[1],
+        &[1, 0],
+        &[1, 4],
+        &[1, 8],
+        &[1, 2],
+        &zero_iterations,
+        &zero_sha512_iterations,
+    ] {
         insert_record(&storage, alice.as_str(), bytes)?;
         block_on(async {
             let mut writer = storage.begin_write().await?;
@@ -116,7 +127,10 @@ fn unsupported_record_versions_are_distinct_from_missing_accounts() -> TestResul
 fn truncated_and_extended_records_are_rejected_even_for_a_complete_first_hash() -> TestResult {
     let storage = storage()?;
     let alice = key("alice@example.com")?;
-    let account = new_account("alice@example.com", 10)?;
+    let account = NewAccount {
+        key: alice.clone(),
+        credentials: ScramCredentials::all(verifier(10), verifier(20), verifier(30)),
+    };
     block_on(write(&storage, async |tx| tx.create_account(account).await))?;
     let mut bytes = stored_record(&storage, alice.as_str())?.ok_or("missing record")?;
     block_on(async {
@@ -330,4 +344,98 @@ fn paging_through_many_long_keys_preserves_order_and_count() -> TestResult {
         assert_eq!(count, 10_000);
         Ok(())
     })
+}
+
+#[test]
+fn every_nonempty_credential_combination_preserves_bytes_across_reopen() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("accounts.redb");
+    let alice = key("alice@example.com")?;
+    for mask in 1_u8..=7 {
+        let mut selected: Option<ScramCredentials> = None;
+        for (bit, verifier) in [
+            (1, ScramVerifier::Sha1(verifier(10))),
+            (2, ScramVerifier::Sha256(verifier(20))),
+            (4, ScramVerifier::Sha512(verifier(30))),
+        ] {
+            if mask & bit != 0 {
+                selected = Some(match selected {
+                    None => ScramCredentials::new(verifier),
+                    Some(credentials) => credentials.with_verifier(verifier),
+                });
+            }
+        }
+        let selected = selected.ok_or("empty set")?;
+        let record = {
+            let storage = RedbStorage::open(&path)?;
+            block_on(write(&storage, async |tx| {
+                tx.create_account(NewAccount {
+                    key: alice.clone(),
+                    credentials: selected,
+                })
+                .await
+            }))?;
+            stored_record(&storage, alice.as_str())?.ok_or("missing record")?
+        };
+        assert_eq!(&record[..2], &[1, mask]);
+        let expected_length = 2
+            + if mask & 1 != 0 { 60 } else { 0 }
+            + if mask & 2 != 0 { 84 } else { 0 }
+            + if mask & 4 != 0 { 148 } else { 0 };
+        assert_eq!(record.len(), expected_length);
+        if mask == 7 {
+            assert_eq!(record.len(), 294);
+        }
+        let storage = RedbStorage::open(&path)?;
+        assert_eq!(
+            stored_record(&storage, alice.as_str())?,
+            Some(record.clone())
+        );
+        block_on(async {
+            let reader = storage.begin_read().await?;
+            for (bit, hash, marker) in [
+                (1, ScramHash::Sha1, 10),
+                (2, ScramHash::Sha256, 20),
+                (4, ScramHash::Sha512, 30),
+            ] {
+                let actual = reader.scram(&alice, hash).await?;
+                if mask & bit == 0 {
+                    assert!(actual.is_none());
+                } else {
+                    assert_scram(actual, marker)?;
+                }
+            }
+            drop(reader);
+            let mut writer = storage.begin_write().await?;
+            writer
+                .replace_credentials(
+                    &alice,
+                    ScramCredentials::all(verifier(40), verifier(50), verifier(60)),
+                )
+                .await?;
+            drop(writer);
+            assert_eq!(stored_record(&storage, alice.as_str())?, Some(record));
+            let mut writer = storage.begin_write().await?;
+            writer
+                .replace_credentials(
+                    &alice,
+                    ScramCredentials::new(ScramVerifier::Sha512(verifier(70))),
+                )
+                .await?;
+            writer.commit().await?;
+            let reader = storage.begin_read().await?;
+            assert!(reader.scram(&alice, ScramHash::Sha1).await?.is_none());
+            assert!(reader.scram(&alice, ScramHash::Sha256).await?.is_none());
+            assert_scram(reader.scram(&alice, ScramHash::Sha512).await?, 70)?;
+            drop(reader);
+            let mut writer = storage.begin_write().await?;
+            writer.delete_account(&alice).await?;
+            drop(writer);
+            assert!(storage.begin_read().await?.account(&alice).await?.is_some());
+            write(&storage, async |tx| tx.delete_account(&alice).await).await?;
+            assert!(storage.begin_read().await?.account(&alice).await?.is_none());
+            Ok::<(), Box<dyn Error>>(())
+        })?;
+    }
+    Ok(())
 }

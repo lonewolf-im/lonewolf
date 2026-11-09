@@ -703,6 +703,17 @@ pub enum TlsMode {
     Direct,
 }
 
+impl TlsMode {
+    pub(crate) const ALL: [Self; 2] = [Self::StartTls, Self::Direct];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::StartTls => "starttls",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct S2sListenerConfig {

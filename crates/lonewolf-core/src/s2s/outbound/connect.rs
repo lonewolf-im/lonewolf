@@ -710,11 +710,11 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         .await;
     if let Some(verdict) = &revocation {
         if let Some(outcome) = verdict.auth_outcome() {
-            tracing::warn!(outcome = outcome.as_str(), direction = "outbound", local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s certificate rejected");
+            tracing::warn!(outcome = outcome.as_str(), direction = "outbound", tls_mode = setup.tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s certificate rejected");
             return Err(EstablishError::Tls(outcome.as_str()).into());
         }
         if let RevocationStatus::Unknown(reason) = verdict.status {
-            tracing::debug!(reason = reason.as_str(), direction = "outbound", local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s revocation status unknown");
+            tracing::debug!(reason = reason.as_str(), direction = "outbound", tls_mode = setup.tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s revocation status unknown");
         }
     }
     Ok(VerifiedPeer {
@@ -737,7 +737,7 @@ pub(crate) async fn establish<A: ChunkAllocator + Clone>(
     .await;
     match &result {
         Ok(stream) => {
-            tracing::info!(connection_id = stream.connection_id, local_domain = %safe_domain(local), remote_domain = %safe_domain(remote), direction = "outbound", bidi = stream.bidi, "s2s connection authenticated")
+            tracing::info!(connection_id = stream.connection_id, local_domain = %safe_domain(local), remote_domain = %safe_domain(remote), direction = "outbound", tls_mode = stream._connection_gauge.tls_mode().map(TlsMode::as_str), bidi = stream.bidi, "s2s connection authenticated")
         }
         Err(error) => {
             tracing::warn!(local_domain = %safe_domain(local), remote_domain = %safe_domain(remote), stage = error.stage(), reason = error.reason(), "s2s connection failed")
@@ -782,17 +782,35 @@ where
     }
     let mut attempts = Attempts::default();
     for (index, endpoint) in resolved.endpoints.iter().enumerate() {
-        let Ok(Ok(tcp)) = compio::time::timeout_at(
+        let mut attempt = context
+            .metrics
+            .transport_attempt(Direction::Outbound, endpoint.tls_mode);
+        let tcp = match compio::time::timeout_at(
             deadline(Instant::now(), context.limits.connect_timeout_secs),
             connect(endpoint.address),
         )
         .await
-        else {
-            attempts.failed(None);
-            continue;
+        {
+            Ok(Ok(tcp)) => tcp,
+            Ok(Err(error)) => {
+                attempt.complete(if error.kind() == io::ErrorKind::TimedOut {
+                    AuthOutcome::Timeout
+                } else {
+                    AuthOutcome::Unreachable
+                });
+                attempts.failed(None);
+                continue;
+            }
+            Err(_) => {
+                attempt.complete(AuthOutcome::Timeout);
+                attempts.failed(None);
+                continue;
+            }
         };
         let socket = ConnectionSocket(tcp);
-        let gauge = context.metrics.connection_opened(Direction::Outbound);
+        let gauge = context
+            .metrics
+            .connection_opened(Direction::Outbound, endpoint.tls_mode);
         let connection_id = NEXT_S2S_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let mut flow = Negotiation {
             connection: None,
@@ -801,9 +819,11 @@ where
         let negotiated = if socket.0.set_nodelay(true).is_err() {
             (Err(protocol()), Instant::now())
         } else {
-            let setup = setups[usize::from(endpoint.tls_mode == TlsMode::Direct)]
-                .as_ref()
-                .ok_or(EstablishError::Negotiation(NegotiationFailure::Protocol))?;
+            let Some(setup) = setups[usize::from(endpoint.tls_mode == TlsMode::Direct)].as_ref()
+            else {
+                attempt.complete(AuthOutcome::Protocol);
+                return Err(EstablishError::Negotiation(NegotiationFailure::Protocol));
+            };
             let deadline = deadline(Instant::now(), context.limits.negotiation_timeout_secs);
             match compio::time::timeout_at(
                 deadline,
@@ -838,8 +858,10 @@ where
                 revocation,
             }) => {
                 let Some(Connection::Tls(reader, writer)) = flow.connection.take() else {
+                    attempt.complete(AuthOutcome::Protocol);
                     return Err(protocol().error);
                 };
+                attempt.complete(AuthOutcome::Success);
                 accounting.select(AuthOutcome::Success, selected_at);
                 accounting.record(selected_at);
                 if context.bidirectional {
@@ -865,6 +887,12 @@ where
                 });
             }
             Err(failure) => {
+                attempt.complete(
+                    failure
+                        .error
+                        .authentication()
+                        .unwrap_or(AuthOutcome::Protocol),
+                );
                 attempts.failed(Some(failure));
                 if index + 1 == resolved.endpoints.len() {
                     accounting.select(

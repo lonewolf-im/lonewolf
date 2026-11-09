@@ -151,6 +151,16 @@ impl RawS2sPeer {
         ))?;
         Ok(())
     }
+    pub fn start_tls_socket(mut self) -> TestResult<TcpStream> {
+        self.stream
+            .send(&format!("<starttls xmlns='{TLS_NAMESPACE}'/>"))?;
+        self.stream.receive()?.assert_name(TLS_NAMESPACE, "proceed");
+        assert!(!self.stream.has_buffered_input());
+        let PeerTransport::Plain(socket) = self.stream.into_inner().into_inner() else {
+            return Err("peer already uses TLS".into());
+        };
+        Ok(socket)
+    }
     pub fn start_tls(self, config: Arc<rustls::ClientConfig>) -> TestResult<Self> {
         let header = opening(&self.from, &self.to);
         let expected_to = self.from.clone();

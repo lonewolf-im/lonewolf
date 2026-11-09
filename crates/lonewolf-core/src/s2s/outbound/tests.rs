@@ -626,6 +626,22 @@ fn domain_context_is_bounded_and_hides_address_literals() {
 #[test]
 fn pending_tcp_connect_is_destroyed_by_production_stop_without_trying_the_next_endpoint()
 -> TestResult {
+    for mode in TlsMode::ALL {
+        pending_connector_case(mode, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn pending_tcp_connect_timeout_counts_each_mode_without_changing_aggregate_unreachable()
+-> TestResult {
+    for mode in TlsMode::ALL {
+        pending_connector_case(mode, true)?;
+    }
+    Ok(())
+}
+
+fn pending_connector_case(mode: TlsMode, expire: bool) -> TestResult {
     use crate::config::{Config, HostConfig, HostTlsConfig, HostTlsSource};
     use crate::delivery::WorkGroup;
     use futures_util::{FutureExt, poll};
@@ -686,6 +702,8 @@ fn pending_tcp_connect_is_destroyed_by_production_stop_without_trying_the_next_e
             "peer.test".into(),
             vec!["127.0.0.1:1".parse()?, "127.0.0.1:2".parse()?],
         );
+        for endpoint in config.s2s.routes.get_mut("peer.test").ok_or("missing route")? { endpoint.tls_mode = mode; }
+        config.limits.s2s.connect_timeout_secs = NonZeroU64::MIN;
         let hosts = Hosts::new(&config.hosts, Some("local.test"))?;
         let trust = PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?;
         let resolver = Resolver::new(&config.s2s)?;
@@ -735,14 +753,20 @@ fn pending_tcp_connect_is_destroyed_by_production_stop_without_trying_the_next_e
             assert!(poll!(future.as_mut()).is_pending());
             assert_eq!(entered.get(), 1);
             assert_eq!(destroyed.get(), 0);
-            stop.send(()).map_err(|_| "stop dropped")?;
-            assert!(future.await.is_none());
+            if expire {
+                assert!(matches!(future.await, Some(Err(EstablishError::Unreachable))));
+            } else {
+                stop.send(()).map_err(|_| "stop dropped")?;
+                assert!(future.await.is_none());
+            }
         }
-        assert_eq!(attempted.get(), 1);
-        assert_eq!(destroyed.get(), 1);
+        assert_eq!(attempted.get(), if expire { 2 } else { 1 });
+        assert_eq!(destroyed.get(), if expire { 2 } else { 1 });
         assert!(poll!(std::pin::pin!(group.drain())).is_ready());
         let output = render(&metrics)?;
-        sample(&output, "protocol", 1);
+        sample(&output, if expire { "unreachable" } else { "protocol" }, 1);
+        assert!(output.lines().any(|line| line == format!("lonewolf_s2s_transport_attempts_total{{direction=\"outbound\",tls_mode=\"{}\",outcome=\"{}\"}} {}", mode.as_str(), if expire { "timeout" } else { "cancelled" }, if expire { 2 } else { 1 })), "{output}");
+        for tls_mode in TlsMode::ALL { assert!(output.contains(&format!("lonewolf_s2s_transport_connections{{direction=\"outbound\",tls_mode=\"{}\"}} 0", tls_mode.as_str())), "{output}"); }
         assert!(output.contains("lonewolf_s2s_dns_resolutions_total{outcome=\"static\"} 1"));
         assert!(output.contains("lonewolf_s2s_connections{direction=\"outbound\"} 0"));
         Ok(())

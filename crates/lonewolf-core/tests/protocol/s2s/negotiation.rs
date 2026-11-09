@@ -377,6 +377,12 @@ fn peer_certificate_with_only_client_auth_fails_tls() -> TestResult {
     peer.expect_starttls_features()?;
     assert_tls_rejection(peer.start_tls(config))?;
     authentication(&fixture.suite, "inbound", "tls_failure", 1)?;
+    super::direct_tls::transport_attempts(
+        &fixture.suite,
+        "inbound",
+        &[("starttls", "tls_failure", 1)],
+    )?;
+    super::direct_tls::transport_connections(&fixture.suite, "inbound", 0, 0)?;
     fixture
         .suite
         .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;

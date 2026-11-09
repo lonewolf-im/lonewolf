@@ -208,6 +208,11 @@ struct S2sAcceptor<A: ChunkAllocator> {
 impl<A: ChunkAllocator + Clone> AcceptHandler for S2sAcceptor<A> {
     type Permit = (GlobalPermit, ConnectionPermit);
     type Rejection = Rejection;
+    fn listener_bound(&self, slot: ListenerSlot) -> impl Sized + 'static {
+        self.settings
+            .metrics
+            .listener_bound(slot.listener_id, self.settings.tls_mode)
+    }
     async fn admit(&self, peer: IpAddr) -> Result<Self::Permit, Self::Rejection> {
         self.admission.reserve(peer).await
     }
@@ -238,7 +243,14 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for S2sAcceptor<A> {
         shutdown: ShutdownSignal,
     ) -> impl Future<Output = ()> + 'static {
         self.settings.metrics.connection_accepted(slot.listener_id);
-        let gauge = self.settings.metrics.connection_opened(Direction::Inbound);
+        let gauge = self
+            .settings
+            .metrics
+            .connection_opened(Direction::Inbound, self.settings.tls_mode);
+        let attempt = self
+            .settings
+            .metrics
+            .transport_attempt(Direction::Inbound, self.settings.tls_mode);
         let settings = self.settings.clone();
         async move {
             let _permits = permits;
@@ -250,6 +262,7 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for S2sAcceptor<A> {
                 &settings,
                 shutdown.clone(),
                 connection_id,
+                attempt,
             )
             .await
             {
@@ -265,6 +278,7 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for S2sAcceptor<A> {
             tracing::info!(
                 connection_id,
                 outcome,
+                tls_mode = settings.tls_mode.as_str(),
                 duration_ms = started.elapsed().as_millis() as u64,
                 "s2s stream disconnected"
             );

@@ -274,3 +274,94 @@ fn stop_keeps_the_first_deadline_and_is_idempotent() -> TestResult {
         Ok(())
     })
 }
+
+struct BoundHandler(Arc<[std::sync::atomic::AtomicUsize; 2]>);
+struct BoundGuard {
+    counts: Arc<[std::sync::atomic::AtomicUsize; 2]>,
+    listener: usize,
+}
+impl Drop for BoundGuard {
+    fn drop(&mut self) {
+        self.counts[self.listener].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+impl AcceptHandler for BoundHandler {
+    type Permit = ();
+    type Rejection = ();
+    fn listener_bound(&self, slot: ListenerSlot) -> impl Sized + 'static {
+        self.0[slot.listener_id].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        BoundGuard {
+            counts: Arc::clone(&self.0),
+            listener: slot.listener_id,
+        }
+    }
+    async fn admit(&self, _: IpAddr) -> Result<(), ()> {
+        Ok(())
+    }
+    fn rejected(&self, _: ListenerSlot, _: ()) {
+        panic!("unexpected rejection");
+    }
+    fn serve(
+        &self,
+        _: ListenerSlot,
+        socket: TcpStream,
+        _: (),
+        _: ShutdownSignal,
+    ) -> impl Future<Output = ()> + 'static {
+        drop(socket);
+        std::future::ready(())
+    }
+}
+fn bound_specs(
+    addresses: [SocketAddr; 2],
+    counts: &Arc<[std::sync::atomic::AtomicUsize; 2]>,
+) -> Vec<ListenerSpec<impl FnMut(ListenerSlot) -> BoundHandler>> {
+    addresses
+        .into_iter()
+        .map(|address| ListenerSpec {
+            address,
+            handler: {
+                let counts = Arc::clone(counts);
+                move |_| BoundHandler(Arc::clone(&counts))
+            },
+        })
+        .collect()
+}
+#[test]
+fn bound_registrations_follow_worker_bind_close_and_startup_rollback() -> TestResult {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    Runtime::new()?.block_on(compio::time::timeout(TIMEOUT * 2, async {
+        for kind in [ListenerKind::C2s, ListenerKind::S2s] {
+            let dispatcher = dispatcher()?;
+            let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+            let any = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let mut listeners =
+                ListenerSet::start(kind, &dispatcher.handle(), bound_specs([any, any], &counts))
+                    .await?;
+            for count in counts.iter() {
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    dispatcher.handle().worker_count()
+                );
+            }
+            listeners.stop(Instant::now() + TIMEOUT);
+            listeners.join().await?;
+            for count in counts.iter() {
+                assert_eq!(count.load(Ordering::SeqCst), 0);
+            }
+            let occupied = std::net::TcpListener::bind(any)?;
+            let result = ListenerSet::start(
+                kind,
+                &dispatcher.handle(),
+                bound_specs([any, occupied.local_addr()?], &counts),
+            )
+            .await;
+            assert!(result.is_err());
+            for count in counts.iter() {
+                assert_eq!(count.load(Ordering::SeqCst), 0);
+            }
+            dispatcher.shutdown(TIMEOUT).await?;
+        }
+        Ok(())
+    }))?
+}

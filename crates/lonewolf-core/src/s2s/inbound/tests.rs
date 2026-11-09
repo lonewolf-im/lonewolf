@@ -1397,3 +1397,52 @@ fn direct_sni_normalizes_idna_and_checks_registration_coverage_and_federation()
         Ok(())
     })
 }
+
+#[test]
+fn admitted_unpolled_connection_counts_cancelled_once_and_releases_mode_gauges_and_permits()
+-> TestResult {
+    use super::super::{AdmissionLimits, GlobalLimit, S2sAcceptor};
+    use crate::config::TlsMode;
+    use crate::connection::{
+        AcceptHandler, ListenerSlot,
+        socket::{ConnectionSocket, ConnectionTask},
+    };
+    use parking_lot::Mutex as PlMutex;
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    Runtime::new()?.block_on(async {
+        for mode in TlsMode::ALL {
+            let mut fixture = Fixture::new()?;
+            fixture.settings.metrics = S2sMetrics::new(1);
+            fixture.settings.tls_mode = mode;
+            let limits = Config::default().limits.s2s;
+            let admission = Arc::new(AdmissionLimits {
+                attempts: crate::admission::attempt_limit::AttemptLimiter::new(&limits.connection_attempts_per_ip),
+                connections: crate::admission::connection_limit::ConnectionLimiter::new(limits.max_connections_per_ip.get()),
+                global: Arc::new(GlobalLimit { active: AtomicUsize::new(0), max: limits.max_inbound_connections.get(), report: PlMutex::new(crate::admission::rejection_report::RejectionReport::default()) }),
+            });
+            let handler = S2sAcceptor { admission: Arc::clone(&admission), settings: fixture.settings.clone() };
+            let listener = crate::connection::bind(([127, 0, 0, 1], 0).into()).await?;
+            let mut peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+            peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let (socket, peer_address) = listener.accept().await?;
+            let permit = handler.admit(peer_address.ip()).await.map_err(|_| "admission rejected")?;
+            let task = ConnectionTask { _socket: ConnectionSocket(socket.clone()), future: Box::pin(handler.serve(ListenerSlot { listener_id: 0, worker_id: 0 }, socket, permit, std::future::pending().boxed_local().shared())) };
+            assert_eq!(admission.global.active.load(Ordering::Acquire), 1);
+            let output = render(&fixture.settings.metrics)?;
+            assert!(!output.contains("s2s_transport_attempts_total"));
+            assert!(output.contains("s2s_connections{direction=\"inbound\"} 1"));
+            drop(task);
+            assert_eq!(peer.read(&mut [0; 1])?, 0);
+            assert_eq!(admission.global.active.load(Ordering::Acquire), 0);
+            let output = render(&fixture.settings.metrics)?;
+            assert_eq!(output.lines().filter(|line| line.starts_with("s2s_transport_attempts_total{")).count(), 1);
+            assert!(output.contains(&format!("s2s_transport_attempts_total{{direction=\"inbound\",tls_mode=\"{}\",outcome=\"cancelled\"}} 1", mode.as_str())));
+            assert!(!output.contains("s2s_authentications_total"));
+            assert!(output.contains("s2s_connections{direction=\"inbound\"} 0"));
+            for tls_mode in TlsMode::ALL { assert!(output.contains(&format!("s2s_transport_connections{{direction=\"inbound\",tls_mode=\"{}\"}} 0", tls_mode.as_str()))); }
+            listener.close().await?;
+        }
+        Ok(())
+    })
+}

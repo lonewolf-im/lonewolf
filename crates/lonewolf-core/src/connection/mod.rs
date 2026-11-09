@@ -43,6 +43,8 @@ pub(crate) struct ListenerSlot {
 pub(crate) trait AcceptHandler: 'static {
     type Permit: 'static;
     type Rejection;
+    /// Keep the returned guard until the bound listener closes.
+    fn listener_bound(&self, _slot: ListenerSlot) -> impl Sized + 'static {}
     async fn admit(&self, peer: IpAddr) -> Result<Self::Permit, Self::Rejection>;
     fn rejected(&self, slot: ListenerSlot, rejection: Self::Rejection);
     fn serve(
@@ -134,6 +136,10 @@ impl ListenerSet {
                             let result = async {
                                 let listener = bind(address).await?;
                                 let bound = listener.local_addr()?;
+                                let _registration = handler.listener_bound(ListenerSlot {
+                                    listener_id,
+                                    worker_id,
+                                });
                                 if ready.send(bound).is_err() {
                                     return Ok(());
                                 }

@@ -851,6 +851,7 @@ fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
 fn cancelled_binding_phase_records_a_cancelled_close() -> io::Result<()> {
     let metrics = crate::c2s::metrics::C2sMetrics::detached();
     drop(ConnectionLifecycle {
+        tls_mode: crate::config::TlsMode::StartTls,
         connection_id: 7,
         listener_id: 2,
         worker_id: 3,
@@ -987,6 +988,7 @@ fn external_only_features_require_a_usable_certificate() -> Result<(), Box<dyn E
 fn cancelled_bound_lifecycle_records_one_close_and_session() -> Result<(), Box<dyn Error>> {
     let metrics = crate::c2s::metrics::C2sMetrics::detached();
     drop(ConnectionLifecycle {
+        tls_mode: crate::config::TlsMode::StartTls,
         connection_id: 7,
         listener_id: 0,
         worker_id: 0,

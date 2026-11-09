@@ -1,46 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::{Future, pending};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use compio::net::{TcpListener, TcpSocket};
-use futures_channel::oneshot;
-use futures_util::FutureExt as _;
-use futures_util::future::{BoxFuture, Either, LocalBoxFuture, Shared, select};
-use futures_util::stream::{FuturesUnordered, StreamExt as _};
+use compio::net::TcpStream;
 use lonewolf_util::arena::ChunkAllocator;
-use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
-use nix::errno::Errno;
+use lonewolf_util::core_dispatcher::DispatchHandle;
 use parking_lot::Mutex as PlMutex;
-use socket2::SockRef;
 
+use super::NEXT_S2S_CONNECTION_ID;
 use super::ingress::IngressServices;
 use super::metrics::{ConnectionRejection, Direction, S2sMetrics};
 use super::revocation::{PeerRevocation, PeerVerification};
 use super::stream::S2sReaderLimits;
-use super::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
 use crate::admission::attempt_limit::{Admission, AttemptLimiter};
 use crate::admission::connection_limit::{
     ConnectionAdmission, ConnectionLimiter, ConnectionPermit,
 };
 use crate::admission::rejection_report::RejectionReport;
-use crate::c2s::StartError;
 use crate::config::S2sConfig;
 use crate::config::limits::S2sLimits;
+use crate::connection::{
+    AcceptHandler, ListenerKind, ListenerSet, ListenerSlot, ListenerSpec, ShutdownSignal,
+    StartError,
+};
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 
 mod negotiate;
 mod stream;
 mod streams;
-
-type Stop = Shared<BoxFuture<'static, Instant>>;
-type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;
 
 #[derive(Clone)]
 struct Settings<A: ChunkAllocator> {
@@ -134,13 +126,7 @@ impl AdmissionLimits {
     }
 }
 
-pub(crate) struct S2sListeners {
-    stop: Option<oneshot::Sender<Instant>>,
-    tasks: FuturesUnordered<Task<io::Result<()>>>,
-    failures: async_channel::Receiver<io::Error>,
-    addresses: Vec<SocketAddr>,
-}
-
+pub(crate) struct S2sListeners(ListenerSet);
 impl S2sListeners {
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &S2sConfig,
@@ -151,21 +137,6 @@ impl S2sListeners {
         services: IngressServices<A>,
         metrics: Arc<S2sMetrics>,
     ) -> Result<Self, StartError> {
-        let (stop, stopped) = oneshot::channel();
-        let stopped = async move {
-            stopped
-                .await
-                .unwrap_or_else(|_| Instant::now() + crate::WORKER_SHUTDOWN_GRACE)
-        }
-        .boxed()
-        .shared();
-        let (report_failure, failures) = async_channel::bounded(1);
-        let mut listeners = Self {
-            stop: Some(stop),
-            tasks: FuturesUnordered::new(),
-            failures,
-            addresses: Vec::with_capacity(config.listeners.len()),
-        };
         let admission = Arc::new(AdmissionLimits {
             attempts: AttemptLimiter::new(&limits.connection_attempts_per_ip),
             connections: ConnectionLimiter::new(limits.max_connections_per_ip.get()),
@@ -191,271 +162,113 @@ impl S2sListeners {
             idle_timeout: Duration::from_secs(limits.idle_timeout_secs.get()),
             metrics,
         };
-        let started: io::Result<()> = async {
-            for (listener_id, config) in config.listeners.iter().enumerate() {
-                let mut address = config.address;
-                for worker_id in 0..dispatcher.worker_count() {
-                    let (ready, readiness) = oneshot::channel();
-                    let stop = stopped.clone();
-                    let report_failure = report_failure.clone();
-                    let admission = Arc::clone(&admission);
-                    let settings = settings.clone();
-                    let task = dispatcher
-                        .dispatch_at(worker_id, move |context| async move {
-                            let result = async {
-                                let listener = bind(address).await?;
-                                let bound = listener.local_addr()?;
-                                if ready.send(bound).is_err() {
-                                    return Ok(());
-                                }
-                                run_listener(
-                                    listener,
-                                    context,
-                                    stop,
-                                    report_failure,
-                                    listener_id,
-                                    admission,
-                                    settings,
-                                )
-                                .await
-                            }
-                            .await;
-                            result.map_err(|error| listener_error(listener_id, worker_id, error))
-                        })
-                        .await
-                        .map_err(|error| listener_error(listener_id, worker_id, error))?;
-                    match readiness.await {
-                        Ok(bound) => address = bound,
-                        Err(_) => {
-                            task.await.map_err(io::Error::other)??;
-                            return Err(io::Error::other(
-                                "s2s listener stopped before reporting readiness",
-                            ));
-                        }
+        let specs = config
+            .listeners
+            .iter()
+            .map(|config| ListenerSpec {
+                address: config.address,
+                handler: {
+                    let admission = &admission;
+                    let settings = &settings;
+                    move |_slot| S2sAcceptor {
+                        admission: Arc::clone(admission),
+                        settings: settings.clone(),
                     }
-                    listeners.tasks.push(task);
-                }
-                listeners.addresses.push(address);
-                tracing::info!(
-                    listener_id,
-                    worker_count = dispatcher.worker_count(),
-                    port = address.port(),
-                    "s2s TCP listener started"
-                );
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = started {
-            let deadline = Instant::now() + crate::WORKER_SHUTDOWN_GRACE;
-            listeners.stop(deadline);
-            let _ = compio::time::timeout_at(deadline, listeners.join()).await;
-            return Err(StartError { error, deadline });
-        }
-        Ok(listeners)
+                },
+            })
+            .collect();
+        ListenerSet::start(ListenerKind::S2s, dispatcher, specs)
+            .await
+            .map(Self)
     }
-
     pub(crate) fn addresses(&self) -> &[SocketAddr] {
-        &self.addresses
+        self.0.addresses()
     }
-
     pub(crate) fn stop(&mut self, deadline: Instant) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(deadline);
-        }
+        self.0.stop(deadline);
     }
-
     pub(crate) async fn failure(&mut self) -> io::Error {
-        let task = match select(pin!(self.failures.recv()), pin!(self.tasks.next())).await {
-            Either::Left((Ok(error), _)) => return error,
-            Either::Left((Err(_), _)) => self.tasks.next().await,
-            Either::Right((task, _)) => task,
-        };
-        match task {
-            Some(Ok(Err(error))) => error,
-            Some(Err(error)) => io::Error::other(error),
-            Some(Ok(Ok(()))) => io::Error::other("s2s listener stopped unexpectedly"),
-            None => pending().await,
-        }
+        self.0.failure().await
     }
-
     pub(crate) async fn join(&mut self) -> io::Result<()> {
-        let mut result = Ok(());
-        while let Some(task) = self.tasks.next().await {
-            result = result.and(task.map_err(io::Error::other).and_then(|result| result));
-        }
-        result
+        self.0.join().await
     }
 }
 
-async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
-    let socket = if address.is_ipv4() {
-        TcpSocket::new_v4().await?
-    } else {
-        let socket = TcpSocket::new_v6().await?;
-        SockRef::from(&socket).set_only_v6(true)?;
-        socket
-    };
-    socket.set_reuseaddr(true)?;
-    socket.set_reuseport(true)?;
-    socket.bind(address).await?;
-    socket.listen(128).await
-}
-
-// Retained transport clones must not keep cancelled connections open.
-struct ConnectionTask<F, S = ConnectionSocket> {
-    _socket: S,
-    future: Pin<Box<F>>,
-}
-
-impl<F: Future<Output = ()>, S: Unpin> Future for ConnectionTask<F, S> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().future.as_mut().poll(context)
-    }
-}
-
-async fn run_listener<A: ChunkAllocator + Clone>(
-    listener: TcpListener,
-    context: WorkerContext,
-    stop: Stop,
-    report_failure: async_channel::Sender<io::Error>,
-    listener_id: usize,
+struct S2sAcceptor<A: ChunkAllocator> {
     admission: Arc<AdmissionLimits>,
     settings: Settings<A>,
-) -> io::Result<()> {
-    let worker_id = context.worker.index;
-    let shutdown = async move {
-        match select(pin!(context.shutdown_requested()), pin!(stop)).await {
-            Either::Left((deadline, _)) | Either::Right((deadline, _)) => deadline,
+}
+impl<A: ChunkAllocator + Clone> AcceptHandler for S2sAcceptor<A> {
+    type Permit = (GlobalPermit, ConnectionPermit);
+    type Rejection = Rejection;
+    async fn admit(&self, peer: IpAddr) -> Result<Self::Permit, Self::Rejection> {
+        self.admission.reserve(peer).await
+    }
+    fn rejected(&self, slot: ListenerSlot, rejection: Rejection) {
+        let ListenerSlot {
+            listener_id,
+            worker_id,
+        } = slot;
+        self.settings
+            .metrics
+            .connection_rejected(listener_id, rejection.reason);
+        if let Some(rejected_connections) = rejection.report_count {
+            tracing::warn!(
+                connection_type = "s2s",
+                listener_id,
+                worker_id,
+                outcome = rejection.reason.as_str(),
+                rejected_connections,
+                "s2s connection rejected"
+            );
         }
     }
-    .boxed_local()
-    .shared();
-    let mut active = FuturesUnordered::new();
-    let mut accept = Box::pin(listener.accept());
-    let result = loop {
-        let next = async {
-            if active.is_empty() {
-                Some(accept.as_mut().await)
-            } else {
-                match select(pin!(active.next()), accept.as_mut()).await {
-                    Either::Left(_) => None,
-                    Either::Right((accepted, _)) => Some(accepted),
+    fn serve(
+        &self,
+        slot: ListenerSlot,
+        tcp: TcpStream,
+        permits: Self::Permit,
+        shutdown: ShutdownSignal,
+    ) -> impl Future<Output = ()> + 'static {
+        self.settings.metrics.connection_accepted(slot.listener_id);
+        let gauge = self.settings.metrics.connection_opened(Direction::Inbound);
+        let settings = self.settings.clone();
+        async move {
+            let _permits = permits;
+            let _gauge = gauge;
+            let connection_id = NEXT_S2S_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            let outcome = match negotiate::negotiate(
+                &tcp,
+                &settings,
+                shutdown.clone(),
+                connection_id,
+            )
+            .await
+            {
+                Ok(authenticated) => stream::serve(authenticated, &tcp, &settings, shutdown)
+                    .await
+                    .as_str(),
+                Err(super::stream::S2sError::PeerError(condition)) => {
+                    tracing::debug!(connection_id, condition = ?condition, "s2s peer stream error");
+                    "peer_error"
                 }
-            }
-        };
-        let accepted = match select(pin!(shutdown.clone()), pin!(next)).await {
-            Either::Left(_) => break Ok(()),
-            Either::Right((None, _)) => continue,
-            Either::Right((Some(accepted), _)) => accepted,
-        };
-        accept.as_mut().set(listener.accept());
-        match accepted {
-            Ok((tcp, peer)) => {
-                let permits = match admission.reserve(peer.ip()).await {
-                    Ok(permits) => permits,
-                    Err(rejection) => {
-                        settings
-                            .metrics
-                            .connection_rejected(listener_id, rejection.reason);
-                        if let Some(rejected_connections) = rejection.report_count {
-                            tracing::warn!(
-                                connection_type = "s2s",
-                                listener_id,
-                                worker_id,
-                                outcome = rejection.reason.as_str(),
-                                rejected_connections,
-                                "s2s connection rejected"
-                            );
-                        }
-                        drop(tcp);
-                        continue;
-                    }
-                };
-                if let Err(error) = tcp.set_nodelay(true) {
-                    break Err(error);
-                }
-                settings.metrics.connection_accepted(listener_id);
-                let gauge = settings.metrics.connection_opened(Direction::Inbound);
-                let settings = settings.clone();
-                let shutdown = shutdown.clone();
-                let owner = ConnectionSocket(tcp.clone());
-                active.push(ConnectionTask { _socket: owner, future: Box::pin(async move {
-                    let _permits = permits;
-                    let _gauge = gauge;
-                    let connection_id = NEXT_S2S_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                    let started = Instant::now();
-                    let outcome = match negotiate::negotiate(&tcp, &settings, shutdown.clone(), connection_id).await {
-                        Ok(authenticated) => stream::serve(authenticated, &tcp, &settings, shutdown).await.as_str(),
-                        Err(super::stream::S2sError::PeerError(condition)) => {
-                            tracing::debug!(connection_id, condition = ?condition, "s2s peer stream error");
-                            "peer_error"
-                        }
-                        Err(_) => "negotiation_failed",
-                    };
-                    tracing::info!(connection_id, outcome, duration_ms = started.elapsed().as_millis() as u64, "s2s stream disconnected");
-                }) });
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted
-                        | io::ErrorKind::ConnectionAborted
-                        | io::ErrorKind::ConnectionReset
-                ) => {}
-            Err(error) if resource_exhausted(&error) => {
-                tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "s2s accept delayed by resource exhaustion");
-                if matches!(
-                    select(
-                        pin!(shutdown.clone()),
-                        pin!(compio::time::sleep(Duration::from_secs(1)))
-                    )
-                    .await,
-                    Either::Left(_)
-                ) {
-                    break Ok(());
-                }
-            }
-            Err(error) => break Err(error),
+                Err(_) => "negotiation_failed",
+            };
+            tracing::info!(
+                connection_id,
+                outcome,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "s2s stream disconnected"
+            );
         }
-    };
-    drop(accept);
-    if let Err(error) = &result {
-        let _ = report_failure.try_send(io::Error::new(error.kind(), error.to_string()));
     }
-    let deadline = shutdown.await;
-    result.and(drain_connections(active, deadline).await)
 }
-
-async fn drain_connections<F: Future<Output = ()>, S: Unpin>(
-    mut active: FuturesUnordered<ConnectionTask<F, S>>,
-    deadline: Instant,
-) -> io::Result<()> {
-    compio::time::timeout_at(deadline, async { while active.next().await.is_some() {} })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "s2s listener shutdown timed out"))
-}
-
-fn listener_error(listener_id: usize, worker_id: usize, error: io::Error) -> io::Error {
-    io::Error::new(
-        error.kind(),
-        format!("listener {listener_id} on worker {worker_id}: {error}"),
-    )
-}
-
-fn resource_exhausted(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::OutOfMemory
-        || matches!(
-            error.raw_os_error().map(Errno::from_raw),
-            Some(Errno::EMFILE | Errno::ENFILE | Errno::ENOBUFS | Errno::ENOMEM)
-        )
-}
-
 #[cfg(test)]
 mod tests {
-    use compio::net::TcpStream;
+    use crate::connection::socket::ConnectionSocket;
+    use compio::net::{TcpListener, TcpStream};
 
     use super::*;
     #[test]

@@ -97,7 +97,7 @@ fn run_case_with_timeouts(
     authentication_timeout: Duration,
 ) -> Result<(CloseOutcome, Duration, String), Box<dyn Error>> {
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
         let mut client = StdTcpStream::connect(address)?;
         client.set_read_timeout(Some(TIMEOUT))?;
@@ -181,7 +181,7 @@ fn run_case_with_timeouts(
 }
 
 async fn phase_socket_pair() -> io::Result<(TcpStream, StdTcpStream)> {
-    let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
     let peer = StdTcpStream::connect(listener.local_addr()?)?;
     peer.set_read_timeout(Some(TIMEOUT))?;
     let (socket, _) = listener.accept().await?;
@@ -312,7 +312,7 @@ fn run_starttls_restart_case_with_timeout(
 ) -> Result<(CloseOutcome, String, String), Box<dyn Error + Send + Sync>> {
     let restart_open = restart_open.to_owned();
     Runtime::new()?.block_on(timeout(TIMEOUT, async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let hosts = hosts()?;
         let mut roots = RootCertStore::empty();
         let certificate = hosts
@@ -439,7 +439,7 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
         let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
             let socket = StdTcpStream::connect(address)?;
@@ -569,7 +569,7 @@ where
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
         let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut socket = StdTcpStream::connect(address)?;
@@ -777,7 +777,7 @@ fn stream_whitespace_consumes_xml_allowance() -> Result<(), Box<dyn Error>> {
 #[test]
 fn cancelled_rate_wait_releases_connection() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let mut client = StdTcpStream::connect(listener.local_addr()?)?;
         client.write_all(OPEN.as_bytes())?;
         let (transport, peer) = listener.accept().await?;
@@ -916,7 +916,7 @@ fn internal_failure_sends_a_stream_error_before_closing() -> Result<(), Box<dyn 
 fn panicking_phase_closes_its_socket_before_waiting_for_tracked_work() -> Result<(), Box<dyn Error>>
 {
     Runtime::new()?.block_on(async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let mut client = StdTcpStream::connect(listener.local_addr()?)?;
         client.set_read_timeout(Some(Duration::from_secs(1)))?;
         let (transport, _) = listener.accept().await?;
@@ -1005,4 +1005,68 @@ fn cancelled_bound_lifecycle_records_one_close_and_session() -> Result<(), Box<d
         "{output}"
     );
     Ok(())
+}
+
+#[test]
+fn hard_listener_deadline_aborts_socket_before_adapters_and_keeps_child_guard_alive()
+-> Result<(), Box<dyn Error>> {
+    struct Adapter {
+        _stream: compio::io::compat::AsyncStream<TcpStream>,
+        peer: StdTcpStream,
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl Drop for Adapter {
+        fn drop(&mut self) {
+            assert!(matches!(self.peer.read(&mut [0; 1]), Ok(0)));
+            self.dropped.set(true);
+        }
+    }
+    Runtime::new()?.block_on(async {
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let peer = StdTcpStream::connect(listener.local_addr()?)?;
+        peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let (socket, _) = listener.accept().await?;
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let adapter = Adapter {
+            _stream: compio::io::compat::AsyncStream::new(socket.clone()),
+            peer,
+            dropped: std::rc::Rc::clone(&dropped),
+        };
+        let mut work = crate::delivery::WorkGroup::new();
+        let guard = work.start();
+        let (release, completion) = futures_channel::oneshot::channel::<()>();
+        let (done, mut finished) = futures_channel::oneshot::channel::<()>();
+        compio::runtime::spawn(guard.run(async move {
+            let _ = completion.await;
+            let _ = done.send(());
+        }))
+        .detach();
+        let active = futures_util::stream::FuturesUnordered::new();
+        active.push(crate::connection::socket::ConnectionTask {
+            _socket: crate::connection::socket::ConnectionSocket(socket),
+            future: Box::pin(async move {
+                let _adapter = adapter;
+                std::future::pending::<()>().await;
+            }),
+        });
+        let mut draining = Box::pin(crate::connection::drain_connections(
+            active,
+            Instant::now() + Duration::from_secs(1),
+            crate::connection::ListenerKind::C2s,
+            |_| {},
+        ));
+        assert!(futures_util::poll!(draining.as_mut()).is_pending());
+        assert!(matches!(draining.await, Err(error) if error.kind() == io::ErrorKind::TimedOut));
+        assert!(dropped.get());
+        let mut drained = Box::pin(work.drain());
+        assert!(futures_util::poll!(drained.as_mut()).is_pending());
+        assert!(futures_util::poll!(&mut finished).is_pending());
+        release
+            .send(())
+            .map_err(|_| "admitted child destroyed with parent")?;
+        finished.await?;
+        drained.await;
+        listener.close().await?;
+        Ok(())
+    })
 }

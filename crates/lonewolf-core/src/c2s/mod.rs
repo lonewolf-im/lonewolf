@@ -1,27 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::pending;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use compio::net::{TcpListener, TcpSocket, TcpStream};
-use futures_channel::oneshot;
-use futures_util::FutureExt;
-use futures_util::future::{BoxFuture, Either, Shared, select};
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use compio::net::TcpStream;
 use lonewolf_auth::scram::{ScramHash, ScramVerifier};
 use lonewolf_auth::server::ScramDecoy;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::ChunkAllocator;
-use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
-use nix::errno::Errno;
+use lonewolf_util::core_dispatcher::DispatchHandle;
 use prometheus_client::registry::Registry;
-use socket2::SockRef;
 
 use crate::admission::attempt_limit::{Admission, AttemptLimiter};
 use crate::admission::connection_limit::{
@@ -29,6 +21,10 @@ use crate::admission::connection_limit::{
 };
 use crate::config::C2sConfig;
 use crate::config::limits::C2sLimits;
+use crate::connection::{
+    AcceptHandler, ListenerKind, ListenerSet, ListenerSlot, ListenerSpec, ShutdownSignal,
+    StartError,
+};
 use crate::hosts::Hosts;
 use crate::router::RouterHandle;
 
@@ -43,16 +39,6 @@ use stream::{StreamAdmission, StreamSettings, StreamTimeouts, XmppStream};
 use unauthenticated_limit::{
     Admission as UnauthenticatedAdmission, UnauthenticatedLimiter, UnauthenticatedPermit,
 };
-
-const BACKLOG: i32 = 128;
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-type Stop = Shared<BoxFuture<'static, Instant>>;
-
-struct ListenerControl {
-    stop: Stop,
-    report_failure: async_channel::Sender<io::Error>,
-}
 
 #[derive(Clone)]
 struct AdmissionLimits {
@@ -145,33 +131,7 @@ struct StreamServices<A: ChunkAllocator> {
     router: RouterHandle<A>,
 }
 
-#[derive(Debug)]
-pub(crate) struct StartError {
-    pub(crate) error: io::Error,
-    pub(crate) deadline: Instant,
-}
-
-impl std::fmt::Display for StartError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl std::error::Error for StartError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
-pub(crate) struct Listeners {
-    stop: Option<oneshot::Sender<Instant>>,
-    tasks: FuturesUnordered<Task<io::Result<()>>>,
-    failures: async_channel::Receiver<io::Error>,
-    addresses: Vec<SocketAddr>,
-    listener_count: usize,
-    worker_count: usize,
-}
-
+pub(crate) struct Listeners(ListenerSet);
 impl Listeners {
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
@@ -184,15 +144,6 @@ impl Listeners {
         allocator: A,
         registry: &mut Registry,
     ) -> Result<Self, StartError> {
-        let (stop, stopped) = oneshot::channel();
-        let (report_failure, failures) = async_channel::bounded(1);
-        let stopped = async move {
-            stopped
-                .await
-                .unwrap_or_else(|_| Instant::now() + crate::WORKER_SHUTDOWN_GRACE)
-        }
-        .boxed()
-        .shared();
         let unauthenticated = Arc::new(UnauthenticatedLimiter::new(
             limits.max_unauthenticated_connections,
         ));
@@ -203,15 +154,7 @@ impl Listeners {
         );
         metrics.register(registry);
         let auth = Arc::new(AuthService { storage });
-        let mut listeners = Self {
-            stop: Some(stop),
-            tasks: FuturesUnordered::new(),
-            failures,
-            addresses: Vec::with_capacity(config.listeners.len()),
-            listener_count: config.listeners.len(),
-            worker_count: dispatcher.worker_count(),
-        };
-        let started: io::Result<()> = async {
+        let mut specs = Vec::with_capacity(config.listeners.len());
         for (listener_id, config) in config.listeners.iter().enumerate() {
             let profile_name = config.limits.as_deref().unwrap_or(&limits.default);
             let profile = limits.profiles.get(profile_name).ok_or_else(|| {
@@ -219,7 +162,7 @@ impl Listeners {
                     io::ErrorKind::InvalidInput,
                     format!("c2s listener {listener_id} references unknown limit profile {profile_name:?}"),
                 )
-            })?;
+            }).map_err(|error| StartError { error, deadline: Instant::now() + crate::WORKER_SHUTDOWN_GRACE })?;
             let admission = AdmissionLimits {
                 attempts: Arc::new(AttemptLimiter::new(&profile.connection_attempts_per_ip)),
                 connections: Arc::new(ConnectionLimiter::new(profile.max_connections_per_ip.get())),
@@ -230,324 +173,153 @@ impl Listeners {
             let authentication_timeout =
                 Duration::from_secs(profile.authentication_timeout_secs.get());
             let binding_timeout = Duration::from_secs(profile.resource_binding_timeout_secs.get());
-            let mut address = config.address;
-            for worker_id in 0..dispatcher.worker_count() {
-                let (ready, readiness) = oneshot::channel();
-                let stop = stopped.clone();
-                let report_failure = report_failure.clone();
-                let admission = admission.clone();
-                let services = StreamServices {
-                    hosts: hosts.clone(),
-                    auth: Arc::clone(&auth),
-                    router: router.clone(),
-                };
-                let worker_metrics = metrics.worker(listener_id, worker_id);
-                let settings = StreamSettings::new(
-                    config.auth_mechanisms,
-                    profile,
-                    StreamTimeouts {
-                        establishment: establishment_timeout,
-                        authentication: authentication_timeout,
-                        binding: binding_timeout,
-                    },
-                    limits.max_resources_per_account,
-                    allocator.clone(),
-                    worker_metrics.clone(),
-                );
-                let task = dispatcher
-                    .dispatch_at(worker_id, move |context| async move {
-                        let result = async {
-                            let listener = bind(address).await?;
-                            let bound = listener.local_addr()?;
-                            if ready.send(bound).is_err() {
-                                return Ok(());
-                            }
-                            run_listener(
-                                listener,
-                                context,
-                                ListenerControl { stop, report_failure },
-                                listener_id,
-                                admission,
-                                services,
-                                settings,
-                                worker_metrics,
-                            )
-                            .await
+            specs.push(ListenerSpec {
+                address: config.address,
+                handler: {
+                    let hosts = &hosts;
+                    let auth = &auth;
+                    let router = &router;
+                    let allocator = &allocator;
+                    let metrics = &metrics;
+                    move |slot: ListenerSlot| {
+                        let worker_metrics = metrics.worker(slot.listener_id, slot.worker_id);
+                        C2sAcceptor {
+                            admission: admission.clone(),
+                            services: StreamServices {
+                                hosts: hosts.clone(),
+                                auth: Arc::clone(auth),
+                                router: router.clone(),
+                            },
+                            settings: StreamSettings::new(
+                                config.auth_mechanisms,
+                                profile,
+                                StreamTimeouts {
+                                    establishment: establishment_timeout,
+                                    authentication: authentication_timeout,
+                                    binding: binding_timeout,
+                                },
+                                limits.max_resources_per_account,
+                                allocator.clone(),
+                                worker_metrics.clone(),
+                            ),
+                            metrics: worker_metrics,
                         }
-                        .await;
-                        result.map_err(|error| listener_error(listener_id, worker_id, error))
-                    })
-                    .await
-                    .map_err(|error| listener_error(listener_id, worker_id, error))?;
-                match readiness.await {
-                    Ok(bound) => address = bound,
-                    Err(_) => {
-                        task.await.map_err(io::Error::other)??;
-                        return Err(io::Error::other(
-                            "c2s listener stopped before reporting readiness",
-                        ));
                     }
-                }
-                listeners.tasks.push(task);
-            }
-            tracing::info!(
-                listener_id,
-                worker_count = dispatcher.worker_count(),
-                port = address.port(),
-                "c2s TCP listener started"
-            );
-            listeners.addresses.push(address);
+                },
+            });
         }
-        Ok(())
-        }.await;
-        if let Err(error) = started {
-            let deadline = Instant::now() + crate::WORKER_SHUTDOWN_GRACE;
-            listeners.stop(deadline);
-            let _ = compio::time::timeout_at(deadline, listeners.join()).await;
-            return Err(StartError { error, deadline });
-        }
-        Ok(listeners)
+        ListenerSet::start(ListenerKind::C2s, dispatcher, specs)
+            .await
+            .map(Self)
     }
-
-    /// Bound addresses in configuration order.
     pub(crate) fn addresses(&self) -> &[SocketAddr] {
-        &self.addresses
+        self.0.addresses()
     }
-
     pub(crate) fn stop(&mut self, deadline: Instant) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(deadline);
-        }
+        self.0.stop(deadline);
     }
-
     pub(crate) async fn failure(&mut self) -> io::Error {
-        let task = match select(pin!(self.failures.recv()), pin!(self.tasks.next())).await {
-            Either::Left((Ok(error), _)) => return error,
-            Either::Left((Err(_), _)) => self.tasks.next().await,
-            Either::Right((task, _)) => task,
-        };
-        match task {
-            Some(Ok(Err(error))) => error,
-            Some(Err(error)) => io::Error::other(error),
-            Some(Ok(Ok(()))) => io::Error::other("c2s listener stopped unexpectedly"),
-            None => pending().await,
-        }
+        self.0.failure().await
     }
-
     pub(crate) async fn join(&mut self) -> io::Result<()> {
-        let mut result = Ok(());
-        while let Some(task) = self.tasks.next().await {
-            result = result.and(task.map_err(io::Error::other).and_then(|result| result));
-        }
-        for listener_id in 0..std::mem::take(&mut self.listener_count) {
-            tracing::info!(
-                listener_id,
-                worker_count = self.worker_count,
-                "c2s TCP listener stopped"
-            );
-        }
-        result
+        self.0.join().await
     }
 }
 
-async fn bind(address: SocketAddr) -> io::Result<TcpListener> {
-    let socket = if address.is_ipv4() {
-        TcpSocket::new_v4().await?
-    } else {
-        let socket = TcpSocket::new_v6().await?;
-        SockRef::from(&socket).set_only_v6(true)?;
-        socket
-    };
-    socket.set_reuseaddr(true)?;
-    socket.set_reuseport(true)?;
-    socket.bind(address).await?;
-    socket.listen(BACKLOG).await
-}
-
-#[expect(clippy::too_many_arguments)]
-async fn run_listener<A: ChunkAllocator + Clone>(
-    listener: TcpListener,
-    context: WorkerContext,
-    control: ListenerControl,
-    listener_id: usize,
+struct C2sAcceptor<A: ChunkAllocator> {
     admission: AdmissionLimits,
     services: StreamServices<A>,
     settings: StreamSettings<A>,
     metrics: C2sWorkerMetrics,
-) -> io::Result<()> {
-    let ListenerControl {
-        stop,
-        report_failure,
-    } = control;
-    let worker_id = context.worker.index;
-    tracing::debug!(
-        listener_id,
-        worker_id,
-        port = listener.local_addr()?.port(),
-        "c2s TCP worker listener started"
-    );
-    let shutdown = async move {
-        match select(pin!(context.shutdown_requested()), pin!(stop)).await {
-            Either::Left((deadline, _)) | Either::Right((deadline, _)) => deadline,
-        }
+}
+impl<A: ChunkAllocator + Clone> AcceptHandler for C2sAcceptor<A> {
+    type Permit = (ConnectionPermit, UnauthenticatedPermit);
+    type Rejection = AdmissionRejection;
+    async fn admit(&self, peer: IpAddr) -> Result<Self::Permit, Self::Rejection> {
+        self.admission.reserve(peer).await
     }
-    .boxed_local()
-    .shared();
-    let mut shutdown_wait = Box::pin(shutdown.clone());
-    let mut active = FuturesUnordered::new();
-    let mut accept = Box::pin(listener.accept());
-    let result = loop {
-        let next = async {
-            if active.is_empty() {
-                ListenerEvent::Accepted(accept.as_mut().await)
-            } else {
-                match select(pin!(active.next()), accept.as_mut()).await {
-                    Either::Left((_, _)) => ListenerEvent::Closed,
-                    Either::Right((result, _)) => ListenerEvent::Accepted(result),
-                }
-            }
-        };
-        let event = match select(shutdown_wait.as_mut(), pin!(next)).await {
-            Either::Left(_) => break Ok(()),
-            Either::Right((event, _)) => event,
-        };
-        match event {
-            ListenerEvent::Accepted(Ok((stream, peer))) => {
-                accept.as_mut().set(listener.accept());
-                if let Err(error) = stream.set_nodelay(true) {
-                    close_unhandled_connection(stream);
-                    break Err(error);
-                }
-                let reserved = admission.reserve(peer.ip()).await;
-                if let Err(rejection) = &reserved {
-                    metrics.connection_rejected(rejection_reason(rejection));
-                }
-                match reserved {
-                    Ok((ip_permit, unauthenticated_permit)) => {
-                        metrics.connection_accepted();
-                        active.push(
-                            XmppStream::new(
-                                stream,
-                                StreamAdmission::new(
-                                    ip_permit,
-                                    unauthenticated_permit,
-                                    listener_id,
-                                    worker_id,
-                                    metrics.clone(),
-                                ),
-                                services.hosts.clone(),
-                                Arc::clone(&services.auth),
-                                services.router.clone(),
-                                settings.clone(),
-                            )
-                            .run_until(shutdown.clone()),
-                        );
-                        metrics.set_connections(active.len());
-                    }
-                    Err(AdmissionRejection::PerIp {
-                        outcome,
-                        report_count,
-                        unauthenticated_permit,
-                    }) => {
-                        close_unhandled_connection(stream);
-                        if let Some(rejected_connections) = report_count {
-                            tracing::warn!(
-                                connection_type = "c2s",
-                                listener_id,
-                                worker_id,
-                                outcome,
-                                rejected_connections,
-                                "c2s connection rejected"
-                            );
-                        }
-                        drop(unauthenticated_permit);
-                    }
-                    Err(AdmissionRejection::Unauthenticated { report_count }) => {
-                        close_unhandled_connection(stream);
-                        if let Some(rejected_connections) = report_count {
-                            tracing::warn!(
-                                connection_type = "c2s",
-                                listener_id,
-                                worker_id,
-                                outcome = "unauthenticated_connection_limit",
-                                rejected_connections,
-                                "c2s connection rejected"
-                            );
-                        }
-                    }
-                    Err(AdmissionRejection::Attempt {
-                        outcome,
-                        report_count,
-                    }) => {
-                        close_unhandled_connection(stream);
-                        if let Some(rejected_attempts) = report_count {
-                            tracing::warn!(
-                                connection_type = "c2s",
-                                listener_id,
-                                worker_id,
-                                outcome,
-                                rejected_attempts,
-                                "c2s connection attempt rejected"
-                            );
-                        }
-                    }
-                }
-            }
-            ListenerEvent::Closed => metrics.set_connections(active.len()),
-            ListenerEvent::Accepted(Err(error)) => {
-                accept.as_mut().set(listener.accept());
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted
-                        | io::ErrorKind::ConnectionAborted
-                        | io::ErrorKind::ConnectionReset
-                ) {
-                    continue;
-                }
-                if resource_exhausted(&error) {
+    fn rejected(&self, slot: ListenerSlot, rejection: Self::Rejection) {
+        let ListenerSlot {
+            listener_id,
+            worker_id,
+        } = slot;
+        self.metrics
+            .connection_rejected(rejection_reason(&rejection));
+        match rejection {
+            AdmissionRejection::PerIp {
+                outcome,
+                report_count,
+                unauthenticated_permit,
+            } => {
+                if let Some(rejected_connections) = report_count {
                     tracing::warn!(
+                        connection_type = "c2s",
                         listener_id,
                         worker_id,
-                        error_kind = ?error.kind(),
-                        "c2s accept delayed by resource exhaustion"
+                        outcome,
+                        rejected_connections,
+                        "c2s connection rejected"
                     );
-                    if let Either::Left(_) = select(
-                        shutdown_wait.as_mut(),
-                        pin!(compio::time::sleep(ACCEPT_RETRY_DELAY)),
-                    )
-                    .await
-                    {
-                        break Ok(());
-                    }
-                } else {
-                    break Err(error);
+                }
+                drop(unauthenticated_permit);
+            }
+            AdmissionRejection::Unauthenticated { report_count } => {
+                if let Some(rejected_connections) = report_count {
+                    tracing::warn!(
+                        connection_type = "c2s",
+                        listener_id,
+                        worker_id,
+                        outcome = "unauthenticated_connection_limit",
+                        rejected_connections,
+                        "c2s connection rejected"
+                    );
+                }
+            }
+            AdmissionRejection::Attempt {
+                outcome,
+                report_count,
+            } => {
+                if let Some(rejected_attempts) = report_count {
+                    tracing::warn!(
+                        connection_type = "c2s",
+                        listener_id,
+                        worker_id,
+                        outcome,
+                        rejected_attempts,
+                        "c2s connection attempt rejected"
+                    );
                 }
             }
         }
-    };
-    drop(accept);
-    if let Err(error) = &result {
-        let _ = report_failure.try_send(io::Error::new(error.kind(), error.to_string()));
     }
-    let deadline = shutdown.await;
-    let drained = compio::time::timeout_at(deadline, async {
-        while active.next().await.is_some() {
-            metrics.set_connections(active.len());
+    fn serve(
+        &self,
+        slot: ListenerSlot,
+        socket: TcpStream,
+        (ip_permit, unauthenticated_permit): Self::Permit,
+        shutdown: ShutdownSignal,
+    ) -> impl std::future::Future<Output = ()> + 'static {
+        self.metrics.connection_accepted();
+        let admission = StreamAdmission::new(
+            ip_permit,
+            unauthenticated_permit,
+            slot.listener_id,
+            slot.worker_id,
+            self.metrics.clone(),
+        );
+        let hosts = self.services.hosts.clone();
+        let auth = Arc::clone(&self.services.auth);
+        let router = self.services.router.clone();
+        let settings = self.settings.clone();
+        async move {
+            let _ = XmppStream::new(socket, admission, hosts, auth, router, settings)
+                .run_until(shutdown)
+                .await;
         }
-    })
-    .await;
-    drop(active);
-    metrics.set_connections(0);
-    let closed = listener.close().await;
-    tracing::debug!(listener_id, worker_id, "c2s TCP worker listener stopped");
-    result
-        .and(drained.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "c2s connections exceeded shutdown deadline",
-            )
-        }))
-        .and(closed)
+    }
+    fn active_connections(&self, count: usize) {
+        self.metrics.set_connections(count);
+    }
 }
 
 fn rejection_reason(rejection: &AdmissionRejection) -> RejectReason {
@@ -564,30 +336,6 @@ fn rejection_reason(rejection: &AdmissionRejection) -> RejectReason {
         } => RejectReason::MaxConnectionsPerIp,
         AdmissionRejection::PerIp { .. } => RejectReason::ConnectionTrackingFull,
     }
-}
-
-enum ListenerEvent {
-    Accepted(io::Result<(TcpStream, SocketAddr)>),
-    Closed,
-}
-
-fn close_unhandled_connection(stream: TcpStream) {
-    drop(stream);
-}
-
-fn resource_exhausted(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::OutOfMemory
-        || matches!(
-            error.raw_os_error().map(Errno::from_raw),
-            Some(Errno::EMFILE | Errno::ENFILE | Errno::ENOBUFS | Errno::ENOMEM)
-        )
-}
-
-fn listener_error(listener_id: usize, worker_id: usize, error: io::Error) -> io::Error {
-    io::Error::new(
-        error.kind(),
-        format!("listener {listener_id} on worker {worker_id}: {error}"),
-    )
 }
 
 #[cfg(test)]

@@ -782,7 +782,7 @@ fn renegotiation_aborts_and_wakes_failure_watch_while_output_is_blocked() -> Tes
     use tokio::io::AsyncReadExt as _;
     use tokio_util::compat::FuturesAsyncReadCompatExt as _;
     Runtime::new()?.block_on(async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let mut peer = StdTcpStream::connect(listener.local_addr()?)?;
         peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
         let (socket, _) = listener.accept().await?;

@@ -337,7 +337,7 @@ fn inbound_offline_message_replays_after_same_stream_dispatch_barrier_and_availa
 }
 
 fn dns_not_found(socket: &UdpSocket) -> std::io::Result<()> {
-    for _ in 0..3 {
+    for _ in 0..4 {
         let mut packet = [0; 4096];
         let (length, peer) = socket.recv_from(&mut packet)?;
         if length < 17 {

@@ -67,6 +67,95 @@ struct Answer {
     records: Vec<RData>,
 }
 
+type SrvRecord = (u16, u16, SrvTarget);
+
+enum SrvAnswer {
+    Absent,
+    Unavailable,
+    Disabled,
+    Malformed,
+    Records(Vec<SrvRecord>),
+}
+
+fn classify_srv(answer: Result<Answer, QueryError>, tls_mode: TlsMode) -> SrvAnswer {
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(_) => return SrvAnswer::Unavailable,
+    };
+    if answer.records.is_empty() {
+        return SrvAnswer::Absent;
+    }
+    if answer
+        .records
+        .iter()
+        .any(|record| matches!(record, RData::SRV(srv) if srv.target.is_root()))
+    {
+        return if answer.records.len() == 1 {
+            SrvAnswer::Disabled
+        } else {
+            SrvAnswer::Malformed
+        };
+    }
+    SrvAnswer::Records(
+        answer
+            .records
+            .into_iter()
+            .filter_map(|record| {
+                let RData::SRV(srv) = record else {
+                    return None;
+                };
+                (srv.port != 0).then(|| {
+                    (
+                        srv.priority,
+                        srv.weight,
+                        SrvTarget {
+                            name: srv.target.to_ascii().into_boxed_str(),
+                            port: srv.port,
+                            tls_mode,
+                        },
+                    )
+                })
+            })
+            .collect(),
+    )
+}
+
+fn merge_srv(answers: [SrvAnswer; 2]) -> Result<Option<Vec<SrvRecord>>, ResolveError> {
+    let mut records = Vec::new();
+    let mut disabled = false;
+    let mut unavailable = false;
+    let mut advertised = false;
+    for answer in answers {
+        match answer {
+            SrvAnswer::Absent => {}
+            SrvAnswer::Unavailable => unavailable = true,
+            SrvAnswer::Disabled => disabled = true,
+            SrvAnswer::Malformed => advertised = true,
+            SrvAnswer::Records(mut values) => {
+                advertised = true;
+                if records.is_empty() {
+                    records = values;
+                } else {
+                    records.append(&mut values);
+                }
+            }
+        }
+    }
+    if !records.is_empty() {
+        Ok(Some(records))
+    } else if advertised {
+        Err(ResolveError::NotFound)
+    } else if disabled {
+        Err(if unavailable {
+            ResolveError::Unavailable
+        } else {
+            ResolveError::NoService
+        })
+    } else {
+        Ok(None)
+    }
+}
+
 impl Resolver {
     pub(crate) fn new(config: &crate::config::S2sConfig) -> io::Result<Self> {
         let nameservers = if config.dns.nameservers.is_empty() {
@@ -178,43 +267,23 @@ impl Resolver {
         let mut name = Name::from_ascii(&ascii).map_err(|_| ResolveError::InvalidDomain)?;
         name.set_fqdn(true);
         let ascii = ascii.trim_end_matches('.');
-        let srv_name = Name::from_ascii(format!("_xmpp-server._tcp.{ascii}."))
+        let starttls_name = Name::from_ascii(format!("_xmpp-server._tcp.{ascii}."))
             .map_err(|_| ResolveError::InvalidDomain)?;
-        let srv = self.query(&srv_name, RecordType::SRV).await;
-        let records: Vec<_> = srv
-            .into_iter()
-            .flat_map(|answer| answer.records)
-            .filter_map(|data| {
-                if let RData::SRV(srv) = data {
-                    Some((
-                        srv.priority,
-                        srv.weight,
-                        SrvTarget {
-                            name: srv.target.to_ascii().into_boxed_str(),
-                            port: srv.port,
-                            tls_mode: TlsMode::StartTls,
-                        },
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if records.len() == 1 && records[0].2.name.as_ref() == "." {
-            return Err(ResolveError::NoService);
-        }
-        if !records.is_empty() {
-            let mut random_failed = false;
-            let targets = order_srv(records, &mut |total| match random_inclusive(total) {
-                Ok(value) => value,
-                Err(_) => {
-                    random_failed = true;
-                    0
-                }
-            });
-            if random_failed {
-                return Err(ResolveError::Unavailable);
-            }
+        let direct_name = Name::from_ascii(format!("_xmpps-server._tcp.{ascii}."))
+            .map_err(|_| ResolveError::InvalidDomain)?;
+        let (starttls, direct) = join(
+            self.query(&starttls_name, RecordType::SRV),
+            self.query(&direct_name, RecordType::SRV),
+        )
+        .await;
+        let records = merge_srv([
+            classify_srv(starttls, TlsMode::StartTls),
+            classify_srv(direct, TlsMode::Direct),
+        ])?;
+        if let Some(records) = records {
+            let targets = order_srv(records, &mut |total| {
+                random_inclusive(total).map_err(|_| ResolveError::Unavailable)
+            })?;
             let mut endpoints = Vec::with_capacity(ENDPOINT_LIMIT);
             for target in targets {
                 let Ok(name) = Name::from_ascii(&target.name) else {
@@ -437,9 +506,9 @@ fn answer_records(message: Message, query: &Name, kind: RecordType) -> Result<An
 }
 
 pub(crate) fn order_srv(
-    mut records: Vec<(u16, u16, SrvTarget)>,
-    random: &mut impl FnMut(u32) -> u32,
-) -> Vec<SrvTarget> {
+    mut records: Vec<SrvRecord>,
+    random: &mut impl FnMut(u32) -> Result<u32, ResolveError>,
+) -> Result<Vec<SrvTarget>, ResolveError> {
     records.sort_by_key(|(priority, weight, _)| (*priority, *weight != 0));
     let mut ordered = Vec::with_capacity(records.len());
     while !records.is_empty() {
@@ -452,7 +521,7 @@ pub(crate) fn order_srv(
             .iter()
             .map(|record| u32::from(record.1))
             .sum();
-        let chosen = random(total);
+        let chosen = random(total)?;
         let mut sum = 0;
         let index = records[..end]
             .iter()
@@ -463,7 +532,7 @@ pub(crate) fn order_srv(
             .unwrap_or(end - 1);
         ordered.push(records.remove(index).2);
     }
-    ordered
+    Ok(ordered)
 }
 
 fn random_inclusive(total: u32) -> Result<u32, graviola::Error> {

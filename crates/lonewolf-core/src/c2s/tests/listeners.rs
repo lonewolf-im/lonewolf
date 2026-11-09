@@ -18,10 +18,17 @@ use socket2::{Domain, Protocol, Socket, Type};
 use super::*;
 use crate::config::limits::{C2sLimitProfile, C2sLimits};
 use crate::config::{AuthMechanisms, Config, TcpListenerConfig};
+use crate::connection::{ListenerControl, bind, run_listener};
 use crate::hosts::HostsError;
 use crate::router::Router;
 use crate::router::local::LocalRouter;
 use crate::test_ports::{bind_released_listener, reserve_listener_address};
+use compio::net::TcpSocket;
+use futures_channel::oneshot;
+use futures_util::FutureExt as _;
+use futures_util::stream::StreamExt as _;
+use socket2::SockRef;
+use std::future::pending;
 
 type TestResult = Result<(), Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -86,26 +93,29 @@ async fn rejected_connection_metrics(
                     .shared(),
                     report_failure: async_channel::bounded(1).0,
                 },
+                ListenerKind::C2s,
                 7,
-                admission,
-                StreamServices {
-                    hosts,
-                    auth,
-                    router: router_handle,
-                },
-                StreamSettings::new(
-                    AuthMechanisms::ALL,
-                    &profile,
-                    StreamTimeouts {
-                        establishment: TIMEOUT,
-                        authentication: TIMEOUT,
-                        binding: TIMEOUT,
+                C2sAcceptor {
+                    admission,
+                    services: StreamServices {
+                        hosts,
+                        auth,
+                        router: router_handle,
                     },
-                    NonZeroUsize::MIN,
-                    GlobalChunkAllocator,
-                    worker.clone(),
-                ),
-                worker,
+                    settings: StreamSettings::new(
+                        AuthMechanisms::ALL,
+                        &profile,
+                        StreamTimeouts {
+                            establishment: TIMEOUT,
+                            authentication: TIMEOUT,
+                            binding: TIMEOUT,
+                        },
+                        NonZeroUsize::MIN,
+                        GlobalChunkAllocator,
+                        worker.clone(),
+                    ),
+                    metrics: worker,
+                },
             )
             .await
         })
@@ -254,32 +264,35 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                             stop: pending().boxed().shared(),
                             report_failure: async_channel::bounded(1).0,
                         },
+                        ListenerKind::C2s,
                         0,
-                        admission,
-                        StreamServices {
-                            hosts,
-                            auth,
-                            router: router_handle,
-                        },
-                        StreamSettings::new(
-                            AuthMechanisms::ALL,
-                            &profile,
-                            StreamTimeouts {
-                                establishment: Duration::from_secs(
-                                    profile.connection_establishment_timeout_secs.get(),
-                                ),
-                                authentication: Duration::from_secs(
-                                    profile.authentication_timeout_secs.get(),
-                                ),
-                                binding: Duration::from_secs(
-                                    profile.resource_binding_timeout_secs.get(),
-                                ),
+                        C2sAcceptor {
+                            admission,
+                            services: StreamServices {
+                                hosts,
+                                auth,
+                                router: router_handle,
                             },
-                            NonZeroUsize::new(10).unwrap(),
-                            GlobalChunkAllocator,
-                            C2sWorkerMetrics::detached(),
-                        ),
-                        C2sWorkerMetrics::detached(),
+                            settings: StreamSettings::new(
+                                AuthMechanisms::ALL,
+                                &profile,
+                                StreamTimeouts {
+                                    establishment: Duration::from_secs(
+                                        profile.connection_establishment_timeout_secs.get(),
+                                    ),
+                                    authentication: Duration::from_secs(
+                                        profile.authentication_timeout_secs.get(),
+                                    ),
+                                    binding: Duration::from_secs(
+                                        profile.resource_binding_timeout_secs.get(),
+                                    ),
+                                },
+                                NonZeroUsize::new(10).unwrap(),
+                                GlobalChunkAllocator,
+                                C2sWorkerMetrics::detached(),
+                            ),
+                            metrics: C2sWorkerMetrics::detached(),
+                        },
                     )
                     .await
                 })
@@ -352,32 +365,35 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                                 stop: pending().boxed().shared(),
                                 report_failure: async_channel::bounded(1).0,
                             },
+                            ListenerKind::C2s,
                             listener_id,
-                            admission,
-                            StreamServices {
-                                hosts,
-                                auth,
-                                router: router_handle,
-                            },
-                            StreamSettings::new(
-                                AuthMechanisms::ALL,
-                                &profile,
-                                StreamTimeouts {
-                                    establishment: Duration::from_secs(
-                                        profile.connection_establishment_timeout_secs.get(),
-                                    ),
-                                    authentication: Duration::from_secs(
-                                        profile.authentication_timeout_secs.get(),
-                                    ),
-                                    binding: Duration::from_secs(
-                                        profile.resource_binding_timeout_secs.get(),
-                                    ),
+                            C2sAcceptor {
+                                admission,
+                                services: StreamServices {
+                                    hosts,
+                                    auth,
+                                    router: router_handle,
                                 },
-                                NonZeroUsize::new(10).unwrap(),
-                                GlobalChunkAllocator,
-                                C2sWorkerMetrics::detached(),
-                            ),
-                            C2sWorkerMetrics::detached(),
+                                settings: StreamSettings::new(
+                                    AuthMechanisms::ALL,
+                                    &profile,
+                                    StreamTimeouts {
+                                        establishment: Duration::from_secs(
+                                            profile.connection_establishment_timeout_secs.get(),
+                                        ),
+                                        authentication: Duration::from_secs(
+                                            profile.authentication_timeout_secs.get(),
+                                        ),
+                                        binding: Duration::from_secs(
+                                            profile.resource_binding_timeout_secs.get(),
+                                        ),
+                                    },
+                                    NonZeroUsize::new(10).unwrap(),
+                                    GlobalChunkAllocator,
+                                    C2sWorkerMetrics::detached(),
+                                ),
+                                metrics: C2sWorkerMetrics::detached(),
+                            },
                         )
                         .await
                     },
@@ -452,11 +468,11 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
         )
         .await?;
         assert_eq!(
-            listeners.tasks.len(),
+            listeners.0.test_tasks().len(),
             config.listeners.len() * handle.worker_count()
         );
         listeners.stop(Instant::now() + TIMEOUT);
-        while let Some(result) = listeners.tasks.next().await {
+        while let Some(result) = listeners.0.test_tasks().next().await {
             result??;
         }
         for index in 0..handle.worker_count() {
@@ -559,15 +575,13 @@ fn listener_failures_reach_the_supervisor() -> TestResult {
     run_test(async {
         let dispatcher = dispatcher()?;
         let (stop, _stopped) = oneshot::channel();
-        let mut listeners = Listeners {
-            stop: Some(stop),
-            tasks: FuturesUnordered::new(),
-            failures: async_channel::bounded(1).1,
-            addresses: Vec::new(),
-            listener_count: 0,
-            worker_count: dispatcher.handle().worker_count(),
-        };
-        listeners.tasks.push(
+        let mut listeners = Listeners(ListenerSet::with_test_channels(
+            ListenerKind::C2s,
+            stop,
+            async_channel::bounded(1).1,
+            dispatcher.handle().worker_count(),
+        ));
+        listeners.0.test_tasks().push(
             dispatcher
                 .handle()
                 .dispatch_at(0, |_| async {
@@ -587,16 +601,14 @@ fn fatal_listener_notification_precedes_connection_drain() -> TestResult {
         let dispatcher = dispatcher()?;
         let (stop, stopped) = oneshot::channel();
         let (report, failures) = async_channel::bounded(1);
-        let mut listeners = Listeners {
-            stop: Some(stop),
-            tasks: FuturesUnordered::new(),
+        let mut listeners = Listeners(ListenerSet::with_test_channels(
+            ListenerKind::C2s,
+            stop,
             failures,
-            addresses: Vec::new(),
-            listener_count: 0,
-            worker_count: dispatcher.handle().worker_count(),
-        };
+            dispatcher.handle().worker_count(),
+        ));
         let (drained, complete) = oneshot::channel();
-        listeners.tasks.push(
+        listeners.0.test_tasks().push(
             dispatcher
                 .handle()
                 .dispatch_at(0, move |_| async move {

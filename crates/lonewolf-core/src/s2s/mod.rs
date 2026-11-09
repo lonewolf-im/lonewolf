@@ -3,8 +3,7 @@
 use std::borrow::Cow;
 use std::sync::atomic::AtomicU64;
 
-use compio::net::TcpStream;
-use socket2::SockRef;
+use crate::connection::socket::ConnectionSocket;
 
 pub(crate) mod dns;
 mod expiry;
@@ -37,11 +36,3 @@ fn log_domain(domain: &str) -> Cow<'_, str> {
 }
 
 static NEXT_S2S_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
-
-struct ConnectionSocket(TcpStream);
-
-impl Drop for ConnectionSocket {
-    fn drop(&mut self) {
-        let _ = SockRef::from(&self.0).shutdown(std::net::Shutdown::Both);
-    }
-}

@@ -422,7 +422,7 @@ fn hard_listener_deadline_aborts_socket_before_adapters_and_keeps_child_guard_al
                 std::future::pending::<Result<(), IngressFailure>>().await
             },
         );
-        let task = super::super::ConnectionTask {
+        let task = crate::connection::socket::ConnectionTask {
             _socket: Socket(Rc::clone(&socket)),
             future: Box::pin(async move {
                 let _adapter = adapter;
@@ -432,7 +432,12 @@ fn hard_listener_deadline_aborts_socket_before_adapters_and_keeps_child_guard_al
         let active = futures_util::stream::FuturesUnordered::new();
         active.push(task);
         let deadline = Instant::now() + Duration::from_secs(1);
-        let mut draining = Box::pin(super::super::drain_connections(active, deadline));
+        let mut draining = Box::pin(crate::connection::drain_connections(
+            active,
+            deadline,
+            crate::connection::ListenerKind::S2s,
+            |_| {},
+        ));
         assert!(poll!(draining.as_mut()).is_pending());
         stop.send(deadline).map_err(|_| "stop dropped")?;
         assert!(poll!(draining.as_mut()).is_pending());

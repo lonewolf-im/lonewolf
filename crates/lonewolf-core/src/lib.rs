@@ -29,6 +29,7 @@ mod acme;
 mod admission;
 mod c2s;
 pub mod config;
+mod connection;
 mod delivery;
 mod error;
 pub mod hosts;

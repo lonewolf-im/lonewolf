@@ -337,7 +337,7 @@ fn finished_plaintext(
 }
 
 async fn socket_pair() -> TestResult<(compio::net::TcpStream, std::net::TcpStream)> {
-    let listener = crate::c2s::bind(std::net::SocketAddr::from((
+    let listener = crate::connection::bind(std::net::SocketAddr::from((
         std::net::Ipv4Addr::LOCALHOST,
         0,
     )))

@@ -236,7 +236,8 @@ fn blocked_phase_writes_cancel_before_timeout_close_discards_application_bufferi
             CloseOutcome::AuthenticationTimeout,
             CloseOutcome::BindingTimeout,
         ] {
-            let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+            let listener =
+                crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
             let _peer = StdTcpStream::connect(listener.local_addr()?)?;
             let (socket, _) = listener.accept().await?;
             let bytes = Rc::new(RefCell::new(Vec::new()));
@@ -286,7 +287,7 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
     use futures_util::FutureExt as _;
     use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
     Runtime::new()?.block_on(async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let _peer = StdTcpStream::connect(listener.local_addr()?)?;
         let (socket, _) = listener.accept().await?;
         let bytes = Rc::new(RefCell::new(Vec::new()));
@@ -380,7 +381,7 @@ fn timeout_grace_is_anchored_to_the_original_phase_deadline() -> TestResult {
     use futures_util::FutureExt as _;
     use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
     Runtime::new()?.block_on(async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let _peer = StdTcpStream::connect(listener.local_addr()?)?;
         let (socket, _) = listener.accept().await?;
         let expired = Instant::now() - Duration::from_secs(1);
@@ -415,7 +416,7 @@ fn shutdown_shortens_a_close_already_waiting_on_its_original_deadline() -> TestR
     use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
 
     Runtime::new()?.block_on(async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let mut peer = StdTcpStream::connect(listener.local_addr()?)?;
         peer.set_read_timeout(Some(Duration::from_secs(1)))?;
         let (socket, _) = listener.accept().await?;
@@ -451,7 +452,8 @@ fn elapsed_close_budgets_preserve_the_phase_timeout_without_polling_network_work
 
     Runtime::new()?.block_on(async {
         for expired_shutdown in [false, true] {
-            let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+            let listener =
+                crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
             let mut peer = StdTcpStream::connect(listener.local_addr()?)?;
             peer.set_read_timeout(Some(Duration::from_secs(1)))?;
             let (socket, _) = listener.accept().await?;
@@ -496,7 +498,7 @@ fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestRes
     use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
 
     Runtime::new()?.block_on(async {
-        let listener = crate::c2s::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+        let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let _peer = StdTcpStream::connect(listener.local_addr()?)?;
         let (socket, _) = listener.accept().await?;
         let context = CloseContext {
@@ -614,7 +616,7 @@ async fn test_context(
     phase_deadline: Option<Instant>,
     shutdown: ShutdownSignal,
 ) -> TestResult<(CloseContext, compio::net::TcpListener, std::net::TcpStream)> {
-    let listener = crate::c2s::bind(std::net::SocketAddr::from((
+    let listener = crate::connection::bind(std::net::SocketAddr::from((
         std::net::Ipv4Addr::LOCALHOST,
         0,
     )))

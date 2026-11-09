@@ -16,7 +16,7 @@ use std::{
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn cli(args: &[&std::ffi::OsStr]) -> std::io::Result<Output> {
-    Command::new(env!("CARGO_BIN_EXE_lonewolf-bench"))
+    Command::new(env!("CARGO_BIN_EXE_lonewolfbench"))
         .args(args)
         .output()
 }

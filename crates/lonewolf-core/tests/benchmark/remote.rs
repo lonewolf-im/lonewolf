@@ -24,7 +24,7 @@ use support::C2sSuite;
 
 const LIMITS: &str = "max_connections_per_ip=100000\nconnection_attempts_per_ip={per_second=1000000,burst=1000000}\nincoming_stanzas_per_connection={per_second=1000000,burst=1000000}\nnew_recipients_per_connection={per_second=1000000,burst=1000000}\nincoming_xml_per_connection={bytes_per_second=1073741824,burst_bytes=1073741824}";
 fn binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_lonewolf-bench"))
+    Path::new(env!("CARGO_BIN_EXE_lonewolfbench"))
 }
 
 fn server() -> TestResult<C2sSuite> {

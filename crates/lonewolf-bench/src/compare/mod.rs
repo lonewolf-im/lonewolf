@@ -153,7 +153,7 @@ pub fn compare_runs(baseline: &RunReport, candidate: &RunReport) -> ComparisonRe
     if (&a.version, &a.revision, &a.build_profile) != (&b.version, &b.revision, &b.build_profile)
         || a.executable_sha256 != b.executable_sha256
     {
-        warnings.push("The runs used different lonewolf-bench builds.".into());
+        warnings.push("The runs used different lonewolfbench builds.".into());
     }
     if a.system != b.system || a.worker_count != b.worker_count {
         warnings.push("The runs used different driver hosts or driver settings.".into());

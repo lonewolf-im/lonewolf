@@ -136,7 +136,7 @@ fn environment_differences_only_warn() -> TestResult {
     let report = compare_runs(&baseline, &candidate);
     assert!(report.comparable);
     for expected in [
-        "different lonewolf-bench builds",
+        "different lonewolfbench builds",
         "different driver hosts",
         "debug build",
         "metrics sampling settings differ",

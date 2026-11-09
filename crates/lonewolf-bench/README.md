@@ -1,6 +1,6 @@
-# lonewolf-bench
+# lonewolfbench
 
-`lonewolf-bench` runs repeatable XMPP workloads against a Lonewolf server and
+`lonewolfbench` runs repeatable XMPP workloads against a Lonewolf server and
 records what happened. Use it to answer two kinds of questions:
 
 - How does this server build behave under this load? For example: delivery
@@ -46,7 +46,7 @@ little over a minute: 10 s of warmup and 60 s of measurement.
 
 ```sh
 cargo build --release -p lonewolf -p lonewolf-bench --locked
-./target/release/lonewolf-bench run \
+./target/release/lonewolfbench run \
   --config examples/bench/messages.toml \
   --output /tmp/bench-messages
 cat /tmp/bench-messages/summary.md
@@ -58,7 +58,7 @@ you build into another target directory, pass `--server-binary <path>`.
 ## Running a workload
 
 ```sh
-lonewolf-bench run --config <file> --output <new-dir> [--server-binary <path>]
+lonewolfbench run --config <file> --output <new-dir> [--server-binary <path>]
 ```
 
 The output directory must not exist yet. Its parent directory must exist.
@@ -217,7 +217,7 @@ is not a good result.
 ## Comparing runs
 
 ```sh
-lonewolf-bench compare <baseline-dir> <candidate-dir> --output <new-dir>
+lonewolfbench compare <baseline-dir> <candidate-dir> --output <new-dir>
 ```
 
 The command writes `comparison.json` and `comparison.md`. For each metric of
@@ -231,7 +231,7 @@ The comparison refuses when either run is `failed`, `invalid` or
 builds near their limit.
 
 Everything else produces a warning instead: a degraded run, a different
-`lonewolf-bench` build or host, a debug driver build, different metrics
+`lonewolfbench` build or host, a debug driver build, different metrics
 settings, a remote server, or the same server binary on both sides.
 
 A typical A/B comparison of a branch against `main`:
@@ -241,20 +241,20 @@ mkdir -p /tmp/ab
 git switch main
 cargo build --release -p lonewolf -p lonewolf-bench --locked
 cp target/release/lonewolf /tmp/ab/lonewolf-a
-cp target/release/lonewolf-bench /tmp/ab/lonewolf-bench
+cp target/release/lonewolfbench /tmp/ab/lonewolfbench
 
 git switch my-branch
 cargo build --release -p lonewolf --locked
 cp target/release/lonewolf /tmp/ab/lonewolf-b
 
-bench=/tmp/ab/lonewolf-bench
+bench=/tmp/ab/lonewolfbench
 config=examples/bench/messages.toml
 $bench run --config $config --server-binary /tmp/ab/lonewolf-a --output /tmp/ab/a1
 $bench run --config $config --server-binary /tmp/ab/lonewolf-b --output /tmp/ab/b1
 $bench compare /tmp/ab/a1 /tmp/ab/b1 --output /tmp/ab/a1-b1
 ```
 
-Keeping a copy of the driver means a rebuild of `lonewolf-bench`, including the
+Keeping a copy of the driver means a rebuild of `lonewolfbench`, including the
 one `cargo test --release` performs, cannot change the driver halfway through
 a series.
 
@@ -277,7 +277,7 @@ the server's configuration, and a remote run never creates accounts.
    messages, and `accounts` for churn.
 
    ```sh
-   lonewolf-bench accounts generate --domain example.test --prefix bench \
+   lonewolfbench accounts generate --domain example.test --prefix bench \
      --count 2 --output /private/bench/credentials.json
    ```
 
@@ -285,7 +285,7 @@ the server's configuration, and a remote run never creates accounts.
    `[admin]` to be enabled in the server configuration.
 
    ```sh
-   lonewolf-bench accounts provision --socket /path/to/admin.sock \
+   lonewolfbench accounts provision --socket /path/to/admin.sock \
      --credentials /private/bench/credentials.json
    ```
 
@@ -303,7 +303,7 @@ the server's configuration, and a remote run never creates accounts.
 5. Run the workload:
 
    ```sh
-   lonewolf-bench run --config /private/bench/remote.toml \
+   lonewolfbench run --config /private/bench/remote.toml \
      --output results/remote-001
    ```
 

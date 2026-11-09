@@ -199,6 +199,31 @@ impl FederatedPair {
         Ok(pair)
     }
 
+    pub fn direct_tls(&mut self) -> TestResult {
+        for (prefix, suite) in [("a", &mut self.a), ("b", &mut self.b)] {
+            let path = suite.fixture_path().join("lonewolf.toml");
+            let config = std::fs::read_to_string(&path)?;
+            let listeners = "listeners = [{ address = \"127.0.0.1:0\" }]";
+            assert!(config.contains(listeners));
+            std::fs::write(
+                path,
+                config.replacen(
+                    listeners,
+                    "listeners=[{address='127.0.0.1:0',tls_mode='direct'}]",
+                    1,
+                ),
+            )?;
+            suite.restart()?;
+            let target = format!("{prefix}.{}", suite.domain);
+            self.dns.srv(&suite.domain, &[]);
+            self.dns.direct_srv(
+                &suite.domain,
+                &[(0, 0, suite.s2s_addresses()?[0].port(), &target)],
+            );
+        }
+        Ok(())
+    }
+
     pub fn stop(&mut self) -> TestResult {
         let a = self.a.stop();
         let b = self.b.stop();

@@ -14,6 +14,11 @@ use super::super::support::federation::{
 use super::super::support::{PASSWORD, TestResult};
 use super::negotiation::{SingleServer, authentication, closed, expect_bounce};
 
+mod discovery;
+mod identities;
+mod pairs;
+mod protected;
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn route(listener: &RawS2sListener) -> TestResult<String> {
@@ -641,6 +646,8 @@ fn inbound_direct_tls_service_requires_registration_covering_certificate_and_fed
     authentication(&fixture.suite, "inbound", "success", 1)?;
     inbound.send("<message from='bob@b.test/phone' to='room@echo.a.test' type='chat' id='service'><body>Service</body></message>")?;
     inbound.receive()?.assert_xml("<message xmlns='jabber:server' from='room@echo.a.test' to='bob@b.test/phone' type='chat' id='service'><body>Service</body></message>")?;
+    inbound.send("<iq from='bob@b.test/phone' to='echo.a.test' type='get' id='direct-service-iq'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
+    inbound.receive()?.assert_xml("<iq xmlns='jabber:server' from='echo.a.test' to='bob@b.test/phone' type='result' id='direct-service-iq'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='component' type='generic' name='Echo'/><feature var='http://jabber.org/protocol/disco#info'/></query></iq>")?;
     inbound.close()?;
     closed(&fixture.suite, "inbound", "stream_end", 1)?;
     for name in ["unregistered.a.test", "echo.uncovered.test"] {

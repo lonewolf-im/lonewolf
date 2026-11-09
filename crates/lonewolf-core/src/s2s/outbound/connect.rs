@@ -738,7 +738,7 @@ where
     for (index, endpoint) in resolved.endpoints.iter().enumerate() {
         let Ok(Ok(tcp)) = compio::time::timeout_at(
             deadline(Instant::now(), context.limits.connect_timeout_secs),
-            connect(*endpoint),
+            connect(endpoint.address),
         )
         .await
         else {

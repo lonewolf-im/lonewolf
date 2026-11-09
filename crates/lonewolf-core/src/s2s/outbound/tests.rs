@@ -145,7 +145,15 @@ fn dns_mapping_preserves_endpoints_and_distinguishes_invalid_domains() {
         (ResolvedVia::Static, "static"),
         (ResolvedVia::Literal, "literal"),
     ] {
-        let endpoints = vec![std::net::SocketAddr::from(([127, 0, 0, 1], 5269))];
+        let endpoints = [
+            crate::config::TlsMode::StartTls,
+            crate::config::TlsMode::Direct,
+        ]
+        .map(|tls_mode| crate::s2s::dns::Endpoint {
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 5269)),
+            tls_mode,
+        })
+        .to_vec();
         let (outcome, result) = dns_result(Ok(Resolved {
             endpoints: endpoints.clone(),
             via,

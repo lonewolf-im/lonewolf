@@ -642,6 +642,15 @@ impl S2sConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+pub enum TlsMode {
+    #[default]
+    #[serde(rename = "starttls")]
+    StartTls,
+    #[serde(rename = "direct")]
+    Direct,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct S2sListenerConfig {

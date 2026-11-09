@@ -136,13 +136,20 @@ fn bind_dns_sockets() -> io::Result<(TcpListener, StdUdpSocket)> {
     }
 }
 
+fn starttls_endpoint(address: SocketAddr) -> Endpoint {
+    Endpoint {
+        address,
+        tls_mode: TlsMode::StartTls,
+    }
+}
+
 fn assert_endpoints(result: Resolved, via: ResolvedVia, port: u16) {
     assert_eq!(result.via, via);
     assert_eq!(
         result.endpoints,
         vec![
-            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port),
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port)
+            starttls_endpoint(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port)),
+            starttls_endpoint(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
         ]
     );
 }
@@ -164,6 +171,7 @@ fn priority_and_inclusive_weighted_order() {
                 SrvTarget {
                     name: name.into(),
                     port: 5269,
+                    tls_mode: TlsMode::StartTls,
                 },
             )
         })
@@ -213,8 +221,8 @@ fn literals_and_static_routes_bypass_dns_and_deduplicate() -> TestResult {
     assert_eq!(
         result.endpoints,
         vec![
-            "127.0.0.2:5270".parse::<SocketAddr>()?,
-            "[::1]:5280".parse()?
+            starttls_endpoint("127.0.0.2:5270".parse()?),
+            starttls_endpoint("[::1]:5280".parse()?)
         ]
     );
     for (domain, endpoint) in [
@@ -223,7 +231,7 @@ fn literals_and_static_routes_bypass_dns_and_deduplicate() -> TestResult {
     ] {
         let result = resolve(&resolver, domain).unwrap();
         assert_eq!(result.via, ResolvedVia::Literal);
-        assert_eq!(result.endpoints, vec![endpoint.parse::<SocketAddr>()?]);
+        assert_eq!(result.endpoints, vec![starttls_endpoint(endpoint.parse()?)]);
     }
     assert!(server.queries().is_empty());
     assert_eq!(
@@ -376,7 +384,7 @@ fn srv_and_static_endpoints_deduplicate_and_cap_at_sixteen() -> TestResult {
     let result = resolve(&resolver, "remote.example").unwrap();
     assert_eq!(result.via, ResolvedVia::Srv);
     let expected: Vec<_> = (1..=16)
-        .map(|last| SocketAddr::from(([192, 0, 2, last], 5270)))
+        .map(|last| starttls_endpoint(SocketAddr::from(([192, 0, 2, last], 5270))))
         .collect();
     assert_eq!(result.endpoints, expected);
     resolver.routes.insert(
@@ -739,4 +747,75 @@ fn host_resolution_distinguishes_empty_answers_failures_and_invalid_names() -> T
         );
     }
     Ok(())
+}
+
+#[test]
+fn typed_candidates_deduplicate_by_mode_and_share_the_cap() {
+    let candidates = (1..=10).flat_map(|last| {
+        let address = SocketAddr::from(([192, 0, 2, last], 5270));
+        let starttls = Endpoint {
+            address,
+            tls_mode: TlsMode::StartTls,
+        };
+        let direct = Endpoint {
+            address,
+            tls_mode: TlsMode::Direct,
+        };
+        [starttls, starttls, direct, direct]
+    });
+    let mut endpoints = Vec::new();
+    append_unique(&mut endpoints, candidates);
+    let expected: Vec<_> = (1..=8)
+        .flat_map(|last| {
+            let address = SocketAddr::from(([192, 0, 2, last], 5270));
+            [
+                Endpoint {
+                    address,
+                    tls_mode: TlsMode::StartTls,
+                },
+                Endpoint {
+                    address,
+                    tls_mode: TlsMode::Direct,
+                },
+            ]
+        })
+        .collect();
+    assert_eq!(endpoints, expected);
+}
+
+#[test]
+fn address_expansion_preserves_target_mode_and_family_order() {
+    let mut endpoints = Vec::new();
+    let ipv6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let ipv4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    for tls_mode in [TlsMode::StartTls, TlsMode::Direct] {
+        append_addresses(
+            &mut endpoints,
+            Ok(Answer {
+                records: vec![RData::AAAA(AAAA(Ipv6Addr::LOCALHOST))],
+            }),
+            5270,
+            tls_mode,
+        );
+        append_addresses(
+            &mut endpoints,
+            Ok(Answer {
+                records: vec![RData::A(A(Ipv4Addr::LOCALHOST))],
+            }),
+            5270,
+            tls_mode,
+        );
+    }
+    assert_eq!(
+        endpoints,
+        [TlsMode::StartTls, TlsMode::Direct]
+            .into_iter()
+            .flat_map(|tls_mode| {
+                [ipv6, ipv4].map(|ip| Endpoint {
+                    address: SocketAddr::new(ip, 5270),
+                    tls_mode,
+                })
+            })
+            .collect::<Vec<_>>()
+    );
 }

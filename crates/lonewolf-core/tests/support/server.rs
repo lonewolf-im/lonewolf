@@ -275,6 +275,15 @@ impl C2sSuite {
         Self::settings(listener, limits, 10, "")
     }
 
+    pub fn with_listener_setup(
+        listener: &str,
+        limits: &str,
+        hosts: &str,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
+        Self::settings_with_profile(listener, limits, 10, hosts, Some("default"), setup)
+    }
+
     pub fn resource_limit(limit: usize) -> TestResult<Self> {
         Self::settings("", "", limit, "")
     }

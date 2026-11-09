@@ -617,8 +617,21 @@ fn shutdown_snapshot_uses_rendered_counter_and_link_sources() -> Result<(), fmt:
             transport_connections: [[0; 2]; 2],
             connections: [0; 2],
             authentication_protocol: [0; 2],
+            streams: [0; 2],
+            bidi_streams: [0; 2],
+            c2s_connections: 0,
+            c2s_unauthenticated: 0,
+            router_sessions: 0,
         }
     );
+    let stream = metrics.stream_opened(Direction::Inbound);
+    let bidi = metrics.bidi_stream_opened(Direction::Outbound);
+    assert_eq!(metrics.shutdown_state().streams, [1, 0]);
+    assert_eq!(metrics.shutdown_state().bidi_streams, [0, 1]);
+    drop(stream);
+    drop(bidi);
+    assert_eq!(metrics.shutdown_state().streams, [0; 2]);
+    assert_eq!(metrics.shutdown_state().bidi_streams, [0; 2]);
     let source = Arc::new(FakeLinks::default());
     let erased: Arc<dyn LinkStats> = source.clone();
     metrics.set_link_source(Arc::downgrade(&erased));

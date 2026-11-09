@@ -81,6 +81,11 @@ impl Server {
         }
     }
 
+    #[allow(dead_code)]
+    pub(super) fn has_readiness(&self) -> std::io::Result<bool> {
+        Ok(self.readiness.receive(Duration::from_millis(1))?.is_some())
+    }
+
     pub(super) fn metrics_address(&self) -> Option<SocketAddr> {
         self.metrics
     }

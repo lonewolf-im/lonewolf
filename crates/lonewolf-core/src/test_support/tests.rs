@@ -170,3 +170,35 @@ fn admission_events_reach_only_the_installed_target() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn shutdown_snapshot_sums_exact_lifecycle_samples_and_rejects_missing_gauges() -> TestResult {
+    use prometheus_client::metrics::{family::Family, gauge::Gauge};
+    use prometheus_client::registry::Registry;
+    let mut registry = Registry::default();
+    assert!(super::shutdown_gauges(&registry).is_err());
+    let connections = Family::<Vec<(String, String)>, Gauge>::default();
+    connections
+        .get_or_create(&vec![("listener".into(), "0".into())])
+        .set(3);
+    connections
+        .get_or_create(&vec![("listener".into(), "1".into())])
+        .set(5);
+    registry.register("lonewolf_c2s_connections", "", connections);
+    let unrelated = Gauge::<i64>::default();
+    unrelated.set(99);
+    registry.register("lonewolf_c2s_connections_limit", "", unrelated);
+    let unauthenticated = Gauge::<i64>::default();
+    unauthenticated.set(2);
+    registry.register(
+        "lonewolf_c2s_unauthenticated_connections",
+        "",
+        unauthenticated,
+    );
+    assert!(super::shutdown_gauges(&registry).is_err());
+    let sessions = Gauge::<i64>::default();
+    sessions.set(4);
+    registry.register("lonewolf_router_sessions", "", sessions);
+    assert_eq!(super::shutdown_gauges(&registry)?, [8, 2, 4]);
+    Ok(())
+}

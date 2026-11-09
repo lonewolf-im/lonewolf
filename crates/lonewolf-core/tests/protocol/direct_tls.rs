@@ -3,6 +3,7 @@
 use super::support::{C2sSuite, Client, PASSWORD, SASL_NAMESPACE, TLS_NAMESPACE, TestResult};
 
 mod authentication;
+mod deadlines;
 mod hosts;
 mod lifecycle;
 mod protocol;

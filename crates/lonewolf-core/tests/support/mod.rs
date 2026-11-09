@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 mod client;
+#[allow(dead_code)]
+pub mod crl_gate;
 mod extensions;
 pub mod federation;
 mod readiness;

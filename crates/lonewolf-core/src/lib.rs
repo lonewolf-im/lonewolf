@@ -183,6 +183,8 @@ fn run_internal(
             let mut router = None;
             #[cfg(feature = "test-support")]
             let mut observed_s2s_metrics = None;
+            #[cfg(feature = "test-support")]
+            let mut observed_registry = None;
             let mut shutdown_deadline = None;
             let result = async {
                 match startup_until_signal(
@@ -392,6 +394,10 @@ fn run_internal(
                     );
                 }
                 let registry = server_metrics.into_registry();
+                #[cfg(feature = "test-support")]
+                if s2s_shutdown_state.is_some() {
+                    observed_registry = Some(Arc::clone(&registry));
+                }
                 run_services(
                     BackgroundServices {
                         admin,
@@ -477,8 +483,17 @@ fn run_internal(
                 .and(router_stopped)
                 .and(acme_stopped)?;
             #[cfg(feature = "test-support")]
-            if let Some(destination) = s2s_shutdown_state {
-                *destination = observed_s2s_metrics.map(|metrics| metrics.shutdown_state());
+            if let Some(destination) = s2s_shutdown_state
+                && let Some(metrics) = observed_s2s_metrics
+            {
+                let mut state = metrics.shutdown_state();
+                if let Some(registry) = observed_registry {
+                    let [connections, unauthenticated, sessions] = test_support::shutdown_gauges(&registry).map_err(RunError::Metrics)?;
+                    state.c2s_connections=connections;
+                    state.c2s_unauthenticated=unauthenticated;
+                    state.router_sessions=sessions;
+                }
+                *destination = Some(state);
             }
             Ok(())
         })?;

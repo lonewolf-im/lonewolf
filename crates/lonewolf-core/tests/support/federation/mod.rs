@@ -285,6 +285,11 @@ pub fn assert_shutdown_empty(state: Option<lonewolf_core::test_support::S2sShutd
         assert_eq!(state.queued_bytes, 0);
         assert_eq!(state.transport_connections, [[0; 2]; 2]);
         assert_eq!(state.connections, [0; 2]);
+        assert_eq!(state.streams, [0; 2]);
+        assert_eq!(state.bidi_streams, [0; 2]);
+        assert_eq!(state.c2s_connections, 0);
+        assert_eq!(state.c2s_unauthenticated, 0);
+        assert_eq!(state.router_sessions, 0);
     }
 }
 

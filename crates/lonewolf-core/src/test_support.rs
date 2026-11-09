@@ -54,7 +54,12 @@ pub struct S2sShutdownState {
     pub transport_cancelled: [[u64; 2]; 2],
     pub transport_connections: [[u64; 2]; 2],
     pub connections: [u64; 2],
+    pub streams: [u64; 2],
+    pub bidi_streams: [u64; 2],
     pub authentication_protocol: [u64; 2],
+    pub c2s_connections: u64,
+    pub c2s_unauthenticated: u64,
+    pub router_sessions: u64,
 }
 
 pub fn run_with_extensions_and_s2s_shutdown_state(
@@ -74,6 +79,37 @@ pub fn run_with_extensions_and_s2s_shutdown_state(
         Some(&mut state),
     )?;
     Ok(state)
+}
+
+pub(crate) fn shutdown_gauges(
+    registry: &prometheus_client::registry::Registry,
+) -> std::io::Result<[u64; 3]> {
+    let mut output = String::new();
+    prometheus_client::encoding::text::encode(&mut output, registry)
+        .map_err(std::io::Error::other)?;
+    let mut connections = None;
+    let mut unauthenticated = None;
+    let mut sessions = None;
+    for line in output.lines() {
+        let Some((sample, value)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let target = if sample.starts_with("lonewolf_c2s_connections{") {
+            &mut connections
+        } else if sample == "lonewolf_c2s_unauthenticated_connections" {
+            &mut unauthenticated
+        } else if sample == "lonewolf_router_sessions" {
+            &mut sessions
+        } else {
+            continue;
+        };
+        let value = value.parse::<u64>().map_err(std::io::Error::other)?;
+        *target = Some(target.unwrap_or(0) + value);
+    }
+    match (connections, unauthenticated, sessions) {
+        (Some(c), Some(u), Some(s)) => Ok([c, u, s]),
+        _ => Err(std::io::Error::other("missing lifecycle shutdown gauge")),
+    }
 }
 
 static PROBES: LazyLock<PlMutex<BTreeMap<String, Weak<State>>>> =

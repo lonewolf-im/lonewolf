@@ -785,6 +785,15 @@ impl S2sMetrics {
             dropped_shutdown: self.dropped[DropReason::Shutdown as usize].load(Ordering::Relaxed),
             dropped_connection_lost: self.dropped[DropReason::ConnectionLost as usize]
                 .load(Ordering::Relaxed),
+            streams: std::array::from_fn(|direction| {
+                self.streams[direction].load(Ordering::Relaxed)
+            }),
+            bidi_streams: std::array::from_fn(|direction| {
+                self.bidi_streams[direction].load(Ordering::Relaxed)
+            }),
+            c2s_connections: 0,
+            c2s_unauthenticated: 0,
+            router_sessions: 0,
             queued_stanzas: snapshot.queued_stanzas,
             queued_bytes: snapshot.queued_bytes,
             transport_cancelled: std::array::from_fn(|direction| {

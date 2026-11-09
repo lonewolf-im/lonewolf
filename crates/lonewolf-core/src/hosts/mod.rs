@@ -425,6 +425,7 @@ impl Hosts {
         &self,
         domain: &str,
         trust: &Arc<PeerTrust>,
+        tls_mode: crate::config::TlsMode,
     ) -> Option<Arc<rustls::ClientConfig>> {
         let resolver: Arc<dyn rustls::client::ResolvesClientCert> =
             if let Some(host) = self.find_host(domain) {
@@ -438,12 +439,15 @@ impl Hosts {
                     snapshot,
                 })
             };
-        let config = rustls::ClientConfig::builder_with_provider(self.crypto_provider())
+        let mut config = rustls::ClientConfig::builder_with_provider(self.crypto_provider())
             .with_safe_default_protocol_versions()
             .ok()?
             .dangerous()
             .with_custom_certificate_verifier(trust.server_verifier())
             .with_client_cert_resolver(resolver);
+        if tls_mode == crate::config::TlsMode::Direct {
+            config.alpn_protocols.push(b"xmpp-server".to_vec());
+        }
         Some(Arc::new(config))
     }
 

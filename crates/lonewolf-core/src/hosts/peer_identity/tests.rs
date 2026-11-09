@@ -454,7 +454,7 @@ fn s2s_handshakes_exchange_server_auth_chains_and_reject_client_auth_only() -> T
             .s2s_server_config("a.test", &trust)
             .ok_or("no server config")?;
         let client = hosts
-            .s2s_client_config("b.test", &trust)
+            .s2s_client_config("b.test", &trust, crate::config::TlsMode::StartTls)
             .ok_or("no client config")?;
         assert!(!server.require_ems);
         let result = handshake_named(client, server, "a.test");
@@ -506,12 +506,24 @@ fn federation_requires_opt_in_configured_tls_and_a_public_dns_name() -> TestResu
         assert!(!hosts.federates(domain));
     }
     assert!(hosts.s2s_server_config("unknown.test", &trust).is_none());
-    assert!(hosts.s2s_client_config("unknown.test", &trust).is_none());
-    assert!(hosts.s2s_client_config("localhost", &trust).is_some());
+    assert!(
+        hosts
+            .s2s_client_config("unknown.test", &trust, crate::config::TlsMode::StartTls)
+            .is_none()
+    );
+    assert!(
+        hosts
+            .s2s_client_config("localhost", &trust, crate::config::TlsMode::StartTls)
+            .is_some()
+    );
     let managed = crate::hosts::test_support::managed_hosts()?;
     assert!(managed.federates("example.com"));
     assert!(managed.s2s_server_config("example.com", &trust).is_none());
-    assert!(managed.s2s_client_config("example.com", &trust).is_some());
+    assert!(
+        managed
+            .s2s_client_config("example.com", &trust, crate::config::TlsMode::StartTls)
+            .is_some()
+    );
     Ok(())
 }
 
@@ -540,7 +552,7 @@ fn new_handshakes_use_the_live_client_generation_and_selected_server_generation(
     let peers = fixture.hosts(false)?;
     let managed = crate::hosts::test_support::managed_hosts()?;
     let client = managed
-        .s2s_client_config("example.com", &trust)
+        .s2s_client_config("example.com", &trust, crate::config::TlsMode::StartTls)
         .ok_or("no client config")?;
     let schemes = trust.client_verifier().supported_verify_schemes();
     assert!(!client.client_auth_cert_resolver.has_certs());
@@ -579,7 +591,7 @@ fn new_handshakes_use_the_live_client_generation_and_selected_server_generation(
             .ok_or("no managed server")?;
         let (peer, _) = handshake_named(
             peers
-                .s2s_client_config("b.test", &trust)
+                .s2s_client_config("b.test", &trust, crate::config::TlsMode::StartTls)
                 .ok_or("no peer client")?,
             Arc::clone(&selected),
             "example.com",
@@ -592,7 +604,7 @@ fn new_handshakes_use_the_live_client_generation_and_selected_server_generation(
     let (selected, old_chain) = captured.ok_or("no captured server")?;
     let (peer, _) = handshake_named(
         peers
-            .s2s_client_config("b.test", &trust)
+            .s2s_client_config("b.test", &trust, crate::config::TlsMode::StartTls)
             .ok_or("no peer client")?,
         selected,
         "example.com",
@@ -614,7 +626,7 @@ fn unavailable_generations_are_not_presented_in_either_direction() -> TestResult
     let trust = fixture.trust()?;
     let managed = crate::hosts::test_support::managed_hosts()?;
     let client = managed
-        .s2s_client_config("example.com", &trust)
+        .s2s_client_config("example.com", &trust, crate::config::TlsMode::StartTls)
         .ok_or("no client config")?;
     let schemes = trust.client_verifier().supported_verify_schemes();
     let now = UnixTime::now().as_secs();
@@ -881,7 +893,7 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
     let peers = fixture.hosts(false)?;
     let old = hosts.certified_key("a.test").ok_or("no old key")?;
     let captured_client = hosts
-        .s2s_client_config("svc.example.test", &trust)
+        .s2s_client_config("svc.example.test", &trust, crate::config::TlsMode::StartTls)
         .ok_or("no client")?;
     let captured_server = hosts
         .s2s_server_config("svc.example.test", &trust)
@@ -906,7 +918,7 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
         ),
         (
             hosts
-                .s2s_client_config("svc.example.test", &trust)
+                .s2s_client_config("svc.example.test", &trust, crate::config::TlsMode::StartTls)
                 .ok_or("no fresh client")?,
             hosts
                 .s2s_server_config("svc.example.test", &trust)
@@ -932,7 +944,7 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
         assert_eq!(server.peer_certificates(), Some(expected.as_slice()));
         for send_sni in [true, false] {
             let mut client = (*peers
-                .s2s_client_config("b.test", &trust)
+                .s2s_client_config("b.test", &trust, crate::config::TlsMode::StartTls)
                 .ok_or("no peer client")?)
             .clone();
             client.enable_sni = send_sni;
@@ -945,7 +957,7 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
         }
         for wrong in ["a.test", "sibling.example.test", "unrelated.test"] {
             let client = peers
-                .s2s_client_config("b.test", &trust)
+                .s2s_client_config("b.test", &trust, crate::config::TlsMode::StartTls)
                 .ok_or("no peer client")?;
             assert!(handshake_named(client, Arc::clone(&server_config), wrong).is_err());
         }
@@ -957,7 +969,7 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
     );
     let fallback = hosts.certified_key("b.test").ok_or("no fallback key")?;
     let fresh_client = hosts
-        .s2s_client_config("svc.example.test", &trust)
+        .s2s_client_config("svc.example.test", &trust, crate::config::TlsMode::StartTls)
         .ok_or("no fallback client")?;
     let (_, server) = handshake_named(
         fresh_client,
@@ -966,7 +978,9 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
     )?;
     assert_eq!(server.peer_certificates(), Some(fallback.cert.as_slice()));
     let (client, _) = handshake_named(
-        peers.s2s_client_config("b.test", &trust).ok_or("no peer")?,
+        peers
+            .s2s_client_config("b.test", &trust, crate::config::TlsMode::StartTls)
+            .ok_or("no peer")?,
         hosts
             .s2s_server_config("svc.example.test", &trust)
             .ok_or("no fallback server")?,
@@ -978,7 +992,7 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
     }
     assert!(
         hosts
-            .s2s_client_config("svc.example.test", &trust)
+            .s2s_client_config("svc.example.test", &trust, crate::config::TlsMode::StartTls)
             .is_none()
     );
     assert!(
@@ -987,7 +1001,9 @@ fn service_configs_pin_checked_generations_and_fresh_configs_reselect_coverage()
             .is_none()
     );
     let (client, _) = handshake_named(
-        peers.s2s_client_config("b.test", &trust).ok_or("no peer")?,
+        peers
+            .s2s_client_config("b.test", &trust, crate::config::TlsMode::StartTls)
+            .ok_or("no peer")?,
         captured_server,
         "svc.example.test",
     )?;

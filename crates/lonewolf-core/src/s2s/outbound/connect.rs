@@ -21,7 +21,7 @@ use tokio::io::BufReader;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::{ClientTlsInput, ClientTlsOutput, OutboundStream};
-use crate::config::limits::S2sLimits;
+use crate::config::{TlsMode, limits::S2sLimits};
 use crate::hosts::{Hosts, peer_identity::PeerTrust, tls_identity};
 use crate::s2s::dns::{ResolveError, Resolved, ResolvedVia, Resolver};
 use crate::s2s::log_domain;
@@ -492,6 +492,7 @@ struct Negotiation<A: ChunkAllocator> {
 }
 
 struct TlsSetup {
+    tls_mode: TlsMode,
     config: Arc<ClientConfig>,
     identity: ServerName<'static>,
 }
@@ -599,20 +600,39 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     allocator: A,
 ) -> Result<VerifiedPeer, Failure> {
     let header = stream::initial_header_xml(local, remote);
-    flow.send_header(&header).await?;
-    flow.header(remote).await?;
-    let offered = features(flow.expected().await?)?;
-    require_starttls(&offered)?;
-    flow.update_peer_limits(offered.limits)?;
-    flow.send(stream::STARTTLS).await?;
-    proceed(flow.expected().await?)?;
-    let Some(Connection::Plain(mut reader, writer)) = flow.connection.take() else {
-        return Err(protocol());
+    let limits = S2sReaderLimits {
+        max_stanza_bytes: context.limits.max_stanza_bytes,
+        stanzas: context.limits.incoming_stanzas_per_connection.clone(),
+        xml: context.limits.incoming_xml_per_connection.clone(),
     };
-    let (input, state) = reader.take_input().await?;
-    drop(input);
-    drop(reader);
-    drop(writer);
+    let state = if setup.tls_mode == TlsMode::StartTls {
+        flow.connection = Some(Connection::Plain(
+            S2sReader::plain(
+                socket.0.clone(),
+                &limits,
+                allocator.clone(),
+                Some(Arc::clone(&context.metrics)),
+            ),
+            S2sWriter::new(Box::pin(AsyncStream::new(socket.0.clone()))),
+        ));
+        flow.send_header(&header).await?;
+        flow.header(remote).await?;
+        let offered = features(flow.expected().await?)?;
+        require_starttls(&offered)?;
+        flow.update_peer_limits(offered.limits)?;
+        flow.send(stream::STARTTLS).await?;
+        proceed(flow.expected().await?)?;
+        let Some(Connection::Plain(mut reader, writer)) = flow.connection.take() else {
+            return Err(protocol());
+        };
+        let (input, state) = reader.take_input().await?;
+        drop(input);
+        drop(reader);
+        drop(writer);
+        Some(state)
+    } else {
+        None
+    };
     let tls = TlsConnector::from(Arc::clone(&setup.config))
         .connect(
             setup.identity.clone(),
@@ -620,13 +640,30 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         )
         .await
         .map_err(tls_failure)?;
+    if setup.tls_mode == TlsMode::Direct
+        && tls
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .is_some_and(|protocol| protocol != b"xmpp-server")
+    {
+        return Err(EstablishError::Tls("alpn").into());
+    }
     let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
     let counted = CountingIo::new(tls, Arc::clone(&context.metrics), Direction::Outbound);
     let activity = counted.activity();
     let (input, output) = counted.split();
     flow.connection = Some(Connection::Tls(
-        S2sReader::from_state(BufReader::new(input.compat()), state, allocator)
-            .with_activity(activity),
+        match state {
+            Some(state) => S2sReader::from_state(BufReader::new(input.compat()), state, allocator),
+            None => S2sReader::new(
+                BufReader::new(input.compat()),
+                &limits,
+                allocator,
+                Some(Arc::clone(&context.metrics)),
+            ),
+        }
+        .with_activity(activity),
         S2sWriter::new(output),
     ));
     flow.send_header(&header).await?;
@@ -725,15 +762,24 @@ where
     context.metrics.dns(outcome);
     let resolved = resolved?;
     let mut accounting = Accounting::new(Arc::clone(&context.metrics), Instant::now());
-    let setup = TlsSetup {
-        config: require_setup(context.hosts.s2s_client_config(local, context.trust))?,
-        identity: require_setup(tls_identity(remote).ok())?,
-    };
-    let limits = S2sReaderLimits {
-        max_stanza_bytes: context.limits.max_stanza_bytes,
-        stanzas: context.limits.incoming_stanzas_per_connection.clone(),
-        xml: context.limits.incoming_xml_per_connection.clone(),
-    };
+    let mut setups = [None, None];
+    for (index, tls_mode) in [TlsMode::StartTls, TlsMode::Direct].into_iter().enumerate() {
+        if resolved
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.tls_mode == tls_mode)
+        {
+            setups[index] = Some(TlsSetup {
+                tls_mode,
+                config: require_setup(context.hosts.s2s_client_config(
+                    local,
+                    context.trust,
+                    tls_mode,
+                ))?,
+                identity: require_setup(tls_identity(remote).ok())?,
+            });
+        }
+    }
     let mut attempts = Attempts::default();
     for (index, endpoint) in resolved.endpoints.iter().enumerate() {
         let Ok(Ok(tcp)) = compio::time::timeout_at(
@@ -755,15 +801,9 @@ where
         let negotiated = if socket.0.set_nodelay(true).is_err() {
             (Err(protocol()), Instant::now())
         } else {
-            flow.connection = Some(Connection::Plain(
-                S2sReader::plain(
-                    socket.0.clone(),
-                    &limits,
-                    allocator.clone(),
-                    Some(Arc::clone(&context.metrics)),
-                ),
-                S2sWriter::new(Box::pin(AsyncStream::new(socket.0.clone()))),
-            ));
+            let setup = setups[usize::from(endpoint.tls_mode == TlsMode::Direct)]
+                .as_ref()
+                .ok_or(EstablishError::Negotiation(NegotiationFailure::Protocol))?;
             let deadline = deadline(Instant::now(), context.limits.negotiation_timeout_secs);
             match compio::time::timeout_at(
                 deadline,
@@ -773,7 +813,7 @@ where
                     local,
                     remote,
                     context,
-                    &setup,
+                    setup,
                     allocator.clone(),
                 ),
             )

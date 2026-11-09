@@ -246,12 +246,18 @@ impl RawS2sPeer {
 }
 
 pub struct RawS2sListener {
+    direct_tls: bool,
     listener: TcpListener,
     local_max: u32,
     local_idle: u32,
     advertisements: [String; 3],
 }
 impl RawS2sListener {
+    pub fn direct_tls(mut self) -> Self {
+        self.direct_tls = true;
+        self
+    }
+
     pub fn advertising(mut self, pre_tls: &str, post_tls: &str, post_sasl: &str) -> Self {
         self.advertisements = [pre_tls.into(), post_tls.into(), post_sasl.into()];
         self
@@ -266,6 +272,7 @@ impl RawS2sListener {
     pub fn bind() -> TestResult<Self> {
         Ok(Self {
             listener: TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?,
+            direct_tls: false,
             local_max: 524288,
             local_idle: 600,
             advertisements: Default::default(),
@@ -278,7 +285,7 @@ impl RawS2sListener {
         socket2::SockRef::from(&self.listener).set_recv_buffer_size(size)?;
         Ok(())
     }
-    pub fn accept_until_proceed(&self, from: &str, to: &str) -> TestResult<RawS2sPeer> {
+    pub fn accept_socket(&self) -> TestResult<TcpStream> {
         let deadline = Instant::now() + TIMEOUT;
         let socket = loop {
             let remaining = deadline
@@ -305,6 +312,36 @@ impl RawS2sListener {
             break self.listener.accept()?.0;
         };
         configure(&socket)?;
+        Ok(socket)
+    }
+
+    pub fn accept_client_hello(
+        &self,
+        domain: &str,
+    ) -> TestResult<(TcpStream, rustls::server::Accepted)> {
+        let mut socket = self.accept_socket()?;
+        let mut first = [0];
+        assert_eq!(socket.peek(&mut first)?, 1);
+        assert_eq!(first, [22]);
+        let mut acceptor = rustls::server::Acceptor::default();
+        loop {
+            if acceptor.read_tls(&mut socket)? == 0 {
+                return Err("connection ended before ClientHello".into());
+            }
+            if let Some(accepted) = acceptor.accept().map_err(|(error, _)| error)? {
+                let hello = accepted.client_hello();
+                assert_eq!(hello.server_name(), Some(domain));
+                assert_eq!(
+                    hello.alpn().ok_or("missing ALPN")?.collect::<Vec<_>>(),
+                    [b"xmpp-server".as_slice()]
+                );
+                return Ok((socket, accepted));
+            }
+        }
+    }
+
+    pub fn accept_until_proceed(&self, from: &str, to: &str) -> TestResult<RawS2sPeer> {
+        let socket = self.accept_socket()?;
         let mut stream = XmlStream::new(PeerTransport::Plain(socket));
         let header = stream.open_with(&opening(from, to))?;
         assert_header(&header, to, from);
@@ -348,13 +385,25 @@ impl RawS2sListener {
         external: bool,
         bidi: bool,
     ) -> TestResult<(RawS2sPeer, bool)> {
-        let peer = self.accept_until_proceed(from, to)?;
-        let PeerTransport::Plain(socket) = peer.stream.into_inner().into_inner() else {
-            return Err("expected plain peer transport".into());
+        let (socket, connection) = if self.direct_tls {
+            let (mut socket, accepted) = self.accept_client_hello(from)?;
+            let connection = match accepted.into_connection(config) {
+                Ok(connection) => connection,
+                Err((error, mut alert)) => {
+                    alert.write_all(&mut socket)?;
+                    return Err(error.into());
+                }
+            };
+            (socket, connection)
+        } else {
+            let peer = self.accept_until_proceed(from, to)?;
+            let PeerTransport::Plain(socket) = peer.stream.into_inner().into_inner() else {
+                return Err("expected plain peer transport".into());
+            };
+            (socket, rustls::ServerConnection::new(config)?)
         };
         let mut stream = XmlStream::new(PeerTransport::Server(Box::new(rustls::StreamOwned::new(
-            rustls::ServerConnection::new(config)?,
-            socket,
+            connection, socket,
         ))));
         assert_header(&stream.open_with(&opening(from, to))?, to, from);
         let mut requested = false;

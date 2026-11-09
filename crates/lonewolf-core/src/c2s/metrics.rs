@@ -621,7 +621,7 @@ impl Collector for C2sCollector {
         }
         let mut family = encoder.encode_descriptor(
             "c2s_received",
-            "Bytes read from client sockets after STARTTLS, including TLS overhead.",
+            "Bytes read from client sockets for TLS, including handshake and record overhead.",
             Some(&Unit::Bytes),
             MetricType::Counter,
         )?;
@@ -631,7 +631,7 @@ impl Collector for C2sCollector {
         }
         let mut family = encoder.encode_descriptor(
             "c2s_sent",
-            "Bytes written to client sockets after STARTTLS, including TLS overhead.",
+            "Bytes written to client sockets for TLS, including handshake and record overhead.",
             Some(&Unit::Bytes),
             MetricType::Counter,
         )?;

@@ -2,10 +2,10 @@
 
 pub mod artifacts;
 
-use lonewolf_bench::config::{
+use lonewolf_core::test_support::spawn_child;
+use lonewolfbench::config::{
     MeasurementConfig, MetricsConfig, RunConfig, ScenarioConfig, TargetConfig,
 };
-use lonewolf_core::test_support::spawn_child;
 use std::{
     ffi::OsStr,
     fs::{self, OpenOptions},

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::TestResult;
-use lonewolf_bench::report::{RunReport, RunStatus};
+use lonewolfbench::report::{RunReport, RunStatus};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 pub fn complete(directory: &Path, expected: RunStatus) -> TestResult<RunReport> {

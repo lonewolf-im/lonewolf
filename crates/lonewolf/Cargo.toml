@@ -12,7 +12,7 @@ lonewolf-core.workspace = true
 
 [dev-dependencies]
 lonewolf-core = { workspace = true, features = ["test-support"] }
-lonewolf-bench.workspace = true
+lonewolfbench.workspace = true
 lonewolf-util.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "net"] }
 base64.workspace = true

@@ -4,7 +4,7 @@ members = [
     "crates/lonewolf-acme",
     "crates/lonewolf-admin",
     "crates/lonewolf-auth",
-    "crates/lonewolf-bench",
+    "crates/lonewolfbench",
     "crates/lonewolf-core",
     "crates/lonewolf-extension",
     "crates/lonewolf-metrics",
@@ -57,7 +57,7 @@ oxilangtag = { version = "0.1.6", default-features = false }
 lonewolf-admin = { path = "crates/lonewolf-admin" }
 lonewolf-acme = { path = "crates/lonewolf-acme" }
 lonewolf-auth = { path = "crates/lonewolf-auth" }
-lonewolf-bench = { path = "crates/lonewolf-bench" }
+lonewolfbench = { path = "crates/lonewolfbench" }
 lonewolf-core = { path = "crates/lonewolf-core" }
 lonewolf-extension = { path = "crates/lonewolf-extension" }
 lonewolf-metrics = { path = "crates/lonewolf-metrics" }

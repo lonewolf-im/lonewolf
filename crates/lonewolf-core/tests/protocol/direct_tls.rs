@@ -4,6 +4,7 @@ use super::support::{C2sSuite, Client, PASSWORD, SASL_NAMESPACE, TLS_NAMESPACE, 
 
 mod authentication;
 mod hosts;
+mod lifecycle;
 mod protocol;
 mod transports;
 

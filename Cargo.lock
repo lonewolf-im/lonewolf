@@ -1411,6 +1411,7 @@ dependencies = [
  "time",
  "tokio",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]

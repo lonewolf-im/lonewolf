@@ -29,6 +29,7 @@ pub struct AcmeServer {
     clock_start: Option<(std::time::SystemTime, ClockMode)>,
     readiness: ReadinessSocket,
     pub address: SocketAddr,
+    pub s2s: Option<Vec<SocketAddr>>,
     metrics: Option<SocketAddr>,
     pub challenge: SocketAddr,
     pub tls: Arc<ClientConfig>,
@@ -118,6 +119,7 @@ ca_certificates_path = {:?}
             clock_start: None,
             readiness: ReadinessSocket::bind()?,
             address,
+            s2s: None,
             metrics: None,
             challenge,
             tls,
@@ -227,6 +229,57 @@ ca_certificates_path = {:?}
             Err(error) => Err(error.into()),
         }
     }
+    pub fn start_once(&mut self, ca: &FakeAcmeCa) -> TestResult {
+        ca.callback(self.challenge);
+        self.spawn()?;
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = self.child.as_mut().ok_or("missing child")?.try_wait()? {
+                self.child.take();
+                self.clock.take();
+                return Err(format!("server exited before readiness: {status}").into());
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                self.clock.take();
+                return Err("server readiness deadline elapsed".into());
+            };
+            if let Some(readiness) = self
+                .readiness
+                .receive(remaining.min(Duration::from_millis(100)))?
+            {
+                self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
+                self.s2s = readiness.s2s;
+                self.metrics = readiness.metrics;
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn stop_once(&mut self) -> TestResult<ExitStatus> {
+        let child = self.child.as_mut().ok_or("missing child")?;
+        let pid = Pid::from_raw(child.id().try_into()?);
+        kill(pid, Signal::SIGTERM)?;
+        let result = thread::scope(|scope| -> TestResult<ExitStatus> {
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let waiter = scope.spawn(move || {
+                let _ = sent.send(child.wait());
+            });
+            let result = received.recv_timeout(TIMEOUT);
+            if result.is_err() {
+                let _ = kill(pid, Signal::SIGKILL);
+            }
+            waiter.join().map_err(|_| "server reaper panicked")?;
+            Ok(result??)
+        });
+        self.child.take();
+        self.clock.take();
+        result
+    }
+
     pub fn start(&mut self, ca: &FakeAcmeCa) -> TestResult {
         self.start_with_route(ca, |address| ca.callback(address))
     }
@@ -410,6 +463,31 @@ ca_certificates_path = {:?}
         }
         Ok(client)
     }
+    pub fn tls_first(&self, domain: &str, config: Arc<ClientConfig>) -> TestResult<Client> {
+        let mut config = (*config).clone();
+        config.alpn_protocols = vec![b"xmpp-client".to_vec()];
+        let mut client = Client::direct_tls_with_config(
+            self.address,
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from(idna::domain_to_ascii(domain)?)?,
+        )?;
+        client.complete_tls()?;
+        Ok(client)
+    }
+
+    pub fn wait_for_metric(&self, sample: &str) -> TestResult<String> {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let body = self.metrics()?;
+            if body.lines().any(|line| line == sample) {
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("missing metric {sample}: {body}").into());
+            }
+        }
+    }
+
     pub fn secure(&self, domain: &str) -> TestResult<Client> {
         let mut client = self.encrypted(domain, self.tls.clone())?;
         client.open_with(&format!("<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='{domain}' version='1.0'>"))?;

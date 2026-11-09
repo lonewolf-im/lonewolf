@@ -124,6 +124,37 @@ impl RawS2sPeer {
         })
     }
 
+    pub fn protected(
+        mode: lonewolf_core::config::TlsMode,
+        address: SocketAddr,
+        from: &str,
+        to: &str,
+        config: Arc<rustls::ClientConfig>,
+        expected_to: Option<&str>,
+    ) -> TestResult<Self> {
+        let header = opening(from, to);
+        match mode {
+            lonewolf_core::config::TlsMode::StartTls => {
+                let mut peer = Self::connect(address, from, to)?;
+                peer.expect_starttls_features()?;
+                peer.start_tls_with_header(config, &header, expected_to)
+            }
+            lonewolf_core::config::TlsMode::Direct => {
+                let mut peer = Self::tls_first(address, from, to, config)?;
+                peer.open_protected(&header, expected_to)?;
+                Ok(peer)
+            }
+        }
+    }
+
+    pub fn peer_certificates(&mut self) -> Option<&[rustls::pki_types::CertificateDer<'static>]> {
+        match self.stream.transport() {
+            PeerTransport::Plain(_) => None,
+            PeerTransport::Client(stream) => stream.conn.peer_certificates(),
+            PeerTransport::Server(stream) => stream.conn.peer_certificates(),
+        }
+    }
+
     pub fn open_protected(&mut self, header: &str, expected_to: Option<&str>) -> TestResult {
         let response = self.stream.open_with(header)?;
         assert_eq!(
@@ -315,6 +346,11 @@ pub struct RawS2sListener {
     advertisements: [String; 3],
 }
 impl RawS2sListener {
+    pub fn with_transport(mut self, mode: lonewolf_core::config::TlsMode) -> Self {
+        self.direct_tls = mode == lonewolf_core::config::TlsMode::Direct;
+        self
+    }
+
     pub fn direct_tls(mut self) -> Self {
         self.direct_tls = true;
         self
@@ -577,9 +613,18 @@ pub fn server_config_with_versions(
     domain: &str,
     versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> TestResult<Arc<rustls::ServerConfig>> {
+    server_config_with_roots(ca.roots()?, key, domain, versions)
+}
+
+pub fn server_config_with_roots(
+    roots: rustls::RootCertStore,
+    key: Arc<rustls::sign::CertifiedKey>,
+    domain: &str,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> TestResult<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls_graviola::default_provider());
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(ca.roots()?),
+        Arc::new(roots),
         Arc::clone(&provider),
     )
     .build()?;

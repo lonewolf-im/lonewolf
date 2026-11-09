@@ -64,6 +64,25 @@ impl SingleServer {
         })
     }
 
+    pub fn set_transport(&mut self, mode: lonewolf_core::config::TlsMode) -> TestResult {
+        if mode == lonewolf_core::config::TlsMode::Direct {
+            let path = self.suite.fixture_path().join("lonewolf.toml");
+            let config = std::fs::read_to_string(&path)?;
+            let listeners = "listeners = [{ address = \"127.0.0.1:0\" }]";
+            assert!(config.contains(listeners));
+            std::fs::write(
+                path,
+                config.replacen(
+                    listeners,
+                    "listeners=[{address='127.0.0.1:0',tls_mode='direct'}]",
+                    1,
+                ),
+            )?;
+            self.suite.restart()?;
+        }
+        Ok(())
+    }
+
     pub fn connect(&self) -> TestResult<RawS2sPeer> {
         let config = lonewolf_core::config::Config::load(Some(
             &self.suite.fixture_path().join("lonewolf.toml"),
@@ -85,7 +104,9 @@ impl SingleServer {
     }
 
     pub fn stop(&mut self) -> TestResult {
-        self.suite.stop()?;
+        super::super::support::federation::assert_direct_transport_metrics(&self.suite)?;
+        let state = self.suite.stop_with_s2s_state()?;
+        super::super::support::federation::assert_shutdown_empty(state);
         self.dns.stop()
     }
 }

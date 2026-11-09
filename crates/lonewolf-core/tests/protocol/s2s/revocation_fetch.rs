@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_core::config::TlsMode;
+
 use rustls::pki_types::pem::PemObject;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -16,12 +18,48 @@ use super::super::support::federation::{
 use super::super::support::{C2sSuite, PASSWORD, TestResult};
 use super::negotiation::{SingleServer, authentication, closed, expect_bounce};
 
+fn crl_url(http: &CrlServer, mode: TlsMode, path: &str) -> String {
+    if mode == TlsMode::Direct {
+        format!("http://crl.test:{}/{path}", http.port())
+    } else {
+        http.url(path)
+    }
+}
+
+fn assert_crl_host_dns(
+    dns: &super::super::support::federation::FakeDns,
+    mode: TlsMode,
+) -> TestResult {
+    use hickory_proto::rr::RecordType;
+    if mode == TlsMode::Direct {
+        assert!(dns.query_count("crl.test", RecordType::A) > 0);
+        for service in ["_xmpp-server._tcp.crl.test", "_xmpps-server._tcp.crl.test"] {
+            assert_eq!(dns.query_count(service, RecordType::SRV), 0);
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions() -> TestResult {
+    revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions() -> TestResult {
+    revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions_transport(TlsMode::Direct)
+}
+
+fn revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions_transport(
+    mode: TlsMode,
+) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut server = SingleServer::start("")?;
-    let listener = RawS2sListener::bind()?;
-    server.dns.srv(
+    server.set_transport(mode)?;
+    server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
+    let listener = RawS2sListener::bind()?.with_transport(mode);
+    server.dns.srv_with_mode(
+        mode,
         "b.test",
         &[(0, 0, listener.address()?.port(), "peer.b.test")],
     );
@@ -30,7 +68,7 @@ fn revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions() -> TestResul
         server.directory.path(),
         "revoked-peer",
         &["b.test"],
-        &[http.url("revoked.crl")],
+        &[crl_url(&http, mode, "revoked.crl")],
     )?;
     let now = OffsetDateTime::now_utc();
     let der = server.ca.crl(
@@ -45,11 +83,12 @@ fn revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions() -> TestResul
     server.suite.create_account("alice", PASSWORD)?;
     let mut alice = server.suite.connect("alice", PASSWORD, "desk")?;
 
-    let mut inbound = server.connect()?;
-    inbound.expect_starttls_features()?;
-    let mut inbound = inbound.start_tls_with_header(
+    let mut inbound = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "b.test",
+        "a.test",
         client,
-        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' from='b.test' to='a.test'>",
         None,
     )?;
     inbound.expect_stream_error("not-authorized")?;
@@ -65,6 +104,7 @@ fn revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions() -> TestResul
     assert_eq!(http.requests("revoked.crl"), 1);
 
     alice.close()?;
+    assert_crl_host_dns(&server.dns, mode)?;
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -72,10 +112,24 @@ fn revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions() -> TestResul
 
 #[test]
 fn peers_without_a_usable_crl_federate_with_an_unknown_status() -> TestResult {
+    peers_without_a_usable_crl_federate_with_an_unknown_status_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_peers_without_a_usable_crl_federate_with_an_unknown_status() -> TestResult {
+    peers_without_a_usable_crl_federate_with_an_unknown_status_transport(TlsMode::Direct)
+}
+
+fn peers_without_a_usable_crl_federate_with_an_unknown_status_transport(
+    mode: TlsMode,
+) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut server = SingleServer::start("")?;
-    let listener = RawS2sListener::bind()?;
-    server.dns.srv(
+    server.set_transport(mode)?;
+    server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
+    let listener = RawS2sListener::bind()?.with_transport(mode);
+    server.dns.srv_with_mode(
+        mode,
         "b.test",
         &[(0, 0, listener.address()?.port(), "peer.b.test")],
     );
@@ -84,7 +138,7 @@ fn peers_without_a_usable_crl_federate_with_an_unknown_status() -> TestResult {
         server.directory.path(),
         "unknown-peer",
         &["b.test"],
-        &[http.url("missing.crl")],
+        &[crl_url(&http, mode, "missing.crl")],
     )?;
     http.serve("missing.crl", CrlResponse::Status(404));
     let client = peer::client_config(&server.ca, Arc::clone(&key))?;
@@ -92,9 +146,14 @@ fn peers_without_a_usable_crl_federate_with_an_unknown_status() -> TestResult {
     server.suite.create_account("alice", PASSWORD)?;
     let mut alice = server.suite.connect("alice", PASSWORD, "desk")?;
 
-    let mut inbound = server.connect()?;
-    inbound.expect_starttls_features()?;
-    let mut inbound = inbound.start_tls(client)?;
+    let mut inbound = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "b.test",
+        "a.test",
+        client,
+        Some("b.test"),
+    )?;
     inbound.expect_external_offered()?;
     inbound.auth_external(Some("b.test"))?;
     inbound.expect_sasl_success()?;
@@ -157,10 +216,10 @@ fn peers_without_a_usable_crl_federate_with_an_unknown_status() -> TestResult {
             "unsupported_scheme",
             vec!["https://crl.test/list.crl".to_owned()],
         ),
-        ("invalid", vec![http.url("invalid.crl")]),
-        ("bad_signature", vec![http.url("wrong-key.crl")]),
-        ("stale", vec![http.url("expired.crl")]),
-        ("too_large", vec![http.url("large.crl")]),
+        ("invalid", vec![crl_url(&http, mode, "invalid.crl")]),
+        ("bad_signature", vec![crl_url(&http, mode, "wrong-key.crl")]),
+        ("stale", vec![crl_url(&http, mode, "expired.crl")]),
+        ("too_large", vec![crl_url(&http, mode, "large.crl")]),
     ]
     .into_iter()
     .enumerate()
@@ -169,9 +228,14 @@ fn peers_without_a_usable_crl_federate_with_an_unknown_status() -> TestResult {
             server
                 .ca
                 .server_with_crl_urls(server.directory.path(), reason, &["b.test"], &urls)?;
-        let mut inbound = server.connect()?;
-        inbound.expect_starttls_features()?;
-        let mut inbound = inbound.start_tls(peer::client_config(&server.ca, key)?)?;
+        let mut inbound = peer::RawS2sPeer::protected(
+            mode,
+            server.suite.s2s_addresses()?[0],
+            "b.test",
+            "a.test",
+            peer::client_config(&server.ca, key)?,
+            Some("b.test"),
+        )?;
         inbound.expect_external_offered()?;
         inbound.auth_external(Some("b.test"))?;
         inbound.expect_sasl_success()?;
@@ -189,6 +253,7 @@ fn peers_without_a_usable_crl_federate_with_an_unknown_status() -> TestResult {
     ] {
         assert_eq!(http.requests(path), 1);
     }
+    assert_crl_host_dns(&server.dns, mode)?;
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -206,30 +271,37 @@ fn checked(
     Ok(())
 }
 
-fn opening(from: &str, to: &str) -> String {
-    format!(
-        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' from='{from}' to='{to}'>"
-    )
+#[test]
+fn unrevoked_peers_federate_with_fetched_crls() -> TestResult {
+    unrevoked_peers_federate_with_fetched_crls_transport(TlsMode::StartTls)
 }
 
 #[test]
-fn unrevoked_peers_federate_with_fetched_crls() -> TestResult {
+fn direct_tls_unrevoked_peers_federate_with_fetched_crls() -> TestResult {
+    unrevoked_peers_federate_with_fetched_crls_transport(TlsMode::Direct)
+}
+
+fn unrevoked_peers_federate_with_fetched_crls_transport(mode: TlsMode) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut pair = FederatedPair::start(
         "a.test",
         "b.test",
         PairOptions {
             a_revocation: HostRevocation {
-                crl_url: Some(http.url("a.crl")),
+                crl_url: Some(crl_url(&http, mode, "a.crl")),
                 ..Default::default()
             },
             b_revocation: HostRevocation {
-                crl_url: Some(http.url("b.crl")),
+                crl_url: Some(crl_url(&http, mode, "b.crl")),
                 ..Default::default()
             },
             ..Default::default()
         },
     )?;
+    if mode == TlsMode::Direct {
+        pair.direct_tls()?;
+    }
+    pair.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     let now = OffsetDateTime::now_utc();
     for path in ["a.crl", "b.crl"] {
         http.serve(
@@ -274,6 +346,7 @@ fn unrevoked_peers_federate_with_fetched_crls() -> TestResult {
     assert_eq!(http.requests("b.crl"), 1);
     alice.close()?;
     bob.close()?;
+    assert_crl_host_dns(&pair.dns, mode)?;
     pair.stop()?;
     http.stop()?;
     Ok(())
@@ -281,6 +354,15 @@ fn unrevoked_peers_federate_with_fetched_crls() -> TestResult {
 
 #[test]
 fn public_trust_policy_refuses_private_crl_destinations() -> TestResult {
+    public_trust_policy_refuses_private_crl_destinations_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_public_trust_policy_refuses_private_crl_destinations() -> TestResult {
+    public_trust_policy_refuses_private_crl_destinations_transport(TlsMode::Direct)
+}
+
+fn public_trust_policy_refuses_private_crl_destinations_transport(mode: TlsMode) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut server = SingleServer::start_with_revocation(
         "",
@@ -289,6 +371,8 @@ fn public_trust_policy_refuses_private_crl_destinations() -> TestResult {
             ..Default::default()
         },
     )?;
+    server.set_transport(mode)?;
+    server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     for (index, url) in [
         format!("http://crl.test:{}/b.crl", http.port()),
@@ -303,9 +387,14 @@ fn public_trust_policy_refuses_private_crl_destinations() -> TestResult {
             &["b.test"],
             &[url],
         )?;
-        let mut inbound = server.connect()?;
-        inbound.expect_starttls_features()?;
-        let mut inbound = inbound.start_tls(peer::client_config(&server.ca, key)?)?;
+        let mut inbound = peer::RawS2sPeer::protected(
+            mode,
+            server.suite.s2s_addresses()?[0],
+            "b.test",
+            "a.test",
+            peer::client_config(&server.ca, key)?,
+            Some("b.test"),
+        )?;
         inbound.expect_external_offered()?;
         inbound.auth_external(Some("b.test"))?;
         inbound.expect_sasl_success()?;
@@ -327,6 +416,7 @@ fn public_trust_policy_refuses_private_crl_destinations() -> TestResult {
     }
     assert_eq!(http.requests("b.crl"), 0);
     assert_eq!(http.requests("c.crl"), 0);
+    assert_crl_host_dns(&server.dns, mode)?;
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -334,13 +424,26 @@ fn public_trust_policy_refuses_private_crl_destinations() -> TestResult {
 
 #[test]
 fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link() -> TestResult {
+    crl_arriving_after_the_handshake_wait_closes_the_revoked_link_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_crl_arriving_after_the_handshake_wait_closes_the_revoked_link() -> TestResult {
+    crl_arriving_after_the_handshake_wait_closes_the_revoked_link_transport(TlsMode::Direct)
+}
+
+fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link_transport(
+    mode: TlsMode,
+) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut server = SingleServer::start("")?;
+    server.set_transport(mode)?;
+    server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     let key = server.ca.server_with_crl_urls(
         server.directory.path(),
         "late-peer",
         &["b.test"],
-        &[http.url("late.crl")],
+        &[crl_url(&http, mode, "late.crl")],
     )?;
     let now = OffsetDateTime::now_utc();
     http.serve(
@@ -357,9 +460,14 @@ fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link() -> TestResult
     );
     let client = peer::client_config(&server.ca, key)?;
     let started = Instant::now();
-    let mut inbound = server.connect()?;
-    inbound.expect_starttls_features()?;
-    let mut inbound = inbound.start_tls(Arc::clone(&client))?;
+    let mut inbound = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "b.test",
+        "a.test",
+        Arc::clone(&client),
+        Some("b.test"),
+    )?;
     inbound.expect_external_offered()?;
     inbound.auth_external(Some("b.test"))?;
     inbound.expect_sasl_success()?;
@@ -386,9 +494,14 @@ fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link() -> TestResult
     assert!(waiting.elapsed() < Wait::from_secs(5));
     closed(&server.suite, "inbound", "certificate_revoked", 1)?;
     checked(&server.suite, "inbound", "recheck", "revoked", "none", 1)?;
-    let mut retry = server.connect()?;
-    retry.expect_starttls_features()?;
-    let mut retry = retry.start_tls_with_header(client, &opening("b.test", "a.test"), None)?;
+    let mut retry = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "b.test",
+        "a.test",
+        client,
+        None,
+    )?;
     retry.expect_stream_error("not-authorized")?;
     server.suite.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"certificate_revoked\"} 1")?;
     server.suite.wait_for_metric(
@@ -396,6 +509,7 @@ fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link() -> TestResult
     )?;
     checked(&server.suite, "inbound", "handshake", "revoked", "none", 1)?;
     assert_eq!(http.requests("late.crl"), 1);
+    assert_crl_host_dns(&server.dns, mode)?;
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -403,17 +517,26 @@ fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link() -> TestResult
 
 #[test]
 fn crl_refresh_revoking_a_live_peer_closes_its_links() -> TestResult {
+    crl_refresh_revoking_a_live_peer_closes_its_links_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_crl_refresh_revoking_a_live_peer_closes_its_links() -> TestResult {
+    crl_refresh_revoking_a_live_peer_closes_its_links_transport(TlsMode::Direct)
+}
+
+fn crl_refresh_revoking_a_live_peer_closes_its_links_transport(mode: TlsMode) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut pair = FederatedPair::start(
         "a.test",
         "b.test",
         PairOptions {
             a_revocation: HostRevocation {
-                crl_url: Some(http.url("a.crl")),
+                crl_url: Some(crl_url(&http, mode, "a.crl")),
                 ..Default::default()
             },
             b_revocation: HostRevocation {
-                crl_url: Some(http.url("b.crl")),
+                crl_url: Some(crl_url(&http, mode, "b.crl")),
                 revalidation_interval: Some(Wait::from_millis(500)),
                 ..Default::default()
             },
@@ -421,6 +544,10 @@ fn crl_refresh_revoking_a_live_peer_closes_its_links() -> TestResult {
             ..Default::default()
         },
     )?;
+    if mode == TlsMode::Direct {
+        pair.direct_tls()?;
+    }
+    pair.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     assert!(
         !pair
             .a
@@ -464,11 +591,16 @@ fn crl_refresh_revoking_a_live_peer_closes_its_links() -> TestResult {
         control_directory.path(),
         "control",
         &["control.test"],
-        &[http.url("a.crl")],
+        &[crl_url(&http, mode, "a.crl")],
     )?;
-    let mut control = RawS2sPeer::connect(pair.b.s2s_addresses()?[0], "control.test", "b.test")?;
-    control.expect_starttls_features()?;
-    let mut control = control.start_tls(peer::client_config(&pair.ca, control_key)?)?;
+    let mut control = peer::RawS2sPeer::protected(
+        mode,
+        pair.b.s2s_addresses()?[0],
+        "control.test",
+        "b.test",
+        peer::client_config(&pair.ca, control_key)?,
+        Some("control.test"),
+    )?;
     control.expect_external_offered()?;
     control.auth_external(Some("control.test"))?;
     control.expect_sasl_success()?;
@@ -521,10 +653,14 @@ fn crl_refresh_revoking_a_live_peer_closes_its_links() -> TestResult {
     )?);
     let client = peer::client_config(&pair.ca, key)?;
     let requests = http.requests("a.crl");
-    let mut rejected = RawS2sPeer::connect(pair.b.s2s_addresses()?[0], "a.test", "b.test")?;
-    rejected.expect_starttls_features()?;
-    let mut rejected =
-        rejected.start_tls_with_header(client, &opening("a.test", "b.test"), None)?;
+    let mut rejected = peer::RawS2sPeer::protected(
+        mode,
+        pair.b.s2s_addresses()?[0],
+        "a.test",
+        "b.test",
+        client,
+        None,
+    )?;
     rejected.expect_stream_error("not-authorized")?;
     pair.b.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"certificate_revoked\"} 1")?;
     pair.b.wait_for_metric(
@@ -534,6 +670,7 @@ fn crl_refresh_revoking_a_live_peer_closes_its_links() -> TestResult {
     assert_eq!(http.requests("a.crl"), requests);
     alice.close()?;
     bob.close()?;
+    assert_crl_host_dns(&pair.dns, mode)?;
     pair.stop()?;
     http.stop()?;
     Ok(())
@@ -541,8 +678,19 @@ fn crl_refresh_revoking_a_live_peer_closes_its_links() -> TestResult {
 
 #[test]
 fn stale_crls_still_reject_listed_peers() -> TestResult {
+    stale_crls_still_reject_listed_peers_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_stale_crls_still_reject_listed_peers() -> TestResult {
+    stale_crls_still_reject_listed_peers_transport(TlsMode::Direct)
+}
+
+fn stale_crls_still_reject_listed_peers_transport(mode: TlsMode) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut server = SingleServer::start("")?;
+    server.set_transport(mode)?;
+    server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     server.suite.create_account("alice", PASSWORD)?;
     let mut alice = server.suite.connect("alice", PASSWORD, "desk")?;
     let mut clients = Vec::new();
@@ -552,7 +700,7 @@ fn stale_crls_still_reject_listed_peers() -> TestResult {
             server.directory.path(),
             domain,
             &[domain],
-            &[http.url("stale.crl")],
+            &[crl_url(&http, mode, "stale.crl")],
         )?;
         certificates.push(key.cert[0].clone());
         clients.push(peer::client_config(&server.ca, key)?);
@@ -576,9 +724,14 @@ fn stale_crls_still_reject_listed_peers() -> TestResult {
             1,
         )?),
     );
-    let mut z = RawS2sPeer::connect(server.suite.s2s_addresses()?[0], "z.test", "a.test")?;
-    z.expect_starttls_features()?;
-    let mut z = z.start_tls(Arc::clone(&clients[2]))?;
+    let mut z = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "z.test",
+        "a.test",
+        Arc::clone(&clients[2]),
+        Some("z.test"),
+    )?;
     z.expect_external_offered()?;
     z.auth_external(Some("z.test"))?;
     z.expect_sasl_success()?;
@@ -586,11 +739,12 @@ fn stale_crls_still_reject_listed_peers() -> TestResult {
     authentication(&server.suite, "inbound", "success", 1)?;
     checked(&server.suite, "inbound", "handshake", "good", "none", 1)?;
     for (index, domain) in ["x.test", "y.test"].into_iter().enumerate() {
-        let mut rejected = RawS2sPeer::connect(server.suite.s2s_addresses()?[0], domain, "a.test")?;
-        rejected.expect_starttls_features()?;
-        let mut rejected = rejected.start_tls_with_header(
+        let mut rejected = peer::RawS2sPeer::protected(
+            mode,
+            server.suite.s2s_addresses()?[0],
+            domain,
+            "a.test",
             Arc::clone(&clients[index]),
-            &opening(domain, "a.test"),
             None,
         )?;
         rejected.expect_stream_error("not-authorized")?;
@@ -601,16 +755,25 @@ fn stale_crls_still_reject_listed_peers() -> TestResult {
     server
         .suite
         .wait_for_metric("lonewolf_s2s_crl_fetches_total{outcome=\"http_status\"} 1")?;
-    let mut x = RawS2sPeer::connect(server.suite.s2s_addresses()?[0], "x.test", "a.test")?;
-    x.expect_starttls_features()?;
-    let mut x =
-        x.start_tls_with_header(Arc::clone(&clients[0]), &opening("x.test", "a.test"), None)?;
+    let mut x = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "x.test",
+        "a.test",
+        Arc::clone(&clients[0]),
+        None,
+    )?;
     x.expect_stream_error("not-authorized")?;
     server.suite.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"certificate_revoked\"} 3")?;
     checked(&server.suite, "inbound", "handshake", "revoked", "none", 3)?;
-    let mut y = RawS2sPeer::connect(server.suite.s2s_addresses()?[0], "y.test", "a.test")?;
-    y.expect_starttls_features()?;
-    let mut y = y.start_tls(Arc::clone(&clients[1]))?;
+    let mut y = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "y.test",
+        "a.test",
+        Arc::clone(&clients[1]),
+        Some("y.test"),
+    )?;
     y.expect_external_offered()?;
     y.auth_external(Some("y.test"))?;
     y.expect_sasl_success()?;
@@ -638,6 +801,7 @@ fn stale_crls_still_reject_listed_peers() -> TestResult {
     y.close()?;
     z.close()?;
     alice.close()?;
+    assert_crl_host_dns(&server.dns, mode)?;
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -645,8 +809,19 @@ fn stale_crls_still_reject_listed_peers() -> TestResult {
 
 #[test]
 fn failing_crl_urls_back_off_and_share_one_fetch() -> TestResult {
+    failing_crl_urls_back_off_and_share_one_fetch_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_failing_crl_urls_back_off_and_share_one_fetch() -> TestResult {
+    failing_crl_urls_back_off_and_share_one_fetch_transport(TlsMode::Direct)
+}
+
+fn failing_crl_urls_back_off_and_share_one_fetch_transport(mode: TlsMode) -> TestResult {
     let mut http = CrlServer::start()?;
     let mut server = SingleServer::start("")?;
+    server.set_transport(mode)?;
+    server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     http.serve(
         "failure.crl",
         CrlResponse::Delayed(Wait::from_secs(1), Box::new(CrlResponse::Status(500))),
@@ -658,7 +833,7 @@ fn failing_crl_urls_back_off_and_share_one_fetch() -> TestResult {
             server.directory.path(),
             domain,
             &[domain],
-            &[http.url("failure.crl")],
+            &[crl_url(&http, mode, "failure.crl")],
         )?;
         configs.push(peer::client_config(&server.ca, key)?);
     }
@@ -671,9 +846,14 @@ fn failing_crl_urls_back_off_and_share_one_fetch() -> TestResult {
             let client = Arc::clone(&configs[index]);
             handles.push(scope.spawn(move || -> Result<RawS2sPeer, String> {
                 let run = || -> TestResult<RawS2sPeer> {
-                    let mut inbound = RawS2sPeer::connect(address, domain, "a.test")?;
-                    inbound.expect_starttls_features()?;
-                    let mut inbound = inbound.start_tls(client)?;
+                    let mut inbound = peer::RawS2sPeer::protected(
+                        mode,
+                        address,
+                        domain,
+                        "a.test",
+                        client,
+                        Some(domain),
+                    )?;
                     inbound.expect_external_offered()?;
                     inbound.auth_external(Some(domain))?;
                     inbound.expect_sasl_success()?;
@@ -702,9 +882,14 @@ fn failing_crl_urls_back_off_and_share_one_fetch() -> TestResult {
         3,
     )?;
     assert_eq!(http.requests("failure.crl"), 1);
-    let mut fourth = RawS2sPeer::connect(address, "four.test", "a.test")?;
-    fourth.expect_starttls_features()?;
-    let mut fourth = fourth.start_tls(Arc::clone(&configs[3]))?;
+    let mut fourth = peer::RawS2sPeer::protected(
+        mode,
+        address,
+        "four.test",
+        "a.test",
+        Arc::clone(&configs[3]),
+        Some("four.test"),
+    )?;
     fourth.expect_external_offered()?;
     fourth.auth_external(Some("four.test"))?;
     fourth.expect_sasl_success()?;
@@ -726,6 +911,7 @@ fn failing_crl_urls_back_off_and_share_one_fetch() -> TestResult {
         peer.close()?;
     }
     fourth.close()?;
+    assert_crl_host_dns(&server.dns, mode)?;
     server.stop()?;
     http.stop()?;
     Ok(())

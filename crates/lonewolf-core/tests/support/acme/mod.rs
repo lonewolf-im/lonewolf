@@ -5,6 +5,10 @@ mod ca;
 #[path = "../client.rs"]
 mod client;
 pub mod clock;
+#[path = "../crl_gate.rs"]
+pub mod crl_gate;
+#[allow(dead_code)]
+pub mod federation;
 pub mod process;
 mod proxy;
 #[path = "../readiness.rs"]

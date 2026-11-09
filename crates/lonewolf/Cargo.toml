@@ -35,6 +35,7 @@ time.workspace = true
 x509-cert.workspace = true
 nix.workspace = true
 tempfile.workspace = true
+zeroize.workspace = true
 
 [[test]]
 name = "admin"

@@ -14,6 +14,8 @@ use futures_util::future::join;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 
+use crate::config::TlsMode;
+
 const ENDPOINT_LIMIT: usize = 16;
 
 pub(crate) struct Resolver {
@@ -40,13 +42,20 @@ pub(crate) enum ResolvedVia {
 
 #[derive(Debug)]
 pub(crate) struct Resolved {
-    pub(crate) endpoints: Vec<SocketAddr>,
+    pub(crate) endpoints: Vec<Endpoint>,
     pub(crate) via: ResolvedVia,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Endpoint {
+    pub(crate) address: SocketAddr,
+    pub(crate) tls_mode: TlsMode,
 }
 
 pub(crate) struct SrvTarget {
     pub(crate) name: Box<str>,
     pub(crate) port: u16,
+    pub(crate) tls_mode: TlsMode,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -86,8 +95,8 @@ impl Resolver {
         let (aaaa, a) = self.addresses(&name).await;
         let negative = aaaa.is_ok() && a.is_ok();
         let mut endpoints = Vec::with_capacity(ENDPOINT_LIMIT);
-        append_addresses(&mut endpoints, aaaa, 0);
-        append_addresses(&mut endpoints, a, 0);
+        append_unique(&mut endpoints, answer_addresses(aaaa));
+        append_unique(&mut endpoints, answer_addresses(a));
         if endpoints.is_empty() {
             Err(if negative {
                 ResolveError::NotFound
@@ -95,10 +104,7 @@ impl Resolver {
                 ResolveError::Unavailable
             })
         } else {
-            Ok(endpoints
-                .into_iter()
-                .map(|endpoint| endpoint.ip())
-                .collect())
+            Ok(endpoints)
         }
     }
 
@@ -146,13 +152,22 @@ impl Resolver {
         });
         if let Some(ip) = literal {
             return Ok(Resolved {
-                endpoints: vec![SocketAddr::new(ip, 5269)],
+                endpoints: vec![Endpoint {
+                    address: SocketAddr::new(ip, 5269),
+                    tls_mode: TlsMode::StartTls,
+                }],
                 via: ResolvedVia::Literal,
             });
         }
         if let Some(route) = self.routes.get(domain) {
             let mut endpoints = Vec::with_capacity(route.len().min(ENDPOINT_LIMIT));
-            append_unique(&mut endpoints, route.iter().copied());
+            append_unique(
+                &mut endpoints,
+                route.iter().map(|&address| Endpoint {
+                    address,
+                    tls_mode: TlsMode::StartTls,
+                }),
+            );
             return Ok(Resolved {
                 endpoints,
                 via: ResolvedVia::Static,
@@ -177,6 +192,7 @@ impl Resolver {
                         SrvTarget {
                             name: srv.target.to_ascii().into_boxed_str(),
                             port: srv.port,
+                            tls_mode: TlsMode::StartTls,
                         },
                     ))
                 } else {
@@ -205,8 +221,8 @@ impl Resolver {
                     continue;
                 };
                 let (aaaa, a) = self.addresses(&name).await;
-                append_addresses(&mut endpoints, aaaa, target.port);
-                append_addresses(&mut endpoints, a, target.port);
+                append_addresses(&mut endpoints, aaaa, target.port, target.tls_mode);
+                append_addresses(&mut endpoints, a, target.port, target.tls_mode);
                 if endpoints.len() == ENDPOINT_LIMIT {
                     break;
                 }
@@ -223,8 +239,8 @@ impl Resolver {
         let (aaaa, a) = self.addresses(&name).await;
         let negative = aaaa.is_ok() && a.is_ok();
         let mut endpoints = Vec::with_capacity(ENDPOINT_LIMIT);
-        append_addresses(&mut endpoints, aaaa, 5269);
-        append_addresses(&mut endpoints, a, 5269);
+        append_addresses(&mut endpoints, aaaa, 5269, TlsMode::StartTls);
+        append_addresses(&mut endpoints, a, 5269, TlsMode::StartTls);
         if endpoints.is_empty() {
             Err(if negative {
                 ResolveError::NotFound
@@ -285,7 +301,7 @@ impl Resolver {
     }
 }
 
-fn append_unique(endpoints: &mut Vec<SocketAddr>, values: impl IntoIterator<Item = SocketAddr>) {
+fn append_unique<T: PartialEq>(endpoints: &mut Vec<T>, values: impl IntoIterator<Item = T>) {
     for address in values {
         if endpoints.len() == ENDPOINT_LIMIT {
             break;
@@ -296,21 +312,30 @@ fn append_unique(endpoints: &mut Vec<SocketAddr>, values: impl IntoIterator<Item
     }
 }
 
+fn answer_addresses(answer: Result<Answer, QueryError>) -> impl Iterator<Item = IpAddr> {
+    answer
+        .into_iter()
+        .flat_map(|answer| answer.records)
+        .filter_map(|data| match data {
+            RData::AAAA(address) => Some(IpAddr::V6(address.0)),
+            RData::A(address) => Some(IpAddr::V4(address.0)),
+            _ => None,
+        })
+}
+
 fn append_addresses(
-    endpoints: &mut Vec<SocketAddr>,
+    endpoints: &mut Vec<Endpoint>,
     answer: Result<Answer, QueryError>,
     port: u16,
+    tls_mode: TlsMode,
 ) {
-    if let Ok(answer) = answer {
-        append_unique(
-            endpoints,
-            answer.records.into_iter().filter_map(|data| match data {
-                RData::AAAA(address) => Some(SocketAddr::new(IpAddr::V6(address.0), port)),
-                RData::A(address) => Some(SocketAddr::new(IpAddr::V4(address.0), port)),
-                _ => None,
-            }),
-        );
-    }
+    append_unique(
+        endpoints,
+        answer_addresses(answer).map(|ip| Endpoint {
+            address: SocketAddr::new(ip, port),
+            tls_mode,
+        }),
+    );
 }
 
 fn matches(response: &Message, request: &Message) -> bool {

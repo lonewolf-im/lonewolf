@@ -73,6 +73,26 @@ fn initial_headers_normalize_domains_and_accept_extra_namespaces() -> TestResult
     Runtime::new()?.block_on(async {
         for (xml, to, from) in [
             (HEADER.to_owned(), "local.test", Some("peer.test")),
+            (
+                HEADER.replace("version='1.0'", "version='2.0'"),
+                "local.test",
+                Some("peer.test"),
+            ),
+            (
+                HEADER.replace("version='1.0'", "version='12.3'"),
+                "local.test",
+                Some("peer.test"),
+            ),
+            (
+                HEADER.replace("version='1.0'", "version='01.0'"),
+                "local.test",
+                Some("peer.test"),
+            ),
+            (
+                HEADER.replace("version='1.0'", "version='999999999999999999999.0'"),
+                "local.test",
+                Some("peer.test"),
+            ),
             (HEADER.replace("from='peer.test'", ""), "local.test", None),
             (
                 HEADER.replace(
@@ -126,7 +146,7 @@ fn initial_headers_reject_namespace_version_language_and_nondomain_jids() -> Tes
                 StreamErrorCondition::UnsupportedVersion,
             ),
             (
-                HEADER.replace("version='1.0'", "version='2.0'"),
+                HEADER.replace("version='1.0'", "version='0000.009'"),
                 StreamErrorCondition::UnsupportedVersion,
             ),
             (

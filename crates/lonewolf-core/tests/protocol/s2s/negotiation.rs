@@ -300,6 +300,29 @@ fn peer_with_valid_certificate_authenticates() -> TestResult {
 }
 
 #[test]
+fn higher_initial_major_version_negotiates_one_and_authenticates() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    let mut peer = fixture.connect()?;
+    peer.expect_starttls_features()?;
+    let mut peer = peer.start_tls_with_header(
+        fixture.client_config()?,
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' from='b.test' to='a.test' version='2.0'>",
+        Some("b.test"),
+    )?;
+    peer.expect_external_offered()?;
+    peer.auth_external(Some("b.test"))?;
+    peer.expect_sasl_success()?;
+    let mut peer = peer.restart("b.test", "a.test")?;
+    authentication(&fixture.suite, "inbound", "success", 1)?;
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 1")?;
+    peer.close()?;
+    closed(&fixture.suite, "inbound", "stream_end", 1)?;
+    fixture.stop()
+}
+
+#[test]
 fn peer_without_client_certificate_is_not_authorized() -> TestResult {
     let mut fixture = SingleServer::start("")?;
     let config = Arc::new(tls::client_config(

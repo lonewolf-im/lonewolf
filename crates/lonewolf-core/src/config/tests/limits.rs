@@ -93,7 +93,7 @@ fn negotiation_retry_limits_reject_values_outside_the_rfc_bounds() -> TestResult
 fn limits_defaults_match_the_policy() -> TestResult {
     let expected = [
         ("max_connections_per_ip", 256),
-        ("max_stanza_bytes", 524_288),
+        ("max_stanza_bytes", 262_144),
         ("connection_establishment_timeout_secs", 10),
         ("authentication_timeout_secs", 15),
         ("resource_binding_timeout_secs", 5),
@@ -301,7 +301,7 @@ address = "[::]:5222"
     assert_eq!(config.limits.c2s.profiles.len(), 2);
     assert_eq!(
         config.limits.c2s.profiles["public"].max_stanza_bytes.get(),
-        524_288
+        262_144
     );
     assert_eq!(
         config.limits.c2s.profiles["internal"]

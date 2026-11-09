@@ -22,7 +22,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::{Settings, ShutdownSignal};
 use crate::s2s::log_domain;
-use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, S2sMetrics};
+use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, S2sMetrics, TransportAttempt};
 use crate::s2s::outbound::RemoteRouter;
 use crate::s2s::revocation::{CheckPhase, RevocationStatus, RevocationVerdict};
 use crate::s2s::stream::traffic::CountingIo;
@@ -159,6 +159,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     settings: &Settings<A>,
     shutdown: ShutdownSignal,
     connection_id: u64,
+    mut attempt: TransportAttempt,
 ) -> Result<Authenticated<A>, S2sError> {
     let mut accounting = Accounting {
         metrics: Arc::clone(&settings.metrics),
@@ -187,6 +188,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     let mut footer_sent = false;
     let deadline = accounting.started + settings.timeout;
     let mut close_deadline = None;
+    let mut cancelled = false;
     let result = {
         let flow = run(
             tcp,
@@ -204,6 +206,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         .await
         {
             Either::Left((deadline, _)) => {
+                cancelled = true;
                 close_deadline = Some(deadline);
                 Err(reject(
                     StreamErrorCondition::SystemShutdown,
@@ -218,6 +221,11 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         }
     };
     accounting.elapsed = Some(accounting.started.elapsed());
+    match &result {
+        Ok(_) => attempt.complete(AuthOutcome::Success),
+        Err(_) if cancelled => attempt.cancel(),
+        Err(failure) => attempt.complete(failure.outcome),
+    }
     match result {
         Ok(VerifiedPeer {
             bidi_offered,
@@ -522,11 +530,11 @@ async fn run<A: ChunkAllocator + Clone>(
         .await;
     if let Some(verdict) = &revocation {
         if let Some(outcome) = verdict.auth_outcome() {
-            tracing::warn!(outcome = outcome.as_str(), direction = "inbound", local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s certificate rejected");
+            tracing::warn!(outcome = outcome.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s certificate rejected");
             return Err(reject(StreamErrorCondition::NotAuthorized, outcome));
         }
         if let RevocationStatus::Unknown(reason) = verdict.status {
-            tracing::debug!(reason = reason.as_str(), direction = "inbound", local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s revocation status unknown");
+            tracing::debug!(reason = reason.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s revocation status unknown");
         }
     }
     tls.send_header(&stream::response_header_xml(&local, Some(&remote))?)

@@ -156,7 +156,7 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
         remote: authenticated.remote,
         connection_id: authenticated.connection_id,
     };
-    tracing::info!(connection_id = peer.connection_id, local_domain = %log_domain(&peer.local), remote_domain = %log_domain(&peer.remote), direction = "inbound", bidi = authenticated.bidi, "s2s connection authenticated");
+    tracing::info!(connection_id = peer.connection_id, local_domain = %log_domain(&peer.local), remote_domain = %log_domain(&peer.remote), direction = "inbound", tls_mode = settings.tls_mode.as_str(), bidi = authenticated.bidi, "s2s connection authenticated");
     let (validity, monitor) = match authenticated.revocation {
         Some(verdict) if verdict.needs_rechecks() => {
             let revocation = std::sync::Arc::clone(&settings.revocation);

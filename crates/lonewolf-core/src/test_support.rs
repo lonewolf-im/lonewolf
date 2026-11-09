@@ -50,6 +50,11 @@ pub struct S2sShutdownState {
     pub dropped_connection_lost: u64,
     pub queued_stanzas: u64,
     pub queued_bytes: u64,
+    /// Indices are inbound/outbound, then starttls/direct.
+    pub transport_cancelled: [[u64; 2]; 2],
+    pub transport_connections: [[u64; 2]; 2],
+    pub connections: [u64; 2],
+    pub authentication_protocol: [u64; 2],
 }
 
 pub fn run_with_extensions_and_s2s_shutdown_state(

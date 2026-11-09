@@ -74,6 +74,7 @@ impl StreamPhase {
 }
 
 struct ConnectionLifecycle {
+    tls_mode: crate::config::TlsMode,
     connection_id: u64,
     listener_id: usize,
     worker_id: usize,
@@ -169,6 +170,7 @@ impl ConnectionLifecycle {
             .phase_completed(StreamPhase::Establishing, elapsed);
         tracing::info!(
             connection_type = "c2s",
+            tls_mode = self.tls_mode.as_str(),
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
@@ -184,6 +186,7 @@ impl ConnectionLifecycle {
             .phase_completed(StreamPhase::Authenticating, elapsed);
         tracing::info!(
             connection_type = "c2s",
+            tls_mode = self.tls_mode.as_str(),
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
@@ -202,6 +205,7 @@ impl ConnectionLifecycle {
         self.bound_at = Some(now);
         tracing::info!(
             connection_type = "c2s",
+            tls_mode = self.tls_mode.as_str(),
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,
@@ -213,6 +217,10 @@ impl ConnectionLifecycle {
 }
 
 impl StreamAdmission {
+    pub(super) fn with_tls_mode(mut self, tls_mode: crate::config::TlsMode) -> Self {
+        self.lifecycle.tls_mode = tls_mode;
+        self
+    }
     pub(super) fn new(
         ip_permit: ConnectionPermit,
         unauthenticated_permit: UnauthenticatedPermit,
@@ -224,6 +232,7 @@ impl StreamAdmission {
             ip_permit,
             unauthenticated_permit,
             lifecycle: ConnectionLifecycle {
+                tls_mode: crate::config::TlsMode::StartTls,
                 connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
                 listener_id,
                 worker_id,
@@ -241,6 +250,7 @@ impl Drop for ConnectionLifecycle {
     fn drop(&mut self) {
         tracing::info!(
             connection_type = "c2s",
+            tls_mode = self.tls_mode.as_str(),
             connection_id = self.connection_id,
             listener_id = self.listener_id,
             worker_id = self.worker_id,

@@ -16,6 +16,8 @@ use prometheus_client::metrics::{
 };
 use prometheus_client::registry::{Registry, Unit};
 
+use crate::config::TlsMode;
+
 use super::stream::{BindRejection, CloseOutcome, SaslFailure, SaslMechanism, StreamPhase};
 use super::unauthenticated_limit::UnauthenticatedLimiter;
 
@@ -155,6 +157,7 @@ impl Default for C2sCounters {
 }
 
 struct WorkerMetrics {
+    bound: [AtomicU64; TlsMode::ALL.len()],
     counters: C2sCounters,
     phase_durations: [Histogram; NEGOTIATION_PHASES.len()],
     session_duration: Histogram,
@@ -164,6 +167,14 @@ struct WorkerMetrics {
 pub(super) struct C2sWorkerMetrics(Arc<CachePadded<WorkerMetrics>>);
 
 impl C2sWorkerMetrics {
+    pub(super) fn listener_bound(&self, mode: TlsMode) -> ListenerGauge {
+        self.0.bound[mode as usize].fetch_add(1, Ordering::Relaxed);
+        ListenerGauge {
+            metrics: self.clone(),
+            mode,
+        }
+    }
+
     pub(super) fn connection_accepted(&self) {
         self.0.counters.accepted.fetch_add(1, Ordering::Relaxed);
     }
@@ -254,6 +265,16 @@ impl C2sWorkerMetrics {
     }
 }
 
+pub(super) struct ListenerGauge {
+    metrics: C2sWorkerMetrics,
+    mode: TlsMode,
+}
+impl Drop for ListenerGauge {
+    fn drop(&mut self) {
+        self.metrics.0.bound[self.mode as usize].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(super) struct C2sMetrics {
     listeners: Box<[Box<[C2sWorkerMetrics]>]>,
     phase_durations: [Histogram; NEGOTIATION_PHASES.len()],
@@ -274,6 +295,7 @@ impl C2sMetrics {
                 (0..workers.get())
                     .map(|_| {
                         C2sWorkerMetrics(Arc::new(CachePadded::new(WorkerMetrics {
+                            bound: Default::default(),
                             counters: C2sCounters::default(),
                             phase_durations: phase_durations.clone(),
                             session_duration: session_duration.clone(),
@@ -335,6 +357,33 @@ fn sum(workers: &[C2sWorkerMetrics], counter: impl Fn(&C2sCounters) -> &AtomicU6
 impl Collector for C2sCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
         let metrics = &self.0;
+        let mut bound = metrics
+            .listeners
+            .iter()
+            .enumerate()
+            .flat_map(|(listener, workers)| {
+                TlsMode::ALL.into_iter().filter_map(move |mode| {
+                    workers
+                        .iter()
+                        .any(|worker| worker.0.bound[mode as usize].load(Ordering::Relaxed) != 0)
+                        .then_some(ListenerInfoLabels {
+                            listener,
+                            tls_mode: mode.as_str(),
+                        })
+                })
+            })
+            .peekable();
+        if bound.peek().is_some() {
+            let mut family = encoder.encode_descriptor(
+                "c2s_listener_info",
+                "Bound C2S listener transport.",
+                None,
+                MetricType::Gauge,
+            )?;
+            for labels in bound {
+                ConstGauge::new(1u64).encode(family.encode_family(&labels)?)?;
+            }
+        }
         if !metrics.listeners.is_empty() {
             let mut family = encoder.encode_descriptor(
                 "c2s_connections",
@@ -630,6 +679,12 @@ impl Collector for C2sCollector {
 struct ListenerLabels {
     listener: usize,
 }
+#[derive(EncodeLabelSet)]
+struct ListenerInfoLabels {
+    listener: usize,
+    tls_mode: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RejectedLabels {
     listener: usize,
@@ -1016,6 +1071,46 @@ mod tests {
         ] {
             assert!(!output.contains(family), "{output}");
         }
+        Ok(())
+    }
+    #[test]
+    fn listener_info_is_one_per_bound_listener_across_workers_and_releases_on_drop()
+    -> Result<(), fmt::Error> {
+        let metrics = C2sMetrics::new(
+            2,
+            NonZeroUsize::MIN.saturating_add(1),
+            Arc::new(UnauthenticatedLimiter::new(NonZeroUsize::MIN)),
+        );
+        assert!(!metrics.render()?.contains("lonewolf_c2s_listener_info"));
+        let first = metrics.worker(0, 0).listener_bound(TlsMode::StartTls);
+        let second = metrics.worker(0, 1).listener_bound(TlsMode::StartTls);
+        let direct = metrics.worker(1, 0).listener_bound(TlsMode::Direct);
+        let output = metrics.render()?;
+        assert!(output.contains("# TYPE lonewolf_c2s_listener_info gauge\n"));
+        assert_eq!(
+            output
+                .lines()
+                .filter(|line| line.starts_with("lonewolf_c2s_listener_info{"))
+                .count(),
+            2
+        );
+        for sample in [
+            "lonewolf_c2s_listener_info{listener=\"0\",tls_mode=\"starttls\"} 1",
+            "lonewolf_c2s_listener_info{listener=\"1\",tls_mode=\"direct\"} 1",
+        ] {
+            assert!(output.lines().any(|line| line == sample), "{output}");
+        }
+        drop(first);
+        assert_eq!(
+            metrics
+                .render()?
+                .lines()
+                .filter(|line| line.starts_with("lonewolf_c2s_listener_info{"))
+                .count(),
+            2
+        );
+        drop((second, direct));
+        assert!(!metrics.render()?.contains("lonewolf_c2s_listener_info"));
         Ok(())
     }
 }

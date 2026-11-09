@@ -183,7 +183,7 @@ fn label_values_and_indexes_are_fixed() {
 fn record_all(metrics: &Arc<S2sMetrics>) -> Vec<ConnectionGauge> {
     let mut guards = Vec::new();
     for direction in Direction::ALL {
-        guards.push(metrics.connection_opened(direction));
+        guards.push(metrics.connection_opened(direction, TlsMode::StartTls));
         guards.push(metrics.stream_opened(direction));
         guards.push(metrics.bidi_stream_opened(direction));
         for outcome in BidiOutcome::ALL {
@@ -431,8 +431,8 @@ fn guards_release_connection_and_stream_counts_on_cancellation() -> Result<(), f
     let metrics = S2sMetrics::new(0);
     let task_metrics = Arc::clone(&metrics);
     let mut future = Box::pin(async move {
-        let _inbound = task_metrics.connection_opened(Direction::Inbound);
-        let _outbound = task_metrics.connection_opened(Direction::Outbound);
+        let _inbound = task_metrics.connection_opened(Direction::Inbound, TlsMode::StartTls);
+        let _outbound = task_metrics.connection_opened(Direction::Outbound, TlsMode::StartTls);
         let _inbound_stream = task_metrics.stream_opened(Direction::Inbound);
         let _outbound_stream = task_metrics.stream_opened(Direction::Outbound);
         let _inbound_bidi = task_metrics.bidi_stream_opened(Direction::Inbound);
@@ -534,6 +534,10 @@ fn link_gauges_snapshot_at_scrape_time_without_retaining_source() -> Result<(), 
 fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
     let metrics = S2sMetrics::new(2);
     let _guards = record_all(&metrics);
+    let _bound = metrics.listener_bound(0, TlsMode::Direct);
+    metrics
+        .transport_attempt(Direction::Inbound, TlsMode::Direct)
+        .complete(AuthOutcome::Success);
     let output = render(&metrics)?;
     let mut families = std::collections::BTreeSet::new();
     for line in output.lines().filter(|line| !line.starts_with('#')) {
@@ -551,6 +555,9 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             | "lonewolf_s2s_sent_bytes_total"
             | "lonewolf_s2s_negotiation_duration_seconds_count"
             | "lonewolf_s2s_negotiation_duration_seconds_sum" => &["direction"],
+            "lonewolf_s2s_listener_info" => &["listener", "tls_mode"],
+            "lonewolf_s2s_transport_connections" => &["direction", "tls_mode"],
+            "lonewolf_s2s_transport_attempts_total" => &["direction", "tls_mode", "outcome"],
             "lonewolf_s2s_crl_fetches_total" => &["outcome"],
             "lonewolf_s2s_crl_cache_evictions_total" => &["reason"],
             "lonewolf_s2s_crl_fetch_duration_seconds_bucket" => &["le"],
@@ -591,7 +598,7 @@ fn every_family_has_only_its_bounded_labels() -> Result<(), fmt::Error> {
             .collect::<Result<_, _>>()?;
         assert_eq!(actual, expected, "{line}");
     }
-    assert_eq!(families.len(), 35);
+    assert_eq!(families.len(), 38);
     Ok(())
 }
 
@@ -606,6 +613,10 @@ fn shutdown_snapshot_uses_rendered_counter_and_link_sources() -> Result<(), fmt:
             dropped_connection_lost: 0,
             queued_stanzas: 0,
             queued_bytes: 0,
+            transport_cancelled: [[0; 2]; 2],
+            transport_connections: [[0; 2]; 2],
+            connections: [0; 2],
+            authentication_protocol: [0; 2],
         }
     );
     let source = Arc::new(FakeLinks::default());
@@ -783,5 +794,137 @@ fn crl_file_metrics_appear_only_after_loads_and_keep_the_last_success() -> Resul
         &output,
         "lonewolf_s2s_crl_file_load_failures_total{reason=\"stale\"} 2",
     );
+    Ok(())
+}
+
+#[test]
+fn transport_attempts_are_bounded_terminal_once_and_default_cancelled() -> Result<(), fmt::Error> {
+    let metrics = S2sMetrics::new(1);
+    assert!(!render(&metrics)?.contains("lonewolf_s2s_listener_info"));
+    let first = metrics.listener_bound(0, TlsMode::Direct);
+    let second = metrics.listener_bound(0, TlsMode::Direct);
+    let bound = render(&metrics)?;
+    assert_eq!(
+        bound
+            .lines()
+            .filter(|line| line.starts_with("lonewolf_s2s_listener_info{"))
+            .count(),
+        1
+    );
+    assert_sample(
+        &bound,
+        "lonewolf_s2s_listener_info{listener=\"0\",tls_mode=\"direct\"} 1",
+    );
+    drop(first);
+    assert_sample(
+        &render(&metrics)?,
+        "lonewolf_s2s_listener_info{listener=\"0\",tls_mode=\"direct\"} 1",
+    );
+    drop(second);
+    assert!(!render(&metrics)?.contains("lonewolf_s2s_listener_info"));
+    for direction in Direction::ALL {
+        for mode in TlsMode::ALL {
+            for outcome in AuthOutcome::ALL {
+                let mut attempt = metrics.transport_attempt(direction, mode);
+                attempt.complete(outcome);
+                attempt.complete(AuthOutcome::Success);
+                attempt.cancel();
+            }
+            let attempt = metrics.transport_attempt(direction, mode);
+            let unpolled = async move { drop(attempt) };
+            drop(unpolled);
+        }
+    }
+    let output = render(&metrics)?;
+    assert!(output.contains("# TYPE lonewolf_s2s_transport_attempts counter\n"));
+    assert!(!output.contains("lonewolf_s2s_authentications_total"));
+    let samples: Vec<_> = output
+        .lines()
+        .filter(|line| line.starts_with("lonewolf_s2s_transport_attempts_total{"))
+        .collect();
+    assert_eq!(samples.len(), 2 * 2 * 24);
+    for direction in Direction::ALL {
+        for mode in TlsMode::ALL {
+            for outcome in AuthOutcome::ALL
+                .into_iter()
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
+                assert_sample(
+                    &output,
+                    &format!(
+                        "lonewolf_s2s_transport_attempts_total{{direction=\"{}\",tls_mode=\"{}\",outcome=\"{}\"}} 1",
+                        direction.as_str(),
+                        mode.as_str(),
+                        outcome.map_or("cancelled", AuthOutcome::as_str)
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn transport_connection_guards_share_direction_lifetimes_without_affecting_streams()
+-> Result<(), fmt::Error> {
+    let metrics = S2sMetrics::new(0);
+    for direction in Direction::ALL {
+        let first = metrics.connection_opened(direction, TlsMode::StartTls);
+        let second = metrics.connection_opened(direction, TlsMode::Direct);
+        let stream = metrics.stream_opened(direction);
+        let bidi = metrics.bidi_stream_opened(direction);
+        assert_eq!(
+            metrics.connections[direction as usize].load(Ordering::Relaxed),
+            2
+        );
+        for mode in TlsMode::ALL {
+            assert_eq!(
+                metrics.transport_connections[direction as usize][mode as usize]
+                    .load(Ordering::Relaxed),
+                1
+            );
+        }
+        drop(first);
+        assert_eq!(
+            metrics.connections[direction as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.transport_connections[direction as usize][TlsMode::StartTls as usize]
+                .load(Ordering::Relaxed),
+            0
+        );
+        drop(second);
+        assert_eq!(
+            metrics.connections[direction as usize].load(Ordering::Relaxed),
+            0
+        );
+        for mode in TlsMode::ALL {
+            assert_eq!(
+                metrics.transport_connections[direction as usize][mode as usize]
+                    .load(Ordering::Relaxed),
+                0
+            );
+        }
+        assert_eq!(
+            metrics.streams[direction as usize].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.bidi_streams[direction as usize].load(Ordering::Relaxed),
+            1
+        );
+        drop((stream, bidi));
+    }
+    let output = render(&metrics)?;
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("lonewolf_s2s_transport_connections{"))
+            .count(),
+        4
+    );
+    assert!(output.contains("# TYPE lonewolf_s2s_transport_connections gauge\n"));
     Ok(())
 }

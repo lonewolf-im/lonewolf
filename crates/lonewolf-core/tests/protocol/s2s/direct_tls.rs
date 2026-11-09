@@ -66,6 +66,8 @@ fn direct_tls_static_route_sends_client_hello_then_external_and_protected_restar
         let mut peer = listener.accept("b.test", "a.test", config, true)?;
         peer.receive()?.assert_xml("<message xmlns='jabber:server' from='alice@a.test/desk' to='bob@b.test/phone' type='chat' id='direct'><body>protected</body></message>")?;
         authentication(&fixture.suite, "outbound", "success", 1)?;
+        transport_attempts(&fixture.suite, "outbound", &[("direct", "success", 1)])?;
+        transport_connections(&fixture.suite, "outbound", 0, 1)?;
         fixture
             .suite
             .wait_for_metric("lonewolf_s2s_dns_resolutions_total{outcome=\"static\"} 1")?;
@@ -74,6 +76,7 @@ fn direct_tls_static_route_sends_client_hello_then_external_and_protected_restar
         }
         peer.close()?;
         closed(&fixture.suite, "outbound", "stream_end", 1)?;
+        transport_connections(&fixture.suite, "outbound", 0, 0)?;
         alice.close()?;
         fixture.stop()?;
     }
@@ -93,6 +96,8 @@ fn direct_tls_rejects_wrong_role_alpn() -> TestResult {
     assert!(listener.accept("b.test", "a.test", config, true).is_err());
     expect_bounce(&mut alice, "alpn", "remote-server-timeout")?;
     authentication(&fixture.suite, "outbound", "tls_failure", 1)?;
+    transport_attempts(&fixture.suite, "outbound", &[("direct", "tls_failure", 1)])?;
+    transport_connections(&fixture.suite, "outbound", 0, 0)?;
     fixture
         .suite
         .wait_for_metric("lonewolf_s2s_connections{direction=\"outbound\"} 0")?;
@@ -165,12 +170,22 @@ fn direct_tls_failure_falls_back_to_separately_configured_starttls() -> TestResu
         "failover"
     );
     authentication(&fixture.suite, "outbound", "success", 1)?;
+    transport_attempts(
+        &fixture.suite,
+        "outbound",
+        &[
+            ("direct", "certificate_name", 1),
+            ("starttls", "success", 1),
+        ],
+    )?;
+    transport_connections(&fixture.suite, "outbound", 1, 0)?;
     let metrics = fixture.suite.scrape_metrics()?;
     assert!(!metrics.contains(
         "lonewolf_s2s_authentications_total{direction=\"outbound\",outcome=\"certificate_name\"}"
     ));
     peer.close()?;
     closed(&fixture.suite, "outbound", "stream_end", 1)?;
+    transport_connections(&fixture.suite, "outbound", 0, 0)?;
     alice.close()?;
     fixture.stop()
 }
@@ -191,6 +206,8 @@ fn direct_tls_handshake_timeout_sends_no_xml_and_releases_connection() -> TestRe
     assert_no_xml_until_close(socket)?;
     expect_bounce(&mut alice, "timeout", "remote-server-timeout")?;
     authentication(&fixture.suite, "outbound", "timeout", 1)?;
+    transport_attempts(&fixture.suite, "outbound", &[("direct", "timeout", 1)])?;
+    transport_connections(&fixture.suite, "outbound", 0, 0)?;
     fixture
         .suite
         .wait_for_metric("lonewolf_s2s_connections{direction=\"outbound\"} 0")?;
@@ -218,6 +235,7 @@ fn direct_tls_shutdown_cancels_handshake_without_xml_and_releases_queued_work() 
     fixture
         .suite
         .wait_for_metric("lonewolf_s2s_outbound_queued_stanzas 1")?;
+    transport_connections(&fixture.suite, "outbound", 0, 1)?;
     alice.close()?;
     let started = Instant::now();
     let state = fixture
@@ -229,11 +247,15 @@ fn direct_tls_shutdown_cancels_handshake_without_xml_and_releases_queued_work() 
     assert_eq!(state.dropped_connection_lost, 0);
     assert_eq!(state.queued_stanzas, 0);
     assert_eq!(state.queued_bytes, 0);
+    assert_eq!(state.transport_cancelled, [[0, 0], [0, 1]]);
+    assert_eq!(state.transport_connections, [[0; 2]; 2]);
+    assert_eq!(state.connections, [0; 2]);
+    assert_eq!(state.authentication_protocol, [0, 1]);
     assert_no_xml_until_close(socket)?;
     fixture.dns.stop()
 }
 
-fn inbound_fixture(extra: &str, bidi: bool) -> TestResult<SingleServer> {
+pub(super) fn inbound_fixture(extra: &str, bidi: bool) -> TestResult<SingleServer> {
     let mut fixture = if bidi {
         SingleServer::start_bidirectional(extra)?
     } else {
@@ -297,6 +319,8 @@ fn inbound_direct_tls_external_bidi_limits_and_optional_alpn_share_starttls_flow
         inbound.expect_sasl_success()?;
         let mut inbound = inbound.restart("b.test", "a.test")?;
         authentication(&fixture.suite, "inbound", "success", 1)?;
+        transport_attempts(&fixture.suite, "inbound", &[("direct", "success", 1)])?;
+        transport_connections(&fixture.suite, "inbound", 0, 1)?;
         inbound.send("<message from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='direct-in'><body>Inbound</body></message>")?;
         alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='direct-in'><body>Inbound</body></message>")?;
         alice.send("<message to='bob@b.test/phone' type='chat' id='bidi-direct'><body>Reply</body></message>")?;
@@ -311,8 +335,15 @@ fn inbound_direct_tls_external_bidi_limits_and_optional_alpn_share_starttls_flow
         legacy.expect_sasl_success()?;
         let mut legacy = legacy.restart("b.test", "a.test")?;
         authentication(&fixture.suite, "inbound", "success", 2)?;
+        transport_attempts(
+            &fixture.suite,
+            "inbound",
+            &[("direct", "success", 1), ("starttls", "success", 1)],
+        )?;
+        transport_connections(&fixture.suite, "inbound", 1, 0)?;
         legacy.close()?;
         closed(&fixture.suite, "inbound", "stream_end", 2)?;
+        transport_connections(&fixture.suite, "inbound", 0, 0)?;
         alice.close()?;
         fixture.stop()?;
     }
@@ -360,6 +391,8 @@ fn inbound_direct_tls_requires_bound_to_from_and_remote_certificate_identity() -
         inbound.open_protected(&inbound_header(from, to), None)?;
         inbound.expect_stream_error(condition)?;
         authentication(&fixture.suite, "inbound", outcome, 1)?;
+        transport_attempts(&fixture.suite, "inbound", &[("direct", outcome, 1)])?;
+        transport_connections(&fixture.suite, "inbound", 0, 0)?;
         fixture
             .suite
             .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
@@ -425,6 +458,8 @@ fn inbound_direct_tls_rejects_untrusted_and_client_auth_only_certificates() -> T
             );
         }
         authentication(&fixture.suite, "inbound", "tls_failure", 1)?;
+        transport_attempts(&fixture.suite, "inbound", &[("direct", "tls_failure", 1)])?;
+        transport_connections(&fixture.suite, "inbound", 0, 0)?;
         fixture
             .suite
             .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
@@ -499,6 +534,12 @@ fn inbound_direct_tls_requires_sni_and_server_alpn_without_plaintext_xml() -> Te
     ] {
         fixture.suite.wait_for_metric(sample)?;
     }
+    transport_attempts(
+        &fixture.suite,
+        "inbound",
+        &[("direct", "tls_failure", 1), ("direct", "host_unknown", 2)],
+    )?;
+    transport_connections(&fixture.suite, "inbound", 0, 0)?;
     fixture.stop()
 }
 
@@ -514,7 +555,13 @@ fn inbound_direct_tls_timeout_malformed_hello_and_shutdown_close_without_xml() -
             .suite
             .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 1")?;
         if kind == "shutdown" {
-            fixture.suite.stop()?;
+            let state = fixture
+                .suite
+                .stop_with_s2s_state()?
+                .ok_or("missing shutdown state")?;
+            assert_eq!(state.transport_cancelled, [[0, 1], [0, 0]]);
+            assert_eq!(state.transport_connections, [[0; 2]; 2]);
+            assert_eq!(state.connections, [0; 2]);
         } else if kind == "malformed" {
             socket.write_all(b"<stream:stream xmlns='jabber:server'>")?;
         }
@@ -533,6 +580,22 @@ fn inbound_direct_tls_timeout_malformed_hello_and_shutdown_close_without_xml() -
             fixture
                 .suite
                 .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
+        }
+        if kind != "shutdown" {
+            transport_attempts(
+                &fixture.suite,
+                "inbound",
+                &[(
+                    "direct",
+                    if kind == "timeout" {
+                        "timeout"
+                    } else {
+                        "tls_failure"
+                    },
+                    1,
+                )],
+            )?;
+            transport_connections(&fixture.suite, "inbound", 0, 0)?;
         }
         fixture.stop()?;
     }
@@ -673,5 +736,56 @@ fn inbound_direct_tls_listener_does_not_override_global_or_host_federation_opt_o
         suite.stop()?;
         dns.stop()?;
     }
+    Ok(())
+}
+
+pub(super) fn transport_attempts(
+    suite: &super::super::support::C2sSuite,
+    direction: &str,
+    expected: &[(&str, &str, u64)],
+) -> TestResult {
+    let prefix = format!("lonewolf_s2s_transport_attempts_total{{direction=\"{direction}\",");
+    let samples: Vec<_> = expected
+        .iter()
+        .map(|(mode, outcome, count)| {
+            format!("{prefix}tls_mode=\"{mode}\",outcome=\"{outcome}\"}} {count}")
+        })
+        .collect();
+    let body = suite.wait_for_metrics("exact transport outcomes", |body| {
+        samples
+            .iter()
+            .all(|sample| body.lines().any(|line| line == sample))
+    })?;
+    let actual: Vec<_> = body
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .collect();
+    assert_eq!(actual.len(), samples.len(), "{body}");
+    Ok(())
+}
+
+pub(super) fn transport_connections(
+    suite: &super::super::support::C2sSuite,
+    direction: &str,
+    starttls: u64,
+    direct: u64,
+) -> TestResult {
+    let samples = [
+        format!(
+            "lonewolf_s2s_connections{{direction=\"{direction}\"}} {}",
+            starttls + direct
+        ),
+        format!(
+            "lonewolf_s2s_transport_connections{{direction=\"{direction}\",tls_mode=\"starttls\"}} {starttls}"
+        ),
+        format!(
+            "lonewolf_s2s_transport_connections{{direction=\"{direction}\",tls_mode=\"direct\"}} {direct}"
+        ),
+    ];
+    suite.wait_for_metrics("matching aggregate and mode connection gauges", |body| {
+        samples
+            .iter()
+            .all(|sample| body.lines().any(|line| line == sample))
+    })?;
     Ok(())
 }

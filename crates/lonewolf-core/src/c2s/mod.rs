@@ -239,6 +239,9 @@ struct C2sAcceptor<A: ChunkAllocator> {
 impl<A: ChunkAllocator + Clone> AcceptHandler for C2sAcceptor<A> {
     type Permit = (ConnectionPermit, UnauthenticatedPermit);
     type Rejection = AdmissionRejection;
+    fn listener_bound(&self, _: ListenerSlot) -> impl Sized + 'static {
+        self.metrics.listener_bound(self.settings.tls_mode)
+    }
     async fn admit(&self, peer: IpAddr) -> Result<Self::Permit, Self::Rejection> {
         self.admission.reserve(peer).await
     }
@@ -310,7 +313,8 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for C2sAcceptor<A> {
             slot.listener_id,
             slot.worker_id,
             self.metrics.clone(),
-        );
+        )
+        .with_tls_mode(self.settings.tls_mode);
         let hosts = self.services.hosts.clone();
         let auth = Arc::clone(&self.services.auth);
         let router = self.services.router.clone();

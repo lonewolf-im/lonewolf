@@ -15,6 +15,7 @@ use prometheus_client::metrics::{
 use prometheus_client::registry::{Registry, Unit};
 
 use crate::c2s::PHASE_BUCKETS;
+use crate::config::TlsMode;
 use crate::hosts::revocation::CrlLoadError;
 
 use super::revocation::{CheckPhase, RevocationSource, RevocationStatus, RevocationVerdict};
@@ -499,6 +500,7 @@ fn kind_index(kind: StanzaKind) -> usize {
 
 #[derive(Default)]
 struct ListenerCounters {
+    bound: [AtomicU64; TlsMode::ALL.len()],
     accepted: AtomicU64,
     rejected: [AtomicU64; ConnectionRejection::ALL.len()],
 }
@@ -517,6 +519,9 @@ pub(crate) trait LinkStats: Send + Sync {
 }
 
 pub(crate) struct S2sMetrics {
+    transport_connections: [[AtomicU64; TlsMode::ALL.len()]; Direction::ALL.len()],
+    transport_attempts:
+        [[[AtomicU64; AuthOutcome::ALL.len() + 1]; TlsMode::ALL.len()]; Direction::ALL.len()],
     connections: [AtomicU64; Direction::ALL.len()],
     listeners: Box<[ListenerCounters]>,
     authentications: [[AtomicU64; AuthOutcome::ALL.len()]; Direction::ALL.len()],
@@ -553,6 +558,8 @@ pub(crate) struct S2sMetrics {
 impl S2sMetrics {
     pub(crate) fn new(listener_count: usize) -> Arc<Self> {
         Arc::new(Self {
+            transport_connections: Default::default(),
+            transport_attempts: Default::default(),
             connections: Default::default(),
             listeners: (0..listener_count)
                 .map(|_| ListenerCounters::default())
@@ -622,12 +629,44 @@ impl S2sMetrics {
         self.crl_cache_evictions[reason as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn connection_opened(self: &Arc<Self>, direction: Direction) -> ConnectionGauge {
+    pub(crate) fn connection_opened(
+        self: &Arc<Self>,
+        direction: Direction,
+        mode: TlsMode,
+    ) -> ConnectionGauge {
+        self.transport_connections[direction as usize][mode as usize]
+            .fetch_add(1, Ordering::Relaxed);
         self.connections[direction as usize].fetch_add(1, Ordering::Relaxed);
         ConnectionGauge {
             metrics: Arc::clone(self),
             direction,
-            kind: GaugeKind::Connection,
+            kind: GaugeKind::Connection(mode),
+        }
+    }
+
+    pub(crate) fn listener_bound(
+        self: &Arc<Self>,
+        listener: usize,
+        mode: TlsMode,
+    ) -> ListenerGauge {
+        self.listeners[listener].bound[mode as usize].fetch_add(1, Ordering::Relaxed);
+        ListenerGauge {
+            metrics: Arc::clone(self),
+            listener,
+            mode,
+        }
+    }
+
+    pub(crate) fn transport_attempt(
+        self: &Arc<Self>,
+        direction: Direction,
+        mode: TlsMode,
+    ) -> TransportAttempt {
+        TransportAttempt {
+            metrics: Arc::clone(self),
+            direction,
+            mode,
+            recorded: false,
         }
     }
 
@@ -748,6 +787,24 @@ impl S2sMetrics {
                 .load(Ordering::Relaxed),
             queued_stanzas: snapshot.queued_stanzas,
             queued_bytes: snapshot.queued_bytes,
+            transport_cancelled: std::array::from_fn(|direction| {
+                std::array::from_fn(|mode| {
+                    self.transport_attempts[direction][mode][AuthOutcome::ALL.len()]
+                        .load(Ordering::Relaxed)
+                })
+            }),
+            transport_connections: std::array::from_fn(|direction| {
+                std::array::from_fn(|mode| {
+                    self.transport_connections[direction][mode].load(Ordering::Relaxed)
+                })
+            }),
+            connections: std::array::from_fn(|direction| {
+                self.connections[direction].load(Ordering::Relaxed)
+            }),
+            authentication_protocol: std::array::from_fn(|direction| {
+                self.authentications[direction][AuthOutcome::Protocol as usize]
+                    .load(Ordering::Relaxed)
+            }),
         }
     }
 
@@ -757,7 +814,7 @@ impl S2sMetrics {
 }
 
 enum GaugeKind {
-    Connection,
+    Connection(TlsMode),
     Stream,
     Bidi,
 }
@@ -769,10 +826,63 @@ pub(crate) struct ConnectionGauge {
     kind: GaugeKind,
 }
 
+impl ConnectionGauge {
+    pub(crate) fn tls_mode(&self) -> Option<TlsMode> {
+        match self.kind {
+            GaugeKind::Connection(mode) => Some(mode),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) struct ListenerGauge {
+    metrics: Arc<S2sMetrics>,
+    listener: usize,
+    mode: TlsMode,
+}
+impl Drop for ListenerGauge {
+    fn drop(&mut self) {
+        self.metrics.listeners[self.listener].bound[self.mode as usize]
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[must_use]
+pub(crate) struct TransportAttempt {
+    metrics: Arc<S2sMetrics>,
+    direction: Direction,
+    mode: TlsMode,
+    recorded: bool,
+}
+impl TransportAttempt {
+    pub(crate) fn complete(&mut self, outcome: AuthOutcome) {
+        self.record(outcome as usize);
+    }
+    pub(crate) fn cancel(&mut self) {
+        self.record(AuthOutcome::ALL.len());
+    }
+    fn record(&mut self, outcome: usize) {
+        if !self.recorded {
+            self.metrics.transport_attempts[self.direction as usize][self.mode as usize][outcome]
+                .fetch_add(1, Ordering::Relaxed);
+            self.recorded = true;
+        }
+    }
+}
+impl Drop for TransportAttempt {
+    fn drop(&mut self) {
+        self.record(AuthOutcome::ALL.len());
+    }
+}
+
 impl Drop for ConnectionGauge {
     fn drop(&mut self) {
         let counters = match self.kind {
-            GaugeKind::Connection => &self.metrics.connections,
+            GaugeKind::Connection(mode) => {
+                self.metrics.transport_connections[self.direction as usize][mode as usize]
+                    .fetch_sub(1, Ordering::Relaxed);
+                &self.metrics.connections
+            }
             GaugeKind::Stream => &self.metrics.streams,
             GaugeKind::Bidi => &self.metrics.bidi_streams,
         };
@@ -813,6 +923,76 @@ fn encode_counter<L: EncodeLabelSet>(
 impl Collector for S2sCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
         let metrics = &self.0;
+        let mut bound = metrics
+            .listeners
+            .iter()
+            .enumerate()
+            .flat_map(|(listener, counters)| {
+                TlsMode::ALL.into_iter().filter_map(move |mode| {
+                    (counters.bound[mode as usize].load(Ordering::Relaxed) != 0).then_some(
+                        ListenerInfoLabels {
+                            listener,
+                            tls_mode: mode.as_str(),
+                        },
+                    )
+                })
+            })
+            .peekable();
+        if bound.peek().is_some() {
+            let mut family = encoder.encode_descriptor(
+                "s2s_listener_info",
+                "Bound S2S listener transport.",
+                None,
+                MetricType::Gauge,
+            )?;
+            for labels in bound {
+                ConstGauge::new(1u64).encode(family.encode_family(&labels)?)?;
+            }
+        }
+        let mut family = encoder.encode_descriptor(
+            "s2s_transport_connections",
+            "Open admitted S2S TCP connections by transport.",
+            None,
+            MetricType::Gauge,
+        )?;
+        for direction in Direction::ALL {
+            for mode in TlsMode::ALL {
+                ConstGauge::new(
+                    metrics.transport_connections[direction as usize][mode as usize]
+                        .load(Ordering::Relaxed),
+                )
+                .encode(family.encode_family(&[
+                    ("direction", direction.as_str()),
+                    ("tls_mode", mode.as_str()),
+                ])?)?;
+            }
+        }
+        encode_counter(
+            &mut encoder,
+            "s2s_transport_attempts",
+            "S2S endpoint negotiation results by transport.",
+            Direction::ALL.into_iter().flat_map(|direction| {
+                TlsMode::ALL.into_iter().flat_map(move |mode| {
+                    AuthOutcome::ALL
+                        .into_iter()
+                        .map(Some)
+                        .chain(std::iter::once(None))
+                        .enumerate()
+                        .map(move |(index, outcome)| {
+                            (
+                                [
+                                    ("direction", direction.as_str()),
+                                    ("tls_mode", mode.as_str()),
+                                    ("outcome", outcome.map_or("cancelled", AuthOutcome::as_str)),
+                                ],
+                                metrics.transport_attempts[direction as usize][mode as usize]
+                                    [index]
+                                    .load(Ordering::Relaxed),
+                            )
+                        })
+                })
+            }),
+        )?;
         encode_counter(
             &mut encoder,
             "s2s_crl_file_load_failures",
@@ -1200,6 +1380,12 @@ impl Collector for S2sCollector {
         }
         Ok(())
     }
+}
+
+#[derive(EncodeLabelSet)]
+struct ListenerInfoLabels {
+    listener: usize,
+    tls_mode: &'static str,
 }
 
 #[derive(EncodeLabelSet)]

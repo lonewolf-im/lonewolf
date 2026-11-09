@@ -123,6 +123,8 @@ fn srv_target_dot_bounces_remote_server_not_found() -> TestResult {
             .query_count("_xmpp-server._tcp.b.test", RecordType::SRV),
         1
     );
+    super::direct_tls::transport_attempts(&fixture.suite, "outbound", &[])?;
+    super::direct_tls::transport_connections(&fixture.suite, "outbound", 0, 0)?;
     alice.close()?;
     fixture.stop()
 }

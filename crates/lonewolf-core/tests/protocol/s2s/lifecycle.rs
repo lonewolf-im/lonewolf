@@ -166,6 +166,10 @@ fn shutdown_during_negotiation_completes_within_deadline() -> TestResult {
     assert_eq!(state.dropped_connection_lost, 0);
     assert_eq!(state.queued_stanzas, 0);
     assert_eq!(state.queued_bytes, 0);
+    assert_eq!(state.transport_cancelled, [[0, 0], [1, 0]]);
+    assert_eq!(state.transport_connections, [[0; 2]; 2]);
+    assert_eq!(state.connections, [0; 2]);
+    assert_eq!(state.authentication_protocol, [0, 1]);
     drop(peer);
     let receipt = fixture.suite.fixture_path().join("s2s-shutdown.json");
     let old = std::fs::read(&receipt)?;

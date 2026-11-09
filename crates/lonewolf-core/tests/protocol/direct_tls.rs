@@ -40,6 +40,17 @@ fn direct_tls_login_bind_message_and_close() -> TestResult {
     let body = suite.wait_for_metric(
         "lonewolf_c2s_resource_bindings_total{listener=\"0\",outcome=\"success\"} 1",
     )?;
+    assert_eq!(
+        body.lines()
+            .filter(|line| line.starts_with("lonewolf_c2s_listener_info{"))
+            .count(),
+        1
+    );
+    assert!(
+        body.lines()
+            .any(|line| line == "lonewolf_c2s_listener_info{listener=\"0\",tls_mode=\"direct\"} 1"),
+        "{body}"
+    );
     for sample in [
         "lonewolf_c2s_connections{listener=\"0\"} 1",
         "lonewolf_c2s_connections_accepted_total{listener=\"0\"} 1",

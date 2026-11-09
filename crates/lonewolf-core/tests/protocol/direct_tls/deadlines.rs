@@ -185,7 +185,10 @@ fn direct_tls_fragmented_records_and_tls13_coalesced_finished_header_complete_wi
         |_| Ok(()),
     )?;
     suite.create_account("alice", PASSWORD)?;
-    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+    for (index, version) in [&rustls::version::TLS12, &rustls::version::TLS13]
+        .into_iter()
+        .enumerate()
+    {
         let body = suite.scrape_metrics()?;
         let baseline = body
             .lines()
@@ -238,6 +241,8 @@ fn direct_tls_fragmented_records_and_tls13_coalesced_finished_header_complete_wi
             "alice@localhost/fragmented"
         );
         client.close()?;
+        suite.wait_for_metric("lonewolf_c2s_connections{listener=\"0\"} 0")?;
+        suite.wait_for_metric(&format!("lonewolf_c2s_connections_closed_total{{listener=\"0\",phase=\"bound\",outcome=\"stream_end\"}} {}",index+1))?;
     }
     suite.wait_for_metric("lonewolf_c2s_authentications_total{listener=\"0\",mechanism=\"SCRAM-SHA-256\",outcome=\"success\"} 2")?;
     suite.wait_for_metric("lonewolf_c2s_connections{listener=\"0\"} 0")?;

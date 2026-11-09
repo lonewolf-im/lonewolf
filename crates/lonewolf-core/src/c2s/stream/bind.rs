@@ -16,12 +16,13 @@ use lonewolf_xmpp::stanza::{
 
 use super::certificate::CertificateMonitor;
 use super::establish::{Established, STARTTLS_FAILURE, is_starttls_element};
-use super::header::{ResponseVersion, escape_attribute};
+use super::header::ResponseVersion;
 use super::outcome::CloseOutcome;
 use super::session::{Session, Writer, namespace_error};
 use crate::c2s::metrics::C2sWorkerMetrics;
 use crate::hosts::Hosts;
 use crate::router::{Registration, RouterError, RouterHandle};
+use crate::xml_stream::escape_attribute;
 
 const BIND_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-bind";
 const BIND_FEATURE: &str = "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>";

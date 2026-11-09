@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::Cell;
-use std::error::Error as _;
 use std::fmt::Write as _;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -17,30 +16,31 @@ use base64::engine::general_purpose::STANDARD;
 use compio::io::compat::AsyncReadStream;
 use compio::net::TcpStream;
 use futures_util::io::{AsyncWrite, AsyncWriteExt as _, BufWriter};
-use lonewolf_util::arena::{
-    Arena, ArenaConfig, ArenaError, ArenaRead, ChunkAllocator, HandleError,
-};
+use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_util::token_bucket::TokenBucket;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    AsyncWriteError, BuildError, Element, NodeRef, SERVER_NAMESPACE, StanzaRef, XML_NAMESPACE,
+    AsyncWriteError, Element, NodeRef, SERVER_NAMESPACE, StanzaRef, XML_NAMESPACE,
 };
-use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamError, StreamErrorCondition};
+use lonewolf_xmpp::stream::StreamErrorCondition;
 use oxilangtag::LanguageTag;
 use tokio::io::{AsyncBufRead, AsyncReadExt as _};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::metrics::{InboundLimit, S2sMetrics};
 use crate::config::limits::{ByteRate, EventRate};
+use crate::xml_stream::parse::{ParseFailure, classify_parse_error};
+use crate::xml_stream::{
+    STREAM_FOOTER, escape_attribute, peer_stream_error, stream_error_xml, version_components,
+};
 
 pub(crate) mod limits;
 pub(crate) mod traffic;
 
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
-const STREAM_FOOTER: &str = "</stream:stream>";
 const HEADER_PREFIX: &str = "<?xml version='1.0'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' from='";
 
 #[cfg(test)]
@@ -125,21 +125,6 @@ pub(crate) fn response_header_xml(from: &str, to: Option<&str>) -> Result<String
     Ok(xml)
 }
 
-fn escape_attribute(output: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '\'' => output.push_str("&apos;"),
-            '"' => output.push_str("&quot;"),
-            '\n' => output.push_str("&#xA;"),
-            '\r' => output.push_str("&#xD;"),
-            '\t' => output.push_str("&#x9;"),
-            _ => output.push(ch),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum HeaderKind {
     Initial,
@@ -162,16 +147,10 @@ fn validate_header<A: ChunkAllocator>(
         .attribute("version", "")
         .map_err(internal_condition)?
         .ok_or(StreamErrorCondition::UnsupportedVersion)?;
-    let Some((major, minor)) = version.split_once('.') else {
+    let Some((major, _)) = version_components(version) else {
         return Err(StreamErrorCondition::UnsupportedVersion);
     };
-    if major.is_empty()
-        || minor.is_empty()
-        || !major.bytes().all(|digit| digit.is_ascii_digit())
-        || !minor.bytes().all(|digit| digit.is_ascii_digit())
-        || major.trim_start_matches('0').is_empty()
-        || (kind == HeaderKind::Response && major.trim_start_matches('0') != "1")
-    {
+    if major == "0" || (kind == HeaderKind::Response && major != "1") {
         return Err(StreamErrorCondition::UnsupportedVersion);
     }
     if header
@@ -327,13 +306,6 @@ pub(crate) fn sasl_failure_xml(failure: SaslFailure) -> String {
         SaslFailure::NotAuthorized => "not-authorized",
     };
     format!("<failure xmlns='{SASL_NAMESPACE}'><{name}/></failure>")
-}
-
-pub(crate) fn stream_error_xml(condition: StreamErrorCondition) -> String {
-    let mut xml = String::with_capacity(128);
-    let _ = StreamError::new(condition).write_xml(&mut xml);
-    xml.push_str(STREAM_FOOTER);
-    xml
 }
 
 #[derive(Clone)]
@@ -564,36 +536,6 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
     }
 }
 
-fn peer_stream_error<A: ChunkAllocator>(
-    event: &StreamEvent<A>,
-) -> Result<Option<StreamErrorCondition>, S2sError> {
-    let StreamEvent::Element(parsed) = event else {
-        return Ok(None);
-    };
-    let element = parsed.value().resolve(parsed.arena())?;
-    if element.namespace() != "http://etherx.jabber.org/streams" || element.name() != "error" {
-        return Ok(None);
-    }
-    let mut condition = None;
-    for child in element.children()? {
-        if let NodeRef::Element(child) = child?
-            && child.namespace() == STREAM_ERROR_NAMESPACE
-            && child.name() != "text"
-        {
-            if condition.is_some() {
-                return Ok(Some(StreamErrorCondition::UndefinedCondition));
-            }
-            condition = Some(
-                StreamErrorCondition::from_name(child.name())
-                    .unwrap_or(StreamErrorCondition::UndefinedCondition),
-            );
-        }
-    }
-    Ok(Some(
-        condition.unwrap_or(StreamErrorCondition::UndefinedCondition),
-    ))
-}
-
 pub(crate) struct S2sWriter<W> {
     output: BufWriter<W>,
     peer_limits: limits::StreamLimits,
@@ -683,34 +625,25 @@ impl From<HandleError> for S2sError {
 
 impl From<ParseError> for S2sError {
     fn from(error: ParseError) -> Self {
-        if error.is_transport_error() {
-            if let ParseError::Xml(xml) = &error
-                && let Some(error) = xml
-                    .source()
-                    .and_then(|source| source.downcast_ref::<Arc<io::Error>>())
-                && error.kind() == io::ErrorKind::TimedOut
-            {
-                return Self::Timeout;
+        let condition = match classify_parse_error(&error) {
+            ParseFailure::Transport(error) => {
+                return if error.is_some_and(|error| error.kind() == io::ErrorKind::TimedOut) {
+                    Self::Timeout
+                } else {
+                    Self::Io
+                };
             }
-            return Self::Io;
-        }
-        let condition = match error {
-            ParseError::SizeLimitExceeded { .. }
-            | ParseError::TooManyAttributes
-            | ParseError::Build(BuildError::TreeLimitExceeded)
-            | ParseError::Build(BuildError::Allocation(ArenaError::ArenaLimitExceeded)) => {
+            ParseFailure::SizeLimit | ParseFailure::ParserLimit => {
                 StreamErrorCondition::PolicyViolation
             }
-            ParseError::Build(BuildError::Allocation(_)) => return Self::Internal,
-            ParseError::InvalidNamespace => StreamErrorCondition::InvalidNamespace,
-            ParseError::BadNamespacePrefix => StreamErrorCondition::BadNamespacePrefix,
-            ParseError::InvalidXml => StreamErrorCondition::InvalidXml,
-            ParseError::NotWellFormed | ParseError::UnboundNamespacePrefix => {
-                StreamErrorCondition::NotWellFormed
-            }
-            ParseError::RestrictedXml => StreamErrorCondition::RestrictedXml,
-            ParseError::UnsupportedEncoding => StreamErrorCondition::UnsupportedEncoding,
-            _ => StreamErrorCondition::BadFormat,
+            ParseFailure::Allocation => return Self::Internal,
+            ParseFailure::InvalidNamespace => StreamErrorCondition::InvalidNamespace,
+            ParseFailure::BadNamespacePrefix => StreamErrorCondition::BadNamespacePrefix,
+            ParseFailure::InvalidXml => StreamErrorCondition::InvalidXml,
+            ParseFailure::NotWellFormed => StreamErrorCondition::NotWellFormed,
+            ParseFailure::RestrictedXml => StreamErrorCondition::RestrictedXml,
+            ParseFailure::UnsupportedEncoding => StreamErrorCondition::UnsupportedEncoding,
+            ParseFailure::Other => StreamErrorCondition::BadFormat,
         };
         Self::Stream(condition)
     }

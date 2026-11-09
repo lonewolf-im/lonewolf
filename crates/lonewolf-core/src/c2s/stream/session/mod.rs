@@ -14,10 +14,8 @@ use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::parser::{ParseError, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    AsyncWriteError, CLIENT_NAMESPACE, NodeRef, SERVER_NAMESPACE, StanzaKind, StanzaNamespace,
-    StanzaRef,
+    AsyncWriteError, CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaKind, StanzaNamespace, StanzaRef,
 };
-use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamErrorCondition};
 use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
 
 use super::close::CloseContext;
@@ -32,6 +30,7 @@ use super::traffic::CountingIo;
 use crate::c2s::metrics::{C2sWorkerMetrics, RateLimit};
 use crate::hosts::Hosts;
 use crate::router::RoutedStanza;
+use crate::xml_stream::peer_stream_error;
 
 pub(super) const IO_BUFFER_BYTES: usize = 4_096;
 
@@ -525,33 +524,3 @@ pub(super) fn namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Opti
 
 #[cfg(test)]
 mod tests;
-
-pub(super) fn peer_stream_error<A: ChunkAllocator>(
-    event: &StreamEvent<A>,
-) -> Result<Option<StreamErrorCondition>, CloseOutcome> {
-    let StreamEvent::Element(parsed) = event else {
-        return Ok(None);
-    };
-    let element = parsed.value().resolve(parsed.arena())?;
-    if element.namespace() != "http://etherx.jabber.org/streams" || element.name() != "error" {
-        return Ok(None);
-    }
-    let mut condition = None;
-    for child in element.children()? {
-        if let NodeRef::Element(child) = child?
-            && child.namespace() == STREAM_ERROR_NAMESPACE
-            && child.name() != "text"
-        {
-            if condition.is_some() {
-                return Ok(Some(StreamErrorCondition::UndefinedCondition));
-            }
-            condition = Some(
-                StreamErrorCondition::from_name(child.name())
-                    .unwrap_or(StreamErrorCondition::UndefinedCondition),
-            );
-        }
-    }
-    Ok(Some(
-        condition.unwrap_or(StreamErrorCondition::UndefinedCondition),
-    ))
-}

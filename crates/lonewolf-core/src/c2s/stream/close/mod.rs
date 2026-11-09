@@ -16,9 +16,10 @@ use lonewolf_xmpp::parser::StreamEvent;
 use socket2::SockRef;
 use tokio::io::AsyncBufRead;
 
-use super::header::{STREAM_FOOTER, stream_error_xml};
+use super::header::stream_error_xml;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, TlsTransport, Writer};
+use crate::xml_stream::STREAM_FOOTER;
 
 pub(super) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;

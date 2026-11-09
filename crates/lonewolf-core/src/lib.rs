@@ -47,6 +47,7 @@ mod test_ports;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support;
+mod xml_stream;
 
 use config::Config;
 pub use error::RunError;

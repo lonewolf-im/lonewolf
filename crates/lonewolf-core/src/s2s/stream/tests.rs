@@ -9,8 +9,9 @@ use compio::net::TcpListener;
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use futures_util::poll;
-use lonewolf_util::arena::{AllocationError, GlobalChunkAllocator};
+use lonewolf_util::arena::{AllocationError, ArenaError, GlobalChunkAllocator};
 use lonewolf_xmpp::parser::parse_element;
+use lonewolf_xmpp::stanza::BuildError;
 use tokio::io::{AsyncWriteExt as _, BufReader};
 
 use super::*;
@@ -368,10 +369,6 @@ fn constants_and_negotiation_builders_emit_exact_xml() {
             format!("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><{name}/></failure>")
         );
     }
-    assert_eq!(
-        stream_error_xml(StreamErrorCondition::HostUnknown),
-        "<stream:error><host-unknown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>"
-    );
 }
 
 #[test]

@@ -13,8 +13,10 @@ use lonewolf_xmpp::stanza::{RejectedStanza, Stanza};
 use parking_lot::Mutex as PlMutex;
 use tokio::io::AsyncBufRead;
 
+use crate::xml_stream::peer_stream_error;
+
 use super::super::certificate::CertificateMonitor;
-use super::super::session::{Reader, namespace_error, peer_stream_error};
+use super::super::session::{Reader, namespace_error};
 use super::{CloseOutcome, OutboxWriter, Outgoing, OutputSequence};
 
 // Bound session progress because queued stanzas already own their memory.
@@ -303,7 +305,7 @@ impl<A: ChunkAllocator> LinkTransport<A> {
                 Ok(Some(StreamEvent::StreamEnd) | None) => Incoming::Ended(CloseOutcome::StreamEnd),
                 Ok(Some(event)) => Incoming::Ended(match peer_stream_error(&event) {
                     Ok(Some(condition)) => CloseOutcome::PeerError(condition),
-                    Err(outcome) => outcome,
+                    Err(error) => error.into(),
                     Ok(None) => {
                         namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedStanzaType)
                     }

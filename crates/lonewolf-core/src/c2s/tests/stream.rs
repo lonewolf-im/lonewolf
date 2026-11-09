@@ -27,7 +27,6 @@ use sha2::{Digest, Sha256};
 
 use super::authenticate::{SASL_NAMESPACE, account_key, decoy_identity};
 use super::establish::{STARTTLS_FEATURES, STARTTLS_NAMESPACE, STARTTLS_PROCEED};
-use super::header::STREAM_FOOTER;
 use super::*;
 use crate::admission::connection_limit::{ConnectionAdmission, ConnectionLimiter};
 use crate::c2s::unauthenticated_limit::{
@@ -38,6 +37,7 @@ use crate::config::limits::ByteRate;
 use crate::hosts::HostsError;
 use crate::router::Router;
 use crate::router::local::LocalRouter;
+use crate::xml_stream::STREAM_FOOTER;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0'>";

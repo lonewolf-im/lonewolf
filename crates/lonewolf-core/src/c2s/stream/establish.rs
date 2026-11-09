@@ -16,6 +16,8 @@ use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element};
 use tokio::io::BufReader;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
+use crate::xml_stream::peer_stream_error;
+
 use super::StreamSettings;
 use super::certificate::CertificateMonitor;
 use super::close::{self, CloseContext};
@@ -25,8 +27,7 @@ use super::header::{
 use super::outcome::CloseOutcome;
 use super::renegotiation::RecordGuard;
 use super::session::{
-    ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, TlsTransport, Writer,
-    namespace_error, peer_stream_error,
+    ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, TlsTransport, Writer, namespace_error,
 };
 use super::stanza_rate::StanzaLimiter;
 use super::traffic::CountingIo;

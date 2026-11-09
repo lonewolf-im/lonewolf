@@ -1652,3 +1652,27 @@ fn s2s_route_tables_reject_invalid_shapes_and_direct_literal_domains() -> TestRe
     }
     Ok(())
 }
+
+#[test]
+fn c2s_tls_modes_preserve_defaults_addresses_and_listener_replacement() -> TestResult {
+    let default = Config::default();
+    assert_eq!(default.c2s.listeners[0].tls_mode, TlsMode::StartTls);
+    assert_eq!(default.c2s.listeners[0].address.port(), 5222);
+    let config: Config = toml::from_str(
+        "[[c2s.listeners]]\naddress='127.0.0.1:0'\ntls_mode='direct'\n[[c2s.listeners]]\naddress='[::1]:0'\n",
+    )?;
+    assert_eq!(config.c2s.listeners.len(), 2);
+    assert_eq!(config.c2s.listeners[0].tls_mode, TlsMode::Direct);
+    assert_eq!(config.c2s.listeners[1].tls_mode, TlsMode::StartTls);
+    assert_eq!(config.c2s.listeners[0].address.port(), 0);
+    for mode in ["DIRECT", "tls", ""] {
+        assert!(
+            toml::from_str::<Config>(&format!("[[c2s.listeners]]\ntls_mode='{mode}'")).is_err()
+        );
+    }
+    let file = config_file(
+        "[[c2s.listeners]]\naddress='127.0.0.1:5222'\ntls_mode='direct'\n[[c2s.listeners]]\naddress='127.0.0.1:5222'\n",
+    )?;
+    assert!(Config::load(Some(file.path())).is_err());
+    Ok(())
+}

@@ -95,6 +95,10 @@ impl C2sSuite {
         Self::configured("", "")
     }
 
+    pub fn direct_tls() -> TestResult<Self> {
+        Self::configured("tls_mode = 'direct'", "")
+    }
+
     pub fn metrics_address(&self) -> SocketAddr {
         self.metrics
     }

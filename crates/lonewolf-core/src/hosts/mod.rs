@@ -322,6 +322,28 @@ impl Hosts {
 
     /// Admission captures one generation before any client-verifier refresh.
     pub async fn tls_handshake(&self, domain: &str) -> Option<TlsHandshake> {
+        self.tls_handshake_with_alpn(domain, None).await
+    }
+
+    pub(crate) fn host_for_sni(&self, sni: Option<&str>) -> Option<&str> {
+        let sni = sni?;
+        self.host_names()
+            .find(|domain| sni_matches_domain(sni, domain))
+    }
+
+    pub(crate) async fn direct_tls_handshake(
+        &self,
+        domain: &str,
+        protocol: &[u8],
+    ) -> Option<TlsHandshake> {
+        self.tls_handshake_with_alpn(domain, Some(protocol)).await
+    }
+
+    async fn tls_handshake_with_alpn(
+        &self,
+        domain: &str,
+        protocol: Option<&[u8]>,
+    ) -> Option<TlsHandshake> {
         let host = self.find_host(domain)?;
         let snapshot = self.snapshot(domain)?;
         if snapshot.validity.is_some_and(|(start, end)| {
@@ -330,8 +352,11 @@ impl Hosts {
         }) {
             return None;
         }
-        let config = if let Some(policy) = &host.client_certificate_policy {
-            let verifier = policy.handshake_verifier().await;
+        let config = if host.client_certificate_policy.is_some() || protocol.is_some() {
+            let verifier = match &host.client_certificate_policy {
+                Some(policy) => policy.handshake_verifier().await,
+                None => rustls::server::WebPkiClientVerifier::no_client_auth(),
+            };
             // Fresh resumption state prevents reuse of an older client-certificate verdict.
             let mut config = host
                 .tls_builder
@@ -339,6 +364,11 @@ impl Hosts {
                 .with_client_cert_verifier(verifier)
                 .with_cert_resolver(snapshot.resolver.clone());
             config.require_ems = true;
+            if let Some(protocol) = protocol {
+                config.alpn_protocols.push(protocol.to_vec());
+                config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+                config.send_tls13_tickets = 0;
+            }
             Arc::new(config)
         } else {
             Arc::clone(&snapshot.config)
@@ -641,6 +671,11 @@ fn managed_validity(
         return Err(invalid(rustls::CertificateError::BadEncoding.into()));
     }
     Ok((start, end))
+}
+
+pub(crate) fn sni_matches_domain(sni: &str, domain: &str) -> bool {
+    let identity = ServerName::try_from(domain).or_else(|_| tls_identity(domain));
+    matches!(identity, Ok(ServerName::DnsName(name)) if name.as_ref().eq_ignore_ascii_case(sni))
 }
 
 pub(crate) fn tls_identity(domain: &str) -> Result<ServerName<'static>, HostsError> {

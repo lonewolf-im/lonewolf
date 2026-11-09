@@ -7,10 +7,10 @@ use std::time::Instant;
 
 use compio::io::compat::{AsyncReadStream, AsyncStream};
 use compio::net::TcpStream;
-use futures_rustls::TlsAcceptor;
+use futures_rustls::{LazyConfigAcceptor, TlsAcceptor};
 use futures_util::io::AsyncReadExt as _;
 use lonewolf_util::arena::{ArenaConfig, ChunkAllocator};
-use lonewolf_util::rate_limited_reader::RateLimitedReader;
+use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_xmpp::parser::{Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element};
 use tokio::io::BufReader;
@@ -59,6 +59,21 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     settings: &StreamSettings<A>,
     context: CloseContext,
 ) -> Result<Established<A>, CloseOutcome> {
+    if settings.tls_mode == crate::config::TlsMode::Direct {
+        let accepted = super::run_phase(
+            context.phase_deadline,
+            CloseOutcome::EstablishmentTimeout,
+            context.interrupt(accept_direct(transport, hosts, settings)),
+        )
+        .await;
+        return match accepted {
+            Ok(accepted) => complete_tls(accepted, hosts, settings, context).await,
+            Err(outcome) => {
+                context.abort();
+                Err(outcome)
+            }
+        };
+    }
     let closing = Rc::new(Cell::new(ReadMode::Open));
     // One-byte reads cannot consume TLS records before the STARTTLS boundary.
     let input = Box::pin(AsyncReadStream::with_capacity(1, transport.clone())).compat();
@@ -194,13 +209,81 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         }),
     )
     .await;
-    let mut transport = match transport {
+    let transport = match transport {
         Ok(transport) => transport,
         Err(outcome) => {
             context.abort();
             return Err(outcome);
         }
     };
+    complete_tls(
+        AcceptedTls {
+            transport,
+            selected_host,
+            server_end_point: handshake.server_end_point,
+            rate_state: Some(rate_state),
+        },
+        hosts,
+        settings,
+        context,
+    )
+    .await
+}
+
+struct AcceptedTls {
+    transport: TlsTransport,
+    selected_host: String,
+    server_end_point: Arc<[u8]>,
+    rate_state: Option<RateLimitState>,
+}
+
+async fn accept_direct<A: ChunkAllocator>(
+    transport: TcpStream,
+    hosts: &Hosts,
+    settings: &StreamSettings<A>,
+) -> Result<AcceptedTls, CloseOutcome> {
+    let io = RecordGuard::new(
+        CountingIo::new(
+            Box::pin(AsyncStream::new(transport.clone())),
+            settings.metrics.clone(),
+        ),
+        transport,
+    );
+    let accepted = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io)
+        .await
+        .map_err(|_| CloseOutcome::TlsFailure)?;
+    let host = hosts
+        .host_for_sni(accepted.client_hello().server_name())
+        .ok_or(CloseOutcome::TlsFailure)?
+        .to_owned();
+    let handshake = hosts
+        .direct_tls_handshake(&host, b"xmpp-client")
+        .await
+        .ok_or(CloseOutcome::TlsFailure)?;
+    let transport = accepted
+        .into_stream(handshake.config)
+        .await
+        .map_err(|_| CloseOutcome::TlsFailure)?;
+    Ok(AcceptedTls {
+        transport,
+        selected_host: host,
+        server_end_point: handshake.server_end_point,
+        rate_state: None,
+    })
+}
+
+async fn complete_tls<A: ChunkAllocator + Clone>(
+    accepted: AcceptedTls,
+    hosts: &Hosts,
+    settings: &StreamSettings<A>,
+    context: CloseContext,
+) -> Result<Established<A>, CloseOutcome> {
+    let AcceptedTls {
+        mut transport,
+        selected_host,
+        server_end_point,
+        rate_state,
+    } = accepted;
     let version = transport.get_ref().1.protocol_version();
     transport.get_mut().0.handshake_complete(version);
     let (client, exporter) = prepare_tls(&mut transport, &context, async |transport| {
@@ -229,14 +312,17 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     .await?;
     let (read, write) = transport.split();
     let closing = Rc::new(Cell::new(ReadMode::Open));
-    let parser = XmppParser::new(
-        ClosingInput::new(
-            RateLimitedReader::from_state(
-                BufReader::with_capacity(IO_BUFFER_BYTES, read.compat()),
-                rate_state,
-            ),
-            Rc::clone(&closing),
+    let input = BufReader::with_capacity(IO_BUFFER_BYTES, read.compat());
+    let input = match rate_state {
+        Some(state) => RateLimitedReader::from_state(input, state),
+        None => RateLimitedReader::new(
+            input,
+            settings.xml_bytes_per_second,
+            settings.xml_burst_bytes,
         ),
+    };
+    let parser = XmppParser::new(
+        ClosingInput::new(input, Rc::clone(&closing)),
         ParserConfig {
             max_stanza_bytes: settings.max_stanza_bytes,
             arena: ArenaConfig::default(),
@@ -252,6 +338,9 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         context.clone(),
         settings.metrics.clone(),
     );
+    if settings.tls_mode == crate::config::TlsMode::Direct {
+        session.use_selected_host_as_default();
+    }
     let opened = super::run_phase(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
@@ -296,7 +385,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         client_from: header.response_to,
         binding: TlsBinding {
             exporter,
-            server_end_point: handshake.server_end_point,
+            server_end_point,
         },
         auth_started_at: Instant::now(),
     })
@@ -340,3 +429,6 @@ pub(super) fn is_starttls_element<A: ChunkAllocator>(element: &Parsed<Element, A
             element.name() == "starttls" && element.namespace() == STARTTLS_NAMESPACE
         })
 }
+
+#[cfg(test)]
+mod tests;

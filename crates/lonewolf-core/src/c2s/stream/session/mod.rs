@@ -21,7 +21,7 @@ use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
 use super::close::CloseContext;
 use super::header::{
     ClientHeader, ResponseVersion, response_header_xml, response_to_from_header,
-    response_version_from_header, validate_header,
+    response_version_from_header, validate_header_with_default,
 };
 use super::outcome::CloseOutcome;
 use super::renegotiation::RecordGuard;
@@ -45,6 +45,7 @@ pub(super) struct Session<A: ChunkAllocator> {
     pub(super) reader: Reader<A>,
     pub(super) writer: Writer,
     pub(super) close: CloseContext,
+    selected_host_default: bool,
 }
 
 pub(super) struct Reader<A: ChunkAllocator, R = XmlInput> {
@@ -145,7 +146,12 @@ impl<A: ChunkAllocator + Clone> Session<A> {
             reader: Reader::with_mode(parser, stanzas, closing, metrics.clone()),
             writer: Writer::new(writer, host, metrics),
             close,
+            selected_host_default: false,
         }
+    }
+
+    pub(super) fn use_selected_host_as_default(&mut self) {
+        self.selected_host_default = true;
     }
 
     pub(super) async fn finish(&mut self, outcome: CloseOutcome) -> CloseOutcome {
@@ -188,7 +194,17 @@ impl<A: ChunkAllocator + Clone> Session<A> {
                 content_namespace,
                 extra_header_namespaces,
             })) => {
-                match validate_header(&header, &content_namespace, extra_header_namespaces, hosts) {
+                match validate_header_with_default(
+                    &header,
+                    &content_namespace,
+                    extra_header_namespaces,
+                    hosts,
+                    if self.selected_host_default {
+                        self.host()
+                    } else {
+                        hosts.default_host_name()
+                    },
+                ) {
                     Ok(header) => Ok(header),
                     Err(outcome) => {
                         let (version, outcome) = match response_version_from_header(&header) {

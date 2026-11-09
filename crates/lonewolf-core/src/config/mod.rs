@@ -769,6 +769,7 @@ fn endpoints_overlap(first: SocketAddr, second: SocketAddr) -> bool {
 pub struct TcpListenerConfig {
     /// IPv6 addresses accept IPv6 only; port zero selects one port for all workers.
     pub address: SocketAddr,
+    pub tls_mode: TlsMode,
     pub auth_mechanisms: AuthMechanisms,
     /// Selects a named profile, or `limits.c2s.default` when absent.
     pub limits: Option<String>,
@@ -778,6 +779,7 @@ impl Default for TcpListenerConfig {
     fn default() -> Self {
         Self {
             address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5222)),
+            tls_mode: TlsMode::StartTls,
             auth_mechanisms: AuthMechanisms::DEFAULT,
             limits: None,
         }

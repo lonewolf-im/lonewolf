@@ -303,6 +303,10 @@
 # overlap.
 # address = "0.0.0.0:5222"
 
+# Choose "direct" when clients send TLS before XML.
+# Direct TLS requires SNI for a configured host and uses the address above.
+# tls_mode = "starttls"
+
 # Choose the SASL mechanisms this endpoint offers and accepts after TLS.
 # Include at least one mechanism.
 # Add SCRAM-SHA-512 or SCRAM-SHA-512-PLUS only after replacing existing account passwords.

@@ -442,14 +442,23 @@ async fn warmup_settlement_drains_invalid_events_beyond_the_hot_loop_batch() -> 
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stopped_fixture_retains_finalized_safe_logs_through_artifact_finalization() -> TestResult {
     let (mut context, _signal) = context(1)?;
     let mut config = config(1)?;
     if let TargetConfig::Local { server_binary, .. } = &mut config.target {
         *server_binary = std::env::current_exe()?;
     }
-    context.fixture = Some(LocalFixture::prepare(&config, &context.cpu).await?);
+    let cpu = context.cpu.clone();
+    // Blocking work keeps the paused clock fixed while storage uses its own pool.
+    context.fixture = Some(
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(LocalFixture::prepare(&config, &cpu))
+        })
+        .await??,
+    );
+    // Native child processes need real time to exit before the startup deadline.
+    tokio::time::resume();
     let error = context
         .fixture
         .as_mut()

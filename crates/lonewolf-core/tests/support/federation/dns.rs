@@ -83,6 +83,12 @@ impl FakeDns {
     }
 
     pub fn srv(&self, domain: &str, records: &[(u16, u16, u16, &str)]) {
+        self.service_srv("_xmpp-server", domain, records);
+    }
+    pub fn direct_srv(&self, domain: &str, records: &[(u16, u16, u16, &str)]) {
+        self.service_srv("_xmpps-server", domain, records);
+    }
+    fn service_srv(&self, service: &str, domain: &str, records: &[(u16, u16, u16, &str)]) {
         let records = records
             .iter()
             .map(|&(priority, weight, port, target)| {
@@ -92,7 +98,7 @@ impl FakeDns {
             })
             .collect();
         self.set(
-            &format!("_xmpp-server._tcp.{domain}"),
+            &format!("{service}._tcp.{domain}"),
             RecordType::SRV,
             records,
         );

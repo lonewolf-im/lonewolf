@@ -254,6 +254,14 @@ impl RawS2sPeer {
         error.child(super::super::STREAM_ERRORS, condition)?;
         self.answer_close()
     }
+    pub fn expect_terminal_stream_error(&mut self, condition: &str) -> TestResult {
+        let error = self.receive()?;
+        error.assert_name(super::super::xml::STREAM_NAMESPACE, "error");
+        assert_eq!(error.children.len(), 1);
+        error.child(super::super::STREAM_ERRORS, condition)?;
+        self.stream.expect_footer()?;
+        self.expect_eof()
+    }
     pub fn close(&mut self) -> TestResult {
         super::phase("send XML footer", self.stream.send("</stream:stream>"))?;
         super::phase("receive XML footer", self.stream.expect_footer())?;
@@ -367,6 +375,21 @@ impl RawS2sListener {
         };
         configure(&socket)?;
         Ok(socket)
+    }
+
+    pub fn assert_not_contacted(&self) -> TestResult {
+        let mut descriptor = nix::libc::pollfd {
+            fd: self.listener.as_raw_fd(),
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: The listener and descriptor remain live during poll.
+        let ready = unsafe { nix::libc::poll(&mut descriptor, 1, 0) };
+        if ready < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        assert_eq!(ready, 0, "unexpected connection to decoy listener");
+        Ok(())
     }
 
     pub fn accept_client_hello(

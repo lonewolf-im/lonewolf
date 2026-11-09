@@ -211,6 +211,15 @@ impl FederationCa {
     }
 
     pub fn srv_id(&self, directory: &Path, domain: &str) -> TestResult<Arc<CertifiedKey>> {
+        self.service_id(directory, "_xmpp-server", domain)
+    }
+
+    pub fn service_id(
+        &self,
+        directory: &Path,
+        service: &str,
+        domain: &str,
+    ) -> TestResult<Arc<CertifiedKey>> {
         use x509_cert::der::{
             Encode,
             asn1::{Ia5String, ObjectIdentifier},
@@ -222,7 +231,7 @@ impl FederationCa {
         let mut parameters = parameters(&[])?;
         let name = GeneralName::OtherName(OtherName {
             type_id: ObjectIdentifier::new("1.3.6.1.5.5.7.8.7")?,
-            value: (&Ia5String::new(&format!("_xmpp-server.{domain}"))?).into(),
+            value: (&Ia5String::new(&format!("{service}.{domain}"))?).into(),
         });
         parameters
             .custom_extensions
@@ -278,7 +287,6 @@ impl FederationCa {
     }
 }
 
-/// Returns the first PEM certificate in `path`.
 pub fn certificate(path: &Path) -> TestResult<CertificateDer<'static>> {
     Ok(CertificateDer::from_pem_file(path)?)
 }

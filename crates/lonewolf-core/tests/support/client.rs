@@ -83,18 +83,34 @@ impl PlainClient {
 
 impl Client {
     pub fn direct_tls(server: &C2sSuite) -> TestResult<Self> {
-        let socket = PlainClient::tcp(server)?.into_inner();
-        assert!(socket.buffer().is_empty());
         let mut config = (*server.tls).clone();
         config.alpn_protocols = vec![b"xmpp-client".to_vec()];
         let identity =
             ServerName::try_from(server.client_domain_override().unwrap_or("localhost"))?
                 .to_owned();
-        let connection = ClientConnection::new(Arc::new(config), identity)?;
+        Self::direct_tls_with_config(server.address, Arc::new(config), identity)
+    }
+
+    pub fn direct_tls_with_config(
+        address: SocketAddr,
+        config: Arc<ClientConfig>,
+        identity: ServerName<'static>,
+    ) -> TestResult<Self> {
+        let socket = PlainClient::tcp_at(address)?.into_inner();
+        assert!(socket.buffer().is_empty());
+        let connection = ClientConnection::new(config, identity)?;
         Ok(XmlStream::new(StreamOwned::new(
             connection,
             socket.into_inner(),
         )))
+    }
+
+    pub fn complete_tls(&mut self) -> std::io::Result<()> {
+        let stream = self.transport();
+        while stream.conn.is_handshaking() {
+            stream.conn.complete_io(&mut stream.sock)?;
+        }
+        Ok(())
     }
 
     pub fn encrypted(server: &C2sSuite) -> TestResult<Self> {

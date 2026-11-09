@@ -390,7 +390,9 @@ fn srv_and_static_endpoints_deduplicate_and_cap_at_sixteen() -> TestResult {
     resolver.routes.insert(
         "static.example".into(),
         (1..=20)
-            .map(|last| SocketAddr::from(([192, 0, 2, last], 5270)))
+            .map(|last| {
+                crate::config::S2sRouteEndpoint::from(SocketAddr::from(([192, 0, 2, last], 5270)))
+            })
             .collect(),
     );
     let result = resolve(&resolver, "static.example").unwrap();

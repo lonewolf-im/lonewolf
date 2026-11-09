@@ -2,6 +2,7 @@
 
 mod bidi;
 mod bidi_pair;
+mod direct_tls;
 mod failures;
 mod iq;
 mod lifecycle;

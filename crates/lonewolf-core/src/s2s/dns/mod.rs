@@ -21,7 +21,7 @@ const ENDPOINT_LIMIT: usize = 16;
 pub(crate) struct Resolver {
     nameservers: Vec<SocketAddr>,
     timeout: Duration,
-    routes: BTreeMap<String, Vec<SocketAddr>>,
+    routes: BTreeMap<String, Vec<crate::config::S2sRouteEndpoint>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,9 +163,9 @@ impl Resolver {
             let mut endpoints = Vec::with_capacity(route.len().min(ENDPOINT_LIMIT));
             append_unique(
                 &mut endpoints,
-                route.iter().map(|&address| Endpoint {
-                    address,
-                    tls_mode: TlsMode::StartTls,
+                route.iter().map(|endpoint| Endpoint {
+                    address: endpoint.address,
+                    tls_mode: endpoint.tls_mode,
                 }),
             );
             return Ok(Resolved {

@@ -540,7 +540,7 @@ pub struct S2sConfig {
     pub tls: S2sTlsConfig,
     pub dns: S2sDnsConfig,
     /// Replaces DNS endpoints for each domain; certificate checks still use that domain.
-    pub routes: BTreeMap<String, Vec<SocketAddr>>,
+    pub routes: BTreeMap<String, Vec<S2sRouteEndpoint>>,
 }
 
 impl Default for S2sConfig {
@@ -591,7 +591,14 @@ impl S2sConfig {
                 ));
             }
             for (index, endpoint) in endpoints.iter().enumerate() {
-                if endpoint.port() == 0 {
+                if endpoint.tls_mode == TlsMode::Direct
+                    && domain.trim_matches(['[', ']']).parse::<IpAddr>().is_ok()
+                {
+                    return Err(format!(
+                        "s2s.routes.{domain}[{index}] cannot use direct TLS for an IP-literal domain"
+                    ));
+                }
+                if endpoint.address.port() == 0 {
                     return Err(format!(
                         "s2s.routes.{domain}[{index}] must not use port zero"
                     ));
@@ -639,6 +646,51 @@ impl S2sConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct S2sRouteEndpoint {
+    pub address: SocketAddr,
+    pub tls_mode: TlsMode,
+}
+
+impl From<SocketAddr> for S2sRouteEndpoint {
+    fn from(address: SocketAddr) -> Self {
+        Self {
+            address,
+            tls_mode: TlsMode::StartTls,
+        }
+    }
+}
+
+impl std::str::FromStr for S2sRouteEndpoint {
+    type Err = std::net::AddrParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse::<SocketAddr>().map(Into::into)
+    }
+}
+
+impl<'de> Deserialize<'de> for S2sRouteEndpoint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            address: SocketAddr,
+            #[serde(default)]
+            tls_mode: TlsMode,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Legacy(SocketAddr),
+            Fields(Fields),
+        }
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Legacy(address) => address.into(),
+            Value::Fields(Fields { address, tls_mode }) => Self { address, tls_mode },
+        })
     }
 }
 

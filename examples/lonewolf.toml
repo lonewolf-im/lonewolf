@@ -377,8 +377,10 @@
 
 # Use fixed endpoints for a domain instead of DNS.
 # Peer certificates are still checked against the domain name.
-# Each domain needs at least one endpoint with a nonzero port; this value is an example.
-# "remote.example" = ["127.0.0.1:5269"]
+# Each domain needs at least one numeric endpoint with a nonzero port.
+# Strings use STARTTLS; tables select starttls or direct, with starttls when omitted.
+# Direct TLS requires a DNS domain name. These values are examples.
+# "remote.example" = ["127.0.0.1:5269", { address = "127.0.0.1:5270", tls_mode = "direct" }]
 
 # [storage]
 

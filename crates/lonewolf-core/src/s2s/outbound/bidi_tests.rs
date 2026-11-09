@@ -122,7 +122,7 @@ impl Fixture {
         config
             .s2s
             .routes
-            .insert("remote.test".into(), vec![address]);
+            .insert("remote.test".into(), vec![address.into()]);
         let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
         let trust = PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?;
         let directory = tempfile::tempdir()?;

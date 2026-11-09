@@ -11,7 +11,8 @@ use std::process::Command;
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
     AccountConfig, ClientCertificateConfig, Config, ConfigError, HostConfig, HostTlsConfig,
-    HostTlsSource, MetricsConfig, StoreConfig, TcpListenerConfig, XmppConfig,
+    HostTlsSource, MetricsConfig, S2sRouteEndpoint, StoreConfig, TcpListenerConfig, TlsMode,
+    XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
 use lonewolf_extension::{Extensions, HostSelection};
@@ -950,10 +951,16 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
     );
     expected.s2s.tls.trust_anchors_path = Some("./certs/federation-roots.pem".into());
     expected.s2s.tls.crls_path = Some("./certs/federation-crls.pem".into());
-    expected
-        .s2s
-        .routes
-        .insert("remote.example".into(), vec!["127.0.0.1:5269".parse()?]);
+    expected.s2s.routes.insert(
+        "remote.example".into(),
+        vec![
+            "127.0.0.1:5269".parse()?,
+            S2sRouteEndpoint {
+                address: "127.0.0.1:5270".parse()?,
+                tls_mode: TlsMode::Direct,
+            },
+        ],
+    );
     expected.xmpp.default_host = Some("localhost".into());
     expected.c2s.listeners[0].limits = Some("default".into());
     expected.c2s.listeners.push(TcpListenerConfig {
@@ -1592,6 +1599,56 @@ fn s2s_listener_overlap_exemptions_and_normalized_routes_are_valid() -> TestResu
     ] {
         let file = config_file(contents)?;
         Config::load(Some(file.path()))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn s2s_route_tables_preserve_order_and_default_to_starttls() -> TestResult {
+    let config: Config = toml::from_str(
+        "[s2s.routes]\n'remote.example' = [{ address='127.0.0.1:5270', tls_mode='direct' }, '127.0.0.1:5269', { address='[::1]:5270' }]",
+    )?;
+    assert_eq!(
+        config.s2s.routes["remote.example"],
+        [
+            S2sRouteEndpoint {
+                address: "127.0.0.1:5270".parse()?,
+                tls_mode: TlsMode::Direct
+            },
+            "127.0.0.1:5269".parse()?,
+            "[::1]:5270".parse()?,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn s2s_route_tables_reject_invalid_shapes_and_direct_literal_domains() -> TestResult {
+    for endpoint in [
+        "{}",
+        "{ address='hostname:5270' }",
+        "{ address='127.0.0.1:5270', tls_mode='DIRECT' }",
+        "{ address='127.0.0.1:5270', extra=true }",
+    ] {
+        assert!(
+            toml::from_str::<Config>(&format!("[s2s.routes]\n'remote.example'=[{endpoint}]"))
+                .is_err()
+        );
+    }
+    for (domain, address) in [
+        ("127.0.0.2", "127.0.0.1:5270"),
+        ("[::1]", "[::1]:5270"),
+        ("remote.example", "127.0.0.1:0"),
+    ] {
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            file.path(),
+            format!("[s2s.routes]\n'{domain}'=[{{address='{address}',tls_mode='direct'}}]"),
+        )?;
+        assert!(matches!(
+            Config::load(Some(file.path())),
+            Err(ConfigError::Invalid { .. })
+        ));
     }
     Ok(())
 }

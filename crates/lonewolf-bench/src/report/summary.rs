@@ -501,7 +501,7 @@ fn environment(text: &mut String, report: &RunReport) {
     text.push_str("\n## Environment\n\n");
     let _ = writeln!(
         text,
-        "- Driver: lonewolf-bench {} ({}, {} build), {} workers, {} CPU jobs at once.",
+        "- Driver: lonewolfbench {} ({}, {} build), {} workers, {} CPU jobs at once.",
         d.version,
         short(&d.revision),
         d.build_profile,

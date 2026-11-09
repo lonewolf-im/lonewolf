@@ -307,7 +307,7 @@ impl LocalFixture {
         let (directory, certificate, credentials) = control
             .run_cpu(cpu, move |_| {
                 let directory = tempfile::Builder::new()
-                    .prefix("lonewolf-bench-")
+                    .prefix("lonewolfbench-")
                     .permissions(std::fs::Permissions::from_mode(0o700))
                     .tempdir()
                     .map_err(|_| failure("fixture_directory"))?;

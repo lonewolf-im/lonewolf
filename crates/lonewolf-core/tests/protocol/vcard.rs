@@ -1102,7 +1102,7 @@ fn vcard_full_get_hidden_disconnected_and_directed_visibility_never_fall_back_to
         "account card"
     );
     alice.close()?;
-    drain_presence(&mut bob)?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/new' to='bob@localhost/reader' type='unavailable'/>")?;
     bob.close()
 }
 

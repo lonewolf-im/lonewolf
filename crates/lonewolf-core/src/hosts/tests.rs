@@ -1311,3 +1311,101 @@ fn managed_usage_extensions_apply_to_every_chain_member_including_unavailable_ma
     }
     Ok(())
 }
+
+#[test]
+fn direct_sni_selects_host_policy_and_one_certificate_generation() -> TestResult {
+    use super::test_support::{handshake_named, material};
+    use std::sync::Arc;
+    compio::runtime::Runtime::new()?.block_on(async {
+        let fixture = super::client_identity::tests::Fixture::new()?;
+        let plain = test_tls_files(&fixture.directory, "localhost", "plain")?;
+        let mut authenticated =
+            test_tls_files(&fixture.directory, "xn--bcher-kva.example", "authenticated")?;
+        authenticated.client_auth = Some(fixture.config.clone());
+        let config = BTreeMap::from([
+            (
+                "localhost".into(),
+                HostConfig {
+                    tls: Some(plain),
+                    ..HostConfig::default()
+                },
+            ),
+            (
+                "bücher.example".into(),
+                HostConfig {
+                    tls: Some(authenticated),
+                    ..HostConfig::default()
+                },
+            ),
+        ]);
+        let hosts = Hosts::new(&config, Some("localhost"))?;
+        assert_eq!(hosts.host_for_sni(None), None);
+        assert_eq!(hosts.host_for_sni(Some("unknown.example")), None);
+        assert_eq!(hosts.host_for_sni(Some("LOCALHOST")), Some("localhost"));
+        assert_eq!(
+            hosts.host_for_sni(Some("XN--BCHER-KVA.EXAMPLE")),
+            Some("bücher.example")
+        );
+        assert!(!super::sni_matches_domain("127.0.0.1", "127.0.0.1"));
+        let mut roots = rustls::RootCertStore::empty();
+        for domain in hosts.host_names() {
+            roots.add(hosts.certified_key(domain).ok_or("missing key")?.cert[0].clone())?;
+        }
+        let baseline = hosts
+            .tls_handshake("localhost")
+            .await
+            .ok_or("no STARTTLS config")?;
+        for (domain, name, policy) in [
+            ("localhost", "localhost", false),
+            ("bücher.example", "xn--bcher-kva.example", true),
+        ] {
+            let selected = hosts
+                .direct_tls_handshake(domain, b"xmpp-client")
+                .await
+                .ok_or("no direct config")?;
+            assert_eq!(selected.config.alpn_protocols, [b"xmpp-client".to_vec()]);
+            assert_eq!(
+                selected.server_end_point,
+                hosts
+                    .tls_server_end_point(domain)
+                    .ok_or("missing endpoint")?
+            );
+            assert_eq!(hosts.client_certificate_policy(domain).is_some(), policy);
+            let client = rustls::ClientConfig::builder_with_provider(hosts.crypto_provider())
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth();
+            let (peer, _) = handshake_named(Arc::new(client), Arc::clone(&selected.config), name)?;
+            assert_eq!(
+                peer.peer_certificates().ok_or("missing peer")?[0],
+                hosts.certified_key(domain).ok_or("missing key")?.cert[0]
+            );
+            let hash =
+                sha2::Sha256::digest(peer.peer_certificates().ok_or("missing peer")?[0].as_ref());
+            assert_eq!(selected.server_end_point.as_ref(), hash.as_slice());
+            let (certificate, key) =
+                material(CertificateParams::new(vec!["untrusted.example".into()])?)?;
+            let client = rustls::ClientConfig::builder_with_provider(hosts.crypto_provider())
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots.clone())
+                .with_client_auth_cert(vec![certificate], key)?;
+            assert_eq!(
+                handshake_named(Arc::new(client), selected.config, name).is_err(),
+                policy
+            );
+        }
+        let after = hosts
+            .tls_handshake("localhost")
+            .await
+            .ok_or("no cached config")?;
+        assert!(Arc::ptr_eq(&baseline.config, &after.config));
+        assert!(after.config.alpn_protocols.is_empty());
+        let mut client = rustls::ClientConfig::builder_with_provider(hosts.crypto_provider())
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.enable_sni = false;
+        handshake_named(Arc::new(client), after.config, "localhost")?;
+        Ok(())
+    })
+}

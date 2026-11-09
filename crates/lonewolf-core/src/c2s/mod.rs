@@ -190,18 +190,22 @@ impl Listeners {
                                 auth: Arc::clone(auth),
                                 router: router.clone(),
                             },
-                            settings: StreamSettings::new(
-                                config.auth_mechanisms,
-                                profile,
-                                StreamTimeouts {
-                                    establishment: establishment_timeout,
-                                    authentication: authentication_timeout,
-                                    binding: binding_timeout,
-                                },
-                                limits.max_resources_per_account,
-                                allocator.clone(),
-                                worker_metrics.clone(),
-                            ),
+                            settings: {
+                                let mut settings = StreamSettings::new(
+                                    config.auth_mechanisms,
+                                    profile,
+                                    StreamTimeouts {
+                                        establishment: establishment_timeout,
+                                        authentication: authentication_timeout,
+                                        binding: binding_timeout,
+                                    },
+                                    limits.max_resources_per_account,
+                                    allocator.clone(),
+                                    worker_metrics.clone(),
+                                );
+                                settings.tls_mode = config.tls_mode;
+                                settings
+                            },
                             metrics: worker_metrics,
                         }
                     }

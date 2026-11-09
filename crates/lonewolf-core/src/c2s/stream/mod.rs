@@ -101,6 +101,7 @@ pub(super) struct XmppStream<A: ChunkAllocator> {
 
 #[derive(Clone)]
 pub(super) struct StreamSettings<A: ChunkAllocator> {
+    pub(super) tls_mode: crate::config::TlsMode,
     auth_mechanisms: AuthMechanisms,
     sasl_features: Option<Arc<str>>,
     external_sasl_features: Option<Arc<str>>,
@@ -138,6 +139,7 @@ impl<A: ChunkAllocator> StreamSettings<A> {
         metrics: C2sWorkerMetrics,
     ) -> Self {
         Self {
+            tls_mode: crate::config::TlsMode::StartTls,
             auth_mechanisms,
             sasl_features: sasl_features(auth_mechanisms, false).map(Arc::from),
             external_sasl_features: sasl_features(auth_mechanisms, true).map(Arc::from),

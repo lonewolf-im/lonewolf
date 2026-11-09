@@ -27,6 +27,8 @@ mod stream;
 
 mod tls_hosts;
 
+mod direct_tls;
+
 mod routing;
 
 mod stanza_rate;

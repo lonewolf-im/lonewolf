@@ -209,11 +209,13 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     recipients: RecipientLimiter,
 ) -> CloseOutcome {
     let Bound {
-        session: Session {
-            reader,
-            writer,
-            close,
-        },
+        session:
+            Session {
+                reader,
+                writer,
+                close,
+                ..
+            },
         monitor,
         registration,
         router,

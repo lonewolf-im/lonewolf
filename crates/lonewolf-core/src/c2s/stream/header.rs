@@ -44,6 +44,22 @@ pub(super) fn validate_header<A: ChunkAllocator>(
     extra_header_namespaces: bool,
     hosts: &Hosts,
 ) -> Result<ClientHeader, CloseOutcome> {
+    validate_header_with_default(
+        header,
+        content_namespace,
+        extra_header_namespaces,
+        hosts,
+        hosts.default_host_name(),
+    )
+}
+
+pub(super) fn validate_header_with_default<A: ChunkAllocator>(
+    header: &Parsed<Element, A>,
+    content_namespace: &str,
+    extra_header_namespaces: bool,
+    hosts: &Hosts,
+    default_host: &str,
+) -> Result<ClientHeader, CloseOutcome> {
     if extra_header_namespaces
         || !matches!(content_namespace, "" | CLIENT_NAMESPACE | STREAM_NAMESPACE)
     {
@@ -78,7 +94,7 @@ pub(super) fn validate_header<A: ChunkAllocator>(
             }
             jid.domainpart().to_owned()
         }
-        None => hosts.default_host_name().to_owned(),
+        None => default_host.to_owned(),
     };
     let response_to = from
         .map(|from| {

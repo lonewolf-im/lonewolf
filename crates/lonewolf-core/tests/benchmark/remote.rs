@@ -11,7 +11,7 @@ mod peer;
 mod support;
 
 use bench_support::{SECRET, TestResult, artifacts, cli, private_write};
-use lonewolf_bench::{
+use lonewolfbench::{
     config::{RunConfig, ScenarioConfig, TargetConfig},
     report::RunStatus,
 };
@@ -134,7 +134,7 @@ fn compare_cli(
     a: &Path,
     b: &Path,
     out: &Path,
-) -> TestResult<lonewolf_bench::compare::ComparisonReport> {
+) -> TestResult<lonewolfbench::compare::ComparisonReport> {
     let output = cli(
         binary(),
         &[
@@ -145,7 +145,7 @@ fn compare_cli(
             out.as_os_str(),
         ],
     )?;
-    let report: lonewolf_bench::compare::ComparisonReport =
+    let report: lonewolfbench::compare::ComparisonReport =
         serde_json::from_slice(&fs::read(out.join("comparison.json"))?)?;
     assert_eq!(
         output.status.code(),

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 /// Runs repeatable XMPP workloads against a Lonewolf server and compares results.
 #[derive(Parser)]
-#[command(name = "lonewolfbench", version, about, long_about = None)]
+#[command(version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

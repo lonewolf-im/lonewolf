@@ -5,8 +5,8 @@
 mod bench_support;
 
 use bench_support::{TestResult, artifacts, local_config};
-use lonewolf_bench::cpu::CpuPool;
-use lonewolf_bench::{
+use lonewolfbench::cpu::CpuPool;
+use lonewolfbench::{
     client::{self, KeyMode},
     compare::compare_runs,
     config::ScenarioConfig,
@@ -122,8 +122,8 @@ async fn all_local_scenarios_persist_complete_accounting_and_release_sessions() 
         assert!(log.contains("c2s TCP listener stopped"));
         assert!(log.contains("metrics service stopped"));
         assert!(persisted.phases.iter().any(|phase| phase.name
-            == lonewolf_bench::report::PhaseName::LocalChildShutdown
-            && phase.status == lonewolf_bench::report::PhaseStatus::Completed));
+            == lonewolfbench::report::PhaseName::LocalChildShutdown
+            && phase.status == lonewolfbench::report::PhaseStatus::Completed));
     }
     Ok(())
 }
@@ -179,8 +179,8 @@ async fn repeated_real_runs_have_fresh_fixtures_and_comparable_a_a_results() -> 
             body_bytes: 64,
         },
     );
-    let a = lonewolf_bench::run(config.clone(), &directory.path().join("a")).await?;
-    let b = lonewolf_bench::run(config, &directory.path().join("b")).await?;
+    let a = lonewolfbench::run(config.clone(), &directory.path().join("a")).await?;
+    let b = lonewolfbench::run(config, &directory.path().join("b")).await?;
     assert_eq!(a.status, RunStatus::Passed);
     assert_eq!(b.status, RunStatus::Passed);
     assert_ne!(a.run_id, b.run_id);

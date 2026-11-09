@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_bench::accounts::{
+use lonewolfbench::accounts::{
     CredentialSet, ProvisionSummary, generate_credentials, provision_accounts,
 };
 use std::{

@@ -45,7 +45,7 @@ Build the server and the tool, then run the message workload. It takes a
 little over a minute: 10 s of warmup and 60 s of measurement.
 
 ```sh
-cargo build --release -p lonewolf -p lonewolf-bench --locked
+cargo build --release -p lonewolf -p lonewolfbench --locked
 ./target/release/lonewolfbench run \
   --config examples/bench/messages.toml \
   --output /tmp/bench-messages
@@ -239,7 +239,7 @@ A typical A/B comparison of a branch against `main`:
 ```sh
 mkdir -p /tmp/ab
 git switch main
-cargo build --release -p lonewolf -p lonewolf-bench --locked
+cargo build --release -p lonewolf -p lonewolfbench --locked
 cp target/release/lonewolf /tmp/ab/lonewolf-a
 cp target/release/lonewolfbench /tmp/ab/lonewolfbench
 

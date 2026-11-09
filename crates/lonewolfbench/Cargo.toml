@@ -1,14 +1,10 @@
 [package]
-name = "lonewolf-bench"
+name = "lonewolfbench"
 description = "Reproducible Unix XMPP workload measurements"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-
-[[bin]]
-name = "lonewolfbench"
-path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true

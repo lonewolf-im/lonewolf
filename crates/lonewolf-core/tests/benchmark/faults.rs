@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use lonewolf_bench::{
+use lonewolfbench::{
     config::MetricsConfig,
     report::{PhaseName, ReasonCode, TelemetryStatus},
     telemetry::{MetricsEndpoint, PhaseSampleRequest, SamplerConfig, TelemetrySampler},
@@ -101,7 +101,7 @@ fn scripted_socket_delivery_faults_preserve_accounting_and_reader_identity() -> 
         let path = config_file(directory.path(), "config", &config)?;
         let out = directory.path().join("result");
         let output = run_cli(&path, &out)?;
-        let report = lonewolf_bench::report::RunReport::read(&out)?;
+        let report = lonewolfbench::report::RunReport::read(&out)?;
         let c = &report.counters;
         assert_eq!(c.planned, 1, "{behavior:?}: {:?}", report.reasons);
         assert_eq!(c.dispatched, 1, "{behavior:?}");
@@ -604,7 +604,7 @@ async fn bounded_control_saturation_does_not_block_and_is_retained_after_join() 
     assert!(refused > 0);
     let (report, raw) = sampler.stop(Instant::now()).await?;
     assert_eq!(report.queue_overflows, refused);
-    assert!(raw.len() <= lonewolf_bench::telemetry::RAW_CAPACITY);
+    assert!(raw.len() <= lonewolfbench::telemetry::RAW_CAPACITY);
     http.finish().await?;
     Ok(())
 }
@@ -631,7 +631,7 @@ async fn raw_output_saturation_keeps_complete_records_and_continues_collection()
     let (report, raw) = sampler
         .stop(Instant::now() + Duration::from_secs(3))
         .await?;
-    assert!(raw.len() <= lonewolf_bench::telemetry::RAW_CAPACITY);
+    assert!(raw.len() <= lonewolfbench::telemetry::RAW_CAPACITY);
     assert!(
         report
             .reasons
@@ -669,15 +669,15 @@ async fn real_workload_restart_invalidates_comparison_while_missing_metrics_only
             *metrics_url = Some(http.url.clone());
         }
         let out = directory.path().join("result");
-        let report = lonewolf_bench::run(config, &out).await?;
+        let report = lonewolfbench::run(config, &out).await?;
         http.request().await?;
         if matches!(fault, HttpFault::Restart | HttpFault::BuildChange) {
             assert_eq!(report.status, RunStatus::Invalid);
-            assert!(!lonewolf_bench::compare::compare_runs(&report, &report).comparable);
+            assert!(!lonewolfbench::compare::compare_runs(&report, &report).comparable);
         } else {
             assert_eq!(report.status, RunStatus::Passed);
             assert_ne!(report.telemetry.quality, TelemetryStatus::Complete);
-            assert!(lonewolf_bench::compare::compare_runs(&report, &report).comparable);
+            assert!(lonewolfbench::compare::compare_runs(&report, &report).comparable);
         }
         http.finish().await?;
         peer.finish()?;
@@ -773,17 +773,17 @@ fn phase_signal_child() -> TestResult {
         config.measurement.duration_ms=if phase==PhaseName::Measurement{10000}else{1000};
         let mut http=if phase==PhaseName::TargetSetup{Some(HttpServer::start(HttpFault::SlowHeaders).await?)}else{None};
         if let (Some(http),TargetConfig::Remote{metrics_url,..})=(&http,&mut config.target){*metrics_url=Some(http.url.clone());config.metrics.timeout_ms=10000;}
-        let (observer,mut events)=lonewolf_bench::run::events::RunObserver::bounded(std::num::NonZeroUsize::new(128).ok_or("capacity")?);
+        let (observer,mut events)=lonewolfbench::run::events::RunObserver::bounded(std::num::NonZeroUsize::new(128).ok_or("capacity")?);
         let signals=tokio::spawn(async move {
             while let Some(event)=events.recv().await {
-                if matches!(event,lonewolf_bench::run::events::ObserverEvent::PhaseStarted(observed) if observed==phase){
+                if matches!(event,lonewolfbench::run::events::ObserverEvent::PhaseStarted(observed) if observed==phase){
                     fs::write(&marker,b"ready")?;
                     return Ok::<_,std::io::Error>(());
                 }
             }
             Err(std::io::Error::other("phase not entered"))
         });
-        let report=lonewolf_bench::run::run_with_observer(config,&output,observer).await?;
+        let report=lonewolfbench::run::run_with_observer(config,&output,observer).await?;
         signals.await??;
         if let Some(http)=http.take(){http.finish().await?;}
         Ok::<_,Box<dyn std::error::Error>>(report)
@@ -839,8 +839,8 @@ async fn actual_cli_ctrl_c_during_pending_setup_closes_http_before_returning() -
 
 #[tokio::test]
 async fn destination_receipt_can_be_consumed_before_queued_sender_completion() -> TestResult {
-    use lonewolf_bench::cpu::CpuPool;
-    use lonewolf_bench::{
+    use lonewolfbench::cpu::CpuPool;
+    use lonewolfbench::{
         client::{
             self, EventSink, KeyMode, MessageCommand, MessageRoute, PreparedAccount, ReceiveRoute,
             ReceivedKind, TrafficPhase, WriteCommand,
@@ -974,11 +974,11 @@ async fn destination_receipt_can_be_consumed_before_queued_sender_completion() -
 #[tokio::test]
 async fn nonreading_tls_peer_forces_write_cancellation_and_forbids_connection_reuse() -> TestResult
 {
-    use lonewolf_bench::client::{
+    use lonewolfbench::client::{
         self, CorrelationId, EventSink, KeyMode, MessageCommand, MessageRoute, PreparedAccount,
         TrafficPhase, WriteCommand,
     };
-    use lonewolf_bench::cpu::CpuPool;
+    use lonewolfbench::cpu::CpuPool;
     let directory = tempfile::tempdir()?;
     let peer = peer::Peer::start(directory.path(), peer::Behavior::NoRead)?;
     let target = client::ResolvedTarget {
@@ -1025,7 +1025,7 @@ async fn nonreading_tls_peer_forces_write_cancellation_and_forbids_connection_re
             writer.send(&command(sequence), &events).await?;
             while queue.try_recv().is_ok() {}
         }
-        Ok::<_, lonewolf_bench::error::BenchError>(())
+        Ok::<_, lonewolfbench::error::BenchError>(())
     })
     .await;
     assert!(stopped.is_err());

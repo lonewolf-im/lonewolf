@@ -140,9 +140,16 @@ fn escape_attribute(output: &mut String, value: &str) {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HeaderKind {
+    Initial,
+    Response,
+}
+
 fn validate_header<A: ChunkAllocator>(
     header: &Parsed<Element, A>,
     content_namespace: &str,
+    kind: HeaderKind,
 ) -> Result<(), StreamErrorCondition> {
     if !matches!(content_namespace, "" | SERVER_NAMESPACE) {
         return Err(StreamErrorCondition::InvalidNamespace);
@@ -162,7 +169,8 @@ fn validate_header<A: ChunkAllocator>(
         || minor.is_empty()
         || !major.bytes().all(|digit| digit.is_ascii_digit())
         || !minor.bytes().all(|digit| digit.is_ascii_digit())
-        || major.trim_start_matches('0') != "1"
+        || major.trim_start_matches('0').is_empty()
+        || (kind == HeaderKind::Response && major.trim_start_matches('0') != "1")
     {
         return Err(StreamErrorCondition::UnsupportedVersion);
     }
@@ -195,7 +203,7 @@ pub(crate) fn validate_initial_header<A: ChunkAllocator>(
     header: &Parsed<Element, A>,
     content_namespace: &str,
 ) -> Result<InitialHeader, StreamErrorCondition> {
-    validate_header(header, content_namespace)?;
+    validate_header(header, content_namespace, HeaderKind::Initial)?;
     let header = header
         .value()
         .resolve(header.arena())
@@ -218,7 +226,7 @@ pub(crate) fn validate_response_header<A: ChunkAllocator>(
     content_namespace: &str,
     expected_from: &str,
 ) -> Result<(), StreamErrorCondition> {
-    validate_header(header, content_namespace)?;
+    validate_header(header, content_namespace, HeaderKind::Response)?;
     let header = header
         .value()
         .resolve(header.arena())

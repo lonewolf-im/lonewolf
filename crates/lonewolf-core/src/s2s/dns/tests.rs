@@ -26,6 +26,22 @@ impl Server {
     fn start(
         mut respond: impl FnMut(&Message) -> Vec<Message> + Send + 'static,
     ) -> io::Result<Self> {
+        Self::with_services(move |query| {
+            if query.queries[0]
+                .name()
+                .to_ascii()
+                .starts_with("_xmpps-server.")
+            {
+                vec![response(query, ResponseCode::NXDomain, vec![])]
+            } else {
+                respond(query)
+            }
+        })
+    }
+
+    fn with_services(
+        mut respond: impl FnMut(&Message) -> Vec<Message> + Send + 'static,
+    ) -> io::Result<Self> {
         let socket = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
         let address = socket.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -180,8 +196,9 @@ fn priority_and_inclusive_weighted_order() {
     let ordered = order_srv(records, &mut |total| {
         let (expected, value) = choices.next().unwrap();
         assert_eq!(total, expected);
-        value
-    });
+        Ok(value)
+    })
+    .unwrap();
     assert_eq!(
         ordered.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
         ["zero", "three", "five", "last"]
@@ -248,10 +265,8 @@ fn single_dot_disables_service_without_fallback() -> TestResult {
         resolve(&server.resolver()?, "remote.example").unwrap_err(),
         ResolveError::NoService
     );
-    assert_eq!(
-        server.queries(),
-        vec![("_xmpp-server._tcp.remote.example.".into(), RecordType::SRV)]
-    );
+    assert_both_services(&server.queries());
+    assert_eq!(server.queries().len(), 2);
     Ok(())
 }
 
@@ -275,7 +290,7 @@ fn nxdomain_nodata_servfail_refused_srv_fall_back() -> TestResult {
             ResolvedVia::Fallback,
             5269,
         );
-        assert_eq!(server.queries().len(), 3);
+        assert_eq!(server.queries().len(), 4);
     }
     Ok(())
 }
@@ -354,10 +369,17 @@ fn srv_ipv6_first_idna_and_cname_final_owner_only() -> TestResult {
         ResolvedVia::Srv,
         5270,
     );
-    assert_eq!(
-        server.queries()[0].0,
-        "_xmpp-server._tcp.xn--bcher-kva.example."
-    );
+    let queries = server.queries();
+    for service in [
+        "_xmpp-server._tcp.xn--bcher-kva.example.",
+        "_xmpps-server._tcp.xn--bcher-kva.example.",
+    ] {
+        assert!(
+            queries
+                .iter()
+                .any(|(name, kind)| name == service && *kind == RecordType::SRV)
+        );
+    }
     Ok(())
 }
 
@@ -419,7 +441,7 @@ fn first_nameserver_timeout_uses_second() -> TestResult {
         ResolvedVia::Fallback,
         5269,
     );
-    assert_eq!(silent.queries().len(), 3);
+    assert_eq!(silent.queries().len(), 4);
     Ok(())
 }
 
@@ -471,34 +493,36 @@ fn truncated_udp_retries_same_nameserver_over_tcp() -> TestResult {
             .block_on(compio::time::timeout(Duration::from_secs(2), async move {
                 let udp = UdpSocket::from_std(udp)?;
                 let listener = compio::net::TcpListener::from_std(listener)?;
-                let BufResult(received, bytes) = udp.recv_from(vec![0; 65535]).await;
-                let (length, peer) = received?;
-                let request = Message::from_vec(&bytes[..length]).map_err(io::Error::other)?;
-                let mut truncated = response(&request, ResponseCode::NoError, vec![]);
-                truncated.metadata.truncation = true;
-                udp.send_to(truncated.to_vec().map_err(io::Error::other)?, peer)
-                    .await
-                    .0?;
-                let (mut stream, _) = listener.accept().await?;
-                let BufResult(read, length) = stream.read_exact([0; 2]).await;
-                read?;
-                let length = usize::from(u16::from_be_bytes(length));
-                let BufResult(read, bytes) = stream.read_exact(bytes.slice(..length)).await;
-                read?;
-                let tcp =
-                    Message::from_vec(&bytes.into_inner()[..length]).map_err(io::Error::other)?;
-                assert_eq!(tcp.metadata.id, request.metadata.id);
-                assert_eq!(tcp.queries, request.queries);
-                let reply = srv(&tcp, ".", 0).to_vec().map_err(io::Error::other)?;
-                stream
-                    .write_all(
-                        u16::try_from(reply.len())
-                            .map_err(io::Error::other)?
-                            .to_be_bytes(),
-                    )
-                    .await
-                    .0?;
-                stream.write_all(reply).await.0?;
+                for _ in 0..2 {
+                    let BufResult(received, bytes) = udp.recv_from(vec![0; 65535]).await;
+                    let (length, peer) = received?;
+                    let request = Message::from_vec(&bytes[..length]).map_err(io::Error::other)?;
+                    let mut truncated = response(&request, ResponseCode::NoError, vec![]);
+                    truncated.metadata.truncation = true;
+                    udp.send_to(truncated.to_vec().map_err(io::Error::other)?, peer)
+                        .await
+                        .0?;
+                    let (mut stream, _) = listener.accept().await?;
+                    let BufResult(read, length) = stream.read_exact([0; 2]).await;
+                    read?;
+                    let length = usize::from(u16::from_be_bytes(length));
+                    let BufResult(read, bytes) = stream.read_exact(bytes.slice(..length)).await;
+                    read?;
+                    let tcp = Message::from_vec(&bytes.into_inner()[..length])
+                        .map_err(io::Error::other)?;
+                    assert_eq!(tcp.metadata.id, request.metadata.id);
+                    assert_eq!(tcp.queries, request.queries);
+                    let reply = srv(&tcp, ".", 0).to_vec().map_err(io::Error::other)?;
+                    stream
+                        .write_all(
+                            u16::try_from(reply.len())
+                                .map_err(io::Error::other)?
+                                .to_be_bytes(),
+                        )
+                        .await
+                        .0?;
+                    stream.write_all(reply).await.0?;
+                }
                 Ok(())
             }))
             .map_err(io::Error::other)?
@@ -549,21 +573,39 @@ fn cname_hop_limit_loops_and_owner_class_are_bounded() {
 }
 
 #[test]
-fn address_queries_are_concurrent() -> TestResult {
+fn service_and_address_queries_are_concurrent() -> TestResult {
     let socket = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let address = socket.local_addr()?;
     let worker = thread::spawn(move || -> io::Result<()> {
         let mut buffer = [0; 65535];
-        let (length, peer) = socket.recv_from(&mut buffer)?;
-        let query = Message::from_vec(&buffer[..length]).map_err(io::Error::other)?;
-        assert_eq!(query.queries[0].query_type(), RecordType::SRV);
-        socket.send_to(
-            &response(&query, ResponseCode::NoError, vec![])
-                .to_vec()
-                .map_err(io::Error::other)?,
-            peer,
-        )?;
+        let mut services = Vec::new();
+        for _ in 0..2 {
+            let (length, peer) = socket.recv_from(&mut buffer)?;
+            let query = Message::from_vec(&buffer[..length]).map_err(io::Error::other)?;
+            assert_eq!(query.queries[0].query_type(), RecordType::SRV);
+            services.push((query, peer));
+        }
+        let mut names: Vec<_> = services
+            .iter()
+            .map(|(query, _)| query.queries[0].name().to_ascii())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "_xmpp-server._tcp.remote.example.",
+                "_xmpps-server._tcp.remote.example."
+            ]
+        );
+        for (query, peer) in services.into_iter().rev() {
+            socket.send_to(
+                &response(&query, ResponseCode::NoError, vec![])
+                    .to_vec()
+                    .map_err(io::Error::other)?,
+                peer,
+            )?;
+        }
         let mut waiting = Vec::with_capacity(2);
         for _ in 0..2 {
             let (length, peer) = socket.recv_from(&mut buffer)?;
@@ -610,7 +652,7 @@ fn mismatch_bound_moves_to_next_nameserver() -> TestResult {
         resolve(&resolver, "remote.example").unwrap_err(),
         ResolveError::NoService
     );
-    assert_eq!(wrong.queries().len(), 1);
+    assert_eq!(wrong.queries().len(), 2);
     assert_eq!(server.queries().len(), 1);
     Ok(())
 }
@@ -820,4 +862,547 @@ fn address_expansion_preserves_target_mode_and_family_order() {
             })
             .collect::<Vec<_>>()
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ServiceReply {
+    NxDomain,
+    NoData,
+    ServFail,
+    Refused,
+    Timeout,
+    Dot,
+    MixedDot,
+    ZeroPort,
+    Usable,
+}
+
+fn service_reply(query: &Message, reply: ServiceReply, mode: TlsMode) -> Vec<Message> {
+    let target = if mode == TlsMode::Direct {
+        "direct.example."
+    } else {
+        "start.example."
+    };
+    match reply {
+        ServiceReply::NxDomain => vec![response(query, ResponseCode::NXDomain, vec![])],
+        ServiceReply::NoData => vec![response(query, ResponseCode::NoError, vec![])],
+        ServiceReply::ServFail => vec![response(query, ResponseCode::ServFail, vec![])],
+        ServiceReply::Refused => vec![response(query, ResponseCode::Refused, vec![])],
+        ServiceReply::Timeout => vec![],
+        ServiceReply::Dot => vec![srv(query, ".", 0)],
+        ServiceReply::ZeroPort => vec![srv(query, target, 0)],
+        ServiceReply::Usable => vec![srv(query, target, 5270)],
+        ServiceReply::MixedDot => {
+            let mut reply = srv(query, ".", 0);
+            reply.answers.extend(srv(query, target, 5270).answers);
+            vec![reply]
+        }
+    }
+}
+
+fn service_mode(query: &Message) -> TlsMode {
+    if query.queries[0]
+        .name()
+        .to_ascii()
+        .starts_with("_xmpps-server.")
+    {
+        TlsMode::Direct
+    } else {
+        TlsMode::StartTls
+    }
+}
+
+fn assert_both_services(queries: &[(String, RecordType)]) {
+    for service in [
+        "_xmpp-server._tcp.remote.example.",
+        "_xmpps-server._tcp.remote.example.",
+    ] {
+        assert_eq!(
+            queries
+                .iter()
+                .filter(|(name, kind)| name == service && *kind == RecordType::SRV)
+                .count(),
+            1,
+            "{queries:?}"
+        );
+    }
+}
+
+#[test]
+fn one_usable_service_survives_other_absent_unavailable_disabled_or_malformed() -> TestResult {
+    for reply in [
+        ServiceReply::NxDomain,
+        ServiceReply::NoData,
+        ServiceReply::ServFail,
+        ServiceReply::Refused,
+        ServiceReply::Timeout,
+        ServiceReply::Dot,
+        ServiceReply::MixedDot,
+        ServiceReply::ZeroPort,
+    ] {
+        for usable in [TlsMode::StartTls, TlsMode::Direct] {
+            let server = Server::with_services(move |query| {
+                if query.queries[0].query_type() == RecordType::SRV {
+                    let mode = service_mode(query);
+                    service_reply(
+                        query,
+                        if mode == usable {
+                            ServiceReply::Usable
+                        } else {
+                            reply
+                        },
+                        mode,
+                    )
+                } else {
+                    vec![address(query)]
+                }
+            })?;
+            let mut resolver = server.resolver()?;
+            resolver.timeout = Duration::from_millis(100);
+            let result = resolve(&resolver, "remote.example").unwrap();
+            assert_eq!(result.via, ResolvedVia::Srv);
+            assert_eq!(
+                result.endpoints,
+                [Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()].map(|ip| Endpoint {
+                    address: SocketAddr::new(ip, 5270),
+                    tls_mode: usable
+                })
+            );
+            let queries = server.queries();
+            assert_both_services(&queries);
+            let target = if usable == TlsMode::Direct {
+                "direct.example."
+            } else {
+                "start.example."
+            };
+            assert_eq!(queries.len(), 4);
+            assert!(
+                queries
+                    .iter()
+                    .all(|(name, kind)| *kind == RecordType::SRV || name == target),
+                "{reply:?} {usable:?}: {queries:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn both_unadvertised_services_fall_back_to_origin_starttls() -> TestResult {
+    let replies = [
+        ServiceReply::NxDomain,
+        ServiceReply::NoData,
+        ServiceReply::ServFail,
+        ServiceReply::Refused,
+        ServiceReply::Timeout,
+    ];
+    for starttls in replies {
+        for direct in replies {
+            let server = Server::with_services(move |query| {
+                if query.queries[0].query_type() == RecordType::SRV {
+                    let mode = service_mode(query);
+                    service_reply(
+                        query,
+                        if mode == TlsMode::Direct {
+                            direct
+                        } else {
+                            starttls
+                        },
+                        mode,
+                    )
+                } else {
+                    vec![address(query)]
+                }
+            })?;
+            let mut resolver = server.resolver()?;
+            resolver.timeout = Duration::from_millis(100);
+            assert_endpoints(
+                resolve(&resolver, "remote.example").unwrap(),
+                ResolvedVia::Fallback,
+                5269,
+            );
+            let queries = server.queries();
+            assert_both_services(&queries);
+            assert_eq!(queries.len(), 4);
+            assert!(
+                queries
+                    .iter()
+                    .all(|(name, kind)| *kind == RecordType::SRV || name == "remote.example.")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn dot_without_usable_other_service_never_queries_origin() -> TestResult {
+    for (other, expected) in [
+        (ServiceReply::NxDomain, ResolveError::NoService),
+        (ServiceReply::NoData, ResolveError::NoService),
+        (ServiceReply::Dot, ResolveError::NoService),
+        (ServiceReply::ServFail, ResolveError::Unavailable),
+        (ServiceReply::Refused, ResolveError::Unavailable),
+        (ServiceReply::Timeout, ResolveError::Unavailable),
+    ] {
+        for disabled in [TlsMode::StartTls, TlsMode::Direct] {
+            let server = Server::with_services(move |query| {
+                let mode = service_mode(query);
+                assert_eq!(query.queries[0].query_type(), RecordType::SRV);
+                service_reply(
+                    query,
+                    if mode == disabled {
+                        ServiceReply::Dot
+                    } else {
+                        other
+                    },
+                    mode,
+                )
+            })?;
+            let mut resolver = server.resolver()?;
+            resolver.timeout = Duration::from_millis(100);
+            assert_eq!(resolve(&resolver, "remote.example").unwrap_err(), expected);
+            assert_both_services(&server.queries());
+            assert_eq!(server.queries().len(), 2);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_and_zero_port_advertisements_never_query_targets_or_origin() -> TestResult {
+    for invalid in [ServiceReply::MixedDot, ServiceReply::ZeroPort] {
+        for mode in [TlsMode::StartTls, TlsMode::Direct] {
+            let server = Server::with_services(move |query| {
+                assert_eq!(query.queries[0].query_type(), RecordType::SRV);
+                let selected = service_mode(query);
+                service_reply(
+                    query,
+                    if selected == mode {
+                        invalid
+                    } else {
+                        ServiceReply::NxDomain
+                    },
+                    selected,
+                )
+            })?;
+            assert_eq!(
+                resolve(&server.resolver()?, "remote.example").unwrap_err(),
+                ResolveError::NotFound
+            );
+            assert_both_services(&server.queries());
+            assert_eq!(server.queries().len(), 2);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn advertised_targets_with_empty_or_failed_addresses_never_fall_back() -> TestResult {
+    for failure in [
+        Some(ResponseCode::NoError),
+        Some(ResponseCode::NXDomain),
+        Some(ResponseCode::ServFail),
+        Some(ResponseCode::Refused),
+        None,
+    ] {
+        for mode in [TlsMode::StartTls, TlsMode::Direct] {
+            let server = Server::with_services(move |query| {
+                if query.queries[0].query_type() == RecordType::SRV {
+                    let selected = service_mode(query);
+                    service_reply(
+                        query,
+                        if selected == mode {
+                            ServiceReply::Usable
+                        } else {
+                            ServiceReply::NoData
+                        },
+                        selected,
+                    )
+                } else {
+                    failure
+                        .map(|code| response(query, code, vec![]))
+                        .into_iter()
+                        .collect()
+                }
+            })?;
+            let mut resolver = server.resolver()?;
+            resolver.timeout = Duration::from_millis(100);
+            assert_eq!(
+                resolve(&resolver, "remote.example").unwrap_err(),
+                ResolveError::NotFound
+            );
+            let queries = server.queries();
+            assert_both_services(&queries);
+            let target = if mode == TlsMode::Direct {
+                "direct.example."
+            } else {
+                "start.example."
+            };
+            assert!(
+                queries
+                    .iter()
+                    .all(|(name, kind)| *kind == RecordType::SRV || name == target)
+            );
+            assert_eq!(queries.len(), 4);
+        }
+    }
+    Ok(())
+}
+
+fn weighted_srv(query: &Message, priority: u16, weight: u16, port: u16, target: &str) -> Record {
+    record(
+        &query.queries[0].name().to_ascii(),
+        RData::SRV(SRV::new(
+            priority,
+            weight,
+            port,
+            Name::from_ascii(target).unwrap(),
+        )),
+    )
+}
+
+#[test]
+fn mixed_service_priorities_interleave_in_either_transport_order() -> TestResult {
+    for first in [TlsMode::StartTls, TlsMode::Direct] {
+        let server = Server::with_services(move |query| {
+            if query.queries[0].query_type() != RecordType::SRV {
+                return vec![address(query)];
+            }
+            let base = if service_mode(query) == first { 0 } else { 10 };
+            vec![response(
+                query,
+                ResponseCode::NoError,
+                vec![
+                    weighted_srv(query, base, 0, 5270 + base, "target.example."),
+                    weighted_srv(query, base + 20, 0, 5290 + base, "target.example."),
+                ],
+            )]
+        })?;
+        let result = resolve(&server.resolver()?, "remote.example").unwrap();
+        let second = if first == TlsMode::Direct {
+            TlsMode::StartTls
+        } else {
+            TlsMode::Direct
+        };
+        let expected: Vec<_> = [(5270, first), (5280, second), (5290, first), (5300, second)]
+            .into_iter()
+            .flat_map(|(port, tls_mode)| {
+                [Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()].map(|ip| Endpoint {
+                    address: SocketAddr::new(ip, port),
+                    tls_mode,
+                })
+            })
+            .collect();
+        assert_eq!(result.endpoints, expected);
+        assert_eq!(result.via, ResolvedVia::Srv);
+        assert_both_services(&server.queries());
+    }
+    Ok(())
+}
+
+#[test]
+fn mixed_weights_share_inclusive_zero_boundary_and_random_failures() {
+    let answer = |records| Ok(Answer { records });
+    let records = merge_srv([
+        classify_srv(
+            answer(vec![
+                RData::SRV(SRV::new(
+                    0,
+                    5,
+                    5270,
+                    Name::from_ascii("start-five.").unwrap(),
+                )),
+                RData::SRV(SRV::new(
+                    0,
+                    0,
+                    5270,
+                    Name::from_ascii("start-zero.").unwrap(),
+                )),
+            ]),
+            TlsMode::StartTls,
+        ),
+        classify_srv(
+            answer(vec![
+                RData::SRV(SRV::new(
+                    0,
+                    3,
+                    5270,
+                    Name::from_ascii("direct-three.").unwrap(),
+                )),
+                RData::SRV(SRV::new(
+                    0,
+                    0,
+                    5270,
+                    Name::from_ascii("direct-zero.").unwrap(),
+                )),
+            ]),
+            TlsMode::Direct,
+        ),
+    ])
+    .unwrap()
+    .unwrap();
+    let mut choices = [(8, 0), (8, 0), (8, 8), (5, 5)].into_iter();
+    let ordered = order_srv(records, &mut |total| {
+        let (expected, value) = choices.next().unwrap();
+        assert_eq!(total, expected);
+        Ok(value)
+    })
+    .unwrap();
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|target| (target.name.as_ref(), target.tls_mode))
+            .collect::<Vec<_>>(),
+        [
+            ("start-zero.", TlsMode::StartTls),
+            ("direct-zero.", TlsMode::Direct),
+            ("direct-three.", TlsMode::Direct),
+            ("start-five.", TlsMode::StartTls)
+        ]
+    );
+    assert!(choices.next().is_none());
+    let records = vec![
+        (
+            0,
+            0,
+            SrvTarget {
+                name: "start.".into(),
+                port: 5270,
+                tls_mode: TlsMode::StartTls,
+            },
+        ),
+        (
+            0,
+            0,
+            SrvTarget {
+                name: "direct.".into(),
+                port: 5270,
+                tls_mode: TlsMode::Direct,
+            },
+        ),
+    ];
+    let ordered = order_srv(records, &mut |total| {
+        assert_eq!(total, 0);
+        Ok(0)
+    })
+    .unwrap();
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|target| target.tls_mode)
+            .collect::<Vec<_>>(),
+        [TlsMode::StartTls, TlsMode::Direct]
+    );
+    let records = vec![(
+        0,
+        0,
+        SrvTarget {
+            name: "direct.".into(),
+            port: 5270,
+            tls_mode: TlsMode::Direct,
+        },
+    )];
+    assert!(matches!(
+        order_srv(records, &mut |_| Err(ResolveError::Unavailable)),
+        Err(ResolveError::Unavailable)
+    ));
+}
+
+#[test]
+fn mixed_service_endpoints_deduplicate_pairs_with_one_shared_cap() -> TestResult {
+    let server = Server::with_services(|query| {
+        if query.queries[0].query_type() == RecordType::SRV {
+            let offset = u16::from(service_mode(query) == TlsMode::Direct);
+            let records = (1..=12)
+                .flat_map(|last| {
+                    let value = weighted_srv(
+                        query,
+                        (last - 1) * 2 + offset,
+                        0,
+                        5270,
+                        &format!("t{last}.example."),
+                    );
+                    [value.clone(), value]
+                })
+                .collect();
+            return vec![response(query, ResponseCode::NoError, records)];
+        }
+        let records = if query.queries[0].query_type() == RecordType::A {
+            let name = query.queries[0].name().to_ascii();
+            let last: u8 = name
+                .strip_prefix('t')
+                .unwrap()
+                .split('.')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let value = record(&name, RData::A(A(Ipv4Addr::new(192, 0, 2, last))));
+            vec![value.clone(), value]
+        } else {
+            vec![]
+        };
+        vec![response(query, ResponseCode::NoError, records)]
+    })?;
+    let result = resolve(&server.resolver()?, "remote.example").unwrap();
+    let expected: Vec<_> = (1..=8)
+        .flat_map(|last| {
+            [TlsMode::StartTls, TlsMode::Direct].map(|tls_mode| Endpoint {
+                address: SocketAddr::from(([192, 0, 2, last], 5270)),
+                tls_mode,
+            })
+        })
+        .collect();
+    assert_eq!(result.endpoints, expected);
+    assert_both_services(&server.queries());
+    assert!(
+        !server
+            .queries()
+            .iter()
+            .any(|(name, _)| name == "t9.example.")
+    );
+    Ok(())
+}
+
+#[test]
+fn either_service_preserves_ipv6_only_and_ipv4_only_targets() -> TestResult {
+    for mode in [TlsMode::StartTls, TlsMode::Direct] {
+        for family in [RecordType::AAAA, RecordType::A] {
+            let server = Server::with_services(move |query| {
+                let kind = query.queries[0].query_type();
+                if kind == RecordType::SRV {
+                    let selected = service_mode(query);
+                    service_reply(
+                        query,
+                        if selected == mode {
+                            ServiceReply::Usable
+                        } else {
+                            ServiceReply::NoData
+                        },
+                        selected,
+                    )
+                } else if kind == family {
+                    vec![address(query)]
+                } else {
+                    vec![response(query, ResponseCode::NoError, vec![])]
+                }
+            })?;
+            let result = resolve(&server.resolver()?, "remote.example").unwrap();
+            let ip = if family == RecordType::AAAA {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            };
+            assert_eq!(
+                result.endpoints,
+                [Endpoint {
+                    address: SocketAddr::new(ip, 5270),
+                    tls_mode: mode
+                }]
+            );
+            assert_eq!(result.via, ResolvedVia::Srv);
+            assert_both_services(&server.queries());
+        }
+    }
+    Ok(())
 }

@@ -8,6 +8,7 @@ mod outbound;
 mod process;
 mod s2s_c2s;
 mod s2s_cases;
+mod s2s_direct_tls;
 #[path = "support/s2s.rs"]
 mod support;
 

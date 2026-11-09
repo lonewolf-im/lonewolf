@@ -32,6 +32,7 @@ struct NameAnswers {
     records: HashMap<RecordType, Vec<RData>>,
     failure: Option<Option<ResponseCode>>,
     counts: HashMap<RecordType, usize>,
+    observers: HashMap<RecordType, Vec<std::sync::mpsc::SyncSender<()>>>,
 }
 
 pub struct FakeDns {
@@ -156,6 +157,17 @@ impl FakeDns {
             .unwrap_or(0)
     }
 
+    pub fn observe_query(&self, name: &str, kind: RecordType) -> std::sync::mpsc::Receiver<()> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut answers = self.answers.lock();
+        let answer = answers.names.entry(canonical(name)).or_default();
+        if answer.counts.get(&kind).copied().unwrap_or(0) > 0 {
+            let _ = sender.try_send(());
+        }
+        answer.observers.entry(kind).or_default().push(sender);
+        receiver
+    }
+
     pub fn stop(&mut self) -> TestResult {
         self.stopped.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
@@ -190,6 +202,11 @@ fn answer(bytes: &[u8], answers: &PlMutex<Answers>) -> io::Result<Option<Vec<u8>
             .entry(canonical(&query.name().to_ascii()))
             .or_default();
         *answer.counts.entry(query.query_type()).or_default() += 1;
+        if let Some(observers) = answer.observers.get(&query.query_type()) {
+            for observer in observers {
+                let _ = observer.try_send(());
+            }
+        }
         if let Some(code) = answer.failure {
             let Some(code) = code else {
                 return Ok(None);

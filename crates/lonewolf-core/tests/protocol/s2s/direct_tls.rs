@@ -14,6 +14,7 @@ use super::super::support::federation::{
 use super::super::support::{PASSWORD, TestResult};
 use super::negotiation::{SingleServer, authentication, closed, expect_bounce};
 
+mod cancellation;
 mod discovery;
 mod identities;
 mod lifecycle;

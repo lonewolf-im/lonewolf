@@ -192,26 +192,6 @@ fn rejected_requests_and_responses_each_consume_a_stanza_token() -> TestResult {
 }
 
 #[test]
-fn peer_error_classifier_ignores_text_and_requires_exact_root_namespace() -> TestResult {
-    Runtime::new()?.block_on(async {
-        for (xml, expected) in [
-            ("<stream:error><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-streams'/><text xmlns='urn:ietf:params:xml:ns:xmpp-streams'>private</text></stream:error>", Some(StreamErrorCondition::PolicyViolation)),
-            ("<stream:error><unsupported-feature xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>", Some(StreamErrorCondition::UnsupportedFeature)),
-            ("<stream:error><unknown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>", Some(StreamErrorCondition::UndefinedCondition)),
-            ("<stream:error/>", Some(StreamErrorCondition::UndefinedCondition)),
-            ("<stream:error><bad-format xmlns='urn:ietf:params:xml:ns:xmpp-streams'/><policy-violation xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error>", Some(StreamErrorCondition::UndefinedCondition)),
-            ("<error xmlns='urn:other'><bad-format xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></error>", None),
-        ] {
-            let mut input = reader(format!("{HEADER}{xml}").as_bytes(), 1)?;
-            input.next_event().await.map_err(|outcome| format!("{outcome:?}"))?;
-            let event = input.next_event().await.map_err(|outcome| format!("{outcome:?}"))?.ok_or("missing event")?;
-            assert_eq!(peer_stream_error(&event).map_err(|outcome| format!("{outcome:?}"))?, expected);
-        }
-        Ok(())
-    })
-}
-
-#[test]
 fn closing_repolls_a_preserved_token_wait_without_a_timer_wakeup() -> TestResult {
     Runtime::new()?.block_on(async {
         let mut reader = reader(

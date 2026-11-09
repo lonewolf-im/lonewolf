@@ -6,13 +6,11 @@ use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::Parsed;
 use lonewolf_xmpp::stanza::{CLIENT_NAMESPACE, Element, STREAM_NAMESPACE, XML_NAMESPACE};
-use lonewolf_xmpp::stream::StreamError;
 use oxilangtag::LanguageTag;
 
 use super::outcome::CloseOutcome;
 use crate::hosts::Hosts;
-
-pub(super) const STREAM_FOOTER: &str = "</stream:stream>";
+use crate::xml_stream::{escape_attribute, version_components};
 
 pub(super) struct ClientHeader {
     pub(super) host: String,
@@ -25,27 +23,6 @@ pub(super) enum ResponseVersion<'a> {
     Omitted,
     Current,
     ZeroMajor { minor: &'a str },
-}
-
-fn version_components(version: &str) -> Option<(&str, &str)> {
-    let (major, minor) = version.split_once('.')?;
-    if major.is_empty()
-        || minor.is_empty()
-        || !major.bytes().all(|digit| digit.is_ascii_digit())
-        || !minor.bytes().all(|digit| digit.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((normalized_component(major), normalized_component(minor)))
-}
-
-fn normalized_component(component: &str) -> &str {
-    let normalized = component.trim_start_matches('0');
-    if normalized.is_empty() {
-        "0"
-    } else {
-        normalized
-    }
 }
 
 pub(super) fn response_version_from_header<A: ChunkAllocator>(
@@ -170,24 +147,7 @@ pub(super) fn response_header_xml(
 }
 
 pub(super) fn stream_error_xml(outcome: CloseOutcome) -> Option<String> {
-    let condition = outcome.stream_condition()?;
-    let mut xml = String::with_capacity(128);
-    StreamError::new(condition).write_xml(&mut xml).ok()?;
-    xml.push_str(STREAM_FOOTER);
-    Some(xml)
-}
-
-pub(super) fn escape_attribute(output: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '\'' => output.push_str("&apos;"),
-            '"' => output.push_str("&quot;"),
-            '\n' => output.push_str("&#xA;"),
-            '\r' => output.push_str("&#xD;"),
-            '\t' => output.push_str("&#x9;"),
-            _ => output.push(ch),
-        }
-    }
+    outcome
+        .stream_condition()
+        .map(crate::xml_stream::stream_error_xml)
 }

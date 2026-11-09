@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::error::Error as _;
 use std::io;
-use std::sync::Arc;
 
 use lonewolf_storage::account::AccountKeyError;
 use lonewolf_util::arena::{ArenaError, HandleError};
@@ -13,6 +11,7 @@ use lonewolf_xmpp::stream::StreamErrorCondition;
 
 use crate::router::local::RetireCause;
 use crate::stages::StageFailure;
+use crate::xml_stream::parse::{ParseFailure, classify_parse_error};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloseOutcome {
@@ -151,31 +150,20 @@ impl CloseOutcome {
     }
 
     pub(super) fn from_parse_error(error: &ParseError) -> Self {
-        if error.is_transport_error() {
-            if let ParseError::Xml(xml) = error
-                && let Some(error) = xml
-                    .source()
-                    .and_then(|source| source.downcast_ref::<Arc<io::Error>>())
-            {
-                return Self::from_io_error(error);
+        match classify_parse_error(error) {
+            ParseFailure::Transport(error) => {
+                error.map_or(Self::TransportError, Self::from_io_error)
             }
-            return Self::TransportError;
-        }
-        match error {
-            ParseError::SizeLimitExceeded { .. } => Self::SizeLimitExceeded,
-            ParseError::TooManyAttributes
-            | ParseError::Build(BuildError::TreeLimitExceeded)
-            | ParseError::Build(BuildError::Allocation(ArenaError::ArenaLimitExceeded)) => {
-                Self::ParserLimitExceeded
-            }
-            ParseError::Build(BuildError::Allocation(_)) => Self::InternalError,
-            ParseError::InvalidNamespace => Self::InvalidNamespace,
-            ParseError::BadNamespacePrefix => Self::BadNamespacePrefix,
-            ParseError::InvalidXml => Self::InvalidXml,
-            ParseError::NotWellFormed | ParseError::UnboundNamespacePrefix => Self::NotWellFormed,
-            ParseError::RestrictedXml => Self::RestrictedXml,
-            ParseError::UnsupportedEncoding => Self::UnsupportedEncoding,
-            _ => Self::ParserError,
+            ParseFailure::SizeLimit => Self::SizeLimitExceeded,
+            ParseFailure::ParserLimit => Self::ParserLimitExceeded,
+            ParseFailure::Allocation => Self::InternalError,
+            ParseFailure::InvalidNamespace => Self::InvalidNamespace,
+            ParseFailure::BadNamespacePrefix => Self::BadNamespacePrefix,
+            ParseFailure::InvalidXml => Self::InvalidXml,
+            ParseFailure::NotWellFormed => Self::NotWellFormed,
+            ParseFailure::RestrictedXml => Self::RestrictedXml,
+            ParseFailure::UnsupportedEncoding => Self::UnsupportedEncoding,
+            ParseFailure::Other => Self::ParserError,
         }
     }
 
@@ -435,6 +423,12 @@ mod tests {
             ),
             (
                 ParseError::from(quick_xml::Error::from(std::io::Error::other("transport"))),
+                CloseOutcome::TransportError,
+            ),
+            (
+                ParseError::from(quick_xml::Error::from(std::io::Error::from(
+                    std::io::ErrorKind::TimedOut,
+                ))),
                 CloseOutcome::TransportError,
             ),
             (

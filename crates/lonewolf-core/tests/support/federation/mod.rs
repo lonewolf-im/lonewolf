@@ -225,10 +225,12 @@ impl FederatedPair {
     }
 
     pub fn stop(&mut self) -> TestResult {
-        let a = self.a.stop();
-        let b = self.b.stop();
-        a?;
-        b?;
+        assert_direct_transport_metrics(&self.a)?;
+        assert_direct_transport_metrics(&self.b)?;
+        let a = self.a.stop_with_s2s_state();
+        let b = self.b.stop_with_s2s_state();
+        assert_shutdown_empty(a?);
+        assert_shutdown_empty(b?);
         self.dns.stop()
     }
 }
@@ -237,6 +239,52 @@ impl Drop for FederatedPair {
         self.a.terminate_and_reap();
         self.b.terminate_and_reap();
         let _ = self.dns.stop();
+    }
+}
+
+pub fn assert_direct_transport_metrics(suite: &C2sSuite) -> TestResult {
+    let config =
+        lonewolf_core::config::Config::load(Some(&suite.fixture_path().join("lonewolf.toml")))?;
+    if !config
+        .s2s
+        .listeners
+        .iter()
+        .all(|listener| listener.tls_mode == lonewolf_core::config::TlsMode::Direct)
+    {
+        return Ok(());
+    }
+    let body = suite.scrape_metrics()?;
+    for line in body
+        .lines()
+        .filter(|line| line.starts_with("lonewolf_s2s_authentications_total{"))
+    {
+        let expected = line
+            .replace(
+                "lonewolf_s2s_authentications_total",
+                "lonewolf_s2s_transport_attempts_total",
+            )
+            .replace(",outcome=", ",tls_mode=\"direct\",outcome=");
+        assert!(
+            body.lines().any(|line| line == expected),
+            "missing {expected}: {body}"
+        );
+    }
+    assert!(
+        !body.lines().any(
+            |line| line.starts_with("lonewolf_s2s_transport_attempts_total{")
+                && line.contains("tls_mode=\"starttls\"")
+        ),
+        "{body}"
+    );
+    Ok(())
+}
+
+pub fn assert_shutdown_empty(state: Option<lonewolf_core::test_support::S2sShutdownState>) {
+    if let Some(state) = state {
+        assert_eq!(state.queued_stanzas, 0);
+        assert_eq!(state.queued_bytes, 0);
+        assert_eq!(state.transport_connections, [[0; 2]; 2]);
+        assert_eq!(state.connections, [0; 2]);
     }
 }
 

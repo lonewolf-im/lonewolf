@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use lonewolf_core::config::TlsMode;
+
 use rustls::pki_types::{PrivateKeyDer, pem::PemObject};
 use std::io::Write as _;
 use std::net::Ipv4Addr;
@@ -23,6 +25,17 @@ use super::negotiation::{SingleServer, authentication, closed, expect_bounce};
 
 #[test]
 fn revoked_peers_are_rejected_with_a_crl_file_in_both_directions() -> TestResult {
+    revoked_peers_are_rejected_with_a_crl_file_in_both_directions_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_revoked_peers_are_rejected_with_a_crl_file_in_both_directions() -> TestResult {
+    revoked_peers_are_rejected_with_a_crl_file_in_both_directions_transport(TlsMode::Direct)
+}
+
+fn revoked_peers_are_rejected_with_a_crl_file_in_both_directions_transport(
+    mode: TlsMode,
+) -> TestResult {
     let mut http = CrlServer::start()?;
     let directory = tempfile::tempdir()?;
     let ca = Arc::new(FederationCa::new(directory.path())?);
@@ -69,8 +82,10 @@ fn revoked_peers_are_rejected_with_a_crl_file_in_both_directions() -> TestResult
         ca,
         directory,
     };
-    let listener = RawS2sListener::bind()?;
-    server.dns.srv(
+    server.set_transport(mode)?;
+    let listener = RawS2sListener::bind()?.with_transport(mode);
+    server.dns.srv_with_mode(
+        mode,
         "b.test",
         &[(0, 0, listener.address()?.port(), "peer.b.test")],
     );
@@ -79,9 +94,14 @@ fn revoked_peers_are_rejected_with_a_crl_file_in_both_directions() -> TestResult
     let serving = peer::server_config(&server.ca, key, "a.test")?;
     server.suite.create_account("alice", PASSWORD)?;
     let mut alice = server.suite.connect("alice", PASSWORD, "desk")?;
-    let mut inbound = server.connect()?;
-    inbound.expect_starttls_features()?;
-    let mut inbound = inbound.start_tls_with_header(client, "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' from='b.test' to='a.test'>", None)?;
+    let mut inbound = peer::RawS2sPeer::protected(
+        mode,
+        server.suite.s2s_addresses()?[0],
+        "b.test",
+        "a.test",
+        client,
+        None,
+    )?;
     inbound.expect_stream_error("not-authorized")?;
     authentication(&server.suite, "inbound", "certificate_revoked", 1)?;
     server.suite.wait_for_metric("lonewolf_s2s_revocation_checks_total{direction=\"inbound\",source=\"file\",phase=\"handshake\",status=\"revoked\",reason=\"none\"} 1")?;
@@ -167,6 +187,15 @@ fn checked(
 
 #[test]
 fn unrevoked_peers_federate_with_crl_files() -> TestResult {
+    unrevoked_peers_federate_with_crl_files_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_unrevoked_peers_federate_with_crl_files() -> TestResult {
+    unrevoked_peers_federate_with_crl_files_transport(TlsMode::Direct)
+}
+
+fn unrevoked_peers_federate_with_crl_files_transport(mode: TlsMode) -> TestResult {
     let mut pair = FederatedPair::start(
         "a.test",
         "b.test",
@@ -175,6 +204,9 @@ fn unrevoked_peers_federate_with_crl_files() -> TestResult {
             ..Default::default()
         },
     )?;
+    if mode == TlsMode::Direct {
+        pair.direct_tls()?;
+    }
     assert!(pair.a_crls.as_ref().is_some_and(|path| path.is_file()));
     assert!(pair.b_crls.as_ref().is_some_and(|path| path.is_file()));
     pair.a.create_account("alice", PASSWORD)?;
@@ -214,6 +246,15 @@ fn unrevoked_peers_federate_with_crl_files() -> TestResult {
 
 #[test]
 fn crl_file_update_revoking_a_live_peer_closes_its_links() -> TestResult {
+    crl_file_update_revoking_a_live_peer_closes_its_links_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_crl_file_update_revoking_a_live_peer_closes_its_links() -> TestResult {
+    crl_file_update_revoking_a_live_peer_closes_its_links_transport(TlsMode::Direct)
+}
+
+fn crl_file_update_revoking_a_live_peer_closes_its_links_transport(mode: TlsMode) -> TestResult {
     let mut pair = FederatedPair::start(
         "a.test",
         "b.test",
@@ -227,6 +268,9 @@ fn crl_file_update_revoking_a_live_peer_closes_its_links() -> TestResult {
             ..Default::default()
         },
     )?;
+    if mode == TlsMode::Direct {
+        pair.direct_tls()?;
+    }
     pair.a.create_account("alice", PASSWORD)?;
     pair.b.create_account("bob", PASSWORD)?;
     let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
@@ -276,6 +320,17 @@ fn crl_file_update_revoking_a_live_peer_closes_its_links() -> TestResult {
 
 #[test]
 fn stale_or_unusable_crl_files_stop_federation_until_refreshed() -> TestResult {
+    stale_or_unusable_crl_files_stop_federation_until_refreshed_transport(TlsMode::StartTls)
+}
+
+#[test]
+fn direct_tls_stale_or_unusable_crl_files_stop_federation_until_refreshed() -> TestResult {
+    stale_or_unusable_crl_files_stop_federation_until_refreshed_transport(TlsMode::Direct)
+}
+
+fn stale_or_unusable_crl_files_stop_federation_until_refreshed_transport(
+    mode: TlsMode,
+) -> TestResult {
     let mut pair = FederatedPair::start(
         "a.test",
         "b.test",
@@ -288,6 +343,9 @@ fn stale_or_unusable_crl_files_stop_federation_until_refreshed() -> TestResult {
             ..Default::default()
         },
     )?;
+    if mode == TlsMode::Direct {
+        pair.direct_tls()?;
+    }
     pair.a.create_account("alice", PASSWORD)?;
     pair.b.create_account("bob", PASSWORD)?;
     let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
@@ -329,9 +387,14 @@ fn stale_or_unusable_crl_files_stop_federation_until_refreshed() -> TestResult {
         closed(&pair.b, direction, "revocation_stale", 1)?;
         closed(&pair.a, direction, "peer_error", 1)?;
     }
-    let mut stale = peer::RawS2sPeer::connect(pair.b.s2s_addresses()?[0], "a.test", "b.test")?;
-    stale.expect_starttls_features()?;
-    let mut stale = stale.start_tls_with_header(Arc::clone(&client), "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' from='a.test' to='b.test'>", None)?;
+    let mut stale = peer::RawS2sPeer::protected(
+        mode,
+        pair.b.s2s_addresses()?[0],
+        "a.test",
+        "b.test",
+        Arc::clone(&client),
+        None,
+    )?;
     stale.expect_stream_error("not-authorized")?;
     pair.b.wait_for_metric(
         "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"revocation_stale\"} 1",
@@ -351,9 +414,14 @@ fn stale_or_unusable_crl_files_stop_federation_until_refreshed() -> TestResult {
         tempfile::NamedTempFile::new_in(path.parent().ok_or("missing CRL directory")?)?;
     invalid.write_all(b"invalid CRL file")?;
     invalid.persist(path).map_err(|error| error.error)?;
-    let mut invalid = peer::RawS2sPeer::connect(pair.b.s2s_addresses()?[0], "a.test", "b.test")?;
-    invalid.expect_starttls_features()?;
-    let mut invalid = invalid.start_tls_with_header(client, "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' from='a.test' to='b.test'>", None)?;
+    let mut invalid = peer::RawS2sPeer::protected(
+        mode,
+        pair.b.s2s_addresses()?[0],
+        "a.test",
+        "b.test",
+        client,
+        None,
+    )?;
     invalid.expect_stream_error("not-authorized")?;
     pair.b.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"revocation_unavailable\"} 1")?;
     pair.b.wait_for_metric(
@@ -404,6 +472,8 @@ fn stale_or_unusable_crl_files_stop_federation_until_refreshed() -> TestResult {
     assert_eq!(state.dropped_connection_lost, 0);
     assert_eq!(state.queued_stanzas, 0);
     assert_eq!(state.queued_bytes, 0);
+    assert_eq!(state.transport_connections, [[0; 2]; 2]);
+    assert_eq!(state.connections, [0; 2]);
     pair.a.stop()?;
     pair.dns.stop()
 }
@@ -520,4 +590,68 @@ fn shutdown_with_crl_file_checks_is_clean() -> TestResult {
         Ok(())
     })?;
     dns.stop()
+}
+
+#[test]
+fn direct_tls_missing_crl_file_resets_bidi_ownership_and_rejects_the_next_handshake() -> TestResult
+{
+    let mut pair = FederatedPair::start(
+        "a.test",
+        "b.test",
+        PairOptions {
+            crl_files: true,
+            a_bidirectional: Some(true),
+            b_bidirectional: Some(true),
+            b_revocation: HostRevocation {
+                revalidation_interval: Some(Wait::from_millis(500)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )?;
+    pair.direct_tls()?;
+    pair.a.create_account("alice", PASSWORD)?;
+    pair.b.create_account("bob", PASSWORD)?;
+    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
+    let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
+    alice.send("<message to='bob@b.test/phone' type='chat' id='file-present'><body>File is valid</body></message>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@a.test/desk' to='bob@b.test/phone' type='chat' id='file-present' xml:lang='en'><body>File is valid</body></message>")?;
+    super::direct_tls::transport_connections(&pair.a, "outbound", 0, 1)?;
+    super::direct_tls::transport_connections(&pair.b, "inbound", 0, 1)?;
+    std::fs::remove_file(pair.b_crls.as_deref().ok_or("missing CRL path")?)?;
+    closed(&pair.b, "inbound", "revocation_unavailable", 1)?;
+    closed(&pair.a, "outbound", "peer_error", 1)?;
+    pair.a
+        .wait_for_metric("lonewolf_s2s_outbound_links{state=\"ready\"} 0")?;
+    pair.b
+        .wait_for_metric("lonewolf_s2s_bidi_streams{direction=\"inbound\"} 0")?;
+    let actual = certificate(&pair.a.fixture_path().join("certificate-host.pem"))?;
+    let private = PrivateKeyDer::from_pem_file(pair.a.fixture_path().join("private-key-host.pem"))?;
+    let key = Arc::new(rustls::sign::CertifiedKey::from_der(
+        vec![actual],
+        private,
+        &rustls_graviola::default_provider(),
+    )?);
+    let mut remote = peer::RawS2sPeer::protected(
+        TlsMode::Direct,
+        pair.b.s2s_addresses()?[0],
+        "a.test",
+        "b.test",
+        peer::client_config(&pair.ca, key)?,
+        None,
+    )?;
+    remote.expect_stream_error("not-authorized")?;
+    pair.b.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"revocation_unavailable\"} 1")?;
+    super::direct_tls::transport_attempts(
+        &pair.b,
+        "inbound",
+        &[
+            ("direct", "success", 1),
+            ("direct", "revocation_unavailable", 1),
+        ],
+    )?;
+    super::direct_tls::transport_connections(&pair.b, "inbound", 0, 0)?;
+    alice.close()?;
+    bob.close()?;
+    pair.stop()
 }

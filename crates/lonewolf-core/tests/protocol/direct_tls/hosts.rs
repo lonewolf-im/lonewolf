@@ -7,15 +7,15 @@ use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use std::sync::Arc;
 
 const NO_TO: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' version='1.0'>";
-struct HostFixture {
-    suite: C2sSuite,
-    first: ClientCertificates,
-    second: ClientCertificates,
-    idn_tls: Arc<rustls::ClientConfig>,
-    localhost_certificate: CertificateDer<'static>,
-    idn_certificate: CertificateDer<'static>,
+pub(super) struct HostFixture {
+    pub(super) suite: C2sSuite,
+    pub(super) first: ClientCertificates,
+    pub(super) second: ClientCertificates,
+    pub(super) idn_tls: Arc<rustls::ClientConfig>,
+    pub(super) localhost_certificate: CertificateDer<'static>,
+    pub(super) idn_certificate: CertificateDer<'static>,
 }
-fn fixture() -> TestResult<HostFixture> {
+pub(super) fn fixture() -> TestResult<HostFixture> {
     let mut first = None;
     let mut second = None;
     let mut roots = None;

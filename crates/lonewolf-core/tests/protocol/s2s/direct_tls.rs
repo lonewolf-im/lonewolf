@@ -16,6 +16,7 @@ use super::negotiation::{SingleServer, authentication, closed, expect_bounce};
 
 mod discovery;
 mod identities;
+mod lifecycle;
 mod pairs;
 mod protected;
 

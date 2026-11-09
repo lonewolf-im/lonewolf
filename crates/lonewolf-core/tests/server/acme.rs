@@ -6,6 +6,9 @@ mod ports;
 #[path = "../support/acme/mod.rs"]
 mod support;
 
+#[path = "acme/direct_tls.rs"]
+mod direct_tls;
+
 use support::process::peer;
 use support::{
     AcmeFault, AcmeStage, C2sSuite, Client, FakeAcmeCa, PASSWORD, SASL_NAMESPACE, TestResult,

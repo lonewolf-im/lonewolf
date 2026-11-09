@@ -88,6 +88,17 @@ impl FakeDns {
     pub fn direct_srv(&self, domain: &str, records: &[(u16, u16, u16, &str)]) {
         self.service_srv("_xmpps-server", domain, records);
     }
+    pub fn srv_with_mode(
+        &self,
+        mode: lonewolf_core::config::TlsMode,
+        domain: &str,
+        records: &[(u16, u16, u16, &str)],
+    ) {
+        match mode {
+            lonewolf_core::config::TlsMode::StartTls => self.srv(domain, records),
+            lonewolf_core::config::TlsMode::Direct => self.direct_srv(domain, records),
+        }
+    }
     fn service_srv(&self, service: &str, domain: &str, records: &[(u16, u16, u16, &str)]) {
         let records = records
             .iter()

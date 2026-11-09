@@ -196,6 +196,45 @@ impl FederationCa {
         )
     }
 
+    pub fn intermediate_until(
+        &self,
+        domain: &str,
+        expiry: OffsetDateTime,
+    ) -> TestResult<Arc<CertifiedKey>> {
+        let mut intermediate = parameters(&[])?;
+        intermediate.serial_number = Some(
+            self.serial
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .into(),
+        );
+        intermediate.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        intermediate.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        intermediate.extended_key_usages.clear();
+        intermediate.not_after = expiry;
+        let intermediate =
+            CertifiedIssuer::signed_by(intermediate, TestSigner::new()?, &self.issuer)?;
+        let mut leaf = parameters(&[domain])?;
+        leaf.serial_number = Some(
+            self.serial
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .into(),
+        );
+        let signer = TestSigner::new()?;
+        let leaf = leaf.signed_by(&signer, &intermediate)?;
+        let mut bytes = zeroize::Zeroizing::new([0; 512]);
+        let key = signer.key.to_pkcs8_der(&mut bytes[..])?;
+        let key = rustls_graviola::default_provider()
+            .key_provider
+            .load_private_key(PrivatePkcs8KeyDer::from(key.to_vec()).into())?;
+        Ok(Arc::new(CertifiedKey::new(
+            vec![leaf.der().clone(), intermediate.der().clone()],
+            key,
+        )))
+    }
+
     pub fn short_lived(
         &self,
         directory: &Path,

@@ -344,6 +344,10 @@
 # or HTTP challenge endpoints for hosts with automatic certificates.
 # address = "0.0.0.0:5269"
 
+# Choose "direct" when peer servers send TLS before XML.
+# SNI must name a federating host or a registered service with a covering certificate.
+# tls_mode = "starttls"
+
 # [s2s.tls]
 
 # Replace the bundled public roots with one PEM bundle for a private federation.

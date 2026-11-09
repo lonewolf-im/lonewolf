@@ -38,10 +38,15 @@ impl Fixture {
     }
 
     fn with_bidi(bidi: bool) -> TestResult<Self> {
+        let config = Config::default();
+        let hosts = Hosts::new(&config.hosts, None)?;
+        Self::with_hosts(hosts, bidi)
+    }
+
+    fn with_hosts(hosts: Hosts, bidi: bool) -> TestResult<Self> {
         use crate::s2s::outbound::{BidiIngress, RemoteRouter};
         use crate::s2s::revocation::PeerVerification;
         let config = Config::default();
-        let hosts = Hosts::new(&config.hosts, None)?;
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("state.redb"))?;
         let metrics = S2sMetrics::new(0);
@@ -64,6 +69,7 @@ impl Fixture {
         }
         Ok(Self {
             settings: Settings {
+                tls_mode: crate::config::TlsMode::StartTls,
                 trust: PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?,
                 revocation: PeerRevocation::disabled(),
                 hosts,
@@ -1239,6 +1245,155 @@ fn physical_whitespace_and_partial_xml_extend_inbound_idle_until_silence() -> Te
         assert!(poll!(running.as_mut()).is_pending());
         clock.advance(Duration::from_millis(1));
         assert!(matches!(running.await.outcome, StreamClose::Idle));
+        Ok(())
+    })
+}
+
+#[test]
+fn direct_sni_normalizes_idna_and_checks_registration_coverage_and_federation()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::{Config, HostConfig, HostTlsConfig, HostTlsSource};
+    use crate::hosts::Hosts;
+    use crate::router::{Router, ServiceRoute, local::LocalRouter};
+    use lonewolf_extension::{
+        ExtensionFuture,
+        delivery::HandlerError,
+        service::{ServiceContext, ServiceHandler},
+    };
+    use lonewolf_storage::RedbStorage;
+    use lonewolf_util::arena::GlobalChunkAllocator;
+    use std::collections::BTreeMap;
+    struct UncalledService;
+    impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for UncalledService {
+        fn route<'a>(
+            &'a self,
+            _stanza: lonewolf_xmpp::stanza::RoutedStanza<GlobalChunkAllocator>,
+            _context: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+        ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+            Box::pin(async { panic!("selection must not route a stanza") })
+        }
+    }
+    compio::runtime::Runtime::new()?.block_on(async {
+        use base64::Engine as _;
+        let directory = tempfile::tempdir()?;
+        let mut config = Config::default();
+        for (domain, names) in [
+            (
+                "example.com",
+                vec!["example.com".into(), "*.example.com".into()],
+            ),
+            ("bücher.example", vec!["xn--bcher-kva.example".into()]),
+            ("disabled.example.com", vec!["disabled.example.com".into()]),
+        ] {
+            let (certificate, key) =
+                crate::hosts::test_support::material(rcgen::CertificateParams::new(names)?)?;
+            let certificate_chain_path = directory.path().join(format!("{domain}.pem"));
+            let private_key_path = directory.path().join(format!("{domain}.key"));
+            let pem = |label, bytes: &[u8]| {
+                format!(
+                    "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                )
+            };
+            std::fs::write(
+                &certificate_chain_path,
+                pem("CERTIFICATE", certificate.as_ref()),
+            )?;
+            std::fs::write(&private_key_path, pem("PRIVATE KEY", key.secret_der()))?;
+            config.hosts.insert(
+                domain.into(),
+                HostConfig {
+                    federation: domain != "disabled.example.com",
+                    tls: Some(HostTlsConfig {
+                        source: HostTlsSource::Files {
+                            certificate_chain_path,
+                            private_key_path,
+                        },
+                        client_auth: None,
+                    }),
+                    ..HostConfig::default()
+                },
+            );
+        }
+        let hosts = Hosts::new(&config.hosts, Some("localhost"))?;
+        let mut fixture = Fixture::with_hosts(hosts.clone(), true)?;
+        let services = || {
+            BTreeMap::from_iter(["echo.example.com", "echo.other.test"].map(|domain| {
+                (
+                    domain.into(),
+                    ServiceRoute {
+                        domain: Arc::from(domain),
+                        handler: Arc::new(UncalledService)
+                            as Arc<dyn ServiceHandler<GlobalChunkAllocator, RedbStorage>>,
+                    },
+                )
+            }))
+        };
+        let remote = fixture
+            .settings
+            .services
+            .router
+            .remote_router()
+            .ok_or("missing remote router")?
+            .clone();
+        let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator))
+            .with_remote(remote)
+            .with_services(services());
+        fixture.settings.services.router = router.handle();
+        for (name, expected) in [
+            ("EXAMPLE.COM", "example.com"),
+            ("XN--BCHER-KVA.EXAMPLE", "bücher.example"),
+            ("ECHO.EXAMPLE.COM", "echo.example.com"),
+        ] {
+            assert_eq!(
+                super::super::negotiate::select_sni(Some(name), &fixture.settings).as_deref(),
+                Some(expected)
+            );
+            let direct = hosts
+                .s2s_direct_server_config(expected, &fixture.settings.trust)
+                .ok_or("missing direct config")?;
+            assert_eq!(direct.alpn_protocols, [b"xmpp-server".to_vec()]);
+            assert!(
+                hosts
+                    .s2s_server_config(expected, &fixture.settings.trust)
+                    .ok_or("missing STARTTLS config")?
+                    .alpn_protocols
+                    .is_empty()
+            );
+        }
+        assert!(
+            hosts
+                .s2s_direct_server_config("unregistered.example.com", &fixture.settings.trust)
+                .is_some()
+        );
+        assert!(
+            hosts
+                .s2s_direct_server_config("echo.other.test", &fixture.settings.trust)
+                .is_none()
+        );
+        for name in [
+            None,
+            Some("unknown.test"),
+            Some("unregistered.example.com"),
+            Some("echo.other.test"),
+            Some("disabled.example.com"),
+            Some("localhost"),
+        ] {
+            assert!(
+                super::super::negotiate::select_sni(name, &fixture.settings).is_none(),
+                "{name:?}"
+            );
+        }
+        let disabled =
+            Router::new(hosts, LocalRouter::new(GlobalChunkAllocator)).with_services(services());
+        fixture.settings.services.router = disabled.handle();
+        assert!(
+            super::super::negotiate::select_sni(Some("example.com"), &fixture.settings).is_none()
+        );
+        assert!(
+            super::super::negotiate::select_sni(Some("echo.example.com"), &fixture.settings)
+                .is_none()
+        );
         Ok(())
     })
 }

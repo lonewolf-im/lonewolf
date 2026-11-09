@@ -100,6 +100,50 @@ impl RawS2sPeer {
         );
         Ok(peer)
     }
+    pub fn tls_first(
+        address: SocketAddr,
+        from: &str,
+        to: &str,
+        config: Arc<rustls::ClientConfig>,
+    ) -> TestResult<Self> {
+        let mut socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
+        configure(&socket)?;
+        let mut connection =
+            rustls::ClientConnection::new(config, ServerName::try_from(to.to_owned())?)?;
+        while connection.is_handshaking() {
+            connection.complete_io(&mut socket)?;
+        }
+        Ok(Self {
+            stream: XmlStream::new(PeerTransport::Client(Box::new(rustls::StreamOwned::new(
+                connection, socket,
+            )))),
+            from: from.into(),
+            to: to.into(),
+            local_max: 524288,
+            local_idle: 600,
+        })
+    }
+
+    pub fn open_protected(&mut self, header: &str, expected_to: Option<&str>) -> TestResult {
+        let response = self.stream.open_with(header)?;
+        assert_eq!(
+            response.attribute("from"),
+            Some(self.to.as_str()),
+            "{response:?}"
+        );
+        assert_eq!(response.attribute("to"), expected_to, "{response:?}");
+        assert_eq!(response.attribute("version"), Some("1.0"), "{response:?}");
+        Ok(())
+    }
+
+    pub fn alpn_protocol(&mut self) -> Option<&[u8]> {
+        match self.stream.transport() {
+            PeerTransport::Plain(_) => None,
+            PeerTransport::Client(stream) => stream.conn.alpn_protocol(),
+            PeerTransport::Server(stream) => stream.conn.alpn_protocol(),
+        }
+    }
+
     pub fn expect_starttls_features(&mut self) -> TestResult {
         let limits = self.local_limits_xml();
         self.stream.features()?.assert_xml(&format!(

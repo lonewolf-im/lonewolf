@@ -426,6 +426,23 @@ impl Hosts {
         domain: &str,
         trust: &Arc<PeerTrust>,
     ) -> Option<Arc<rustls::ServerConfig>> {
+        self.s2s_server_config_with_alpn(domain, trust, None)
+    }
+
+    pub(crate) fn s2s_direct_server_config(
+        &self,
+        domain: &str,
+        trust: &Arc<PeerTrust>,
+    ) -> Option<Arc<rustls::ServerConfig>> {
+        self.s2s_server_config_with_alpn(domain, trust, Some(b"xmpp-server"))
+    }
+
+    fn s2s_server_config_with_alpn(
+        &self,
+        domain: &str,
+        trust: &Arc<PeerTrust>,
+        protocol: Option<&[u8]>,
+    ) -> Option<Arc<rustls::ServerConfig>> {
         let (host, resolver): (_, Arc<dyn ResolvesServerCert>) =
             if let Some(host) = self.find_host(domain) {
                 let snapshot = self.snapshot(domain)?;
@@ -443,12 +460,15 @@ impl Hosts {
                     }),
                 )
             };
-        Some(Arc::new(
-            host.tls_builder
-                .clone()
-                .with_client_cert_verifier(trust.client_verifier())
-                .with_cert_resolver(resolver),
-        ))
+        let mut config = host
+            .tls_builder
+            .clone()
+            .with_client_cert_verifier(trust.client_verifier())
+            .with_cert_resolver(resolver);
+        if let Some(protocol) = protocol {
+            config.alpn_protocols.push(protocol.to_vec());
+        }
+        Some(Arc::new(config))
     }
 
     pub(crate) fn s2s_client_config(

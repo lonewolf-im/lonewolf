@@ -36,6 +36,7 @@ mod streams;
 
 #[derive(Clone)]
 struct Settings<A: ChunkAllocator> {
+    tls_mode: crate::config::TlsMode,
     hosts: Hosts,
     trust: Arc<PeerTrust>,
     revocation: Arc<PeerRevocation>,
@@ -147,6 +148,7 @@ impl S2sListeners {
             }),
         });
         let settings = Settings {
+            tls_mode: crate::config::TlsMode::StartTls,
             hosts,
             trust: peers.trust,
             revocation: peers.revocation,
@@ -170,9 +172,13 @@ impl S2sListeners {
                 handler: {
                     let admission = &admission;
                     let settings = &settings;
+                    let tls_mode = config.tls_mode;
                     move |_slot| S2sAcceptor {
                         admission: Arc::clone(admission),
-                        settings: settings.clone(),
+                        settings: Settings {
+                            tls_mode,
+                            ..settings.clone()
+                        },
                     }
                 },
             })

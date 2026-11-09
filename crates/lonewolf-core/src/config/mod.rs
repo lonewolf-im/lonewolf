@@ -708,12 +708,14 @@ pub enum TlsMode {
 pub struct S2sListenerConfig {
     /// IPv6 addresses accept IPv6 only; port zero selects one port for all workers.
     pub address: SocketAddr,
+    pub tls_mode: TlsMode,
 }
 
 impl Default for S2sListenerConfig {
     fn default() -> Self {
         Self {
             address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 5269)),
+            tls_mode: TlsMode::StartTls,
         }
     }
 }

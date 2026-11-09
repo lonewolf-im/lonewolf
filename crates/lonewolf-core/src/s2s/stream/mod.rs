@@ -167,7 +167,10 @@ fn internal_condition(_: HandleError) -> StreamErrorCondition {
     StreamErrorCondition::InternalServerError
 }
 
-fn domain(value: &str, invalid: StreamErrorCondition) -> Result<Box<str>, StreamErrorCondition> {
+pub(super) fn domain(
+    value: &str,
+    invalid: StreamErrorCondition,
+) -> Result<Box<str>, StreamErrorCondition> {
     let mut arena = Arena::try_new(ArenaConfig::default())
         .map_err(|_| StreamErrorCondition::InternalServerError)?;
     let jid = Jid::parse_in(value, &mut arena).map_err(|_| invalid)?;

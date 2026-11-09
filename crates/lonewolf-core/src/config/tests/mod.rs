@@ -1368,7 +1368,8 @@ timeout_secs = 7
     assert_eq!(
         config.s2s.listeners,
         vec![super::S2sListenerConfig {
-            address: "[::]:5269".parse()?
+            address: "[::]:5269".parse()?,
+            tls_mode: TlsMode::StartTls,
         }]
     );
     assert_eq!(
@@ -1672,6 +1673,31 @@ fn c2s_tls_modes_preserve_defaults_addresses_and_listener_replacement() -> TestR
     }
     let file = config_file(
         "[[c2s.listeners]]\naddress='127.0.0.1:5222'\ntls_mode='direct'\n[[c2s.listeners]]\naddress='127.0.0.1:5222'\n",
+    )?;
+    assert!(Config::load(Some(file.path())).is_err());
+    Ok(())
+}
+
+#[test]
+fn s2s_tls_modes_preserve_default_address_replacement_and_overlap_validation() -> TestResult {
+    let config = Config::default();
+    assert_eq!(config.s2s.listeners[0].address.port(), 5269);
+    assert_eq!(config.s2s.listeners[0].tls_mode, TlsMode::StartTls);
+    let file = config_file(
+        "[[s2s.listeners]]\naddress='127.0.0.1:0'\n[[s2s.listeners]]\naddress='[::1]:0'\ntls_mode='direct'\n",
+    )?;
+    let config = Config::load(Some(file.path()))?;
+    assert_eq!(config.s2s.listeners.len(), 2);
+    assert_eq!(config.s2s.listeners[0].tls_mode, TlsMode::StartTls);
+    assert_eq!(config.s2s.listeners[1].tls_mode, TlsMode::Direct);
+    assert_eq!(config.s2s.listeners[1].address.port(), 0);
+    for mode in ["DIRECT", "tls", ""] {
+        assert!(
+            toml::from_str::<Config>(&format!("[[s2s.listeners]]\ntls_mode='{mode}'")).is_err()
+        );
+    }
+    let file = config_file(
+        "[[s2s.listeners]]\naddress='127.0.0.1:5269'\ntls_mode='direct'\n[[s2s.listeners]]\naddress='127.0.0.1:5269'\n",
     )?;
     assert!(Config::load(Some(file.path())).is_err());
     Ok(())

@@ -16,9 +16,11 @@ use futures_util::future::{Either, Shared, join, select};
 use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::discovery::Discovery;
+#[cfg(test)]
+use lonewolf_extension::iq::IqDestinationRule;
 use lonewolf_extension::iq::{
-    IqDestinationRule, IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType,
-    IqScope, Requester, SessionIqHandler, SessionIqReply, XmlSpace,
+    IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester,
+    SessionIqHandler, SessionIqReply, XmlSpace,
 };
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
@@ -63,7 +65,7 @@ use crate::router::{
 use crate::stages::iq::{IqTarget, iq_requester, iq_target, require_iq_account};
 use crate::stages::message::{self, DeliveryOutcome};
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
-use crate::stages::{Stage, archive, observe, policy};
+use crate::stages::{Stage, archive, ingress, observe, policy};
 
 mod link;
 mod output;
@@ -751,7 +753,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     ) -> Result<Option<Parsed<Stanza, A>>, CloseOutcome> {
         let stanza = parsed.value().resolve(parsed.arena())?;
         let error = if self.admit_recipient(&stanza)? {
-            self.iq_destination_error(&stanza)?
+            crate::stages::iq::destination_error(
+                &self.router,
+                Some(self.registration.account()),
+                &stanza,
+            )?
         } else {
             Some(HandlerError::described(StanzaErrorCondition::PolicyViolation,
                 lonewolf_xmpp::stanza::StanzaErrorText::Static("Too many distinct recipients were contacted. Wait before contacting additional recipients.")).into())
@@ -769,45 +775,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         )?;
         self.queue_iq_error(request, sender, arena, error)?;
         Ok(None)
-    }
-
-    fn iq_destination_error(
-        &self,
-        stanza: &StanzaRef<'_, Arena<A>>,
-    ) -> Result<Option<IqError>, CloseOutcome> {
-        let kind = match stanza.stanza_type() {
-            StanzaType::Iq(IqType::Get) => IqRequestType::Get,
-            StanzaType::Iq(IqType::Set) => IqRequestType::Set,
-            _ => return Ok(None),
-        };
-        let payload = stanza
-            .children()?
-            .next()
-            .transpose()?
-            .ok_or(CloseOutcome::InternalError)?;
-        let source_domain = self.registration.account().domain();
-        let target = stanza.to()?;
-        let target_domain = target.map_or(source_domain, |to| to.domainpart());
-        let mut rejected = false;
-        for domain in [
-            Some(source_domain),
-            (target_domain != source_domain).then_some(target_domain),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let rule = self.router.iq_handlers(domain).and_then(|registry| {
-                registry.destination_rule(kind, payload.namespace(), payload.name())
-            });
-            rejected |= match rule {
-                Some(IqDestinationRule::SenderBare) => {
-                    target.is_some_and(|to| to.as_str() != self.registration.account().as_str())
-                }
-                None => false,
-            };
-        }
-        Ok(rejected.then(|| IqError::without_payload(HandlerError::described(StanzaErrorCondition::Forbidden,
-            lonewolf_xmpp::stanza::StanzaErrorText::Static("This operation requires an omitted destination or your authenticated bare JID without a resource.")))))
     }
 
     /// Committed handler effects outlive this session.
@@ -2615,12 +2582,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         application: Option<ApplicationCondition>,
         text: lonewolf_xmpp::stanza::StanzaErrorText,
     ) -> Result<RoutedStanza<A>, CloseOutcome> {
-        let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
-        let source = source.resolve()?.clone_in(&mut arena)?;
-        let reply = source
-            .error_reply_described_in(&mut arena, condition, application, text)?
-            .build()?;
-        Ok(RoutedStanza::from_parts(reply, arena))
+        Ok(ingress::rejection_reply(
+            &self.allocator,
+            source,
+            condition,
+            application,
+            text,
+        )?)
     }
 
     fn delivery(&self) -> RouterDelivery<A> {

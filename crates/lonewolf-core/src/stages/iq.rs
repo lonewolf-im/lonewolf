@@ -1,19 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::delivery::HandlerError;
-use lonewolf_extension::iq::Requester;
+use lonewolf_extension::iq::{IqDestinationRule, IqError, IqRequestType, Requester};
 use lonewolf_extension::presence::PresenceRequestType;
 use lonewolf_storage::RedbRead;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
-use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
+use lonewolf_util::arena::{Arena, ArenaError, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{JidError, JidRef};
 use lonewolf_xmpp::stanza::{
     BuildError, Element, IqType, Stanza, StanzaErrorCondition, StanzaErrorText, StanzaRef,
     StanzaType, error_element_in,
 };
 
+use super::StageFailure;
 use crate::delivery::storage_failure;
 use crate::router::{RouterError, RouterHandle};
+
+pub(crate) fn destination_error<A: ChunkAllocator + Clone, R: ArenaRead>(
+    router: &RouterHandle<A>,
+    sender: Option<&AccountKey>,
+    stanza: &StanzaRef<'_, R>,
+) -> Result<Option<IqError>, StageFailure> {
+    let kind = match stanza.stanza_type() {
+        StanzaType::Iq(IqType::Get) => IqRequestType::Get,
+        StanzaType::Iq(IqType::Set) => IqRequestType::Set,
+        _ => return Ok(None),
+    };
+    let payload = stanza.children()?.next().transpose()?.ok_or(StageFailure)?;
+    let target = stanza.to()?;
+    if sender.is_none() && target.is_none() {
+        return Err(StageFailure);
+    }
+    let target_domain = target.map(|to| to.domainpart());
+    let source_domain = sender.map(AccountKey::domain);
+    let mut rejected = false;
+    for domain in [
+        source_domain,
+        target_domain.filter(|domain| Some(*domain) != source_domain),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let rule = router.iq_handlers(domain).and_then(|registry| {
+            registry.destination_rule(kind, payload.namespace(), payload.name())
+        });
+        rejected |= match rule {
+            Some(IqDestinationRule::SenderBare) => {
+                sender.is_none_or(|sender| target.is_some_and(|to| to.as_str() != sender.as_str()))
+            }
+            None => false,
+        };
+    }
+    Ok(rejected.then(|| IqError::without_payload(HandlerError::described(
+        StanzaErrorCondition::Forbidden,
+        StanzaErrorText::Static("This operation requires an omitted destination or your authenticated bare JID without a resource."),
+    ))))
+}
 
 pub(crate) struct ReplyError;
 

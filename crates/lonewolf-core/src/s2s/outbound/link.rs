@@ -1780,10 +1780,10 @@ mod tests {
     fn physical_whitespace_and_partial_xml_extend_outbound_idle_until_silence()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::s2s::stream::traffic::{
-            S2sTrafficObserver,
+            ConnectionActivity,
             test_support::{Clock, Fragments},
         };
-        use crate::xml_stream::traffic::CountingIo;
+        use crate::xml_stream::traffic::ObservedIo;
         use tokio_util::compat::FuturesAsyncReadCompatExt;
         run(async {
             let manager = manager(S2sLimits {
@@ -1797,11 +1797,8 @@ mod tests {
             drop(task.queue.receiver.recv().await?);
             let input = Fragments::default();
             input.push(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0'>");
-            let counted = CountingIo::new(
-                input.clone(),
-                S2sTrafficObserver::new(Arc::clone(&manager.inner.metrics), Direction::Outbound),
-            );
-            let activity = counted.observer().activity();
+            let counted = ObservedIo::new(input.clone(), ConnectionActivity::new(Instant::now()));
+            let activity = counted.observer().clone();
             let mut reader = S2sReader::new(
                 tokio::io::BufReader::new(counted.compat()),
                 &S2sReaderLimits {

@@ -38,40 +38,38 @@ impl ConnectionActivity {
     }
 }
 
-pub(crate) struct S2sTrafficObserver {
+#[derive(Clone)]
+pub(crate) struct S2sByteObserver {
     metrics: Arc<S2sMetrics>,
     direction: Direction,
-    activity: ConnectionActivity,
 }
 
-impl S2sTrafficObserver {
+impl S2sByteObserver {
     pub(crate) fn new(metrics: Arc<S2sMetrics>, direction: Direction) -> Self {
-        Self {
-            metrics,
-            direction,
-            activity: ConnectionActivity::new(Instant::now()),
-        }
-    }
-
-    pub(crate) fn activity(&self) -> ConnectionActivity {
-        self.activity.clone()
+        Self { metrics, direction }
     }
 }
 
-impl TrafficObserver for S2sTrafficObserver {
+impl TrafficObserver for S2sByteObserver {
+    fn received(&self, bytes: usize) {
+        self.metrics.bytes(self.direction, bytes as u64, 0);
+    }
+    fn sent(&self, bytes: usize) {
+        self.metrics.bytes(self.direction, 0, bytes as u64);
+    }
+}
+
+impl TrafficObserver for ConnectionActivity {
     const COOPERATIVE_READS: bool = true;
 
     fn received(&self, bytes: usize) {
-        self.metrics.bytes(self.direction, bytes as u64, 0);
         if bytes > 0 {
-            self.activity.record(Instant::now());
+            self.record(Instant::now());
         }
     }
-
     fn sent(&self, bytes: usize) {
-        self.metrics.bytes(self.direction, 0, bytes as u64);
         if bytes > 0 {
-            self.activity.record(Instant::now());
+            self.record(Instant::now());
         }
     }
 }

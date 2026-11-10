@@ -16,6 +16,8 @@ mod readiness;
 #[allow(dead_code)]
 #[path = "../tls.rs"]
 pub mod tls;
+#[path = "../wire.rs"]
+pub mod wire;
 #[allow(dead_code)]
 #[path = "../xml.rs"]
 pub mod xml;

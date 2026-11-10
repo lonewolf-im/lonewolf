@@ -12,6 +12,7 @@ pub mod federation;
 mod readiness;
 mod server;
 pub mod tls;
+pub mod wire;
 pub mod xml;
 
 pub use client::{Client, PlainClient};

@@ -15,7 +15,6 @@ use tokio::io::{AsyncRead, ReadBuf};
 use super::*;
 use crate::config::Config;
 use crate::router::{Router, local::LocalRouter};
-use crate::s2s::metrics::Direction;
 use crate::s2s::outbound::manager_tests::{run as test, stanza_in};
 use crate::s2s::revocation::{RevocationSource, RevocationStatus, RevocationVerdict};
 use crate::s2s::stream::S2sReaderLimits;
@@ -1162,8 +1161,8 @@ fn ready_batches_cooperate_with_shutdown_and_invalidation() -> TestResult {
 
 #[test]
 fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> TestResult {
-    use crate::s2s::stream::traffic::{S2sTrafficObserver, test_support::Fragments};
-    use crate::xml_stream::traffic::CountingIo;
+    use crate::s2s::stream::traffic::{ConnectionActivity, test_support::Fragments};
+    use crate::xml_stream::traffic::ObservedIo;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
     test(async {
         for outbound in [false, true] {
@@ -1171,11 +1170,8 @@ fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> Tes
             let mut queue = f.queue(0).await?;
             let input = Fragments::default();
             input.push(HEADER.as_bytes());
-            let counted = CountingIo::new(
-                input.clone(),
-                S2sTrafficObserver::new(Arc::clone(&f.remote.inner.metrics), Direction::Outbound),
-            );
-            let activity = counted.observer().activity();
+            let counted = ObservedIo::new(input.clone(), ConnectionActivity::new(Instant::now()));
+            let activity = counted.observer().clone();
             let mut reader = S2sReader::new(
                 tokio::io::BufReader::new(counted.compat()),
                 &S2sReaderLimits {
@@ -1247,8 +1243,8 @@ fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> Tes
 
 #[test]
 fn incomplete_ready_reads_cooperate_before_shutdown_or_invalidation() -> TestResult {
-    use crate::s2s::stream::traffic::{S2sTrafficObserver, test_support::Fragments};
-    use crate::xml_stream::traffic::CountingIo;
+    use crate::s2s::stream::traffic::{ConnectionActivity, test_support::Fragments};
+    use crate::xml_stream::traffic::ObservedIo;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
     test(async {
         for invalidate in [false, true] {
@@ -1256,11 +1252,8 @@ fn incomplete_ready_reads_cooperate_before_shutdown_or_invalidation() -> TestRes
             let mut queue = f.queue(0).await?;
             let input = Fragments::default();
             input.push(HEADER.as_bytes());
-            let counted = CountingIo::new(
-                input.clone(),
-                S2sTrafficObserver::new(Arc::clone(&f.remote.inner.metrics), Direction::Outbound),
-            );
-            let activity = counted.observer().activity();
+            let counted = ObservedIo::new(input.clone(), ConnectionActivity::new(Instant::now()));
+            let activity = counted.observer().clone();
             let mut reader = S2sReader::new(
                 tokio::io::BufReader::new(counted.compat()),
                 &S2sReaderLimits {

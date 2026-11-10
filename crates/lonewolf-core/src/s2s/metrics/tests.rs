@@ -609,6 +609,9 @@ fn shutdown_snapshot_uses_rendered_counter_and_link_sources() -> Result<(), fmt:
     assert_eq!(
         metrics.shutdown_state(),
         crate::test_support::S2sShutdownState {
+            received_bytes: [0; 2],
+            sent_bytes: [0; 2],
+            transport_ends: [0; 2],
             dropped_shutdown: 0,
             dropped_connection_lost: 0,
             queued_stanzas: 0,

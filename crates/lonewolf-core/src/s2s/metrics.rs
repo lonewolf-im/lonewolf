@@ -531,6 +531,8 @@ pub(crate) struct S2sMetrics {
     streams_closed: [[AtomicU64; StreamClose::ALL.len()]; Direction::ALL.len()],
     stanzas_received: [AtomicU64; KINDS.len()],
     stanzas_sent: [AtomicU64; KINDS.len()],
+    #[cfg(feature = "test-support")]
+    transport_ends: [AtomicU64; Direction::ALL.len()],
     received_bytes: [AtomicU64; Direction::ALL.len()],
     sent_bytes: [AtomicU64; Direction::ALL.len()],
     rate_limited: [AtomicU64; InboundLimit::ALL.len()],
@@ -571,6 +573,8 @@ impl S2sMetrics {
             streams_closed: Default::default(),
             stanzas_received: Default::default(),
             stanzas_sent: Default::default(),
+            #[cfg(feature = "test-support")]
+            transport_ends: Default::default(),
             received_bytes: Default::default(),
             sent_bytes: Default::default(),
             rate_limited: Default::default(),
@@ -778,10 +782,24 @@ impl S2sMetrics {
     }
 
     #[cfg(feature = "test-support")]
+    pub(crate) fn transport_end(&self, direction: Direction) {
+        self.transport_ends[direction as usize].fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(feature = "test-support")]
     pub(crate) fn shutdown_state(&self) -> crate::test_support::S2sShutdownState {
         let source = self.link_source.read().as_ref().and_then(Weak::upgrade);
         let snapshot = source.map_or_else(LinkSnapshot::default, |source| source.snapshot());
+        let transport_ends =
+            std::array::from_fn(|direction| self.transport_ends[direction].load(Ordering::Acquire));
         crate::test_support::S2sShutdownState {
+            transport_ends,
+            received_bytes: std::array::from_fn(|direction| {
+                self.received_bytes[direction].load(Ordering::Relaxed)
+            }),
+            sent_bytes: std::array::from_fn(|direction| {
+                self.sent_bytes[direction].load(Ordering::Relaxed)
+            }),
             dropped_shutdown: self.dropped[DropReason::Shutdown as usize].load(Ordering::Relaxed),
             dropped_connection_lost: self.dropped[DropReason::ConnectionLost as usize]
                 .load(Ordering::Relaxed),
@@ -1256,12 +1274,12 @@ impl Collector for S2sCollector {
         for (name, help, counters) in [
             (
                 "s2s_received_bytes",
-                "XML bytes received after TLS.",
+                "Reported TLS socket read completions, including handshake and record overhead; cancellation or teardown may omit completions.",
                 &metrics.received_bytes,
             ),
             (
                 "s2s_sent_bytes",
-                "XML bytes sent after TLS.",
+                "Reported TLS socket write completions, including handshake and record overhead; cancellation or teardown may omit completions.",
                 &metrics.sent_bytes,
             ),
         ] {

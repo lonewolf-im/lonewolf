@@ -320,6 +320,8 @@ pub(crate) struct S2sReader<A: ChunkAllocator, R> {
     inner: XmlReader<A, RateLimitedReader<R>, S2sReadObserver>,
     max_stanza_bytes: NonZeroUsize,
     activity: Option<traffic::ConnectionActivity>,
+    #[cfg(feature = "test-support")]
+    transport_direction: Option<crate::s2s::metrics::Direction>,
 }
 
 struct S2sReadObserver(Option<Arc<S2sMetrics>>);
@@ -402,11 +404,22 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
             ),
             max_stanza_bytes: state.max_stanza_bytes,
             activity: None,
+            #[cfg(feature = "test-support")]
+            transport_direction: None,
         }
     }
 
     pub(crate) fn with_activity(mut self, activity: traffic::ConnectionActivity) -> Self {
         self.activity = Some(activity);
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn with_transport_direction(
+        mut self,
+        direction: crate::s2s::metrics::Direction,
+    ) -> Self {
+        self.transport_direction = Some(direction);
         self
     }
 
@@ -437,10 +450,19 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
     /// Call once after a TLS reader returns `StreamEvent::StreamEnd`.
     /// Consumes input even if the read fails or is canceled.
     pub(crate) async fn read_transport_end(&mut self) -> Result<(), S2sError> {
-        let (mut input, _) = self.take_input().await?;
+        let (mut input, state) = self.take_input().await?;
+        #[cfg(feature = "test-support")]
+        let metrics = state.metrics.as_ref().map(Arc::clone);
+        drop(state);
         let mut byte = [0];
         match input.read(&mut byte).await? {
-            0 => Ok(()),
+            0 => {
+                #[cfg(feature = "test-support")]
+                if let (Some(metrics), Some(direction)) = (metrics, self.transport_direction) {
+                    metrics.transport_end(direction);
+                }
+                Ok(())
+            }
             _ => Err(io::Error::from(io::ErrorKind::InvalidData).into()),
         }
     }

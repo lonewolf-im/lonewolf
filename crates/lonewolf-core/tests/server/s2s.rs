@@ -11,6 +11,8 @@ mod s2s_cases;
 mod s2s_direct_tls;
 #[path = "support/s2s.rs"]
 mod support;
+#[path = "../support/wire.rs"]
+mod wire;
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
@@ -26,48 +28,60 @@ use support::*;
 fn inbound_external_success_orders_elements_and_rotates_stream_ids() -> Result {
     let fixture = Fixture::new()?;
     let (mut server, address) = fixture.server("")?;
-    let mut received = 0;
-    let mut sent = 0;
-    let limits = "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>524288</max-bytes><idle-seconds>600</idle-seconds></limits>";
-    for auth in [
+    for (index, auth) in [
         AUTH.to_owned(),
         format!(
             "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='EXTERNAL'>{}</auth>",
             STANDARD.encode("PEER.TEST")
         ),
-    ] {
-        let (mut peer, first) = start_tls(address, fixture.client(Some("peer.test"), false)?)?;
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        wait_sample(
+            &server,
+            "lonewolf_s2s_connections{direction=\"inbound\"}",
+            0,
+        )?;
+        let baseline = metrics(&server)?;
+        let received = optional_bytes(&baseline, "received")?;
+        let sent = optional_bytes(&baseline, "sent")?;
+        let (mut peer, first) =
+            start_tls_counted(address, fixture.client(Some("peer.test"), false)?)?;
         let second = external(&mut peer, HEADER)?;
         let third = success(&mut peer, &auth)?;
-        received += 2 * HEADER.len() + auth.len() + FOOTER.len();
-        sent += second.len() + third.len() + FOOTER.len()
-            + "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms><bidi xmlns='urn:xmpp:features:bidi'/></stream:features>".len()
-            + "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>".len()
-            + "<stream:features></stream:features>".len()
-            + 2 * limits.len();
         assert_ne!(id(&first)?, id(&second)?);
         assert_ne!(id(&second)?, id(&third)?);
         assert_ne!(id(&first)?, id(&third)?);
+        wait_sample(&server, &auth_sample("success"), index + 1)?;
+        let totals = peer.sock.counters().snapshot();
+        let body = metrics(&server)?;
+        assert_eq!(
+            optional_bytes(&body, "received")? - received,
+            totals.written
+        );
+        assert_eq!(optional_bytes(&body, "sent")? - sent, totals.read);
         close(&mut peer)?;
+        wait_sample(
+            &server,
+            "lonewolf_s2s_connections{direction=\"inbound\"}",
+            0,
+        )?;
     }
     wait_sample(&server, &auth_sample("success"), 2)?;
-    wait_sample(
-        &server,
-        "lonewolf_s2s_received_bytes_total{direction=\"inbound\"}",
-        received,
-    )?;
-    wait_sample(
-        &server,
-        "lonewolf_s2s_sent_bytes_total{direction=\"inbound\"}",
-        sent,
-    )?;
-    wait_sample(
-        &server,
-        "lonewolf_s2s_connections{direction=\"inbound\"}",
-        0,
-    )?;
     server.stop(Signal::SIGTERM)?;
     Ok(())
+}
+
+fn optional_bytes(body: &str, event: &str) -> Result<u64> {
+    let name = format!("lonewolf_s2s_{event}_bytes_total{{direction=\"inbound\"}}");
+    match body
+        .lines()
+        .find_map(|line| line.strip_prefix(&name)?.strip_prefix(' '))
+    {
+        Some(value) => Ok(value.parse()?),
+        None => Ok(0),
+    }
 }
 
 #[test]

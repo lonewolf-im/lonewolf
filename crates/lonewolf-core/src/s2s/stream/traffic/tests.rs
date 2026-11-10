@@ -9,7 +9,7 @@ use futures_util::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt a
 use prometheus_client::registry::Registry;
 
 use super::*;
-use crate::xml_stream::traffic::CountingIo;
+use crate::xml_stream::traffic::ObservedIo;
 fn metrics() -> Arc<S2sMetrics> {
     S2sMetrics::new(1)
 }
@@ -25,18 +25,18 @@ fn render(metrics: &Arc<S2sMetrics>) -> Result<String, Box<dyn std::error::Error
 fn reads_and_writes_are_counted() -> Result<(), Box<dyn std::error::Error>> {
     compio::runtime::Runtime::new()?.block_on(async {
         let metrics = metrics();
-        let mut input = CountingIo::new(
+        let mut input = ObservedIo::new(
             Cursor::new(b"hello"),
-            S2sTrafficObserver::new(Arc::clone(&metrics), Direction::Inbound),
+            S2sByteObserver::new(Arc::clone(&metrics), Direction::Inbound),
         );
         let mut buffer = [0; 3];
         assert_eq!(input.read(&mut buffer).await?, 3);
         assert_eq!(input.read(&mut buffer).await?, 2);
         assert_eq!(input.read(&mut buffer).await?, 0);
         assert_eq!(input.read(&mut []).await?, 0);
-        let mut output = CountingIo::new(
+        let mut output = ObservedIo::new(
             Vec::new(),
-            S2sTrafficObserver::new(Arc::clone(&metrics), Direction::Inbound),
+            S2sByteObserver::new(Arc::clone(&metrics), Direction::Inbound),
         );
         output.write_all(b"goodbye").await?;
         assert_eq!(output.write(&[]).await?, 0);
@@ -99,13 +99,13 @@ impl AsyncWrite for ControlledIo {
 fn pending_errors_and_partial_operations_preserve_actual_byte_counts()
 -> Result<(), Box<dyn std::error::Error>> {
     let metrics = metrics();
-    let mut io = CountingIo::new(
+    let mut io = ObservedIo::new(
         ControlledIo {
             result: Poll::Pending,
             flushes: 0,
             closes: 0,
         },
-        S2sTrafficObserver::new(Arc::clone(&metrics), Direction::Inbound),
+        S2sByteObserver::new(Arc::clone(&metrics), Direction::Inbound),
     );
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
     let mut buffer = [0; 8];
@@ -168,17 +168,17 @@ fn physical_activity_and_read_cooperation_follow_only_successful_positive_io()
     let wake = Arc::new(Wake(std::sync::atomic::AtomicUsize::new(0)));
     let waker = futures_util::task::waker_ref(&wake);
     let mut cx = Context::from_waker(&waker);
-    let mut io = CountingIo::new(
+    let mut io = ObservedIo::new(
         ControlledIo {
             result: Poll::Ready(Ok(2)),
             flushes: 0,
             closes: 0,
         },
-        S2sTrafficObserver::new(metrics(), Direction::Outbound),
+        ConnectionActivity::new(Instant::now()),
     );
     let old = Instant::now() - std::time::Duration::from_secs(1);
-    io.observer_mut().activity = ConnectionActivity::new(old);
-    let activity = io.observer().activity();
+    *io.observer_mut() = ConnectionActivity::new(old);
+    let activity = io.observer().clone();
     let mut output = [0; 8];
     assert!(matches!(
         Pin::new(&mut io).poll_read(&mut cx, &mut output),
@@ -220,8 +220,8 @@ fn physical_activity_and_read_cooperation_follow_only_successful_positive_io()
         assert!(!io.yields_read());
         assert_eq!(activity.last(), before);
     }
-    io.observer_mut().activity = ConnectionActivity::new(old);
-    let activity = io.observer().activity();
+    *io.observer_mut() = ConnectionActivity::new(old);
+    let activity = io.observer().clone();
     io.inner_mut().result = Poll::Ready(Ok(1));
     assert!(matches!(
         Pin::new(&mut io).poll_write(&mut cx, b"x"),

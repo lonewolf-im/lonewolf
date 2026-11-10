@@ -25,9 +25,9 @@ use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, S2sMetrics, TransportAttempt};
 use crate::s2s::outbound::RemoteRouter;
 use crate::s2s::revocation::{CheckPhase, RevocationStatus, RevocationVerdict};
-use crate::s2s::stream::traffic::S2sTrafficObserver;
+use crate::s2s::stream::traffic::{ConnectionActivity, S2sByteObserver};
 use crate::s2s::stream::{self, Auth, S2sError, S2sReader, S2sWriter, SaslFailure};
-use crate::xml_stream::traffic::CountingIo;
+use crate::xml_stream::traffic::ObservedIo;
 
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
@@ -35,7 +35,12 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 type PlainInput = Compat<Pin<Box<AsyncReadStream<TcpStream>>>>;
 type PlainOutput = Pin<Box<AsyncStream<TcpStream>>>;
-type TlsTransport = CountingIo<futures_rustls::server::TlsStream<PlainOutput>, S2sTrafficObserver>;
+type TlsTransport = ObservedIo<
+    futures_rustls::server::TlsStream<
+        Pin<Box<AsyncStream<ObservedIo<TcpStream, S2sByteObserver>>>>,
+    >,
+    ConnectionActivity,
+>;
 type TlsInput = BufReader<Compat<ReadHalf<TlsTransport>>>;
 type TlsOutput = WriteHalf<TlsTransport>;
 
@@ -365,7 +370,10 @@ async fn run<A: ChunkAllocator + Clone>(
     let (local, tls, state) = if settings.tls_mode == crate::config::TlsMode::Direct {
         let accepted = LazyConfigAcceptor::new(
             rustls::server::Acceptor::default(),
-            Box::pin(AsyncStream::new(tcp.clone())),
+            Box::pin(AsyncStream::new(ObservedIo::new(
+                tcp.clone(),
+                S2sByteObserver::new(Arc::clone(&settings.metrics), Direction::Inbound),
+            ))),
         )
         .await
         .map_err(|_| Failure {
@@ -451,7 +459,10 @@ async fn run<A: ChunkAllocator + Clone>(
         drop(reader);
         drop(writer);
         let tls = TlsAcceptor::from(config)
-            .accept(Box::pin(AsyncStream::new(tcp.clone())))
+            .accept(Box::pin(AsyncStream::new(ObservedIo::new(
+                tcp.clone(),
+                S2sByteObserver::new(Arc::clone(&settings.metrics), Direction::Inbound),
+            ))))
             .await
             .map_err(|_| Failure {
                 error: S2sError::Io,
@@ -473,29 +484,26 @@ async fn run<A: ChunkAllocator + Clone>(
             )
         })
     });
-    let counted = CountingIo::new(
-        tls,
-        S2sTrafficObserver::new(Arc::clone(&settings.metrics), Direction::Inbound),
-    );
-    let activity = counted.observer().activity();
+    let counted = ObservedIo::new(tls, ConnectionActivity::new(Instant::now()));
+    let activity = counted.observer().clone();
     let (input, output) = counted.split();
-    *connection = Some(Connection::Tls(
-        match state {
-            Some(state) => S2sReader::from_state(
-                BufReader::new(input.compat()),
-                state,
-                settings.services.allocator.clone(),
-            ),
-            None => S2sReader::new(
-                BufReader::new(input.compat()),
-                &settings.reader_limits,
-                settings.services.allocator.clone(),
-                Some(Arc::clone(&settings.metrics)),
-            ),
-        }
-        .with_activity(activity),
-        S2sWriter::new(output),
-    ));
+    let reader = match state {
+        Some(state) => S2sReader::from_state(
+            BufReader::new(input.compat()),
+            state,
+            settings.services.allocator.clone(),
+        ),
+        None => S2sReader::new(
+            BufReader::new(input.compat()),
+            &settings.reader_limits,
+            settings.services.allocator.clone(),
+            Some(Arc::clone(&settings.metrics)),
+        ),
+    }
+    .with_activity(activity);
+    #[cfg(feature = "test-support")]
+    let reader = reader.with_transport_direction(Direction::Inbound);
+    *connection = Some(Connection::Tls(reader, S2sWriter::new(output)));
     *header_sent = false;
     let tls = connection.as_mut().ok_or(S2sError::Internal)?;
     let restarted = header(expected(tls, peer_footer).await?)?;

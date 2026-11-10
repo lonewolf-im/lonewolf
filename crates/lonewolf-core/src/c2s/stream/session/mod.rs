@@ -31,12 +31,12 @@ use crate::xml_stream::limiter::StanzaLimiter;
 use crate::xml_stream::peer_stream_error;
 pub(super) use crate::xml_stream::reader::ReadMode;
 use crate::xml_stream::reader::{ReadObserver, XmlReader};
-use crate::xml_stream::traffic::CountingIo;
+use crate::xml_stream::traffic::ObservedIo;
 
 pub(super) const IO_BUFFER_BYTES: usize = 4_096;
 
 pub(super) type TlsTransport = futures_rustls::server::TlsStream<
-    RecordGuard<CountingIo<Pin<Box<AsyncStream<TcpStream>>>, C2sWorkerMetrics>>,
+    RecordGuard<Pin<Box<AsyncStream<ObservedIo<TcpStream, C2sWorkerMetrics>>>>>,
 >;
 pub(super) type TlsReader = ReadHalf<TlsTransport>;
 pub(super) type TlsWriter = WriteHalf<TlsTransport>;

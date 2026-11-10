@@ -34,6 +34,26 @@ fn reader(input: &[u8], burst: usize) -> TestResult<TestReader> {
     ))
 }
 
+fn instrumented_reader(
+    input: &[u8],
+    per_second: NonZeroUsize,
+    burst: NonZeroUsize,
+    metrics: C2sWorkerMetrics,
+) -> TestResult<TestReader> {
+    Ok(Reader::with_mode(
+        XmppParser::new(
+            std::io::Cursor::new(input.to_vec()),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(10_000).ok_or("invalid stanza size")?,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        ),
+        StanzaLimiter::new(per_second, burst),
+        Rc::new(Cell::new(ReadMode::Open)),
+        metrics,
+    ))
+}
 #[test]
 fn only_complete_stanzas_consume_tokens_including_all_iq_types_and_server_namespace() -> TestResult
 {
@@ -250,8 +270,12 @@ fn parsed_and_written_stanzas_are_counted_by_kind() -> TestResult {
     Runtime::new()?.block_on(async {
         let metrics = crate::c2s::metrics::C2sMetrics::detached();
         let input = format!("{HEADER}<message/><iq type='unknown'/>");
-        let mut reader = reader(input.as_bytes(), 3)?;
-        reader.ready.as_mut().ok_or("missing read state")?.metrics = metrics.worker(0, 0);
+        let mut reader = instrumented_reader(
+            input.as_bytes(),
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(3).ok_or("invalid burst")?,
+            metrics.worker(0, 0),
+        )?;
         assert!(matches!(
             reader.next_event().await,
             Ok(Some(StreamEvent::StreamStart { .. }))
@@ -288,10 +312,7 @@ fn resumed_stanza_waits_are_counted_once() -> TestResult {
     Runtime::new()?.block_on(async {
         let metrics = crate::c2s::metrics::C2sMetrics::detached();
         let input = format!("{HEADER}<message/><message/>");
-        let mut reader = reader(input.as_bytes(), 1)?;
-        let state = reader.ready.as_mut().ok_or("missing read state")?;
-        state.metrics = metrics.worker(0, 0);
-        state.stanzas = StanzaLimiter::new(NonZeroUsize::new(20).ok_or("zero rate")?, NonZeroUsize::MIN);
+        let mut reader = instrumented_reader(input.as_bytes(), NonZeroUsize::new(20).ok_or("zero rate")?, NonZeroUsize::MIN, metrics.worker(0, 0))?;
         assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::StreamStart { .. }))));
         assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::Stanza(_)))));
         let mut waiting = Box::pin(reader.next_event());
@@ -439,6 +460,29 @@ fn cancelled_raw_stanza_flush_does_not_increment_sent_count() -> TestResult {
                 .render()?
                 .contains("lonewolf_c2s_stanzas_sent_total{listener=\"0\",kind=\"iq\"} 0\n")
         );
+        Ok(())
+    })
+}
+
+#[test]
+fn first_stanza_wait_is_counted_once_before_close_aborts_it() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let input = format!("{HEADER}<message/><message/></stream:stream>");
+        let mut reader = instrumented_reader(input.as_bytes(), NonZeroUsize::MIN, NonZeroUsize::MIN, metrics.worker(0, 0))?;
+        assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::StreamStart { .. }))));
+        assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::Stanza(_)))));
+        let mut waiting = Box::pin(reader.next_event());
+        assert!(poll!(waiting.as_mut()).is_pending());
+        let sample = "lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"incoming_stanzas_per_connection\"} 1\n";
+        assert!(metrics.render()?.contains(sample));
+        assert!(poll!(waiting.as_mut()).is_pending());
+        assert!(metrics.render()?.contains(sample));
+        drop(waiting);
+        reader.closing();
+        assert!(matches!(poll!(Box::pin(reader.next_event()).as_mut()), Poll::Ready(Ok(Some(StreamEvent::Stanza(_))))));
+        assert!(matches!(reader.next_event().await, Ok(Some(StreamEvent::StreamEnd))));
+        assert!(metrics.render()?.contains(sample));
         Ok(())
     })
 }

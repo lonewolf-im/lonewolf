@@ -11,7 +11,6 @@ mod outcome;
 mod recipient_rate;
 mod renegotiation;
 mod session;
-mod stanza_rate;
 mod traffic;
 
 use std::future::Future;

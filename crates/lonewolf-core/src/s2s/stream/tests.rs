@@ -969,7 +969,7 @@ fn transfer_preserves_stanza_budget_and_counts_one_wait_per_stanza() -> TestResu
             Some(StreamEvent::Stanza(_))
         ));
         let (_, state) = success(before.take_input().await)?;
-        assert_eq!(state.bucket.available(), 0);
+        assert_eq!(state.limiter.available(), 0);
         let mut after = S2sReader::from_state(io::Cursor::new(input), state, GlobalChunkAllocator);
         assert!(matches!(
             success(after.next_event().await)?,
@@ -1186,6 +1186,52 @@ fn size_preflight_matches_serializer_with_escaping_unicode_and_namespaces() -> T
         assert!(!success(super::limits::stanza_fits(&view, 0).await)?);
         let xml = std::str::from_utf8(&actual)?;
         assert!(xml.contains("urn:payload") && xml.contains("&amp;") && xml.contains("🙂"));
+        Ok(())
+    })
+}
+
+#[test]
+fn restart_distinguishes_pending_extracted_and_ready_failed_parsers() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (input, mut output) = tokio::io::duplex(4_096);
+        output.write_all(HEADER.as_bytes()).await?;
+        let mut pending =
+            S2sReader::new(BufReader::new(input), &limits(), GlobalChunkAllocator, None);
+        assert!(matches!(
+            success(pending.next_event().await)?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        {
+            let mut next = pin!(pending.next_event());
+            assert!(poll!(next.as_mut()).is_pending());
+        }
+        assert!(matches!(pending.restart(), Err(S2sError::Internal)));
+        output
+            .write_all(b"<message from='peer.test' to='local.test'/>")
+            .await?;
+        assert!(matches!(
+            success(pending.next_event().await)?,
+            Some(StreamEvent::Stanza(_))
+        ));
+        drop(success(pending.take_input().await)?);
+        assert!(matches!(pending.restart(), Err(S2sError::Internal)));
+        assert!(matches!(
+            pending.take_input().await,
+            Err(S2sError::Internal)
+        ));
+
+        let mut failed = reader(&format!("{HEADER}<message></presence>"), &limits());
+        assert!(matches!(
+            success(failed.next_event().await)?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        assert!(failed.next_event().await.is_err());
+        assert!(matches!(
+            failed.restart(),
+            Err(S2sError::Stream(StreamErrorCondition::BadFormat))
+        ));
+        drop(success(failed.take_input().await)?);
+        assert!(matches!(failed.restart(), Err(S2sError::Internal)));
         Ok(())
     })
 }

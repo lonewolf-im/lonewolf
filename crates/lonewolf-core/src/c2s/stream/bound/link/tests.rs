@@ -18,7 +18,7 @@ use lonewolf_xmpp::stanza::PresenceType;
 
 use super::super::tests::{ControlledWriter, routed_presence};
 use super::*;
-use crate::c2s::stream::stanza_rate::StanzaLimiter;
+use crate::xml_stream::limiter::StanzaLimiter;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 

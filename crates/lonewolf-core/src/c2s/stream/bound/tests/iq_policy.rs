@@ -14,6 +14,7 @@ struct PolicyVisibility {
     policies: PlMutex<Vec<Snapshot>>,
     visibility: PlMutex<Vec<Snapshot>>,
     policy_gate: PlMutex<Option<Gate>>,
+    policy_done: PlMutex<Option<oneshot::Sender<()>>>,
     visibility_done: PlMutex<Option<oneshot::Sender<()>>>,
     fail_visibility: bool,
 }
@@ -24,6 +25,7 @@ impl PolicyVisibility {
             policies: PlMutex::default(),
             visibility: PlMutex::default(),
             policy_gate: PlMutex::default(),
+            policy_done: PlMutex::default(),
             visibility_done: PlMutex::default(),
             fail_visibility,
         }
@@ -40,6 +42,7 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for PolicyVisibility {
         slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
     ) -> Result<(), RegistrationError> {
         slots.policy(self.clone());
+        slots.presence(PresenceRequestType::Probe, self.clone())?;
         slots.presence(PresenceRequestType::Available, self)
     }
 }
@@ -65,6 +68,11 @@ impl PolicyHandler<RedbStorage> for PolicyVisibility {
                 release
                     .await
                     .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            }
+            if request.direction == Direction::Inbound
+                && let Some(done) = self.policy_done.lock().take()
+            {
+                let _ = done.send(());
             }
             Ok(Verdict::Allow)
         })
@@ -363,4 +371,146 @@ fn detached_full_iq_rechecks_source_liveness_after_ticket_wait() -> TestResult {
         router.shutdown().await?;
         fixture.finish().await
     }))?
+}
+
+async fn probe_request(target: &str) -> TestResult<Parsed<Stanza, GlobalChunkAllocator>> {
+    let xml = format!(
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'><presence type='probe' from='mallory@remote.test/spoof' to='{target}'/>"
+    );
+    let mut parser = XmppParser::new(
+        xml.as_bytes(),
+        ParserConfig {
+            max_stanza_bytes: NonZeroUsize::new(4096).ok_or("limit")?,
+            arena: ArenaConfig::default(),
+        },
+        GlobalChunkAllocator,
+    );
+    assert!(matches!(
+        parser.next_event().await?,
+        Some(StreamEvent::StreamStart { .. })
+    ));
+    let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+        return Err("probe".into());
+    };
+    Ok(parsed)
+}
+
+#[test]
+fn local_probe_shares_snapshot_waits_for_target_and_drains_until_delivery() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let handler = Arc::new(PolicyVisibility::new(false));
+        let (entered, reached) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        *handler.policy_gate.lock() = Some((entered, resume));
+        let (done, completed) = oneshot::channel();
+        *handler.policy_done.lock() = Some(done);
+        let (router, mut session, phone) = setup(&fixture, handler.clone(), false).await?;
+        let handle = router.handle();
+        let ((), blocker) = handle
+            .order()
+            .fix(vec![phone.account().clone()], async {
+                Ok::<_, RouterError>(())
+            })
+            .await?;
+        let (flushed, written) = oneshot::channel();
+        session.outbox.writer.flush_entered = Some(flushed);
+        let parsed = probe_request("alice@localhost/phone").await?;
+        let mut dispatch = Box::pin(session.handle_probe(parsed));
+        match futures_util::future::select(reached, dispatch.as_mut()).await {
+            Either::Left((entered, _)) => entered?,
+            Either::Right(_) => return Err("probe preceded policy".into()),
+        }
+        assert_eq!(handler.visibility.lock().len(), 1);
+        let mut transaction = fixture.storage.begin_write().await?;
+        transaction
+            .replace_vcard(
+                phone.account(),
+                "<vCard xmlns='vcard-temp'/>",
+                VCardQuota::default(),
+            )
+            .await?;
+        transaction.commit().await?;
+        release.send(()).map_err(|_| "policy cancelled")?;
+        match futures_util::future::select(completed, dispatch.as_mut()).await {
+            Either::Left((done, _)) => done?,
+            Either::Right(_) => return Err("probe preceded final policy".into()),
+        }
+        assert!(poll!(&mut dispatch).is_pending());
+        {
+            let policies = handler.policies.lock();
+            let visibility = handler.visibility.lock();
+            assert_eq!(policies.len(), 2);
+            for policy in policies.iter() {
+                assert_eq!(policy.0, visibility[0].0);
+                assert!(policy.1.is_none());
+            }
+            assert!(visibility[0].1.is_none());
+        }
+        for id in ["first", "second"] {
+            let mut arena = Arena::try_new(Default::default())?;
+            let to = Jid::parse_in("bob@localhost/desk", &mut arena)?;
+            let stanza = Stanza::builder_in(
+                StanzaType::Message(MessageType::Chat),
+                StanzaNamespace::Client,
+                &mut arena,
+            )
+            .to(Some(to))?
+            .id(Some(id))?
+            .build()?;
+            handle
+                .route_full(RoutedStanza::from_parts(stanza, arena))
+                .await?;
+        }
+        match futures_util::future::select(written, dispatch.as_mut()).await {
+            Either::Left((done, _)) => done?,
+            Either::Right(_) => return Err("probe stopped mailbox draining".into()),
+        }
+        assert!(poll!(&mut dispatch).is_pending());
+        drop(blocker);
+        dispatch.await.map_err(|error| format!("{error:?}"))?;
+        assert_eq!(session.outbox.writer.written.len(), 2);
+        assert!(session.outbox.writer.written[0].contains("id=\"first\""));
+        assert!(session.outbox.writer.written[1].contains("id=\"second\""));
+        let replies = session.registration.take_queued();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].stanza.resolve()?.stanza_type(),
+            StanzaType::Presence(PresenceType::Available)
+        );
+        assert_eq!(
+            replies[0].stanza.resolve()?.from()?.ok_or("from")?.as_str(),
+            "alice@localhost/phone"
+        );
+        drop((replies, session, phone));
+        router.shutdown().await?;
+        fixture.finish().await
+    }))?
+}
+
+#[test]
+fn same_account_local_probe_keeps_visibility_failure_before_policy() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for fail in [false, true] {
+            let fixture = Fixture::new(&[]).await?;
+            let handler = Arc::new(PolicyVisibility::new(fail));
+            let (router, mut session, phone) = setup(&fixture, handler.clone(), true).await?;
+            let result = session
+                .handle_probe(probe_request("bob@localhost/phone").await?)
+                .await;
+            assert_eq!(handler.visibility.lock().len(), 1);
+            assert!(handler.policies.lock().is_empty());
+            if fail {
+                assert_eq!(result, Err(CloseOutcome::InternalError));
+                assert!(session.registration.take_queued().is_empty());
+            } else {
+                result.map_err(|error| format!("{error:?}"))?;
+                assert_eq!(session.registration.take_queued().len(), 1);
+            }
+            drop((session, phone));
+            router.shutdown().await?;
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
 }

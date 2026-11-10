@@ -32,6 +32,7 @@ use crate::stages::message::DeliveryOutcome;
 
 mod iq;
 mod message;
+mod presence;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 

@@ -1192,76 +1192,23 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let storage = self.storage.clone();
         let account = self.registration.account().clone();
         let pending = Pending::spawn(self.outbox.work.start(), async move {
-            let mut accounts = vec![account];
-            if accounts[0] != target {
-                accounts.push(target.clone());
-            }
-            let (transaction, mut ticket) = router
-                .order()
-                .fix(accounts, storage.begin_read())
-                .await
-                .map_err(|error| {
-                    report_failure(storage_failure(error, "presence_probe_begin_read"), &target);
-                    RouterError::Unavailable
-                })?;
-            let observer = routed
-                .resolve()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .from()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            let subscribed = match router
-                .presence_handlers(target.domain())
-                .and_then(|handlers| handlers.find(PresenceRequestType::Probe))
-            {
-                Some(handler) => handler
-                    .visibility(&target, observer, &transaction)
-                    .await
-                    .map_err(|error| {
-                        report_handler_failure(&error, &target);
-                        RouterError::Unavailable
-                    })?,
-                None => false,
+            let Some(grant) = ingress::presence::authorize_probe(
+                router.clone(),
+                storage,
+                Some(account),
+                Some(target),
+                &routed,
+                false,
+            )
+            .await?
+            else {
+                return Ok::<_, CloseOutcome>(());
             };
-            if observer.bare().as_str() != target.as_str()
-                && (!router.policies(observer.domainpart()).is_empty()
-                    || !router.policies(target.domain()).is_empty())
-            {
-                let prober = AccountKey::try_from(observer.bare())
-                    .map_err(|_| RouterError::InvalidTarget)?;
-                let peer = routed
-                    .resolve()
-                    .map_err(|_| RouterError::InvalidTarget)?
-                    .to()
-                    .map_err(|_| RouterError::InvalidTarget)?
-                    .ok_or(RouterError::InvalidTarget)?;
-                let checks = [
-                    policy::Check {
-                        account: &prober,
-                        direction: Direction::Outbound,
-                        peer,
-                    },
-                    policy::Check {
-                        account: &target,
-                        direction: Direction::Inbound,
-                        peer: observer,
-                    },
-                ];
-                if policy::evaluate_in(
-                    &router,
-                    &transaction,
-                    StanzaType::Presence(PresenceType::Probe),
-                    &checks,
-                )
-                .await
-                .map_err(|_| RouterError::Unavailable)?
-                    != Verdict::Allow
-                {
-                    return Ok(());
-                }
-            }
-            ticket.turn().await;
-            router.probe_presence(&session, &routed, subscribed).await
+            let result = router
+                .probe_presence(&session, &routed, grant.subscribed)
+                .await;
+            drop(grant.ticket);
+            result.map_err(|_| CloseOutcome::InternalError)
         });
         self.outbox
             .drain_until(&self.registration, pending.finished())
@@ -1275,45 +1222,24 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let storage = self.storage.clone();
         let account = self.registration.account().clone();
         let pending = Pending::spawn(self.outbox.work.start(), async move {
-            let (transaction, mut ticket) = router
-                .order()
-                .fix(vec![account.clone()], storage.begin_read())
-                .await
-                .map_err(|error| {
-                    report_failure(
-                        storage_failure(error, "presence_probe_begin_read"),
-                        &account,
-                    );
-                    RouterError::Unavailable
-                })?;
-            let peer = routed
-                .resolve()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .to()
-                .map_err(|_| RouterError::InvalidTarget)?
-                .ok_or(RouterError::InvalidTarget)?;
-            let checks = [policy::Check {
-                account: &account,
-                direction: Direction::Outbound,
-                peer,
-            }];
-            let verdict = policy::evaluate_in(
-                &router,
-                &transaction,
-                StanzaType::Presence(PresenceType::Probe),
-                &checks,
+            let Some(grant) = ingress::presence::authorize_probe(
+                router.clone(),
+                storage,
+                Some(account),
+                None,
+                &routed,
+                false,
             )
-            .await
-            .map_err(|_| RouterError::Unavailable)?;
-            drop(transaction);
-            if verdict != Verdict::Allow {
-                return Ok(());
-            }
-            ticket.turn().await;
-            match router.route_remote_or_bounce(routed) {
-                Err(RouterError::Stopped) => Err(RouterError::Stopped),
+            .await?
+            else {
+                return Ok::<_, CloseOutcome>(());
+            };
+            let result = match router.route_remote_or_bounce(routed) {
+                Err(RouterError::Stopped) => Err(CloseOutcome::InternalError),
                 _ => Ok(()),
-            }
+            };
+            drop(grant.ticket);
+            result
         });
         self.outbox
             .drain_until(&self.registration, pending.finished())
@@ -1346,33 +1272,21 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             }
         };
         if target.as_ref() != Some(self.registration.account()) {
-            let stage = Stage {
-                router: &self.router,
-                storage: &self.storage,
-                allocator: &self.allocator,
-                work: &self.work,
-            };
             let view = routed.resolve()?;
-            let checks = [
-                policy::Check {
-                    account: self.registration.account(),
-                    direction: Direction::Outbound,
-                    peer: view.to()?.ok_or(CloseOutcome::InternalError)?,
-                },
-                policy::Check {
-                    account: target.as_ref().unwrap_or(self.registration.account()),
-                    direction: Direction::Inbound,
-                    peer: view.from()?.ok_or(CloseOutcome::InternalError)?,
-                },
-            ];
+            view.to()?.ok_or(CloseOutcome::InternalError)?;
+            view.from()?.ok_or(CloseOutcome::InternalError)?;
             if self
                 .outbox
                 .drain_until(
                     &self.registration,
-                    policy::evaluate(
-                        &stage,
-                        view.stanza_type(),
-                        &checks[..if target.is_some() { 2 } else { 1 }],
+                    ingress::checks::check_from(
+                        &self.router,
+                        &self.storage,
+                        Some(self.registration.account()),
+                        target.as_ref(),
+                        &view,
+                        None,
+                        ingress::checks::Snapshot::Fresh,
                     ),
                 )
                 .await??

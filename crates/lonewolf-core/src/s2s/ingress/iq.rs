@@ -18,9 +18,10 @@ use lonewolf_xmpp::stanza::{IqType, Stanza, StanzaErrorCondition, StanzaErrorTex
 use super::{InboundPeer, IngressContext, IngressFailure, reply_error};
 use crate::delivery::{
     EffectsDiagnostics, EffectsIdentity, RouterDelivery, after_turn, commit_and_deliver,
-    report_failure, report_server_failure, storage_failure,
+    storage_failure,
 };
 use crate::router::{Destination, RoutedStanza, RouterError};
+use crate::stages::ingress::Origin;
 use crate::stages::iq::{
     IqTarget, ReplyError, error_reply_omitting_payload, iq_requester, iq_target,
     require_iq_account, result_reply,
@@ -33,25 +34,16 @@ impl From<ReplyError> for IngressFailure {
     }
 }
 
-fn report(failure: Failure, account: Option<&AccountKey>, domain: &str) {
-    match account {
-        Some(account) => report_failure(failure, account),
-        None => report_server_failure(failure, domain),
-    }
-}
-
-fn report_handler(error: &HandlerError, account: Option<&AccountKey>, domain: &str) {
-    if let Some(failure) = error.failure() {
-        report(failure, account, domain);
-    }
-}
-
 pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     context: &IngressContext<A>,
     peer: &InboundPeer,
     routed: RoutedStanza<A>,
     kind: IqType,
 ) -> Result<(), IngressFailure> {
+    let origin: Origin<'_, A> = Origin::Remote {
+        local: &peer.local,
+        remote: &peer.remote,
+    };
     let stage = Stage {
         router: &context.router,
         storage: &context.storage,
@@ -121,7 +113,10 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
                 .fix(vec![account.clone()], context.storage.begin_read())
                 .await
                 .map_err(|error| {
-                    report_failure(storage_failure(error, "iq_resource_begin_read"), account);
+                    origin.report(
+                        storage_failure(error, "iq_resource_begin_read"),
+                        Some(account),
+                    );
                     IngressFailure
                 })?;
             (Some(transaction), ticket)
@@ -152,7 +147,9 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
             )
             .await
             .map_err(|error| {
-                report_handler(&error, Some(account), &peer.local);
+                if let Some(failure) = error.failure() {
+                    origin.report(failure, Some(account));
+                }
                 IngressFailure
             })? == Requester::PresenceAuthorized
         } else {
@@ -230,10 +227,9 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
                 )
                 .await
                 .map_err(|error| {
-                    report(
+                    origin.report(
                         storage_failure(error, "iq_get_begin_read"),
                         account.as_ref(),
-                        &peer.local,
                     );
                     IngressFailure
                 })?;
@@ -262,10 +258,9 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         }
         IqRequestType::Set => {
             let mut transaction = context.storage.begin_write().await.map_err(|error| {
-                report(
+                origin.report(
                     storage_failure(error, "iq_set_begin_write"),
                     account.as_ref(),
-                    &peer.local,
                 );
                 IngressFailure
             })?;
@@ -316,7 +311,9 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
                 }
                 Err(error) => {
                     drop(transaction);
-                    report_handler(error.handler_error(), account.as_ref(), &peer.local);
+                    if let Some(failure) = error.handler_error().failure() {
+                        origin.report(failure, account.as_ref());
+                    }
                     (Err(error), response)
                 }
             }
@@ -452,16 +449,26 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
             }
         };
         drop(self.transaction);
+        let sender = self
+            .request
+            .resolve(&self.arena)
+            .map_err(|_| IngressFailure)?
+            .from()
+            .map_err(|_| IngressFailure)?
+            .ok_or(IngressFailure)?;
+        let origin: Origin<'_, A> = Origin::Remote {
+            local: &self.domain,
+            remote: sender.domainpart(),
+        };
         let reply = match reply {
             Ok(reply) => {
                 (reply.effects.deliver)(&self.delivery).await.map_err(|_| {
-                    report(
+                    origin.report(
                         Failure {
                             kind: FailureKind::Delivery,
                             operation: "iq_get_effects",
                         },
                         self.account.as_ref(),
-                        &self.domain,
                     );
                     IngressFailure
                 })?;
@@ -472,7 +479,9 @@ impl<A: ChunkAllocator + Clone> GetWork<A> {
                 })
             }
             Err(error) => {
-                report_handler(error.handler_error(), self.account.as_ref(), &self.domain);
+                if let Some(failure) = error.handler_error().failure() {
+                    origin.report(failure, self.account.as_ref());
+                }
                 Err(error)
             }
         };

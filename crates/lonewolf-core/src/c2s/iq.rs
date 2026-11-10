@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::iq::IqRequestType;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
@@ -21,16 +20,6 @@ pub(super) struct Route {
     pub(super) sender: Jid,
     pub(super) kind: IqType,
     pub(super) destination: Destination,
-}
-
-impl Route {
-    pub(super) fn request_type(&self) -> Option<IqRequestType> {
-        match self.kind {
-            IqType::Get => Some(IqRequestType::Get),
-            IqType::Set => Some(IqRequestType::Set),
-            IqType::Result | IqType::Error => None,
-        }
-    }
 }
 
 pub(super) fn route<A: ChunkAllocator + Clone>(

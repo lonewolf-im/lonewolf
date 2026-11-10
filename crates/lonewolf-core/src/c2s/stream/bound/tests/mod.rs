@@ -33,6 +33,7 @@ use crate::router::{Router, StoredRelease};
 
 mod iq_destinations;
 mod iq_errors;
+mod iq_policy;
 mod observers;
 mod remote;
 mod session_iq;
@@ -1715,16 +1716,24 @@ fn iq_order_wait_rechecks_directed_grants_replacement_deletion_and_source_retire
                     async { Ok::<_, RouterError>(()) },
                 )
                 .await?;
-            let work = ResourceIqWork {
-                source: fixture.registration.account().clone(),
-                liveness: fixture.registration.liveness(),
-                router: router.clone(),
-                storage: fixture.storage.clone(),
-                target: target_account.clone(),
-                request: true,
-                stanza: RoutedStanza::from_parts(stanza, arena),
-            };
-            let pending = Pending::spawn(fixture.work.start(), work.admit(false, ticket));
+            let source = fixture.registration.account().clone();
+            let liveness = fixture.registration.liveness();
+            let worker_router = router.clone();
+            let storage = fixture.storage.clone();
+            let worker_target = target_account.clone();
+            let pending = Pending::spawn(fixture.work.start(), async move {
+                ResourceIqWork {
+                    source: Some(source),
+                    liveness: Some(liveness),
+                    router: &worker_router,
+                    storage: &storage,
+                    target: worker_target,
+                    request: true,
+                    input: IqInput::Routed(RoutedStanza::from_parts(stanza, arena)),
+                }
+                .admit(false, ticket)
+                .await
+            });
             let mut replacement = None;
             match action {
                 1 => {
@@ -1838,13 +1847,13 @@ fn iq_visibility_reads_prior_roster_revocation_while_delivery_waits_on_order() -
         .child(query)?
         .build()?;
         let work = ResourceIqWork {
-            source: account.clone(),
-            liveness: source.liveness(),
-            router: router.clone(),
-            storage: fixture.storage.clone(),
+            source: Some(account.clone()),
+            liveness: Some(source.liveness()),
+            router: &router,
+            storage: &fixture.storage,
             target: owner.clone(),
             request: true,
-            stanza: RoutedStanza::from_parts(stanza, arena),
+            input: IqInput::Routed(RoutedStanza::from_parts(stanza, arena)),
         };
         let mut transaction = fixture.storage.begin_write().await?;
         transaction.remove_roster_item(&owner, &contact).await?;
@@ -1853,12 +1862,21 @@ fn iq_visibility_reads_prior_roster_revocation_while_delivery_waits_on_order() -
             .fix(vec![owner, account], transaction.commit())
             .await?;
         blocker.turn().await;
-        let (subscribed, ticket) = work.authorize().await?;
+        let ResourceAuthorization::Allowed {
+            work,
+            subscribed,
+            ticket,
+        } = work.authorize().await?
+        else {
+            return Err("unexpected policy rejection".into());
+        };
         assert!(!subscribed);
-        let mut admission = std::pin::pin!(work.admit(subscribed, ticket));
-        assert!(poll!(admission.as_mut()).is_pending());
-        drop(blocker);
-        assert_eq!(admission.await, Err(RouterError::NotFound));
+        {
+            let mut admission = std::pin::pin!(work.admit(subscribed, ticket));
+            assert!(poll!(admission.as_mut()).is_pending());
+            drop(blocker);
+            assert_eq!(admission.await, Err(RouterError::NotFound));
+        }
         assert!(fixture.registration.take_queued().is_empty());
         drop(source);
         fixture.finish().await?;

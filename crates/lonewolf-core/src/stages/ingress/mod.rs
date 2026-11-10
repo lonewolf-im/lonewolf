@@ -42,7 +42,6 @@ impl<'o, A: ChunkAllocator + Clone> Origin<'o, A> {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn detaches(&self) -> bool {
         matches!(self, Self::Session(_))
     }

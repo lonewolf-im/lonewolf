@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::delivery::{DeliveryError, DeliveryFuture, HostLookup};
-use lonewolf_extension::policy::{Direction, Verdict};
+use lonewolf_extension::policy::Verdict;
 use lonewolf_extension::service::{ServiceContext, ServiceOutbound};
 use lonewolf_storage::RedbStorage;
-use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaErrorCondition, StanzaType};
 
 use super::ingress::{
     Origin,
+    checks::{self, Snapshot},
     message::{self, MessageDisposition},
 };
-use super::{Stage, StageFailure, policy};
+use super::{Stage, StageFailure};
 use crate::delivery::WorkHandle;
 use crate::router::{Destination, RoutedStanza, RouterError, RouterHandle, ServiceRoute};
 
@@ -118,19 +118,18 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                 && !matches!(view.stanza_type(), StanzaType::Message(_))
                 && !self.router.policies(to.domainpart()).is_empty()
             {
-                let account = AccountKey::try_from(to.bare()).map_err(|_| DeliveryError)?;
-                let checks = [policy::Check {
-                    account: &account,
-                    direction: Direction::Inbound,
-                    peer: view.from()?.ok_or(DeliveryError)?,
-                }];
+                let origin = Origin::Service {
+                    domain: self.domain,
+                };
+                let parties = checks::parties(self.router, &origin, to, view.kind())
+                    .map_err(|_| DeliveryError)?;
                 let stage = Stage {
                     router: self.router,
                     storage: self.storage,
                     allocator: self.allocator,
                     work: self.work,
                 };
-                match policy::evaluate(&stage, view.stanza_type(), &checks)
+                match checks::check(&stage, &origin, &view, &parties, Snapshot::Fresh)
                     .await
                     .map_err(|_| DeliveryError)?
                 {

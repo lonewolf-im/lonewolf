@@ -122,3 +122,89 @@ fn iq_requests_follow_inbound_policy_over_federation() -> TestResult {
     bob.close()?;
     pair.stop()
 }
+
+#[test]
+fn probes_from_dropped_peers_are_unanswered_over_federation() -> TestResult {
+    let mut pair = FederatedPair::start(
+        "a.test",
+        "b.test",
+        PairOptions {
+            a_extensions: "'roster'".into(),
+            b_extensions: "'roster', 'test-policy', 'ping'".into(),
+            ..PairOptions::default()
+        },
+    )?;
+    pair.a.create_account("spammer", PASSWORD)?;
+    pair.b.create_account("bob", PASSWORD)?;
+    let mut spammer = pair.a.connect("spammer", PASSWORD, "desk")?;
+    let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
+    bob.send("<iq type='set' to='b.test' id='policy-off'><toggle xmlns='urn:lonewolf:test:policy' enabled='false'/></iq>")?;
+    assert!(
+        iq_reply(
+            &mut bob,
+            "policy-off",
+            "result",
+            "b.test",
+            "bob@b.test/phone"
+        )?
+        .children
+        .is_empty()
+    );
+    crate::support::federation::subscribe_mutually(
+        &mut spammer,
+        "spammer@a.test",
+        &mut bob,
+        "bob@b.test",
+    )?;
+    spammer.send("<presence type='probe' to='bob@b.test/phone'/>")?;
+    super::presence(
+        &mut spammer,
+        "bob@b.test/phone",
+        "spammer@a.test/desk",
+        None,
+    )?;
+    bob.send("<iq type='set' to='b.test' id='policy-on'><toggle xmlns='urn:lonewolf:test:policy' enabled='true'/></iq>")?;
+    assert!(
+        iq_reply(
+            &mut bob,
+            "policy-on",
+            "result",
+            "b.test",
+            "bob@b.test/phone"
+        )?
+        .children
+        .is_empty()
+    );
+
+    spammer.send("<presence type='probe' to='bob@b.test/phone'/><iq type='get' id='probe-fence' to='b.test'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+    assert!(
+        iq_reply(
+            &mut spammer,
+            "probe-fence",
+            "result",
+            "b.test",
+            "spammer@a.test/desk"
+        )?
+        .children
+        .is_empty()
+    );
+
+    bob.send("<iq type='set' to='b.test' id='policy-cleanup'><toggle xmlns='urn:lonewolf:test:policy' enabled='false'/></iq>")?;
+    assert!(
+        iq_reply(
+            &mut bob,
+            "policy-cleanup",
+            "result",
+            "b.test",
+            "bob@b.test/phone"
+        )?
+        .children
+        .is_empty()
+    );
+    spammer.send("<presence type='unavailable'/>")?;
+    spammer.expect_xml("<presence xmlns='jabber:client' from='spammer@a.test/desk' to='spammer@a.test' type='unavailable'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='spammer@a.test/desk' to='bob@b.test' type='unavailable' xml:lang='en'/>")?;
+    spammer.close()?;
+    bob.close()?;
+    pair.stop()
+}

@@ -14,6 +14,7 @@ use crate::router::Registration;
 pub(crate) mod checks;
 pub(crate) mod iq;
 pub(crate) mod message;
+pub(crate) mod presence;
 
 pub(crate) enum Origin<'o, A: ChunkAllocator> {
     Session(&'o Registration<A>),
